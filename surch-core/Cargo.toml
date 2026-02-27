@@ -1,0 +1,28 @@
+[package]
+name = "surch-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+regex.workspace = true
+unicode-segmentation.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio-test = "0.4"
+proptest = "1.4"
+tempfile = "3.8"

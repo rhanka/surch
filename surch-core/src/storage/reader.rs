@@ -1,0 +1,81 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use parking_lot::RwLock;
+use crate::common::{Document, FieldValue, IndexMetadata};
+use super::{Segment, SegmentManager, error::Error};
+use std::collections::HashMap;
+
+pub struct IndexReader {
+    path: PathBuf,
+    segments: Arc<RwLock<SegmentManager>>,
+    index_name: String,
+}
+
+impl IndexReader {
+    pub fn new(path: impl Into<PathBuf>, index_name: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            segments: Arc::new(RwLock::new(SegmentManager::new())),
+            index_name: index_name.into(),
+        }
+    }
+
+    pub fn load_segments(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    pub fn get_document(&self, doc_id: &str) -> Option<Document> {
+        for segment in self.segments.read().segments() {
+            if let Some(fields) = segment.get_document(doc_id) {
+                return Some(Document {
+                    id: doc_id.to_string(),
+                    fields,
+                    version: None,
+                    seq_no: None,
+                    primary_term: None,
+                });
+            }
+        }
+        None
+    }
+
+    pub fn search(&self, field: &str, term: &str) -> Vec<u64> {
+        self.segments.read().segments()
+            .iter()
+            .flat_map(|s| s.search_term(field, term))
+            .collect()
+    }
+
+    pub fn get_all_documents(&self) -> Vec<Document> {
+        self.segments.read().segments()
+            .iter()
+            .flat_map(|s| {
+                (0..s.meta.num_docs)
+                    .filter_map(|doc_id| {
+                        s.get_document(&doc_id.to_string()).map(|fields| Document {
+                            id: doc_id.to_string(),
+                            fields,
+                            version: None,
+                            seq_no: None,
+                            primary_term: None,
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    pub fn num_docs(&self) -> u64 {
+        self.segments.read().total_docs()
+    }
+
+    pub fn num_segments(&self) -> usize {
+        self.segments.read().num_segments()
+    }
+
+    pub fn set_segments(&self, segments: Vec<Segment>) {
+        let mut manager = self.segments.write();
+        for seg in segments {
+            manager.add_segment(seg);
+        }
+    }
+}

@@ -1,0 +1,38 @@
+# Dependencies
+/Ctarget/
+/vendor/
+
+# Build outputs
+/bin/
+/build/
+/dist/
+/out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+coverage/
+
+# Backup files
+*.bak
+*.tmp
+target/
+Cargo.lock
