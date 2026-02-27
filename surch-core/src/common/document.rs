@@ -1,6 +1,6 @@
+use crate::common::FieldValue;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::common::FieldValue;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -37,7 +37,8 @@ impl Document {
     }
 
     pub fn get_text(&self, name: &str) -> Option<String> {
-        self.get_field(name).and_then(|v| v.as_text().map(String::from))
+        self.get_field(name)
+            .and_then(|v| v.as_text().map(String::from))
     }
 }
 

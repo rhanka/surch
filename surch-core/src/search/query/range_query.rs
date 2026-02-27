@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::common::Document;
 use crate::search::{Query, ScoredDocument};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeQuery {
@@ -84,7 +84,7 @@ impl Query for RangeQuery {
             .filter(|doc| {
                 if let Some(field_value) = doc.get_field(&self.field) {
                     let mut matches = true;
-                    
+
                     if let Some(gte) = &self.gte {
                         matches = matches && compare_bound(gte, field_value).unwrap_or(false);
                     }
@@ -97,7 +97,7 @@ impl Query for RangeQuery {
                     if let Some(lt) = &self.lt {
                         matches = matches && compare_bound_strict(lt, field_value).unwrap_or(false);
                     }
-                    
+
                     matches
                 } else {
                     false

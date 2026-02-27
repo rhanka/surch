@@ -14,25 +14,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("Storage error: {0}")]
     Storage(#[from] storage::Error),
-    
+
     #[error("Indexer error: {0}")]
     Indexer(#[from] indexer::Error),
-    
+
     #[error("Search error: {0}")]
     Search(#[from] search::Error),
-    
+
     #[error("Document not found: {0}")]
     NotFound(String),
-    
+
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
-    
+
     #[error("Index already exists: {0}")]
     IndexExists(String),
-    
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

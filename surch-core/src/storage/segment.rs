@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
-use crate::common::FieldValue;
 use super::error::Error;
+use crate::common::FieldValue;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentMeta {
@@ -52,7 +52,11 @@ impl Segment {
         }
     }
 
-    pub fn add_document(&mut self, doc_id: u64, fields: &HashMap<String, FieldValue>) -> Result<(), Error> {
+    pub fn add_document(
+        &mut self,
+        doc_id: u64,
+        fields: &HashMap<String, FieldValue>,
+    ) -> Result<(), Error> {
         for (field, value) in fields {
             if let Some(text) = value.as_text() {
                 let tokens = tokenize(text);
@@ -67,7 +71,7 @@ impl Segment {
                         });
                 }
             }
-            
+
             if let Some(keyword) = value.as_keyword() {
                 self.terms
                     .entry(format!("{}_kw", field))
@@ -77,19 +81,19 @@ impl Segment {
                         term_freq: 1,
                         positions: vec![],
                     });
-                
+
                 self.store
                     .entry(format!("{}_kw", field))
                     .or_insert_with(HashMap::new)
                     .insert(doc_id.to_string(), FieldValue::Keyword(keyword.to_string()));
             }
-            
+
             self.store
                 .entry(field.clone())
                 .or_insert_with(HashMap::new)
                 .insert(doc_id.to_string(), value.clone());
         }
-        
+
         self.meta.num_docs += 1;
         Ok(())
     }
@@ -105,14 +109,19 @@ impl Segment {
                 }
             }
         }
-        if doc.is_empty() { None } else { Some(doc) }
+        if doc.is_empty() {
+            None
+        } else {
+            Some(doc)
+        }
     }
 
     pub fn search_term(&self, field: &str, term: &str) -> Vec<u64> {
         let key = format!("{}_{}", field, term);
-        self.terms.get(&key).map(|postings| {
-            postings.iter().map(|p| p.doc_id).collect()
-        }).unwrap_or_default()
+        self.terms
+            .get(&key)
+            .map(|postings| postings.iter().map(|p| p.doc_id).collect())
+            .unwrap_or_default()
     }
 
     pub fn num_docs(&self) -> u64 {
@@ -165,10 +174,18 @@ impl SegmentManager {
 
         for segment in self.segments.drain(..) {
             for (key, postings) in segment.terms {
-                merged.terms.entry(key).or_insert_with(Vec::new).extend(postings);
+                merged
+                    .terms
+                    .entry(key)
+                    .or_insert_with(Vec::new)
+                    .extend(postings);
             }
             for (key, docs) in segment.store {
-                merged.store.entry(key).or_insert_with(HashMap::new).extend(docs);
+                merged
+                    .store
+                    .entry(key)
+                    .or_insert_with(HashMap::new)
+                    .extend(docs);
             }
             merged.meta.num_docs += segment.meta.num_docs;
         }

@@ -1,8 +1,8 @@
+use super::error::Error;
+use crate::common::{Document, FieldValue};
+use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
-use parking_lot::RwLock;
-use crate::common::{Document, FieldValue};
-use super::error::Error;
 
 #[derive(Debug, Clone)]
 pub struct WalEntry {
@@ -30,7 +30,7 @@ impl WriteAheadLog {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, Error> {
         let path = path.into();
         std::fs::create_dir_all(&path)?;
-        
+
         Ok(Self {
             path,
             entries: Arc::new(RwLock::new(Vec::new())),
@@ -38,13 +38,18 @@ impl WriteAheadLog {
         })
     }
 
-    pub fn append(&self, index: impl Into<String>, doc_id: impl Into<String>, operation: WalOperation) -> Result<u64, Error> {
+    pub fn append(
+        &self,
+        index: impl Into<String>,
+        doc_id: impl Into<String>,
+        operation: WalOperation,
+    ) -> Result<u64, Error> {
         let seq = {
             let mut current = self.current_seq.write();
             *current += 1;
             *current
         };
-        
+
         let entry = WalEntry {
             seq,
             index: index.into(),
@@ -52,9 +57,9 @@ impl WriteAheadLog {
             operation,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
-        
+
         self.entries.write().push(entry);
-        
+
         Ok(seq)
     }
 
@@ -91,16 +96,26 @@ impl WalManager {
 
     pub fn write_index(&self, index: &str, doc: Document) -> Result<u64, Error> {
         let wal = self.wal.read();
-        let wal = wal.as_ref().ok_or_else(|| Error::Wal("WAL not initialized".to_string()))?;
-        
+        let wal = wal
+            .as_ref()
+            .ok_or_else(|| Error::Wal("WAL not initialized".to_string()))?;
+
         wal.append(index, doc.id.clone(), WalOperation::Index(doc))
     }
 
     pub fn write_delete(&self, index: &str, doc_id: &str) -> Result<u64, Error> {
         let wal = self.wal.read();
-        let wal = wal.as_ref().ok_or_else(|| Error::Wal("WAL not initialized".to_string()))?;
-        
-        wal.append(index, doc_id.to_string(), WalOperation::Delete { doc_id: doc_id.to_string() })
+        let wal = wal
+            .as_ref()
+            .ok_or_else(|| Error::Wal("WAL not initialized".to_string()))?;
+
+        wal.append(
+            index,
+            doc_id.to_string(),
+            WalOperation::Delete {
+                doc_id: doc_id.to_string(),
+            },
+        )
     }
 }
 

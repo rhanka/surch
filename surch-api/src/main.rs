@@ -1,14 +1,16 @@
 use axum::{
-    Router,
-    routing::{get, post, put, delete},
-    Json, Extension,
+    routing::{delete, get, post, put},
+    Extension, Json, Router,
 };
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 use surch_core::{
+    common::{
+        BulkRequest, BulkResponse, Document, FieldValue, IndexMetadata, IndexRequest,
+        IndexResponse, ShardsInfo,
+    },
+    search::{MatchQuery, Query, ScoredDocument},
     storage::IndexStore,
-    common::{IndexMetadata, Document, FieldValue, IndexRequest, IndexResponse, BulkRequest, BulkResponse, ShardsInfo},
-    search::{Query, MatchQuery, ScoredDocument},
 };
 use tokio::sync::oneshot;
 use tracing_subscriber;
@@ -23,29 +25,37 @@ struct AppState {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    
+
     let store = IndexStore::new("./data").expect("Failed to create index store");
     let state = AppState {
         store: Arc::new(RwLock::new(store)),
     };
-    
+
     let app = Router::new()
         .route("/", get(root))
         .route("/_cluster/health", get(cluster_health))
         .route("/_cat/indices", get(list_all_indexes))
-        .route("/{index}", put(create_index).delete(delete_index).get(get_index))
+        .route(
+            "/{index}",
+            put(create_index).delete(delete_index).get(get_index),
+        )
         .route("/{index}/_mapping", get(get_mapping))
-        .route("/{index}/_doc/:id", put(index_document).get(get_document).delete(delete_document))
+        .route(
+            "/{index}/_doc/:id",
+            put(index_document)
+                .get(get_document)
+                .delete(delete_document),
+        )
         .route("/{index}/_search", post(search))
         .route("/{index}/_refresh", post(refresh_index))
         .route("/{index}/_flush", post(flush_index))
         .route("/_bulk", post(bulk))
         .with_state(state);
-    
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9200").await.unwrap();
-    
+
     tracing::info!("Surch server started on http://0.0.0.0:9200");
-    
+
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -87,23 +97,26 @@ async fn cluster_health() -> Json<serde_json::Value> {
 async fn list_all_indexes(Extension(state): Extension<AppState>) -> Json<serde_json::Value> {
     let store = state.store.read();
     let indexes = store.list_indexes();
-    
+
     let mut result = serde_json::Map::new();
     for idx in indexes {
         let idx_name = idx.name.clone();
-        result.insert(idx_name.clone(), serde_json::json!({
-            "health": "green",
-            "status": "open",
-            "index": idx_name,
-            "uuid": idx.uuid,
-            "pri": 1,
-            "rep": 0,
-            "docs.count": 0,
-            "docs.deleted": 0,
-            "store.size": "1kb"
-        }));
+        result.insert(
+            idx_name.clone(),
+            serde_json::json!({
+                "health": "green",
+                "status": "open",
+                "index": idx_name,
+                "uuid": idx.uuid,
+                "pri": 1,
+                "rep": 0,
+                "docs.count": 0,
+                "docs.deleted": 0,
+                "store.size": "1kb"
+            }),
+        );
     }
-    
+
     Json(serde_json::Value::Object(result))
 }
 
@@ -113,7 +126,7 @@ async fn create_index(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let mut metadata = IndexMetadata::new(index.clone());
-    
+
     if let Some(mappings) = payload.get("mappings") {
         if let Some(props) = mappings.get("properties") {
             if let Some(obj) = props.as_object() {
@@ -129,15 +142,19 @@ async fn create_index(
                         Some("date") => surch_core::common::FieldType::Date,
                         _ => surch_core::common::FieldType::Text,
                     };
-                    metadata.mapping.add_field(surch_core::common::FieldDefinition::new(name, field_type));
+                    metadata
+                        .mapping
+                        .add_field(surch_core::common::FieldDefinition::new(name, field_type));
                 }
             }
         }
     }
-    
+
     let store = state.store.read();
-    store.create_index(metadata).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
-    
+    store
+        .create_index(metadata)
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
     Ok(Json(serde_json::json!({
         "index": index,
         "result": "created",
@@ -150,8 +167,10 @@ async fn delete_index(
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
-    store.delete_index(&index).map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
-    
+    store
+        .delete_index(&index)
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+
     Ok(Json(serde_json::json!({
         "index": index,
         "result": "deleted"
@@ -163,15 +182,17 @@ async fn get_index(
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
-    let metadata = store.get_index(&index).ok_or(axum::http::StatusCode::NOT_FOUND)?;
-    
+    let metadata = store
+        .get_index(&index)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+
     let mut index_info = serde_json::Map::new();
     let mut settings = serde_json::Map::new();
     settings.insert("index.number_of_shards".to_string(), serde_json::json!(1));
     settings.insert("index.number_of_replicas".to_string(), serde_json::json!(0));
-    
+
     index_info.insert("settings".to_string(), serde_json::Value::Object(settings));
-    
+
     Ok(Json(serde_json::json!({
         index: index_info
     })))
@@ -182,8 +203,10 @@ async fn get_mapping(
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
-    let metadata = store.get_index(&index).ok_or(axum::http::StatusCode::NOT_FOUND)?;
-    
+    let metadata = store
+        .get_index(&index)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+
     Ok(Json(serde_json::json!({
         index: {
             "mappings": metadata.mapping
@@ -197,7 +220,7 @@ async fn index_document(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<IndexResponse>, axum::http::StatusCode> {
     let doc_id = id.clone();
-    
+
     let fields: std::collections::HashMap<String, FieldValue> = payload
         .as_object()
         .map(|obj| {
@@ -206,12 +229,14 @@ async fn index_document(
                 .collect()
         })
         .unwrap_or_default();
-    
+
     let doc = Document::new(id).with_fields(fields);
-    
+
     let store = state.store.read();
-    let indexed_id = store.index_document(&index, doc).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
-    
+    let indexed_id = store
+        .index_document(&index, doc)
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
     Ok(Json(IndexResponse {
         _index: index,
         _id: doc_id,
@@ -228,8 +253,10 @@ async fn get_document(
     axum::extract::Path((index, id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
-    let doc = store.get_document(&index, &id).map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
-    
+    let doc = store
+        .get_document(&index, &id)
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+
     match doc {
         Some(d) => Ok(Json(serde_json::json!({
             "_index": index,
@@ -244,7 +271,7 @@ async fn get_document(
             "_index": index,
             "_id": id,
             "found": false
-        })))
+        }))),
     }
 }
 
@@ -267,26 +294,39 @@ async fn search(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
     let docs = store.get_all_documents(&index).unwrap_or_default();
-    
-    let results: Vec<surch_core::search::ScoredDocument> = if let Some(query) = payload.get("query") {
+
+    let results: Vec<surch_core::search::ScoredDocument> = if let Some(query) = payload.get("query")
+    {
         let q = surch_core::search::MatchQuery::new("_all", query.as_str().unwrap_or("*"));
         q.execute(&docs)
     } else {
-        docs.iter().map(|d| surch_core::search::ScoredDocument { doc: d.clone(), score: 1.0 }).collect()
+        docs.iter()
+            .map(|d| surch_core::search::ScoredDocument {
+                doc: d.clone(),
+                score: 1.0,
+            })
+            .collect()
     };
-    
+
     let total = results.len();
-    let max_score: f64 = results.iter().map(|r| r.score).fold(0.0f64, |a: f64, b| a.max(b));
-    
-    let hits: Vec<serde_json::Value> = results.into_iter().take(10).map(|r| {
-        serde_json::json!({
-            "_index": index,
-            "_id": r.doc.id,
-            "_score": r.score,
-            "_source": r.doc.fields
+    let max_score: f64 = results
+        .iter()
+        .map(|r| r.score)
+        .fold(0.0f64, |a: f64, b| a.max(b));
+
+    let hits: Vec<serde_json::Value> = results
+        .into_iter()
+        .take(10)
+        .map(|r| {
+            serde_json::json!({
+                "_index": index,
+                "_id": r.doc.id,
+                "_score": r.score,
+                "_source": r.doc.fields
+            })
         })
-    }).collect();
-    
+        .collect();
+
     Ok(Json(serde_json::json!({
         "took": 0,
         "timed_out": false,
@@ -304,8 +344,10 @@ async fn refresh_index(
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
-    store.refresh(&index).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
-    
+    store
+        .refresh(&index)
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
     Ok(Json(serde_json::json!({
         "_shards": { "total": 1, "successful": 1, "failed": 0 }
     })))
@@ -316,8 +358,10 @@ async fn flush_index(
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
-    store.flush(&index).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
-    
+    store
+        .flush(&index)
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
     Ok(Json(serde_json::json!({
         "_shards": { "total": 1, "successful": 1, "failed": 0 }
     })))

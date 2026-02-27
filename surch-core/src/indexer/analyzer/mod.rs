@@ -1,12 +1,12 @@
-mod standard;
-mod simple;
-mod stop;
 mod keyword;
+mod simple;
+mod standard;
+mod stop;
 
-pub use standard::StandardAnalyzer;
-pub use simple::SimpleAnalyzer;
-pub use stop::StopAnalyzer;
 pub use keyword::KeywordAnalyzer;
+pub use simple::SimpleAnalyzer;
+pub use standard::StandardAnalyzer;
+pub use stop::StopAnalyzer;
 
 use crate::common::FieldValue;
 
@@ -62,12 +62,12 @@ impl AnalyzerRegistry {
         let mut registry = Self {
             analyzers: std::collections::HashMap::new(),
         };
-        
+
         registry.register("standard", Box::new(StandardAnalyzer::new()));
         registry.register("simple", Box::new(SimpleAnalyzer::new()));
         registry.register("stop", Box::new(StopAnalyzer::new()));
         registry.register("keyword", Box::new(KeywordAnalyzer::new()));
-        
+
         registry
     }
 
@@ -80,9 +80,8 @@ impl AnalyzerRegistry {
     }
 
     pub fn get_or_default(&self, name: &str) -> &dyn Analyzer {
-        self.get(name).unwrap_or_else(|| {
-            self.get("standard").unwrap()
-        })
+        self.get(name)
+            .unwrap_or_else(|| self.get("standard").unwrap())
     }
 }
 

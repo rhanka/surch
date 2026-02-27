@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::common::Document;
 use crate::search::{Query, ScoredDocument};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TermQuery {
@@ -37,31 +37,45 @@ impl TermQuery {
 }
 
 impl From<String> for TermValue {
-    fn from(s: String) -> Self { TermValue::Text(s) }
+    fn from(s: String) -> Self {
+        TermValue::Text(s)
+    }
 }
 
 impl From<&str> for TermValue {
-    fn from(s: &str) -> Self { TermValue::Text(s.to_string()) }
+    fn from(s: &str) -> Self {
+        TermValue::Text(s.to_string())
+    }
 }
 
 impl From<i32> for TermValue {
-    fn from(i: i32) -> Self { TermValue::Integer(i) }
+    fn from(i: i32) -> Self {
+        TermValue::Integer(i)
+    }
 }
 
 impl From<i64> for TermValue {
-    fn from(i: i64) -> Self { TermValue::Long(i) }
+    fn from(i: i64) -> Self {
+        TermValue::Long(i)
+    }
 }
 
 impl From<f32> for TermValue {
-    fn from(f: f32) -> Self { TermValue::Float(f) }
+    fn from(f: f32) -> Self {
+        TermValue::Float(f)
+    }
 }
 
 impl From<f64> for TermValue {
-    fn from(f: f64) -> Self { TermValue::Double(f) }
+    fn from(f: f64) -> Self {
+        TermValue::Double(f)
+    }
 }
 
 impl From<bool> for TermValue {
-    fn from(b: bool) -> Self { TermValue::Bool(b) }
+    fn from(b: bool) -> Self {
+        TermValue::Bool(b)
+    }
 }
 
 impl Query for TermQuery {
@@ -73,11 +87,13 @@ impl Query for TermQuery {
                         (TermValue::Text(t), _) => fv.as_text().map(|v| v == t),
                         (TermValue::Integer(i), _) => fv.as_i64().map(|v| v == *i as i64),
                         (TermValue::Long(l), _) => fv.as_i64().map(|v| v == *l),
-                        (TermValue::Float(f), _) => fv.as_f64().map(|v| (v - *f as f64).abs() < 0.0001),
+                        (TermValue::Float(f), _) => {
+                            fv.as_f64().map(|v| (v - *f as f64).abs() < 0.0001)
+                        }
                         (TermValue::Double(d), _) => fv.as_f64().map(|v| (v - d).abs() < 0.0001),
                         (TermValue::Bool(b), _) => fv.as_bool().map(|v| v == *b),
                     };
-                    
+
                     matches.map(|m| {
                         if m {
                             Some(ScoredDocument {

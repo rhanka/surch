@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::common::Document;
-use crate::search::{Query, ScoredDocument, QueryType};
+use crate::search::{Query, QueryType, ScoredDocument};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BoolQuery {
@@ -16,7 +16,9 @@ pub struct BoolQuery {
     pub minimum_should_match: usize,
 }
 
-fn default_minimum_should_match() -> usize { 1 }
+fn default_minimum_should_match() -> usize {
+    1
+}
 
 impl BoolQuery {
     pub fn new() -> Self {
@@ -47,7 +49,7 @@ impl BoolQuery {
 impl Query for BoolQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let mut results = Vec::new();
-        
+
         for doc in docs {
             let mut must_score = 0.0;
             let mut must_match = self.must.is_empty();
@@ -55,7 +57,7 @@ impl Query for BoolQuery {
             let mut should_score = 0.0;
             let mut should_match_count = 0;
             let mut must_not_match = true;
-            
+
             for q in &self.must {
                 let hits = q.execute(&[doc.clone()]);
                 if !hits.is_empty() {
@@ -63,7 +65,7 @@ impl Query for BoolQuery {
                     must_match = true;
                 }
             }
-            
+
             for q in &self.filter {
                 let hits = q.execute(&[doc.clone()]);
                 if !hits.is_empty() {
@@ -73,7 +75,7 @@ impl Query for BoolQuery {
                     break;
                 }
             }
-            
+
             for q in &self.should {
                 let hits = q.execute(&[doc.clone()]);
                 if !hits.is_empty() {
@@ -81,7 +83,7 @@ impl Query for BoolQuery {
                     should_match_count += 1;
                 }
             }
-            
+
             for q in &self.must_not {
                 let hits = q.execute(&[doc.clone()]);
                 if !hits.is_empty() {
@@ -89,7 +91,7 @@ impl Query for BoolQuery {
                     break;
                 }
             }
-            
+
             if must_match && filter_pass && must_not_match {
                 let total_score = must_score + should_score;
                 if self.should.is_empty() || should_match_count >= self.minimum_should_match {
@@ -100,12 +102,15 @@ impl Query for BoolQuery {
                 }
             }
         }
-        
+
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         results
     }
 
     fn estimate_cost(&self) -> usize {
-        self.must.len() * 50 + self.filter.len() * 50 + self.should.len() * 50 + self.must_not.len() * 50
+        self.must.len() * 50
+            + self.filter.len() * 50
+            + self.should.len() * 50
+            + self.must_not.len() * 50
     }
 }

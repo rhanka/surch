@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::common::Document;
 use crate::search::{Query, ScoredDocument};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchQuery {
@@ -43,33 +43,36 @@ impl MatchQuery {
 impl Query for MatchQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         use crate::search::fuzzy::FuzzyAlgorithm;
-        
+
         let query_lower = self.query.to_lowercase();
         let query_terms: Vec<String> = query_lower.split_whitespace().map(String::from).collect();
         let mut results = Vec::new();
-        
+
         for doc in docs {
             if let Some(field_value) = doc.get_field(&self.field) {
                 let field_text = field_value.as_text().unwrap_or("").to_lowercase();
                 let doc_terms: Vec<&str> = field_text.split_whitespace().collect();
-                
+
                 let matches = if let Some(fuzziness) = self.fuzziness {
-                    query_terms.iter().filter(|qt| {
-                        doc_terms.iter().any(|dt| 
-                            FuzzyAlgorithm::is_fuzzy_match(qt, dt, fuzziness)
-                        )
-                    }).count()
+                    query_terms
+                        .iter()
+                        .filter(|qt| {
+                            doc_terms
+                                .iter()
+                                .any(|dt| FuzzyAlgorithm::is_fuzzy_match(qt, dt, fuzziness))
+                        })
+                        .count()
                 } else {
                     match self.operator {
-                        MatchOperator::Or => {
-                            query_terms.iter().filter(|qt| {
-                                doc_terms.iter().any(|dt| (*dt).contains(qt.as_str()))
-                            }).count()
-                        }
+                        MatchOperator::Or => query_terms
+                            .iter()
+                            .filter(|qt| doc_terms.iter().any(|dt| (*dt).contains(qt.as_str())))
+                            .count(),
                         MatchOperator::And => {
-                            if query_terms.iter().all(|qt| {
-                                doc_terms.iter().any(|dt| (*dt).contains(qt.as_str()))
-                            }) {
+                            if query_terms
+                                .iter()
+                                .all(|qt| doc_terms.iter().any(|dt| (*dt).contains(qt.as_str())))
+                            {
                                 query_terms.len()
                             } else {
                                 0
@@ -77,7 +80,7 @@ impl Query for MatchQuery {
                         }
                     }
                 };
-                
+
                 if matches > 0 {
                     let score = matches as f64 / query_terms.len() as f64;
                     results.push(ScoredDocument {
@@ -87,7 +90,7 @@ impl Query for MatchQuery {
                 }
             }
         }
-        
+
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         results
     }
@@ -105,7 +108,9 @@ pub struct MatchPhraseQuery {
     pub slop: usize,
 }
 
-fn default_slop() -> usize { 0 }
+fn default_slop() -> usize {
+    0
+}
 
 impl MatchPhraseQuery {
     pub fn new(field: impl Into<String>, query: impl Into<String>) -> Self {
@@ -121,12 +126,12 @@ impl Query for MatchPhraseQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let query_terms: Vec<&str> = self.query.split_whitespace().collect();
         let mut results = Vec::new();
-        
+
         for doc in docs {
             if let Some(field_value) = doc.get_field(&self.field) {
                 let field_text = field_value.as_text().unwrap_or("");
                 let doc_terms: Vec<&str> = field_text.split_whitespace().collect();
-                
+
                 if Self::phrase_match(&query_terms, &doc_terms, self.slop) {
                     results.push(ScoredDocument {
                         doc: doc.clone(),
@@ -135,7 +140,7 @@ impl Query for MatchPhraseQuery {
                 }
             }
         }
-        
+
         results
     }
 
@@ -149,18 +154,18 @@ impl MatchPhraseQuery {
         if query_terms.is_empty() {
             return true;
         }
-        
+
         let mut qi = 0;
         for dt in doc_terms {
             if qi < query_terms.len() && *dt == query_terms[qi] {
                 qi += 1;
             }
         }
-        
+
         if qi == query_terms.len() {
             return true;
         }
-        
+
         if slop > 0 {
             qi = 0;
             let mut distance = 0;

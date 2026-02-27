@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::common::FieldType;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -28,9 +28,10 @@ impl FieldValue {
             FieldValue::Text(_) => FieldType::Text,
             FieldValue::Keyword(_) => FieldType::Keyword,
             FieldValue::Date(_) => FieldType::Date,
-            FieldValue::Array(arr) => {
-                arr.first().map(|v| v.field_type()).unwrap_or(FieldType::Unknown)
-            }
+            FieldValue::Array(arr) => arr
+                .first()
+                .map(|v| v.field_type())
+                .unwrap_or(FieldType::Unknown),
         }
     }
 

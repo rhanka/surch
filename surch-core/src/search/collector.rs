@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use crate::common::Document;
 use crate::search::ScoredDocument;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -113,31 +113,43 @@ impl ResultCollector {
 
     pub fn finalize(self, index_name: &str) -> SearchResult {
         let mut hits = self.results;
-        
+
         if !self.sort.is_empty() {
             for sf in self.sort.iter().rev() {
                 match sf.order {
                     SortOrder::Asc => {
                         hits.sort_by(|a, b| {
-                            let a_val = a.doc.get_field(&sf.field).map(|v| v.as_text().unwrap_or(""));
-                            let b_val = b.doc.get_field(&sf.field).map(|v| v.as_text().unwrap_or(""));
+                            let a_val = a
+                                .doc
+                                .get_field(&sf.field)
+                                .map(|v| v.as_text().unwrap_or(""));
+                            let b_val = b
+                                .doc
+                                .get_field(&sf.field)
+                                .map(|v| v.as_text().unwrap_or(""));
                             a_val.cmp(&b_val)
                         });
                     }
                     SortOrder::Desc => {
                         hits.sort_by(|a, b| {
-                            let a_val = a.doc.get_field(&sf.field).map(|v| v.as_text().unwrap_or(""));
-                            let b_val = b.doc.get_field(&sf.field).map(|v| v.as_text().unwrap_or(""));
+                            let a_val = a
+                                .doc
+                                .get_field(&sf.field)
+                                .map(|v| v.as_text().unwrap_or(""));
+                            let b_val = b
+                                .doc
+                                .get_field(&sf.field)
+                                .map(|v| v.as_text().unwrap_or(""));
                             b_val.cmp(&a_val)
                         });
                     }
                 }
             }
         }
-        
+
         let total = hits.len() as u64;
         let max_score = hits.iter().map(|h| h.score).fold(0.0f64, |a, b| a.max(b));
-        
+
         let paginated: Vec<Hit> = hits
             .into_iter()
             .skip(self.from)
@@ -146,7 +158,9 @@ impl ResultCollector {
                 index: index_name.to_string(),
                 id: sd.doc.id.clone(),
                 score: sd.score,
-                source: Some(serde_json::to_value(&sd.doc.fields).unwrap_or(serde_json::Value::Null)),
+                source: Some(
+                    serde_json::to_value(&sd.doc.fields).unwrap_or(serde_json::Value::Null),
+                ),
                 highlights: None,
             })
             .collect();

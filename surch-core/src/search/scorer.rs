@@ -1,9 +1,16 @@
-use serde::{Deserialize, Serialize};
 use crate::common::Document;
 use crate::search::ScoredDocument;
+use serde::{Deserialize, Serialize};
 
 pub trait Scorer: Send + Sync {
-    fn score(&self, doc: &Document, term_freq: u32, doc_len: usize, avg_doc_len: f64, num_docs: u64) -> f64;
+    fn score(
+        &self,
+        doc: &Document,
+        term_freq: u32,
+        doc_len: usize,
+        avg_doc_len: f64,
+        num_docs: u64,
+    ) -> f64;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,10 +32,7 @@ pub struct BM25Scorer {
 
 impl BM25Scorer {
     pub fn new() -> Self {
-        Self {
-            k1: 1.5,
-            b: 0.75,
-        }
+        Self { k1: 1.5, b: 0.75 }
     }
 }
 
@@ -39,13 +43,20 @@ impl Default for BM25Scorer {
 }
 
 impl Scorer for BM25Scorer {
-    fn score(&self, _doc: &Document, term_freq: u32, doc_len: usize, avg_doc_len: f64, _num_docs: u64) -> f64 {
+    fn score(
+        &self,
+        _doc: &Document,
+        term_freq: u32,
+        doc_len: usize,
+        avg_doc_len: f64,
+        _num_docs: u64,
+    ) -> f64 {
         let tf = term_freq as f64;
         let doc_len = doc_len as f64;
-        
+
         let numerator = tf * (self.k1 + 1.0);
         let denominator = tf + self.k1 * (1.0 - self.b + self.b * (doc_len / avg_doc_len));
-        
+
         numerator / denominator
     }
 }
@@ -65,7 +76,14 @@ impl Default for TfIdfScorer {
 }
 
 impl Scorer for TfIdfScorer {
-    fn score(&self, _doc: &Document, term_freq: u32, _doc_len: usize, _avg_doc_len: f64, _num_docs: u64) -> f64 {
+    fn score(
+        &self,
+        _doc: &Document,
+        term_freq: u32,
+        _doc_len: usize,
+        _avg_doc_len: f64,
+        _num_docs: u64,
+    ) -> f64 {
         (1.0 + (term_freq as f64).ln())
     }
 }
@@ -81,8 +99,16 @@ impl SearchScorer {
         }
     }
 
-    pub fn score(&self, doc: &Document, term_freq: u32, doc_len: usize, avg_doc_len: f64, num_docs: u64) -> f64 {
-        self.similarity.score(doc, term_freq, doc_len, avg_doc_len, num_docs)
+    pub fn score(
+        &self,
+        doc: &Document,
+        term_freq: u32,
+        doc_len: usize,
+        avg_doc_len: f64,
+        num_docs: u64,
+    ) -> f64 {
+        self.similarity
+            .score(doc, term_freq, doc_len, avg_doc_len, num_docs)
     }
 }
 

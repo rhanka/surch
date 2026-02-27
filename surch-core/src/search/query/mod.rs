@@ -1,17 +1,17 @@
-mod match_query;
-mod term_query;
-mod range_query;
 mod bool_query;
+mod match_query;
+mod range_query;
+mod term_query;
 
-pub use match_query::*;
-pub use term_query::*;
-pub use range_query::*;
 pub use bool_query::*;
+pub use match_query::*;
+pub use range_query::*;
+pub use term_query::*;
 
-use serde::{Deserialize, Serialize};
 use crate::common::{Document, FieldValue};
 use crate::search::error::Error;
 use crate::search::fuzzy::FuzzyAlgorithm;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub trait Query: Send + Sync {
@@ -79,8 +79,12 @@ pub struct FuzzyQuery {
     pub prefix_length: usize,
 }
 
-fn default_fuzziness() -> usize { 2 }
-fn default_prefix_length() -> usize { 0 }
+fn default_fuzziness() -> usize {
+    2
+}
+fn default_prefix_length() -> usize {
+    0
+}
 
 impl FuzzyQuery {
     pub fn new(field: impl Into<String>, value: impl Into<String>) -> Self {
@@ -106,13 +110,19 @@ impl FuzzyQuery {
 impl Query for FuzzyQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let mut results = Vec::new();
-        
+
         for doc in docs {
             if let Some(field_value) = doc.get_field(&self.field) {
                 let field_text = field_value.as_text().unwrap_or("");
-                
+
                 if FuzzyAlgorithm::is_fuzzy_match(&self.value, field_text, self.fuzziness) {
-                    let score = 1.0 / (FuzzyAlgorithm::damerau_levenshtein(&self.value, field_text, self.fuzziness) as f64 + 1.0);
+                    let score = 1.0
+                        / (FuzzyAlgorithm::damerau_levenshtein(
+                            &self.value,
+                            field_text,
+                            self.fuzziness,
+                        ) as f64
+                            + 1.0);
                     results.push(ScoredDocument {
                         doc: doc.clone(),
                         score,
@@ -120,7 +130,7 @@ impl Query for FuzzyQuery {
                 }
             }
         }
-        
+
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         results
     }
@@ -137,7 +147,9 @@ pub struct ExistsQuery {
 
 impl ExistsQuery {
     pub fn new(field: impl Into<String>) -> Self {
-        Self { field: field.into() }
+        Self {
+            field: field.into(),
+        }
     }
 }
 
@@ -175,7 +187,7 @@ impl PrefixQuery {
 impl Query for PrefixQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let mut results = Vec::new();
-        
+
         for doc in docs {
             if let Some(field_value) = doc.get_field(&self.field) {
                 if let Some(text) = field_value.as_text() {
@@ -188,7 +200,7 @@ impl Query for PrefixQuery {
                 }
             }
         }
-        
+
         results
     }
 
@@ -222,7 +234,7 @@ impl WildcardQuery {
 impl Query for WildcardQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let mut results = Vec::new();
-        
+
         for doc in docs {
             if let Some(field_value) = doc.get_field(&self.field) {
                 if let Some(text) = field_value.as_text() {
@@ -235,7 +247,7 @@ impl Query for WildcardQuery {
                 }
             }
         }
-        
+
         results
     }
 
@@ -265,10 +277,10 @@ impl MultiMatchQuery {
 impl Query for MultiMatchQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let mut results = Vec::new();
-        
+
         for doc in docs {
             let mut match_count = 0;
-            
+
             for field in &self.fields {
                 if let Some(field_value) = doc.get_field(field) {
                     if let Some(text) = field_value.as_text() {
@@ -282,7 +294,7 @@ impl Query for MultiMatchQuery {
                     }
                 }
             }
-            
+
             if match_count > 0 {
                 results.push(ScoredDocument {
                     doc: doc.clone(),
@@ -290,7 +302,7 @@ impl Query for MultiMatchQuery {
                 });
             }
         }
-        
+
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         results
     }

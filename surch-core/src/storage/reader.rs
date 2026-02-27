@@ -1,9 +1,9 @@
+use super::{error::Error, Segment, SegmentManager};
+use crate::common::{Document, FieldValue, IndexMetadata};
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use parking_lot::RwLock;
-use crate::common::{Document, FieldValue, IndexMetadata};
-use super::{Segment, SegmentManager, error::Error};
-use std::collections::HashMap;
 
 pub struct IndexReader {
     path: PathBuf,
@@ -40,26 +40,29 @@ impl IndexReader {
     }
 
     pub fn search(&self, field: &str, term: &str) -> Vec<u64> {
-        self.segments.read().segments()
+        self.segments
+            .read()
+            .segments()
             .iter()
             .flat_map(|s| s.search_term(field, term))
             .collect()
     }
 
     pub fn get_all_documents(&self) -> Vec<Document> {
-        self.segments.read().segments()
+        self.segments
+            .read()
+            .segments()
             .iter()
             .flat_map(|s| {
-                (0..s.meta.num_docs)
-                    .filter_map(|doc_id| {
-                        s.get_document(&doc_id.to_string()).map(|fields| Document {
-                            id: doc_id.to_string(),
-                            fields,
-                            version: None,
-                            seq_no: None,
-                            primary_term: None,
-                        })
+                (0..s.meta.num_docs).filter_map(|doc_id| {
+                    s.get_document(&doc_id.to_string()).map(|fields| Document {
+                        id: doc_id.to_string(),
+                        fields,
+                        version: None,
+                        seq_no: None,
+                        primary_term: None,
                     })
+                })
             })
             .collect()
     }

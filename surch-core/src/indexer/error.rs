@@ -4,19 +4,19 @@ use thiserror::Error;
 pub enum Error {
     #[error("Analyzer error: {0}")]
     Analyzer(String),
-    
+
     #[error("Mapping error: {0}")]
     Mapping(String),
-    
+
     #[error("Pipeline error: {0}")]
     Pipeline(String),
-    
+
     #[error("Tokenization error: {0}")]
     Tokenization(String),
-    
+
     #[error("Index not found: {0}")]
     IndexNotFound(String),
-    
+
     #[error("Invalid field: {0}")]
     InvalidField(String),
 }

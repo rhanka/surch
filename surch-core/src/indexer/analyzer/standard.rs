@@ -9,10 +9,9 @@ impl StandardAnalyzer {
     pub fn new() -> Self {
         Self {
             stop_words: vec![
-                "a", "an", "and", "are", "as", "at", "be", "but", "by", "for",
-                "if", "in", "into", "is", "it", "no", "not", "of", "on", "or",
-                "such", "that", "the", "their", "then", "there", "these", "they",
-                "this", "to", "was", "will", "with",
+                "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into",
+                "is", "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then",
+                "there", "these", "they", "this", "to", "was", "will", "with",
             ],
         }
     }
@@ -40,11 +39,11 @@ impl Analyzer for StandardAnalyzer {
 
         for word in text.unicode_words() {
             let word_lower = word.to_lowercase();
-            
+
             if !self.is_stop_word(&word_lower) && word_lower.len() > 1 {
                 let start = char_offset;
                 let end = start + word.len();
-                
+
                 tokens.push(Token {
                     text: word_lower,
                     field: String::new(),
@@ -54,10 +53,10 @@ impl Analyzer for StandardAnalyzer {
                     term_freq: 1,
                     pos_increment: 1,
                 });
-                
+
                 position += 1;
             }
-            
+
             char_offset += word.len();
         }
 
