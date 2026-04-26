@@ -69,6 +69,7 @@ For Surch, drumbeat means continuous forward motion:
 | Index + Document APIs | `spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md` | confirmed | Confirmed by BR-01, ready for BR-03, BR-04, and BR-06 consumption |
 | Search + Query DSL | `spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md` | confirmed | Confirmed by BR-02, ready for BR-05 and BR-07 consumption |
 | Security + Testing Baseline | `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md` | drafted | Used as governance input and release gate baseline |
+| MatchID Elastic Parity Exit Criteria | `spec/SPEC_MATCHID_ELASTIC_PARITY_EXIT_CRITERIA.md` | drafted | Final acceptance target is Elastic parity in MatchID context, not full MatchID cloning |
 | Governance Orchestration | `spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md` | active | Governs this repo structure |
 
 Status vocabulary:
@@ -202,7 +203,17 @@ The MVP release must reject known avoidable gaps in these areas:
 
 Detailed baseline: `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md` and `rules/security.md`.
 
-## 12) Superpowers Framing
+## 12) Final Exit Criteria
+
+The final project target is not to clone MatchID as a whole application.
+
+The final target is to replace Elasticsearch in the MatchID usage context with Surch, with:
+- zero accepted search gap on the agreed corpus
+- no performance regression versus Elasticsearch baseline
+
+Reference spec: `spec/SPEC_MATCHID_ELASTIC_PARITY_EXIT_CRITERIA.md`.
+
+## 13) Superpowers Framing
 
 Superpowers skills are allowed only as helpers.
 
@@ -214,7 +225,7 @@ They must not:
 
 Project-specific framing is defined in `rules/superpowers.md`.
 
-## 13) Next Working Set
+## 14) Next Working Set
 
 Immediate repo goals:
 - finalize governance docs
