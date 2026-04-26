@@ -27,8 +27,8 @@
 - `PLAN.md` only if branch status or dependency wording must be updated by conductor
 
 ## Dependency Gates
-- [ ] Governance spec reviewed
-- [ ] OpenSearch source links verified
+- [x] Governance spec reviewed
+- [x] OpenSearch source links verified
 
 ## Environment Mapping
 - Worktree: `tmp/br-01-spec-harvest`
@@ -36,31 +36,34 @@
 
 ## Plan / Lots / Todo
 
-- [ ] **Lot 0 - Source capture**
-  - [ ] Confirm source docs for create index, delete index, get index, get mapping
-  - [ ] Confirm source docs for index document, get document, delete document, bulk, refresh, flush
+- [x] **Lot 0 - Source capture**
+  - [x] Confirm source docs for create index, delete index, get index, get mapping
+  - [x] Confirm source docs for index document, get document, delete document, bulk, refresh, flush
 
-- [ ] **Lot 1 - Compatibility matrix**
-  - [ ] Normalize endpoints, methods, required params, body shapes, and response fields
-  - [ ] Record error codes and compatibility traps
+- [x] **Lot 1 - Compatibility matrix**
+  - [x] Normalize endpoints, methods, required params, body shapes, and response fields
+  - [x] Record error codes and compatibility traps
 
-- [ ] **Lot 2 - Test inventory**
-  - [ ] Write Given/When/Then compatibility cases for success and error paths
-  - [ ] Mark MVP `MUST`, `SHOULD`, or `LATER`
+- [x] **Lot 2 - Test inventory**
+  - [x] Write Given/When/Then compatibility cases for success and error paths
+  - [x] Mark MVP `MUST`, `SHOULD`, or `LATER`
 
-- [ ] **Lot 3 - Final validation**
-  - [ ] Spec reviewed for ambiguity and contradictions
+- [x] **Lot 3 - Final validation**
+  - [x] Spec reviewed for ambiguity and contradictions
 
 ## Feedback Loop
-- Record any undocumented OpenSearch divergence as `spec-mismatch`
+- `attention`: `Flush` remains explicitly `LATER` for MVP and must not block BR-03, BR-04, or BR-06.
+- `attention`: unsupported-but-known syntax is normalized to explicit `400` rejection rather than silent acceptance.
+- `attention`: baseline `cargo test` in this worktree is still blocked by missing system OpenSSL for `openssl-sys`; environment issue only, outside branch scope.
+- Record any undocumented OpenSearch divergence as `spec-mismatch`.
 
 ## Tests Required
 - Compatibility scenarios listed in spec, no code tests in this branch
 
 ## Security Checks
-- [ ] Body size and malformed NDJSON concerns captured for bulk
+- [x] Body size and malformed NDJSON concerns captured for bulk
 
 ## Merge Checklist
-- [ ] Syntax matrix complete
-- [ ] Error shape notes complete
-- [ ] MVP endpoint priorities marked
+- [x] Syntax matrix complete
+- [x] Error shape notes complete
+- [x] MVP endpoint priorities marked

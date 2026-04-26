@@ -66,8 +66,8 @@ For Surch, drumbeat means continuous forward motion:
 
 | Surface | Primary Spec File | Status | Notes |
 |---|---|---|---|
-| Index + Document APIs | `spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md` | drafted | Built from OpenSearch references, needs branch-level confirmation during BR-01 |
-| Search + Query DSL | `spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md` | drafted | Built from OpenSearch references, needs branch-level confirmation during BR-02 |
+| Index + Document APIs | `spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md` | confirmed | Confirmed by BR-01, ready for BR-03, BR-04, and BR-06 consumption |
+| Search + Query DSL | `spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md` | confirmed | Confirmed by BR-02, ready for BR-05 and BR-07 consumption |
 | Security + Testing Baseline | `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md` | drafted | Used as governance input and release gate baseline |
 | Governance Orchestration | `spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md` | active | Governs this repo structure |
 
@@ -82,8 +82,8 @@ Status vocabulary:
 
 | ID | Branch | Owner | Status | Depends On | File |
 |---|---|---|---|---|---|
-| BR-01 | `feature/BR-01-spec-harvest-index-doc-api` | #4 APIServer | plan | — | `plan/01_BRANCH_spec-harvest-index-and-document-apis.md` |
-| BR-02 | `feature/BR-02-spec-harvest-search-query-dsl` | #3 SearchEngine | plan | — | `plan/02_BRANCH_spec-harvest-search-and-query-dsl.md` |
+| BR-01 | `feature/BR-01-spec-harvest-index-doc-api` | #4 APIServer | ready | — | `plan/01_BRANCH_spec-harvest-index-and-document-apis.md` |
+| BR-02 | `feature/BR-02-spec-harvest-search-query-dsl` | #3 SearchEngine | ready | — | `plan/02_BRANCH_spec-harvest-search-and-query-dsl.md` |
 | BR-03 | `feature/BR-03-storage-wal-segments-docstore` | #1 StorageEngine | plan | BR-01 | `plan/03_BRANCH_storage-wal-segments-and-docstore.md` |
 | BR-04 | `feature/BR-04-indexer-mappings-analyzers-bulk` | #2 Indexer | plan | BR-01, BR-03 | `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md` |
 | BR-05 | `feature/BR-05-search-query-exec-fuzzy` | #3 SearchEngine | plan | BR-02, BR-03, BR-04 | `plan/05_BRANCH_search-query-execution-and-fuzzy.md` |
