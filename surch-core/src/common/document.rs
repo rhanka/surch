@@ -109,6 +109,13 @@ pub enum BulkAction {
         #[serde(rename = "_id")]
         id: Option<String>,
     },
+    #[serde(rename = "create")]
+    Create {
+        #[serde(rename = "_index")]
+        index: String,
+        #[serde(rename = "_id")]
+        id: Option<String>,
+    },
     #[serde(rename = "delete")]
     Delete {
         #[serde(rename = "_index")]

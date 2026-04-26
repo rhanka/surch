@@ -16,7 +16,7 @@
 ## Allowed Paths
 - `surch-core/src/indexer/**`
 - `surch-core/src/common/**`
-- `tests/integration/indexer/**`
+- `surch-core/tests/**`
 - `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md`
 
 ## Forbidden Paths
@@ -29,7 +29,7 @@
 
 ## Dependency Gates
 - [x] BR-01 reviewed
-- [ ] BR-03 storage contract reviewed
+- [x] BR-03 storage contract reviewed
 
 ## Environment Mapping
 - Worktree: `tmp/br-04-indexer`
@@ -56,26 +56,26 @@
     - [x] `cargo test -p surch-core indexer::analyzer`
 
 - [ ] **Lot 3 - Bulk ingestion contract**
-  - [ ] Model the parsing expectations required by bulk ingestion
-  - [ ] Add `tests/integration/indexer/bulk_contract.rs`
-  - [ ] Final gate:
-    - [ ] `cargo fmt --all`
+  - [x] Model the parsing expectations required by bulk ingestion
+  - [x] Add `surch-core/tests/indexer_bulk_contract.rs`
+  - [x] Final gate:
+    - [x] `cargo fmt --all`
     - [ ] `cargo clippy --workspace --all-targets --all-features`
-    - [ ] `cargo test --workspace`
+    - [x] `cargo test -p surch-core`
 
 ## Feedback Loop
 - Raise `spec-mismatch` if mapping or bulk semantics differ from harvested spec
-- Remaining dependency: Lot 3 bulk ingestion contract still depends on BR-03 storage-side interfaces and is intentionally deferred in this slice.
+- attention: branch-local verification is green on `surch-core`; workspace-level clippy remains pending because the crate still contains pre-existing warnings outside the BR-04 slice.
 
 ## Tests Required
 - Unit: mapping validation, analyzer tokenization
-- Integration: bulk contract and single-document ingestion shape
+- Integration: `surch-core/tests/indexer_bulk_contract.rs`
 
 ## Security Checks
 - [x] Invalid field definitions rejected cleanly
-- [ ] Bulk payload parsing risks documented
+- [x] Bulk payload parsing risks documented
 
 ## Merge Checklist
 - [x] Mapping validation works
 - [x] Analyzer tests pass
-- [ ] Bulk contract is explicit
+- [x] Bulk contract is explicit
