@@ -1,9 +1,10 @@
 use super::{error::Error, Segment, SegmentManager};
-use crate::common::{Document, FieldValue, IndexMetadata};
+use crate::common::Document;
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+const SEGMENT_FILE_SUFFIX: &str = ".segment.json";
 
 pub struct IndexReader {
     path: PathBuf,
@@ -21,6 +22,28 @@ impl IndexReader {
     }
 
     pub fn load_segments(&mut self) -> Result<(), Error> {
+        let mut manager = SegmentManager::new();
+
+        if self.path.exists() {
+            let mut segment_paths: Vec<PathBuf> = std::fs::read_dir(&self.path)?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.ends_with(SEGMENT_FILE_SUFFIX))
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            segment_paths.sort();
+
+            for segment_path in segment_paths {
+                manager.add_segment(Segment::load(segment_path)?);
+            }
+        }
+
+        *self.segments.write() = manager;
         Ok(())
     }
 
@@ -54,15 +77,15 @@ impl IndexReader {
             .segments()
             .iter()
             .flat_map(|s| {
-                (0..s.meta.num_docs).filter_map(|doc_id| {
-                    s.get_document(&doc_id.to_string()).map(|fields| Document {
-                        id: doc_id.to_string(),
+                s.all_documents()
+                    .into_iter()
+                    .map(|(doc_id, fields)| Document {
+                        id: doc_id,
                         fields,
                         version: None,
                         seq_no: None,
                         primary_term: None,
                     })
-                })
             })
             .collect()
     }

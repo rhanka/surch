@@ -69,18 +69,12 @@ impl IndexStore {
     }
 
     pub fn index_document(&self, index_name: &str, doc: Document) -> Result<u64, Error> {
-        let indexes = self.indexes.read();
+        let mut indexes = self.indexes.write();
         let instance = indexes
-            .get(index_name)
+            .get_mut(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        let mut writer = IndexWriter::new(
-            self.base_path.join(index_name).join("data"),
-            index_name,
-            self.wal.clone(),
-        )?;
-
-        writer.index_document(doc)
+        instance.writer.index_document(doc)
     }
 
     pub fn get_document(&self, index_name: &str, doc_id: &str) -> Result<Option<Document>, Error> {
@@ -89,7 +83,8 @@ impl IndexStore {
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        let reader = IndexReader::new(self.base_path.join(index_name).join("data"), index_name);
+        let mut reader = IndexReader::new(self.base_path.join(index_name).join("data"), index_name);
+        reader.load_segments()?;
 
         Ok(reader.get_document(doc_id))
     }
@@ -108,7 +103,8 @@ impl IndexStore {
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
-        let reader = IndexReader::new(self.base_path.join(index_name).join("data"), index_name);
+        let mut reader = IndexReader::new(self.base_path.join(index_name).join("data"), index_name);
+        reader.load_segments()?;
 
         Ok(reader.get_all_documents())
     }
@@ -119,5 +115,42 @@ impl IndexStore {
 
     pub fn flush(&self, index_name: &str) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IndexStore;
+    use crate::common::{Document, FieldValue, IndexMetadata};
+    use tempfile::tempdir;
+
+    #[test]
+    fn index_document_round_trips_from_store() {
+        let temp_dir = tempdir().expect("temp dir");
+        let store = IndexStore::new(temp_dir.path()).expect("create store");
+
+        store
+            .create_index(IndexMetadata::new("books"))
+            .expect("create index");
+
+        store
+            .index_document(
+                "books",
+                Document::new("doc-1")
+                    .with_field("title", FieldValue::Text("Hello".to_string()))
+                    .with_field("year", FieldValue::Integer(2024)),
+            )
+            .expect("index document");
+
+        let doc = store
+            .get_document("books", "doc-1")
+            .expect("get document result")
+            .expect("document should exist");
+
+        assert_eq!(doc.get_text("title"), Some("Hello".to_string()));
+        assert_eq!(
+            doc.get_field("year").and_then(FieldValue::as_i64),
+            Some(2024)
+        );
     }
 }

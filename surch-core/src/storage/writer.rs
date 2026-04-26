@@ -1,8 +1,10 @@
 use super::{error::Error, Segment, SegmentManager, WalManager};
-use crate::common::{Document, IndexMetadata};
+use crate::common::Document;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+const SEGMENT_FILE_SUFFIX: &str = ".segment.json";
 
 pub struct IndexWriter {
     path: PathBuf,
@@ -21,12 +23,24 @@ impl IndexWriter {
         let path = path.into();
         std::fs::create_dir_all(&path)?;
 
+        let current_doc_id = std::fs::read_dir(&path)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.ends_with(SEGMENT_FILE_SUFFIX))
+                    .unwrap_or(false)
+            })
+            .count() as u64;
+
         Ok(Self {
             path,
             segments: Arc::new(RwLock::new(SegmentManager::new())),
             wal,
             index_name: index_name.into(),
-            current_doc_id: 0,
+            current_doc_id,
         })
     }
 
@@ -38,7 +52,8 @@ impl IndexWriter {
 
         let mut segment = Segment::new(format!("seg_{}", uuid::Uuid::new_v4()), &self.path);
 
-        segment.add_document(doc_id, &doc.fields)?;
+        segment.add_document(doc_id, &doc.id, &doc.fields)?;
+        segment.persist()?;
 
         self.segments.write().add_segment(segment);
 

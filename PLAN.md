@@ -85,8 +85,8 @@ Status vocabulary:
 |---|---|---|---|---|---|
 | BR-01 | `feature/BR-01-spec-harvest-index-doc-api` | #4 APIServer | ready | — | `plan/01_BRANCH_spec-harvest-index-and-document-apis.md` |
 | BR-02 | `feature/BR-02-spec-harvest-search-query-dsl` | #3 SearchEngine | ready | — | `plan/02_BRANCH_spec-harvest-search-and-query-dsl.md` |
-| BR-03 | `feature/BR-03-storage-wal-segments-docstore` | #1 StorageEngine | plan | BR-01 | `plan/03_BRANCH_storage-wal-segments-and-docstore.md` |
-| BR-04 | `feature/BR-04-indexer-mappings-analyzers-bulk` | #2 Indexer | plan | BR-01, BR-03 | `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md` |
+| BR-03 | `feature/BR-03-storage-wal-segments-docstore` | #1 StorageEngine | active | BR-01 | `plan/03_BRANCH_storage-wal-segments-and-docstore.md` |
+| BR-04 | `feature/BR-04-indexer-mappings-analyzers-bulk` | #2 Indexer | partial | BR-01, BR-03 | `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md` |
 | BR-05 | `feature/BR-05-search-query-exec-fuzzy` | #3 SearchEngine | plan | BR-02, BR-03, BR-04 | `plan/05_BRANCH_search-query-execution-and-fuzzy.md` |
 | BR-06 | `feature/BR-06-api-index-document-compat` | #4 APIServer | plan | BR-01, BR-03, BR-04 | `plan/06_BRANCH_api-index-and-document-compat.md` |
 | BR-07 | `feature/BR-07-api-search-compat-integration` | #4 APIServer | plan | BR-02, BR-05, BR-06 | `plan/07_BRANCH_api-search-compat-and-integration.md` |

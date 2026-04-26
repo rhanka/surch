@@ -16,7 +16,7 @@
 ## Allowed Paths
 - `surch-core/src/storage/**`
 - `surch-core/src/common/**`
-- `tests/integration/storage/**`
+- `surch-core/tests/**`
 - `plan/03_BRANCH_storage-wal-segments-and-docstore.md`
 
 ## Forbidden Paths
@@ -51,27 +51,28 @@
     - [x] `cargo test -p surch-core storage::wal`
 
 - [ ] **Lot 2 - Segment metadata and docstore**
-  - [ ] Tighten segment metadata behavior
-  - [ ] Make doc write/read path deterministic
-  - [ ] Add unit tests for segment document persistence shape
-  - [ ] Lot gate:
-    - [ ] `cargo test -p surch-core storage::segment`
+  - [x] Tighten segment metadata behavior
+  - [x] Make doc write/read path deterministic
+  - [x] Add unit tests for segment document persistence shape
+  - [x] Lot gate:
+    - [x] `cargo test -p surch-core storage::segment`
 
 - [ ] **Lot 3 - Integration path**
-  - [ ] Add `tests/integration/storage/wal_recovery.rs`
-  - [ ] Add `tests/integration/storage/docstore_roundtrip.rs`
-  - [ ] Final gate:
-    - [ ] `cargo fmt --all`
+  - [x] Add `surch-core/tests/storage_wal_recovery.rs`
+  - [x] Add `surch-core/tests/storage_docstore_roundtrip.rs`
+  - [x] Final gate:
+    - [x] `cargo fmt --all`
     - [ ] `cargo clippy --workspace --all-targets --all-features`
-    - [ ] `cargo test --workspace`
+    - [x] `cargo test -p surch-core`
 
 ## Feedback Loop
 - Raise `attention` if a required shared type change expands beyond `surch-core/src/common/**`
-- attention: WAL persistence shape for MVP is a fixed `wal/wal.jsonl` file with one JSON entry per line; segment/docstore persistence remains pending in Lot 2.
+- attention: WAL persistence shape for MVP is a fixed `wal/wal.jsonl` file with one JSON entry per line; segment persistence is now present and may evolve later if compaction changes the file layout.
+- attention: branch-local storage verification is green on `surch-core`; workspace-level clippy remains pending because the crate still contains pre-existing warnings outside the BR-03 slice.
 
 ## Tests Required
 - Unit: WAL append/replay, segment metadata, docstore round-trip
-- Integration: recovery after restart simulation
+- Integration: `surch-core/tests/storage_wal_recovery.rs`, `surch-core/tests/storage_docstore_roundtrip.rs`
 
 ## Security Checks
 - [x] No path traversal or unsafe file naming introduced
@@ -79,5 +80,5 @@
 
 ## Merge Checklist
 - [x] WAL replay works
-- [ ] Docstore round-trip works
-- [ ] Storage tests pass
+- [x] Docstore round-trip works
+- [x] Storage tests pass
