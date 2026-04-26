@@ -29,8 +29,8 @@
 - `spec/**` only if implementation reveals a storage assumption that changes documented behavior
 
 ## Dependency Gates
-- [ ] BR-01 syntax constraints reviewed
-- [ ] storage file layout approach agreed
+- [x] BR-01 syntax constraints reviewed
+- [x] storage file layout approach agreed
 
 ## Environment Mapping
 - Worktree: `tmp/br-03-storage-wal`
@@ -39,16 +39,16 @@
 
 ## Plan / Lots / Todo
 
-- [ ] **Lot 0 - Read and confirm contract**
-  - [ ] Review current `wal.rs`, `segment.rs`, `reader.rs`, `writer.rs`, `index_store.rs`
-  - [ ] Confirm on-disk shape to keep MVP minimal
+- [x] **Lot 0 - Read and confirm contract**
+  - [x] Review current `wal.rs`, `segment.rs`, `reader.rs`, `writer.rs`, `index_store.rs`
+  - [x] Confirm on-disk shape to keep MVP minimal
 
-- [ ] **Lot 1 - WAL append and replay**
-  - [ ] Make WAL append explicit and deterministic
-  - [ ] Add replay path for restart/recovery
-  - [ ] Add unit tests for append, flush, replay, and empty log
-  - [ ] Lot gate:
-    - [ ] `cargo test -p surch-core storage::wal`
+- [x] **Lot 1 - WAL append and replay**
+  - [x] Make WAL append explicit and deterministic
+  - [x] Add replay path for restart/recovery
+  - [x] Add unit tests for append, flush, replay, and empty log
+  - [x] Lot gate:
+    - [x] `cargo test -p surch-core storage::wal`
 
 - [ ] **Lot 2 - Segment metadata and docstore**
   - [ ] Tighten segment metadata behavior
@@ -67,16 +67,17 @@
 
 ## Feedback Loop
 - Raise `attention` if a required shared type change expands beyond `surch-core/src/common/**`
+- attention: WAL persistence shape for MVP is a fixed `wal/wal.jsonl` file with one JSON entry per line; segment/docstore persistence remains pending in Lot 2.
 
 ## Tests Required
 - Unit: WAL append/replay, segment metadata, docstore round-trip
 - Integration: recovery after restart simulation
 
 ## Security Checks
-- [ ] No path traversal or unsafe file naming introduced
-- [ ] Corruption and empty-state handling reviewed
+- [x] No path traversal or unsafe file naming introduced
+- [x] Corruption and empty-state handling reviewed
 
 ## Merge Checklist
-- [ ] WAL replay works
+- [x] WAL replay works
 - [ ] Docstore round-trip works
 - [ ] Storage tests pass

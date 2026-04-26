@@ -26,7 +26,51 @@ impl FieldMapper {
         field_def: &FieldDefinition,
         value: &crate::common::FieldValue,
     ) -> Result<crate::common::FieldValue, Error> {
+        Self::validate_field_definition(field_def)?;
+
+        if !Self::value_matches_field_type(&field_def.field_type, value) {
+            return Err(Error::InvalidField(field_def.name.clone()));
+        }
+
         Ok(value.clone())
+    }
+
+    fn validate_field_definition(field_def: &FieldDefinition) -> Result<(), Error> {
+        if let Some(analyzer) = &field_def.analyzer {
+            if !matches!(
+                analyzer.as_str(),
+                "standard" | "simple" | "stop" | "keyword"
+            ) {
+                return Err(Error::Mapping(format!(
+                    "unsupported analyzer '{analyzer}' for field '{}'",
+                    field_def.name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn value_matches_field_type(field_type: &FieldType, value: &crate::common::FieldValue) -> bool {
+        use crate::common::FieldValue;
+
+        match value {
+            FieldValue::Array(values) => {
+                !values.is_empty()
+                    && values
+                        .iter()
+                        .all(|entry| Self::value_matches_field_type(field_type, entry))
+            }
+            FieldValue::Null => true,
+            FieldValue::Text(_) => matches!(field_type, FieldType::Text),
+            FieldValue::Keyword(_) => matches!(field_type, FieldType::Keyword),
+            FieldValue::Integer(_) => matches!(field_type, FieldType::Integer),
+            FieldValue::Long(_) => matches!(field_type, FieldType::Long),
+            FieldValue::Float(_) => matches!(field_type, FieldType::Float),
+            FieldValue::Double(_) => matches!(field_type, FieldType::Double),
+            FieldValue::Bool(_) => matches!(field_type, FieldType::Boolean),
+            FieldValue::Date(_) => matches!(field_type, FieldType::Date),
+        }
     }
 
     pub fn infer_mapping(
@@ -57,5 +101,54 @@ impl FieldMapper {
         }
 
         mapping
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FieldMapper;
+    use crate::common::{FieldDefinition, FieldType, FieldValue, Mapping};
+    use crate::indexer::Error;
+    use std::collections::HashMap;
+
+    #[test]
+    fn map_document_rejects_type_mismatch_for_integer_field() {
+        let mut mapping = Mapping::new();
+        mapping.add_field(FieldDefinition::new("count", FieldType::Integer));
+
+        let fields = HashMap::from([("count".to_string(), FieldValue::Text("twelve".to_string()))]);
+
+        let error = FieldMapper::map_document(&mapping, &fields).expect_err("mapping should fail");
+
+        assert!(matches!(error, Error::InvalidField(field) if field == "count"));
+    }
+
+    #[test]
+    fn map_document_rejects_unknown_analyzer_for_text_field() {
+        let mut mapping = Mapping::new();
+        mapping.add_field(
+            FieldDefinition::new("title", FieldType::Text).with_analyzer("does-not-exist"),
+        );
+
+        let fields = HashMap::from([("title".to_string(), FieldValue::Text("hello".to_string()))]);
+
+        let error = FieldMapper::map_document(&mapping, &fields).expect_err("mapping should fail");
+
+        assert!(matches!(error, Error::Mapping(message) if message.contains("does-not-exist")));
+    }
+
+    #[test]
+    fn map_document_accepts_supported_text_analyzer_and_matching_type() {
+        let mut mapping = Mapping::new();
+        mapping.add_field(FieldDefinition::new("title", FieldType::Text).with_analyzer("standard"));
+
+        let fields = HashMap::from([("title".to_string(), FieldValue::Text("hello".to_string()))]);
+
+        let mapped = FieldMapper::map_document(&mapping, &fields).expect("mapping should succeed");
+
+        assert_eq!(
+            mapped.get("title").and_then(FieldValue::as_text),
+            Some("hello")
+        );
     }
 }

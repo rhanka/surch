@@ -90,3 +90,58 @@ impl Default for AnalyzerRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AnalyzerRegistry;
+
+    fn token_texts(registry: &AnalyzerRegistry, analyzer: &str, text: &str) -> Vec<String> {
+        registry
+            .get(analyzer)
+            .expect("analyzer should exist")
+            .analyze(text)
+            .into_iter()
+            .map(|token| token.text)
+            .collect()
+    }
+
+    #[test]
+    fn standard_analyzer_keeps_stop_words_and_numbers() {
+        let registry = AnalyzerRegistry::new();
+
+        assert_eq!(
+            token_texts(&registry, "standard", "The 2 QUICK foxes"),
+            vec!["the", "2", "quick", "foxes"]
+        );
+    }
+
+    #[test]
+    fn simple_analyzer_splits_on_non_letters_and_discards_numbers() {
+        let registry = AnalyzerRegistry::new();
+
+        assert_eq!(
+            token_texts(&registry, "simple", "The 2 QUICK foxes"),
+            vec!["the", "quick", "foxes"]
+        );
+    }
+
+    #[test]
+    fn stop_analyzer_removes_stop_words_after_normalization() {
+        let registry = AnalyzerRegistry::new();
+
+        assert_eq!(
+            token_texts(&registry, "stop", "The 2 QUICK foxes"),
+            vec!["2", "quick", "foxes"]
+        );
+    }
+
+    #[test]
+    fn keyword_analyzer_preserves_full_input() {
+        let registry = AnalyzerRegistry::new();
+
+        assert_eq!(
+            token_texts(&registry, "keyword", "The 2 QUICK foxes"),
+            vec!["The 2 QUICK foxes"]
+        );
+    }
+}
