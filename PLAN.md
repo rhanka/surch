@@ -1,395 +1,227 @@
-# Surch - Rust OpenSearch/Lucene Clone
+# PLAN - Surch Orchestrated Roadmap
 
-## Vision
+Status: Updated 2026-04-25. Governance refit in progress. Branch-centered execution model adopted. Source branch files live in `plan/01_BRANCH_*.md` onward. Governing spec: `spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md`.
 
-**Surch** est un moteur de recherche 100% Rust reproduisant les fonctionnalités core d'indexation et de recherche d'OpenSearch/Elasticsearch, sans le module analytique (mais avec les fondations). L'objectif MVP est d'atteindre une compatibilité fonctionnelle avec l'API REST d'OpenSearch pour les opérations d'indexation et de search, avec l'algorithme Damerau-Levenshtein (distance ≤ 2) comme signature distinctive de Lucène.
+## 1) Current State
 
----
+**Completed governance milestones:**
+- `docs(plan): add governance documentation design spec` (`b4a2f7e`)
+- `docs(plan): align governance spec with entropic structure` (`eb19d91`)
 
-## 1. Features & Roadmap
+**Current engineering baseline:**
+- Rust workspace scaffold exists: `surch-core`, `surch-api`
+- Initial storage, indexer, search, and API skeletons exist
+- Governance and execution model were previously underspecified
 
-### Phase 1: Foundations (Jour 1)
+**Current conductor decision:**
+- adopt Entropic-like branch orchestration adapted for Rust
+- use `PLAN.md` as conductor index
+- use numbered branch files in `plan/` as execution source of truth per branch
+- cap parallel execution at 4 subagents
+- treat OpenSearch spec harvesting as a first-class prerequisite
 
-| Feature | Description | Priorité |
-|---------|-------------|----------|
-| **F1.1** | Architecture core - Storage layer (segment-based, Write-Ahead Log) | Critical |
-| **F1.2** | Inverted index implementation | Critical |
-| **F1.3** | Document DSL (JSON parsing, mapping) | Critical |
-| **F1.4** | HTTP server (REST API compatible OpenSearch) | Critical |
-| **F1.5** | Basic authentication & authorization | High |
+## 2) MVP Contract
 
-### Phase 2: Indexation (Jour 2)
+**In scope:**
+- index creation and deletion
+- document CRUD and bulk indexing
+- mappings and analyzers for MVP field types
+- Query DSL core: `match`, `match_phrase`, `multi_match`, `term`, `terms`, `range`, `exists`, `bool`, `prefix`, `wildcard`, `regexp`, `fuzzy`
+- search endpoint compatibility
+- fuzzy behavior up to edit distance 2
+- storage durability sufficient for single-node MVP
 
-| Feature | Description | Priorité |
-|---------|-------------|----------|
-| **F2.1** | Index creation/deletion API | Critical |
-| **F2.2** | Document indexing (single/bulk) | Critical |
-| **F2.3** | Field types: text, keyword, integer, long, float, double, boolean, date | Critical |
-| **F2.4** | Analyzer pipeline (standard, simple, whitespace, stop, keyword) | Critical |
-| **F2.5** | Segment merging (basic) | High |
-| **F2.6** | Refresh & Flush API | High |
+**Out of scope for MVP:**
+- full analytics and advanced aggregations
+- clustering and replication
+- snapshots and restore
+- plugin system
+- production-grade authn/authz beyond foundations
 
-### Phase 3: Recherche (Jour 3)
+## 3) Operating Model
 
-| Feature | Description | Priorité |
-|---------|-------------|----------|
-| **F3.1** | Query DSL (match, term, range, bool, exists, missing) | Critical |
-| **F3.2** | Full-text search (match, match_phrase, multi_match) | Critical |
-| **F3.3** | Sorting & Pagination | Critical |
-| **F3.4** | Aggregations foundation (terms, avg, sum, min, max) | Medium |
-| **F3.5** | Search templates | Medium |
-| **F3.6** | Highlighting | Medium |
+### Source Of Truth Order
+1. Direct user instructions
+2. `AGENTS.md`
+3. `rules/MASTER.md`
+4. `rules/workflow.md`
+5. `PLAN.md`
+6. `plan/NN_BRANCH_*.md`
+7. `spec/*.md`
+8. Helper rules such as `rules/testing.md`, `rules/security.md`, `rules/dev-env.md`, `rules/subagents.md`, `rules/superpowers.md`
 
-### Phase 4: Lucene Signature (Jour 4 - FINAL)
+### Drumbeat
+For Surch, drumbeat means continuous forward motion:
+- keep conductor continuity until the current governance or implementation slice is complete
+- move lot by lot
+- surface blockers immediately
+- do not stall in abstract analysis once the next concrete step is known
 
-| Feature | Description | Priorité |
-|---------|-------------|----------|
-| **F4.1** | Fuzzy search (Damerau-Levenshtein distance ≤ 2) | Critical |
-| **F4.2** | Prefix queries | Critical |
-| **F4.3** | Wildcard & Regexp queries | Critical |
-| **F4.4** | Suggesters (Term, Phrase, Completion) | High |
-| **F4.5** | Percolate (match reverse) | Medium |
+### Parallelism Cap
+- maximum 4 active subagents at once
+- one subagent owns one branch at a time
+- conductor remains sole integrator
 
-### Post-MVP (Future)
+## 4) Spec Harvesting Matrix
 
-- Index aliases
-- Index templates
-- Reindex API
-- Snapshot/Restore
-- Cross-cluster replication
-- Plugin system
+| Surface | Primary Spec File | Status | Notes |
+|---|---|---|---|
+| Index + Document APIs | `spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md` | drafted | Built from OpenSearch references, needs branch-level confirmation during BR-01 |
+| Search + Query DSL | `spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md` | drafted | Built from OpenSearch references, needs branch-level confirmation during BR-02 |
+| Security + Testing Baseline | `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md` | drafted | Used as governance input and release gate baseline |
+| Governance Orchestration | `spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md` | active | Governs this repo structure |
 
----
+Status vocabulary:
+- `unread`
+- `drafted`
+- `confirmed`
+- `implemented`
+- `verified`
 
-## 2. Stratégie Branches
+## 5) Branch Catalog
 
-### Branch Strategy: Gitflow Adapté
+| ID | Branch | Owner | Status | Depends On | File |
+|---|---|---|---|---|---|
+| BR-01 | `feature/BR-01-spec-harvest-index-doc-api` | #4 APIServer | plan | — | `plan/01_BRANCH_spec-harvest-index-and-document-apis.md` |
+| BR-02 | `feature/BR-02-spec-harvest-search-query-dsl` | #3 SearchEngine | plan | — | `plan/02_BRANCH_spec-harvest-search-and-query-dsl.md` |
+| BR-03 | `feature/BR-03-storage-wal-segments-docstore` | #1 StorageEngine | plan | BR-01 | `plan/03_BRANCH_storage-wal-segments-and-docstore.md` |
+| BR-04 | `feature/BR-04-indexer-mappings-analyzers-bulk` | #2 Indexer | plan | BR-01, BR-03 | `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md` |
+| BR-05 | `feature/BR-05-search-query-exec-fuzzy` | #3 SearchEngine | plan | BR-02, BR-03, BR-04 | `plan/05_BRANCH_search-query-execution-and-fuzzy.md` |
+| BR-06 | `feature/BR-06-api-index-document-compat` | #4 APIServer | plan | BR-01, BR-03, BR-04 | `plan/06_BRANCH_api-index-and-document-compat.md` |
+| BR-07 | `feature/BR-07-api-search-compat-integration` | #4 APIServer | plan | BR-02, BR-05, BR-06 | `plan/07_BRANCH_api-search-compat-and-integration.md` |
+| BR-08 | `release/v0.1.0-mvp` | Conductor | plan | BR-03, BR-04, BR-05, BR-06, BR-07 | `plan/08_BRANCH_release-hardening-and-security-gates.md` |
 
-```
-main (protected)
-    │
-    ├── develop (integration)
-    │   │
-    │   ├── feature/F1.1-storage-layer
-    │   ├── feature/F1.2-inverted-index
-    │   ├── feature/F2.x-indexation
-    │   ├── feature/F3.x-search
-    │   └── feature/F4.x-lucene-signature
-    │
-    ├── bugfix/*
-    ├── hotfix/*
-    └── release/v0.1.0-mvp
-```
+## 6) Dependency Graph
 
-### Règles
+```mermaid
+graph TD
+  BR01[BR-01 Index+Doc API Spec Harvest]
+  BR02[BR-02 Search+Query DSL Spec Harvest]
+  BR03[BR-03 Storage WAL Segments Docstore]
+  BR04[BR-04 Indexer Mappings Analyzers Bulk]
+  BR05[BR-05 Search Query Execution Fuzzy]
+  BR06[BR-06 API Index Document Compat]
+  BR07[BR-07 API Search Compat Integration]
+  BR08[BR-08 Release Hardening Security Gates]
 
-- **main**: production-ready, tagué sémantiquement
-- **develop**: integration continue,tests d'intégration
-- **feature/F#.#-description**: une feature par branche, PR vers develop
-- **bugfix/#-description**: fix vers develop
-- **hotfix/#-description**: fix urgent vers main + merge develop
-- **release/vX.Y.Z**: freeze API, release candidate
-
-### Convention Commits
-
-```
-<type>(<scope>): <description>
-
-Types: feat, fix, refactor, test, docs, chore, perf, security, api
-Scopes: storage, indexer, search, api, auth, analyzer, fuzzy, aggregation
-```
-
----
-
-## 3. Directives Développement Agentique
-
-### Rôle: Conductor (ce document)
-
-Le Conductor orchestre l'ensemble du projet et gère les interactions avec les subagents.
-
-**Responsabilités:**
-1. Maintenir la vision produit et la roadmap
-2. Allouer les tâches aux subagents
-3. Valider les livrables avant merge
-4. Gérer les feedback loops
-5. Assurer la cohérence architecturale
-6. Décider des compromis techniques
-
-### Sous-Agents
-
-| Agent | Rôle | Numéro |
-|-------|------|--------|
-| **StorageEngine** | Persistence, WAL, segments, index files | #1 |
-| **Indexer** | Analyse, tokenization, indexing pipeline | #2 |
-| **SearchEngine** | Query parsing, execution, scoring | #3 |
-| **APIServer** | HTTP REST, OpenSearch compatibility | #4 |
-
-### Directive pour Subagents
-
-```
-=== DEBUT DIRECTIVE ===
-Tu es [AGENT_NAME], un subagent de Surch.
-Tu as pour mission de développer [FEATURE_DESCRIPTION].
-
-## Contexte
-- Surch: Moteur de recherche 100% Rust (clone OpenSearch/Lucene)
-- MVP: Indexation + Search avec Damerau-Levenshtein (distance ≤ 2)
-- Compatibilité: API REST OpenSearch/Elasticsearch
-- Sécurité: Zero-trust, input validation stricte
-
-## Contraintes
-1.Tout code DOIT être en Rust (edition 2021+)
-2.Respecter les standards de code du projet (voir CODE_STYLE.md)
-3.Tests unitaires avec >80% coverage
-4.Tests d'intégration pour chaque feature
-5.Pas de dépendances unsafe sauf justification documentée
-6.Privilégier les crates maintenues et sécurisées
-
-## Livrables Attendus
-- Code source dans src/[domain]/
-- Tests unitaires dans tests/unit/
-- Tests d'intégration dans tests/integration/
-- Documentation API dans docs/
-- Mise à jour du CHANGELOG.md
-
-## Processus
-1.Lire la spec OpenSearch/Elasticsearch correspondante
-2.Implémenter la feature selon le plan
-3.Écrire les tests
-4.Run: cargo test + cargo clippy + cargo fmt
-5.Créer PR vers develop avec description détaillée
-
-=== FIN DIRECTIVE ===
+  BR01 --> BR03
+  BR01 --> BR04
+  BR02 --> BR05
+  BR03 --> BR04
+  BR03 --> BR05
+  BR04 --> BR05
+  BR01 --> BR06
+  BR03 --> BR06
+  BR04 --> BR06
+  BR02 --> BR07
+  BR05 --> BR07
+  BR06 --> BR07
+  BR03 --> BR08
+  BR04 --> BR08
+  BR05 --> BR08
+  BR06 --> BR08
+  BR07 --> BR08
 ```
 
-### Communication Flow
+## 7) Wave Sequencing
 
-```
-User → Conductor → SubAgent(s) → Review → Conductor → Merge
-                 ↑              ↓
-                 ←←←←←←← Feedback Loop ←←←←←←
-```
+### Wave 0 - Spec Confirmation
+- BR-01
+- BR-02
 
-### Feedback Loop Types
+Goal:
+- lock exact MVP syntax and response shape before implementation branches diverge
 
-1. **Code Review**: Le subagent soumet une PR, le Conductor review
-2. **Integration Test Fail**: Les tests d'intégration révèlent un problème inter-modules
-3. **Spec Change**: Une nouvelle version d'OpenSearch modifie le comportement attendu
-4. **Security Issue**: Une vulnérabilité est découverte
+### Wave 1 - Core Engine Foundations
+- BR-03
+- BR-04
 
----
+Goal:
+- durable write path
+- mapping and analyzer contract aligned with indexed representation
 
-## 4. Architecture Technique
+### Wave 2 - Search And API Vertical Slice
+- BR-05
+- BR-06
 
-### Stack Technique
+Goal:
+- executable search semantics
+- index/document API compatibility
 
-| Composant | Choice | Version |
-|-----------|--------|---------|
-| Language | Rust | 1.75+ |
-| Async Runtime | Tokio | 1.x |
-| HTTP Server | Axum | 0.7.x |
-| Serialization | Serde + serde_json | 1.x |
-| Logging | Tracing | 0.1.x |
-| Testing | Tokio + Assertions | - |
-| Fuzzy Logic | Custom (Damerau-Levenshtein) | - |
+### Wave 3 - Integration And Release
+- BR-07
+- BR-08
 
-### Module Structure
+Goal:
+- search API compatibility
+- integration tests
+- hardening and release gate
 
-```
-src/
-├── main.rs                 # Entry point
-├── lib.rs                  # Library root
-├── config.rs               # Configuration
-├── error.rs                # Error types
-│
-├── api/                    # REST API Layer
-│   ├── mod.rs
-│   ├── routes/
-│   │   ├── mod.rs
-│   │   ├── index.rs
-│   │   ├── document.rs
-│   │   └── search.rs
-│   └── middleware/
-│       ├── mod.rs
-│       ├── auth.rs
-│       └── tracing.rs
-│
-├── storage/               # Storage Engine
-│   ├── mod.rs
-│   ├── wal.rs            # Write-Ahead Log
-│   ├── segment.rs        # Segment management
-│   ├── index_reader.rs   # Index reader
-│   └── index_writer.rs   # Index writer
-│
-├── indexer/               # Indexation Pipeline
-│   ├── mod.rs
-│   ├── document.rs       # Document handling
-│   ├── mapping.rs        # Index mapping
-│   ├── analyzer/
-│   │   ├── mod.rs
-│   │   ├── standard.rs
-│   │   ├── simple.rs
-│   │   └── stop.rs
-│   └── pipeline.rs       # Indexing pipeline
-│
-├── search/                # Search Engine
-│   ├── mod.rs
-│   ├── query/
-│   │   ├── mod.rs
-│   │   ├── match.rs
-│   │   ├── term.rs
-│   │   ├── range.rs
-│   │   ├── bool.rs
-│   │   └── fuzzy.rs      # Damerau-Levenshtein
-│   ├── scorer.rs          # TF-IDF, BM25
-│   ├── collector.rs       # Result collection
-│   └── aggregator.rs      # Aggregations foundation
-│
-└── common/                # Shared utilities
-    ├── mod.rs
-    ├── document.rs
-    ├── field.rs
-    └── types.rs
-```
+## 8) Branch Execution Rules
 
-### API Compatibility Layer
+- every real implementation branch must have a corresponding `plan/NN_BRANCH_*.md`
+- every branch file must define allowed and forbidden paths
+- branch files own the detailed lots and validation checklists
+- `PLAN.md` tracks dependencies, status, and wave sequencing only
+- no branch may silently expand scope beyond its file contract
 
-OpenSearch/Elasticsearch compatibility endpoint structure:
+## 9) Feedback Loop Types
 
-```
-# Index Management
-PUT /{index}
-DELETE /{index}
-GET /{index}/_mapping
+- `blocked`: missing prerequisite or unresolved dependency
+- `attention`: risk, ambiguity, or expected drift
+- `spec-mismatch`: behavior or syntax differs from harvested spec
+- `security-alert`: abuse path, validation gap, or risky dependency
+- `clarification`: conductor or user decision required
 
-# Document Operations
-POST /{index}/_doc/{id}
-PUT /{index}/_doc/{id}
-GET /{index}/_doc/{id}
-DELETE /{index}/_doc/{id}
-POST /{index}/_bulk
+All active feedback items must be recorded in the branch file before merge.
 
-# Search
-POST /{index}/_search
-GET /{index}/_search
+## 10) Verification Gates
 
-# Refresh/Flush
-POST /{index}/_refresh
-POST /{index}/_flush
-```
+### Required Before Merge
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features`
+- relevant unit tests
+- relevant integration tests
+- branch checklist complete
+- no unresolved blocker in branch file
 
----
+### Required Before Release
+- full workspace tests
+- compatibility smoke on documented endpoints
+- fuzzy behavior checks
+- documented security review against `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md`
+- release branch checklist complete
 
-## 5. Tests Strategy
+## 11) Security Gate Summary
 
-### Unit Tests
+The MVP release must reject known avoidable gaps in these areas:
+- unbounded request body size
+- unbounded wildcard or regex execution
+- missing validation for core API payloads
+- dependency vulnerabilities with no documented mitigation path
 
-- **Coverage Target**: 80% minimum
-- **Naming**: `#[cfg(test)] mod tests { ... }` dans chaque crate
-- **Tools**: `cargo test`, `cargo tarpaulin` pour coverage
+Detailed baseline: `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md` and `rules/security.md`.
 
-### Integration Tests
+## 12) Superpowers Framing
 
-- **Location**: `tests/integration/`
-- **Framework**: Rust built-in + custom test harness
-- **API Tests**: Exhaustive sur les endpoints REST
+Superpowers skills are allowed only as helpers.
 
-### Test Categories
+They must not:
+- override Surch branch structure
+- relocate specs away from `spec/`
+- replace branch execution files with their own format
+- bypass branch scope boundaries or verification gates
 
-| Category | Location | Run |
-|----------|----------|-----|
-| Unit | src/**/tests | On PR |
-| Integration | tests/integration/ | On PR + nightly |
-| Benchmark | benches/ | Manual |
-| Fuzz | fuzz/ | CI weekly |
+Project-specific framing is defined in `rules/superpowers.md`.
 
----
+## 13) Next Working Set
 
-## 6. Sécurité
+Immediate repo goals:
+- finalize governance docs
+- finalize branch template and subagent prompt
+- finalize ruleset
+- lock branch files BR-01 through BR-08
 
-### Principes
-
-1. **Zero Trust**: Toute entrée est non-fiable
-2. **Input Validation**: Validate all inputs at API boundary
-3. **Sandboxing**: Limiter les privilèges du processus
-4. **Audit**: Logging de toutes les opérations sensibles
-
-### Points de Contrôle
-
-- [ ] Authentication JWT
-- [ ] Authorization (RBAC basique)
-- [ ] Input sanitization (injection attacks)
-- [ ] Rate limiting
-- [ ] TLS support
-- [ ] Secrets management
-
----
-
-## 7. OpenSearch Spec References
-
-### Prioritaire (pour MVP)
-
-1. [Search API](https://opensearch.org/docs/latest/api-reference/search/)
-2. [Document API](https://opensearch.org/docs/latest/api-reference/document-api/)
-3. [Index API](https://opensearch.org/docs/latest/api-reference/index-api/)
-4. [Query DSL](https://opensearch.org/docs/latest/query-dsl/)
-5. [Aggregations](https://opensearch.org/docs/latest/aggregations/)
-6. [Fuzzy Query](https://opensearch.org/docs/latest/query-dsl/term/fuzzy/)
-
-### Specification OpenSearch Sources
-
-- Repo: https://github.com/opensearch-project/OpenSearch
-- Specs: https://opensearch.org/docs/latest/
-
----
-
-## 8. Définitions Done/MVP
-
-### Done Criteria
-
-- [ ] Code compile sans warning (`cargo clippy`)
-- [ ] Code formaté (`cargo fmt`)
-- [ ] Tests unitaires passent (>80% coverage)
-- [ ] Tests d'intégration passent
-- [ ] Documentation API complète
-- [ ] CHANGELOG mis à jour
-
-### MVP Success Metrics
-
-1. **Indexation**: Peut indexer 10k documents/sec sur laptop standard
-2. **Search**: Latence <50ms pour queries simples
-3. **Fuzzy**: Damerau-Levenshtein distance ≤ 2 fonctionnel
-4. **API Compatible**: Requêtes OpenSearch retournent les mêmes résultats
-
----
-
-## 9. Timeline Jour par Jour
-
-### Jour 1: Foundations
-- [x] Repo setup, Cargo.toml, workspace
-- [ ] Storage layer (WAL + segments)
-- [ ] HTTP server basic
-- [ ] Document DSL
-
-### Jour 2: Indexation
-- [ ] Index CRUD API
-- [ ] Bulk indexing
-- [ ] Analyzers
-- [ ] Field types
-
-### Jour 3: Recherche
-- [ ] Query DSL
-- [ ] Full-text search
-- [ ] Sorting/Pagination
-- [ ] Aggregations foundation
-
-### Jour 4: Lucene Signature
-- [ ] Fuzzy search (Damerau-Levenshtein)
-- [ ] Wildcard/Regex
-- [ ] Suggesters
-- [ ] Final integration tests
-- [ ] MVP release
-
----
-
-*Document généré par Conductor - Version 0.1.0*
+After that:
+- launch BR-01 and BR-02 first
+- then proceed wave by wave

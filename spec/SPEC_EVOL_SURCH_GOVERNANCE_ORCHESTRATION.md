@@ -119,11 +119,11 @@ Each concrete branch must have its own file in `plan/`.
 
 Naming convention:
 
-- `plan/01_BRANCH_spec-harvest-index-and-doc-api.md`
-- `plan/02_BRANCH_storage-wal-and-segments.md`
-- `plan/03_BRANCH_indexer-pipeline-and-mappings.md`
-- `plan/04_BRANCH_search-query-dsl-core.md`
-- `plan/05_BRANCH_api-opensearch-compat-slice.md`
+- `plan/01_BRANCH_spec-harvest-index-and-document-apis.md`
+- `plan/02_BRANCH_spec-harvest-search-and-query-dsl.md`
+- `plan/03_BRANCH_storage-wal-segments-and-docstore.md`
+- `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md`
+- `plan/05_BRANCH_search-query-execution-and-fuzzy.md`
 
 Rules:
 
