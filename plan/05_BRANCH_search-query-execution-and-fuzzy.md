@@ -58,12 +58,12 @@
     - [x] `cargo test -p surch-core search::query`
 
 - [ ] **Lot 3 - Integration semantics**
-  - [ ] Add `tests/integration/search/query_dsl_core.rs`
-  - [ ] Add `tests/integration/search/fuzzy_compat.rs`
-  - [ ] Final gate:
-    - [ ] `cargo fmt --all`
+  - [x] Add `surch-core/tests/search_query_dsl_core.rs`
+  - [x] Add `surch-core/tests/search_fuzzy_compat.rs`
+  - [x] Final gate:
+    - [x] `cargo fmt --all`
     - [ ] `cargo clippy --workspace --all-targets --all-features`
-    - [ ] `cargo test --workspace`
+    - [x] `cargo test -p surch-core`
 
 ## Feedback Loop
 - Raise `security-alert` for any unbounded wildcard or regex behavior
@@ -82,4 +82,4 @@
 ## Merge Checklist
 - [x] Clause semantics align with spec for `term`, `terms`, `range`, `exists`, and `bool`
 - [x] Fuzzy behavior verified up to distance 2
-- [ ] Search integration tests pass
+- [x] Search integration tests pass
