@@ -28,8 +28,8 @@
 - `surch-core/src/indexer/**` only if payload-to-document conversion requires a shared fix and it is recorded
 
 ## Dependency Gates
-- [ ] BR-01 reviewed
-- [ ] BR-03 and BR-04 contracts reviewed
+- [x] BR-01 reviewed
+- [x] BR-03 and BR-04 contracts reviewed
 
 ## Environment Mapping
 - Worktree: `tmp/br-06-api-index-doc`
@@ -40,8 +40,8 @@
 ## Plan / Lots / Todo
 
 - [ ] **Lot 0 - Handler contract read**
-  - [ ] Review current `surch-api/src/main.rs`
-  - [ ] Confirm in-scope endpoints and response fields
+  - [x] Review current `surch-api/src/main.rs`
+  - [x] Confirm in-scope endpoints and response fields
 
 - [ ] **Lot 1 - Index management endpoints**
   - [ ] Normalize create index, delete index, get index, get mapping
@@ -65,6 +65,7 @@
 
 ## Feedback Loop
 - Raise `spec-mismatch` for any response-shape discrepancy
+- attention: baseline `cargo test -p surch-api` is now green after switching `reqwest` dev-dependency to `rustls`; OpenSSL system dependency is no longer the blocker for BR-06.
 
 ## Tests Required
 - Integration: create/delete/get index, mapping, document CRUD, bulk shape, refresh, flush
