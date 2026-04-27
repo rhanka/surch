@@ -16,7 +16,52 @@ pub struct FuzzyAlgorithm;
 
 impl FuzzyAlgorithm {
     pub fn damerau_levenshtein(s1: &str, s2: &str, max_distance: usize) -> usize {
-        Self::levenshtein(s1, s2).min(max_distance + 1)
+        let s1_chars: Vec<char> = s1.chars().collect();
+        let s2_chars: Vec<char> = s2.chars().collect();
+        let len1 = s1_chars.len();
+        let len2 = s2_chars.len();
+
+        if len1 == 0 {
+            return len2.min(max_distance + 1);
+        }
+        if len2 == 0 {
+            return len1.min(max_distance + 1);
+        }
+
+        let mut matrix = vec![vec![0usize; len2 + 1]; len1 + 1];
+
+        for i in 0..=len1 {
+            matrix[i][0] = i;
+        }
+        for j in 0..=len2 {
+            matrix[0][j] = j;
+        }
+
+        for i in 1..=len1 {
+            for j in 1..=len2 {
+                let cost = if s1_chars[i - 1] == s2_chars[j - 1] {
+                    0
+                } else {
+                    1
+                };
+                let mut value = std::cmp::min(
+                    std::cmp::min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1),
+                    matrix[i - 1][j - 1] + cost,
+                );
+
+                if i > 1
+                    && j > 1
+                    && s1_chars[i - 1] == s2_chars[j - 2]
+                    && s1_chars[i - 2] == s2_chars[j - 1]
+                {
+                    value = value.min(matrix[i - 2][j - 2] + 1);
+                }
+
+                matrix[i][j] = value;
+            }
+        }
+
+        matrix[len1][len2].min(max_distance + 1)
     }
 
     pub fn levenshtein(s1: &str, s2: &str) -> usize {
@@ -94,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_damerau_levenshtein() {
-        assert_eq!(FuzzyAlgorithm::damerau_levenshtein("ab", "ba", 3), 2);
+        assert_eq!(FuzzyAlgorithm::damerau_levenshtein("ab", "ba", 3), 1);
         assert_eq!(FuzzyAlgorithm::damerau_levenshtein("ab", "abc", 2), 1);
         assert_eq!(FuzzyAlgorithm::damerau_levenshtein("ca", "abc", 3), 3);
     }

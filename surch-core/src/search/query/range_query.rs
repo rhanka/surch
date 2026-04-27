@@ -107,15 +107,15 @@ impl Query for RangeQuery {
                         matches = matches && compare_lower_bound(gte, field_value).unwrap_or(false);
                     }
                     if let Some(gt) = &self.gt {
-                        matches = matches
-                            && compare_lower_bound_strict(gt, field_value).unwrap_or(false);
+                        matches =
+                            matches && compare_lower_bound_strict(gt, field_value).unwrap_or(false);
                     }
                     if let Some(lte) = &self.lte {
                         matches = matches && compare_upper_bound(lte, field_value).unwrap_or(false);
                     }
                     if let Some(lt) = &self.lt {
-                        matches = matches
-                            && compare_upper_bound_strict(lt, field_value).unwrap_or(false);
+                        matches =
+                            matches && compare_upper_bound_strict(lt, field_value).unwrap_or(false);
                     }
 
                     matches

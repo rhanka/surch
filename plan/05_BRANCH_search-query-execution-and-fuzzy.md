@@ -48,12 +48,14 @@
   - [x] Lot gate:
     - [x] `cargo test -p surch-core search::query`
 
-- [ ] **Lot 2 - Full-text and fuzzy**
-  - [ ] Normalize `match`, `match_phrase`, `multi_match`, `prefix`, `wildcard`, `regexp`, `fuzzy`
-  - [ ] Tighten fuzzy behavior up to distance 2
-  - [ ] Add unit tests for fuzzy and invalid expensive-query cases
-  - [ ] Lot gate:
-    - [ ] `cargo test -p surch-core search::fuzzy`
+- [x] **Lot 2 - Full-text and fuzzy**
+  - [x] Normalize `match`, `match_phrase`, `multi_match`, `prefix`, `wildcard`, and `fuzzy`
+  - [x] Keep `regexp` explicitly unsupported for MVP
+  - [x] Tighten fuzzy behavior up to distance 2
+  - [x] Add unit tests for phrase semantics, prefix, wildcard, multi-match, and fuzzy edge cases
+  - [x] Lot gate:
+    - [x] `cargo test -p surch-core search::fuzzy`
+    - [x] `cargo test -p surch-core search::query`
 
 - [ ] **Lot 3 - Integration semantics**
   - [ ] Add `tests/integration/search/query_dsl_core.rs`
@@ -66,7 +68,8 @@
 ## Feedback Loop
 - Raise `security-alert` for any unbounded wildcard or regex behavior
 - attention: branch-local verification is green on `surch-core`; workspace-level clippy remains pending because the crate still contains pre-existing warnings outside the BR-05 slice.
-- decision: `regexp` remains unsupported in MVP and is not part of Lot 1 delivery.
+- decision: `regexp` remains unsupported in MVP and is not part of BR-05 executable scope.
+- attention: cost ceilings for wildcard depth, nesting, and maximum query size remain governance-level follow-ups and are not yet enforced in execution code.
 
 ## Tests Required
 - Unit: each clause family and fuzzy behavior
@@ -74,9 +77,9 @@
 
 ## Security Checks
 - [x] Expensive query bounds reviewed
-- [x] Deep nesting and invalid payload behavior considered at contract level for Lot 1 clauses
+- [x] Deep nesting and invalid payload behavior considered at contract level for Lots 1 and 2 clauses
 
 ## Merge Checklist
 - [x] Clause semantics align with spec for `term`, `terms`, `range`, `exists`, and `bool`
-- [ ] Fuzzy behavior verified up to distance 2
+- [x] Fuzzy behavior verified up to distance 2
 - [ ] Search integration tests pass

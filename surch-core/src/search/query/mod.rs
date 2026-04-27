@@ -80,6 +80,8 @@ pub struct FuzzyQuery {
     pub fuzziness: usize,
     #[serde(default = "default_prefix_length")]
     pub prefix_length: usize,
+    #[serde(default = "default_transpositions")]
+    pub transpositions: bool,
 }
 
 fn default_fuzziness() -> usize {
@@ -87,6 +89,9 @@ fn default_fuzziness() -> usize {
 }
 fn default_prefix_length() -> usize {
     0
+}
+fn default_transpositions() -> bool {
+    true
 }
 
 impl FuzzyQuery {
@@ -96,6 +101,7 @@ impl FuzzyQuery {
             value: value.into(),
             fuzziness: 2,
             prefix_length: 0,
+            transpositions: true,
         }
     }
 
@@ -113,19 +119,14 @@ impl FuzzyQuery {
 impl Query for FuzzyQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let mut results = Vec::new();
+        let query_value = self.value.to_lowercase();
 
         for doc in docs {
             if let Some(field_value) = doc.get_field(&self.field) {
-                let field_text = field_value.as_text().unwrap_or("");
+                let field_text = field_value.as_text().unwrap_or("").to_lowercase();
 
-                if FuzzyAlgorithm::is_fuzzy_match(&self.value, field_text, self.fuzziness) {
-                    let score = 1.0
-                        / (FuzzyAlgorithm::damerau_levenshtein(
-                            &self.value,
-                            field_text,
-                            self.fuzziness,
-                        ) as f64
-                            + 1.0);
+                if let Some(distance) = self.match_distance(&query_value, &field_text) {
+                    let score = 1.0 / (distance as f64 + 1.0);
                     results.push(ScoredDocument {
                         doc: doc.clone(),
                         score,
@@ -140,6 +141,25 @@ impl Query for FuzzyQuery {
 
     fn estimate_cost(&self) -> usize {
         100
+    }
+}
+
+impl FuzzyQuery {
+    fn match_distance(&self, query: &str, candidate: &str) -> Option<usize> {
+        let prefix_len = self.prefix_length.min(query.len()).min(candidate.len());
+        if query[..prefix_len] != candidate[..prefix_len] {
+            return None;
+        }
+
+        let query_suffix = &query[prefix_len..];
+        let candidate_suffix = &candidate[prefix_len..];
+        let distance = if self.transpositions {
+            FuzzyAlgorithm::damerau_levenshtein(query_suffix, candidate_suffix, self.fuzziness)
+        } else {
+            FuzzyAlgorithm::levenshtein(query_suffix, candidate_suffix)
+        };
+
+        (distance <= self.fuzziness).then_some(distance)
     }
 }
 
@@ -312,5 +332,70 @@ impl Query for MultiMatchQuery {
 
     fn estimate_cost(&self) -> usize {
         self.fields.len() * 50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FuzzyQuery, MultiMatchQuery, PrefixQuery, WildcardQuery};
+    use crate::common::{Document, FieldValue};
+    use crate::search::Query;
+
+    #[test]
+    fn prefix_query_matches_case_insensitive_prefix() {
+        let docs =
+            vec![Document::new("1")
+                .with_field("title", FieldValue::Text("Surch Engine".to_string()))];
+
+        let results = PrefixQuery::new("title", "sur").execute(&docs);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn wildcard_query_matches_star_pattern() {
+        let docs =
+            vec![Document::new("1")
+                .with_field("title", FieldValue::Text("search-engine".to_string()))];
+
+        let results = WildcardQuery::new("title", "search*").execute(&docs);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn multi_match_query_matches_any_listed_field() {
+        let docs = vec![
+            Document::new("1").with_field("body", FieldValue::Text("hello rust world".to_string())),
+            Document::new("2").with_field("title", FieldValue::Text("plain text".to_string())),
+        ];
+
+        let results = MultiMatchQuery::new("rust", vec!["title".to_string(), "body".to_string()])
+            .execute(&docs);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc.id, "1");
+    }
+
+    #[test]
+    fn fuzzy_query_honors_prefix_length() {
+        let docs =
+            vec![Document::new("1").with_field("title", FieldValue::Text("jello".to_string()))];
+
+        let results = FuzzyQuery::new("title", "hello")
+            .with_fuzziness(1)
+            .with_prefix_length(1)
+            .execute(&docs);
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_query_matches_transposition_with_distance_one() {
+        let docs = vec![Document::new("1").with_field("title", FieldValue::Text("ba".to_string()))];
+
+        let results = FuzzyQuery::new("title", "ab")
+            .with_fuzziness(1)
+            .execute(&docs);
+
+        assert_eq!(results.len(), 1);
     }
 }

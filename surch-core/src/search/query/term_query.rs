@@ -140,9 +140,16 @@ impl Query for TermsQuery {
                 let field_value = doc.get_field(&self.field)?;
 
                 let matches = self.values.iter().any(|value| match (value, field_value) {
-                    (TermValue::Text(t), _) => field_value.as_text().map(|v| v == t).unwrap_or(false),
-                    (TermValue::Integer(i), _) => field_value.as_i64().map(|v| v == *i as i64).unwrap_or(false),
-                    (TermValue::Long(l), _) => field_value.as_i64().map(|v| v == *l).unwrap_or(false),
+                    (TermValue::Text(t), _) => {
+                        field_value.as_text().map(|v| v == t).unwrap_or(false)
+                    }
+                    (TermValue::Integer(i), _) => field_value
+                        .as_i64()
+                        .map(|v| v == *i as i64)
+                        .unwrap_or(false),
+                    (TermValue::Long(l), _) => {
+                        field_value.as_i64().map(|v| v == *l).unwrap_or(false)
+                    }
                     (TermValue::Float(f), _) => field_value
                         .as_f64()
                         .map(|v| (v - *f as f64).abs() < 0.0001)
@@ -151,7 +158,9 @@ impl Query for TermsQuery {
                         .as_f64()
                         .map(|v| (v - d).abs() < 0.0001)
                         .unwrap_or(false),
-                    (TermValue::Bool(b), _) => field_value.as_bool().map(|v| v == *b).unwrap_or(false),
+                    (TermValue::Bool(b), _) => {
+                        field_value.as_bool().map(|v| v == *b).unwrap_or(false)
+                    }
                 });
 
                 if matches {

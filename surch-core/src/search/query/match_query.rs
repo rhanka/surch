@@ -155,33 +155,90 @@ impl MatchPhraseQuery {
             return true;
         }
 
-        let mut qi = 0;
-        for dt in doc_terms {
-            if qi < query_terms.len() && *dt == query_terms[qi] {
-                qi += 1;
+        if query_terms.len() > doc_terms.len() {
+            return false;
+        }
+
+        for start in 0..doc_terms.len() {
+            if doc_terms[start] != query_terms[0] {
+                continue;
             }
-        }
 
-        if qi == query_terms.len() {
-            return true;
-        }
+            let mut qi = 1;
+            let mut last_match = start;
+            let mut used_slop = 0;
 
-        if slop > 0 {
-            qi = 0;
-            let mut distance = 0;
-            for dt in doc_terms {
-                if qi < query_terms.len() && *dt == query_terms[qi] {
+            for (index, term) in doc_terms.iter().enumerate().skip(start + 1) {
+                if qi == query_terms.len() {
+                    break;
+                }
+
+                if *term == query_terms[qi] {
+                    used_slop += index.saturating_sub(last_match + 1);
+                    if used_slop > slop {
+                        break;
+                    }
+                    last_match = index;
                     qi += 1;
-                } else if qi < query_terms.len() {
-                    distance += 1;
-                }
-                if distance > slop {
-                    return false;
                 }
             }
-            qi == query_terms.len()
-        } else {
-            false
+
+            if qi == query_terms.len() {
+                return true;
+            }
         }
+
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MatchOperator, MatchPhraseQuery, MatchQuery};
+    use crate::common::{Document, FieldValue};
+    use crate::search::Query;
+
+    #[test]
+    fn match_query_with_and_requires_all_terms() {
+        let docs = vec![
+            Document::new("1").with_field("title", FieldValue::Text("rust search".to_string())),
+            Document::new("2").with_field("title", FieldValue::Text("rust only".to_string())),
+        ];
+
+        let results = MatchQuery::new("title", "rust search")
+            .with_operator(MatchOperator::And)
+            .execute(&docs);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc.id, "1");
+    }
+
+    #[test]
+    fn match_phrase_query_requires_adjacency_when_slop_is_zero() {
+        let docs = vec![
+            Document::new("1")
+                .with_field("title", FieldValue::Text("search fast engine".to_string())),
+            Document::new("2").with_field("title", FieldValue::Text("search engine".to_string())),
+        ];
+
+        let results = MatchPhraseQuery::new("title", "search engine").execute(&docs);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc.id, "2");
+    }
+
+    #[test]
+    fn match_phrase_query_uses_slop_for_single_gap() {
+        let docs = vec![Document::new("1")
+            .with_field("title", FieldValue::Text("search fast engine".to_string()))];
+
+        let results = MatchPhraseQuery {
+            field: "title".to_string(),
+            query: "search engine".to_string(),
+            slop: 1,
+        }
+        .execute(&docs);
+
+        assert_eq!(results.len(), 1);
     }
 }
