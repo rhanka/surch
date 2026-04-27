@@ -49,6 +49,13 @@ impl BoolQuery {
 impl Query for BoolQuery {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         let mut results = Vec::new();
+        let minimum_should_match = if self.minimum_should_match == default_minimum_should_match()
+            && (!self.must.is_empty() || !self.filter.is_empty())
+        {
+            0
+        } else {
+            self.minimum_should_match
+        };
 
         for doc in docs {
             let mut must_score = 0.0;
@@ -94,7 +101,7 @@ impl Query for BoolQuery {
 
             if must_match && filter_pass && must_not_match {
                 let total_score = must_score + should_score;
-                if self.should.is_empty() || should_match_count >= self.minimum_should_match {
+                if self.should.is_empty() || should_match_count >= minimum_should_match {
                     results.push(ScoredDocument {
                         doc: doc.clone(),
                         score: total_score,
@@ -112,5 +119,29 @@ impl Query for BoolQuery {
             + self.filter.len() * 50
             + self.should.len() * 50
             + self.must_not.len() * 50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BoolQuery;
+    use crate::common::{Document, FieldValue};
+    use crate::search::{MatchQuery, Query, QueryType, TermQuery};
+
+    #[test]
+    fn bool_query_with_must_does_not_require_should_by_default() {
+        let docs = vec![
+            Document::new("1")
+                .with_field("status", FieldValue::Keyword("published".to_string()))
+                .with_field("title", FieldValue::Text("rust search".to_string())),
+            Document::new("2").with_field("status", FieldValue::Keyword("published".to_string())),
+        ];
+
+        let query = BoolQuery::new()
+            .must(QueryType::Term(TermQuery::new("status", "published")))
+            .should(QueryType::Match(MatchQuery::new("title", "rust")));
+
+        let results = query.execute(&docs);
+        assert_eq!(results.len(), 2);
     }
 }

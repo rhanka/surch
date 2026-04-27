@@ -56,25 +56,43 @@ impl RangeQuery {
     }
 }
 
-fn compare_bound(bound: &Bound, value: &crate::common::FieldValue) -> Option<bool> {
+fn compare_lower_bound(bound: &Bound, value: &crate::common::FieldValue) -> Option<bool> {
     match (bound, value) {
         (Bound::Integer(i), _) => value.as_i64().map(|v| v >= *i as i64),
         (Bound::Long(l), _) => value.as_i64().map(|v| v >= *l),
         (Bound::Float(f), _) => value.as_f64().map(|v| v >= *f as f64),
         (Bound::Double(d), _) => value.as_f64().map(|v| v >= *d),
         (Bound::String(s), _) => value.as_text().map(|v| v >= s.as_str()),
-        _ => None,
     }
 }
 
-fn compare_bound_strict(bound: &Bound, value: &crate::common::FieldValue) -> Option<bool> {
+fn compare_lower_bound_strict(bound: &Bound, value: &crate::common::FieldValue) -> Option<bool> {
     match (bound, value) {
         (Bound::Integer(i), _) => value.as_i64().map(|v| v > *i as i64),
         (Bound::Long(l), _) => value.as_i64().map(|v| v > *l),
         (Bound::Float(f), _) => value.as_f64().map(|v| v > *f as f64),
         (Bound::Double(d), _) => value.as_f64().map(|v| v > *d),
         (Bound::String(s), _) => value.as_text().map(|v| v > s.as_str()),
-        _ => None,
+    }
+}
+
+fn compare_upper_bound(bound: &Bound, value: &crate::common::FieldValue) -> Option<bool> {
+    match (bound, value) {
+        (Bound::Integer(i), _) => value.as_i64().map(|v| v <= *i as i64),
+        (Bound::Long(l), _) => value.as_i64().map(|v| v <= *l),
+        (Bound::Float(f), _) => value.as_f64().map(|v| v <= *f as f64),
+        (Bound::Double(d), _) => value.as_f64().map(|v| v <= *d),
+        (Bound::String(s), _) => value.as_text().map(|v| v <= s.as_str()),
+    }
+}
+
+fn compare_upper_bound_strict(bound: &Bound, value: &crate::common::FieldValue) -> Option<bool> {
+    match (bound, value) {
+        (Bound::Integer(i), _) => value.as_i64().map(|v| v < *i as i64),
+        (Bound::Long(l), _) => value.as_i64().map(|v| v < *l),
+        (Bound::Float(f), _) => value.as_f64().map(|v| v < *f as f64),
+        (Bound::Double(d), _) => value.as_f64().map(|v| v < *d),
+        (Bound::String(s), _) => value.as_text().map(|v| v < s.as_str()),
     }
 }
 
@@ -86,16 +104,18 @@ impl Query for RangeQuery {
                     let mut matches = true;
 
                     if let Some(gte) = &self.gte {
-                        matches = matches && compare_bound(gte, field_value).unwrap_or(false);
+                        matches = matches && compare_lower_bound(gte, field_value).unwrap_or(false);
                     }
                     if let Some(gt) = &self.gt {
-                        matches = matches && compare_bound_strict(gt, field_value).unwrap_or(false);
+                        matches = matches
+                            && compare_lower_bound_strict(gt, field_value).unwrap_or(false);
                     }
                     if let Some(lte) = &self.lte {
-                        matches = matches && compare_bound(lte, field_value).unwrap_or(false);
+                        matches = matches && compare_upper_bound(lte, field_value).unwrap_or(false);
                     }
                     if let Some(lt) = &self.lt {
-                        matches = matches && compare_bound_strict(lt, field_value).unwrap_or(false);
+                        matches = matches
+                            && compare_upper_bound_strict(lt, field_value).unwrap_or(false);
                     }
 
                     matches
@@ -112,5 +132,30 @@ impl Query for RangeQuery {
 
     fn estimate_cost(&self) -> usize {
         50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bound, RangeQuery};
+    use crate::common::{Document, FieldValue};
+    use crate::search::Query;
+
+    #[test]
+    fn range_query_honors_upper_bounds() {
+        let docs = vec![
+            Document::new("1").with_field("year", FieldValue::Integer(2023)),
+            Document::new("2").with_field("year", FieldValue::Integer(2024)),
+            Document::new("3").with_field("year", FieldValue::Integer(2025)),
+        ];
+
+        let results = RangeQuery::new("year")
+            .gte(Bound::Integer(2023))
+            .lte(Bound::Integer(2024))
+            .execute(&docs);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc.id, "1");
+        assert_eq!(results[1].doc.id, "2");
     }
 }

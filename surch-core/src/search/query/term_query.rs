@@ -21,6 +21,14 @@ pub enum TermValue {
     Bool(bool),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TermsQuery {
+    pub field: String,
+    pub values: Vec<TermValue>,
+    #[serde(default)]
+    pub boost: f64,
+}
+
 impl TermQuery {
     pub fn new(field: impl Into<String>, value: impl Into<TermValue>) -> Self {
         Self {
@@ -112,5 +120,91 @@ impl Query for TermQuery {
 
     fn estimate_cost(&self) -> usize {
         10
+    }
+}
+
+impl TermsQuery {
+    pub fn new(field: impl Into<String>, values: Vec<String>) -> Self {
+        Self {
+            field: field.into(),
+            values: values.into_iter().map(TermValue::from).collect(),
+            boost: 1.0,
+        }
+    }
+}
+
+impl Query for TermsQuery {
+    fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
+        docs.iter()
+            .filter_map(|doc| {
+                let field_value = doc.get_field(&self.field)?;
+
+                let matches = self.values.iter().any(|value| match (value, field_value) {
+                    (TermValue::Text(t), _) => field_value.as_text().map(|v| v == t).unwrap_or(false),
+                    (TermValue::Integer(i), _) => field_value.as_i64().map(|v| v == *i as i64).unwrap_or(false),
+                    (TermValue::Long(l), _) => field_value.as_i64().map(|v| v == *l).unwrap_or(false),
+                    (TermValue::Float(f), _) => field_value
+                        .as_f64()
+                        .map(|v| (v - *f as f64).abs() < 0.0001)
+                        .unwrap_or(false),
+                    (TermValue::Double(d), _) => field_value
+                        .as_f64()
+                        .map(|v| (v - d).abs() < 0.0001)
+                        .unwrap_or(false),
+                    (TermValue::Bool(b), _) => field_value.as_bool().map(|v| v == *b).unwrap_or(false),
+                });
+
+                if matches {
+                    Some(ScoredDocument {
+                        doc: doc.clone(),
+                        score: self.boost,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn estimate_cost(&self) -> usize {
+        10 * self.values.len().max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TermQuery, TermsQuery};
+    use crate::common::{Document, FieldValue};
+    use crate::search::Query;
+
+    #[test]
+    fn term_query_matches_exact_value() {
+        let docs = vec![
+            Document::new("1").with_field("status", FieldValue::Keyword("published".to_string())),
+            Document::new("2").with_field("status", FieldValue::Keyword("draft".to_string())),
+        ];
+
+        let results = TermQuery::new("status", "published").execute(&docs);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc.id, "1");
+    }
+
+    #[test]
+    fn terms_query_matches_any_exact_value() {
+        let docs = vec![
+            Document::new("1").with_field("status", FieldValue::Keyword("published".to_string())),
+            Document::new("2").with_field("status", FieldValue::Keyword("draft".to_string())),
+            Document::new("3").with_field("status", FieldValue::Keyword("archived".to_string())),
+        ];
+
+        let results = TermsQuery::new(
+            "status",
+            vec!["published".to_string(), "archived".to_string()],
+        )
+        .execute(&docs);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc.id, "1");
+        assert_eq!(results[1].doc.id, "3");
     }
 }

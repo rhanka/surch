@@ -30,6 +30,7 @@ pub struct ScoredDocument {
 pub enum QueryType {
     Match(MatchQuery),
     Term(TermQuery),
+    Terms(TermsQuery),
     Range(RangeQuery),
     Bool(BoolQuery),
     Fuzzy(FuzzyQuery),
@@ -44,6 +45,7 @@ impl Query for QueryType {
         match self {
             QueryType::Match(q) => q.execute(docs),
             QueryType::Term(q) => q.execute(docs),
+            QueryType::Terms(q) => q.execute(docs),
             QueryType::Range(q) => q.execute(docs),
             QueryType::Bool(q) => q.execute(docs),
             QueryType::Fuzzy(q) => q.execute(docs),
@@ -58,6 +60,7 @@ impl Query for QueryType {
         match self {
             QueryType::Match(q) => q.estimate_cost(),
             QueryType::Term(q) => q.estimate_cost(),
+            QueryType::Terms(q) => q.estimate_cost(),
             QueryType::Range(q) => q.estimate_cost(),
             QueryType::Bool(q) => q.estimate_cost(),
             QueryType::Fuzzy(q) => q.estimate_cost(),

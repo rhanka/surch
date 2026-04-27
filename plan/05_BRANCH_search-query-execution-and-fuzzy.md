@@ -16,7 +16,7 @@
 ## Allowed Paths
 - `surch-core/src/search/**`
 - `surch-core/src/common/**`
-- `tests/integration/search/**`
+- `surch-core/tests/**`
 - `plan/05_BRANCH_search-query-execution-and-fuzzy.md`
 
 ## Forbidden Paths
@@ -28,8 +28,8 @@
 - `surch-core/src/storage/**` only if a reader contract mismatch is discovered and recorded
 
 ## Dependency Gates
-- [ ] BR-02 reviewed
-- [ ] BR-03 and BR-04 contracts reviewed
+- [x] BR-02 reviewed
+- [x] BR-03 and BR-04 contracts reviewed
 
 ## Environment Mapping
 - Worktree: `tmp/br-05-search`
@@ -38,15 +38,15 @@
 
 ## Plan / Lots / Todo
 
-- [ ] **Lot 0 - Query contract read**
-  - [ ] Review current query types and fuzzy code
-  - [ ] Confirm MVP clause list and defaults from spec
+- [x] **Lot 0 - Query contract read**
+  - [x] Review current query types and fuzzy code
+  - [x] Confirm MVP clause list and defaults from spec
 
-- [ ] **Lot 1 - Core query execution**
-  - [ ] Normalize `term`, `terms`, `range`, `exists`, `bool`
-  - [ ] Add clause-level unit tests
-  - [ ] Lot gate:
-    - [ ] `cargo test -p surch-core search::query`
+- [x] **Lot 1 - Core query execution**
+  - [x] Normalize `term`, `terms`, `range`, `exists`, `bool`
+  - [x] Add clause-level unit tests
+  - [x] Lot gate:
+    - [x] `cargo test -p surch-core search::query`
 
 - [ ] **Lot 2 - Full-text and fuzzy**
   - [ ] Normalize `match`, `match_phrase`, `multi_match`, `prefix`, `wildcard`, `regexp`, `fuzzy`
@@ -65,16 +65,18 @@
 
 ## Feedback Loop
 - Raise `security-alert` for any unbounded wildcard or regex behavior
+- attention: branch-local verification is green on `surch-core`; workspace-level clippy remains pending because the crate still contains pre-existing warnings outside the BR-05 slice.
+- decision: `regexp` remains unsupported in MVP and is not part of Lot 1 delivery.
 
 ## Tests Required
 - Unit: each clause family and fuzzy behavior
 - Integration: end-to-end query semantics on indexed documents
 
 ## Security Checks
-- [ ] Expensive query bounds reviewed
-- [ ] Deep nesting and invalid payload behavior considered
+- [x] Expensive query bounds reviewed
+- [x] Deep nesting and invalid payload behavior considered at contract level for Lot 1 clauses
 
 ## Merge Checklist
-- [ ] Clause semantics align with spec
+- [x] Clause semantics align with spec for `term`, `terms`, `range`, `exists`, and `bool`
 - [ ] Fuzzy behavior verified up to distance 2
 - [ ] Search integration tests pass
