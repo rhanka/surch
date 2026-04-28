@@ -7,13 +7,12 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use surch_core::{
     common::{
-        BulkRequest, BulkResponse, Document, FieldValue, IndexMetadata, IndexRequest,
+        BulkItemResponse, BulkItemResult, BulkResponse, Document, FieldValue, IndexMetadata,
         IndexResponse, ShardsInfo,
     },
-    search::{MatchQuery, Query, ScoredDocument},
+    search::{Query, ScoredDocument},
     storage::IndexStore,
 };
-use tokio::sync::oneshot;
 use tracing_subscriber;
 
 mod routes;
@@ -92,6 +91,7 @@ fn build_app(state: AppState) -> Router {
                 .get(get_document)
                 .delete(delete_document),
         )
+        .route("/:index/_bulk", post(bulk_with_default_index))
         .route("/:index/_search", post(search))
         .route("/:index/_refresh", post(refresh_index))
         .route("/:index/_flush", post(flush_index))
@@ -386,13 +386,148 @@ async fn flush_index(
 
 async fn bulk(
     State(state): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
-) -> Json<BulkResponse> {
-    Json(BulkResponse {
-        took: 0,
-        errors: false,
-        items: vec![],
-    })
+    body: String,
+) -> Result<Json<BulkResponse>, axum::http::StatusCode> {
+    process_bulk_request(state, None, &body)
+}
+
+async fn bulk_with_default_index(
+    State(state): State<AppState>,
+    axum::extract::Path(index): axum::extract::Path<String>,
+    body: String,
+) -> Result<Json<BulkResponse>, axum::http::StatusCode> {
+    process_bulk_request(state, Some(index), &body)
+}
+
+fn process_bulk_request(
+    state: AppState,
+    default_index: Option<String>,
+    body: &str,
+) -> Result<Json<BulkResponse>, axum::http::StatusCode> {
+    if !body.ends_with('\n') {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    let lines: Vec<&str> = body.lines().collect();
+    let mut cursor = 0;
+    let mut items = Vec::new();
+    let mut errors = false;
+
+    while cursor < lines.len() {
+        let action_line: serde_json::Value =
+            serde_json::from_str(lines[cursor]).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+        let action_object = action_line
+            .as_object()
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+        if action_object.len() != 1 {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        let (action_name, action_payload) = action_object.iter().next().expect("one action");
+        let payload = action_payload
+            .as_object()
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+        match action_name.as_str() {
+            "index" | "create" => {
+                let source_line = lines
+                    .get(cursor + 1)
+                    .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+                let source: serde_json::Value =
+                    serde_json::from_str(source_line).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+                let source_obj = source
+                    .as_object()
+                    .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+                let index = payload
+                    .get("_index")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| default_index.clone())
+                    .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+                let id = payload
+                    .get("_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                let fields = source_obj
+                    .iter()
+                    .map(|(key, value)| (key.clone(), json_to_field_value(value)))
+                    .collect();
+
+                let store = state.store.read();
+                match store.index_document(&index, Document::new(id.clone()).with_fields(fields)) {
+                    Ok(_) => {
+                        items.push(BulkItemResponse {
+                            index: Some(BulkItemResult {
+                                index,
+                                id,
+                                version: 1,
+                                result: "created".to_string(),
+                                status: 201,
+                            }),
+                            delete: None,
+                        });
+                    }
+                    Err(_) => {
+                        errors = true;
+                        items.push(BulkItemResponse {
+                            index: Some(BulkItemResult {
+                                index,
+                                id,
+                                version: 0,
+                                result: "error".to_string(),
+                                status: 404,
+                            }),
+                            delete: None,
+                        });
+                    }
+                }
+
+                cursor += 2;
+            }
+            "delete" => {
+                let index = payload
+                    .get("_index")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| default_index.clone())
+                    .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+                let id = payload
+                    .get("_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+                let store = state.store.read();
+                let deleted = store
+                    .delete_document(&index, &id)
+                    .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
+                items.push(BulkItemResponse {
+                    index: None,
+                    delete: Some(BulkItemResult {
+                        index,
+                        id,
+                        version: 1,
+                        result: if deleted {
+                            "deleted".to_string()
+                        } else {
+                            "not_found".to_string()
+                        },
+                        status: 200,
+                    }),
+                });
+
+                cursor += 1;
+            }
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        }
+    }
+
+    Ok(Json(BulkResponse { took: 0, errors, items }))
 }
 
 fn json_to_field_value(v: &serde_json::Value) -> FieldValue {
@@ -741,5 +876,98 @@ mod tests {
         let body = to_bytes(get_response.into_body(), usize::MAX).await.expect("body");
         let json: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(json.get("found").and_then(Value::as_bool), Some(false));
+    }
+
+    #[tokio::test]
+    async fn bulk_endpoint_indexes_document_from_ndjson() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_bulk")
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from("{\"index\":{\"_index\":\"books\",\"_id\":\"doc-1\"}}\n{\"title\":\"Hello\"}\n"))
+                    .expect("request"),
+            )
+            .await
+            .expect("bulk response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json.get("errors").and_then(Value::as_bool), Some(false));
+        assert_eq!(json["items"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn bulk_endpoint_rejects_malformed_ndjson() {
+        let app = test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_bulk")
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from("{\"index\":{\"_index\":\"books\"}}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn refresh_and_flush_return_shard_summary() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        for path in ["/books/_refresh", "/books/_flush"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+            let json: Value = serde_json::from_slice(&body).expect("json body");
+            assert!(json.get("_shards").is_some());
+        }
     }
 }

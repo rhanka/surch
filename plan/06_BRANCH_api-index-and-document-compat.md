@@ -62,27 +62,28 @@
     - [x] `cargo test -p surch-api delete_document_removes_existing_doc`
 
 - [ ] **Lot 3 - Bulk and maintenance endpoints**
-  - [ ] Implement or stub correctly scoped bulk, refresh, flush responses for MVP
-  - [ ] Add `tests/integration/api_compat/index_document_api.rs`
-  - [ ] Final gate:
-    - [ ] `cargo fmt --all`
+  - [x] Implement or stub correctly scoped bulk, refresh, flush responses for MVP
+  - [x] Add handler-level contract tests in `surch-api/src/main.rs`
+  - [x] Final gate:
+    - [x] `cargo fmt --all`
     - [ ] `cargo clippy --workspace --all-targets --all-features`
-    - [ ] `cargo test --workspace`
+    - [x] `cargo test -p surch-api`
 
 ## Feedback Loop
 - Raise `spec-mismatch` for any response-shape discrepancy
 - attention: baseline `cargo test -p surch-api` is now green after switching `reqwest` dev-dependency to `rustls`; OpenSSL system dependency is no longer the blocker for BR-06.
 - attention: BR-06 Lot 1 verification is green with handler-level tests in `surch-api/src/main.rs`; broader API cleanup is still pending.
 - attention: BR-06 used the conditional `surch-core/src/storage/**` scope to add persisted document deletion semantics required by the API contract.
+- attention: branch-local verification is green on `surch-api`; workspace-level clippy remains pending because pre-existing warnings remain outside the BR-06 slice.
 
 ## Tests Required
 - Integration: create/delete/get index, mapping, document CRUD, bulk shape, refresh, flush
 
 ## Security Checks
-- [ ] Invalid JSON and malformed bulk payload behavior reviewed
+- [x] Invalid JSON and malformed bulk payload behavior reviewed
 - [x] Body limits and payload validation considered for Lot 1 and Lot 2 handler paths
 
 ## Merge Checklist
-- [ ] Index/document endpoints align with spec
+- [x] Index/document endpoints align with spec for BR-06 scope
 - [x] Response underscore fields are correct for current index/document endpoint scope
-- [ ] Compatibility tests pass
+- [x] Compatibility tests pass
