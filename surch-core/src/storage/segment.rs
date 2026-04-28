@@ -178,6 +178,22 @@ impl Segment {
             .collect()
     }
 
+    pub fn remove_document(&mut self, doc_id: &str) -> bool {
+        let mut removed = false;
+
+        for fields in self.store.values_mut() {
+            if fields.remove(doc_id).is_some() {
+                removed = true;
+            }
+        }
+
+        if removed {
+            self.meta.deleted_docs += 1;
+        }
+
+        removed
+    }
+
     pub fn search_term(&self, field: &str, term: &str) -> Vec<u64> {
         let key = format!("{}_{}", field, term);
         self.terms

@@ -291,11 +291,16 @@ async fn delete_document(
     State(state): State<AppState>,
     axum::extract::Path((index, id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    let store = state.store.read();
+    let deleted = store
+        .delete_document(&index, &id)
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+
     Ok(Json(serde_json::json!({
         "_index": index,
         "_id": id,
-        "result": "deleted",
-        "_version": 2
+        "result": if deleted { "deleted" } else { "not_found" },
+        "_version": if deleted { 2 } else { 1 }
     })))
 }
 
@@ -565,5 +570,176 @@ mod tests {
         assert!(json.get("books").is_some());
         assert!(json["books"].get("settings").is_some());
         assert!(json["books"].get("mappings").is_some());
+    }
+
+    #[tokio::test]
+    async fn index_document_returns_expected_metadata() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books/_doc/doc-1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"Hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(json.get("_index").and_then(Value::as_str), Some("books"));
+        assert_eq!(json.get("_id").and_then(Value::as_str), Some("doc-1"));
+        assert_eq!(json.get("result").and_then(Value::as_str), Some("created"));
+        assert!(json.get("_seq_no").is_some());
+        assert!(json.get("_primary_term").is_some());
+        assert!(json.get("_shards").is_some());
+    }
+
+    #[tokio::test]
+    async fn get_document_returns_found_false_for_missing_doc() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/books/_doc/missing")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(json.get("found").and_then(Value::as_bool), Some(false));
+    }
+
+    #[tokio::test]
+    async fn delete_document_returns_not_found_for_missing_doc() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/books/_doc/missing")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(json.get("result").and_then(Value::as_str), Some("not_found"));
+    }
+
+    #[tokio::test]
+    async fn delete_document_removes_existing_doc() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books/_doc/doc-1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"Hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("index response");
+
+        let delete_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/books/_doc/doc-1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("delete response");
+
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/books/_doc/doc-1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get response");
+
+        let body = to_bytes(get_response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json.get("found").and_then(Value::as_bool), Some(false));
     }
 }

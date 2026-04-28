@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const SEGMENT_FILE_SUFFIX: &str = ".segment.json";
+
 pub struct IndexStore {
     base_path: PathBuf,
     indexes: Arc<RwLock<HashMap<String, IndexInstance>>>,
@@ -87,6 +89,41 @@ impl IndexStore {
         reader.load_segments()?;
 
         Ok(reader.get_document(doc_id))
+    }
+
+    pub fn delete_document(&self, index_name: &str, doc_id: &str) -> Result<bool, Error> {
+        let indexes = self.indexes.read();
+        let _instance = indexes
+            .get(index_name)
+            .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
+
+        let data_path = self.base_path.join(index_name).join("data");
+        if !data_path.exists() {
+            return Ok(false);
+        }
+
+        let mut segment_paths: Vec<PathBuf> = std::fs::read_dir(&data_path)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.ends_with(SEGMENT_FILE_SUFFIX))
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        segment_paths.sort();
+
+        for segment_path in segment_paths {
+            let mut segment = super::Segment::load(&segment_path)?;
+            if segment.remove_document(doc_id) {
+                segment.persist()?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     pub fn list_indexes(&self) -> Vec<IndexMetadata> {

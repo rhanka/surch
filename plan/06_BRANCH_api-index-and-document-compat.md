@@ -53,10 +53,13 @@
     - [x] `cargo test -p surch-api get_mapping_returns_index_keyed_mappings`
 
 - [ ] **Lot 2 - Document endpoints**
-  - [ ] Normalize index document, get document, delete document
-  - [ ] Normalize response fields such as `_index`, `_id`, `_version`, `_seq_no`, `_primary_term`, `_shards`
-  - [ ] Lot gate:
-    - [ ] `cargo test --workspace document`
+  - [x] Normalize index document, get document, delete document
+  - [x] Normalize response fields such as `_index`, `_id`, `_version`, `_seq_no`, `_primary_term`, `_shards`
+  - [x] Lot gate:
+    - [x] `cargo test -p surch-api index_document_returns_expected_metadata`
+    - [x] `cargo test -p surch-api get_document_returns_found_false_for_missing_doc`
+    - [x] `cargo test -p surch-api delete_document_returns_not_found_for_missing_doc`
+    - [x] `cargo test -p surch-api delete_document_removes_existing_doc`
 
 - [ ] **Lot 3 - Bulk and maintenance endpoints**
   - [ ] Implement or stub correctly scoped bulk, refresh, flush responses for MVP
@@ -70,15 +73,16 @@
 - Raise `spec-mismatch` for any response-shape discrepancy
 - attention: baseline `cargo test -p surch-api` is now green after switching `reqwest` dev-dependency to `rustls`; OpenSSL system dependency is no longer the blocker for BR-06.
 - attention: BR-06 Lot 1 verification is green with handler-level tests in `surch-api/src/main.rs`; broader API cleanup is still pending.
+- attention: BR-06 used the conditional `surch-core/src/storage/**` scope to add persisted document deletion semantics required by the API contract.
 
 ## Tests Required
 - Integration: create/delete/get index, mapping, document CRUD, bulk shape, refresh, flush
 
 ## Security Checks
 - [ ] Invalid JSON and malformed bulk payload behavior reviewed
-- [ ] Body limits and payload validation considered
+- [x] Body limits and payload validation considered for Lot 1 and Lot 2 handler paths
 
 ## Merge Checklist
 - [ ] Index/document endpoints align with spec
-- [ ] Response underscore fields are correct
+- [x] Response underscore fields are correct for current index/document endpoint scope
 - [ ] Compatibility tests pass
