@@ -1,6 +1,7 @@
 use axum::{
+    extract::State,
     routing::{delete, get, post, put},
-    Extension, Json, Router,
+    Json, Router,
 };
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -31,26 +32,7 @@ async fn main() {
         store: Arc::new(RwLock::new(store)),
     };
 
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/_cluster/health", get(cluster_health))
-        .route("/_cat/indices", get(list_all_indexes))
-        .route(
-            "/{index}",
-            put(create_index).delete(delete_index).get(get_index),
-        )
-        .route("/{index}/_mapping", get(get_mapping))
-        .route(
-            "/{index}/_doc/:id",
-            put(index_document)
-                .get(get_document)
-                .delete(delete_document),
-        )
-        .route("/{index}/_search", post(search))
-        .route("/{index}/_refresh", post(refresh_index))
-        .route("/{index}/_flush", post(flush_index))
-        .route("/_bulk", post(bulk))
-        .with_state(state);
+    let app = build_app(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9200").await.unwrap();
 
@@ -94,7 +76,30 @@ async fn cluster_health() -> Json<serde_json::Value> {
     }))
 }
 
-async fn list_all_indexes(Extension(state): Extension<AppState>) -> Json<serde_json::Value> {
+fn build_app(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(root))
+        .route("/_cluster/health", get(cluster_health))
+        .route("/_cat/indices", get(list_all_indexes))
+        .route(
+            "/:index",
+            put(create_index).delete(delete_index).get(get_index),
+        )
+        .route("/:index/_mapping", get(get_mapping))
+        .route(
+            "/:index/_doc/:id",
+            put(index_document)
+                .get(get_document)
+                .delete(delete_document),
+        )
+        .route("/:index/_search", post(search))
+        .route("/:index/_refresh", post(refresh_index))
+        .route("/:index/_flush", post(flush_index))
+        .route("/_bulk", post(bulk))
+        .with_state(state)
+}
+
+async fn list_all_indexes(State(state): State<AppState>) -> Json<serde_json::Value> {
     let store = state.store.read();
     let indexes = store.list_indexes();
 
@@ -121,7 +126,7 @@ async fn list_all_indexes(Extension(state): Extension<AppState>) -> Json<serde_j
 }
 
 async fn create_index(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(index): axum::extract::Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
@@ -156,14 +161,14 @@ async fn create_index(
         .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
 
     Ok(Json(serde_json::json!({
-        "index": index,
-        "result": "created",
-        "shards": { "total": 1, "successful": 1, "failed": 0 }
+        "acknowledged": true,
+        "shards_acknowledged": true,
+        "index": index
     })))
 }
 
 async fn delete_index(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
@@ -172,13 +177,12 @@ async fn delete_index(
         .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
 
     Ok(Json(serde_json::json!({
-        "index": index,
-        "result": "deleted"
+        "acknowledged": true
     })))
 }
 
 async fn get_index(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
@@ -191,7 +195,15 @@ async fn get_index(
     settings.insert("index.number_of_shards".to_string(), serde_json::json!(1));
     settings.insert("index.number_of_replicas".to_string(), serde_json::json!(0));
 
+    index_info.insert(
+        "aliases".to_string(),
+        serde_json::Value::Object(serde_json::Map::new()),
+    );
     index_info.insert("settings".to_string(), serde_json::Value::Object(settings));
+    index_info.insert(
+        "mappings".to_string(),
+        serde_json::to_value(&metadata.mapping).unwrap_or(serde_json::Value::Null),
+    );
 
     Ok(Json(serde_json::json!({
         index: index_info
@@ -199,7 +211,7 @@ async fn get_index(
 }
 
 async fn get_mapping(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
@@ -215,7 +227,7 @@ async fn get_mapping(
 }
 
 async fn index_document(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path((index, id)): axum::extract::Path<(String, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<IndexResponse>, axum::http::StatusCode> {
@@ -249,7 +261,7 @@ async fn index_document(
 }
 
 async fn get_document(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path((index, id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
@@ -276,7 +288,7 @@ async fn get_document(
 }
 
 async fn delete_document(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path((index, id)): axum::extract::Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     Ok(Json(serde_json::json!({
@@ -288,7 +300,7 @@ async fn delete_document(
 }
 
 async fn search(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(index): axum::extract::Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
@@ -340,7 +352,7 @@ async fn search(
 }
 
 async fn refresh_index(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
@@ -354,7 +366,7 @@ async fn refresh_index(
 }
 
 async fn flush_index(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     axum::extract::Path(index): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let store = state.store.read();
@@ -368,7 +380,7 @@ async fn flush_index(
 }
 
 async fn bulk(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<serde_json::Value>,
 ) -> Json<BulkResponse> {
     Json(BulkResponse {
@@ -396,5 +408,162 @@ fn json_to_field_value(v: &serde_json::Value) -> FieldValue {
             FieldValue::Array(arr.iter().map(json_to_field_value).collect())
         }
         _ => FieldValue::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_app, AppState};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use serde_json::Value;
+    use std::sync::Arc;
+    use surch_core::storage::IndexStore;
+    use tower::ServiceExt;
+
+    fn test_app() -> Router {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = IndexStore::new(temp_dir.path()).expect("create store");
+        let state = AppState {
+            store: Arc::new(parking_lot::RwLock::new(store)),
+        };
+        build_app(state)
+    }
+
+    #[tokio::test]
+    async fn create_index_returns_acknowledged_shape() {
+        let app = test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mappings":{"properties":{"title":{"type":"text"}}}}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(json.get("acknowledged").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            json.get("shards_acknowledged").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(json.get("index").and_then(Value::as_str), Some("books"));
+    }
+
+    #[tokio::test]
+    async fn delete_index_returns_acknowledged_shape() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/books")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(json.get("acknowledged").and_then(Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn get_mapping_returns_index_keyed_mappings() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mappings":{"properties":{"title":{"type":"text"}}}}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/books/_mapping")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert!(json.get("books").is_some());
+        assert!(json["books"].get("mappings").is_some());
+    }
+
+    #[tokio::test]
+    async fn get_index_returns_index_keyed_settings_and_mappings() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mappings":{"properties":{"title":{"type":"text"}}}}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/books")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+
+        assert!(json.get("books").is_some());
+        assert!(json["books"].get("settings").is_some());
+        assert!(json["books"].get("mappings").is_some());
     }
 }

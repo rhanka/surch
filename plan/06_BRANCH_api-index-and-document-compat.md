@@ -44,10 +44,13 @@
   - [x] Confirm in-scope endpoints and response fields
 
 - [ ] **Lot 1 - Index management endpoints**
-  - [ ] Normalize create index, delete index, get index, get mapping
-  - [ ] Add handler-level tests where possible
-  - [ ] Lot gate:
-    - [ ] `cargo test --workspace index`
+  - [x] Normalize create index, delete index, get index, get mapping
+  - [x] Add handler-level tests where possible
+  - [x] Lot gate:
+    - [x] `cargo test -p surch-api create_index_returns_acknowledged_shape`
+    - [x] `cargo test -p surch-api delete_index_returns_acknowledged_shape`
+    - [x] `cargo test -p surch-api get_index_returns_index_keyed_settings_and_mappings`
+    - [x] `cargo test -p surch-api get_mapping_returns_index_keyed_mappings`
 
 - [ ] **Lot 2 - Document endpoints**
   - [ ] Normalize index document, get document, delete document
@@ -66,6 +69,7 @@
 ## Feedback Loop
 - Raise `spec-mismatch` for any response-shape discrepancy
 - attention: baseline `cargo test -p surch-api` is now green after switching `reqwest` dev-dependency to `rustls`; OpenSSL system dependency is no longer the blocker for BR-06.
+- attention: BR-06 Lot 1 verification is green with handler-level tests in `surch-api/src/main.rs`; broader API cleanup is still pending.
 
 ## Tests Required
 - Integration: create/delete/get index, mapping, document CRUD, bulk shape, refresh, flush
