@@ -66,7 +66,7 @@ impl Query for BoolQuery {
             let mut must_not_match = true;
 
             for q in &self.must {
-                let hits = q.execute(&[doc.clone()]);
+                let hits = q.execute(std::slice::from_ref(doc));
                 if !hits.is_empty() {
                     must_score += hits[0].score;
                     must_match = true;
@@ -74,7 +74,7 @@ impl Query for BoolQuery {
             }
 
             for q in &self.filter {
-                let hits = q.execute(&[doc.clone()]);
+                let hits = q.execute(std::slice::from_ref(doc));
                 if !hits.is_empty() {
                     filter_pass = true;
                 } else {
@@ -84,7 +84,7 @@ impl Query for BoolQuery {
             }
 
             for q in &self.should {
-                let hits = q.execute(&[doc.clone()]);
+                let hits = q.execute(std::slice::from_ref(doc));
                 if !hits.is_empty() {
                     should_score += hits[0].score;
                     should_match_count += 1;
@@ -92,7 +92,7 @@ impl Query for BoolQuery {
             }
 
             for q in &self.must_not {
-                let hits = q.execute(&[doc.clone()]);
+                let hits = q.execute(std::slice::from_ref(doc));
                 if !hits.is_empty() {
                     must_not_match = false;
                     break;

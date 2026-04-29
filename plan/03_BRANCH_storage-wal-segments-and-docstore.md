@@ -62,13 +62,13 @@
   - [x] Add `surch-core/tests/storage_docstore_roundtrip.rs`
   - [x] Final gate:
     - [x] `cargo fmt --all`
-    - [ ] `cargo clippy --workspace --all-targets --all-features`
+    - [x] `cargo clippy --workspace --all-targets --all-features`
     - [x] `cargo test -p surch-core`
 
 ## Feedback Loop
 - Raise `attention` if a required shared type change expands beyond `surch-core/src/common/**`
 - attention: WAL persistence shape for MVP is a fixed `wal/wal.jsonl` file with one JSON entry per line; segment persistence is now present and may evolve later if compaction changes the file layout.
-- attention: branch-local storage verification is green on `surch-core`; workspace-level clippy remains pending because the crate still contains pre-existing warnings outside the BR-03 slice.
+- attention: branch-local storage verification is green on `surch-core`; workspace-level clippy is now green after release-hardening cleanup.
 
 ## Tests Required
 - Unit: WAL append/replay, segment metadata, docstore round-trip

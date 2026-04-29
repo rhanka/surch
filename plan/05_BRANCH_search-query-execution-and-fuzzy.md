@@ -62,12 +62,12 @@
   - [x] Add `surch-core/tests/search_fuzzy_compat.rs`
   - [x] Final gate:
     - [x] `cargo fmt --all`
-    - [ ] `cargo clippy --workspace --all-targets --all-features`
+    - [x] `cargo clippy --workspace --all-targets --all-features`
     - [x] `cargo test -p surch-core`
 
 ## Feedback Loop
 - Raise `security-alert` for any unbounded wildcard or regex behavior
-- attention: branch-local verification is green on `surch-core`; workspace-level clippy remains pending because the crate still contains pre-existing warnings outside the BR-05 slice.
+- attention: branch-local verification is green on `surch-core`; workspace-level clippy is now green after release-hardening cleanup.
 - decision: `regexp` remains unsupported in MVP and is not part of BR-05 executable scope.
 - attention: cost ceilings for wildcard depth, nesting, and maximum query size remain governance-level follow-ups and are not yet enforced in execution code.
 

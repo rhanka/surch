@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
+    #[default]
     Text,
     Keyword,
     Integer,
@@ -14,12 +15,6 @@ pub enum FieldType {
     Date,
     #[serde(other)]
     Unknown,
-}
-
-impl Default for FieldType {
-    fn default() -> Self {
-        FieldType::Text
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

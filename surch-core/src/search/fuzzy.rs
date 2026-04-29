@@ -1,15 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub enum EditDistance {
+    #[default]
     DamerauLevenshtein,
     Levenshtein,
-}
-
-impl Default for EditDistance {
-    fn default() -> Self {
-        EditDistance::DamerauLevenshtein
-    }
 }
 
 pub struct FuzzyAlgorithm;
@@ -30,11 +25,11 @@ impl FuzzyAlgorithm {
 
         let mut matrix = vec![vec![0usize; len2 + 1]; len1 + 1];
 
-        for i in 0..=len1 {
-            matrix[i][0] = i;
+        for (i, row) in matrix.iter_mut().enumerate().take(len1 + 1) {
+            row[0] = i;
         }
-        for j in 0..=len2 {
-            matrix[0][j] = j;
+        for (j, cell) in matrix[0].iter_mut().enumerate().take(len2 + 1) {
+            *cell = j;
         }
 
         for i in 1..=len1 {
@@ -79,11 +74,11 @@ impl FuzzyAlgorithm {
 
         let mut matrix = vec![vec![0usize; len2 + 1]; len1 + 1];
 
-        for i in 0..=len1 {
-            matrix[i][0] = i;
+        for (i, row) in matrix.iter_mut().enumerate().take(len1 + 1) {
+            row[0] = i;
         }
-        for j in 0..=len2 {
-            matrix[0][j] = j;
+        for (j, cell) in matrix[0].iter_mut().enumerate().take(len2 + 1) {
+            *cell = j;
         }
 
         for i in 1..=len1 {

@@ -8,11 +8,9 @@ pub use match_query::*;
 pub use range_query::*;
 pub use term_query::*;
 
-use crate::common::{Document, FieldValue};
-use crate::search::error::Error;
+use crate::common::Document;
 use crate::search::fuzzy::FuzzyAlgorithm;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 pub trait Query: Send + Sync {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument>;

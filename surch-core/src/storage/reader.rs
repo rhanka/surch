@@ -9,15 +9,13 @@ const SEGMENT_FILE_SUFFIX: &str = ".segment.json";
 pub struct IndexReader {
     path: PathBuf,
     segments: Arc<RwLock<SegmentManager>>,
-    index_name: String,
 }
 
 impl IndexReader {
-    pub fn new(path: impl Into<PathBuf>, index_name: impl Into<String>) -> Self {
+    pub fn new(path: impl Into<PathBuf>, _index_name: impl Into<String>) -> Self {
         Self {
             path: path.into(),
             segments: Arc::new(RwLock::new(SegmentManager::new())),
-            index_name: index_name.into(),
         }
     }
 

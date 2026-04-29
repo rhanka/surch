@@ -66,7 +66,7 @@
   - [x] Add handler-level contract tests in `surch-api/src/main.rs`
   - [x] Final gate:
     - [x] `cargo fmt --all`
-    - [ ] `cargo clippy --workspace --all-targets --all-features`
+    - [x] `cargo clippy --workspace --all-targets --all-features`
     - [x] `cargo test -p surch-api`
 
 ## Feedback Loop
@@ -74,7 +74,7 @@
 - attention: baseline `cargo test -p surch-api` is now green after switching `reqwest` dev-dependency to `rustls`; OpenSSL system dependency is no longer the blocker for BR-06.
 - attention: BR-06 Lot 1 verification is green with handler-level tests in `surch-api/src/main.rs`; broader API cleanup is still pending.
 - attention: BR-06 used the conditional `surch-core/src/storage/**` scope to add persisted document deletion semantics required by the API contract.
-- attention: branch-local verification is green on `surch-api`; workspace-level clippy remains pending because pre-existing warnings remain outside the BR-06 slice.
+- attention: branch-local verification is green on `surch-api`; workspace-level clippy is now green after release-hardening cleanup.
 
 ## Tests Required
 - Integration: create/delete/get index, mapping, document CRUD, bulk shape, refresh, flush

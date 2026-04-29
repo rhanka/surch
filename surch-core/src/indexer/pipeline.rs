@@ -1,7 +1,6 @@
 use crate::common::{Document, FieldValue, Mapping};
-use crate::indexer::analyzer::{Analyzer, AnalyzerRegistry, Token};
+use crate::indexer::analyzer::{AnalyzerRegistry, Token};
 use crate::indexer::error::Error;
-use crate::indexer::mapping::FieldMapper;
 use std::sync::Arc;
 
 pub struct IndexingPipeline {

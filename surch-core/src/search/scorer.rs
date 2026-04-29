@@ -1,5 +1,4 @@
 use crate::common::Document;
-use crate::search::ScoredDocument;
 use serde::{Deserialize, Serialize};
 
 pub trait Scorer: Send + Sync {
@@ -13,16 +12,11 @@ pub trait Scorer: Send + Sync {
     ) -> f64;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum Similarity {
     Tf,
+    #[default]
     BM25,
-}
-
-impl Default for Similarity {
-    fn default() -> Self {
-        Similarity::BM25
-    }
 }
 
 pub struct BM25Scorer {
@@ -84,7 +78,7 @@ impl Scorer for TfIdfScorer {
         _avg_doc_len: f64,
         _num_docs: u64,
     ) -> f64 {
-        (1.0 + (term_freq as f64).ln())
+        1.0 + (term_freq as f64).ln()
     }
 }
 

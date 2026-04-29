@@ -60,12 +60,12 @@
   - [x] Add `surch-core/tests/indexer_bulk_contract.rs`
   - [x] Final gate:
     - [x] `cargo fmt --all`
-    - [ ] `cargo clippy --workspace --all-targets --all-features`
+    - [x] `cargo clippy --workspace --all-targets --all-features`
     - [x] `cargo test -p surch-core`
 
 ## Feedback Loop
 - Raise `spec-mismatch` if mapping or bulk semantics differ from harvested spec
-- attention: branch-local verification is green on `surch-core`; workspace-level clippy remains pending because the crate still contains pre-existing warnings outside the BR-04 slice.
+- attention: branch-local verification is green on `surch-core`; workspace-level clippy is now green after release-hardening cleanup.
 
 ## Tests Required
 - Unit: mapping validation, analyzer tokenization

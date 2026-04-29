@@ -61,12 +61,12 @@
   - [x] Cover valid and invalid query cases for term, bool, phrase, prefix, wildcard, multi_match, fuzzy, regexp rejection, and pagination
   - [x] Final gate:
     - [x] `cargo fmt --all`
-    - [ ] `cargo clippy --workspace --all-targets --all-features`
+    - [x] `cargo clippy --workspace --all-targets --all-features`
     - [x] `cargo test -p surch-api`
 
 ## Feedback Loop
 - Raise `spec-mismatch` if API response shape and search-core output drift apart
-- attention: branch-local verification is green on `surch-api`; workspace-level clippy remains pending because pre-existing warnings remain outside the BR-07 slice.
+- attention: branch-local verification is green on `surch-api`; workspace-level clippy is now green after release-hardening cleanup.
 - decision: `regexp` is explicitly rejected with `400` in MVP.
 
 ## Tests Required

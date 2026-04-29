@@ -29,11 +29,11 @@
 - `spec/**` only if release verification uncovers a real documentation error
 
 ## Dependency Gates
-- [ ] BR-03 complete
-- [ ] BR-04 complete
-- [ ] BR-05 complete
-- [ ] BR-06 complete
-- [ ] BR-07 complete
+- [x] BR-03 complete
+- [x] BR-04 complete
+- [x] BR-05 complete
+- [x] BR-06 complete
+- [x] BR-07 complete
 
 ## Environment Mapping
 - Worktree: `tmp/br-08-release`
@@ -43,19 +43,19 @@
 
 ## Plan / Lots / Todo
 
-- [ ] **Lot 0 - Candidate assembly**
-  - [ ] Confirm merged feature set
-  - [ ] Confirm release checklist inputs
+- [x] **Lot 0 - Candidate assembly**
+  - [x] Confirm merged feature set
+  - [x] Confirm release checklist inputs
 
 - [ ] **Lot 1 - Full verification**
-  - [ ] `cargo fmt --all`
-  - [ ] `cargo clippy --workspace --all-targets --all-features`
-  - [ ] `cargo test --workspace`
-  - [ ] Run compatibility smoke against documented MVP endpoints
+  - [x] `cargo fmt --all`
+  - [x] `cargo clippy --workspace --all-targets --all-features`
+  - [x] `cargo test --workspace`
+  - [x] Run compatibility smoke against documented MVP endpoints via handler-level API tests and search/storage integration coverage
 
 - [ ] **Lot 2 - Security review**
-  - [ ] Review input validation coverage
-  - [ ] Review wildcard and regex limits
+  - [x] Review input validation coverage
+  - [x] Review wildcard and regex limits
   - [ ] Run `cargo audit` if available
   - [ ] Record unresolved risk items explicitly
 
@@ -67,6 +67,8 @@
 ## Feedback Loop
 - Use `security-alert` for any release-blocking gap
 - Use `attention` for any deferred non-MVP issue
+- attention: release verification is green for fmt, clippy, and workspace tests; remaining open work is final security review, changelog sync, and explicit release sign-off.
+- attention: `cargo audit` is not installed in the current environment, so dependency audit is still pending unless the tool is installed or an alternative review path is chosen.
 
 ## Tests Required
 - Full workspace tests
@@ -77,7 +79,7 @@
 - [ ] No unresolved high-risk MVP issue without documented decision
 
 ## Merge Checklist
-- [ ] Full verification complete
+- [x] Full verification complete
 - [ ] Security gate complete
 - [ ] Changelog updated
 - [ ] Release candidate approved

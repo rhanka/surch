@@ -16,7 +16,6 @@ pub struct IndexStore {
 struct IndexInstance {
     metadata: IndexMetadata,
     writer: IndexWriter,
-    readers: Vec<IndexReader>,
 }
 
 impl IndexStore {
@@ -43,7 +42,6 @@ impl IndexStore {
         let instance = IndexInstance {
             metadata,
             writer,
-            readers: Vec::new(),
         };
 
         self.indexes
@@ -81,7 +79,7 @@ impl IndexStore {
 
     pub fn get_document(&self, index_name: &str, doc_id: &str) -> Result<Option<Document>, Error> {
         let indexes = self.indexes.read();
-        let instance = indexes
+        let _instance = indexes
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
@@ -136,7 +134,7 @@ impl IndexStore {
 
     pub fn get_all_documents(&self, index_name: &str) -> Result<Vec<Document>, Error> {
         let indexes = self.indexes.read();
-        let instance = indexes
+        let _instance = indexes
             .get(index_name)
             .ok_or_else(|| Error::IndexNotFound(index_name.to_string()))?;
 
@@ -146,11 +144,11 @@ impl IndexStore {
         Ok(reader.get_all_documents())
     }
 
-    pub fn refresh(&self, index_name: &str) -> Result<(), Error> {
+    pub fn refresh(&self, _index_name: &str) -> Result<(), Error> {
         Ok(())
     }
 
-    pub fn flush(&self, index_name: &str) -> Result<(), Error> {
+    pub fn flush(&self, _index_name: &str) -> Result<(), Error> {
         Ok(())
     }
 }

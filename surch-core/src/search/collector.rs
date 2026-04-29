@@ -1,4 +1,3 @@
-use crate::common::Document;
 use crate::search::ScoredDocument;
 use serde::{Deserialize, Serialize};
 
