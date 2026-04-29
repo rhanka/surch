@@ -56,8 +56,8 @@
 - [ ] **Lot 2 - Security review**
   - [x] Review input validation coverage
   - [x] Review wildcard and regex limits
-  - [ ] Run `cargo audit` if available
-  - [ ] Record unresolved risk items explicitly
+  - [x] Run `cargo audit` if available
+  - [x] Record unresolved risk items explicitly
 
 - [ ] **Lot 3 - Release closeout**
   - [x] Update `CHANGELOG.md`
@@ -68,7 +68,7 @@
 - Use `security-alert` for any release-blocking gap
 - Use `attention` for any deferred non-MVP issue
 - attention: release verification is green for fmt, clippy, and workspace tests; remaining open work is final security review, changelog sync, and explicit release sign-off.
-- attention: `cargo audit` is not installed in the current environment, so dependency audit is still pending unless the tool is installed or an alternative review path is chosen.
+- attention: `cargo audit` is now installed and clean on the current dependency graph.
 
 ## Tests Required
 - Full workspace tests
@@ -76,10 +76,10 @@
 - Release-critical regression tests
 
 ## Security Checks
-- [ ] No unresolved high-risk MVP issue without documented decision
+- [x] No unresolved high-risk MVP issue without documented decision
 
 ## Merge Checklist
 - [x] Full verification complete
-- [ ] Security gate complete
+- [x] Security gate complete
 - [x] Changelog updated
 - [ ] Release candidate approved
