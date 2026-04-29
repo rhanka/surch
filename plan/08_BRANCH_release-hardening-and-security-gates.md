@@ -61,7 +61,7 @@
 
 - [ ] **Lot 3 - Release closeout**
   - [x] Update `CHANGELOG.md`
-  - [ ] Confirm rollback path
+  - [x] Confirm rollback path
   - [ ] Confirm release branch ready for merge
 
 ## Feedback Loop
@@ -69,6 +69,7 @@
 - Use `attention` for any deferred non-MVP issue
 - attention: release verification is green for fmt, clippy, and workspace tests; remaining open work is final security review, changelog sync, and explicit release sign-off.
 - attention: `cargo audit` is now installed and clean on the current dependency graph.
+- decision: rollback path is commit-based. Before release approval, tag the release candidate SHA. If post-release rollback is needed, create a rollback fix branch from `main` or release branch, revert the release commits in reverse order, rerun workspace verification, and publish a hotfix release.
 
 ## Tests Required
 - Full workspace tests
