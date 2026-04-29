@@ -29,6 +29,7 @@ pub struct ScoredDocument {
 #[serde(tag = "type")]
 pub enum QueryType {
     Match(MatchQuery),
+    MatchPhrase(MatchPhraseQuery),
     Term(TermQuery),
     Terms(TermsQuery),
     Range(RangeQuery),
@@ -44,6 +45,7 @@ impl Query for QueryType {
     fn execute(&self, docs: &[Document]) -> Vec<ScoredDocument> {
         match self {
             QueryType::Match(q) => q.execute(docs),
+            QueryType::MatchPhrase(q) => q.execute(docs),
             QueryType::Term(q) => q.execute(docs),
             QueryType::Terms(q) => q.execute(docs),
             QueryType::Range(q) => q.execute(docs),
@@ -59,6 +61,7 @@ impl Query for QueryType {
     fn estimate_cost(&self) -> usize {
         match self {
             QueryType::Match(q) => q.estimate_cost(),
+            QueryType::MatchPhrase(q) => q.estimate_cost(),
             QueryType::Term(q) => q.estimate_cost(),
             QueryType::Terms(q) => q.estimate_cost(),
             QueryType::Range(q) => q.estimate_cost(),

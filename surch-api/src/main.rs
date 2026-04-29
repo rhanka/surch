@@ -10,7 +10,11 @@ use surch_core::{
         BulkItemResponse, BulkItemResult, BulkResponse, Document, FieldValue, IndexMetadata,
         IndexResponse, ShardsInfo,
     },
-    search::{Query, ScoredDocument},
+    search::{
+        BoolQuery, Bound, ExistsQuery, FuzzyQuery, MatchOperator, MatchPhraseQuery, MatchQuery,
+        MultiMatchQuery, PrefixQuery, Query, QueryType, RangeQuery, ScoredDocument, TermQuery,
+        TermValue, TermsQuery, WildcardQuery,
+    },
     storage::IndexStore,
 };
 use tracing_subscriber;
@@ -312,28 +316,27 @@ async fn search(
     let store = state.store.read();
     let docs = store.get_all_documents(&index).unwrap_or_default();
 
-    let results: Vec<surch_core::search::ScoredDocument> = if let Some(query) = payload.get("query")
-    {
-        let q = surch_core::search::MatchQuery::new("_all", query.as_str().unwrap_or("*"));
-        q.execute(&docs)
+    let parsed = parse_search_request(&payload)?;
+    let mut results: Vec<ScoredDocument> = if let Some(query) = parsed.query {
+        query.execute(&docs)
     } else {
         docs.iter()
-            .map(|d| surch_core::search::ScoredDocument {
+            .map(|d| ScoredDocument {
                 doc: d.clone(),
                 score: 1.0,
             })
             .collect()
     };
 
+    sort_results(&mut results, parsed.sort);
+
     let total = results.len();
-    let max_score: f64 = results
-        .iter()
-        .map(|r| r.score)
-        .fold(0.0f64, |a: f64, b| a.max(b));
+    let max_score: f64 = results.iter().map(|r| r.score).fold(0.0f64, f64::max);
 
     let hits: Vec<serde_json::Value> = results
         .into_iter()
-        .take(10)
+        .skip(parsed.from)
+        .take(parsed.size)
         .map(|r| {
             serde_json::json!({
                 "_index": index,
@@ -347,7 +350,7 @@ async fn search(
     Ok(Json(serde_json::json!({
         "took": 0,
         "timed_out": false,
-        "shards": { "total": 1, "successful": 1, "failed": 0 },
+        "_shards": { "total": 1, "successful": 1, "failed": 0 },
         "hits": {
             "total": { "value": total, "relation": "eq" },
             "max_score": max_score,
@@ -528,6 +531,486 @@ fn process_bulk_request(
     }
 
     Ok(Json(BulkResponse { took: 0, errors, items }))
+}
+
+struct ParsedSearchRequest {
+    query: Option<QueryType>,
+    from: usize,
+    size: usize,
+    sort: Vec<SortSpec>,
+}
+
+enum SortSpec {
+    ScoreDesc,
+    ScoreAsc,
+    Field { name: String, asc: bool },
+}
+
+fn parse_search_request(payload: &serde_json::Value) -> Result<ParsedSearchRequest, axum::http::StatusCode> {
+    let object = payload
+        .as_object()
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+    for key in object.keys() {
+        if !matches!(key.as_str(), "query" | "from" | "size" | "sort" | "track_total_hits") {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let from = payload
+        .get("from")
+        .map(parse_usize)
+        .transpose()?
+        .unwrap_or(0);
+    let size = payload
+        .get("size")
+        .map(parse_usize)
+        .transpose()?
+        .unwrap_or(10);
+
+    if let Some(track_total_hits) = payload.get("track_total_hits") {
+        if !track_total_hits.is_boolean() {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let sort = payload
+        .get("sort")
+        .map(parse_sort_specs)
+        .transpose()?
+        .unwrap_or_else(|| vec![SortSpec::ScoreDesc]);
+
+    let query = payload.get("query").map(parse_query_type).transpose()?;
+
+    Ok(ParsedSearchRequest {
+        query,
+        from,
+        size,
+        sort,
+    })
+}
+
+fn parse_query_type(value: &serde_json::Value) -> Result<QueryType, axum::http::StatusCode> {
+    let object = value
+        .as_object()
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+    if object.len() != 1 {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    let (query_type, query_body) = object.iter().next().expect("one query entry");
+    match query_type.as_str() {
+        "match" => parse_match_query(query_body).map(QueryType::Match),
+        "match_phrase" => parse_match_phrase_query(query_body).map(QueryType::MatchPhrase),
+        "multi_match" => parse_multi_match_query(query_body).map(QueryType::MultiMatch),
+        "term" => parse_term_query(query_body).map(QueryType::Term),
+        "terms" => parse_terms_query(query_body).map(QueryType::Terms),
+        "range" => parse_range_query(query_body).map(QueryType::Range),
+        "exists" => parse_exists_query(query_body).map(QueryType::Exists),
+        "bool" => parse_bool_query(query_body).map(QueryType::Bool),
+        "prefix" => parse_prefix_query(query_body).map(QueryType::Prefix),
+        "wildcard" => parse_wildcard_query(query_body).map(QueryType::Wildcard),
+        "fuzzy" => parse_fuzzy_query(query_body).map(QueryType::Fuzzy),
+        "regexp" => Err(axum::http::StatusCode::BAD_REQUEST),
+        _ => Err(axum::http::StatusCode::BAD_REQUEST),
+    }
+}
+
+fn parse_match_query(value: &serde_json::Value) -> Result<MatchQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    if let Some(query) = inner.as_str() {
+        return Ok(MatchQuery::new(field, query));
+    }
+
+    let object = inner.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let query = object
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let operator = match object.get("operator").and_then(serde_json::Value::as_str) {
+        Some("and") => MatchOperator::And,
+        Some("or") | None => MatchOperator::Or,
+        _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+    };
+
+    let mut match_query = MatchQuery::new(field, query).with_operator(operator);
+    if let Some(fuzziness) = object.get("fuzziness") {
+        match_query = match_query.with_fuzziness(parse_fuzziness(fuzziness, query)?);
+    }
+    Ok(match_query)
+}
+
+fn parse_match_phrase_query(
+    value: &serde_json::Value,
+) -> Result<MatchPhraseQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    if let Some(query) = inner.as_str() {
+        return Ok(MatchPhraseQuery::new(field, query));
+    }
+
+    let object = inner.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let query = object
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let slop = object.get("slop").map(parse_usize).transpose()?.unwrap_or(0);
+
+    Ok(MatchPhraseQuery {
+        field,
+        query: query.to_string(),
+        slop,
+    })
+}
+
+fn parse_multi_match_query(
+    value: &serde_json::Value,
+) -> Result<MultiMatchQuery, axum::http::StatusCode> {
+    let object = value.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let query = object
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let fields = object
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?
+        .iter()
+        .map(|field| {
+            field
+                .as_str()
+                .map(str::to_string)
+                .ok_or(axum::http::StatusCode::BAD_REQUEST)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if let Some(query_type) = object.get("type") {
+        if query_type.as_str() != Some("best_fields") {
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let mut multi_match = MultiMatchQuery::new(query, fields);
+    if let Some(fuzziness) = object.get("fuzziness") {
+        multi_match.fuzziness = Some(parse_fuzziness(fuzziness, query)?);
+    }
+    Ok(multi_match)
+}
+
+fn parse_term_query(value: &serde_json::Value) -> Result<TermQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    let term_value = if inner.is_object() {
+        let object = inner.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+        let value = object
+            .get("value")
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+        parse_term_value(value)?
+    } else {
+        parse_term_value(inner)?
+    };
+
+    Ok(TermQuery::new(field, term_value))
+}
+
+fn parse_terms_query(value: &serde_json::Value) -> Result<TermsQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    let values = inner.as_array().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    if values.is_empty() {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    Ok(TermsQuery {
+        field,
+        values: values
+            .iter()
+            .map(parse_term_value)
+            .collect::<Result<Vec<_>, _>>()?,
+        boost: 1.0,
+    })
+}
+
+fn parse_range_query(value: &serde_json::Value) -> Result<RangeQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    let object = inner.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let mut range = RangeQuery::new(field);
+    let mut has_bound = false;
+
+    if let Some(value) = object.get("gte") {
+        range = range.gte(parse_bound(value)?);
+        has_bound = true;
+    }
+    if let Some(value) = object.get("gt") {
+        range = range.gt(parse_bound(value)?);
+        has_bound = true;
+    }
+    if let Some(value) = object.get("lte") {
+        range = range.lte(parse_bound(value)?);
+        has_bound = true;
+    }
+    if let Some(value) = object.get("lt") {
+        range = range.lt(parse_bound(value)?);
+        has_bound = true;
+    }
+
+    if !has_bound {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    Ok(range)
+}
+
+fn parse_exists_query(value: &serde_json::Value) -> Result<ExistsQuery, axum::http::StatusCode> {
+    let field = value
+        .get("field")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    Ok(ExistsQuery::new(field))
+}
+
+fn parse_bool_query(value: &serde_json::Value) -> Result<BoolQuery, axum::http::StatusCode> {
+    let object = value.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let mut query = BoolQuery::new();
+
+    if let Some(must) = object.get("must") {
+        query.must = parse_query_array(must)?;
+    }
+    if let Some(filter) = object.get("filter") {
+        query.filter = parse_query_array(filter)?;
+    }
+    if let Some(should) = object.get("should") {
+        query.should = parse_query_array(should)?;
+    }
+    if let Some(must_not) = object.get("must_not") {
+        query.must_not = parse_query_array(must_not)?;
+    }
+    if let Some(msm) = object.get("minimum_should_match") {
+        query.minimum_should_match = parse_usize(msm)?;
+    }
+
+    if query.must.is_empty() && query.filter.is_empty() && query.should.is_empty() && query.must_not.is_empty() {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    Ok(query)
+}
+
+fn parse_prefix_query(value: &serde_json::Value) -> Result<PrefixQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    let prefix = if let Some(value) = inner.as_str() {
+        value.to_string()
+    } else {
+        inner
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?
+    };
+    Ok(PrefixQuery::new(field, prefix))
+}
+
+fn parse_wildcard_query(value: &serde_json::Value) -> Result<WildcardQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    let wildcard = if let Some(value) = inner.as_str() {
+        value.to_string()
+    } else {
+        inner
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?
+    };
+    Ok(WildcardQuery::new(field, wildcard))
+}
+
+fn parse_fuzzy_query(value: &serde_json::Value) -> Result<FuzzyQuery, axum::http::StatusCode> {
+    let (field, inner) = single_field_clause(value)?;
+    let object = inner.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let query = object
+        .get("value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+
+    let mut fuzzy = FuzzyQuery::new(field, query);
+    if let Some(fuzziness) = object.get("fuzziness") {
+        fuzzy.fuzziness = parse_fuzziness(fuzziness, query)?;
+    }
+    if let Some(prefix_length) = object.get("prefix_length") {
+        fuzzy.prefix_length = parse_usize(prefix_length)?;
+    }
+    if let Some(transpositions) = object.get("transpositions") {
+        fuzzy.transpositions = transpositions
+            .as_bool()
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    }
+    Ok(fuzzy)
+}
+
+fn parse_query_array(value: &serde_json::Value) -> Result<Vec<QueryType>, axum::http::StatusCode> {
+    let items = value.as_array().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    items.iter().map(parse_query_type).collect()
+}
+
+fn single_field_clause(value: &serde_json::Value) -> Result<(String, &serde_json::Value), axum::http::StatusCode> {
+    let object = value.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    if object.len() != 1 {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+    let (field, inner) = object.iter().next().expect("one field");
+    Ok((field.clone(), inner))
+}
+
+fn parse_term_value(value: &serde_json::Value) -> Result<TermValue, axum::http::StatusCode> {
+    match value {
+        serde_json::Value::String(text) => Ok(TermValue::Text(text.clone())),
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                if let Ok(value) = i32::try_from(integer) {
+                    Ok(TermValue::Integer(value))
+                } else {
+                    Ok(TermValue::Long(integer))
+                }
+            } else {
+                number
+                    .as_f64()
+                    .map(TermValue::Double)
+                    .ok_or(axum::http::StatusCode::BAD_REQUEST)
+            }
+        }
+        serde_json::Value::Bool(value) => Ok(TermValue::Bool(*value)),
+        _ => Err(axum::http::StatusCode::BAD_REQUEST),
+    }
+}
+
+fn parse_bound(value: &serde_json::Value) -> Result<Bound, axum::http::StatusCode> {
+    match value {
+        serde_json::Value::String(text) => Ok(Bound::String(text.clone())),
+        serde_json::Value::Number(number) => {
+            if let Some(integer) = number.as_i64() {
+                if let Ok(value) = i32::try_from(integer) {
+                    Ok(Bound::Integer(value))
+                } else {
+                    Ok(Bound::Long(integer))
+                }
+            } else {
+                number
+                    .as_f64()
+                    .map(Bound::Double)
+                    .ok_or(axum::http::StatusCode::BAD_REQUEST)
+            }
+        }
+        _ => Err(axum::http::StatusCode::BAD_REQUEST),
+    }
+}
+
+fn parse_fuzziness(value: &serde_json::Value, query: &str) -> Result<usize, axum::http::StatusCode> {
+    match value {
+        serde_json::Value::String(text) if text == "AUTO" => Ok(auto_fuzziness(query)),
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value <= 2)
+            .ok_or(axum::http::StatusCode::BAD_REQUEST),
+        _ => Err(axum::http::StatusCode::BAD_REQUEST),
+    }
+}
+
+fn auto_fuzziness(query: &str) -> usize {
+    match query.chars().count() {
+        0..=2 => 0,
+        3..=5 => 1,
+        _ => 2,
+    }
+}
+
+fn parse_sort_specs(value: &serde_json::Value) -> Result<Vec<SortSpec>, axum::http::StatusCode> {
+    let items = value.as_array().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    items.iter()
+        .map(|item| {
+            if let Some(text) = item.as_str() {
+                return Ok(if text == "_score" {
+                    SortSpec::ScoreDesc
+                } else {
+                    SortSpec::Field {
+                        name: text.to_string(),
+                        asc: true,
+                    }
+                });
+            }
+
+            let object = item.as_object().ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+            if object.len() != 1 {
+                return Err(axum::http::StatusCode::BAD_REQUEST);
+            }
+            let (field, value) = object.iter().next().expect("one sort entry");
+            let direction = value
+                .as_str()
+                .or_else(|| value.get("order").and_then(serde_json::Value::as_str))
+                .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+            let asc = match direction {
+                "asc" => true,
+                "desc" => false,
+                _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+            };
+
+            Ok(if field == "_score" {
+                if asc {
+                    SortSpec::ScoreAsc
+                } else {
+                    SortSpec::ScoreDesc
+                }
+            } else {
+                SortSpec::Field {
+                    name: field.to_string(),
+                    asc,
+                }
+            })
+        })
+        .collect()
+}
+
+fn parse_usize(value: &serde_json::Value) -> Result<usize, axum::http::StatusCode> {
+    value.as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(axum::http::StatusCode::BAD_REQUEST)
+}
+
+fn sort_results(results: &mut [ScoredDocument], sort: Vec<SortSpec>) {
+    for sort_spec in sort.into_iter().rev() {
+        match sort_spec {
+            SortSpec::ScoreDesc => {
+                results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            }
+            SortSpec::ScoreAsc => {
+                results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+            }
+            SortSpec::Field { name, asc } => {
+                results.sort_by(|a, b| {
+                    let a_value = a.doc.get_field(&name).map(field_value_sort_key).unwrap_or_default();
+                    let b_value = b.doc.get_field(&name).map(field_value_sort_key).unwrap_or_default();
+                    if asc {
+                        a_value.cmp(&b_value)
+                    } else {
+                        b_value.cmp(&a_value)
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn field_value_sort_key(value: &FieldValue) -> String {
+    match value {
+        FieldValue::Null => String::new(),
+        FieldValue::Bool(value) => value.to_string(),
+        FieldValue::Integer(value) => value.to_string(),
+        FieldValue::Long(value) => value.to_string(),
+        FieldValue::Float(value) => value.to_string(),
+        FieldValue::Double(value) => value.to_string(),
+        FieldValue::Text(value) => value.clone(),
+        FieldValue::Keyword(value) => value.clone(),
+        FieldValue::Date(value) => value.clone(),
+        FieldValue::Array(values) => values.first().map(field_value_sort_key).unwrap_or_default(),
+    }
 }
 
 fn json_to_field_value(v: &serde_json::Value) -> FieldValue {
@@ -968,6 +1451,305 @@ mod tests {
             let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
             let json: Value = serde_json::from_slice(&body).expect("json body");
             assert!(json.get("_shards").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn search_term_query_returns_matching_hit() {
+        let app = test_app();
+
+        seed_search_docs(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":{"term":{"status":"published"}}}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["hits"]["total"]["value"].as_u64(), Some(2));
+        assert_eq!(json["hits"]["hits"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn search_match_phrase_respects_slop_zero() {
+        let app = test_app();
+
+        seed_search_docs(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":{"match_phrase":{"title":{"query":"search engine","slop":0}}}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = json["hits"]["hits"].as_array().expect("hits array");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"].as_str(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn search_fuzzy_query_matches_transposition() {
+        let app = test_app();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books/_doc/1")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"ba"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("index response");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":{"fuzzy":{"title":{"value":"ab","fuzziness":1}}}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = json["hits"]["hits"].as_array().expect("hits array");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"].as_str(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn search_applies_from_size_and_sort() {
+        let app = test_app();
+
+        seed_search_docs(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"from":1,"size":1,"sort":[{"title":"asc"}]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = json["hits"]["hits"].as_array().expect("hits array");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"].as_str(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn search_rejects_regexp_query_for_mvp() {
+        let app = test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":{"regexp":{"title":{"value":"s.*"}}}}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn search_bool_query_filters_hits() {
+        let app = test_app();
+
+        seed_search_docs(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":{"bool":{"must":[{"term":{"status":"published"}}],"filter":[{"range":{"year":{"lte":2023}}}]}}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = json["hits"]["hits"].as_array().expect("hits array");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"].as_str(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn search_prefix_query_matches_prefix() {
+        let app = test_app();
+
+        seed_search_docs(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":{"prefix":{"title":"sea"}}}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = json["hits"]["hits"].as_array().expect("hits array");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"].as_str(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn search_wildcard_query_matches_pattern() {
+        let app = test_app();
+
+        seed_search_docs(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":{"wildcard":{"title":"search*"}}}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = json["hits"]["hits"].as_array().expect("hits array");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"].as_str(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn search_multi_match_query_matches_any_listed_field() {
+        let app = test_app();
+
+        seed_search_docs(&app).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/books/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":{"multi_match":{"query":"manual","fields":["title","body"],"type":"best_fields"}}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let json: Value = serde_json::from_slice(&body).expect("json body");
+        let hits = json["hits"]["hits"].as_array().expect("hits array");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["_id"].as_str(), Some("3"));
+    }
+
+    async fn seed_search_docs(app: &Router) {
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/books")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+
+        for (id, title, status, year) in [
+            ("1", "rust search", "published", 2024),
+            ("2", "search engine", "published", 2023),
+            ("3", "zebra manual", "draft", 2025),
+        ] {
+            let body = serde_json::json!({
+                "title": title,
+                "body": format!("body {title}"),
+                "status": status,
+                "year": year,
+            });
+
+            let _ = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/books/_doc/{id}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("index response");
         }
     }
 }

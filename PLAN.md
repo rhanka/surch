@@ -89,7 +89,7 @@ Status vocabulary:
 | BR-04 | `feature/BR-04-indexer-mappings-analyzers-bulk` | #2 Indexer | active | BR-01, BR-03 | `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md` |
 | BR-05 | `feature/BR-05-search-query-exec-fuzzy` | #3 SearchEngine | ready | BR-02, BR-03, BR-04 | `plan/05_BRANCH_search-query-execution-and-fuzzy.md` |
 | BR-06 | `feature/BR-06-api-index-document-compat` | #4 APIServer | ready | BR-01, BR-03, BR-04 | `plan/06_BRANCH_api-index-and-document-compat.md` |
-| BR-07 | `feature/BR-07-api-search-compat-integration` | #4 APIServer | plan | BR-02, BR-05, BR-06 | `plan/07_BRANCH_api-search-compat-and-integration.md` |
+| BR-07 | `feature/BR-07-api-search-compat-integration` | #4 APIServer | ready | BR-02, BR-05, BR-06 | `plan/07_BRANCH_api-search-compat-and-integration.md` |
 | BR-08 | `release/v0.1.0-mvp` | Conductor | plan | BR-03, BR-04, BR-05, BR-06, BR-07 | `plan/08_BRANCH_release-hardening-and-security-gates.md` |
 
 ## 6) Dependency Graph
