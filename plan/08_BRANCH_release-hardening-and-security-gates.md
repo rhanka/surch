@@ -60,7 +60,7 @@
   - [ ] Record unresolved risk items explicitly
 
 - [ ] **Lot 3 - Release closeout**
-  - [ ] Update `CHANGELOG.md`
+  - [x] Update `CHANGELOG.md`
   - [ ] Confirm rollback path
   - [ ] Confirm release branch ready for merge
 
@@ -81,5 +81,5 @@
 ## Merge Checklist
 - [x] Full verification complete
 - [ ] Security gate complete
-- [ ] Changelog updated
+- [x] Changelog updated
 - [ ] Release candidate approved

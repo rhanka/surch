@@ -1,20 +1,27 @@
 # Changelog
 
-## [0.1.0] - 2024-01-01
+## [0.1.0] - 2026-04-25
 
 ### Added
 - Initial release of Surch - a 100% Rust OpenSearch/Lucene clone
-- Core storage layer with Write-Ahead Log (WAL) and segment management
-- Basic indexer with analyzer pipeline (standard, simple, stop, keyword)
-- Query DSL with match, term, range, bool queries
-- Fuzzy search with Damerau-Levenshtein distance (≤ 2)
-- REST API compatible with OpenSearch/Elasticsearch
-- Document indexing and search endpoints
+- Governance framework with conductor `PLAN.md`, numbered branch files, spec-first execution, and subagent rules
+- OpenSearch compatibility specs for index/document APIs, search/query DSL, security baseline, and MatchID Elastic parity exit criteria
+- Persisted Write-Ahead Log replay with on-disk `wal.jsonl`
+- Persisted segment storage with document round-trip recovery
+- Mapping validation for MVP field types and analyzer declarations
+- Analyzer behavior coverage for `standard`, `simple`, `stop`, and `keyword`
+- Core query semantics for `term`, `terms`, `range`, `exists`, `bool`, `match`, `match_phrase`, `multi_match`, `prefix`, `wildcard`, and `fuzzy`
+- Fuzzy transposition handling and prefix-length behavior up to distance 2
+- OpenSearch-like index/document compatibility handlers
+- OpenSearch-like `_search` request parsing with pagination, sorting, and unsupported `regexp` rejection
+- NDJSON `_bulk` ingestion path with malformed input rejection
+- Refresh and flush shard-summary responses
+- API and crate-level compatibility tests for storage, indexer, search, and REST surface
 
 ### Features
 - Index CRUD operations
 - Document single and bulk indexing
-- Query DSL (match, term, range, bool, fuzzy, prefix, wildcard)
+- Query DSL (`match`, `match_phrase`, `multi_match`, `term`, `terms`, `range`, `exists`, `bool`, `prefix`, `wildcard`, `fuzzy`)
 - Sorting and pagination
 - TF-IDF and BM25 scoring
 
@@ -23,3 +30,4 @@
 - Axum-based HTTP server
 - Tokio async runtime
 - parking_lot for concurrency
+- Rustls-based API test client to avoid OpenSSL system dependency in dev tests
