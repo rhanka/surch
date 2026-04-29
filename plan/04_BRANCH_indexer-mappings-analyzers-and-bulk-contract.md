@@ -55,7 +55,7 @@
   - [x] Lot gate:
     - [x] `cargo test -p surch-core indexer::analyzer`
 
-- [ ] **Lot 3 - Bulk ingestion contract**
+- [x] **Lot 3 - Bulk ingestion contract**
   - [x] Model the parsing expectations required by bulk ingestion
   - [x] Add `surch-core/tests/indexer_bulk_contract.rs`
   - [x] Final gate:

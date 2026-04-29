@@ -50,14 +50,14 @@
   - [x] Lot gate:
     - [x] `cargo test -p surch-core storage::wal`
 
-- [ ] **Lot 2 - Segment metadata and docstore**
+- [x] **Lot 2 - Segment metadata and docstore**
   - [x] Tighten segment metadata behavior
   - [x] Make doc write/read path deterministic
   - [x] Add unit tests for segment document persistence shape
   - [x] Lot gate:
     - [x] `cargo test -p surch-core storage::segment`
 
-- [ ] **Lot 3 - Integration path**
+- [x] **Lot 3 - Integration path**
   - [x] Add `surch-core/tests/storage_wal_recovery.rs`
   - [x] Add `surch-core/tests/storage_docstore_roundtrip.rs`
   - [x] Final gate:

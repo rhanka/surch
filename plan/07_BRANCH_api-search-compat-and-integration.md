@@ -78,4 +78,4 @@
 ## Merge Checklist
 - [x] `_search` aligns with spec for MVP clauses in current scope
 - [x] Integration tests pass
-- [ ] Search API remains analytics-free
+- [x] Search API remains analytics-free

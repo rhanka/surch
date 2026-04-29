@@ -39,11 +39,11 @@
 
 ## Plan / Lots / Todo
 
-- [ ] **Lot 0 - Handler contract read**
+- [x] **Lot 0 - Handler contract read**
   - [x] Review current `surch-api/src/main.rs`
   - [x] Confirm in-scope endpoints and response fields
 
-- [ ] **Lot 1 - Index management endpoints**
+- [x] **Lot 1 - Index management endpoints**
   - [x] Normalize create index, delete index, get index, get mapping
   - [x] Add handler-level tests where possible
   - [x] Lot gate:
@@ -52,7 +52,7 @@
     - [x] `cargo test -p surch-api get_index_returns_index_keyed_settings_and_mappings`
     - [x] `cargo test -p surch-api get_mapping_returns_index_keyed_mappings`
 
-- [ ] **Lot 2 - Document endpoints**
+- [x] **Lot 2 - Document endpoints**
   - [x] Normalize index document, get document, delete document
   - [x] Normalize response fields such as `_index`, `_id`, `_version`, `_seq_no`, `_primary_term`, `_shards`
   - [x] Lot gate:
@@ -61,7 +61,7 @@
     - [x] `cargo test -p surch-api delete_document_returns_not_found_for_missing_doc`
     - [x] `cargo test -p surch-api delete_document_removes_existing_doc`
 
-- [ ] **Lot 3 - Bulk and maintenance endpoints**
+- [x] **Lot 3 - Bulk and maintenance endpoints**
   - [x] Implement or stub correctly scoped bulk, refresh, flush responses for MVP
   - [x] Add handler-level contract tests in `surch-api/src/main.rs`
   - [x] Final gate:
