@@ -37,3 +37,5 @@ coverage/
 target/
 Cargo.lock
 .worktrees/
+__pycache__/
+*.pyc
