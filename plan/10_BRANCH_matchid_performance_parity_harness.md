@@ -23,7 +23,7 @@
 - `rules/**`
 
 ## Dependency Gates
-- [ ] BR-08 technical hardening complete
+- [x] BR-08 technical hardening complete
 - [ ] MatchID performance baseline source identified
 - [ ] Representative workloads selected
 
@@ -34,13 +34,13 @@
 ## Plan / Lots / Todo
 
 - [ ] **Lot 0 - Benchmark contract**
-  - [ ] Define workload families
-  - [ ] Define hardware and environment normalization rules
-  - [ ] Define pass/fail thresholds
+  - [x] Define workload families
+  - [x] Define hardware and environment normalization rules
+  - [x] Define pass/fail thresholds
 
 - [ ] **Lot 1 - Harness implementation**
-  - [ ] Add replay or artillery-based scenarios for MatchID-like workloads
-  - [ ] Add result capture format
+  - [x] Add replay or artillery-based scenarios for MatchID-like workloads
+  - [x] Add result capture format
 
 - [ ] **Lot 2 - Parity evidence**
   - [ ] Run Elasticsearch baseline
@@ -49,8 +49,10 @@
 
 ## Feedback Loop
 - Block on any ambiguity around workload realism or pass/fail thresholds.
+- attention: the harness is testable locally with synthetic summaries, but real MatchID workload baselines are still missing.
+- attention: final BR-10 completion requires Elasticsearch and Surch benchmark summaries produced from actual MatchID-relevant workloads.
 
 ## Merge Checklist
-- [ ] Benchmark contract frozen
-- [ ] Harness reproducible
+- [x] Benchmark contract frozen
+- [x] Harness reproducible
 - [ ] Performance parity evidence produced
