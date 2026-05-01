@@ -34,6 +34,8 @@
 - [x] BR-05 complete
 - [x] BR-06 complete
 - [x] BR-07 complete
+- [ ] BR-09 complete
+- [ ] BR-10 complete
 
 ## Environment Mapping
 - Worktree: `tmp/br-08-release`
@@ -70,6 +72,7 @@
 - attention: release verification is green for fmt, clippy, and workspace tests; remaining open work is final security review, changelog sync, and explicit release sign-off.
 - attention: `cargo audit` is now installed and clean on the current dependency graph.
 - decision: rollback path is commit-based. Before release approval, tag the release candidate SHA. If post-release rollback is needed, create a rollback fix branch from `main` or release branch, revert the release commits in reverse order, rerun workspace verification, and publish a hotfix release.
+- blocked: final release sign-off still requires BR-09 zero-gap evidence and BR-10 performance parity evidence in the MatchID Elastic context.
 
 ## Tests Required
 - Full workspace tests

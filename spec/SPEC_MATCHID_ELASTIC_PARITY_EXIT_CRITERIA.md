@@ -146,3 +146,19 @@ This exit-criteria spec should inform:
 - BR-05 search semantics
 - BR-07 search API compatibility
 - BR-08 release hardening and final validation
+
+## Current Gap To Final Release
+
+Current state:
+- Surch core and API technical slices are green on workspace tests and clippy.
+- OpenSearch-like syntax coverage for the MVP surface is implemented and tested locally.
+
+What is still missing before final user-level release sign-off:
+- a frozen MatchID-derived golden corpus for Elasticsearch-vs-Surch comparison
+- a reproducible zero-gap comparison harness
+- a reproducible performance parity harness using MatchID-relevant workloads
+- user-facing UAT sign-off on those two evidences
+
+Therefore:
+- technical MVP core is close to release-ready
+- final release is not approved until MatchID-context parity evidence exists
