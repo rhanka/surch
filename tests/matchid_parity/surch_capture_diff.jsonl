@@ -1,0 +1,2 @@
+{"case_id":"golden-term-published","http_status":200,"response":{"hits":{"total":{"value":2,"relation":"eq"},"hits":[{"_id":"2","_source":{"title":"Rust Search","status":"published","year":2024}}]}}}
+{"case_id":"golden-fuzzy-typo","http_status":500,"response":{"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}}

@@ -91,7 +91,7 @@ Status vocabulary:
 | BR-06 | `feature/BR-06-api-index-document-compat` | #4 APIServer | ready | BR-01, BR-03, BR-04 | `plan/06_BRANCH_api-index-and-document-compat.md` |
 | BR-07 | `feature/BR-07-api-search-compat-integration` | #4 APIServer | ready | BR-02, BR-05, BR-06 | `plan/07_BRANCH_api-search-compat-and-integration.md` |
 | BR-08 | `release/v0.1.0-mvp` | Conductor | blocked | BR-03, BR-04, BR-05, BR-06, BR-07, BR-09, BR-10 | `plan/08_BRANCH_release-hardening-and-security-gates.md` |
-| BR-09 | `feature/BR-09-matchid-elastic-parity-corpus` | Conductor | plan | BR-08 | `plan/09_BRANCH_matchid_elastic_parity_corpus_and_comparator.md` |
+| BR-09 | `feature/BR-09-matchid-elastic-parity-corpus` | Conductor | active | BR-08 | `plan/09_BRANCH_matchid_elastic_parity_corpus_and_comparator.md` |
 | BR-10 | `feature/BR-10-matchid-performance-parity` | Conductor | plan | BR-08 | `plan/10_BRANCH_matchid_performance_parity_harness.md` |
 
 ## 6) Dependency Graph

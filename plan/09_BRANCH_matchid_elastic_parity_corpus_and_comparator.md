@@ -25,7 +25,7 @@
 - `rules/**`
 
 ## Dependency Gates
-- [ ] BR-08 technical hardening complete
+- [x] BR-08 technical hardening complete
 - [ ] MatchID reference corpus source identified
 - [ ] Elasticsearch baseline source identified
 
@@ -36,13 +36,13 @@
 ## Plan / Lots / Todo
 
 - [ ] **Lot 0 - Corpus contract**
-  - [ ] Define request corpus format
-  - [ ] Define normalized response comparison format
+  - [x] Define request corpus format
+  - [x] Define normalized response comparison format
   - [ ] Freeze golden corpus source
 
 - [ ] **Lot 1 - Comparator harness**
-  - [ ] Implement Elasticsearch vs Surch replay harness
-  - [ ] Record diff categories
+  - [x] Implement Elasticsearch vs Surch replay harness
+  - [x] Record diff categories
 
 - [ ] **Lot 2 - Zero-gap evidence**
   - [ ] Run corpus replay
@@ -50,8 +50,10 @@
 
 ## Feedback Loop
 - Block on any ambiguity around what counts as a zero-gap comparison field.
+- attention: the harness is testable locally with fixtures, but the real MatchID-derived frozen corpus is still missing.
+- attention: final BR-09 completion requires actual Elasticsearch captures from the MatchID context, not only synthetic sample fixtures.
 
 ## Merge Checklist
 - [ ] Golden corpus frozen
-- [ ] Comparator reproducible
+- [x] Comparator reproducible
 - [ ] Zero-gap evidence produced
