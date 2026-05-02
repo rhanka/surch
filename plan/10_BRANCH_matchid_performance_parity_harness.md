@@ -24,8 +24,8 @@
 
 ## Dependency Gates
 - [x] BR-08 technical hardening complete
-- [ ] MatchID performance baseline source identified
-- [ ] Representative workloads selected
+- [x] MatchID performance baseline source identified
+- [x] Representative workloads selected
 
 ## Environment Mapping
 - Worktree: `tmp/br-10-matchid-perf`
@@ -51,6 +51,7 @@
 - Block on any ambiguity around workload realism or pass/fail thresholds.
 - attention: the harness is testable locally with synthetic summaries, but real MatchID workload baselines are still missing.
 - attention: final BR-10 completion requires Elasticsearch and Surch benchmark summaries produced from actual MatchID-relevant workloads.
+- attention: `tests/matchid_parity/matchid_perf_profile.json` freezes the first inherited workload profile, but it is still only a starting point.
 
 ## Merge Checklist
 - [x] Benchmark contract frozen

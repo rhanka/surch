@@ -1,0 +1,30 @@
+{
+  "label": "matchid-artillery-v1-derived",
+  "source": "matchID/matchID/packages/deces-backend/tests/performance/scenarios/test-backend-v1.yml",
+  "payload_source": "matchID/matchID/packages/deces-backend/tests/clients_test.csv",
+  "request_shapes": [
+    {
+      "method": "GET",
+      "path": "/deces/api/v1/search",
+      "fields": ["firstName", "lastName", "birthDate", "fuzzy=false"]
+    },
+    {
+      "method": "POST",
+      "path": "/deces/api/v1/search",
+      "fields": ["firstName", "lastName", "birthDate"]
+    }
+  ],
+  "phases": [
+    {"duration_seconds": 30, "arrival_rate": 2},
+    {"duration_seconds": 30, "arrival_rate": 2},
+    {"duration_seconds": 30, "arrival_rate": 5},
+    {"duration_seconds": 30, "arrival_rate": 10},
+    {"duration_seconds": 30, "arrival_rate": 20},
+    {"duration_seconds": 60, "arrival_rate": 50}
+  ],
+  "thresholds": {
+    "max_error_rate_pct": 1,
+    "max_latency_ms": 500,
+    "p95_latency_ms": 200
+  }
+}
