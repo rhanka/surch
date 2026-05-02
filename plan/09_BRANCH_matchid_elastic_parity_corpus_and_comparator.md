@@ -43,6 +43,7 @@
 - [ ] **Lot 1 - Comparator harness**
   - [x] Implement Elasticsearch vs Surch replay harness
   - [x] Record diff categories
+  - [x] Compile MatchID request seed into a first canonical `/deces/_search` corpus
 
 - [ ] **Lot 2 - Zero-gap evidence**
   - [ ] Run corpus replay
@@ -53,6 +54,7 @@
 - attention: the harness is testable locally with fixtures, but the real MatchID-derived frozen corpus is still missing.
 - attention: final BR-09 completion requires actual Elasticsearch captures from the MatchID context, not only synthetic sample fixtures.
 - attention: `tests/matchid_parity/matchid_request_seed.jsonl` is a representative seed derived from MatchID test data, not yet the final golden zero-gap corpus.
+- attention: `tests/matchid_parity/matchid_deces_corpus.jsonl` is a first compiled canonical corpus for the simple non-fuzzy MatchID profile; it still needs real Elasticsearch captures.
 
 ## Merge Checklist
 - [ ] Golden corpus frozen
