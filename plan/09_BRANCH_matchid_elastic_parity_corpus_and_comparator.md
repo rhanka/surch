@@ -27,7 +27,7 @@
 ## Dependency Gates
 - [x] BR-08 technical hardening complete
 - [x] MatchID reference corpus source identified
-- [ ] Elasticsearch baseline source identified
+- [x] Elasticsearch baseline source identified
 
 ## Environment Mapping
 - Worktree: `tmp/br-09-matchid-parity`
@@ -55,6 +55,8 @@
 - attention: final BR-09 completion requires actual Elasticsearch captures from the MatchID context, not only synthetic sample fixtures.
 - attention: `tests/matchid_parity/matchid_request_seed.jsonl` is a representative seed derived from MatchID test data, not yet the final golden zero-gap corpus.
 - attention: `tests/matchid_parity/matchid_deces_corpus.jsonl` is a first compiled canonical corpus for the simple non-fuzzy MatchID profile; it still needs real Elasticsearch captures.
+- attention: `dev-deces.matchid.io` is reachable and can return real backend captures for the seed corpus.
+- attention: local MatchID backend can be started, but the local Elasticsearch `deces` shard is currently red and snapshot restore failed because the repository endpoint timed out.
 
 ## Merge Checklist
 - [ ] Golden corpus frozen
