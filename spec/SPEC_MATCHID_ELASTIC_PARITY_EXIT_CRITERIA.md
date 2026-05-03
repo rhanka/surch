@@ -74,6 +74,11 @@ Representative replay corpus:
 - sampled real or realistic MatchID request shapes
 - broad enough to cover common names, dates, localities, and typo patterns
 
+Initial mini-dataset baseline selected for first parity loop:
+- `deces-2020-m01.txt.gz`
+- `60,584` records
+- manifest: `tests/matchid_parity/matchid_2020m01_manifest.json`
+
 Adversarial corpus:
 - typos
 - swapped names

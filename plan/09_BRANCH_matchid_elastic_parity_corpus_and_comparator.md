@@ -39,6 +39,7 @@
   - [x] Define request corpus format
   - [x] Define normalized response comparison format
   - [x] Freeze representative seed corpus source from `clients_test.csv`
+  - [x] Freeze mini dataset baseline `deces-2020-m01.txt.gz` with manifest and record count
 
 - [ ] **Lot 1 - Comparator harness**
   - [x] Implement Elasticsearch vs Surch replay harness
@@ -61,6 +62,7 @@
 - decision: the first 6 positive cases in `matchid_positive_seed.jsonl` were manually validated against `dev-deces.matchid.io` and return `total=1` in both GET and POST search modes.
 - decision: `tests/matchid_parity/dev_deces_positive_capture.jsonl` is now the first persisted real backend baseline capture for those positive cases.
 - decision: `tests/matchid_parity/dev_deces_positive_capture_normalized.jsonl` is normalized into the generic comparator format, so BR-09 now has a real backend baseline that can be diffed with Surch.
+- decision: `tests/matchid_parity/matchid_2020m01_manifest.json` is the frozen mini dataset descriptor for the first real Surch parity ingestion loop.
 
 ## Merge Checklist
 - [ ] Golden corpus frozen
