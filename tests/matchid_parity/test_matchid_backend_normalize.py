@@ -33,6 +33,11 @@ class MatchIdBackendNormalizeTests(unittest.TestCase):
             self.assertGreaterEqual(len(rows), 1)
             self.assertIn("hits", rows[0]["response"])
             self.assertIn("total", rows[0]["response"]["hits"])
+            source = rows[0]["response"]["hits"]["hits"][0]["_source"]
+            self.assertIn("UID", source)
+            self.assertIn("NOM", source)
+            self.assertIn("PRENOM", source)
+            self.assertIn("DATE_NAISSANCE", source)
 
 
 if __name__ == "__main__":

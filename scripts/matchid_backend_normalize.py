@@ -30,9 +30,16 @@ def normalize_backend_capture(row):
                     {
                         "_id": person.get("id"),
                         "_source": {
-                            "source": person.get("source"),
-                            "birth": person.get("birth"),
-                            "death": person.get("death"),
+                            "UID": person.get("id"),
+                            "NOM": person.get("name", {}).get("last"),
+                            "PRENOM": (person.get("name", {}).get("first") or [None])[0],
+                            "PRENOMS": " ".join(person.get("name", {}).get("first", [])),
+                            "DATE_NAISSANCE": person.get("birth", {}).get("date"),
+                            "COMMUNE_NAISSANCE": first_or_self(
+                                person.get("birth", {}).get("location", {}).get("city")
+                            ),
+                            "PAYS_NAISSANCE": person.get("birth", {}).get("location", {}).get("country"),
+                            "SOURCE": person.get("source"),
                         },
                     }
                     for person in persons
@@ -40,6 +47,12 @@ def normalize_backend_capture(row):
             }
         },
     }
+
+
+def first_or_self(value):
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
 
 
 def main(argv=None):
