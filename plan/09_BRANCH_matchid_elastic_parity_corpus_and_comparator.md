@@ -58,6 +58,7 @@
 - attention: `dev-deces.matchid.io` is reachable and can return real backend captures for the seed corpus.
 - attention: local MatchID backend can be started, but the local Elasticsearch `deces` shard is currently red and snapshot restore failed because the repository endpoint timed out.
 - attention: `tests/matchid_parity/matchid_positive_seed.jsonl` and `tests/matchid_parity/matchid_positive_deces_corpus.jsonl` freeze a first positive corpus derived from real hits returned by `dev-deces`.
+- decision: the first 6 positive cases in `matchid_positive_seed.jsonl` were manually validated against `dev-deces.matchid.io` and return `total=1` in both GET and POST search modes.
 
 ## Merge Checklist
 - [ ] Golden corpus frozen
