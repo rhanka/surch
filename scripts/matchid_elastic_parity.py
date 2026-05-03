@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -81,26 +82,84 @@ def compare_case(case, baseline, candidate):
     return diffs, baseline_norm, candidate_norm
 
 
-def replay_case(base_url: str, case):
+def replay_case(base_url: str, case, docker_container: str | None = None):
     request_def = case["request"]
-    body_bytes = json.dumps(request_def.get("json", {})).encode("utf-8")
+    body_json = json.dumps(request_def.get("json", {}))
+
+    if docker_container:
+        return replay_case_via_docker(docker_container, request_def, body_json, case["case_id"])
+
+    body_bytes = body_json.encode("utf-8")
     request = urllib.request.Request(
         base_url.rstrip("/") + request_def["path"],
         data=body_bytes,
         method=request_def.get("method", "POST"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return {
+                "case_id": case["case_id"],
+                "http_status": response.status,
+                "response": json.loads(response.read().decode("utf-8")),
+            }
+    except Exception as exc:
         return {
             "case_id": case["case_id"],
-            "http_status": response.status,
-            "response": json.loads(response.read().decode("utf-8")),
+            "http_status": 599,
+            "response": {"error": str(exc)},
         }
+
+
+def replay_case_via_docker(container: str, request_def: dict, body_json: str, case_id: str):
+    command = [
+        "docker",
+        "exec",
+        container,
+        "curl",
+        "-s",
+        "-X",
+        request_def.get("method", "POST"),
+        "http://localhost:9200" + request_def["path"],
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        body_json,
+        "-w",
+        "\n%{http_code}",
+    ]
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return {
+            "case_id": case_id,
+            "http_status": 599,
+            "response": {"error": result.stderr.strip() or result.stdout.strip()},
+        }
+
+    lines = result.stdout.splitlines()
+    if not lines:
+        return {
+            "case_id": case_id,
+            "http_status": 599,
+            "response": {"error": "empty docker exec response"},
+        }
+
+    status_line = lines[-1]
+    response_body = "\n".join(lines[:-1])
+    return {
+        "case_id": case_id,
+        "http_status": int(status_line),
+        "response": json.loads(response_body) if response_body else {},
+    }
 
 
 def command_replay(args):
     corpus = load_jsonl(Path(args.corpus))
-    captures = [replay_case(args.base_url, case) for case in corpus]
+    captures = [
+        replay_case(args.base_url, case, docker_container=args.docker_container)
+        for case in corpus
+    ]
     dump_jsonl(Path(args.out), captures)
     return 0
 
@@ -148,6 +207,7 @@ def build_parser():
     replay = subparsers.add_parser("replay")
     replay.add_argument("--corpus", required=True)
     replay.add_argument("--base-url", required=True)
+    replay.add_argument("--docker-container")
     replay.add_argument("--out", required=True)
     replay.set_defaults(func=command_replay)
 

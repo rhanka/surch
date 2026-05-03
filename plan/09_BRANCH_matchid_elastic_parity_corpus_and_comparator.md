@@ -63,6 +63,7 @@
 - decision: `tests/matchid_parity/dev_deces_positive_capture.jsonl` is now the first persisted real backend baseline capture for those positive cases.
 - decision: `tests/matchid_parity/dev_deces_positive_capture_normalized.jsonl` is normalized into the generic comparator format, so BR-09 now has a real backend baseline that can be diffed with Surch.
 - decision: `tests/matchid_parity/matchid_2020m01_manifest.json` is the frozen mini dataset descriptor for the first real Surch parity ingestion loop.
+- attention: a local dataprep-backend path is partially prepared through `scripts/matchid_prepare_local_dataprep_project.py`, but the first filesystem/csv run currently fails inside dataprep-backend (`Dataset.before` / `Dataset.reader` path) and is not yet a reliable evidence source.
 
 ## Merge Checklist
 - [ ] Golden corpus frozen

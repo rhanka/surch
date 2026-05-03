@@ -39,3 +39,6 @@ Cargo.lock
 .worktrees/
 __pycache__/
 *.pyc
+tests/matchid_parity/local_dataprep_project/
+tests/matchid_parity/local_dataprep_output/
+tests/matchid_parity/elastic_capture_matchid_local_positive.jsonl
