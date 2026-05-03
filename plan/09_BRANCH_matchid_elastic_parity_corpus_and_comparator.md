@@ -60,6 +60,7 @@
 - attention: `tests/matchid_parity/matchid_positive_seed.jsonl` and `tests/matchid_parity/matchid_positive_deces_corpus.jsonl` freeze a first positive corpus derived from real hits returned by `dev-deces`.
 - decision: the first 6 positive cases in `matchid_positive_seed.jsonl` were manually validated against `dev-deces.matchid.io` and return `total=1` in both GET and POST search modes.
 - decision: `tests/matchid_parity/dev_deces_positive_capture.jsonl` is now the first persisted real backend baseline capture for those positive cases.
+- decision: `tests/matchid_parity/dev_deces_positive_capture_normalized.jsonl` is normalized into the generic comparator format, so BR-09 now has a real backend baseline that can be diffed with Surch.
 
 ## Merge Checklist
 - [ ] Golden corpus frozen
