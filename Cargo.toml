@@ -16,8 +16,8 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Surch Team"]
-homepage = "https://github.com/surch/surch"
-repository = "https://github.com/surch/surch"
+homepage = "https://github.com/rhanka/surch"
+repository = "https://github.com/rhanka/surch"
 
 [workspace.dependencies]
 tokio = { version = "1.35", features = ["full"] }
