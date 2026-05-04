@@ -36,7 +36,8 @@
     "Rust parses generations file names and rejects corrupt commit metadata"
   ],
   "gates": [
-    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
     "cargo test -p surch-index segment_infos",
     "cargo clippy --workspace --all-targets --all-features"
   ],

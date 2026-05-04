@@ -34,7 +34,8 @@
     "Rust matches Java behavior for transpositions prefix_length max_expansions and AUTO-derived fuzziness"
   ],
   "gates": [
-    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
     "cargo test -p surch-search fuzzy_query",
     "cargo clippy --workspace --all-targets --all-features"
   ],

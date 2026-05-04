@@ -16,5 +16,11 @@ Each ticket must include:
 Validate the ledger:
 
 ```bash
-python tools/portage-ledger/validate.py docs/portage/ledger/tickets
+cargo run -p portage-ledger -- validate docs/portage/ledger/tickets
+```
+
+Check the repository language policy:
+
+```bash
+cargo run -p portage-ledger -- language-policy .
 ```

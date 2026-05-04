@@ -33,7 +33,8 @@
     "Rust response matches status errors item ordering and bulk took normalization rules"
   ],
   "gates": [
-    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
     "cargo test -p surch-api bulk",
     "cargo clippy --workspace --all-targets --all-features"
   ],

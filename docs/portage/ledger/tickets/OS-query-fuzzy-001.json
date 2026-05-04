@@ -35,7 +35,8 @@
     "Rust matches total hits order and score epsilon on the same indexed corpus"
   ],
   "gates": [
-    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
     "cargo test -p surch-search opensearch_fuzzy_query",
     "cargo clippy --workspace --all-targets --all-features"
   ],

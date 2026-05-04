@@ -1,7 +1,0 @@
-{
-  "label": "elastic-baseline-sample",
-  "corpus": "tests/matchid_parity/sample_corpus.jsonl",
-  "iterations": 2,
-  "warmup_iterations": 1,
-  "timeout_seconds": 30
-}

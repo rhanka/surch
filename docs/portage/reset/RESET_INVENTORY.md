@@ -8,7 +8,6 @@ This inventory records the cleanup that moved Surch from the old prototype roadm
 
 ## Preserved State
 
-- Main dirty-worktree patch: `docs/portage/reset/prototype-dirty-worktree.patch`
 - Before-reset status: `docs/portage/reset/git-status-before-reset.txt`
 - Before-reset diff stat: `docs/portage/reset/git-diff-stat-before-reset.txt`
 - Before-reset worktree list: `docs/portage/reset/git-worktrees-before-reset.txt`
@@ -19,6 +18,8 @@ Archive branches created:
 - `archive-prototype-before-portage-2026-05-04`
 
 The flat branch exists because the first non-escalated attempt could not write the nested ref under sandboxed `.git`; the nested branch was created after escalation and is the canonical archive branch.
+
+The original dirty-worktree patch remains recoverable from the archive branches and Git history. It was removed from the active tree during the language-policy cleanup because it embedded disallowed historical script references.
 
 ## Removed Worktree Checkouts
 
@@ -41,10 +42,11 @@ The active prototype implementation was moved out of the workspace:
 
 - `archive/legacy-prototype/surch-core/`
 - `archive/legacy-prototype/surch-api/`
-- `archive/legacy-prototype/matchid/`
 - `archive/legacy-prototype/devops/`
 
 The new active workspace uses `crates/*`.
+
+The archived MatchID prototype remains recoverable from the archive branches and Git history. It was removed from the active tree during the language-policy cleanup.
 
 ## Removed Runtime Artifacts
 
@@ -53,7 +55,8 @@ The following local generated directories were removed:
 - `target/`
 - `data/`
 - `.worktrees/runtime-surch/`
-- Python `__pycache__/` directories under archived MatchID scripts/tests
+- Interpreter cache directories under archived MatchID scripts/tests
+- Historical script archive under `archive/legacy-prototype/matchid/`
 
 ## Governance Decisions
 
@@ -66,4 +69,4 @@ The active source documents are:
 - `spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md`
 - `docs/portage/REFERENCES.md`
 
-Historical old references remain only inside saved reset patches, before-reset inventories, and archived prototype files.
+Historical old references remain in archive branches and Git history. The active tree keeps only the reset inventories and the BR worktree patches that satisfy the current language policy.
