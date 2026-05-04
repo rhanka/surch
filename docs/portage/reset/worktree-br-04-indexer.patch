@@ -1,0 +1,371 @@
+diff --git a/plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md b/plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md
+index e3229f1..190dafa 100644
+--- a/plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md
++++ b/plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md
+@@ -28,7 +28,7 @@
+ - `surch-core/src/storage/**` only if BR-03 exposes a necessary contract mismatch and it is recorded
+ 
+ ## Dependency Gates
+-- [ ] BR-01 reviewed
++- [x] BR-01 reviewed
+ - [ ] BR-03 storage contract reviewed
+ 
+ ## Environment Mapping
+@@ -38,22 +38,22 @@
+ 
+ ## Plan / Lots / Todo
+ 
+-- [ ] **Lot 0 - Contract read**
+-  - [ ] Review current mapping and analyzer files
+-  - [ ] Confirm MVP field types and analyzer list
++- [x] **Lot 0 - Contract read**
++  - [x] Review current mapping and analyzer files
++  - [x] Confirm MVP field types and analyzer list
+ 
+-- [ ] **Lot 1 - Mapping validation**
+-  - [ ] Tighten mapping rules for supported field types
+-  - [ ] Reject obviously invalid field definitions
+-  - [ ] Add unit tests for valid and invalid mapping cases
+-  - [ ] Lot gate:
+-    - [ ] `cargo test -p surch-core indexer::mapping`
++- [x] **Lot 1 - Mapping validation**
++  - [x] Tighten mapping rules for supported field types
++  - [x] Reject obviously invalid field definitions
++  - [x] Add unit tests for valid and invalid mapping cases
++  - [x] Lot gate:
++    - [x] `cargo test -p surch-core indexer::mapping`
+ 
+-- [ ] **Lot 2 - Analyzer behavior**
+-  - [ ] Normalize analyzer outputs for standard, simple, stop, keyword
+-  - [ ] Add unit tests for token output and edge cases
+-  - [ ] Lot gate:
+-    - [ ] `cargo test -p surch-core indexer::analyzer`
++- [x] **Lot 2 - Analyzer behavior**
++  - [x] Normalize analyzer outputs for standard, simple, stop, keyword
++  - [x] Add unit tests for token output and edge cases
++  - [x] Lot gate:
++    - [x] `cargo test -p surch-core indexer::analyzer`
+ 
+ - [ ] **Lot 3 - Bulk ingestion contract**
+   - [ ] Model the parsing expectations required by bulk ingestion
+@@ -65,16 +65,17 @@
+ 
+ ## Feedback Loop
+ - Raise `spec-mismatch` if mapping or bulk semantics differ from harvested spec
++- Remaining dependency: Lot 3 bulk ingestion contract still depends on BR-03 storage-side interfaces and is intentionally deferred in this slice.
+ 
+ ## Tests Required
+ - Unit: mapping validation, analyzer tokenization
+ - Integration: bulk contract and single-document ingestion shape
+ 
+ ## Security Checks
+-- [ ] Invalid field definitions rejected cleanly
++- [x] Invalid field definitions rejected cleanly
+ - [ ] Bulk payload parsing risks documented
+ 
+ ## Merge Checklist
+-- [ ] Mapping validation works
+-- [ ] Analyzer tests pass
++- [x] Mapping validation works
++- [x] Analyzer tests pass
+ - [ ] Bulk contract is explicit
+diff --git a/surch-core/src/indexer/analyzer/mod.rs b/surch-core/src/indexer/analyzer/mod.rs
+index d2ef83f..480168f 100644
+--- a/surch-core/src/indexer/analyzer/mod.rs
++++ b/surch-core/src/indexer/analyzer/mod.rs
+@@ -90,3 +90,58 @@ impl Default for AnalyzerRegistry {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::AnalyzerRegistry;
++
++    fn token_texts(registry: &AnalyzerRegistry, analyzer: &str, text: &str) -> Vec<String> {
++        registry
++            .get(analyzer)
++            .expect("analyzer should exist")
++            .analyze(text)
++            .into_iter()
++            .map(|token| token.text)
++            .collect()
++    }
++
++    #[test]
++    fn standard_analyzer_keeps_stop_words_and_numbers() {
++        let registry = AnalyzerRegistry::new();
++
++        assert_eq!(
++            token_texts(&registry, "standard", "The 2 QUICK foxes"),
++            vec!["the", "2", "quick", "foxes"]
++        );
++    }
++
++    #[test]
++    fn simple_analyzer_splits_on_non_letters_and_discards_numbers() {
++        let registry = AnalyzerRegistry::new();
++
++        assert_eq!(
++            token_texts(&registry, "simple", "The 2 QUICK foxes"),
++            vec!["the", "quick", "foxes"]
++        );
++    }
++
++    #[test]
++    fn stop_analyzer_removes_stop_words_after_normalization() {
++        let registry = AnalyzerRegistry::new();
++
++        assert_eq!(
++            token_texts(&registry, "stop", "The 2 QUICK foxes"),
++            vec!["2", "quick", "foxes"]
++        );
++    }
++
++    #[test]
++    fn keyword_analyzer_preserves_full_input() {
++        let registry = AnalyzerRegistry::new();
++
++        assert_eq!(
++            token_texts(&registry, "keyword", "The 2 QUICK foxes"),
++            vec!["The 2 QUICK foxes"]
++        );
++    }
++}
+diff --git a/surch-core/src/indexer/analyzer/simple.rs b/surch-core/src/indexer/analyzer/simple.rs
+index 8df5d71..4bfc127 100644
+--- a/surch-core/src/indexer/analyzer/simple.rs
++++ b/surch-core/src/indexer/analyzer/simple.rs
+@@ -1,5 +1,4 @@
+ use super::{Analyzer, Token};
+-use unicode_segmentation::UnicodeSegmentation;
+ 
+ pub struct SimpleAnalyzer;
+ 
+@@ -21,20 +20,26 @@ impl Analyzer for SimpleAnalyzer {
+     }
+ 
+     fn analyze(&self, text: &str) -> Vec<Token> {
+-        text.unicode_words()
+-            .enumerate()
+-            .map(|(i, word)| {
+-                let word_lower = word.to_lowercase();
+-                Token {
+-                    text: word_lower,
+-                    field: String::new(),
+-                    start_offset: 0,
+-                    end_offset: word.len(),
+-                    position: i,
+-                    term_freq: 1,
+-                    pos_increment: 1,
+-                }
+-            })
+-            .collect()
++        let mut tokens = Vec::new();
++        let mut start = None;
++
++        for (offset, ch) in text.char_indices() {
++            if ch.is_alphabetic() {
++                start.get_or_insert(offset);
++                continue;
++            }
++
++            if let Some(token_start) = start.take() {
++                let token_text = text[token_start..offset].to_lowercase();
++                tokens.push(Token::new(token_text, String::new(), tokens.len()));
++            }
++        }
++
++        if let Some(token_start) = start {
++            let token_text = text[token_start..].to_lowercase();
++            tokens.push(Token::new(token_text, String::new(), tokens.len()));
++        }
++
++        tokens
+     }
+ }
+diff --git a/surch-core/src/indexer/analyzer/standard.rs b/surch-core/src/indexer/analyzer/standard.rs
+index 15e6617..f1f00f0 100644
+--- a/surch-core/src/indexer/analyzer/standard.rs
++++ b/surch-core/src/indexer/analyzer/standard.rs
+@@ -1,23 +1,10 @@
+ use super::{Analyzer, Token};
+-use unicode_segmentation::UnicodeSegmentation;
+ 
+-pub struct StandardAnalyzer {
+-    stop_words: Vec<&'static str>,
+-}
++pub struct StandardAnalyzer;
+ 
+ impl StandardAnalyzer {
+     pub fn new() -> Self {
+-        Self {
+-            stop_words: vec![
+-                "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into",
+-                "is", "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then",
+-                "there", "these", "they", "this", "to", "was", "will", "with",
+-            ],
+-        }
+-    }
+-
+-    fn is_stop_word(&self, word: &str) -> bool {
+-        self.stop_words.contains(&word.to_lowercase().as_str())
++        Self
+     }
+ }
+ 
+@@ -34,30 +21,23 @@ impl Analyzer for StandardAnalyzer {
+ 
+     fn analyze(&self, text: &str) -> Vec<Token> {
+         let mut tokens = Vec::new();
+-        let mut position = 0;
+-        let mut char_offset = 0;
++        let mut start = None;
+ 
+-        for word in text.unicode_words() {
+-            let word_lower = word.to_lowercase();
+-
+-            if !self.is_stop_word(&word_lower) && word_lower.len() > 1 {
+-                let start = char_offset;
+-                let end = start + word.len();
+-
+-                tokens.push(Token {
+-                    text: word_lower,
+-                    field: String::new(),
+-                    start_offset: start,
+-                    end_offset: end,
+-                    position,
+-                    term_freq: 1,
+-                    pos_increment: 1,
+-                });
++        for (offset, ch) in text.char_indices() {
++            if ch.is_alphanumeric() {
++                start.get_or_insert(offset);
++                continue;
++            }
+ 
+-                position += 1;
++            if let Some(token_start) = start.take() {
++                let token_text = text[token_start..offset].to_lowercase();
++                tokens.push(Token::new(token_text, String::new(), tokens.len()));
+             }
++        }
+ 
+-            char_offset += word.len();
++        if let Some(token_start) = start {
++            let token_text = text[token_start..].to_lowercase();
++            tokens.push(Token::new(token_text, String::new(), tokens.len()));
+         }
+ 
+         tokens
+diff --git a/surch-core/src/indexer/mapping.rs b/surch-core/src/indexer/mapping.rs
+index 4a9abce..2e10453 100644
+--- a/surch-core/src/indexer/mapping.rs
++++ b/surch-core/src/indexer/mapping.rs
+@@ -26,9 +26,53 @@ impl FieldMapper {
+         field_def: &FieldDefinition,
+         value: &crate::common::FieldValue,
+     ) -> Result<crate::common::FieldValue, Error> {
++        Self::validate_field_definition(field_def)?;
++
++        if !Self::value_matches_field_type(&field_def.field_type, value) {
++            return Err(Error::InvalidField(field_def.name.clone()));
++        }
++
+         Ok(value.clone())
+     }
+ 
++    fn validate_field_definition(field_def: &FieldDefinition) -> Result<(), Error> {
++        if let Some(analyzer) = &field_def.analyzer {
++            if !matches!(
++                analyzer.as_str(),
++                "standard" | "simple" | "stop" | "keyword"
++            ) {
++                return Err(Error::Mapping(format!(
++                    "unsupported analyzer '{analyzer}' for field '{}'",
++                    field_def.name
++                )));
++            }
++        }
++
++        Ok(())
++    }
++
++    fn value_matches_field_type(field_type: &FieldType, value: &crate::common::FieldValue) -> bool {
++        use crate::common::FieldValue;
++
++        match value {
++            FieldValue::Array(values) => {
++                !values.is_empty()
++                    && values
++                        .iter()
++                        .all(|entry| Self::value_matches_field_type(field_type, entry))
++            }
++            FieldValue::Null => true,
++            FieldValue::Text(_) => matches!(field_type, FieldType::Text),
++            FieldValue::Keyword(_) => matches!(field_type, FieldType::Keyword),
++            FieldValue::Integer(_) => matches!(field_type, FieldType::Integer),
++            FieldValue::Long(_) => matches!(field_type, FieldType::Long),
++            FieldValue::Float(_) => matches!(field_type, FieldType::Float),
++            FieldValue::Double(_) => matches!(field_type, FieldType::Double),
++            FieldValue::Bool(_) => matches!(field_type, FieldType::Boolean),
++            FieldValue::Date(_) => matches!(field_type, FieldType::Date),
++        }
++    }
++
+     pub fn infer_mapping(
+         fields: &std::collections::HashMap<String, crate::common::FieldValue>,
+     ) -> Mapping {
+@@ -59,3 +103,52 @@ impl FieldMapper {
+         mapping
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::FieldMapper;
++    use crate::common::{FieldDefinition, FieldType, FieldValue, Mapping};
++    use crate::indexer::Error;
++    use std::collections::HashMap;
++
++    #[test]
++    fn map_document_rejects_type_mismatch_for_integer_field() {
++        let mut mapping = Mapping::new();
++        mapping.add_field(FieldDefinition::new("count", FieldType::Integer));
++
++        let fields = HashMap::from([("count".to_string(), FieldValue::Text("twelve".to_string()))]);
++
++        let error = FieldMapper::map_document(&mapping, &fields).expect_err("mapping should fail");
++
++        assert!(matches!(error, Error::InvalidField(field) if field == "count"));
++    }
++
++    #[test]
++    fn map_document_rejects_unknown_analyzer_for_text_field() {
++        let mut mapping = Mapping::new();
++        mapping.add_field(
++            FieldDefinition::new("title", FieldType::Text).with_analyzer("does-not-exist"),
++        );
++
++        let fields = HashMap::from([("title".to_string(), FieldValue::Text("hello".to_string()))]);
++
++        let error = FieldMapper::map_document(&mapping, &fields).expect_err("mapping should fail");
++
++        assert!(matches!(error, Error::Mapping(message) if message.contains("does-not-exist")));
++    }
++
++    #[test]
++    fn map_document_accepts_supported_text_analyzer_and_matching_type() {
++        let mut mapping = Mapping::new();
++        mapping.add_field(FieldDefinition::new("title", FieldType::Text).with_analyzer("standard"));
++
++        let fields = HashMap::from([("title".to_string(), FieldValue::Text("hello".to_string()))]);
++
++        let mapped = FieldMapper::map_document(&mapping, &fields).expect("mapping should succeed");
++
++        assert_eq!(
++            mapped.get("title").and_then(FieldValue::as_text),
++            Some("hello")
++        );
++    }
++}

@@ -1,0 +1,34 @@
+ M CHANGELOG.md
+ M PLAN.md
+ M README.md
+ D plan/01_BRANCH_spec-harvest-index-and-document-apis.md
+ D plan/02_BRANCH_spec-harvest-search-and-query-dsl.md
+ D plan/03_BRANCH_storage-wal-segments-and-docstore.md
+ D plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md
+ D plan/05_BRANCH_search-query-execution-and-fuzzy.md
+ D plan/06_BRANCH_api-index-and-document-compat.md
+ D plan/07_BRANCH_api-search-compat-and-integration.md
+ D plan/08_BRANCH_release-hardening-and-security-gates.md
+ D plan/09_BRANCH_matchid_elastic_parity_corpus_and_comparator.md
+ D plan/10_BRANCH_matchid_performance_parity_harness.md
+ D plan/BRANCH_TEMPLATE.md
+ D plan/SUBAGENT_PROMPT.md
+ D spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md
+ D spec/SPEC_MATCHID_ELASTIC_PARITY_CORPUS_FORMAT.md
+ D spec/SPEC_MATCHID_ELASTIC_PARITY_EXIT_CRITERIA.md
+ D spec/SPEC_MATCHID_PERFORMANCE_PARITY_HARNESS.md
+ D spec/SPEC_MATCHID_PERF_WORKLOAD_PROFILE.md
+ D spec/SPEC_MATCHID_QUERY_SURFACE.md
+ D spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md
+ D spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md
+ D spec/SPEC_SECURITY_AND_TESTING_BASELINE.md
+ M surch-api/src/main.rs
+ M surch-core/src/search/query/bool_query.rs
+ M surch-core/src/storage/index_store.rs
+ M surch-core/src/storage/writer.rs
+?? .dockerignore
+?? Dockerfile
+?? Makefile
+?? docs/
+?? plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md
+?? spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md

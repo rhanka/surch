@@ -1,0 +1,14 @@
+[package]
+name = "surch-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+surch-index = { path = "../surch-index" }
+surch-store = { path = "../surch-store" }
+surch-types = { path = "../surch-types" }
+thiserror = { workspace = true }

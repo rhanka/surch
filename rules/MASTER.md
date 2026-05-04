@@ -11,8 +11,9 @@ This file defines rule priority and mandatory read order for Surch.
 3. `rules/MASTER.md`
 4. `rules/workflow.md`
 5. `PLAN.md`
-6. Active branch file in `plan/NN_BRANCH_*.md`
-7. Relevant `spec/*.md`
+6. `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
+7. Active parity ticket or branch execution file
+8. Relevant `spec/*.md`
 8. Specialized helper rules:
    - `rules/testing.md`
    - `rules/security.md`
@@ -24,9 +25,10 @@ This file defines rule priority and mandatory read order for Surch.
 ## Core Principles
 
 - Surch is conductor-driven.
-- Branch files are execution contracts, not optional notes.
-- Specs live in `spec/`.
-- `PLAN.md` indexes branches and status; branch detail belongs in `plan/`.
+- Portage tickets are execution contracts, not optional notes.
+- Specs live in `spec/`; reference reports live in `docs/portage/`.
+- `PLAN.md` defines phase order and source documents.
+- `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md` defines ticket shape and execution flow.
 - Rust-native verification is mandatory.
 - Generic helper skills may assist, but may not redefine project structure.
 
@@ -36,13 +38,14 @@ This file defines rule priority and mandatory read order for Surch.
 2. `rules/MASTER.md`
 3. `rules/workflow.md`
 4. `PLAN.md`
-5. the active `plan/NN_BRANCH_*.md`
-6. relevant `spec/*.md`
-7. helper rules needed for the task
+5. `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
+6. the active parity ticket or branch execution file
+7. relevant `spec/*.md`
+8. helper rules needed for the task
 
 ## Prohibited Behavior
 
-- inventing an alternate planning structure when branch files already exist
+- inventing an alternate planning structure when the portage ledger already defines the ticket contract
 - using a skill-driven folder layout that conflicts with repo conventions
 - bypassing verification and merge gates
-- expanding scope without recording it in the active branch file
+- expanding scope without recording it in the active parity ticket

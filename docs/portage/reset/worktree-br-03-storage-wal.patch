@@ -1,0 +1,238 @@
+diff --git a/plan/03_BRANCH_storage-wal-segments-and-docstore.md b/plan/03_BRANCH_storage-wal-segments-and-docstore.md
+index 022e88d..8fc2393 100644
+--- a/plan/03_BRANCH_storage-wal-segments-and-docstore.md
++++ b/plan/03_BRANCH_storage-wal-segments-and-docstore.md
+@@ -29,8 +29,8 @@
+ - `spec/**` only if implementation reveals a storage assumption that changes documented behavior
+ 
+ ## Dependency Gates
+-- [ ] BR-01 syntax constraints reviewed
+-- [ ] storage file layout approach agreed
++- [x] BR-01 syntax constraints reviewed
++- [x] storage file layout approach agreed
+ 
+ ## Environment Mapping
+ - Worktree: `tmp/br-03-storage-wal`
+@@ -39,16 +39,16 @@
+ 
+ ## Plan / Lots / Todo
+ 
+-- [ ] **Lot 0 - Read and confirm contract**
+-  - [ ] Review current `wal.rs`, `segment.rs`, `reader.rs`, `writer.rs`, `index_store.rs`
+-  - [ ] Confirm on-disk shape to keep MVP minimal
++- [x] **Lot 0 - Read and confirm contract**
++  - [x] Review current `wal.rs`, `segment.rs`, `reader.rs`, `writer.rs`, `index_store.rs`
++  - [x] Confirm on-disk shape to keep MVP minimal
+ 
+-- [ ] **Lot 1 - WAL append and replay**
+-  - [ ] Make WAL append explicit and deterministic
+-  - [ ] Add replay path for restart/recovery
+-  - [ ] Add unit tests for append, flush, replay, and empty log
+-  - [ ] Lot gate:
+-    - [ ] `cargo test -p surch-core storage::wal`
++- [x] **Lot 1 - WAL append and replay**
++  - [x] Make WAL append explicit and deterministic
++  - [x] Add replay path for restart/recovery
++  - [x] Add unit tests for append, flush, replay, and empty log
++  - [x] Lot gate:
++    - [x] `cargo test -p surch-core storage::wal`
+ 
+ - [ ] **Lot 2 - Segment metadata and docstore**
+   - [ ] Tighten segment metadata behavior
+@@ -67,16 +67,17 @@
+ 
+ ## Feedback Loop
+ - Raise `attention` if a required shared type change expands beyond `surch-core/src/common/**`
++- attention: WAL persistence shape for MVP is a fixed `wal/wal.jsonl` file with one JSON entry per line; segment/docstore persistence remains pending in Lot 2.
+ 
+ ## Tests Required
+ - Unit: WAL append/replay, segment metadata, docstore round-trip
+ - Integration: recovery after restart simulation
+ 
+ ## Security Checks
+-- [ ] No path traversal or unsafe file naming introduced
+-- [ ] Corruption and empty-state handling reviewed
++- [x] No path traversal or unsafe file naming introduced
++- [x] Corruption and empty-state handling reviewed
+ 
+ ## Merge Checklist
+-- [ ] WAL replay works
++- [x] WAL replay works
+ - [ ] Docstore round-trip works
+ - [ ] Storage tests pass
+diff --git a/surch-core/src/storage/wal.rs b/surch-core/src/storage/wal.rs
+index 7b97616..69a1b83 100644
+--- a/surch-core/src/storage/wal.rs
++++ b/surch-core/src/storage/wal.rs
+@@ -1,10 +1,15 @@
+ use super::error::Error;
+-use crate::common::{Document, FieldValue};
++use crate::common::Document;
+ use parking_lot::RwLock;
++use serde::{Deserialize, Serialize};
++use std::fs::File;
++use std::io::{BufRead, BufReader, Write};
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+-#[derive(Debug, Clone)]
++const WAL_FILE_NAME: &str = "wal.jsonl";
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct WalEntry {
+     pub seq: u64,
+     pub index: String,
+@@ -13,7 +18,7 @@ pub struct WalEntry {
+     pub timestamp: i64,
+ }
+ 
+-#[derive(Debug, Clone)]
++#[derive(Debug, Clone, Serialize, Deserialize)]
+ pub enum WalOperation {
+     Index(Document),
+     Delete { doc_id: String },
+@@ -30,11 +35,13 @@ impl WriteAheadLog {
+     pub fn new(path: impl Into<PathBuf>) -> Result<Self, Error> {
+         let path = path.into();
+         std::fs::create_dir_all(&path)?;
++        let entries = Self::load_entries(&path)?;
++        let current_seq = entries.last().map(|entry| entry.seq).unwrap_or(0);
+ 
+         Ok(Self {
+             path,
+-            entries: Arc::new(RwLock::new(Vec::new())),
+-            current_seq: Arc::new(RwLock::new(0)),
++            entries: Arc::new(RwLock::new(entries)),
++            current_seq: Arc::new(RwLock::new(current_seq)),
+         })
+     }
+ 
+@@ -72,8 +79,42 @@ impl WriteAheadLog {
+     }
+ 
+     pub fn flush(&self) -> Result<(), Error> {
++        let wal_path = self.path.join(WAL_FILE_NAME);
++        let mut file = File::create(wal_path)?;
++
++        for entry in self.entries.read().iter() {
++            serde_json::to_writer(&mut file, entry)
++                .map_err(|err| Error::Serialization(err.to_string()))?;
++            file.write_all(b"\n")?;
++        }
++
++        file.flush()?;
+         Ok(())
+     }
++
++    fn load_entries(path: &std::path::Path) -> Result<Vec<WalEntry>, Error> {
++        let wal_path = path.join(WAL_FILE_NAME);
++        if !wal_path.exists() {
++            return Ok(Vec::new());
++        }
++
++        let file = File::open(wal_path)?;
++        let reader = BufReader::new(file);
++        let mut entries = Vec::new();
++
++        for line in reader.lines() {
++            let line = line?;
++            if line.trim().is_empty() {
++                continue;
++            }
++
++            let entry = serde_json::from_str::<WalEntry>(&line)
++                .map_err(|err| Error::Corruption(err.to_string()))?;
++            entries.push(entry);
++        }
++
++        Ok(entries)
++    }
+ }
+ 
+ #[derive(Clone)]
+@@ -124,3 +165,85 @@ impl Default for WalManager {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{WalOperation, WriteAheadLog};
++    use crate::common::{Document, FieldValue};
++    use tempfile::tempdir;
++
++    fn sample_document(id: &str) -> Document {
++        Document::new(id).with_field("title", FieldValue::Text("hello wal".to_string()))
++    }
++
++    #[test]
++    fn replays_flushed_entries_after_reopen() {
++        let temp_dir = tempdir().expect("temp dir");
++        let wal = WriteAheadLog::new(temp_dir.path()).expect("create wal");
++
++        wal.append("books", "doc-1", WalOperation::Index(sample_document("doc-1")))
++            .expect("append first entry");
++        wal.append(
++            "books",
++            "doc-1",
++            WalOperation::Delete {
++                doc_id: "doc-1".to_string(),
++            },
++        )
++        .expect("append delete entry");
++
++        wal.flush().expect("flush wal");
++
++        let reopened = WriteAheadLog::new(temp_dir.path()).expect("reopen wal");
++        let entries = reopened.read_all();
++
++        assert_eq!(entries.len(), 2);
++        assert_eq!(entries[0].seq, 1);
++        assert_eq!(entries[1].seq, 2);
++        assert_eq!(entries[0].index, "books");
++        assert_eq!(entries[0].doc_id, "doc-1");
++
++        match &entries[0].operation {
++            WalOperation::Index(doc) => {
++                assert_eq!(doc.id, "doc-1");
++                assert_eq!(doc.get_text("title"), Some("hello wal".to_string()));
++            }
++            other => panic!("expected index operation, got {other:?}"),
++        }
++
++        match &entries[1].operation {
++            WalOperation::Delete { doc_id } => assert_eq!(doc_id, "doc-1"),
++            other => panic!("expected delete operation, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn append_continues_sequence_after_replay() {
++        let temp_dir = tempdir().expect("temp dir");
++        let wal = WriteAheadLog::new(temp_dir.path()).expect("create wal");
++
++        wal.append("books", "doc-1", WalOperation::Index(sample_document("doc-1")))
++            .expect("append first entry");
++        wal.flush().expect("flush wal");
++
++        let reopened = WriteAheadLog::new(temp_dir.path()).expect("reopen wal");
++        let next_seq = reopened
++            .append("books", "doc-2", WalOperation::Index(sample_document("doc-2")))
++            .expect("append after replay");
++
++        assert_eq!(next_seq, 2);
++    }
++
++    #[test]
++    fn reopening_empty_wal_returns_no_entries() {
++        let temp_dir = tempdir().expect("temp dir");
++
++        let wal = WriteAheadLog::new(temp_dir.path()).expect("create wal");
++        assert!(wal.read_all().is_empty());
++
++        wal.flush().expect("flush wal");
++
++        let reopened = WriteAheadLog::new(temp_dir.path()).expect("reopen wal");
++        assert!(reopened.read_all().is_empty());
++    }
++}

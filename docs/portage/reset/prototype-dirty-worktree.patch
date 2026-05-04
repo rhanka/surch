@@ -1,0 +1,3401 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..988e926
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,14 @@
++.git
++.gitignore
++target
++**/target
++
++
++*.swp
++*.tmp
++
++.env
++.env.*
++
++.idea
++.vscode
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1592333..c7310f8 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,14 @@
+ # Changelog
+ 
++## [Unreleased]
++
++### Changed
++- Replaced the previous branch/spec roadmap with a clean OpenSearch + Lucene Rust portage plan.
++- Added upstream reference tracking for cloned OpenSearch and Lucene commits.
++- Added graphify reports for focused LuceneCore and OpenSearchCore reference corpora.
++- Defined a golden-test-first autonomous execution model for function-level parity work.
++- Added a clean restart housekeeping phase for archiving the prototype, stale worktrees, runtime artifacts, and old governance references before rebuilding from a blank workspace.
++
+ ## [0.1.0] - 2026-04-25
+ 
+ ### Added
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..e2317c2
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,56 @@
++# syntax=docker/dockerfile:1
++
++ARG RUST_VERSION=1.85.0
++
++FROM rust:${RUST_VERSION}-bookworm AS builder
++
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends \
++        ca-certificates \
++        pkg-config \
++        libssl-dev \
++    && rm -rf /var/lib/apt/lists/*
++
++WORKDIR /app
++
++COPY Cargo.toml Cargo.lock ./
++COPY surch-core/Cargo.toml surch-core/Cargo.toml
++COPY surch-api/Cargo.toml surch-api/Cargo.toml
++
++RUN mkdir -p surch-core/src surch-api/src \
++    && printf '%s\n' 'pub fn _placeholder() {}' > surch-core/src/lib.rs \
++    && printf '%s\n' 'fn main() {}' > surch-api/src/main.rs \
++    && cargo build -p surch-api --release --locked \
++    && rm -rf surch-core/src surch-api/src
++
++COPY surch-core/src surch-core/src
++COPY surch-api/src surch-api/src
++
++RUN cargo build -p surch-api --release --locked
++
++FROM builder AS test
++RUN cargo test --locked
++
++FROM debian:bookworm-slim AS runtime
++
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends \
++        ca-certificates \
++        libssl3 \
++    && rm -rf /var/lib/apt/lists/* \
++    && useradd -m -u 10001 -s /usr/sbin/nologin surch
++
++WORKDIR /app
++
++COPY --from=builder /app/target/release/surch /usr/local/bin/surch
++
++RUN mkdir -p /app/data \
++    && chown -R surch:surch /app
++
++USER surch
++
++ENV RUST_LOG=info
++EXPOSE 9200
++VOLUME ["/app/data"]
++
++ENTRYPOINT ["/usr/local/bin/surch"]
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..a83ad41
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,86 @@
++IMAGE ?= surch:dev
++RUST_VERSION ?= 1.85.0
++DOCKER ?= docker
++
++BUILDER_IMAGE ?= $(IMAGE)-builder
++
++CARGO_REGISTRY_VOL ?= surch-cargo-registry
++CARGO_GIT_VOL ?= surch-cargo-git
++CARGO_TARGET_VOL ?= surch-target
++
++.PHONY: help build test run docker-builder docker-build docker-test docker-run docker-sh docker-fmt docker-clippy docker-clean host-test host-build host-run dev dev-watch
++
++help:
++	@printf '%s\n' \
++		'make build          Build runtime image' \
++		'make test           Run cargo test in Docker' \
++		'make run            Run API on localhost:9200 (mount ./data)' \
++		'make dev            Run API on host (debug, RUST_LOG=debug)' \
++		'make dev-watch      Auto-reload on changes (requires cargo-watch)' \
++		'make docker-sh      Shell in builder container' \
++		'make docker-fmt     Run cargo fmt in Docker' \
++		'make docker-clippy  Run cargo clippy in Docker' \
++		'make host-build     cargo build -p surch-api' \
++		'make host-run       Run API on host (release)' \
++		'make host-test      Run cargo test on host'
++
++build: docker-build
++
++test: docker-test
++
++run: docker-run
++
++docker-builder:
++	$(DOCKER) build --build-arg RUST_VERSION=$(RUST_VERSION) --target builder -t $(BUILDER_IMAGE) .
++
++docker-build:
++	$(DOCKER) build --build-arg RUST_VERSION=$(RUST_VERSION) -t $(IMAGE) .
++
++docker-test:
++	$(DOCKER) build --build-arg RUST_VERSION=$(RUST_VERSION) --target test .
++
++docker-run: docker-build
++	mkdir -p ./data
++	$(DOCKER) run --rm -p 9200:9200 -v $(PWD)/data:/app/data $(IMAGE)
++
++docker-sh: docker-builder
++	$(DOCKER) run --rm -it \
++		-v $(PWD):/app -w /app \
++		-v $(CARGO_REGISTRY_VOL):/usr/local/cargo/registry \
++		-v $(CARGO_GIT_VOL):/usr/local/cargo/git \
++		-v $(CARGO_TARGET_VOL):/app/target \
++		--entrypoint bash \
++		$(BUILDER_IMAGE)
++
++docker-fmt: docker-builder
++	$(DOCKER) run --rm -v $(PWD):/app -w /app $(BUILDER_IMAGE) cargo fmt --all
++
++docker-clippy: docker-builder
++	$(DOCKER) run --rm \
++		-v $(PWD):/app -w /app \
++		-v $(CARGO_REGISTRY_VOL):/usr/local/cargo/registry \
++		-v $(CARGO_GIT_VOL):/usr/local/cargo/git \
++		-v $(CARGO_TARGET_VOL):/app/target \
++		$(BUILDER_IMAGE) cargo clippy --all-targets --all-features -- -D warnings
++
++docker-clean:
++	$(DOCKER) rmi -f $(IMAGE) $(BUILDER_IMAGE) 2>/dev/null || true
++	$(DOCKER) volume rm -f $(CARGO_REGISTRY_VOL) $(CARGO_GIT_VOL) $(CARGO_TARGET_VOL) 2>/dev/null || true
++
++host-test:
++	cargo test
++
++host-build:
++	cargo build -p surch-api
++
++host-run:
++	mkdir -p ./data
++	cargo run -p surch-api --release
++
++dev:
++	mkdir -p ./data
++	RUST_LOG=debug cargo run -p surch-api
++
++dev-watch:
++	mkdir -p ./data
++	@command -v cargo-watch >/dev/null 2>&1 && RUST_LOG=debug cargo watch -x 'run -p surch-api' || (echo 'cargo-watch not found; install with: cargo install cargo-watch' && exit 1)
+diff --git a/PLAN.md b/PLAN.md
+index 5516ed7..3623c9d 100644
+--- a/PLAN.md
++++ b/PLAN.md
+@@ -1,240 +1,110 @@
+-# PLAN - Surch Orchestrated Roadmap
+-
+-Status: Updated 2026-04-25. Governance refit in progress. Branch-centered execution model adopted. Source branch files live in `plan/01_BRANCH_*.md` onward. Governing spec: `spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md`.
+-
+-## 1) Current State
+-
+-**Completed governance milestones:**
+-- `docs(plan): add governance documentation design spec` (`b4a2f7e`)
+-- `docs(plan): align governance spec with entropic structure` (`eb19d91`)
+-
+-**Current engineering baseline:**
+-- Rust workspace scaffold exists: `surch-core`, `surch-api`
+-- Initial storage, indexer, search, and API skeletons exist
+-- Governance and execution model were previously underspecified
+-
+-**Current conductor decision:**
+-- adopt Entropic-like branch orchestration adapted for Rust
+-- use `PLAN.md` as conductor index
+-- use numbered branch files in `plan/` as execution source of truth per branch
+-- cap parallel execution at 4 subagents
+-- treat OpenSearch spec harvesting as a first-class prerequisite
+-
+-## 2) MVP Contract
+-
+-**In scope:**
+-- index creation and deletion
+-- document CRUD and bulk indexing
+-- mappings and analyzers for MVP field types
+-- Query DSL core: `match`, `match_phrase`, `multi_match`, `term`, `terms`, `range`, `exists`, `bool`, `prefix`, `wildcard`, `regexp`, `fuzzy`
+-- search endpoint compatibility
+-- fuzzy behavior up to edit distance 2
+-- storage durability sufficient for single-node MVP
+-
+-**Out of scope for MVP:**
+-- full analytics and advanced aggregations
+-- clustering and replication
+-- snapshots and restore
+-- plugin system
+-- production-grade authn/authz beyond foundations
+-
+-## 3) Operating Model
+-
+-### Source Of Truth Order
+-1. Direct user instructions
+-2. `AGENTS.md`
+-3. `rules/MASTER.md`
+-4. `rules/workflow.md`
+-5. `PLAN.md`
+-6. `plan/NN_BRANCH_*.md`
+-7. `spec/*.md`
+-8. Helper rules such as `rules/testing.md`, `rules/security.md`, `rules/dev-env.md`, `rules/subagents.md`, `rules/superpowers.md`
+-
+-### Drumbeat
+-For Surch, drumbeat means continuous forward motion:
+-- keep conductor continuity until the current governance or implementation slice is complete
+-- move lot by lot
+-- surface blockers immediately
+-- do not stall in abstract analysis once the next concrete step is known
+-
+-### Parallelism Cap
+-- maximum 4 active subagents at once
+-- one subagent owns one branch at a time
+-- conductor remains sole integrator
+-
+-## 4) Spec Harvesting Matrix
+-
+-| Surface | Primary Spec File | Status | Notes |
+-|---|---|---|---|
+-| Index + Document APIs | `spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md` | confirmed | Confirmed by BR-01, ready for BR-03, BR-04, and BR-06 consumption |
+-| Search + Query DSL | `spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md` | confirmed | Confirmed by BR-02, ready for BR-05 and BR-07 consumption |
+-| Security + Testing Baseline | `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md` | drafted | Used as governance input and release gate baseline |
+-| MatchID Elastic Parity Exit Criteria | `spec/SPEC_MATCHID_ELASTIC_PARITY_EXIT_CRITERIA.md` | drafted | Final acceptance target is Elastic parity in MatchID context, not full MatchID cloning |
+-| Governance Orchestration | `spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md` | active | Governs this repo structure |
+-
+-Status vocabulary:
+-- `unread`
+-- `drafted`
+-- `confirmed`
+-- `implemented`
+-- `verified`
+-
+-## 5) Branch Catalog
+-
+-| ID | Branch | Owner | Status | Depends On | File |
+-|---|---|---|---|---|---|
+-| BR-01 | `feature/BR-01-spec-harvest-index-doc-api` | #4 APIServer | ready | — | `plan/01_BRANCH_spec-harvest-index-and-document-apis.md` |
+-| BR-02 | `feature/BR-02-spec-harvest-search-query-dsl` | #3 SearchEngine | ready | — | `plan/02_BRANCH_spec-harvest-search-and-query-dsl.md` |
+-| BR-03 | `feature/BR-03-storage-wal-segments-docstore` | #1 StorageEngine | ready | BR-01 | `plan/03_BRANCH_storage-wal-segments-and-docstore.md` |
+-| BR-04 | `feature/BR-04-indexer-mappings-analyzers-bulk` | #2 Indexer | ready | BR-01, BR-03 | `plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md` |
+-| BR-05 | `feature/BR-05-search-query-exec-fuzzy` | #3 SearchEngine | ready | BR-02, BR-03, BR-04 | `plan/05_BRANCH_search-query-execution-and-fuzzy.md` |
+-| BR-06 | `feature/BR-06-api-index-document-compat` | #4 APIServer | ready | BR-01, BR-03, BR-04 | `plan/06_BRANCH_api-index-and-document-compat.md` |
+-| BR-07 | `feature/BR-07-api-search-compat-integration` | #4 APIServer | ready | BR-02, BR-05, BR-06 | `plan/07_BRANCH_api-search-compat-and-integration.md` |
+-| BR-08 | `release/v0.1.0-mvp` | Conductor | blocked | BR-03, BR-04, BR-05, BR-06, BR-07, BR-09, BR-10 | `plan/08_BRANCH_release-hardening-and-security-gates.md` |
+-| BR-09 | `feature/BR-09-matchid-elastic-parity-corpus` | Conductor | active | BR-08 | `plan/09_BRANCH_matchid_elastic_parity_corpus_and_comparator.md` |
+-| BR-10 | `feature/BR-10-matchid-performance-parity` | Conductor | active | BR-08 | `plan/10_BRANCH_matchid_performance_parity_harness.md` |
+-
+-## 6) Dependency Graph
+-
+-```mermaid
+-graph TD
+-  BR01[BR-01 Index+Doc API Spec Harvest]
+-  BR02[BR-02 Search+Query DSL Spec Harvest]
+-  BR03[BR-03 Storage WAL Segments Docstore]
+-  BR04[BR-04 Indexer Mappings Analyzers Bulk]
+-  BR05[BR-05 Search Query Execution Fuzzy]
+-  BR06[BR-06 API Index Document Compat]
+-  BR07[BR-07 API Search Compat Integration]
+-  BR08[BR-08 Release Hardening Security Gates]
+-
+-  BR01 --> BR03
+-  BR01 --> BR04
+-  BR02 --> BR05
+-  BR03 --> BR04
+-  BR03 --> BR05
+-  BR04 --> BR05
+-  BR01 --> BR06
+-  BR03 --> BR06
+-  BR04 --> BR06
+-  BR02 --> BR07
+-  BR05 --> BR07
+-  BR06 --> BR07
+-  BR03 --> BR08
+-  BR04 --> BR08
+-  BR05 --> BR08
+-  BR06 --> BR08
+-  BR07 --> BR08
+-```
++# Surch Portage Plan
+ 
+-## 7) Wave Sequencing
++Date: 2026-05-04
+ 
+-### Wave 0 - Spec Confirmation
+-- BR-01
+-- BR-02
++## Objective
+ 
+-Goal:
+-- lock exact MVP syntax and response shape before implementation branches diverge
++Rebuild Surch from a clean planning baseline as a Rust port of OpenSearch plus Lucene, with function-level traceability to upstream source, compatibility tests, and autonomous subagent execution.
+ 
+-### Wave 1 - Core Engine Foundations
+-- BR-03
+-- BR-04
++The current Rust prototype remains only as migration context. It is not the target architecture.
+ 
+-Goal:
+-- durable write path
+-- mapping and analyzer contract aligned with indexed representation
++## Upstream References
+ 
+-### Wave 2 - Search And API Vertical Slice
+-- BR-05
+-- BR-06
++- OpenSearch clone: `/tmp/surch-portage-references/opensearch`
++- OpenSearch commit: `fead3a928236b61f9c759c61e738b541a148ab9f`
++- Lucene clone: `/tmp/surch-portage-references/lucene`
++- Lucene commit: `7691b7ef9cfe3b87178646f4f32b3854afa0a567`
++- Graphify reports copied under `docs/portage/graphify/`
++- Full graph outputs remain in `/tmp/surch-portage-graph-corpora/*/.graphify/`
+ 
+-Goal:
+-- executable search semantics
+-- index/document API compatibility
++## Target Architecture
+ 
+-### Wave 3 - Integration And Release
+-- BR-07
+-- BR-08
++The target workspace is split by porting boundary, not by prototype convenience:
+ 
+-Goal:
+-- search API compatibility
+-- integration tests
+-- hardening and release gate
++```text
++crates/
++  surch-types/        # OpenSearch JSON/API types, documents, errors
++  surch-analysis/     # Lucene analyzer/token stream model
++  surch-codec/        # Lucene codec utilities, binary formats, checksums
++  surch-store/        # Directory, translog, manifests, segments, docstore
++  surch-index/        # mappings, indexing chain, postings, term dictionary
++  surch-search/       # Lucene query model, scorers, collectors, fuzzy automata
++  surch-api/          # Axum REST API compatible with OpenSearch
++```
+ 
+-## 8) Branch Execution Rules
++Existing `surch-core` and `surch-api` prototype crates must be archived out of the active workspace before new implementation work starts. New feature work lands in `crates/*`.
+ 
+-- every real implementation branch must have a corresponding `plan/NN_BRANCH_*.md`
+-- every branch file must define allowed and forbidden paths
+-- branch files own the detailed lots and validation checklists
+-- `PLAN.md` tracks dependencies, status, and wave sequencing only
+-- no branch may silently expand scope beyond its file contract
++## Execution Rule
+ 
+-## 9) Feedback Loop Types
++Every feature ticket must be traceable to upstream:
+ 
+-- `blocked`: missing prerequisite or unresolved dependency
+-- `attention`: risk, ambiguity, or expected drift
+-- `spec-mismatch`: behavior or syntax differs from harvested spec
+-- `security-alert`: abuse path, validation gap, or risky dependency
+-- `clarification`: conductor or user decision required
++```text
++Epic -> Capability -> Feature -> Function/API -> Golden scenario
++```
+ 
+-All active feedback items must be recorded in the branch file before merge.
++No ticket is ready unless it includes:
+ 
+-## 10) Verification Gates
++- upstream repository, commit, file, class, and method or REST spec
++- owner subagent
++- dependencies
++- allowed paths and forbidden paths
++- failing golden test against Surch and passing oracle against upstream
++- unit, integration, security, and parity gates
+ 
+-### Required Before Merge
+-- `cargo fmt --all`
+-- `cargo clippy --workspace --all-targets --all-features`
+-- relevant unit tests
+-- relevant integration tests
+-- branch checklist complete
+-- no unresolved blocker in branch file
++## Phase Order
+ 
+-### Required Before Release
+-- full workspace tests
+-- compatibility smoke on documented endpoints
+-- fuzzy behavior checks
+-- documented security review against `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md`
+-- release branch checklist complete
++0. Clean restart housekeeping: archive current prototype state, remove obsolete branch plans, remove stale worktrees, clear runtime/build artifacts, and leave only governance plus upstream references.
++1. Reference harness and blank workspace reset.
++2. Lucene store, codec utilities, segment metadata.
++3. Lucene postings, term dictionary, writer, reader, stored fields, doc values.
++4. Lucene analysis, search model, BM25, collectors, automata, fuzzy query.
++5. OpenSearch REST contracts, response rendering, errors, mappings/settings.
++6. OpenSearch document, update, delete, get, bulk, refresh, translog semantics.
++7. OpenSearch Query DSL, search responses, sorting, pagination, fuzzy signature.
++8. P1/P2 compatibility, admin endpoints, security, performance, release parity.
+ 
+-## 11) Security Gate Summary
++## Clean Restart Housekeeping
+ 
+-The MVP release must reject known avoidable gaps in these areas:
+-- unbounded request body size
+-- unbounded wildcard or regex execution
+-- missing validation for core API payloads
+-- dependency vulnerabilities with no documented mitigation path
++Before implementation starts, the conductor must make the repository intentionally blank for the new port while preserving recoverability:
+ 
+-Detailed baseline: `spec/SPEC_SECURITY_AND_TESTING_BASELINE.md` and `rules/security.md`.
++- record `git status --short`, `git diff --stat`, and `git worktree list` in `docs/portage/reset/RESET_INVENTORY.md`
++- create an archive branch named `archive/prototype-before-portage-2026-05-04` from the current `develop` tip
++- save a patch of uncommitted user/prototype changes to `docs/portage/reset/prototype-dirty-worktree.patch`
++- remove obsolete `plan/01_BRANCH_*.md`, old `spec/SPEC_*.md`, and old branch prompt/template files
++- remove stale `.worktrees/br-*` only after confirming they have no unique commits not reachable from named branches
++- move or delete prototype implementation crates from the active workspace before creating `crates/*`
++- remove runtime/build artifacts from version consideration: `target/`, `data/`, `.worktrees/runtime-surch/`, generated captures, and local caches
++- rewrite README claims so the repo states "portage in progress" until parity gates prove compatibility
++- update `rules/MASTER.md` and related governance docs so they point at the new `PLAN.md`, `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`, and `spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md`
++- require a clean `git status --short` except for the intentionally staged reset commit before spawning feature subagents
+ 
+-## 12) Final Exit Criteria
++## Subagent Allocation
+ 
+-The final project target is not to clone MatchID as a whole application.
++- `#1 StorageEngine`: `surch-codec`, `surch-store`, Lucene segment/commit/translog foundations.
++- `#2 Indexer`: `surch-analysis`, `surch-index`, mappings, field types, indexing chain.
++- `#3 SearchEngine`: `surch-search`, Query DSL execution, BM25, fuzzy automata, collectors.
++- `#4 APIServer`: `surch-types`, `surch-api`, REST compatibility, request/response rendering.
+ 
+-The final target is to replace Elasticsearch in the MatchID usage context with Surch, with:
+-- zero accepted search gap on the agreed corpus
+-- no performance regression versus Elasticsearch baseline
++Maximum active work in parallel: four subagents, one feature per subagent.
+ 
+-Reference spec: `spec/SPEC_MATCHID_ELASTIC_PARITY_EXIT_CRITERIA.md`.
++## Gates
+ 
+-## 13) Superpowers Framing
++Each branch must pass:
+ 
+-Superpowers skills are allowed only as helpers.
+-
+-They must not:
+-- override Surch branch structure
+-- relocate specs away from `spec/`
+-- replace branch execution files with their own format
+-- bypass branch scope boundaries or verification gates
+-
+-Project-specific framing is defined in `rules/superpowers.md`.
++- `cargo fmt --all`
++- `cargo clippy --workspace --all-targets --all-features`
++- targeted unit tests
++- targeted integration tests
++- targeted golden parity tests
++- unsafe scan with documented exception for any `unsafe`
++- dependency/security scan once `cargo-audit` or `cargo-deny` is configured
+ 
+-## 14) Next Working Set
++PRs target `develop`. `main` is release-only.
+ 
+-Immediate repo goals:
+-- finalize governance docs
+-- finalize branch template and subagent prompt
+-- finalize ruleset
+-- lock branch files BR-01 through BR-08
++## Source Documents
+ 
+-After that:
+-- launch BR-01 and BR-02 first
+-- then proceed wave by wave
++- Portage spec: `spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md`
++- Autonomous execution plan: `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
++- Reference inventory: `docs/portage/REFERENCES.md`
++- Superpowers design: `docs/superpowers/specs/2026-05-04-opensearch-lucene-rust-port-design.md`
++- Superpowers plan: `docs/superpowers/plans/2026-05-04-opensearch-lucene-rust-portage.md`
+diff --git a/README.md b/README.md
+index 77e6bf2..9d1db29 100644
+--- a/README.md
++++ b/README.md
+@@ -12,14 +12,23 @@ A 100% Rust search engine replicating OpenSearch/Lucene functionality.
+ ## Quick Start
+ 
+ ```bash
+-# Build
++# Build (local)
+ cargo build --release
+ 
+-# Run
++# Run (local)
+ cargo run --release
+ 
+-# Test
++# Test (local)
+ cargo test
++
++# Build/Test/Run via Docker (no host deps)
++make build
++make test
++make run
++
++# Dev on host
++make dev
++make dev-watch
+ ```
+ 
+ ## API Examples
+diff --git a/docs/portage/REFERENCES.md b/docs/portage/REFERENCES.md
+new file mode 100644
+index 0000000..9225cc7
+--- /dev/null
++++ b/docs/portage/REFERENCES.md
+@@ -0,0 +1,75 @@
++# Portage References
++
++Date: 2026-05-04
++
++## Clones
++
++OpenSearch:
++
++- Path: `/tmp/surch-portage-references/opensearch`
++- Commit: `fead3a928236b61f9c759c61e738b541a148ab9f`
++- Full graphify detect: 12,952 files, approximately 9,050,705 words
++- Full AST extraction: 148,786 nodes, 365,877 edges
++- Full report finalization was too large for a practical interactive run, so a targeted graph was produced.
++
++Lucene:
++
++- Path: `/tmp/surch-portage-references/lucene`
++- Commit: `7691b7ef9cfe3b87178646f4f32b3854afa0a567`
++- Full graphify detect: 5,998 files, approximately 5,725,114 words
++- Full AST extraction: 70,874 nodes, 150,878 edges
++- Full report finalization was too large for a practical interactive run, so a targeted graph was produced.
++
++## Targeted Graphify Outputs
++
++Lucene core corpus:
++
++- Corpus path: `/tmp/surch-portage-graph-corpora/lucene-core`
++- Included files: 204
++- Graph: 2,964 nodes, 4,701 edges
++- Report copied to `docs/portage/graphify/lucene-core/GRAPH_REPORT.md`
++- Runtime proof copied to `docs/portage/graphify/lucene-core/runtime.json`
++- Full interactive graph remains at `/tmp/surch-portage-graph-corpora/lucene-core/.graphify/graph.html`
++- Raw graph remains at `/tmp/surch-portage-graph-corpora/lucene-core/.graphify/graph.json`
++
++OpenSearch core corpus:
++
++- Corpus path: `/tmp/surch-portage-graph-corpora/opensearch-core`
++- Included files: 238
++- Graph: 3,813 nodes, 5,996 edges
++- Report copied to `docs/portage/graphify/opensearch-core/GRAPH_REPORT.md`
++- Runtime proof copied to `docs/portage/graphify/opensearch-core/runtime.json`
++- Full interactive graph remains at `/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/graph.html`
++- Raw graph remains at `/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/graph.json`
++
++Both runtime proofs state `"runtime": "typescript"`.
++
++## Graphify Findings Used In The Plan
++
++Lucene god nodes:
++
++- `IndexWriter`
++- `SegmentInfos`
++- `RegExp`
++- `IndexWriterConfig`
++- `FieldInfo`
++- `FieldType`
++- `SegmentCommitInfo`
++- `IndexSearcher`
++- `MemorySegmentIndexInput`
++- `Automaton`
++
++OpenSearch god nodes:
++
++- `InternalEngine`
++- `Engine`
++- `SearchRequestBuilder`
++- `UpdateRequest`
++- `QueryBuilders`
++- `AbstractSearchAsyncAction`
++- `SearchModule`
++- `SearchRequest`
++- `IndexRequest`
++- `FieldMapper`
++
++These nodes define the first backlog anchors: storage/index writer, segment metadata, automata/fuzzy, engine lifecycle, query registry, action routing, request parsing, and field mapping.
+diff --git a/docs/portage/graphify/lucene-core/GRAPH_REPORT.md b/docs/portage/graphify/lucene-core/GRAPH_REPORT.md
+new file mode 100644
+index 0000000..fef590a
+--- /dev/null
++++ b/docs/portage/graphify/lucene-core/GRAPH_REPORT.md
+@@ -0,0 +1,485 @@
++# Graph Report - .  (2026-05-04)
++
++## Corpus Check
++- Large corpus: 204 files · ~221,403 words. Semantic extraction will be expensive (many Claude tokens). Consider running on a subfolder, or use --no-semantic to run AST-only.
++
++## Summary
++- 2964 nodes · 4701 edges · 87 communities detected
++- Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS
++- Token cost: 0 input · 0 output
++
++
++## Input Scope
++- Requested: all
++- Resolved: all (source: cli)
++- Included files: 204 · Candidates: recursive
++- Excluded: 0 untracked · 0 ignored · 7 sensitive · 0 missing committed
++## God Nodes (most connected - your core abstractions)
++1. `IndexWriter` - 164 edges
++2. `SegmentInfos` - 55 edges
++3. `RegExp` - 48 edges
++4. `IndexWriterConfig` - 44 edges
++5. `FieldInfo` - 41 edges
++6. `FieldType` - 39 edges
++7. `SegmentCommitInfo` - 39 edges
++8. `IndexSearcher` - 39 edges
++9. `MemorySegmentIndexInput` - 36 edges
++10. `Automaton` - 31 edges
++
++## Surprising Connections (you probably didn't know these)
++- `Analyzer` --implements--> `Closeable`  [EXTRACTED]
++  lucene/core/src/java/org/apache/lucene/analysis/Analyzer.java →   _Bridges community 31 → community 1_
++- `StringTokenStream` --inherits--> `TokenStream`  [EXTRACTED]
++  lucene/core/src/java/org/apache/lucene/analysis/Analyzer.java →   _Bridges community 31 → community 5_
++- `FieldInfos` --implements--> `Iterable`  [EXTRACTED]
++  lucene/core/src/java/org/apache/lucene/index/FieldInfos.java →   _Bridges community 23 → community 5_
++- `IndexWriter` --implements--> `Closeable`  [EXTRACTED]
++  lucene/core/src/java/org/apache/lucene/index/IndexWriter.java →   _Bridges community 0 → community 1_
++- `IndexWriter` --implements--> `Accountable`  [EXTRACTED]
++  lucene/core/src/java/org/apache/lucene/index/IndexWriter.java →   _Bridges community 0 → community 4_
++
++## Communities
++
++### Community 0 - "Index Writer"
++Cohesion: 0.03
++Nodes (27): AddIndexesMergeSource, afterSegmentsFlushed(), deleteUnusedFiles(), DocModifier, DocStats, EventQueue, flushFailed(), getNextMerge() (+19 more)
++
++### Community 1 - "Store IO"
++Cohesion: 0.02
++Nodes (26): AutomatonProvider, Closeable, FilterDirectory, FilterIndexOutput, IOException, Scorable, Collector, Query (+18 more)
++
++### Community 2 - "Index Writer"
++Cohesion: 0.02
++Nodes (14): Checksum, ChecksumIndexInput, DataInput, DataOutput, IndexOutput, Provider, SortField, SortFieldProvider (+6 more)
++
++### Community 3 - "Terms Postings"
++Cohesion: 0.02
++Nodes (19): PointTransitions, Comparable, Builder, PhraseQuery, PostingsAndFreq, BM25Scorer, BM25Similarity, BooleanSimilarity (+11 more)
++
++### Community 4 - "Store IO"
++Cohesion: 0.03
++Nodes (10): Accountable, CompiledAutomaton, DState, NFARunAutomaton, RunAutomaton, Transition, Term, AutomatonQuery (+2 more)
++
++### Community 5 - "Field Metadata"
++Cohesion: 0.03
++Nodes (11): Document, BinaryTokenStream, Field, StringTokenStream, FieldInvertState, IndexableField, IndexableField, Iterable (+3 more)
++
++### Community 6 - "Similarity Scoring"
++Cohesion: 0.03
++Nodes (7): Axiomatic, AxiomaticF1EXP, AxiomaticF1LOG, AxiomaticF2EXP, AxiomaticF2LOG, AxiomaticF3EXP, AxiomaticF3LOG
++
++### Community 7 - "Segment Metadata"
++Cohesion: 0.03
++Nodes (7): BaseCompositeReader, StoredFieldsFormat, Directory, DirectoryReader, SegmentInfo, BaseDirectory, FilterDirectory
++
++### Community 8 - "Stored Fields"
++Cohesion: 0.04
++Nodes (12): ByteRunAutomaton, CharacterRunAutomaton, TooComplexToDeterminizeException, ByteRunnable, IndexReader, RunAutomaton, RuntimeException, IndexSearcher (+4 more)
++
++### Community 9 - "Store IO"
++Cohesion: 0.05
++Nodes (6): Arena, MemorySegmentAccessInput, MemorySegmentIndexInput, MultiSegmentImpl, SingleSegmentImpl, RefCountedSharedArena
++
++### Community 10 - "Similarity Scoring"
++Cohesion: 0.04
++Nodes (10): BasicStats, Axiomatic, DFISimilarity, DFRSimilarity, IBSimilarity, CollectionModel, DefaultCollectionModel, LMSimilarity (+2 more)
++
++### Community 11 - "Index Writer"
++Cohesion: 0.03
++Nodes (5): StringField, TextField, Field, IndexWriterConfig, LiveIndexWriterConfig
++
++### Community 12 - "Index Writer"
++Cohesion: 0.07
++Nodes (3): FindSegmentsFile, SegmentInfos, SegmentCommitInfo
++
++### Community 13 - "Segment Metadata"
++Cohesion: 0.05
++Nodes (8): Codec, Holder, DocValuesFormat, Holder, Holder, PostingsFormat, NamedSPI, NamedSPILoader
++
++### Community 14 - "Store IO"
++Cohesion: 0.05
++Nodes (14): FSLockFactory, Lock, LockFactory, FSLockFactory, NativeFSLock, NativeFSLockFactory, NoLock, NoLockFactory (+6 more)
++
++### Community 15 - "Store IO"
++Cohesion: 0.06
++Nodes (5): StoredFields, IndexInput, ByteBuffersIndexInput, ChecksumIndexInput, FilterIndexInput
++
++### Community 16 - "Automata Fuzzy"
++Cohesion: 0.11
++Nodes (2): MakeRegexGroup, RegExp
++
++### Community 17 - "Terms Postings"
++Cohesion: 0.07
++Nodes (7): BooleanClause, Query, BooleanQuery, Builder, TermQuery, TermWeight, Weight
++
++### Community 18 - "Terms Postings"
++Cohesion: 0.06
++Nodes (8): State, StringsToAutomaton, BytesRefIterator, postings(), prepareSeekExact(), seekCeil(), seekExact(), TermsEnum
++
++### Community 19 - "Store IO"
++Cohesion: 0.06
++Nodes (7): BaseDirectory, OutputStreamIndexOutput, apply(), ByteBuffersDirectory, FileEntry, FSDirectory, FSIndexOutput
++
++### Community 20 - "Automata Fuzzy"
++Cohesion: 0.09
++Nodes (4): Automaton, Builder, swap(), swapOne()
++
++### Community 21 - "Doc Values"
++Cohesion: 0.07
++Nodes (1): FieldInfo
++
++### Community 22 - "Terms Postings"
++Cohesion: 0.06
++Nodes (5): LeafReader, TopFieldDocs, TopScoreDocCollector, TopDocs, TopDocsCollector
++
++### Community 23 - "Index Writer"
++Cohesion: 0.08
++Nodes (4): FieldInfo, Builder, FieldInfos, FieldNumbers
++
++### Community 24 - "Index Writer"
++Cohesion: 0.11
++Nodes (3): Operations, PointTransitionSet, TransitionList
++
++### Community 25 - "Doc Values"
++Cohesion: 0.1
++Nodes (2): FieldType, IndexableFieldType
++
++### Community 26 - "Terms Postings"
++Cohesion: 0.09
++Nodes (5): DocIdSetIterator, IntersectVisitor, PointTree, PointValues, PostingsEnum
++
++### Community 27 - "Segment Metadata"
++Cohesion: 0.06
++Nodes (1): SegmentCommitInfo
++
++### Community 28 - "Collectors Sorting"
++Cohesion: 0.07
++Nodes (7): Collector, LeafCollector, SimpleCollector, PagingFieldCollector, SimpleFieldCollector, TopFieldCollector, TopFieldLeafCollector
++
++### Community 29 - "Terms Postings"
++Cohesion: 0.07
++Nodes (6): MultiTermQuery, RewriteMethod, TopTermsBlendedFreqScoringRewrite, TopTermsBoostOnlyBooleanQueryRewrite, TopTermsScoringBooleanQueryRewrite, TopTermsRewrite
++
++### Community 30 - "Segment Metadata"
++Cohesion: 0.08
++Nodes (3): CodecReader, getKey(), SegmentReader
++
++### Community 31 - "Similarity Scoring"
++Cohesion: 0.09
++Nodes (6): Analyzer, getReusableComponents(), ReuseStrategy, setReusableComponents(), StringTokenStream, TokenStreamComponents
++
++### Community 32 - "Store IO"
++Cohesion: 0.11
++Nodes (2): ByteBufferRecycler, ByteBuffersDataOutput
++
++### Community 33 - "Store IO"
++Cohesion: 0.14
++Nodes (2): BufferedIndexInput, SlicedIndexInput
++
++### Community 34 - "Similarity Scoring"
++Cohesion: 0.08
++Nodes (5): Normalization, NormalizationH1, NormalizationH2, NormalizationH3, NormalizationZ
++
++### Community 35 - "Automata Fuzzy"
++Cohesion: 0.13
++Nodes (1): Automata
++
++### Community 36 - "Similarity Scoring"
++Cohesion: 0.09
++Nodes (6): CollectionModel, LMSimilarity, IndriCollectionModel, IndriDirichletSimilarity, LMDirichletSimilarity, LMJelinekMercerSimilarity
++
++### Community 37 - "Store IO"
++Cohesion: 0.09
++Nodes (5): BufferedIndexInput, FSDirectory, MMapDirectory, NIOFSDirectory, NIOFSIndexInput
++
++### Community 38 - "Store IO"
++Cohesion: 0.18
++Nodes (1): CodecUtil
++
++### Community 39 - "Terms Postings"
++Cohesion: 0.1
++Nodes (6): getDocCount(), getSumDocFreq(), getSumTotalTermFreq(), iterator(), size(), Terms
++
++### Community 40 - "Terms Postings"
++Cohesion: 0.1
++Nodes (4): DocValuesIterator, NumericDocValues, SortedDocValues, SortedSetDocValues
++
++### Community 41 - "Store IO"
++Cohesion: 0.13
++Nodes (4): Cloneable, RandomAccessInput, DataInput, MemorySegmentAccessInput
++
++### Community 42 - "Bulkscorer"
++Cohesion: 0.14
++Nodes (6): BulkScorer, ScorerSupplier, DefaultBulkScorer, DefaultScorerSupplier, Weight, SegmentCacheable
++
++### Community 43 - "Basicmodel"
++Cohesion: 0.09
++Nodes (5): BasicModel, BasicModelG, BasicModelIF, BasicModelIn, BasicModelIne
++
++### Community 44 - "Store IO"
++Cohesion: 0.24
++Nodes (1): ByteBuffersDataInput
++
++### Community 45 - "Abstractdocidsetiterator"
++Cohesion: 0.14
++Nodes (3): AbstractDocIdSetIterator, DocIdSetIterator, RangeDocIdSetIterator
++
++### Community 46 - "Automata Fuzzy"
++Cohesion: 0.12
++Nodes (4): AutomatonQuery, PrefixQuery, RegexpQuery, WildcardQuery
++
++### Community 47 - "Doc Values"
++Cohesion: 0.11
++Nodes (1): IndexableFieldType
++
++### Community 48 - "Store IO"
++Cohesion: 0.16
++Nodes (1): FileSwitchDirectory
++
++### Community 49 - "Index Writer"
++Cohesion: 0.16
++Nodes (3): BufferedOutputStream, OutputStreamIndexOutput, XBufferedOutputStream
++
++### Community 50 - "Automata Fuzzy"
++Cohesion: 0.15
++Nodes (3): FrozenIntSet, StateSet, IntSet
++
++### Community 51 - "Automata Fuzzy"
++Cohesion: 0.29
++Nodes (12): all(), binary(), build(), end(), FSA, getUTF8Rest(), main(), Adds edge from n1-n2, utf8 byte range v1-v2. (+4 more)
++
++### Community 52 - "Index Writer"
++Cohesion: 0.16
++Nodes (6): LessThan, PriorityQueue, ScoreLessThan, ShardRef, ShardRefLessThan, TopDocs
++
++### Community 53 - "Automata Fuzzy"
++Cohesion: 0.22
++Nodes (3): UTF32ToUTF8, UTF8Byte, UTF8Sequence
++
++### Community 54 - "Doc Values"
++Cohesion: 0.24
++Nodes (1): DocValues
++
++### Community 55 - "Terms Postings"
++Cohesion: 0.15
++Nodes (2): MultiTermQuery, FuzzyQuery
++
++### Community 56 - "Similarity Scoring"
++Cohesion: 0.13
++Nodes (4): BulkSimScorer, DefaultBulkSimScorer, Similarity, SimScorer
++
++### Community 57 - "Store IO"
++Cohesion: 0.23
++Nodes (1): DataOutput
++
++### Community 58 - "Automata Fuzzy"
++Cohesion: 0.15
++Nodes (5): Lev1ParametricDescription, Lev1TParametricDescription, Lev2ParametricDescription, Lev2TParametricDescription, ParametricDescription
++
++### Community 59 - "Independence"
++Cohesion: 0.13
++Nodes (4): Independence, IndependenceChiSquared, IndependenceSaturated, IndependenceStandardized
++
++### Community 60 - "Filterdocidsetiterator"
++Cohesion: 0.18
++Nodes (3): FilterDocIdSetIterator, TwoPhaseIterator, TwoPhaseIteratorAsDocIdSetIterator
++
++### Community 61 - "Document Fields"
++Cohesion: 0.14
++Nodes (1): BasicStats
++
++### Community 62 - "Search Explanation"
++Cohesion: 0.21
++Nodes (1): Explanation
++
++### Community 63 - "Aftereffect"
++Cohesion: 0.18
++Nodes (3): AfterEffect, AfterEffectB, AfterEffectL
++
++### Community 64 - "Lambda"
++Cohesion: 0.18
++Nodes (3): Lambda, LambdaDF, LambdaTTF
++
++### Community 65 - "Automata Fuzzy"
++Cohesion: 0.23
++Nodes (2): LevenshteinAutomata, ParametricDescription
++
++### Community 66 - "Nativeaccess"
++Cohesion: 0.23
++Nodes (2): NativeAccess, PosixNativeAccess
++
++### Community 67 - "Store Ratelimiter"
++Cohesion: 0.2
++Nodes (2): RateLimiter, SimpleRateLimiter
++
++### Community 68 - "Distribution"
++Cohesion: 0.18
++Nodes (3): Distribution, DistributionLL, DistributionSPL
++
++### Community 69 - "Similarity Scoring"
++Cohesion: 0.22
++Nodes (2): NoNormalization, Normalization
++
++### Community 70 - "Index Writer"
++Cohesion: 0.2
++Nodes (2): FileOpenHint, IOContext
++
++### Community 71 - "Store Randomaccessinput"
++Cohesion: 0.22
++Nodes (1): RandomAccessInput
++
++### Community 72 - "Similarity Scoring"
++Cohesion: 0.25
++Nodes (2): ClassicSimilarity, TFIDFSimilarity
++
++### Community 73 - "Automata Fuzzy"
++Cohesion: 0.39
++Nodes (2): FiniteStringsIterator, PathNode
++
++### Community 74 - "Automata Fuzzy"
++Cohesion: 0.48
++Nodes (1): IntSet
++
++### Community 75 - "Search Similarities"
++Cohesion: 0.33
++Nodes (1): AfterEffect
++
++### Community 76 - "Search Similarities"
++Cohesion: 0.33
++Nodes (1): BasicModel
++
++### Community 77 - "Search Similarities"
++Cohesion: 0.4
++Nodes (1): Distribution
++
++### Community 79 - "Automata Fuzzy"
++Cohesion: 0.47
++Nodes (1): ByteRunnable
++
++### Community 80 - "Automata Fuzzy"
++Cohesion: 0.33
++Nodes (2): LimitedFiniteStringsIterator, FiniteStringsIterator
++
++### Community 81 - "Automata Fuzzy"
++Cohesion: 0.33
++Nodes (1): StatePair
++
++### Community 82 - "Automata Fuzzy"
++Cohesion: 0.33
++Nodes (1): TransitionAccessor
++
++### Community 84 - "Search Similarities"
++Cohesion: 0.4
++Nodes (1): Independence
++
++### Community 85 - "Search Similarities"
++Cohesion: 0.4
++Nodes (1): Lambda
++
++### Community 86 - "Search Scoredoc"
++Cohesion: 0.5
++Nodes (1): ScoreDoc
++
++### Community 87 - "Illegalstateexception"
++Cohesion: 0.5
++Nodes (2): IllegalStateException, AlreadyClosedException
++
++### Community 88 - "Automata Fuzzy"
++Cohesion: 0.5
++Nodes (1): CaseFolding
++
++## Knowledge Gaps
++- **3 isolated node(s):** `FileOpenHint`, `UTF8Byte`, `Adds edge from n1-n2, utf8 byte range v1-v2.`
++  These have ≤1 connection - possible missing edges or undocumented components.
++- **Thin community `Automata Fuzzy`** (2 nodes): `MakeRegexGroup`, `RegExp`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Doc Values`** (1 nodes): `FieldInfo`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Doc Values`** (2 nodes): `FieldType`, `IndexableFieldType`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Segment Metadata`** (1 nodes): `SegmentCommitInfo`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store IO`** (2 nodes): `ByteBufferRecycler`, `ByteBuffersDataOutput`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store IO`** (2 nodes): `BufferedIndexInput`, `SlicedIndexInput`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (1 nodes): `Automata`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store IO`** (1 nodes): `CodecUtil`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store IO`** (1 nodes): `ByteBuffersDataInput`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Doc Values`** (1 nodes): `IndexableFieldType`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store IO`** (1 nodes): `FileSwitchDirectory`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Doc Values`** (1 nodes): `DocValues`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Terms Postings`** (2 nodes): `MultiTermQuery`, `FuzzyQuery`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store IO`** (1 nodes): `DataOutput`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Document Fields`** (1 nodes): `BasicStats`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Explanation`** (1 nodes): `Explanation`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (2 nodes): `LevenshteinAutomata`, `ParametricDescription`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Nativeaccess`** (2 nodes): `NativeAccess`, `PosixNativeAccess`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store Ratelimiter`** (2 nodes): `RateLimiter`, `SimpleRateLimiter`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Similarity Scoring`** (2 nodes): `NoNormalization`, `Normalization`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Index Writer`** (2 nodes): `FileOpenHint`, `IOContext`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Store Randomaccessinput`** (1 nodes): `RandomAccessInput`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Similarity Scoring`** (2 nodes): `ClassicSimilarity`, `TFIDFSimilarity`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (2 nodes): `FiniteStringsIterator`, `PathNode`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (1 nodes): `IntSet`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Similarities`** (1 nodes): `AfterEffect`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Similarities`** (1 nodes): `BasicModel`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Similarities`** (1 nodes): `Distribution`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (1 nodes): `ByteRunnable`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (2 nodes): `LimitedFiniteStringsIterator`, `FiniteStringsIterator`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (1 nodes): `StatePair`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (1 nodes): `TransitionAccessor`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Similarities`** (1 nodes): `Independence`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Similarities`** (1 nodes): `Lambda`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Scoredoc`** (1 nodes): `ScoreDoc`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Illegalstateexception`** (2 nodes): `IllegalStateException`, `AlreadyClosedException`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Automata Fuzzy`** (1 nodes): `CaseFolding`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++
++## Suggested Questions
++_Questions this graph is uniquely positioned to answer:_
++
++- **Why does `IndexWriter` connect `Index Writer` to `Store IO`, `Store IO`?**
++  _High betweenness centrality (0.074) - this node is a cross-community bridge._
++- **Why does `SegmentInfos` connect `Index Writer` to `Index Writer`, `Store IO`, `Field Metadata`?**
++  _High betweenness centrality (0.037) - this node is a cross-community bridge._
++- **What connects `FileOpenHint`, `UTF8Byte`, `Adds edge from n1-n2, utf8 byte range v1-v2.` to the rest of the system?**
++  _3 weakly-connected nodes found - possible documentation gaps or missing edges._
++- **Should `Index Writer` be split into smaller, more focused modules?**
++  _Cohesion score 0.03 - nodes in this community are weakly interconnected._
++- **Should `Store IO` be split into smaller, more focused modules?**
++  _Cohesion score 0.02 - nodes in this community are weakly interconnected._
++- **Should `Index Writer` be split into smaller, more focused modules?**
++  _Cohesion score 0.02 - nodes in this community are weakly interconnected._
++- **Should `Terms Postings` be split into smaller, more focused modules?**
++  _Cohesion score 0.02 - nodes in this community are weakly interconnected._
+\ No newline at end of file
+diff --git a/docs/portage/graphify/lucene-core/manifest.json b/docs/portage/graphify/lucene-core/manifest.json
+new file mode 100644
+index 0000000..93c2cbc
+--- /dev/null
++++ b/docs/portage/graphify/lucene-core/manifest.json
+@@ -0,0 +1,206 @@
++{
++  "lucene/core/src/java/org/apache/lucene/analysis/Analyzer.java": 1777860288512.4473,
++  "lucene/core/src/java/org/apache/lucene/analysis/standard/StandardAnalyzer.java": 1777860288513.4473,
++  "lucene/core/src/java/org/apache/lucene/analysis/standard/package-info.java": 1777860288513.4473,
++  "lucene/core/src/java/org/apache/lucene/codecs/Codec.java": 1777860288514.4473,
++  "lucene/core/src/java/org/apache/lucene/codecs/CodecUtil.java": 1777860288514.4473,
++  "lucene/core/src/java/org/apache/lucene/codecs/DocValuesFormat.java": 1777860288514.4473,
++  "lucene/core/src/java/org/apache/lucene/codecs/PostingsFormat.java": 1777860288515.4473,
++  "lucene/core/src/java/org/apache/lucene/codecs/StoredFieldsFormat.java": 1777860288515.4473,
++  "lucene/core/src/java/org/apache/lucene/document/Document.java": 1777860288520.4473,
++  "lucene/core/src/java/org/apache/lucene/document/Field.java": 1777860288520.4473,
++  "lucene/core/src/java/org/apache/lucene/document/FieldType.java": 1777860288520.4473,
++  "lucene/core/src/java/org/apache/lucene/document/StringField.java": 1777860288522.4473,
++  "lucene/core/src/java/org/apache/lucene/document/TextField.java": 1777860288522.4473,
++  "lucene/core/src/java/org/apache/lucene/index/DirectoryReader.java": 1777860288525.4473,
++  "lucene/core/src/java/org/apache/lucene/index/DocValues.java": 1777860288526.4473,
++  "lucene/core/src/java/org/apache/lucene/index/FieldInfo.java": 1777860288527.4473,
++  "lucene/core/src/java/org/apache/lucene/index/FieldInfos.java": 1777860288527.4473,
++  "lucene/core/src/java/org/apache/lucene/index/FieldInvertState.java": 1777860288527.4473,
++  "lucene/core/src/java/org/apache/lucene/index/IndexOptions.java": 1777860288528.4473,
++  "lucene/core/src/java/org/apache/lucene/index/IndexWriter.java": 1777860288529.4473,
++  "lucene/core/src/java/org/apache/lucene/index/IndexWriterConfig.java": 1777860288529.4473,
++  "lucene/core/src/java/org/apache/lucene/index/IndexableField.java": 1777860288529.4473,
++  "lucene/core/src/java/org/apache/lucene/index/IndexableFieldType.java": 1777860288529.4473,
++  "lucene/core/src/java/org/apache/lucene/index/LeafReader.java": 1777860288530.4473,
++  "lucene/core/src/java/org/apache/lucene/index/NumericDocValues.java": 1777860288531.4473,
++  "lucene/core/src/java/org/apache/lucene/index/PointValues.java": 1777860288532.4473,
++  "lucene/core/src/java/org/apache/lucene/index/PostingsEnum.java": 1777860288532.4473,
++  "lucene/core/src/java/org/apache/lucene/index/SegmentCommitInfo.java": 1777860288532.4473,
++  "lucene/core/src/java/org/apache/lucene/index/SegmentInfo.java": 1777860288532.4473,
++  "lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java": 1777860288532.4473,
++  "lucene/core/src/java/org/apache/lucene/index/SegmentReader.java": 1777860288533.4473,
++  "lucene/core/src/java/org/apache/lucene/index/SortedDocValues.java": 1777860288533.4473,
++  "lucene/core/src/java/org/apache/lucene/index/SortedSetDocValues.java": 1777860288533.4473,
++  "lucene/core/src/java/org/apache/lucene/index/StoredFields.java": 1777860288534.4473,
++  "lucene/core/src/java/org/apache/lucene/index/Term.java": 1777860288534.4473,
++  "lucene/core/src/java/org/apache/lucene/index/Terms.java": 1777860288534.4473,
++  "lucene/core/src/java/org/apache/lucene/index/TermsEnum.java": 1777860288534.4473,
++  "lucene/core/src/java/org/apache/lucene/search/AutomatonQuery.java": 1777860288539.4473,
++  "lucene/core/src/java/org/apache/lucene/search/BooleanClause.java": 1777860288539.4473,
++  "lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java": 1777860288539.4473,
++  "lucene/core/src/java/org/apache/lucene/search/Collector.java": 1777860288539.4473,
++  "lucene/core/src/java/org/apache/lucene/search/DocIdSetIterator.java": 1777860288542.4473,
++  "lucene/core/src/java/org/apache/lucene/search/Explanation.java": 1777860288542.4473,
++  "lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java": 1777860288545.4473,
++  "lucene/core/src/java/org/apache/lucene/search/IndexSearcher.java": 1777860288545.4473,
++  "lucene/core/src/java/org/apache/lucene/search/MultiTermQuery.java": 1777860288547.4473,
++  "lucene/core/src/java/org/apache/lucene/search/PhraseQuery.java": 1777860288548.4473,
++  "lucene/core/src/java/org/apache/lucene/search/PrefixQuery.java": 1777860288548.4473,
++  "lucene/core/src/java/org/apache/lucene/search/Query.java": 1777860288548.4473,
++  "lucene/core/src/java/org/apache/lucene/search/RegexpQuery.java": 1777860288548.4473,
++  "lucene/core/src/java/org/apache/lucene/search/ScoreDoc.java": 1777860288549.4473,
++  "lucene/core/src/java/org/apache/lucene/search/Scorer.java": 1777860288549.4473,
++  "lucene/core/src/java/org/apache/lucene/search/SimpleCollector.java": 1777860288549.4473,
++  "lucene/core/src/java/org/apache/lucene/search/Sort.java": 1777860288549.4473,
++  "lucene/core/src/java/org/apache/lucene/search/SortField.java": 1777860288549.4473,
++  "lucene/core/src/java/org/apache/lucene/search/TermQuery.java": 1777860288550.4473,
++  "lucene/core/src/java/org/apache/lucene/search/TopDocs.java": 1777860288550.4473,
++  "lucene/core/src/java/org/apache/lucene/search/TopFieldCollector.java": 1777860288550.4473,
++  "lucene/core/src/java/org/apache/lucene/search/TopFieldDocs.java": 1777860288551.4473,
++  "lucene/core/src/java/org/apache/lucene/search/TopScoreDocCollector.java": 1777860288551.4473,
++  "lucene/core/src/java/org/apache/lucene/search/TwoPhaseIterator.java": 1777860288551.4473,
++  "lucene/core/src/java/org/apache/lucene/search/Weight.java": 1777860288551.4473,
++  "lucene/core/src/java/org/apache/lucene/search/WildcardQuery.java": 1777860288551.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AfterEffect.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AfterEffectB.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AfterEffectL.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/Axiomatic.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1EXP.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF1LOG.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2EXP.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF2LOG.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3EXP.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/AxiomaticF3LOG.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BM25Similarity.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BasicModel.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BasicModelG.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BasicModelIF.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BasicModelIn.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BasicModelIne.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BasicStats.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/BooleanSimilarity.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/ClassicSimilarity.java": 1777860288552.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/DFISimilarity.java": 1777860288553.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/DFRSimilarity.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/Distribution.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/DistributionLL.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/DistributionSPL.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/IBSimilarity.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/Independence.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/IndependenceChiSquared.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/IndependenceSaturated.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/IndependenceStandardized.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/IndriDirichletSimilarity.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/LMDirichletSimilarity.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/LMJelinekMercerSimilarity.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/LMSimilarity.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/Lambda.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/LambdaDF.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/LambdaTTF.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/MultiSimilarity.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/Normalization.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/NormalizationH1.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/NormalizationH2.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/NormalizationH3.java": 1777860288554.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/NormalizationZ.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/PerFieldSimilarityWrapper.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/RawTFSimilarity.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/Similarity.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/SimilarityBase.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/TFIDFSimilarity.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/search/similarities/package-info.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/store/AlreadyClosedException.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/store/BaseDirectory.java": 1777860288555.4473,
++  "lucene/core/src/java/org/apache/lucene/store/BufferedChecksum.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/BufferedChecksumIndexInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/BufferedIndexInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ByteArrayDataInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ByteArrayDataOutput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ByteBuffersDataInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ByteBuffersDataOutput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ByteBuffersDirectory.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ByteBuffersIndexInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ByteBuffersIndexOutput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ChecksumIndexInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/DataAccessHint.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/DataInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/DataOutput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/DefaultIOContext.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/Directory.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FSDirectory.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FSLockFactory.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FileDataHint.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FileSwitchDirectory.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FileTypeHint.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FilterDirectory.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FilterIndexInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FilterIndexOutput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/FlushInfo.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/IOContext.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/IndexInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/IndexOutput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/InputStreamDataInput.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/Lock.java": 1777860288556.4473,
++  "lucene/core/src/java/org/apache/lucene/store/LockFactory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/LockObtainFailedException.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/LockReleaseFailedException.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/LockStressTest.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/LockValidatingDirectoryWrapper.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/LockVerifyServer.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/MMapDirectory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/MemorySegmentAccessInput.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/MemorySegmentIndexInput.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/MergeInfo.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/NIOFSDirectory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/NRTCachingDirectory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/NativeAccess.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/NativeFSLockFactory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/NoLockFactory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/OutputStreamDataOutput.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/OutputStreamIndexOutput.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/PosixNativeAccess.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/PreloadHint.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/RandomAccessInput.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/RateLimitedIndexOutput.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/RateLimiter.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ReadAdvice.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/ReadOnceHint.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/RefCountedSharedArena.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/SimpleFSLockFactory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/SingleInstanceLockFactory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/SleepingLockWrapper.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/TrackingDirectoryWrapper.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/VerifyingLockFactory.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/store/package-info.java": 1777860288557.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Automata.java": 1777860288562.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Automaton.java": 1777860288562.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/AutomatonProvider.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/ByteRunAutomaton.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/ByteRunnable.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/CaseFolding.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/CharacterRunAutomaton.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/CompiledAutomaton.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/FiniteStringsIterator.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/FrozenIntSet.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/IntSet.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Lev1ParametricDescription.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Lev1TParametricDescription.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Lev2ParametricDescription.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Lev2TParametricDescription.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/LevenshteinAutomata.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/LimitedFiniteStringsIterator.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/NFARunAutomaton.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Operations.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/RegExp.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/RunAutomaton.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/StatePair.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/StateSet.java": 1777860288563.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/StringsToAutomaton.java": 1777860288564.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/TooComplexToDeterminizeException.java": 1777860288564.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/Transition.java": 1777860288564.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/TransitionAccessor.java": 1777860288564.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/UTF32ToUTF8.java": 1777860288564.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/UTF32ToUTF8.py": 1777860288564.4473,
++  "lucene/core/src/java/org/apache/lucene/util/automaton/package-info.java": 1777860288564.4473
++}
+\ No newline at end of file
+diff --git a/docs/portage/graphify/lucene-core/runtime.json b/docs/portage/graphify/lucene-core/runtime.json
+new file mode 100644
+index 0000000..7bc637b
+--- /dev/null
++++ b/docs/portage/graphify/lucene-core/runtime.json
+@@ -0,0 +1,85 @@
++{
++  "runtime": "typescript",
++  "version": "0.5.5",
++  "node": "/usr/bin/node",
++  "script": "/home/antoinefa/.npm-global/lib/node_modules/graphifyy/dist/skill-runtime.js",
++  "module": "/home/antoinefa/.npm-global/lib/node_modules/graphifyy/dist/index.js",
++  "cli": "/home/antoinefa/.npm-global/lib/node_modules/graphifyy/dist/cli.js",
++  "paths": {
++    "root": "/tmp/surch-portage-graph-corpora/lucene-core",
++    "stateDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify",
++    "graph": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/graph.json",
++    "report": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/GRAPH_REPORT.md",
++    "html": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/graph.html",
++    "flows": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/flows.json",
++    "manifest": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/manifest.json",
++    "scope": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/scope.json",
++    "cost": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/cost.json",
++    "cacheDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/cache",
++    "transcriptsDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/transcripts",
++    "downloadsDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/transcripts/downloads",
++    "convertedDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/converted",
++    "memoryDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/memory",
++    "wikiDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/wiki",
++    "needsUpdate": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/needs_update",
++    "profile": {
++      "dir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile",
++      "projectConfig": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile/project-config.normalized.json",
++      "ontologyProfile": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile/ontology-profile.normalized.json",
++      "state": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile/profile-state.json",
++      "registriesDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile/registries",
++      "registryExtraction": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile/registry-extraction.json",
++      "semanticDetection": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile/semantic-detection.json",
++      "dataprepReport": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/profile/dataprep-report.md"
++    },
++    "imageDataprep": {
++      "dir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/image-dataprep",
++      "manifest": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/image-dataprep/manifest.json",
++      "captionsDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/image-dataprep/captions",
++      "routingDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/image-dataprep/routing",
++      "batchDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/image-dataprep/batch",
++      "importsDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/image-dataprep/imports",
++      "assistantInstructions": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/image-dataprep/assistant-instructions.md"
++    },
++    "ontologyOutput": {
++      "dir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology",
++      "manifest": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/manifest.json",
++      "nodes": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/nodes.json",
++      "aliases": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/aliases.json",
++      "relations": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/relations.json",
++      "sources": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/sources.json",
++      "occurrences": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/occurrences.json",
++      "validation": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/validation.json",
++      "index": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/index.json",
++      "wikiDir": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/ontology/wiki"
++    },
++    "scratch": {
++      "detect": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_detect.json",
++      "detectSemantic": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_detect_semantic.json",
++      "ast": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_ast.json",
++      "cached": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_cached.json",
++      "uncached": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_uncached.txt",
++      "semanticNew": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_semantic_new.json",
++      "semantic": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_semantic.json",
++      "extract": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_extract.json",
++      "analysis": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_analysis.json",
++      "labels": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_labels.json",
++      "transcripts": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_transcripts.json",
++      "pdfOcr": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_pdf_ocr.json",
++      "incremental": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_incremental.json",
++      "incrementalSemantic": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_incremental_semantic.json",
++      "oldGraph": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_old.json",
++      "runtime": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_runtime.json",
++      "node": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_node",
++      "runtimeScript": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify/.graphify_runtime_script"
++    },
++    "legacyRootScratch": {
++      "detect": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify_detect.json",
++      "extract": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify_extract.json",
++      "analysis": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify_analysis.json",
++      "labels": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify_labels.json",
++      "incremental": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify_incremental.json",
++      "oldGraph": "/tmp/surch-portage-graph-corpora/lucene-core/.graphify_old.json"
++    }
++  }
++}
+diff --git a/docs/portage/graphify/opensearch-core/GRAPH_REPORT.md b/docs/portage/graphify/opensearch-core/GRAPH_REPORT.md
+new file mode 100644
+index 0000000..13ed200
+--- /dev/null
++++ b/docs/portage/graphify/opensearch-core/GRAPH_REPORT.md
+@@ -0,0 +1,457 @@
++# Graph Report - .  (2026-05-04)
++
++## Corpus Check
++- Large corpus: 238 files · ~215,629 words. Semantic extraction will be expensive (many Claude tokens). Consider running on a subfolder, or use --no-semantic to run AST-only.
++
++## Summary
++- 3813 nodes · 5996 edges · 81 communities detected
++- Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS
++- Token cost: 0 input · 0 output
++
++
++## Input Scope
++- Requested: all
++- Resolved: all (source: cli)
++- Included files: 238 · Candidates: recursive
++- Excluded: 0 untracked · 0 ignored · 0 sensitive · 0 missing committed
++## God Nodes (most connected - your core abstractions)
++1. `InternalEngine` - 125 edges
++2. `Engine` - 85 edges
++3. `SearchRequestBuilder` - 53 edges
++4. `UpdateRequest` - 51 edges
++5. `QueryBuilders` - 50 edges
++6. `AbstractSearchAsyncAction` - 47 edges
++7. `SearchModule` - 47 edges
++8. `SearchRequest` - 46 edges
++9. `IndexRequest` - 45 edges
++10. `FieldMapper` - 45 edges
++
++## Surprising Connections (you probably didn't know these)
++- `BackoffPolicy` --implements--> `Iterable`  [EXTRACTED]
++  server/src/main/java/org/opensearch/action/bulk/BackoffPolicy.java →   _Bridges community 0 → community 10_
++- `BulkItemResponse` --implements--> `Writeable`  [EXTRACTED]
++  server/src/main/java/org/opensearch/action/bulk/BulkItemResponse.java →   _Bridges community 36 → community 0_
++- `BulkItemResponse` --implements--> `StatusToXContentObject`  [EXTRACTED]
++  server/src/main/java/org/opensearch/action/bulk/BulkItemResponse.java →   _Bridges community 36 → community 4_
++- `Failure` --implements--> `ToXContentFragment`  [EXTRACTED]
++  server/src/main/java/org/opensearch/action/bulk/BulkItemResponse.java →   _Bridges community 36 → community 16_
++- `BulkProcessor` --implements--> `Closeable`  [EXTRACTED]
++  server/src/main/java/org/opensearch/action/bulk/BulkProcessor.java →   _Bridges community 31 → community 13_
++
++## Communities
++
++### Community 0 - "Bulk Actions"
++Cohesion: 0.01
++Nodes (83): AbstractRunnable, ActionListener, ActionListenerResponseHandler, ActionRunnable, BiConsumer, BackoffPolicy, ConstantBackoff, ConstantBackoffIterator (+75 more)
++
++### Community 1 - "Bulk Actions"
++Cohesion: 0.01
++Nodes (81): Accountable, AnalyzerWrapper, BaseNodesRequest, BulkItemRequest(), readPrimaryResponse(), BytesRefIterator, CheckedRunnable, Collector (+73 more)
++
++### Community 2 - "Mapping Fields"
++Cohesion: 0.01
++Nodes (19): Delete, DeleteResult, Engine, EventListener, Get, GetResult, Index, IndexResult (+11 more)
++
++### Community 3 - "Bulk Actions"
++Cohesion: 0.02
++Nodes (21): AcknowledgedRequest, ActionRequest, BaseNodesResponse, BulkRequest, CompositeIndicesRequest, Item, MultiGetRequest, Failure (+13 more)
++
++### Community 4 - "Bulk Actions"
++Cohesion: 0.02
++Nodes (14): ActionResponse, BulkResponse, BulkItemResponse, DocumentField, GetResponse, MultiGetShardResponse, ClearScrollResponse, CreatePitResponse (+6 more)
++
++### Community 5 - "REST Search"
++Cohesion: 0.03
++Nodes (5): EngineMergeScheduler, ExternalReaderManager, InternalEngine, OpenSearchConcurrentMergeScheduler, ReferenceManager
++
++### Community 6 - "Query DSL"
++Cohesion: 0.02
++Nodes (10): AbstractQueryBuilder, MultiTermQueryBuilder, ExistsQueryBuilder, FuzzyQueryBuilder, MatchAllQueryBuilder, MatchNoneQueryBuilder, PrefixQueryBuilder, RangeQueryBuilder (+2 more)
++
++### Community 7 - "REST Search"
++Cohesion: 0.02
++Nodes (23): BaseRestHandler, CreatePitRequest, DeletePitRequest, QueryRewriter, QueryRewriterRegistry, QueryBuilder, RestClearScrollAction, RestCountAction (+15 more)
++
++### Community 8 - "Query DSL"
++Cohesion: 0.03
++Nodes (30): FieldValueConverter, BooleanFieldMapper, Builder, Builder, bitmapQuery(), Builder, createFields(), doubleRangeQuery() (+22 more)
++
++### Community 9 - "Query DSL"
++Cohesion: 0.03
++Nodes (9): FieldMapper, Builder, PhraseFieldMapper, PhraseFieldType, PrefixFieldMapper, PrefixFieldType, TextFieldMapper, TextFieldType (+1 more)
++
++### Community 10 - "Mapping Fields"
++Cohesion: 0.05
++Nodes (5): Iterable, Builder, CopyTo, FieldMapper, MultiFields
++
++### Community 11 - "Search Actions"
++Cohesion: 0.03
++Nodes (5): IndicesRequest, QuerySearchRequest, Replaceable, CreatePitRequest, SearchRequest
++
++### Community 12 - "Bulk Actions"
++Cohesion: 0.03
++Nodes (12): ActionRequestBuilder, BulkRequestBuilder, DeleteRequestBuilder, MultiGetRequestBuilder, IndexRequestBuilder, InstanceShardOperationRequestBuilder, ReplicationRequestBuilder, ClearScrollRequestBuilder (+4 more)
++
++### Community 13 - "Mapping Fields"
++Cohesion: 0.04
++Nodes (6): AbstractIndexComponent, Closeable, DelegatingAnalyzerWrapper, MapperAnalyzerWrapper, MapperService, TranslogManager
++
++### Community 14 - "Bulk Actions"
++Cohesion: 0.03
++Nodes (4): BulkShardRequest, DeleteRequest, IndexRequest, ReplicatedWriteRequest
++
++### Community 15 - "Search Actions"
++Cohesion: 0.03
++Nodes (4): Item, QueryBuilders, Item, MultiSearchResponse
++
++### Community 16 - "Search Actions"
++Cohesion: 0.04
++Nodes (7): BaseNodeResponse, Builder, DocumentMapper, GetAllPitNodeResponse, ListPitInfo, SearchResponseSections, ToXContentFragment
++
++### Community 17 - "Query DSL"
++Cohesion: 0.05
++Nodes (9): QueryRewriter, BooleanFlatteningRewriter, ClauseAdder, MatchAllRemovalRewriter, MustNotToShouldRewriter, MustToFilterRewriter, ClauseAdder, TermsInfo (+1 more)
++
++### Community 18 - "Mapping Fields"
++Cohesion: 0.07
++Nodes (6): Cloneable, Mapper, Builder, Nested, ObjectMapper, TypeParser
++
++### Community 19 - "Query DSL"
++Cohesion: 0.05
++Nodes (6): BaseTermQueryBuilder, ComplementAwareQueryBuilder, MatchQueryBuilder, TermQueryBuilder, fromString(), TermsQueryBuilder
++
++### Community 20 - "Query DSL"
++Cohesion: 0.06
++Nodes (8): Builder, clampToValidRange(), convert(), DateFieldMapper, DateFieldType, numericType(), toInstant(), type()
++
++### Community 21 - "Bulk Actions"
++Cohesion: 0.05
++Nodes (18): ActionType, BulkAction, DeleteAction, GetAction, MultiGetAction, IndexAction, ClearScrollAction, CreatePitAction (+10 more)
++
++### Community 22 - "Search Actions"
++Cohesion: 0.07
++Nodes (1): SearchRequestBuilder
++
++### Community 23 - "Search Actions"
++Cohesion: 0.09
++Nodes (3): AbstractSearchAsyncAction, PendingExecutions, SearchPhaseContext
++
++### Community 24 - "Search Actions"
++Cohesion: 0.05
++Nodes (9): Comparable, Countable, compare(), extractShardId(), FieldDocAndSearchHit, SearchResponseMerger, ShardIdAndClusterAlias, SearchShard (+1 more)
++
++### Community 25 - "Index Actions"
++Cohesion: 0.06
++Nodes (3): InstanceShardOperationRequest, UpdateRequest, WriteRequest
++
++### Community 26 - "Search Actions"
++Cohesion: 0.05
++Nodes (7): OpenSearchLogMessage, SearchRequestSlowLog, SearchRequestSlowLogMessage, SearchRequestStats, StatsHolder, SearchTaskRequestOperationsListener, SearchRequestOperationsListener
++
++### Community 27 - "Search Actions"
++Cohesion: 0.08
++Nodes (1): SearchModule
++
++### Community 28 - "Search Actions"
++Cohesion: 0.08
++Nodes (5): Response, CCSActionListener, SearchAsyncActionProvider, SearchTimeProvider, TransportSearchAction
++
++### Community 29 - "Bulk Actions"
++Cohesion: 0.09
++Nodes (4): BulkOperation, ConcreteIndices, TransportBulkAction, BulkRequest
++
++### Community 30 - "REST Search"
++Cohesion: 0.07
++Nodes (9): AbstractModule, ActionModule, DynamicActionRegistry, SearchShardTask, SearchTask, StreamTransportSearchAction, SearchBackpressureTask, TransportSearchAction (+1 more)
++
++### Community 31 - "Bulk Actions"
++Cohesion: 0.09
++Nodes (5): BulkProcessor, Flush, Runnable, ClearScrollController, SearchScrollAsyncAction
++
++### Community 32 - "Search Actions"
++Cohesion: 0.06
++Nodes (7): AbstractSearchAsyncAction, ArraySearchPhaseResults, CanMatchPreFilterSearchPhase, CanMatchSearchPhaseResults, SearchDfsQueryThenFetchAsyncAction, SearchQueryThenFetchAsyncAction, SearchPhaseResults
++
++### Community 33 - "Query DSL"
++Cohesion: 0.09
++Nodes (5): MultiMatchQueryBuilder, parse(), parseField(), readFromStream(), writeTo()
++
++### Community 34 - "PIT Scroll"
++Cohesion: 0.07
++Nodes (7): CollapsingTopDocsCollectorContext, EmptyTopDocsCollectorContext, ScrollingTopDocsCollectorContext, SimpleTopDocsCollectorContext, TopDocsCollectorContext, QueryCollectorContext, RescoringQueryCollectorContext
++
++### Community 35 - "Search Actions"
++Cohesion: 0.12
++Nodes (4): ArraySearchPhaseResults, PendingReduces, QueryPhaseResultConsumer, ReduceTask
++
++### Community 36 - "Bulk Actions"
++Cohesion: 0.09
++Nodes (4): BulkItemResponse, Failure, fromSourceType(), getSourceType()
++
++### Community 37 - "Query DSL"
++Cohesion: 0.12
++Nodes (2): KeywordFieldMapper, KeywordFieldType
++
++### Community 38 - "Query DSL"
++Cohesion: 0.09
++Nodes (1): AbstractQueryBuilder
++
++### Community 39 - "Search Response"
++Cohesion: 0.09
++Nodes (1): QuerySearchResult
++
++### Community 40 - "Get Actions"
++Cohesion: 0.08
++Nodes (5): DocRequest, GetRequest, MultiGetShardRequest, RealtimeRequest, SingleShardRequest
++
++### Community 41 - "Search Actions"
++Cohesion: 0.11
++Nodes (3): ReducedQueryPhase, SearchPhaseController, TopDocsStats
++
++### Community 42 - "Bulk Actions"
++Cohesion: 0.15
++Nodes (1): BulkPrimaryExecutionContext
++
++### Community 43 - "Search Actions"
++Cohesion: 0.09
++Nodes (5): QueryPhaseExecutionException, SearchPhaseExecutionException, ShardSearchFailure, SearchException, ShardOperationFailedException
++
++### Community 44 - "Search Actions"
++Cohesion: 0.11
++Nodes (5): DfsQueryPhase, ExpandSearchPhase, FetchSearchPhase, WrappingSearchAsyncActionPhase, SearchPhase
++
++### Community 45 - "Search Actions"
++Cohesion: 0.09
++Nodes (2): SearchRequestContext, toString()
++
++### Community 46 - "Search Actions"
++Cohesion: 0.09
++Nodes (2): CompositeListener, SearchRequestOperationsListener
++
++### Community 47 - "Query DSL"
++Cohesion: 0.12
++Nodes (1): BoolQueryBuilder
++
++### Community 48 - "Get Actions"
++Cohesion: 0.1
++Nodes (3): TransportGetAction, TransportShardMultiGetAction, TransportSingleShardAction
++
++### Community 49 - "Index Actions"
++Cohesion: 0.17
++Nodes (5): ContextFields, lenientFromString(), Result, toString(), UpdateHelper
++
++### Community 50 - "Search Actions"
++Cohesion: 0.13
++Nodes (1): SearchTransportService
++
++### Community 51 - "Search Actions"
++Cohesion: 0.13
++Nodes (1): SearchPhaseContext
++
++### Community 52 - "Search Response"
++Cohesion: 0.17
++Nodes (1): SearchProgressListener
++
++### Community 53 - "Update Actions"
++Cohesion: 0.18
++Nodes (2): Builder, UpdateResponse
++
++### Community 54 - "Mapping Fields"
++Cohesion: 0.13
++Nodes (3): Builder, SourceFieldMapper, MetadataFieldMapper
++
++### Community 55 - "Bulk Actions"
++Cohesion: 0.21
++Nodes (3): Retry, RetryHandler, BulkResponse
++
++### Community 56 - "Delete Actions"
++Cohesion: 0.15
++Nodes (3): DeleteSearchPipelineTransportAction, PutSearchPipelineTransportAction, TransportClusterManagerNodeAction
++
++### Community 57 - "Query Queryphase"
++Cohesion: 0.2
++Nodes (2): DefaultQueryPhaseSearcher, QueryPhase
++
++### Community 58 - "Update Actions"
++Cohesion: 0.21
++Nodes (2): TransportInstanceSingleOperationAction, TransportUpdateAction
++
++### Community 59 - "Get Actions"
++Cohesion: 0.17
++Nodes (2): GetRequestBuilder, SingleShardOperationRequestBuilder
++
++### Community 60 - "PIT Scroll"
++Cohesion: 0.15
++Nodes (3): SearchScrollQueryAndFetchAsyncAction, SearchScrollQueryThenFetchAsyncAction, SearchScrollAsyncAction
++
++### Community 61 - "Bulk Actions"
++Cohesion: 0.18
++Nodes (1): Builder
++
++### Community 62 - "Query DSL"
++Cohesion: 0.27
++Nodes (2): BooleanFieldType, TermBasedFieldType
++
++### Community 63 - "Query Querycollectorcontext"
++Cohesion: 0.23
++Nodes (1): QueryCollectorContext
++
++### Community 64 - "Search Actions"
++Cohesion: 0.2
++Nodes (1): SearchPhaseResults
++
++### Community 65 - "Query Querycollectorarguments"
++Cohesion: 0.2
++Nodes (2): Builder, QueryCollectorArguments
++
++### Community 66 - "Search Response"
++Cohesion: 0.22
++Nodes (2): StreamSearchTransportService, SearchTransportService
++
++### Community 67 - "Search Response"
++Cohesion: 0.36
++Nodes (1): BottomSortValuesCollector
++
++### Community 68 - "PIT Scroll"
++Cohesion: 0.36
++Nodes (1): CreatePitController
++
++### Community 69 - "Get Actions"
++Cohesion: 0.29
++Nodes (2): GetSearchPipelineTransportAction, TransportClusterManagerNodeReadAction
++
++### Community 70 - "PIT Scroll"
++Cohesion: 0.25
++Nodes (1): ParsedScrollId
++
++### Community 71 - "PIT Scroll"
++Cohesion: 0.29
++Nodes (1): PitService
++
++### Community 72 - "Action Search"
++Cohesion: 0.29
++Nodes (1): SearchContextId
++
++### Community 73 - "Action Search"
++Cohesion: 0.32
++Nodes (2): StreamSearchActionListener, SearchActionListener
++
++### Community 74 - "Bulk Actions"
++Cohesion: 0.48
++Nodes (1): BulkRequestParser
++
++### Community 75 - "Bulk Actions"
++Cohesion: 0.38
++Nodes (3): TransportDeleteAction, TransportIndexAction, TransportSingleItemBulkWriteAction
++
++### Community 76 - "Action Search"
++Cohesion: 0.33
++Nodes (2): ClusterManagerNodeReadRequest, GetSearchPipelineRequest
++
++### Community 77 - "Action Search"
++Cohesion: 0.4
++Nodes (1): CountedCollector
++
++### Community 78 - "Search Actions"
++Cohesion: 0.4
++Nodes (1): SearchRequestOperationsCompositeListenerFactory
++
++### Community 81 - "Query Earlyterminatinglistener"
++Cohesion: 0.67
++Nodes (1): EarlyTerminatingListener
++
++### Community 82 - "Query Rescoringquerycollectorcontext"
++Cohesion: 0.67
++Nodes (1): RescoringQueryCollectorContext
++
++## Knowledge Gaps
++- **9 isolated node(s):** `Fields`, `StatsHolder`, `ContextFields`, `Defaults`, `Values` (+4 more)
++  These have ≤1 connection - possible missing edges or undocumented components.
++- **Thin community `Search Actions`** (1 nodes): `SearchRequestBuilder`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Actions`** (1 nodes): `SearchModule`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query DSL`** (2 nodes): `KeywordFieldMapper`, `KeywordFieldType`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query DSL`** (1 nodes): `AbstractQueryBuilder`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Response`** (1 nodes): `QuerySearchResult`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Bulk Actions`** (1 nodes): `BulkPrimaryExecutionContext`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Actions`** (2 nodes): `SearchRequestContext`, `toString()`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Actions`** (2 nodes): `CompositeListener`, `SearchRequestOperationsListener`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query DSL`** (1 nodes): `BoolQueryBuilder`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Actions`** (1 nodes): `SearchTransportService`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Actions`** (1 nodes): `SearchPhaseContext`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Response`** (1 nodes): `SearchProgressListener`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Update Actions`** (2 nodes): `Builder`, `UpdateResponse`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query Queryphase`** (2 nodes): `DefaultQueryPhaseSearcher`, `QueryPhase`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Update Actions`** (2 nodes): `TransportInstanceSingleOperationAction`, `TransportUpdateAction`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Get Actions`** (2 nodes): `GetRequestBuilder`, `SingleShardOperationRequestBuilder`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Bulk Actions`** (1 nodes): `Builder`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query DSL`** (2 nodes): `BooleanFieldType`, `TermBasedFieldType`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query Querycollectorcontext`** (1 nodes): `QueryCollectorContext`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Actions`** (1 nodes): `SearchPhaseResults`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query Querycollectorarguments`** (2 nodes): `Builder`, `QueryCollectorArguments`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Response`** (2 nodes): `StreamSearchTransportService`, `SearchTransportService`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Response`** (1 nodes): `BottomSortValuesCollector`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `PIT Scroll`** (1 nodes): `CreatePitController`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Get Actions`** (2 nodes): `GetSearchPipelineTransportAction`, `TransportClusterManagerNodeReadAction`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `PIT Scroll`** (1 nodes): `ParsedScrollId`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `PIT Scroll`** (1 nodes): `PitService`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Action Search`** (1 nodes): `SearchContextId`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Action Search`** (2 nodes): `StreamSearchActionListener`, `SearchActionListener`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Bulk Actions`** (1 nodes): `BulkRequestParser`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Action Search`** (2 nodes): `ClusterManagerNodeReadRequest`, `GetSearchPipelineRequest`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Action Search`** (1 nodes): `CountedCollector`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Search Actions`** (1 nodes): `SearchRequestOperationsCompositeListenerFactory`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query Earlyterminatinglistener`** (1 nodes): `EarlyTerminatingListener`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++- **Thin community `Query Rescoringquerycollectorcontext`** (1 nodes): `RescoringQueryCollectorContext`
++  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
++
++## Suggested Questions
++_Questions this graph is uniquely positioned to answer:_
++
++- **Why does `InternalEngine` connect `REST Search` to `Bulk Actions`?**
++  _High betweenness centrality (0.061) - this node is a cross-community bridge._
++- **Why does `Engine` connect `Mapping Fields` to `Mapping Fields`?**
++  _High betweenness centrality (0.041) - this node is a cross-community bridge._
++- **Why does `SearchRequestBuilder` connect `Search Actions` to `REST Search`, `Bulk Actions`?**
++  _High betweenness centrality (0.025) - this node is a cross-community bridge._
++- **What connects `Fields`, `StatsHolder`, `ContextFields` to the rest of the system?**
++  _9 weakly-connected nodes found - possible documentation gaps or missing edges._
++- **Should `Bulk Actions` be split into smaller, more focused modules?**
++  _Cohesion score 0.01 - nodes in this community are weakly interconnected._
++- **Should `Bulk Actions` be split into smaller, more focused modules?**
++  _Cohesion score 0.01 - nodes in this community are weakly interconnected._
++- **Should `Mapping Fields` be split into smaller, more focused modules?**
++  _Cohesion score 0.01 - nodes in this community are weakly interconnected._
+\ No newline at end of file
+diff --git a/docs/portage/graphify/opensearch-core/manifest.json b/docs/portage/graphify/opensearch-core/manifest.json
+new file mode 100644
+index 0000000..527f1ce
+--- /dev/null
++++ b/docs/portage/graphify/opensearch-core/manifest.json
+@@ -0,0 +1,240 @@
++{
++  "server/src/main/java/org/opensearch/action/ActionModule.java": 1777860279900.448,
++  "server/src/main/java/org/opensearch/action/bulk/BackoffPolicy.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkAction.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkItemRequest.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkItemResponse.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkPrimaryExecutionContext.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkProcessor.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkRequest.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkRequestBuilder.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkRequestHandler.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkRequestParser.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkResponse.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkShardRequest.java": 1777860279932.448,
++  "server/src/main/java/org/opensearch/action/bulk/BulkShardResponse.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/bulk/MappingUpdatePerformer.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/bulk/Retry.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/bulk/TransportBulkAction.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/bulk/TransportShardBulkAction.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/bulk/TransportSingleItemBulkWriteAction.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/bulk/package-info.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/delete/DeleteAction.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/delete/DeleteRequest.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/delete/DeleteRequestBuilder.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/delete/DeleteResponse.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/delete/TransportDeleteAction.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/delete/package-info.java": 1777860279933.448,
++  "server/src/main/java/org/opensearch/action/get/GetAction.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/GetRequest.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/GetRequestBuilder.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/GetResponse.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/MultiGetAction.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/MultiGetItemResponse.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/MultiGetRequest.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/MultiGetRequestBuilder.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/MultiGetResponse.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/MultiGetShardRequest.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/MultiGetShardResponse.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/TransportGetAction.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/TransportMultiGetAction.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/TransportShardMultiGetAction.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/get/package-info.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/index/IndexAction.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/index/IndexRequest.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/index/IndexRequestBuilder.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/index/IndexResponse.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/index/TransportIndexAction.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/index/package-info.java": 1777860279934.448,
++  "server/src/main/java/org/opensearch/action/search/AbstractSearchAsyncAction.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/ArraySearchPhaseResults.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/BottomSortValuesCollector.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/CanMatchPreFilterSearchPhase.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/ClearScrollAction.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/ClearScrollController.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/ClearScrollRequest.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/ClearScrollRequestBuilder.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/ClearScrollResponse.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/CountedCollector.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/CreatePitAction.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/CreatePitController.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/CreatePitRequest.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/CreatePitResponse.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DeletePitAction.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DeletePitInfo.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DeletePitRequest.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DeletePitResponse.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DeleteSearchPipelineAction.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DeleteSearchPipelineRequest.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DeleteSearchPipelineTransportAction.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/DfsQueryPhase.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/ExpandSearchPhase.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/FetchSearchPhase.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/GetAllPitNodeRequest.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/GetAllPitNodeResponse.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/GetAllPitNodesRequest.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/GetAllPitNodesResponse.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/GetAllPitsAction.java": 1777860279936.448,
++  "server/src/main/java/org/opensearch/action/search/GetSearchPipelineAction.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/GetSearchPipelineRequest.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/GetSearchPipelineResponse.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/GetSearchPipelineTransportAction.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/ListPitInfo.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/MaxScoreCollector.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/MultiSearchAction.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/MultiSearchRequest.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/MultiSearchRequestBuilder.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/MultiSearchResponse.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/ParsedScrollId.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/PitSearchContextIdForNode.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/PitService.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/PutSearchPipelineAction.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/PutSearchPipelineRequest.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/PutSearchPipelineTransportAction.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/QueryPhaseResultConsumer.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/ReduceSearchPhaseException.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchAction.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchActionListener.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchContextId.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchContextIdForNode.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchDfsQueryThenFetchAsyncAction.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchExecutionStatsCollector.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchPhase.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchPhaseContext.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchPhaseController.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchPhaseExecutionException.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchPhaseName.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchPhaseResults.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchProgressActionListener.java": 1777860279937.448,
++  "server/src/main/java/org/opensearch/action/search/SearchProgressListener.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchQueryThenFetchAsyncAction.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchRequest.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchRequestBuilder.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchRequestContext.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchRequestOperationsCompositeListenerFactory.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchRequestOperationsListener.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchRequestSlowLog.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchRequestStats.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchResponse.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchResponseMerger.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchResponseSections.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchScrollAction.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchScrollAsyncAction.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchScrollQueryAndFetchAsyncAction.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchScrollQueryThenFetchAsyncAction.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchScrollRequest.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchScrollRequestBuilder.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchShard.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchShardIterator.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchShardTask.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchTask.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchTaskRequestOperationsListener.java": 1777860279938.448,
++  "server/src/main/java/org/opensearch/action/search/SearchTransportService.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/SearchType.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/SearchUtils.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/ShardSearchFailure.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/StreamQueryPhaseResultConsumer.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/StreamSearchAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/StreamSearchActionListener.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/StreamSearchQueryThenFetchAsyncAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/StreamSearchTransportService.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/StreamTransportSearchAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportClearScrollAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportCreatePitAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportDeletePitAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportGetAllPitsAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportMultiSearchAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportSearchAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportSearchHelper.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/TransportSearchScrollAction.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/UpdatePitContextRequest.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/UpdatePitContextResponse.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/WrappingSearchAsyncActionPhase.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/search/package-info.java": 1777860279939.448,
++  "server/src/main/java/org/opensearch/action/update/TransportUpdateAction.java": 1777860279948.448,
++  "server/src/main/java/org/opensearch/action/update/UpdateAction.java": 1777860279948.448,
++  "server/src/main/java/org/opensearch/action/update/UpdateHelper.java": 1777860279948.448,
++  "server/src/main/java/org/opensearch/action/update/UpdateRequest.java": 1777860279948.448,
++  "server/src/main/java/org/opensearch/action/update/UpdateRequestBuilder.java": 1777860279950.448,
++  "server/src/main/java/org/opensearch/action/update/UpdateResponse.java": 1777860279950.448,
++  "server/src/main/java/org/opensearch/action/update/package-info.java": 1777860279950.448,
++  "server/src/main/java/org/opensearch/index/engine/Engine.java": 1777860280015.448,
++  "server/src/main/java/org/opensearch/index/engine/InternalEngine.java": 1777860280016.448,
++  "server/src/main/java/org/opensearch/index/mapper/BooleanFieldMapper.java": 1777860280023.448,
++  "server/src/main/java/org/opensearch/index/mapper/DateFieldMapper.java": 1777860280023.448,
++  "server/src/main/java/org/opensearch/index/mapper/DocumentMapper.java": 1777860280024.448,
++  "server/src/main/java/org/opensearch/index/mapper/FieldMapper.java": 1777860280024.448,
++  "server/src/main/java/org/opensearch/index/mapper/KeywordFieldMapper.java": 1777860280025.448,
++  "server/src/main/java/org/opensearch/index/mapper/MapperService.java": 1777860280026.448,
++  "server/src/main/java/org/opensearch/index/mapper/NumberFieldMapper.java": 1777860280026.448,
++  "server/src/main/java/org/opensearch/index/mapper/ObjectMapper.java": 1777860280026.448,
++  "server/src/main/java/org/opensearch/index/mapper/SourceFieldMapper.java": 1777860280027.448,
++  "server/src/main/java/org/opensearch/index/mapper/TextFieldMapper.java": 1777860280027.448,
++  "server/src/main/java/org/opensearch/index/query/AbstractQueryBuilder.java": 1777860280028.448,
++  "server/src/main/java/org/opensearch/index/query/BoolQueryBuilder.java": 1777860280028.448,
++  "server/src/main/java/org/opensearch/index/query/ExistsQueryBuilder.java": 1777860280029.448,
++  "server/src/main/java/org/opensearch/index/query/FuzzyQueryBuilder.java": 1777860280029.448,
++  "server/src/main/java/org/opensearch/index/query/MatchAllQueryBuilder.java": 1777860280030.448,
++  "server/src/main/java/org/opensearch/index/query/MatchNoneQueryBuilder.java": 1777860280030.448,
++  "server/src/main/java/org/opensearch/index/query/MatchQueryBuilder.java": 1777860280030.448,
++  "server/src/main/java/org/opensearch/index/query/MultiMatchQueryBuilder.java": 1777860280030.448,
++  "server/src/main/java/org/opensearch/index/query/PrefixQueryBuilder.java": 1777860280030.448,
++  "server/src/main/java/org/opensearch/index/query/QueryBuilder.java": 1777860280030.448,
++  "server/src/main/java/org/opensearch/index/query/QueryBuilders.java": 1777860280030.448,
++  "server/src/main/java/org/opensearch/index/query/RangeQueryBuilder.java": 1777860280031.448,
++  "server/src/main/java/org/opensearch/index/query/RegexpQueryBuilder.java": 1777860280031.448,
++  "server/src/main/java/org/opensearch/index/query/TermQueryBuilder.java": 1777860280031.448,
++  "server/src/main/java/org/opensearch/index/query/TermsQueryBuilder.java": 1777860280031.448,
++  "server/src/main/java/org/opensearch/index/query/WildcardQueryBuilder.java": 1777860280032.448,
++  "server/src/main/java/org/opensearch/index/translog/TranslogManager.java": 1777860280043.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestClearScrollAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestCountAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestCreatePitAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestDeletePitAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestDeleteSearchPipelineAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestExplainAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestGetAllPitsAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestGetSearchPipelineAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestMultiSearchAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestPutSearchPipelineAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestSearchAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/RestSearchScrollAction.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/rest/action/search/package-info.java": 1777860280094.448,
++  "server/src/main/java/org/opensearch/search/SearchModule.java": 1777860280099.448,
++  "server/src/main/java/org/opensearch/search/query/Bitmap64DocValuesQuery.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/Bitmap64IndexQuery.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/BitmapDocValuesQuery.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/BitmapIndexQuery.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/ConcurrentQueryPhaseSearcher.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/EarlyTerminatingCollector.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/EarlyTerminatingCollectorManager.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/EarlyTerminatingListener.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/FilteredCollectorManager.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/MinimumCollectorManager.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryCollectorArguments.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryCollectorContext.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryCollectorContextSpec.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryCollectorContextSpecFactory.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryCollectorContextSpecRegistry.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryCollectorManagerContext.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryPhase.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryPhaseExecutionException.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryPhaseSearcher.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryPhaseSearcherWrapper.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryRewriter.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QueryRewriterRegistry.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QuerySearchRequest.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/QuerySearchResult.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/ReduceableSearchResult.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/RescoringQueryCollectorContext.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/ScrollQuerySearchResult.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/TopDocsCollectorContext.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/TotalHitCountCollectorManager.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/package-info.java": 1777860280126.448,
++  "server/src/main/java/org/opensearch/search/query/rewriters/BooleanFlatteningRewriter.java": 1777860280127.448,
++  "server/src/main/java/org/opensearch/search/query/rewriters/MatchAllRemovalRewriter.java": 1777860280127.448,
++  "server/src/main/java/org/opensearch/search/query/rewriters/MustNotToShouldRewriter.java": 1777860280127.448,
++  "server/src/main/java/org/opensearch/search/query/rewriters/MustToFilterRewriter.java": 1777860280127.448,
++  "server/src/main/java/org/opensearch/search/query/rewriters/TermsMergingRewriter.java": 1777860280127.448,
++  "server/src/main/java/org/opensearch/search/query/rewriters/package-info.java": 1777860280127.448
++}
+\ No newline at end of file
+diff --git a/docs/portage/graphify/opensearch-core/runtime.json b/docs/portage/graphify/opensearch-core/runtime.json
+new file mode 100644
+index 0000000..a7093c6
+--- /dev/null
++++ b/docs/portage/graphify/opensearch-core/runtime.json
+@@ -0,0 +1,85 @@
++{
++  "runtime": "typescript",
++  "version": "0.5.5",
++  "node": "/usr/bin/node",
++  "script": "/home/antoinefa/.npm-global/lib/node_modules/graphifyy/dist/skill-runtime.js",
++  "module": "/home/antoinefa/.npm-global/lib/node_modules/graphifyy/dist/index.js",
++  "cli": "/home/antoinefa/.npm-global/lib/node_modules/graphifyy/dist/cli.js",
++  "paths": {
++    "root": "/tmp/surch-portage-graph-corpora/opensearch-core",
++    "stateDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify",
++    "graph": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/graph.json",
++    "report": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/GRAPH_REPORT.md",
++    "html": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/graph.html",
++    "flows": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/flows.json",
++    "manifest": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/manifest.json",
++    "scope": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/scope.json",
++    "cost": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/cost.json",
++    "cacheDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/cache",
++    "transcriptsDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/transcripts",
++    "downloadsDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/transcripts/downloads",
++    "convertedDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/converted",
++    "memoryDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/memory",
++    "wikiDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/wiki",
++    "needsUpdate": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/needs_update",
++    "profile": {
++      "dir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile",
++      "projectConfig": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile/project-config.normalized.json",
++      "ontologyProfile": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile/ontology-profile.normalized.json",
++      "state": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile/profile-state.json",
++      "registriesDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile/registries",
++      "registryExtraction": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile/registry-extraction.json",
++      "semanticDetection": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile/semantic-detection.json",
++      "dataprepReport": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/profile/dataprep-report.md"
++    },
++    "imageDataprep": {
++      "dir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/image-dataprep",
++      "manifest": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/image-dataprep/manifest.json",
++      "captionsDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/image-dataprep/captions",
++      "routingDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/image-dataprep/routing",
++      "batchDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/image-dataprep/batch",
++      "importsDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/image-dataprep/imports",
++      "assistantInstructions": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/image-dataprep/assistant-instructions.md"
++    },
++    "ontologyOutput": {
++      "dir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology",
++      "manifest": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/manifest.json",
++      "nodes": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/nodes.json",
++      "aliases": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/aliases.json",
++      "relations": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/relations.json",
++      "sources": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/sources.json",
++      "occurrences": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/occurrences.json",
++      "validation": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/validation.json",
++      "index": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/index.json",
++      "wikiDir": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/ontology/wiki"
++    },
++    "scratch": {
++      "detect": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_detect.json",
++      "detectSemantic": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_detect_semantic.json",
++      "ast": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_ast.json",
++      "cached": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_cached.json",
++      "uncached": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_uncached.txt",
++      "semanticNew": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_semantic_new.json",
++      "semantic": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_semantic.json",
++      "extract": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_extract.json",
++      "analysis": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_analysis.json",
++      "labels": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_labels.json",
++      "transcripts": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_transcripts.json",
++      "pdfOcr": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_pdf_ocr.json",
++      "incremental": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_incremental.json",
++      "incrementalSemantic": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_incremental_semantic.json",
++      "oldGraph": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_old.json",
++      "runtime": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_runtime.json",
++      "node": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_node",
++      "runtimeScript": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify/.graphify_runtime_script"
++    },
++    "legacyRootScratch": {
++      "detect": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify_detect.json",
++      "extract": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify_extract.json",
++      "analysis": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify_analysis.json",
++      "labels": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify_labels.json",
++      "incremental": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify_incremental.json",
++      "oldGraph": "/tmp/surch-portage-graph-corpora/opensearch-core/.graphify_old.json"
++    }
++  }
++}
+diff --git a/docs/portage/reset/git-diff-stat-before-reset.txt b/docs/portage/reset/git-diff-stat-before-reset.txt
+new file mode 100644
+index 0000000..a98237f
+--- /dev/null
++++ b/docs/portage/reset/git-diff-stat-before-reset.txt
+@@ -0,0 +1,29 @@
++ CHANGELOG.md                                       |   9 +
++ PLAN.md                                            | 292 ++++----------
++ README.md                                          |  15 +-
++ ..._BRANCH_spec-harvest-index-and-document-apis.md |  69 ----
++ .../02_BRANCH_spec-harvest-search-and-query-dsl.md |  71 ----
++ .../03_BRANCH_storage-wal-segments-and-docstore.md |  84 ----
++ ...indexer-mappings-analyzers-and-bulk-contract.md |  81 ----
++ plan/05_BRANCH_search-query-execution-and-fuzzy.md |  85 ----
++ plan/06_BRANCH_api-index-and-document-compat.md    |  89 -----
++ .../07_BRANCH_api-search-compat-and-integration.md |  81 ----
++ ..._BRANCH_release-hardening-and-security-gates.md |  89 -----
++ ...matchid_elastic_parity_corpus_and_comparator.md |  71 ----
++ ...10_BRANCH_matchid_performance_parity_harness.md |  59 ---
++ plan/BRANCH_TEMPLATE.md                            | 101 -----
++ plan/SUBAGENT_PROMPT.md                            |  81 ----
++ spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md   | 439 ---------------------
++ spec/SPEC_MATCHID_ELASTIC_PARITY_CORPUS_FORMAT.md  | 110 ------
++ spec/SPEC_MATCHID_ELASTIC_PARITY_EXIT_CRITERIA.md  | 169 --------
++ spec/SPEC_MATCHID_PERFORMANCE_PARITY_HARNESS.md    |  64 ---
++ spec/SPEC_MATCHID_PERF_WORKLOAD_PROFILE.md         |  39 --
++ spec/SPEC_MATCHID_QUERY_SURFACE.md                 |  78 ----
++ spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md            | 262 ------------
++ spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md               | 409 -------------------
++ spec/SPEC_SECURITY_AND_TESTING_BASELINE.md         |  63 ---
++ surch-api/src/main.rs                              | 202 +++++++++-
++ surch-core/src/search/query/bool_query.rs          |  27 ++
++ surch-core/src/storage/index_store.rs              |   4 +-
++ surch-core/src/storage/writer.rs                   |  41 +-
++ 28 files changed, 366 insertions(+), 2818 deletions(-)
+diff --git a/docs/portage/reset/git-status-before-reset.txt b/docs/portage/reset/git-status-before-reset.txt
+new file mode 100644
+index 0000000..e842739
+--- /dev/null
++++ b/docs/portage/reset/git-status-before-reset.txt
+@@ -0,0 +1,34 @@
++ M CHANGELOG.md
++ M PLAN.md
++ M README.md
++ D plan/01_BRANCH_spec-harvest-index-and-document-apis.md
++ D plan/02_BRANCH_spec-harvest-search-and-query-dsl.md
++ D plan/03_BRANCH_storage-wal-segments-and-docstore.md
++ D plan/04_BRANCH_indexer-mappings-analyzers-and-bulk-contract.md
++ D plan/05_BRANCH_search-query-execution-and-fuzzy.md
++ D plan/06_BRANCH_api-index-and-document-compat.md
++ D plan/07_BRANCH_api-search-compat-and-integration.md
++ D plan/08_BRANCH_release-hardening-and-security-gates.md
++ D plan/09_BRANCH_matchid_elastic_parity_corpus_and_comparator.md
++ D plan/10_BRANCH_matchid_performance_parity_harness.md
++ D plan/BRANCH_TEMPLATE.md
++ D plan/SUBAGENT_PROMPT.md
++ D spec/SPEC_EVOL_SURCH_GOVERNANCE_ORCHESTRATION.md
++ D spec/SPEC_MATCHID_ELASTIC_PARITY_CORPUS_FORMAT.md
++ D spec/SPEC_MATCHID_ELASTIC_PARITY_EXIT_CRITERIA.md
++ D spec/SPEC_MATCHID_PERFORMANCE_PARITY_HARNESS.md
++ D spec/SPEC_MATCHID_PERF_WORKLOAD_PROFILE.md
++ D spec/SPEC_MATCHID_QUERY_SURFACE.md
++ D spec/SPEC_OS_INDEX_AND_DOCUMENT_APIS.md
++ D spec/SPEC_OS_SEARCH_AND_QUERY_DSL.md
++ D spec/SPEC_SECURITY_AND_TESTING_BASELINE.md
++ M surch-api/src/main.rs
++ M surch-core/src/search/query/bool_query.rs
++ M surch-core/src/storage/index_store.rs
++ M surch-core/src/storage/writer.rs
++?? .dockerignore
++?? Dockerfile
++?? Makefile
++?? docs/
++?? plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md
++?? spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md
+diff --git a/docs/portage/reset/git-worktrees-before-reset.txt b/docs/portage/reset/git-worktrees-before-reset.txt
+new file mode 100644
+index 0000000..09bb54d
+--- /dev/null
++++ b/docs/portage/reset/git-worktrees-before-reset.txt
+@@ -0,0 +1,7 @@
++/home/antoinefa/src/surch                                 757f08f [develop]
++/home/antoinefa/src/surch/.worktrees/br-01-spec-harvest   53859e7 [feature/BR-01-spec-harvest-index-doc-api]
++/home/antoinefa/src/surch/.worktrees/br-02-spec-harvest   53859e7 [feature/BR-02-spec-harvest-search-query-dsl]
++/home/antoinefa/src/surch/.worktrees/br-03-storage-wal    23db5ab [feature/BR-03-storage-wal-segments-docstore]
++/home/antoinefa/src/surch/.worktrees/br-04-indexer        23db5ab [feature/BR-04-indexer-mappings-analyzers-bulk]
++/home/antoinefa/src/surch/.worktrees/br-05-search-fuzzy   d55ce7d [feature/BR-05-search-query-exec-fuzzy]
++/home/antoinefa/src/surch/.worktrees/br-06-api-index-doc  cdeb44b [feature/BR-06-api-index-document-compat]
+diff --git a/docs/superpowers/plans/2026-05-04-opensearch-lucene-rust-portage.md b/docs/superpowers/plans/2026-05-04-opensearch-lucene-rust-portage.md
+new file mode 100644
+index 0000000..2225800
+--- /dev/null
++++ b/docs/superpowers/plans/2026-05-04-opensearch-lucene-rust-portage.md
+@@ -0,0 +1,252 @@
++# OpenSearch Lucene Rust Portage Implementation Plan
++
++> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
++
++**Goal:** Build Surch as an upstream-traceable Rust port of OpenSearch plus Lucene behavior.
++
++**Architecture:** Split the prototype into focused crates for types, analysis, codec, store, index, search, and API. Every implementation ticket starts with an upstream reference and a golden parity test.
++
++**Tech Stack:** Rust 1.75+, edition 2021, Cargo workspace, Axum for REST, OpenSearch REST/YAML fixtures, Java Lucene/OpenSearch golden oracles, graphify reference reports.
++
++---
++
++### Task 0: Clean Restart Housekeeping
++
++**Files:**
++- Create: `docs/portage/reset/RESET_INVENTORY.md`
++- Create: `docs/portage/reset/git-status-before-reset.txt`
++- Create: `docs/portage/reset/git-diff-stat-before-reset.txt`
++- Create: `docs/portage/reset/git-worktrees-before-reset.txt`
++- Create: `docs/portage/reset/prototype-dirty-worktree.patch`
++- Move: `surch-core/` to `archive/legacy-prototype/surch-core/`
++- Move: `surch-api/` to `archive/legacy-prototype/surch-api/`
++- Move: `tests/matchid_parity/` to `archive/legacy-prototype/matchid/tests/`
++- Move: `scripts/matchid_*` to `archive/legacy-prototype/matchid/`
++- Modify: `README.md`
++- Modify: `rules/MASTER.md`
++
++- [ ] Record the dirty state before cleanup.
++
++Run:
++
++```bash
++mkdir -p docs/portage/reset
++git status --short > docs/portage/reset/git-status-before-reset.txt
++git diff --stat > docs/portage/reset/git-diff-stat-before-reset.txt
++git worktree list > docs/portage/reset/git-worktrees-before-reset.txt
++```
++
++Expected: the three reset inventory files exist under `docs/portage/reset/`.
++
++- [ ] Save the current prototype patch.
++
++Run:
++
++```bash
++git diff --binary > docs/portage/reset/prototype-dirty-worktree.patch
++```
++
++Expected: `docs/portage/reset/prototype-dirty-worktree.patch` contains the current uncommitted prototype/docs diff.
++
++- [ ] Create the archive branch.
++
++Run:
++
++```bash
++git branch archive/prototype-before-portage-2026-05-04 develop
++```
++
++Expected: `git branch --list archive/prototype-before-portage-2026-05-04` prints the archive branch.
++
++- [ ] Validate stale worktrees before removal.
++
++Run:
++
++```bash
++git worktree list
++git branch --contains feature/BR-01-spec-harvest-index-doc-api
++git branch --contains feature/BR-02-spec-harvest-search-query-dsl
++git branch --contains feature/BR-03-storage-wal-segments-docstore
++git branch --contains feature/BR-04-indexer-mappings-analyzers-bulk
++git branch --contains feature/BR-05-search-query-exec-fuzzy
++git branch --contains feature/BR-06-api-index-document-compat
++```
++
++Expected: every old feature branch is reachable from a named branch or explicitly recorded in `RESET_INVENTORY.md`.
++
++- [ ] Remove stale old-plan worktrees after conductor confirmation.
++
++Run after confirmation:
++
++```bash
++git worktree remove .worktrees/br-01-spec-harvest
++git worktree remove .worktrees/br-02-spec-harvest
++git worktree remove .worktrees/br-03-storage-wal
++git worktree remove .worktrees/br-04-indexer
++git worktree remove .worktrees/br-05-search-fuzzy
++git worktree remove .worktrees/br-06-api-index-doc
++```
++
++Expected: `git worktree list` no longer shows `.worktrees/br-*`.
++
++- [ ] Archive the prototype implementation from the active workspace.
++
++Run:
++
++```bash
++mkdir -p archive/legacy-prototype
++git mv surch-core archive/legacy-prototype/surch-core
++git mv surch-api archive/legacy-prototype/surch-api
++```
++
++Expected: `Cargo.toml` no longer references `surch-core` or `surch-api` after Task 2 rewrites the workspace.
++
++- [ ] Archive MatchID-specific prototype harnesses.
++
++Run:
++
++```bash
++mkdir -p archive/legacy-prototype/matchid
++git mv tests/matchid_parity archive/legacy-prototype/matchid/tests
++git mv scripts/matchid_* archive/legacy-prototype/matchid/
++```
++
++Expected: default `tests/` and `scripts/` no longer contain MatchID-specific prototype files.
++
++- [ ] Remove local runtime/build artifacts.
++
++Run:
++
++```bash
++rm -rf target data .worktrees/runtime-surch
++```
++
++Expected: `git status --short --ignored` shows no tracked deletion for those generated artifacts.
++
++- [ ] Rewrite stale governance references.
++
++Run:
++
++```bash
++rg -n "SPEC_OS_|SPEC_MATCHID_|BRANCH_|SUBAGENT_PROMPT|SPEC_EVOL" PLAN.md rules docs plan spec README.md CHANGELOG.md
++```
++
++Expected: remaining hits are either absent or listed in `docs/portage/reset/RESET_INVENTORY.md` with a migration decision.
++
++- [ ] Commit the cleanup baseline.
++
++Run:
++
++```bash
++git add PLAN.md plan spec docs CHANGELOG.md README.md rules archive Cargo.toml
++git commit -m "chore(portage): reset repository for opensearch lucene port"
++```
++
++Expected: reset commit contains only governance, archive moves, cleanup inventory, and blank-workspace preparation.
++
++### Task 1: Reference Ledger And Backlog Generator
++
++**Files:**
++- Create: `tools/portage-ledger/README.md`
++- Create: `tests/lucene_parity/README.md`
++- Create: `tests/opensearch_compat/README.md`
++- Modify: `Cargo.toml`
++
++- [ ] Create the reference ledger format from `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`.
++- [ ] Generate initial discovered tickets from Lucene selected classes and OpenSearch REST specs.
++- [ ] Add a CI check that rejects tickets without `upstream_ref`, owner, gates, and golden tests.
++- [ ] Commit with `docs(portage): add upstream reference ledger`.
++
++### Task 2: Workspace Reset
++
++**Files:**
++- Modify: `Cargo.toml`
++- Create: `crates/surch-types/Cargo.toml`
++- Create: `crates/surch-analysis/Cargo.toml`
++- Create: `crates/surch-codec/Cargo.toml`
++- Create: `crates/surch-store/Cargo.toml`
++- Create: `crates/surch-index/Cargo.toml`
++- Create: `crates/surch-search/Cargo.toml`
++- Create: `crates/surch-api/Cargo.toml`
++
++- [ ] Add the target crates with empty compileable libraries.
++- [ ] Confirm Task 0 archived the existing prototype outside the active workspace.
++- [ ] Run `cargo fmt --all`.
++- [ ] Run `cargo test --workspace`.
++- [ ] Commit with `chore(workspace): create portage crate layout`.
++
++### Task 3: Lucene Store And Codec Foundation
++
++**Files:**
++- Create under `crates/surch-store/src/`
++- Create under `crates/surch-codec/src/`
++- Create under `tests/lucene_parity/store/`
++
++- [ ] Write Java-generated golden fixtures for `DataInput/DataOutput`.
++- [ ] Port vint, vlong, zig-zag, strings, maps, sets.
++- [ ] Port `IndexInput`, `IndexOutput`, `Directory`, locks, checksum.
++- [ ] Port `CodecUtil` headers, footers, CRC validation.
++- [ ] Run targeted store/codec tests.
++- [ ] Commit with `feat(storage): port lucene store primitives`.
++
++### Task 4: Lucene Segment Metadata
++
++**Files:**
++- Create under `crates/surch-codec/src/segment/`
++- Create under `crates/surch-index/src/metadata/`
++- Create under `tests/lucene_parity/segment/`
++
++- [ ] Port `FieldInfo(s)`, `SegmentInfo`, `SegmentCommitInfo`, `SegmentInfos`.
++- [ ] Add golden fixtures for file names, generations, and `segments_N`.
++- [ ] Add corruption and version mismatch tests.
++- [ ] Commit with `feat(storage): add lucene segment metadata`.
++
++### Task 5: Lucene Index Core
++
++**Files:**
++- Create under `crates/surch-index/src/`
++- Create under `tests/lucene_parity/index/`
++
++- [ ] Port term dictionary interfaces, `TermsEnum`, `PostingsEnum`.
++- [ ] Add postings docs/frequencies/positions/offsets.
++- [ ] Add stored fields, live docs, and doc values foundations.
++- [ ] Add reader round-trip tests.
++- [ ] Commit with `feat(indexer): add lucene index primitives`.
++
++### Task 6: Analysis, Search, And Fuzzy
++
++**Files:**
++- Create under `crates/surch-analysis/src/`
++- Create under `crates/surch-search/src/`
++- Create under `tests/lucene_parity/search/`
++
++- [ ] Port analyzer/token stream model and `StandardAnalyzer` behavior.
++- [ ] Port query, weight, scorer, collector, top docs, and BM25 foundations.
++- [ ] Port automata and `FuzzyQuery` with maximum edit distance 2.
++- [ ] Add fuzzy `AUTO`, transposition, prefix, and expansion golden tests.
++- [ ] Commit with `feat(search): add lucene query and fuzzy core`.
++
++### Task 7: OpenSearch API Compatibility P0
++
++**Files:**
++- Create under `crates/surch-types/src/opensearch/`
++- Create under `crates/surch-api/src/`
++- Create under `tests/opensearch_compat/`
++
++- [ ] Port root/index/mapping/settings document APIs.
++- [ ] Port `_bulk`, `_search`, and `_count` P0 contracts.
++- [ ] Implement OpenSearch-compatible error envelopes.
++- [ ] Replay upstream REST fixtures for status, shape, hits, order, and score tolerance.
++- [ ] Commit with `api(search): add opensearch p0 compatibility`.
++
++### Task 8: Security, Performance, And Release Gates
++
++**Files:**
++- Create under `tests/security/`
++- Create under `tests/perf/`
++- Modify: CI configuration when present
++
++- [ ] Add body size, NDJSON, bool depth, wildcard, regexp, fuzzy expansion, and pagination negative tests.
++- [ ] Add performance baseline harness for indexing and search.
++- [ ] Add dependency audit/deny tooling.
++- [ ] Commit with `security(api): add compatibility safety gates`.
+diff --git a/docs/superpowers/specs/2026-05-04-opensearch-lucene-rust-port-design.md b/docs/superpowers/specs/2026-05-04-opensearch-lucene-rust-port-design.md
+new file mode 100644
+index 0000000..1e27e17
+--- /dev/null
++++ b/docs/superpowers/specs/2026-05-04-opensearch-lucene-rust-port-design.md
+@@ -0,0 +1,36 @@
++# OpenSearch + Lucene Rust Port Design
++
++Date: 2026-05-04
++
++## Design Decision
++
++Surch will be rebuilt around upstream-traceable crates instead of extending the current scan-based prototype. The prototype can remain as a migration facade, but it is not the architecture of record.
++
++## Architecture
++
++The workspace splits into `surch-types`, `surch-analysis`, `surch-codec`, `surch-store`, `surch-index`, `surch-search`, and `surch-api`. The Lucene-like crates form the engine substrate; OpenSearch compatibility sits at the API and request/response layers.
++
++Before those crates are created, the current prototype must be archived out of the active workspace. The cleanup step records the dirty worktree, creates an archive branch, removes stale old-plan worktrees after conductor confirmation, archives prototype crates and MatchID-specific harnesses, and rewrites governance references.
++
++## Data Flow
++
++OpenSearch REST requests are parsed into typed request models, validated, and dispatched locally. Indexing flows through mappings and analyzers into Lucene-style segments. Search requests parse Query DSL into a Lucene-style query tree, rewrite through term dictionaries and automata, execute via scorers and collectors, and render OpenSearch-compatible JSON.
++
++## Testing
++
++Every feature starts with a golden oracle:
++
++- Lucene golden fixtures for binary formats, analyzers, query behavior, scoring, and fuzzy automata.
++- OpenSearch REST replay fixtures for API status, JSON shape, errors, totals, ordering, and score tolerance.
++
++## Error Handling
++
++All public API errors render OpenSearch-compatible envelopes. Unsupported features must fail explicitly with compatible status and reason rather than silently degrade.
++
++## Security
++
++Bounded input parsing is part of the contract. JSON/NDJSON body size, bool nesting, wildcard length, regexp determinization, fuzzy expansion, pagination, and sorting all require explicit limits and negative tests.
++
++## Scope Control
++
++The first release is a single-node compatible engine. Distributed cluster behavior, plugins, snapshots, remote store, vector search, and advanced ingest are deferred to explicit P2+ tickets.
+diff --git a/plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md b/plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md
+new file mode 100644
+index 0000000..9028a20
+--- /dev/null
++++ b/plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md
+@@ -0,0 +1,283 @@
++# Autonomous Portage Execution Plan
++
++Date: 2026-05-04
++
++> Required sub-skill for implementation: `superpowers:subagent-driven-development` for independent branch work, or `superpowers:executing-plans` for inline batches.
++
++## Goal
++
++Turn the upstream OpenSearch and Lucene references into an executable Rust porting backlog where subagents can implement one parity feature at a time without guessing architecture or acceptance criteria.
++
++## Backlog Schema
++
++Each ticket must use this shape:
++
++```yaml
++id: LUCENE-store-DataInput-001
++title: Port DataInput variable-length integer decoding
++owner: StorageEngine
++priority: Critical
++upstream_ref:
++  repo: lucene
++  commit: 7691b7ef9cfe3b87178646f4f32b3854afa0a567
++  files:
++    - lucene/core/src/java/org/apache/lucene/store/DataInput.java
++  symbols:
++    - readVInt
++    - readVLong
++    - readZLong
++parity_level: P1 behavior
++dependencies: []
++allowed_paths:
++  - crates/surch-store/**
++  - crates/surch-codec/**
++  - tests/lucene_parity/**
++forbidden_paths:
++  - surch-api/**
++golden_tests_required:
++  - Java fixture emits encoded bytes and expected decoded values
++  - Rust test consumes fixture and matches Java behavior
++gates:
++  - cargo fmt --all
++  - cargo test -p surch-store data_input
++  - cargo clippy --workspace --all-targets --all-features
++status: discovered
++```
++
++## Phase -1: Clean Restart Housekeeping
++
++Owner: Conductor
++
++Purpose: make the active repository intentionally blank for the new port without losing recoverability.
++
++Steps:
++
++1. Record the current state:
++
++```bash
++mkdir -p docs/portage/reset
++git status --short > docs/portage/reset/git-status-before-reset.txt
++git diff --stat > docs/portage/reset/git-diff-stat-before-reset.txt
++git worktree list > docs/portage/reset/git-worktrees-before-reset.txt
++```
++
++2. Save the dirty prototype patch:
++
++```bash
++git diff --binary > docs/portage/reset/prototype-dirty-worktree.patch
++```
++
++3. Create an archive branch from the current `develop` tip before destructive cleanup:
++
++```bash
++git branch archive/prototype-before-portage-2026-05-04 develop
++```
++
++4. Check stale worktrees before removal:
++
++```bash
++git worktree list
++git branch --contains feature/BR-01-spec-harvest-index-doc-api
++git branch --contains feature/BR-02-spec-harvest-search-query-dsl
++git branch --contains feature/BR-03-storage-wal-segments-docstore
++git branch --contains feature/BR-04-indexer-mappings-analyzers-bulk
++git branch --contains feature/BR-05-search-query-exec-fuzzy
++git branch --contains feature/BR-06-api-index-document-compat
++```
++
++5. Remove stale old-plan worktrees only after the conductor confirms they are archived:
++
++```bash
++git worktree remove .worktrees/br-01-spec-harvest
++git worktree remove .worktrees/br-02-spec-harvest
++git worktree remove .worktrees/br-03-storage-wal
++git worktree remove .worktrees/br-04-indexer
++git worktree remove .worktrees/br-05-search-fuzzy
++git worktree remove .worktrees/br-06-api-index-doc
++```
++
++6. Delete runtime/build artifacts from the active tree:
++
++```bash
++rm -rf target data .worktrees/runtime-surch
++```
++
++7. Remove or isolate prototype crates before blank workspace creation:
++
++```bash
++mkdir -p archive/legacy-prototype
++git mv surch-core archive/legacy-prototype/surch-core
++git mv surch-api archive/legacy-prototype/surch-api
++```
++
++8. Remove old generated parity scripts and fixtures from the default path unless they are reintroduced as golden harness inputs:
++
++```bash
++mkdir -p archive/legacy-prototype/matchid
++git mv scripts/matchid_* archive/legacy-prototype/matchid/
++git mv tests/matchid_parity archive/legacy-prototype/matchid/tests
++```
++
++9. Rewrite governance references:
++
++```bash
++rg -n "SPEC_OS_|SPEC_MATCHID_|BRANCH_|SUBAGENT_PROMPT|SPEC_EVOL" PLAN.md rules docs plan spec README.md CHANGELOG.md
++```
++
++Every hit must be either removed, rewritten to the new plan/spec, or documented in `docs/portage/reset/RESET_INVENTORY.md`.
++
++10. Exit criteria:
++
++```bash
++git status --short
++```
++
++Expected result: only the intentional reset files, archived prototype moves, deleted old plans/specs, and new portage docs are present.
++
++## Phase 0: Reference Harness And Blank Workspace Reset
++
++Owner: Conductor
++
++- Create `crates/` workspace skeleton.
++- Confirm Phase -1 has archived or isolated the existing prototype.
++- Add `tests/lucene_parity/` and `tests/opensearch_compat/`.
++- Add scripts that can run upstream Java/OpenSearch or consume recorded golden fixtures.
++- Generate the first backlog from upstream AST symbols and OpenSearch REST specs.
++- Require every branch plan to list exact upstream references.
++
++Exit criteria:
++
++- a `cargo test --workspace` baseline exists
++- first Lucene golden fixture passes against Java and fails against unimplemented Rust
++- first OpenSearch REST fixture passes against OpenSearch and fails against Surch
++
++## Phase 1: Lucene Store, Codec, Metadata
++
++Owner: StorageEngine
++
++Critical tickets:
++
++- `DataInput/DataOutput`: vint, vlong, zig-zag, string, map/set encoding.
++- `IndexInput/IndexOutput`: random access, slices, clone semantics, checksum.
++- `Directory`: filesystem implementation, locks, temp files, sync.
++- `CodecUtil`: headers, footers, magic, version checks, CRC validation.
++- `FieldInfo(s)`, `SegmentInfo`, `SegmentCommitInfo`, `SegmentInfos`.
++
++Golden tests:
++
++- Java-generated binary fixtures for primitive encodings.
++- corrupt footer/header fixtures.
++- `segments_N` metadata fixtures.
++
++## Phase 2: Lucene Index And Persistence
++
++Owner: StorageEngine + Indexer
++
++Critical tickets:
++
++- term dictionary and `TermsEnum`
++- postings docs/frequencies/positions/offsets
++- stored fields and `_source`
++- numeric/sorted/sorted-set doc values
++- live docs, hard deletes, commit points
++- writer flush/commit and reader reopen
++
++Golden tests:
++
++- Java indexes read by Rust where format support exists.
++- Rust indexes validated by a Java checker once writer parity exists.
++- round-trip index/search fixtures per field type.
++
++## Phase 3: Lucene Analysis And Search
++
++Owner: Indexer + SearchEngine
++
++Critical tickets:
++
++- token stream model
++- `StandardAnalyzer` UAX#29 behavior
++- term, boolean, phrase, prefix, wildcard, regexp, automaton, fuzzy queries
++- BM25 scoring with tolerance
++- collectors, sort, pagination, explanations
++
++Golden tests:
++
++- analyzer token snapshots
++- query doc IDs and score order
++- fuzzy edit-distance matrix with `AUTO`, prefix, expansions, transpositions
++
++## Phase 4: OpenSearch API Contracts
++
++Owner: APIServer
++
++Critical tickets:
++
++- route table for P0 endpoints
++- request parsing and validation
++- OpenSearch error envelopes
++- response rendering for `_shards`, `_seq_no`, `_primary_term`, `_version`, `result`, `hits`
++- mappings/settings model
++
++Golden tests:
++
++- REST spec fixtures from upstream YAML.
++- negative tests for malformed JSON, malformed NDJSON, unknown params, unsupported features.
++
++## Phase 5: Documents, Bulk, Search
++
++Owner: APIServer + StorageEngine + SearchEngine
++
++Critical tickets:
++
++- index/create/get/source/delete/update
++- `_bulk` strict NDJSON and item-level errors
++- refresh visibility
++- `_search` and `_count`
++- source filtering
++- sorting, pagination, `track_total_hits`
++- P0 Query DSL parser and execution
++
++Golden tests:
++
++- OpenSearch replay harness comparing status, body shape, hit totals, order, and score epsilon.
++- MatchID parity fixtures retained as external client regression tests.
++
++## Phase 6: P1/P2 Expansion
++
++Owner: Conductor assigns by dependency
++
++Backlog groups:
++
++- `_mget`, `_msearch`, `_field_caps`, `_analyze`
++- admin compatibility: refresh, flush, stats, segments, cat indices, cluster health
++- query string, simple query string, regexp, dis_max, constant score
++- PIT/scroll, aliases, templates, ingest/search pipelines
++
++Each group starts only when its LuceneCore dependencies are done.
++
++## Feedback Loop
++
++Feedback item states:
++
++```text
++open -> assigned -> fix_in_progress -> ready_for_review -> resolved | deferred | blocked
++```
++
++Blocking types:
++
++- `CODE_REVIEW`
++- `INTEGRATION_FAIL`
++- `SPEC_MISMATCH`
++- `SECURITY_ALERT`
++- `BLOCKED`
++
++`SECURITY_ALERT` and `SPEC_MISMATCH` block merge unless the conductor documents a deferral.
++
++## Branch Policy
++
++- one branch per feature ticket
++- one feature per subagent
++- PR target is `develop`
++- no direct commit to `main`
++- max four active subagents
++- branch must update changelog or parity ledger when public behavior changes
+diff --git a/spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md b/spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md
+new file mode 100644
+index 0000000..703588d
+--- /dev/null
++++ b/spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md
+@@ -0,0 +1,116 @@
++# Spec: Integral OpenSearch + Lucene Rust Portage
++
++Date: 2026-05-04
++
++## Scope
++
++Surch must become a Rust implementation of the observable OpenSearch plus Lucene behavior used by OpenSearch-compatible clients. The project is not a clean-room search toy; every implemented function, API, parser, codec, query, or response contract must trace to an upstream source reference and a parity test.
++
++The active implementation workspace starts from a blank Rust crate layout. Existing Surch prototype code is historical input only and must be archived or isolated before new porting work begins.
++
++Initial compatibility target:
++
++- OpenSearch commit `fead3a928236b61f9c759c61e738b541a148ab9f`
++- Lucene commit `7691b7ef9cfe3b87178646f4f32b3854afa0a567`
++- Rust 1.75+, edition 2021
++- no `unsafe` unless documented, reviewed, and locally justified
++
++## Non-Goals For The First Release
++
++Distributed cluster replication, security plugins, snapshots, remote store, vector search, analytics dashboards, ingest pipelines, and every optional OpenSearch plugin are outside the first release. They remain backlog items with explicit upstream references.
++
++The first release may be single-node, but it must render compatible OpenSearch responses for supported APIs.
++
++## Lucene Porting Domains
++
++Port in dependency order:
++
++1. `store`: `DataInput`, `DataOutput`, `IndexInput`, `IndexOutput`, `Directory`, `FSDirectory`, `MMapDirectory`, locks, checksum, `IOContext`.
++2. `codecs`: `CodecUtil`, headers, footers, CRC, `Codec`, postings/stored/docvalues/norms/live docs/compound abstractions.
++3. `index metadata`: `FieldInfo(s)`, `SegmentInfo`, `SegmentCommitInfo`, `SegmentInfos`, file names, generations, commit points.
++4. `terms and postings`: `Terms`, `TermsEnum`, `PostingsEnum`, impacts, block tree term dictionary, postings docs/positions/payloads.
++5. `stored fields and doc values`: `_source`, stored fields, norms, numeric/sorted/sorted-set doc values.
++6. `writer and reader`: `IndexWriter`, flush, commit, deletes, NRT reader reopen, `DirectoryReader`, `SegmentReader`, `LeafReader`.
++7. `analysis`: `Analyzer`, `TokenStream`, `Tokenizer`, `StandardAnalyzer`, lowercase, stop filter, UAX#29 behavior.
++8. `search`: `Query`, `Weight`, `Scorer`, `IndexSearcher`, collectors, sort, term/bool/phrase/multi-term queries.
++9. `automaton and fuzzy`: automata, regexp, compiled automata, Levenshtein automata, `FuzzyQuery`.
++10. `similarities`: BM25 first, then Boolean and Classic similarities.
++
++Fuzzy compatibility is mandatory: maximum supported edit distance is `2`, default transpositions are enabled, and fuzzy search must enumerate terms through the term dictionary/automata path rather than comparing the query string to whole field text.
++
++## OpenSearch Compatibility Domains
++
++P0 REST surface:
++
++- root info and index existence
++- create/delete index
++- mappings and settings
++- index/create/get/source/delete/update document
++- `_bulk`
++- `_search` and `_count`
++
++P0 Query DSL:
++
++- `match_all`, `match_none`, `term`, `terms`, `range`, `exists`, `ids`, `bool`
++- `match`, `multi_match`, `match_phrase`
++- `prefix`, `wildcard`, `fuzzy`
++
++P1 compatibility:
++
++- `_mget`, `_msearch`, `_explain`, `_validate/query`, `_field_caps`, `_analyze`
++- `_refresh`, `_flush`, `_stats`, `_segments`, `_cat/indices`, `_cluster/health`
++- `query_string`, `simple_query_string`, `regexp`, `constant_score`, `dis_max`
++
++P2 compatibility:
++
++- scroll/PIT, templates, aliases, ingest/search pipelines, tasks, snapshots, data streams, nested/span/interval/function-score queries, geo, scripting.
++
++## Golden Test Strategy
++
++OpenSearch tests:
++
++- derive API matrix from `rest-api-spec/api/*.json`
++- derive scenarios from `rest-api-spec/test/**/*.yml`
++- replay equivalent requests against upstream OpenSearch and Surch
++- normalize non-deterministic fields: `took`, generated IDs unless asserted, timestamps, version strings, shard details
++- compare status code, JSON envelope, error shape, required fields, hit totals, hit order, `_score` epsilon
++
++Lucene tests:
++
++- analyzer snapshots: tokens, positions, offsets, types
++- storage/index tests: round-trip, corruption, checksum, commit, delete replay
++- query tests: matching doc IDs, ordering, explanations, BM25 tolerances
++- fuzzy tests: distances `0`, `1`, `2`, rejection above `2`, `AUTO`, `prefix_length`, `max_expansions`, transpositions
++- codec tests: Rust-produced indexes accepted by a Java Lucene checker once the codec stage reaches binary parity
++
++## Security Requirements
++
++- all API inputs are bounded and validated
++- JSON and NDJSON parsers must reject malformed input with OpenSearch-compatible errors
++- bool depth, wildcard length, regexp determinization, fuzzy expansions, body size, pagination, and sort cardinality must have explicit limits
++- logs must never expose secrets or entire user documents by default
++- every public API boundary has negative tests
++
++## Reset Requirements
++
++Before any feature branch starts:
++
++- the old roadmap files are removed from the active plan/spec directories
++- stale branch worktrees are inventoried, checked for unique commits, then removed or archived
++- current dirty changes are saved as a patch in `docs/portage/reset/`
++- prototype crates are removed from the active Cargo workspace or moved behind an explicit legacy facade
++- runtime and build artifacts are excluded from the active reset commit
++- docs and rules no longer claim completed OpenSearch/Lucene compatibility without golden proof
++- the conductor records the reset inventory and exact cleanup decisions
++
++## Done Criteria
++
++A feature is done only when:
++
++- upstream reference is documented
++- golden test fails before implementation and passes after
++- module unit tests pass
++- integration test covers API or cross-crate behavior
++- docs/changelog are updated for public behavior
++- no blocking feedback remains open
++- conductor review accepts parity level and residual gaps
+diff --git a/surch-api/src/main.rs b/surch-api/src/main.rs
+index 11592e5..c741956 100644
+--- a/surch-api/src/main.rs
++++ b/surch-api/src/main.rs
+@@ -248,7 +248,7 @@ async fn index_document(
+     let doc = Document::new(id).with_fields(fields);
+ 
+     let store = state.store.read();
+-    let indexed_id = store
++    let write_result = store
+         .index_document(&index, doc)
+         .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+ 
+@@ -256,9 +256,13 @@ async fn index_document(
+         _index: index,
+         _id: doc_id,
+         version: 1,
+-        _seq_no: indexed_id,
++        _seq_no: write_result.seq_no,
+         _primary_term: 1,
+-        result: "created".to_string(),
++        result: if write_result.created {
++            "created".to_string()
++        } else {
++            "updated".to_string()
++        },
+         shards: ShardsInfo::default(),
+     }))
+ }
+@@ -461,14 +465,18 @@ fn process_bulk_request(
+ 
+                 let store = state.store.read();
+                 match store.index_document(&index, Document::new(id.clone()).with_fields(fields)) {
+-                    Ok(_) => {
++                    Ok(write_result) => {
+                         items.push(BulkItemResponse {
+                             index: Some(BulkItemResult {
+                                 index,
+                                 id,
+                                 version: 1,
+-                                result: "created".to_string(),
+-                                status: 201,
++                                result: if write_result.created {
++                                    "created".to_string()
++                                } else {
++                                    "updated".to_string()
++                                },
++                                status: if write_result.created { 201 } else { 200 },
+                             }),
+                             delete: None,
+                         });
+@@ -1711,6 +1719,188 @@ mod tests {
+         assert_eq!(hits[0]["_id"].as_str(), Some("3"));
+     }
+ 
++    #[tokio::test]
++    async fn indexing_same_document_id_overwrites_previous_document() {
++        let app = test_app();
++
++        let _ = app
++            .clone()
++            .oneshot(
++                Request::builder()
++                    .method("PUT")
++                    .uri("/books")
++                    .header("content-type", "application/json")
++                    .body(Body::from("{}"))
++                    .expect("request"),
++            )
++            .await
++            .expect("create response");
++
++        for body in [r#"{"title":"First"}"#, r#"{"title":"Second"}"#] {
++            let response = app
++                .clone()
++                .oneshot(
++                    Request::builder()
++                        .method("PUT")
++                        .uri("/books/_doc/doc-1")
++                        .header("content-type", "application/json")
++                        .body(Body::from(body))
++                        .expect("request"),
++                )
++                .await
++                .expect("index response");
++
++            assert_eq!(response.status(), StatusCode::OK);
++        }
++
++        let response = app
++            .clone()
++            .oneshot(
++                Request::builder()
++                    .method("GET")
++                    .uri("/books/_doc/doc-1")
++                    .body(Body::empty())
++                    .expect("request"),
++            )
++            .await
++            .expect("get response");
++
++        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
++        let json: Value = serde_json::from_slice(&body).expect("json body");
++        assert_eq!(json["_source"]["title"].as_str(), Some("Second"));
++
++        let response = app
++            .oneshot(
++                Request::builder()
++                    .method("POST")
++                    .uri("/books/_search")
++                    .header("content-type", "application/json")
++                    .body(Body::from("{}"))
++                    .expect("request"),
++            )
++            .await
++            .expect("search response");
++
++        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
++        let json: Value = serde_json::from_slice(&body).expect("json body");
++        let hits = json["hits"]["hits"].as_array().expect("hits array");
++
++        assert_eq!(json["hits"]["total"]["value"].as_u64(), Some(1));
++        assert_eq!(hits.len(), 1);
++        assert_eq!(hits[0]["_id"].as_str(), Some("doc-1"));
++        assert_eq!(hits[0]["_source"]["title"].as_str(), Some("Second"));
++    }
++
++    #[tokio::test]
++    async fn search_matchid_positive_payload_returns_single_hit() {
++        let app = test_app();
++
++        let _ = app
++            .clone()
++            .oneshot(
++                Request::builder()
++                    .method("PUT")
++                    .uri("/deces")
++                    .header("content-type", "application/json")
++                    .body(Body::from("{}"))
++                    .expect("request"),
++            )
++            .await
++            .expect("create response");
++
++        for (id, nom, prenom, date_naissance, commune_naissance, pays_naissance) in [
++            (
++                "d6aHnLNWwBAt",
++                "Barlet",
++                "Suzanne",
++                "19260131",
++                "Amberieu-En-Bugey",
++                "France",
++            ),
++            (
++                "V-eJkbwV2qUN",
++                "Clavel",
++                "Jeannine",
++                "19300315",
++                "Lyon",
++                "France",
++            ),
++            (
++                "kWa8FSky6mMn",
++                "Suard",
++                "Marie",
++                "19291014",
++                "Pontchy",
++                "France",
++            ),
++            (
++                "MuqNxGUMhk9L",
++                "Geurts",
++                "Geoffrey",
++                "19660611",
++                "Appleton, Wisconsin",
++                "Etats-Unis",
++            ),
++            (
++                "rKbNkluzQDH7",
++                "Brachet",
++                "Suzanne",
++                "19240512",
++                "Catillon-sur-Sambre",
++                "France",
++            ),
++        ] {
++            let body = serde_json::json!({
++                "UID": id,
++                "NOM": nom,
++                "PRENOM": prenom,
++                "DATE_NAISSANCE": date_naissance,
++                "DATE_NAISSANCE.raw": date_naissance,
++                "COMMUNE_NAISSANCE": commune_naissance,
++                "COMMUNE_NAISSANCE.raw": commune_naissance,
++                "PAYS_NAISSANCE": pays_naissance,
++                "PAYS_NAISSANCE.raw": pays_naissance,
++            });
++
++            let response = app
++                .clone()
++                .oneshot(
++                    Request::builder()
++                        .method("PUT")
++                        .uri(format!("/deces/_doc/{id}"))
++                        .header("content-type", "application/json")
++                        .body(Body::from(body.to_string()))
++                        .expect("request"),
++                )
++                .await
++                .expect("index response");
++
++            assert_eq!(response.status(), StatusCode::OK);
++        }
++
++        let response = app
++            .oneshot(
++                Request::builder()
++                    .method("POST")
++                    .uri("/deces/_search")
++                    .header("content-type", "application/json")
++                    .body(Body::from(
++                        r#"{"size":20,"from":0,"sort":[{"_score":"desc"}],"query":{"bool":{"must":[{"bool":{"should":[{"match":{"PRENOM":"Suzanne Aimee"}},{"match":{"NOM":"Barlet"}}],"minimum_should_match":2}},{"match":{"DATE_NAISSANCE.raw":"19260131"}},{"match":{"COMMUNE_NAISSANCE.raw":"Amberieu-En-Bugey"}},{"match":{"PAYS_NAISSANCE.raw":"France"}}]}}}"#,
++                    ))
++                    .expect("request"),
++            )
++            .await
++            .expect("search response");
++
++        let body = to_bytes(response.into_body(), usize::MAX).await.expect("body");
++        let json: Value = serde_json::from_slice(&body).expect("json body");
++        let hits = json["hits"]["hits"].as_array().expect("hits array");
++
++        assert_eq!(json["hits"]["total"]["value"].as_u64(), Some(1));
++        assert_eq!(hits.len(), 1);
++        assert_eq!(hits[0]["_id"].as_str(), Some("d6aHnLNWwBAt"));
++    }
++
+     async fn seed_search_docs(app: &Router) {
+         let _ = app
+             .clone()
+diff --git a/surch-core/src/search/query/bool_query.rs b/surch-core/src/search/query/bool_query.rs
+index 50125c2..f77259c 100644
+--- a/surch-core/src/search/query/bool_query.rs
++++ b/surch-core/src/search/query/bool_query.rs
+@@ -70,6 +70,9 @@ impl Query for BoolQuery {
+                 if !hits.is_empty() {
+                     must_score += hits[0].score;
+                     must_match = true;
++                } else {
++                    must_match = false;
++                    break;
+                 }
+             }
+ 
+@@ -144,4 +147,28 @@ mod tests {
+         let results = query.execute(&docs);
+         assert_eq!(results.len(), 2);
+     }
++
++    #[test]
++    fn bool_query_requires_all_must_clauses() {
++        let docs = vec![
++            Document::new("1")
++                .with_field("status", FieldValue::Keyword("published".to_string()))
++                .with_field("year", FieldValue::Integer(2024)),
++            Document::new("2")
++                .with_field("status", FieldValue::Keyword("published".to_string()))
++                .with_field("year", FieldValue::Integer(2023)),
++        ];
++
++        let query = BoolQuery::new()
++            .must(QueryType::Term(TermQuery::new("status", "published")))
++            .must(QueryType::Range(
++                crate::search::RangeQuery::new("year")
++                    .gte(crate::search::Bound::Integer(2024))
++                    .lte(crate::search::Bound::Integer(2024)),
++            ));
++
++        let results = query.execute(&docs);
++        assert_eq!(results.len(), 1);
++        assert_eq!(results[0].doc.id, "1");
++    }
+ }
+diff --git a/surch-core/src/storage/index_store.rs b/surch-core/src/storage/index_store.rs
+index a89f121..6326fd9 100644
+--- a/surch-core/src/storage/index_store.rs
++++ b/surch-core/src/storage/index_store.rs
+@@ -1,4 +1,4 @@
+-use super::{error::Error, IndexReader, IndexWriter, WalManager};
++use super::{error::Error, IndexReader, IndexWriteResult, IndexWriter, WalManager};
+ use crate::common::{Document, IndexMetadata};
+ use parking_lot::RwLock;
+ use std::collections::HashMap;
+@@ -68,7 +68,7 @@ impl IndexStore {
+         self.indexes.read().get(name).map(|i| i.metadata.clone())
+     }
+ 
+-    pub fn index_document(&self, index_name: &str, doc: Document) -> Result<u64, Error> {
++    pub fn index_document(&self, index_name: &str, doc: Document) -> Result<IndexWriteResult, Error> {
+         let mut indexes = self.indexes.write();
+         let instance = indexes
+             .get_mut(index_name)
+diff --git a/surch-core/src/storage/writer.rs b/surch-core/src/storage/writer.rs
+index 6c408d5..d8947e9 100644
+--- a/surch-core/src/storage/writer.rs
++++ b/surch-core/src/storage/writer.rs
+@@ -14,6 +14,11 @@ pub struct IndexWriter {
+     current_doc_id: u64,
+ }
+ 
++pub struct IndexWriteResult {
++    pub seq_no: u64,
++    pub created: bool,
++}
++
+ impl IndexWriter {
+     pub fn new(
+         path: impl Into<PathBuf>,
+@@ -44,7 +49,9 @@ impl IndexWriter {
+         })
+     }
+ 
+-    pub fn index_document(&mut self, doc: Document) -> Result<u64, Error> {
++    pub fn index_document(&mut self, doc: Document) -> Result<IndexWriteResult, Error> {
++        let created = !self.remove_existing_document(&doc.id)?;
++
+         self.current_doc_id += 1;
+         let doc_id = self.current_doc_id;
+ 
+@@ -57,7 +64,10 @@ impl IndexWriter {
+ 
+         self.segments.write().add_segment(segment);
+ 
+-        Ok(doc_id)
++        Ok(IndexWriteResult {
++            seq_no: doc_id,
++            created,
++        })
+     }
+ 
+     pub fn delete_document(&mut self, doc_id: &str) -> Result<(), Error> {
+@@ -79,4 +89,31 @@ impl IndexWriter {
+     pub fn refresh(&self) -> Result<(), Error> {
+         Ok(())
+     }
++
++    fn remove_existing_document(&self, external_doc_id: &str) -> Result<bool, Error> {
++        let mut removed = false;
++
++        let mut segment_paths: Vec<PathBuf> = std::fs::read_dir(&self.path)?
++            .filter_map(Result::ok)
++            .map(|entry| entry.path())
++            .filter(|path| {
++                path.file_name()
++                    .and_then(|name| name.to_str())
++                    .map(|name| name.ends_with(SEGMENT_FILE_SUFFIX))
++                    .unwrap_or(false)
++            })
++            .collect();
++
++        segment_paths.sort();
++
++        for segment_path in segment_paths {
++            let mut segment = Segment::load(&segment_path)?;
++            if segment.remove_document(external_doc_id) {
++                segment.persist()?;
++                removed = true;
++            }
++        }
++
++        Ok(removed)
++    }
+ }

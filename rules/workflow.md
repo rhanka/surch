@@ -8,16 +8,17 @@ Provide a lean but strict execution model for Surch branch work.
 
 - `main`: release-only
 - `develop`: integration branch
-- `feature/BR-XX-<slug>`: one scoped feature stream
-- `bugfix/BR-XX-<slug>`: one scoped fix stream
-- `release/v0.1.0-mvp`: hardening and release validation
+- `feature/<ticket-id>-<slug>`: one scoped parity feature stream
+- `bugfix/<ticket-id>-<slug>`: one scoped fix stream
+- `release/vX.Y.Z-*`: hardening and release validation
 
-## Branch File Contract
+## Ticket Contract
 
-- Every real branch must have a corresponding `plan/NN_BRANCH_*.md` file.
-- The branch file is the execution source of truth for that branch.
-- `PLAN.md` references branch files and tracks status and dependencies.
-- Do not duplicate full lot checklists in `PLAN.md`.
+- Every implementation branch must have a parity ticket.
+- The ticket is the execution source of truth for that branch.
+- `PLAN.md` tracks phase order and source documents.
+- `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md` defines the required ticket schema.
+- Do not start work without upstream references, allowed paths, forbidden paths, golden tests, and gates.
 
 ## Worktree Policy
 
@@ -28,9 +29,9 @@ Provide a lean but strict execution model for Surch branch work.
   - isolated ports or data dirs are needed
 
 Naming convention:
-- `tmp/br-01-spec-harvest`
-- `tmp/br-03-storage-wal`
-- `tmp/br-05-search-fuzzy`
+- `tmp/lucene-store-datainput-001`
+- `tmp/os-api-bulk-001`
+- `tmp/lucene-search-fuzzyquery-001`
 
 ## Commit Policy
 
@@ -53,8 +54,8 @@ Rules:
 
 ## Scope Control
 
-- Allowed and forbidden paths must be declared in every branch file.
-- Conditional scope exceptions must be recorded in the branch file before touching sensitive paths.
+- Allowed and forbidden paths must be declared in every parity ticket.
+- Conditional scope exceptions must be recorded in the ticket before touching sensitive paths.
 - If the required change crosses branch boundaries, stop and escalate through the feedback loop.
 
 ## Verification Before Merge
@@ -64,7 +65,8 @@ Minimum merge gate for implementation branches:
 - `cargo clippy --workspace --all-targets --all-features`
 - scoped unit tests
 - scoped integration tests
-- branch checklist complete
+- golden parity tests for the ticket
+- ticket checklist complete
 - no unresolved blocker items
 
 ## Orchestration Model
@@ -88,11 +90,11 @@ Expected behavior:
 ## Pull Request Policy
 
 - one capability or one branch objective per PR
-- PR title and body must align with the branch file
-- do not merge without branch checklist completion and verification evidence
+- PR title and body must align with the parity ticket
+- do not merge without ticket checklist completion and verification evidence
 
 ## Release Policy
 
-- only `release/v0.1.0-mvp` may merge to `main` for MVP release
+- only release branches may merge to `main`
 - hardening fixes land on release branch, then back to `develop`
 - never bypass release checklist

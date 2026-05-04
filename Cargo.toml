@@ -1,7 +1,12 @@
 [workspace]
 members = [
-    "surch-core",
-    "surch-api",
+    "crates/surch-types",
+    "crates/surch-analysis",
+    "crates/surch-codec",
+    "crates/surch-store",
+    "crates/surch-index",
+    "crates/surch-search",
+    "crates/surch-api",
 ]
 resolver = "2"
 

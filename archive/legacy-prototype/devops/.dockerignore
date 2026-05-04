@@ -1,0 +1,14 @@
+.git
+.gitignore
+target
+**/target
+
+
+*.swp
+*.tmp
+
+.env
+.env.*
+
+.idea
+.vscode

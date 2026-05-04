@@ -1,0 +1,12 @@
+[package]
+name = "surch-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+surch-types = { path = "../surch-types" }
+unicode-segmentation = { workspace = true }

@@ -1,9 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- Replaced the previous branch/spec roadmap with a clean OpenSearch + Lucene Rust portage plan.
+- Added upstream reference tracking for cloned OpenSearch and Lucene commits.
+- Added graphify reports for focused LuceneCore and OpenSearchCore reference corpora.
+- Defined a golden-test-first autonomous execution model for function-level parity work.
+- Added a clean restart housekeeping phase for archiving the prototype, stale worktrees, runtime artifacts, and old governance references before rebuilding from a blank workspace.
+
 ## [0.1.0] - 2026-04-25
 
 ### Added
-- Initial release of Surch - a 100% Rust OpenSearch/Lucene clone
+- Initial Surch prototype. The OpenSearch/Lucene compatibility claims from this phase were superseded by the 2026-05-04 portage reset and now require golden parity proof.
 - Governance framework with conductor `PLAN.md`, numbered branch files, spec-first execution, and subagent rules
 - OpenSearch compatibility specs for index/document APIs, search/query DSL, security baseline, and MatchID Elastic parity exit criteria
 - Persisted Write-Ahead Log replay with on-disk `wal.jsonl`

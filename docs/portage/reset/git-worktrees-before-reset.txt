@@ -1,0 +1,7 @@
+/home/antoinefa/src/surch                                 757f08f [develop]
+/home/antoinefa/src/surch/.worktrees/br-01-spec-harvest   53859e7 [feature/BR-01-spec-harvest-index-doc-api]
+/home/antoinefa/src/surch/.worktrees/br-02-spec-harvest   53859e7 [feature/BR-02-spec-harvest-search-query-dsl]
+/home/antoinefa/src/surch/.worktrees/br-03-storage-wal    23db5ab [feature/BR-03-storage-wal-segments-docstore]
+/home/antoinefa/src/surch/.worktrees/br-04-indexer        23db5ab [feature/BR-04-indexer-mappings-analyzers-bulk]
+/home/antoinefa/src/surch/.worktrees/br-05-search-fuzzy   d55ce7d [feature/BR-05-search-query-exec-fuzzy]
+/home/antoinefa/src/surch/.worktrees/br-06-api-index-doc  cdeb44b [feature/BR-06-api-index-document-compat]

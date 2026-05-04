@@ -1,0 +1,13 @@
+[package]
+name = "surch-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+surch-codec = { path = "../surch-codec" }
+surch-types = { path = "../surch-types" }
+thiserror = { workspace = true }

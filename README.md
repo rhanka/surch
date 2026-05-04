@@ -1,60 +1,50 @@
 # Surch
 
-A 100% Rust search engine replicating OpenSearch/Lucene functionality.
+Surch is being rebuilt as a Rust port of OpenSearch plus Lucene behavior.
 
-## Features
+The previous prototype has been archived under `archive/legacy-prototype/`. The active workspace is intentionally blank and will grow through upstream-traceable parity tickets.
 
-- **Indexation**: Full-text indexing with configurable analyzers
-- **Search**: Query DSL with match, term, range, bool, fuzzy queries
-- **Fuzzy Search**: Damerau-Levenshtein distance ≤ 2 (Lucene signature)
-- **REST API**: OpenSearch/Elasticsearch compatible
+## Current Status
 
-## Quick Start
+- Planning baseline: `PLAN.md`
+- Integral portage spec: `spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md`
+- Autonomous execution plan: `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
+- Upstream references and graphify reports: `docs/portage/`
 
-```bash
-# Build
-cargo build --release
+Compatibility is not claimed until golden tests prove it against the pinned OpenSearch and Lucene references.
 
-# Run
-cargo run --release
+## Workspace
 
-# Test
-cargo test
+```text
+crates/
+  surch-types/
+  surch-analysis/
+  surch-codec/
+  surch-store/
+  surch-index/
+  surch-search/
+  surch-api/
 ```
 
-## API Examples
+## Development
 
-### Create Index
 ```bash
-curl -X PUT "localhost:9200/my-index"
+cargo test --workspace
+cargo fmt --all
+cargo clippy --workspace --all-targets --all-features
 ```
 
-### Index Document
-```bash
-curl -X PUT "localhost:9200/my-index/_doc/1" \
-  -H "Content-Type: application/json" \
-  -d '{"title": "Hello World", "content": "This is a test"}'
-```
+## Portage Rule
 
-### Search
-```bash
-curl -X POST "localhost:9200/my-index/_search" \
-  -H "Content-Type: application/json" \
-  -d '{"query": {"match": {"content": "test"}}}'
-```
+Every feature starts from an upstream reference and a golden parity test:
 
-### Fuzzy Search
-```bash
-curl -X POST "localhost:9200/my-index/_search" \
-  -H "Content-Type: application/json" \
-  -d '{"query": {"fuzzy": {"content": {"value": "tesh", "fuzziness": 2}}}}'
-```
-
-## Architecture
-
-- **surch-core**: Core search engine (storage, indexer, search)
-- **surch-api**: REST API server
+- upstream repository, commit, file, class, method or REST spec
+- owner subagent
+- allowed and forbidden paths
+- failing Surch test before implementation
+- passing oracle against upstream or recorded fixture
+- verification gates
 
 ## License
 
-Apache 2.0
+Apache-2.0
