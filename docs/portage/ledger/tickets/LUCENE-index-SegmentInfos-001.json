@@ -1,0 +1,44 @@
+{
+  "id": "LUCENE-index-SegmentInfos-001",
+  "title": "Port SegmentInfos commit metadata and generation handling",
+  "owner": "StorageEngine",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/index/SegmentInfos.java",
+      "lucene/core/src/java/org/apache/lucene/index/SegmentInfo.java",
+      "lucene/core/src/java/org/apache/lucene/index/SegmentCommitInfo.java"
+    ],
+    "symbols": [
+      "readCommit",
+      "commit",
+      "getNextPendingGeneration",
+      "getSegmentsFileName"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-codec-CodecUtil-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-codec/**",
+    "crates/surch-index/**",
+    "crates/surch-store/**",
+    "tests/lucene_parity/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**"
+  ],
+  "golden_tests_required": [
+    "Java fixture creates segments_N metadata for an empty and non-empty index",
+    "Rust parses generations file names and rejects corrupt commit metadata"
+  ],
+  "gates": [
+    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo test -p surch-index segment_infos",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

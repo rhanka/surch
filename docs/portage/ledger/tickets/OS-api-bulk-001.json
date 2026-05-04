@@ -1,0 +1,41 @@
+{
+  "id": "OS-api-bulk-001",
+  "title": "Port OpenSearch bulk NDJSON request parsing and item responses",
+  "owner": "APIServer",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "server/src/main/java/org/opensearch/action/bulk/BulkRequestParser.java",
+      "server/src/main/java/org/opensearch/action/bulk/BulkItemResponse.java"
+    ],
+    "symbols": [
+      "parse",
+      "BulkItemResponse",
+      "Failure"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-index-SegmentInfos-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-api/**",
+    "crates/surch-types/**",
+    "tests/opensearch_compat/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch oracle covers final newline handling unknown action create index delete and update items",
+    "Rust response matches status errors item ordering and bulk took normalization rules"
+  ],
+  "gates": [
+    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo test -p surch-api bulk",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

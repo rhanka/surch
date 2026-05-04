@@ -1,0 +1,42 @@
+{
+  "id": "LUCENE-store-DataInput-001",
+  "title": "Port DataInput and DataOutput primitive encodings",
+  "owner": "StorageEngine",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/store/DataInput.java",
+      "lucene/core/src/java/org/apache/lucene/store/DataOutput.java"
+    ],
+    "symbols": [
+      "readVInt",
+      "readVLong",
+      "readZLong",
+      "writeVInt",
+      "writeVLong",
+      "writeZLong"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [],
+  "allowed_paths": [
+    "crates/surch-store/**",
+    "crates/surch-codec/**",
+    "tests/lucene_parity/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**"
+  ],
+  "golden_tests_required": [
+    "Java fixture emits encoded primitive byte sequences and decoded values",
+    "Rust tests decode Java fixtures and encode values that round-trip through Java"
+  ],
+  "gates": [
+    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo test -p surch-store data_input",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

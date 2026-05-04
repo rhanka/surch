@@ -1,0 +1,43 @@
+{
+  "id": "OS-query-fuzzy-001",
+  "title": "Port OpenSearch fuzzy query DSL parameters",
+  "owner": "SearchEngine",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "server/src/main/java/org/opensearch/index/query/FuzzyQueryBuilder.java"
+    ],
+    "symbols": [
+      "fromXContent",
+      "doToQuery",
+      "fuzziness",
+      "prefixLength",
+      "maxExpansions",
+      "transpositions"
+    ]
+  },
+  "parity_level": "P2 scoring/order",
+  "dependencies": [
+    "LUCENE-search-FuzzyQuery-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-search/**",
+    "crates/surch-types/**",
+    "tests/opensearch_compat/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-store/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch oracle covers fuzziness 0 1 2 AUTO AUTO:x,y prefix_length max_expansions and transpositions",
+    "Rust matches total hits order and score epsilon on the same indexed corpus"
+  ],
+  "gates": [
+    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo test -p surch-search opensearch_fuzzy_query",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

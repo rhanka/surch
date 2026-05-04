@@ -1,0 +1,42 @@
+{
+  "id": "LUCENE-search-FuzzyQuery-001",
+  "title": "Port Lucene FuzzyQuery edit distance and rewrite behavior",
+  "owner": "SearchEngine",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/search/FuzzyQuery.java",
+      "lucene/core/src/java/org/apache/lucene/util/automaton/LevenshteinAutomata.java"
+    ],
+    "symbols": [
+      "FuzzyQuery",
+      "getFuzzyAutomaton",
+      "defaultMaxExpansions",
+      "defaultTranspositions"
+    ]
+  },
+  "parity_level": "P2 scoring/order",
+  "dependencies": [
+    "LUCENE-index-SegmentInfos-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-search/**",
+    "crates/surch-index/**",
+    "tests/lucene_parity/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**"
+  ],
+  "golden_tests_required": [
+    "Java Lucene oracle covers edit distances 0 1 2 and rejects distances above 2",
+    "Rust matches Java behavior for transpositions prefix_length max_expansions and AUTO-derived fuzziness"
+  ],
+  "gates": [
+    "python tools/portage-ledger/validate.py docs/portage/ledger/tickets",
+    "cargo test -p surch-search fuzzy_query",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}
