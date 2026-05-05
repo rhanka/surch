@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use surch_codec::codec_util::{
     check_footer, check_header, footer_length, write_footer, write_header, CodecUtilError,
 };
@@ -51,6 +53,7 @@ pub struct SegmentInfos {
     last_generation: i64,
     id: Option<[u8; 16]>,
     lucene_version: Option<(i32, i32, i32)>,
+    pub user_data: BTreeMap<String, String>,
     pub counter: i64,
     pub version: i64,
 }
@@ -75,6 +78,7 @@ impl SegmentInfos {
             last_generation: 0,
             id: None,
             lucene_version: None,
+            user_data: BTreeMap::new(),
             counter: 0,
             version: 0,
         })
@@ -144,7 +148,7 @@ impl SegmentInfos {
         write_be_i64(&mut bytes, self.version);
         write_vlong(&mut bytes, self.counter as u64);
         write_be_i32(&mut bytes, 0);
-        write_vint(&mut bytes, 0);
+        write_map_of_strings(&mut bytes, &self.user_data);
         write_footer(&mut bytes);
 
         Ok(SegmentInfosCommit {
@@ -198,12 +202,7 @@ impl SegmentInfos {
                 count: segment_count,
             });
         }
-        let user_data_count = read_vint(bytes, &mut position)?;
-        if user_data_count != 0 {
-            return Err(SegmentInfosError::UnsupportedUserData {
-                count: user_data_count,
-            });
-        }
+        let user_data = read_map_of_strings(bytes, &mut position)?;
         if position != body_end {
             return Err(SegmentInfosError::TrailingBytes {
                 count: body_end - position,
@@ -215,6 +214,7 @@ impl SegmentInfos {
         infos.last_generation = generation;
         infos.id = Some(id);
         infos.lucene_version = Some(lucene_version);
+        infos.user_data = user_data;
         infos.version = version;
         infos.counter = counter;
         Ok(infos)
@@ -346,6 +346,53 @@ fn write_vint(output: &mut Vec<u8>, value: i32) {
         bits >>= 7;
     }
     output.push(bits as u8);
+}
+
+fn write_string(output: &mut Vec<u8>, value: &str) {
+    write_vint(output, value.len() as i32);
+    output.extend_from_slice(value.as_bytes());
+}
+
+fn read_string(input: &[u8], position: &mut usize) -> Result<String> {
+    let length = read_vint(input, position)?;
+    if length < 0 {
+        return Err(SegmentInfosError::UnexpectedEof);
+    }
+    let length = length as usize;
+    let end = position
+        .checked_add(length)
+        .ok_or(SegmentInfosError::UnexpectedEof)?;
+    if end > input.len() {
+        return Err(SegmentInfosError::UnexpectedEof);
+    }
+    let value = std::str::from_utf8(&input[*position..end])
+        .map_err(|_| SegmentInfosError::UnexpectedEof)?
+        .to_owned();
+    *position = end;
+    Ok(value)
+}
+
+fn write_map_of_strings(output: &mut Vec<u8>, map: &BTreeMap<String, String>) {
+    write_vint(output, map.len() as i32);
+    for (key, value) in map {
+        write_string(output, key);
+        write_string(output, value);
+    }
+}
+
+fn read_map_of_strings(input: &[u8], position: &mut usize) -> Result<BTreeMap<String, String>> {
+    let count = read_vint(input, position)?;
+    if count < 0 {
+        return Err(SegmentInfosError::UnsupportedUserData { count });
+    }
+
+    let mut map = BTreeMap::new();
+    for _ in 0..count {
+        let key = read_string(input, position)?;
+        let value = read_string(input, position)?;
+        map.insert(key, value);
+    }
+    Ok(map)
 }
 
 fn read_vint(input: &[u8], position: &mut usize) -> Result<i32> {

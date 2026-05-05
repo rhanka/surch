@@ -3,6 +3,8 @@ use surch_index::segment_infos::{
     SegmentInfos, SegmentInfosError, PENDING_SEGMENTS, SEGMENTS,
 };
 
+use std::collections::BTreeMap;
+
 use surch_codec::codec_util::{check_footer, footer_length, write_footer, CODEC_MAGIC};
 
 #[test]
@@ -174,4 +176,20 @@ fn segment_infos_rejects_empty_commit_with_trailing_body_bytes() {
         .expect_err("trailing body bytes");
 
     assert!(matches!(err, SegmentInfosError::TrailingBytes { count: 1 }));
+}
+
+#[test]
+fn segment_infos_round_trips_commit_user_data() {
+    let mut infos = SegmentInfos::new(10).expect("segment infos");
+    infos.user_data = BTreeMap::from([
+        ("opaque".to_owned(), "client-value".to_owned()),
+        ("source".to_owned(), "surch".to_owned()),
+    ]);
+    let id = [0x33; 16];
+
+    let commit = infos.write_empty_commit(&id).expect("write commit");
+    let decoded =
+        SegmentInfos::read_empty_commit(&commit.file_name, &commit.bytes).expect("read commit");
+
+    assert_eq!(decoded.user_data, infos.user_data);
 }
