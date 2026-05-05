@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- Added Lucene-compatible `DataInput`/`DataOutput` VInt, VLong, and ZLong primitive encodings in `surch-store`.
+- Added Rust parity vectors for Lucene variable-length integer boundary behavior.
+
 ### Changed
 - Replaced the previous branch/spec roadmap with a clean OpenSearch + Lucene Rust portage plan.
 - Added upstream reference tracking for cloned OpenSearch and Lucene commits.
