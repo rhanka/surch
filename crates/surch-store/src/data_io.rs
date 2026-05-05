@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, DataIoError>;
@@ -6,6 +8,12 @@ pub type Result<T> = std::result::Result<T, DataIoError>;
 pub enum DataIoError {
     #[error("unexpected end of input at byte position {position}")]
     UnexpectedEof { position: usize },
+    #[error("invalid UTF-8 string data")]
+    InvalidUtf8,
+    #[error("invalid negative length {length}")]
+    NegativeLength { length: i32 },
+    #[error("length {length} exceeds i32::MAX")]
+    LengthOverflow { length: usize },
     #[error("cannot write negative vLong value {value}")]
     NegativeVLong { value: i64 },
 }
@@ -47,6 +55,31 @@ pub trait DataInput {
     fn read_zlong(&mut self) -> Result<i64> {
         Ok(zig_zag_decode_i64(self.read_vlong()? as u64))
     }
+
+    fn read_string(&mut self) -> Result<String> {
+        let length = checked_vint_length(self.read_vint()?)?;
+        let mut bytes = vec![0; length];
+        self.read_bytes(&mut bytes)?;
+        String::from_utf8(bytes).map_err(|_| DataIoError::InvalidUtf8)
+    }
+
+    fn read_map_of_strings(&mut self) -> Result<BTreeMap<String, String>> {
+        let count = checked_vint_length(self.read_vint()?)?;
+        let mut values = BTreeMap::new();
+        for _ in 0..count {
+            values.insert(self.read_string()?, self.read_string()?);
+        }
+        Ok(values)
+    }
+
+    fn read_set_of_strings(&mut self) -> Result<BTreeSet<String>> {
+        let count = checked_vint_length(self.read_vint()?)?;
+        let mut values = BTreeSet::new();
+        for _ in 0..count {
+            values.insert(self.read_string()?);
+        }
+        Ok(values)
+    }
 }
 
 pub trait DataOutput {
@@ -85,6 +118,29 @@ pub trait DataOutput {
             value >>= 7;
         }
         self.write_byte(value as u8)
+    }
+
+    fn write_string(&mut self, value: &str) -> Result<()> {
+        let bytes = value.as_bytes();
+        self.write_vint(checked_usize_length(bytes.len())?)?;
+        self.write_bytes(bytes)
+    }
+
+    fn write_map_of_strings(&mut self, values: &BTreeMap<String, String>) -> Result<()> {
+        self.write_vint(checked_usize_length(values.len())?)?;
+        for (key, value) in values {
+            self.write_string(key)?;
+            self.write_string(value)?;
+        }
+        Ok(())
+    }
+
+    fn write_set_of_strings(&mut self, values: &BTreeSet<String>) -> Result<()> {
+        self.write_vint(checked_usize_length(values.len())?)?;
+        for value in values {
+            self.write_string(value)?;
+        }
+        Ok(())
     }
 }
 
@@ -148,4 +204,12 @@ fn zig_zag_encode_i64(value: i64) -> u64 {
 
 fn zig_zag_decode_i64(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
+}
+
+fn checked_vint_length(length: i32) -> Result<usize> {
+    usize::try_from(length).map_err(|_| DataIoError::NegativeLength { length })
+}
+
+fn checked_usize_length(length: usize) -> Result<i32> {
+    i32::try_from(length).map_err(|_| DataIoError::LengthOverflow { length })
 }
