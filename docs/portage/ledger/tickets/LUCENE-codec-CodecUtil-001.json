@@ -39,5 +39,5 @@
     "cargo test -p surch-codec codec_util",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "active"
 }
