@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use surch_codec::codec_util::{
     check_footer, check_header, footer_length, write_footer, write_header, CodecUtilError,
@@ -38,6 +38,8 @@ pub enum SegmentInfosError {
     SuffixMismatch { expected: String, actual: String },
     #[error("invalid segment count: {count}")]
     InvalidSegmentCount { count: i32 },
+    #[error("invalid segment commit info id marker: {marker}")]
+    InvalidSegmentCommitInfoIdMarker { marker: u8 },
     #[error("empty commit reader does not support segment count: {count}")]
     UnsupportedSegmentCount { count: i32 },
     #[error("empty commit reader does not support commit user data count: {count}")]
@@ -54,6 +56,7 @@ pub struct SegmentInfos {
     id: Option<[u8; 16]>,
     lucene_version: Option<(i32, i32, i32)>,
     pub user_data: BTreeMap<String, String>,
+    pub segments: Vec<SegmentCommitInfo>,
     pub counter: i64,
     pub version: i64,
 }
@@ -62,6 +65,26 @@ pub struct SegmentInfos {
 pub struct SegmentInfosCommit {
     pub file_name: String,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentMetadata {
+    pub name: String,
+    pub id: [u8; 16],
+    pub codec: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentCommitInfo {
+    pub metadata: SegmentMetadata,
+    pub del_gen: i64,
+    pub del_count: i32,
+    pub field_infos_gen: i64,
+    pub doc_values_gen: i64,
+    pub soft_del_count: i32,
+    pub sci_id: Option<[u8; 16]>,
+    pub field_infos_files: BTreeSet<String>,
+    pub doc_values_update_files: BTreeMap<i32, BTreeSet<String>>,
 }
 
 impl SegmentInfos {
@@ -79,6 +102,7 @@ impl SegmentInfos {
             id: None,
             lucene_version: None,
             user_data: BTreeMap::new(),
+            segments: Vec::new(),
             counter: 0,
             version: 0,
         })
@@ -128,6 +152,10 @@ impl SegmentInfos {
     }
 
     pub fn write_empty_commit(&mut self, id: &[u8; 16]) -> Result<SegmentInfosCommit> {
+        self.write_commit(id)
+    }
+
+    pub fn write_commit(&mut self, id: &[u8; 16]) -> Result<SegmentInfosCommit> {
         let generation = self.get_next_pending_generation();
         self.generation = generation;
         self.last_generation = generation;
@@ -147,7 +175,10 @@ impl SegmentInfos {
         write_vint(&mut bytes, self.index_created_version_major);
         write_be_i64(&mut bytes, self.version);
         write_vlong(&mut bytes, self.counter as u64);
-        write_be_i32(&mut bytes, 0);
+        write_be_i32(&mut bytes, self.segments.len() as i32);
+        for segment in &self.segments {
+            write_segment_commit_info(&mut bytes, segment);
+        }
         write_map_of_strings(&mut bytes, &self.user_data);
         write_footer(&mut bytes);
 
@@ -159,6 +190,16 @@ impl SegmentInfos {
     }
 
     pub fn read_empty_commit(file_name: &str, bytes: &[u8]) -> Result<Self> {
+        let infos = Self::read_commit(file_name, bytes)?;
+        if !infos.segments.is_empty() {
+            return Err(SegmentInfosError::UnsupportedSegmentCount {
+                count: infos.segments.len() as i32,
+            });
+        }
+        Ok(infos)
+    }
+
+    pub fn read_commit(file_name: &str, bytes: &[u8]) -> Result<Self> {
         let generation = generation_from_segments_file_name(file_name)?;
         check_footer(bytes)?;
 
@@ -197,10 +238,9 @@ impl SegmentInfos {
                 count: segment_count,
             });
         }
-        if segment_count != 0 {
-            return Err(SegmentInfosError::UnsupportedSegmentCount {
-                count: segment_count,
-            });
+        let mut segments = Vec::with_capacity(segment_count as usize);
+        for _ in 0..segment_count {
+            segments.push(read_segment_commit_info(bytes, &mut position)?);
         }
         let user_data = read_map_of_strings(bytes, &mut position)?;
         if position != body_end {
@@ -215,6 +255,7 @@ impl SegmentInfos {
         infos.id = Some(id);
         infos.lucene_version = Some(lucene_version);
         infos.user_data = user_data;
+        infos.segments = segments;
         infos.version = version;
         infos.counter = counter;
         Ok(infos)
@@ -378,6 +419,94 @@ fn write_map_of_strings(output: &mut Vec<u8>, map: &BTreeMap<String, String>) {
         write_string(output, key);
         write_string(output, value);
     }
+}
+
+fn write_set_of_strings(output: &mut Vec<u8>, set: &BTreeSet<String>) {
+    write_vint(output, set.len() as i32);
+    for value in set {
+        write_string(output, value);
+    }
+}
+
+fn read_set_of_strings(input: &[u8], position: &mut usize) -> Result<BTreeSet<String>> {
+    let count = read_vint(input, position)?;
+    if count < 0 {
+        return Err(SegmentInfosError::UnexpectedEof);
+    }
+
+    let mut set = BTreeSet::new();
+    for _ in 0..count {
+        set.insert(read_string(input, position)?);
+    }
+    Ok(set)
+}
+
+fn write_segment_commit_info(output: &mut Vec<u8>, segment: &SegmentCommitInfo) {
+    write_string(output, &segment.metadata.name);
+    output.extend_from_slice(&segment.metadata.id);
+    write_string(output, &segment.metadata.codec);
+    write_be_i64(output, segment.del_gen);
+    write_be_i32(output, segment.del_count);
+    write_be_i64(output, segment.field_infos_gen);
+    write_be_i64(output, segment.doc_values_gen);
+    write_be_i32(output, segment.soft_del_count);
+    match segment.sci_id {
+        Some(id) => {
+            output.push(1);
+            output.extend_from_slice(&id);
+        }
+        None => output.push(0),
+    }
+    write_set_of_strings(output, &segment.field_infos_files);
+    write_be_i32(output, segment.doc_values_update_files.len() as i32);
+    for (field_number, files) in &segment.doc_values_update_files {
+        write_be_i32(output, *field_number);
+        write_set_of_strings(output, files);
+    }
+}
+
+fn read_segment_commit_info(input: &[u8], position: &mut usize) -> Result<SegmentCommitInfo> {
+    let metadata = SegmentMetadata {
+        name: read_string(input, position)?,
+        id: read_array::<16>(input, position)?,
+        codec: read_string(input, position)?,
+    };
+    let del_gen = read_be_i64(input, position)?;
+    let del_count = read_be_i32(input, position)?;
+    let field_infos_gen = read_be_i64(input, position)?;
+    let doc_values_gen = read_be_i64(input, position)?;
+    let soft_del_count = read_be_i32(input, position)?;
+    let sci_marker = read_byte(input, position)?;
+    let sci_id = match sci_marker {
+        0 => None,
+        1 => Some(read_array::<16>(input, position)?),
+        _ => {
+            return Err(SegmentInfosError::InvalidSegmentCommitInfoIdMarker { marker: sci_marker });
+        }
+    };
+    let field_infos_files = read_set_of_strings(input, position)?;
+    let doc_values_update_file_count = read_be_i32(input, position)?;
+    if doc_values_update_file_count < 0 {
+        return Err(SegmentInfosError::UnexpectedEof);
+    }
+    let mut doc_values_update_files = BTreeMap::new();
+    for _ in 0..doc_values_update_file_count {
+        let field_number = read_be_i32(input, position)?;
+        let files = read_set_of_strings(input, position)?;
+        doc_values_update_files.insert(field_number, files);
+    }
+
+    Ok(SegmentCommitInfo {
+        metadata,
+        del_gen,
+        del_count,
+        field_infos_gen,
+        doc_values_gen,
+        soft_del_count,
+        sci_id,
+        field_infos_files,
+        doc_values_update_files,
+    })
 }
 
 fn read_map_of_strings(input: &[u8], position: &mut usize) -> Result<BTreeMap<String, String>> {

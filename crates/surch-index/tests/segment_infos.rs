@@ -1,9 +1,10 @@
 use surch_index::segment_infos::{
     file_name_from_generation, generation_from_segments_file_name, get_last_commit_generation,
-    SegmentInfos, SegmentInfosError, PENDING_SEGMENTS, SEGMENTS,
+    SegmentCommitInfo, SegmentInfos, SegmentInfosError, SegmentMetadata, PENDING_SEGMENTS,
+    SEGMENTS,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use surch_codec::codec_util::{check_footer, footer_length, write_footer, CODEC_MAGIC};
 
@@ -192,4 +193,83 @@ fn segment_infos_round_trips_commit_user_data() {
         SegmentInfos::read_empty_commit(&commit.file_name, &commit.bytes).expect("read commit");
 
     assert_eq!(decoded.user_data, infos.user_data);
+}
+
+#[test]
+fn segment_infos_round_trips_single_segment_commit_metadata() {
+    let mut infos = SegmentInfos::new(10).expect("segment infos");
+    infos.segments.push(SegmentCommitInfo {
+        metadata: SegmentMetadata {
+            name: "_0".to_owned(),
+            id: [0x10; 16],
+            codec: "Lucene90".to_owned(),
+        },
+        del_gen: -1,
+        del_count: 0,
+        field_infos_gen: -1,
+        doc_values_gen: -1,
+        soft_del_count: 0,
+        sci_id: Some([0x55; 16]),
+        field_infos_files: BTreeSet::from(["_0.fnm".to_owned()]),
+        doc_values_update_files: BTreeMap::from([(3, BTreeSet::from(["_0_1.dvm".to_owned()]))]),
+    });
+    let id = [0x44; 16];
+
+    let commit = infos.write_commit(&id).expect("write commit");
+    let decoded = SegmentInfos::read_commit(&commit.file_name, &commit.bytes).expect("read commit");
+
+    assert_eq!(decoded.segments, infos.segments);
+}
+
+#[test]
+fn segment_infos_rejects_invalid_segment_commit_info_id_marker() {
+    let mut infos = SegmentInfos::new(10).expect("segment infos");
+    infos.segments.push(SegmentCommitInfo {
+        metadata: SegmentMetadata {
+            name: "_0".to_owned(),
+            id: [0x10; 16],
+            codec: "Lucene90".to_owned(),
+        },
+        del_gen: -1,
+        del_count: 0,
+        field_infos_gen: -1,
+        doc_values_gen: -1,
+        soft_del_count: 0,
+        sci_id: None,
+        field_infos_files: BTreeSet::new(),
+        doc_values_update_files: BTreeMap::new(),
+    });
+    let id = [0x45; 16];
+    let mut commit = infos.write_commit(&id).expect("write commit");
+    let mut pattern = Vec::new();
+    pattern.extend_from_slice(&(-1_i64).to_be_bytes());
+    pattern.extend_from_slice(&0_i32.to_be_bytes());
+    pattern.extend_from_slice(&(-1_i64).to_be_bytes());
+    pattern.extend_from_slice(&(-1_i64).to_be_bytes());
+    pattern.extend_from_slice(&0_i32.to_be_bytes());
+    pattern.push(0);
+    pattern.push(0);
+    pattern.extend_from_slice(&0_i32.to_be_bytes());
+
+    let marker_offset = commit
+        .bytes
+        .windows(pattern.len())
+        .position(|window| window == pattern.as_slice())
+        .expect("segment commit info marker")
+        + 8
+        + 4
+        + 8
+        + 8
+        + 4;
+    let _old_footer = commit.bytes.split_off(commit.bytes.len() - footer_length());
+    commit.bytes[marker_offset] = 2;
+    write_footer(&mut commit.bytes);
+
+    let err =
+        SegmentInfos::read_commit(&commit.file_name, &commit.bytes).expect_err("invalid marker");
+
+    assert!(matches!(
+        err,
+        SegmentInfosError::InvalidSegmentCommitInfoIdMarker { marker: 2 }
+    ));
 }
