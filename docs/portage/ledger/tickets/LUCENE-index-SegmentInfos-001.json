@@ -41,5 +41,5 @@
     "cargo test -p surch-index segment_infos",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "active"
 }
