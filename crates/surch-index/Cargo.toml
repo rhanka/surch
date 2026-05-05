@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 surch-analysis = { path = "../surch-analysis" }
+surch-codec = { path = "../surch-codec" }
 surch-store = { path = "../surch-store" }
 surch-types = { path = "../surch-types" }
 thiserror = { workspace = true }

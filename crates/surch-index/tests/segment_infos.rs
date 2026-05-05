@@ -3,6 +3,8 @@ use surch_index::segment_infos::{
     SegmentInfos, SegmentInfosError, PENDING_SEGMENTS, SEGMENTS,
 };
 
+use surch_codec::codec_util::{check_footer, footer_length, write_footer, CODEC_MAGIC};
+
 #[test]
 fn segment_infos_parses_lucene_segments_generations() {
     assert_eq!(generation_from_segments_file_name("segments").unwrap(), 0);
@@ -116,4 +118,60 @@ fn segment_infos_rejects_decreasing_write_generation() {
             current: 4
         }
     ));
+}
+
+#[test]
+fn segment_infos_writes_and_reads_empty_lucene_commit() {
+    let mut infos = SegmentInfos::new(10).expect("segment infos");
+    infos.version = 3;
+    infos.counter = 7;
+    let id = [0x42; 16];
+
+    let commit = infos.write_empty_commit(&id).expect("write commit");
+
+    assert_eq!(commit.file_name, "segments_1");
+    assert_eq!(infos.generation(), 1);
+    assert_eq!(infos.last_generation(), 1);
+    assert_eq!(&commit.bytes[..4], &CODEC_MAGIC.to_be_bytes());
+    check_footer(&commit.bytes).expect("valid footer");
+
+    let decoded =
+        SegmentInfos::read_empty_commit(&commit.file_name, &commit.bytes).expect("read commit");
+
+    assert_eq!(decoded.generation(), 1);
+    assert_eq!(decoded.last_generation(), 1);
+    assert_eq!(decoded.index_created_version_major(), 10);
+    assert_eq!(decoded.version, 3);
+    assert_eq!(decoded.counter, 7);
+    assert_eq!(decoded.id(), Some(id));
+    assert_eq!(decoded.lucene_version(), Some((11, 0, 0)));
+}
+
+#[test]
+fn segment_infos_rejects_empty_commit_with_corrupt_footer() {
+    let mut infos = SegmentInfos::new(10).expect("segment infos");
+    let id = [0x24; 16];
+    let mut commit = infos.write_empty_commit(&id).expect("write commit");
+    let last = commit.bytes.len() - 1;
+    commit.bytes[last] ^= 1;
+
+    let err = SegmentInfos::read_empty_commit(&commit.file_name, &commit.bytes)
+        .expect_err("corrupt footer");
+
+    assert!(matches!(err, SegmentInfosError::Codec(_)));
+}
+
+#[test]
+fn segment_infos_rejects_empty_commit_with_trailing_body_bytes() {
+    let mut infos = SegmentInfos::new(10).expect("segment infos");
+    let id = [0x18; 16];
+    let mut commit = infos.write_empty_commit(&id).expect("write commit");
+    let _footer = commit.bytes.split_off(commit.bytes.len() - footer_length());
+    commit.bytes.push(0xaa);
+    write_footer(&mut commit.bytes);
+
+    let err = SegmentInfos::read_empty_commit(&commit.file_name, &commit.bytes)
+        .expect_err("trailing body bytes");
+
+    assert!(matches!(err, SegmentInfosError::TrailingBytes { count: 1 }));
 }

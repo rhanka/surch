@@ -4,6 +4,7 @@
 
 ### Added
 - Added Lucene-compatible `SegmentInfos` generation and `segments_N` file-name handling in `surch-index`.
+- Added empty Lucene `segments_N` commit write/read support with footer validation in `surch-index`.
 - Added Lucene-compatible `CodecUtil` header/footer validation and CRC32 checksum primitives in `surch-codec`.
 - Added Lucene-compatible `DataInput`/`DataOutput` VInt, VLong, and ZLong primitive encodings in `surch-store`.
 - Added Rust parity vectors for Lucene variable-length integer boundary behavior.

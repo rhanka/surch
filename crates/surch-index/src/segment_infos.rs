@@ -1,8 +1,16 @@
+use surch_codec::codec_util::{
+    check_footer, check_header, footer_length, write_footer, write_header, CodecUtilError,
+};
 use thiserror::Error;
 
 pub const SEGMENTS: &str = "segments";
 pub const PENDING_SEGMENTS: &str = "pending_segments";
 pub const OLD_SEGMENTS_GEN: &str = "segments.gen";
+pub const SEGMENTS_CODEC: &str = "segments";
+pub const SEGMENTS_VERSION_74: i32 = 9;
+pub const SEGMENTS_VERSION_86: i32 = 10;
+pub const SEGMENTS_VERSION_CURRENT: i32 = SEGMENTS_VERSION_86;
+pub const LUCENE_LATEST_VERSION: (i32, i32, i32) = (11, 0, 0);
 
 pub type Result<T> = std::result::Result<T, SegmentInfosError>;
 
@@ -18,6 +26,22 @@ pub enum SegmentInfosError {
     UnsupportedIndexCreatedVersion { major: i32 },
     #[error("cannot decrease generation to {requested} from current generation {current}")]
     GenerationDecrease { requested: i64, current: i64 },
+    #[error("codec error: {0}")]
+    Codec(#[from] CodecUtilError),
+    #[error("unexpected end of segment infos input")]
+    UnexpectedEof,
+    #[error("invalid index header id length: {length}")]
+    InvalidIdLength { length: usize },
+    #[error("file mismatch, expected suffix={expected}, got={actual}")]
+    SuffixMismatch { expected: String, actual: String },
+    #[error("invalid segment count: {count}")]
+    InvalidSegmentCount { count: i32 },
+    #[error("empty commit reader does not support segment count: {count}")]
+    UnsupportedSegmentCount { count: i32 },
+    #[error("empty commit reader does not support commit user data count: {count}")]
+    UnsupportedUserData { count: i32 },
+    #[error("segment infos body has {count} trailing byte(s) before footer")]
+    TrailingBytes { count: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,8 +49,16 @@ pub struct SegmentInfos {
     index_created_version_major: i32,
     generation: i64,
     last_generation: i64,
+    id: Option<[u8; 16]>,
+    lucene_version: Option<(i32, i32, i32)>,
     pub counter: i64,
     pub version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentInfosCommit {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
 }
 
 impl SegmentInfos {
@@ -41,6 +73,8 @@ impl SegmentInfos {
             index_created_version_major,
             generation: 0,
             last_generation: 0,
+            id: None,
+            lucene_version: None,
             counter: 0,
             version: 0,
         })
@@ -56,6 +90,14 @@ impl SegmentInfos {
 
     pub fn last_generation(&self) -> i64 {
         self.last_generation
+    }
+
+    pub fn id(&self) -> Option<[u8; 16]> {
+        self.id
+    }
+
+    pub fn lucene_version(&self) -> Option<(i32, i32, i32)> {
+        self.lucene_version
     }
 
     pub fn get_segments_file_name(&self) -> Option<String> {
@@ -79,6 +121,103 @@ impl SegmentInfos {
         }
         self.generation = generation;
         Ok(())
+    }
+
+    pub fn write_empty_commit(&mut self, id: &[u8; 16]) -> Result<SegmentInfosCommit> {
+        let generation = self.get_next_pending_generation();
+        self.generation = generation;
+        self.last_generation = generation;
+        self.id = Some(*id);
+        self.lucene_version = Some(LUCENE_LATEST_VERSION);
+
+        let suffix = format_base36(generation);
+        let mut bytes = Vec::new();
+        write_header(&mut bytes, SEGMENTS_CODEC, SEGMENTS_VERSION_CURRENT)?;
+        bytes.extend_from_slice(id);
+        bytes.push(suffix.len() as u8);
+        bytes.extend_from_slice(suffix.as_bytes());
+
+        write_vint(&mut bytes, LUCENE_LATEST_VERSION.0);
+        write_vint(&mut bytes, LUCENE_LATEST_VERSION.1);
+        write_vint(&mut bytes, LUCENE_LATEST_VERSION.2);
+        write_vint(&mut bytes, self.index_created_version_major);
+        write_be_i64(&mut bytes, self.version);
+        write_vlong(&mut bytes, self.counter as u64);
+        write_be_i32(&mut bytes, 0);
+        write_vint(&mut bytes, 0);
+        write_footer(&mut bytes);
+
+        Ok(SegmentInfosCommit {
+            file_name: file_name_from_generation(SEGMENTS, "", generation)
+                .expect("positive generation must produce a file name"),
+            bytes,
+        })
+    }
+
+    pub fn read_empty_commit(file_name: &str, bytes: &[u8]) -> Result<Self> {
+        let generation = generation_from_segments_file_name(file_name)?;
+        check_footer(bytes)?;
+
+        if bytes.len() < footer_length() {
+            return Err(SegmentInfosError::UnexpectedEof);
+        }
+        let body_end = bytes.len() - footer_length();
+        let header = check_header(
+            &bytes[..body_end],
+            SEGMENTS_CODEC,
+            SEGMENTS_VERSION_74,
+            SEGMENTS_VERSION_CURRENT,
+        )?;
+        let mut position = header.length;
+        let id = read_array::<16>(bytes, &mut position)?;
+        let suffix = read_byte_string(bytes, &mut position)?;
+        let expected_suffix = format_base36(generation);
+        if suffix != expected_suffix {
+            return Err(SegmentInfosError::SuffixMismatch {
+                expected: expected_suffix,
+                actual: suffix,
+            });
+        }
+
+        let lucene_version = (
+            read_vint(bytes, &mut position)?,
+            read_vint(bytes, &mut position)?,
+            read_vint(bytes, &mut position)?,
+        );
+        let index_created_version_major = read_vint(bytes, &mut position)?;
+        let version = read_be_i64(bytes, &mut position)?;
+        let counter = read_vlong(bytes, &mut position)? as i64;
+        let segment_count = read_be_i32(bytes, &mut position)?;
+        if segment_count < 0 {
+            return Err(SegmentInfosError::InvalidSegmentCount {
+                count: segment_count,
+            });
+        }
+        if segment_count != 0 {
+            return Err(SegmentInfosError::UnsupportedSegmentCount {
+                count: segment_count,
+            });
+        }
+        let user_data_count = read_vint(bytes, &mut position)?;
+        if user_data_count != 0 {
+            return Err(SegmentInfosError::UnsupportedUserData {
+                count: user_data_count,
+            });
+        }
+        if position != body_end {
+            return Err(SegmentInfosError::TrailingBytes {
+                count: body_end - position,
+            });
+        }
+
+        let mut infos = SegmentInfos::new(index_created_version_major)?;
+        infos.generation = generation;
+        infos.last_generation = generation;
+        infos.id = Some(id);
+        infos.lucene_version = Some(lucene_version);
+        infos.version = version;
+        infos.counter = counter;
+        Ok(infos)
     }
 }
 
@@ -198,4 +337,97 @@ fn format_base36(value: i64) -> String {
         digits.push('-');
     }
     digits.iter().rev().collect()
+}
+
+fn write_vint(output: &mut Vec<u8>, value: i32) {
+    let mut bits = value as u32;
+    while bits & !0x7f != 0 {
+        output.push(((bits & 0x7f) | 0x80) as u8);
+        bits >>= 7;
+    }
+    output.push(bits as u8);
+}
+
+fn read_vint(input: &[u8], position: &mut usize) -> Result<i32> {
+    let mut value = 0_u32;
+    for shift in (0..32).step_by(7) {
+        let byte = read_byte(input, position)?;
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    Ok(value as i32)
+}
+
+fn write_vlong(output: &mut Vec<u8>, mut value: u64) {
+    while value & !0x7f != 0 {
+        output.push(((value & 0x7f) | 0x80) as u8);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn read_vlong(input: &[u8], position: &mut usize) -> Result<u64> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let byte = read_byte(input, position)?;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    Ok(value)
+}
+
+fn write_be_i32(output: &mut Vec<u8>, value: i32) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_be_i32(input: &[u8], position: &mut usize) -> Result<i32> {
+    Ok(i32::from_be_bytes(read_array::<4>(input, position)?))
+}
+
+fn write_be_i64(output: &mut Vec<u8>, value: i64) {
+    output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_be_i64(input: &[u8], position: &mut usize) -> Result<i64> {
+    Ok(i64::from_be_bytes(read_array::<8>(input, position)?))
+}
+
+fn read_byte_string(input: &[u8], position: &mut usize) -> Result<String> {
+    let length = usize::from(read_byte(input, position)?);
+    let end = position
+        .checked_add(length)
+        .ok_or(SegmentInfosError::UnexpectedEof)?;
+    if end > input.len() {
+        return Err(SegmentInfosError::UnexpectedEof);
+    }
+    let value = std::str::from_utf8(&input[*position..end])
+        .map_err(|_| SegmentInfosError::UnexpectedEof)?
+        .to_owned();
+    *position = end;
+    Ok(value)
+}
+
+fn read_byte(input: &[u8], position: &mut usize) -> Result<u8> {
+    let Some(byte) = input.get(*position).copied() else {
+        return Err(SegmentInfosError::UnexpectedEof);
+    };
+    *position += 1;
+    Ok(byte)
+}
+
+fn read_array<const N: usize>(input: &[u8], position: &mut usize) -> Result<[u8; N]> {
+    let end = position
+        .checked_add(N)
+        .ok_or(SegmentInfosError::UnexpectedEof)?;
+    if end > input.len() {
+        return Err(SegmentInfosError::UnexpectedEof);
+    }
+    let mut bytes = [0_u8; N];
+    bytes.copy_from_slice(&input[*position..end]);
+    *position = end;
+    Ok(bytes)
 }
