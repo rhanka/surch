@@ -1,0 +1,5 @@
+analyzer	input	tokens
+keyword	Hello, Surch	Hello, Surch:0:12:1
+keyword		
+whitespace	a café  β	a:0:1:1|café:2:7:1|β:9:11:1
+whitespace	 spaced	spaced:1:7:1

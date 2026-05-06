@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- Added Lucene-like keyword and whitespace analyzer token-stream bootstrap with offset fixtures.
+- Added Lucene-like in-memory lock factory acquire/release semantics.
+- Added deterministic in-memory term dictionary and postings enumeration bootstrap.
+- Added OpenSearch-compatible root endpoint and reusable error envelope.
 - Added Lucene-compatible `SegmentInfos` generation and `segments_N` file-name handling in `surch-index`.
 - Added empty Lucene `segments_N` commit write/read support with footer validation in `surch-index`.
 - Added `SegmentInfos` commit user data round-trip support.

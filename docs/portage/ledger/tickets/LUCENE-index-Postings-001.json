@@ -1,0 +1,43 @@
+{
+  "id": "LUCENE-index-Postings-001",
+  "title": "Port Lucene term dictionary and postings bootstrap",
+  "owner": "Indexer",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/index/TermsEnum.java",
+      "lucene/core/src/java/org/apache/lucene/index/PostingsEnum.java",
+      "lucene/core/src/java/org/apache/lucene/codecs/PostingsFormat.java"
+    ],
+    "symbols": [
+      "TermsEnum",
+      "PostingsEnum",
+      "PostingsFormat"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-index-SegmentInfos-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-index/**",
+    "tests/lucene_parity/index/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers deterministic term order and postings doc freq positions",
+    "Rust tests match field term enumeration and postings ordering for classic fixture"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-index postings",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

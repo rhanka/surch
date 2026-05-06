@@ -1,0 +1,5 @@
+field	term	doc_id	freq	positions
+body	search	1	2	0,3
+body	rust	2	1	1
+body	search	3	1	5
+body	engine	4	1	

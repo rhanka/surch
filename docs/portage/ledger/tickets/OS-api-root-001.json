@@ -1,0 +1,40 @@
+{
+  "id": "OS-api-root-001",
+  "title": "Port OpenSearch root endpoint and reusable error envelope",
+  "owner": "APIServer",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "server/src/main/java/org/opensearch/rest/action/RestMainAction.java",
+      "server/src/main/java/org/opensearch/OpenSearchException.java"
+    ],
+    "symbols": [
+      "RestMainAction",
+      "convertMainResponse",
+      "generateThrowableXContent"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [],
+  "allowed_paths": [
+    "crates/surch-api/**",
+    "tests/opensearch_compat/root/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-search/**",
+    "crates/surch-index/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch oracle covers root endpoint status and stable JSON shape",
+    "Rust router test matches fixture fields for name cluster version distribution and tagline"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-api root",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

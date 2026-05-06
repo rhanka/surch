@@ -1,0 +1,10 @@
+{
+  "name": "surch-node-0",
+  "cluster_name": "surch-cluster",
+  "cluster_uuid": "00000000-0000-0000-0000-000000000000",
+  "version": {
+    "number": "0.1.0",
+    "distribution": "opensearch"
+  },
+  "tagline": "The OpenSearch Project: https://opensearch.org/"
+}
