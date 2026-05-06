@@ -1,0 +1,34 @@
+{
+  "took": 0,
+  "errors": false,
+  "items": [
+    {
+      "index": {
+        "_index": "books",
+        "_id": "1",
+        "status": 201
+      }
+    },
+    {
+      "create": {
+        "_index": "books",
+        "_id": "2",
+        "status": 201
+      }
+    },
+    {
+      "update": {
+        "_index": "books",
+        "_id": "1",
+        "status": 200
+      }
+    },
+    {
+      "delete": {
+        "_index": "books",
+        "_id": "3",
+        "status": 200
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 //! Lucene-compatible directory, translog, manifest, and segment storage.
 
 pub mod data_io;
+pub mod directory;
 pub mod index_io;
 
 /// Short crate purpose used by workspace smoke tests.

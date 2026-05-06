@@ -23,6 +23,13 @@ pub struct FuzzyQueryConfig {
     pub transpositions: bool,
 }
 
+/// A term accepted by fuzzy expansion, with its edit distance from the query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuzzyTermMatch {
+    pub term: String,
+    pub edits: u8,
+}
+
 /// Errors returned by fuzzy term helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum FuzzyError {
@@ -154,6 +161,62 @@ pub fn bounded_damerau_levenshtein(
     } else {
         Ok(None)
     }
+}
+
+/// Expands a fuzzy query against a term list using Lucene/OpenSearch P0 rules.
+pub fn expand_fuzzy_terms<'a>(
+    query: &str,
+    terms: impl IntoIterator<Item = &'a str>,
+    config: FuzzyQueryConfig,
+) -> Result<Vec<FuzzyTermMatch>, FuzzyError> {
+    if config.max_expansions == 0 {
+        return Err(FuzzyError::MaxExpansionsZero);
+    }
+
+    let max_edits = edits_for_term_len(config.fuzziness, query.chars().count())?;
+    let mut matches = Vec::new();
+
+    for term in terms {
+        if !has_exact_char_prefix(query, term, config.prefix_length) {
+            continue;
+        }
+
+        if let Some(edits) =
+            bounded_damerau_levenshtein(query, term, max_edits, config.transpositions)?
+        {
+            matches.push(FuzzyTermMatch {
+                term: term.to_string(),
+                edits,
+            });
+        }
+    }
+
+    matches.sort_by(|left, right| {
+        left.edits
+            .cmp(&right.edits)
+            .then_with(|| left.term.cmp(&right.term))
+    });
+    matches.truncate(config.max_expansions);
+
+    Ok(matches)
+}
+
+fn has_exact_char_prefix(query: &str, term: &str, prefix_length: usize) -> bool {
+    if prefix_length == 0 {
+        return true;
+    }
+
+    let mut query_chars = query.chars();
+    let mut term_chars = term.chars();
+
+    for _ in 0..prefix_length {
+        match (query_chars.next(), term_chars.next()) {
+            (Some(query_char), Some(term_char)) if query_char == term_char => {}
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 fn damerau_levenshtein_chars(left: &[char], right: &[char], transpositions: bool) -> usize {

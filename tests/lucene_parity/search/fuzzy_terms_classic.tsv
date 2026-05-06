@@ -1,0 +1,8 @@
+# term	matches query=surch prefix_length=1 max_expansions=3 transpositions=true
+surch	true
+sruch	true
+such	true
+surgh	false
+lurch	false
+search	false
+Surch	false

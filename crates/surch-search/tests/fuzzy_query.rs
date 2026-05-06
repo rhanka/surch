@@ -1,6 +1,6 @@
 use surch_search::fuzzy::{
-    bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness, FuzzyError,
-    FuzzyQueryConfig,
+    bounded_damerau_levenshtein, edits_for_term_len, expand_fuzzy_terms, parse_fuzziness,
+    Fuzziness, FuzzyError, FuzzyQueryConfig, FuzzyTermMatch,
 };
 
 #[test]
@@ -140,6 +140,80 @@ fn fuzzy_query_config_rejects_edits_above_lucene_limit() {
 }
 
 #[test]
+fn fuzzy_query_expansion_filters_terms_by_exact_char_prefix() {
+    let config = FuzzyQueryConfig::new(Fuzziness::Edits(1), 1, 10, true).expect("config");
+
+    let matches = expand_fuzzy_terms("éclair", ["écliar", "eclair", "écart"], config);
+
+    assert_eq!(
+        matches,
+        Ok(vec![FuzzyTermMatch {
+            term: "écliar".to_string(),
+            edits: 1,
+        }])
+    );
+}
+
+#[test]
+fn fuzzy_query_expansion_sorts_by_edits_then_term_and_truncates_max_expansions() {
+    let config = FuzzyQueryConfig::new(Fuzziness::Edits(1), 1, 3, true).expect("config");
+
+    let matches = expand_fuzzy_terms(
+        "surch",
+        ["surgh", "such", "surch", "sruch", "lurch"],
+        config,
+    );
+
+    assert_eq!(
+        matches,
+        Ok(vec![
+            FuzzyTermMatch {
+                term: "surch".to_string(),
+                edits: 0,
+            },
+            FuzzyTermMatch {
+                term: "sruch".to_string(),
+                edits: 1,
+            },
+            FuzzyTermMatch {
+                term: "such".to_string(),
+                edits: 1,
+            },
+        ])
+    );
+}
+
+#[test]
+fn fuzzy_query_expansion_rejects_zero_max_expansions() {
+    let config = FuzzyQueryConfig {
+        fuzziness: Fuzziness::Edits(1),
+        prefix_length: 0,
+        max_expansions: 0,
+        transpositions: true,
+    };
+
+    let matches = expand_fuzzy_terms("surch", ["surch"], config);
+
+    assert_eq!(matches, Err(FuzzyError::MaxExpansionsZero));
+}
+
+#[test]
+fn fuzzy_query_expansion_uses_query_length_for_auto_fuzziness() {
+    let config =
+        FuzzyQueryConfig::new(Fuzziness::Auto { low: 3, high: 6 }, 0, 10, true).expect("config");
+
+    let matches = expand_fuzzy_terms("surch", ["surch", "search"], config);
+
+    assert_eq!(
+        matches,
+        Ok(vec![FuzzyTermMatch {
+            term: "surch".to_string(),
+            edits: 0,
+        }])
+    );
+}
+
+#[test]
 fn fuzzy_query_classic_fixture_matches_expected_edit_distances() {
     let fixture = include_str!("../../../tests/lucene_parity/search/fuzzy_classic_cases.tsv");
 
@@ -170,4 +244,45 @@ fn fuzzy_query_classic_fixture_matches_expected_edit_distances() {
             line_number + 1
         );
     }
+}
+
+#[test]
+fn fuzzy_query_terms_classic_fixture_matches_expansion_results() {
+    let fixture = include_str!("../../../tests/lucene_parity/search/fuzzy_terms_classic.tsv");
+    let mut terms = Vec::new();
+    let mut expected = Vec::new();
+
+    for (line_number, line) in fixture.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let mut columns = line.split('\t');
+        let term = columns.next().expect("fixture term");
+        let should_match = columns
+            .next()
+            .expect("fixture expected match")
+            .parse::<bool>()
+            .expect("fixture expected match is bool");
+        assert_eq!(
+            columns.next(),
+            None,
+            "unexpected extra fixture column on line {}",
+            line_number + 1
+        );
+
+        terms.push(term);
+        if should_match {
+            expected.push(term.to_string());
+        }
+    }
+
+    let config = FuzzyQueryConfig::new(Fuzziness::Edits(1), 1, 3, true).expect("config");
+    let matches = expand_fuzzy_terms("surch", terms, config).expect("expanded terms");
+    let matched_terms = matches
+        .into_iter()
+        .map(|term_match| term_match.term)
+        .collect::<Vec<_>>();
+
+    assert_eq!(matched_terms, expected);
 }

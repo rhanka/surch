@@ -1,5 +1,10 @@
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
 
 /// One parsed OpenSearch `_bulk` NDJSON operation.
@@ -101,6 +106,31 @@ pub fn build_bulk_response(operations: &[BulkOperation], took: u64) -> BulkRespo
         errors: false,
         items,
     }
+}
+
+/// Axum handler for the OpenSearch-compatible `_bulk` endpoint.
+pub async fn bulk_handler(body: String) -> impl IntoResponse {
+    match parse_bulk_ndjson(&body) {
+        Ok(operations) => {
+            let response = build_bulk_response(&operations, 0);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => bulk_parse_error_response(error),
+    }
+}
+
+fn bulk_parse_error_response(error: BulkParseError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "type": "parse_exception",
+                "reason": error.to_string(),
+            },
+            "status": 400,
+        })),
+    )
+        .into_response()
 }
 
 fn item_status(index: &Option<String>, id: &Option<String>, status: u16) -> BulkItemStatus {

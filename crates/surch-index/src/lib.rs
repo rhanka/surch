@@ -3,6 +3,7 @@
 
 pub mod field_infos;
 pub mod field_infos_codec;
+pub mod segment_field_infos;
 pub mod segment_infos;
 
 /// Short crate purpose used by workspace smoke tests.

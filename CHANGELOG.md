@@ -9,12 +9,16 @@
 - Added `SegmentInfos` segment commit metadata round-trip support.
 - Added Lucene-compatible `FieldInfo`/`FieldInfos` validation bootstrap in `surch-index`.
 - Added deterministic bootstrap `FieldInfos` binary codec with local Lucene parity fixture.
+- Added segment-scoped `FieldInfos` file wrapper for `_N.fnm` metadata.
 - Added Lucene-compatible `DataInput`/`DataOutput` string, string map, and string set encodings in `surch-store`.
 - Added Lucene-like in-memory `IndexInput`/`IndexOutput` primitives with checksum and local parity fixture.
+- Added Lucene-like in-memory `Directory` file lifecycle primitives with local manifest fixture.
 - Added bounded Damerau-Levenshtein fuzzy distance primitives in `surch-search`.
 - Added fuzzy `AUTO`/fixed edit configuration parsing with local classic fuzzy fixture.
+- Added deterministic fuzzy term expansion with prefix filtering and max expansions.
 - Added OpenSearch `_bulk` NDJSON parser bootstrap in `surch-api`.
 - Added OpenSearch-like `_bulk` response builder with local NDJSON/JSON compatibility fixtures.
+- Added Axum `_bulk` handler bootstrap with local HTTP compatibility fixtures.
 - Added Lucene-compatible `CodecUtil` header/footer validation and CRC32 checksum primitives in `surch-codec`.
 - Added Lucene-compatible `DataInput`/`DataOutput` VInt, VLong, and ZLong primitive encodings in `surch-store`.
 - Added Rust parity vectors for Lucene variable-length integer boundary behavior.
