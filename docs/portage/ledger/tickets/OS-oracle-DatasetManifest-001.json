@@ -1,0 +1,43 @@
+{
+  "id": "OS-oracle-DatasetManifest-001",
+  "title": "Add OpenSearch oracle dataset manifests",
+  "owner": "Conductor",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "rest-api-spec/src/main/resources/rest-api-spec/test/search/10_basic.yml",
+      "rest-api-spec/src/main/resources/rest-api-spec/test/indices.create/10_basic.yml"
+    ],
+    "symbols": [
+      "bulk",
+      "indices.create",
+      "indices.refresh"
+    ]
+  },
+  "parity_level": "P1 replay fixture",
+  "dependencies": [
+    "OS-api-bulk-001",
+    "OS-api-document-001"
+  ],
+  "allowed_paths": [
+    "crates/opensearch-oracle/**",
+    "tests/opensearch_compat/oracle/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-index/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch oracle datasets declare deterministic create bulk and refresh operations",
+    "Rust tests validate dataset manifest shape status codes paths and body references"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p opensearch-oracle dataset",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

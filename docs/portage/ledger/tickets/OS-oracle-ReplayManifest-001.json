@@ -1,0 +1,43 @@
+{
+  "id": "OS-oracle-ReplayManifest-001",
+  "title": "Add OpenSearch oracle replay manifests",
+  "owner": "Conductor",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "test/framework/src/main/java/org/opensearch/test/rest/yaml/ClientYamlTestSuite.java",
+      "test/framework/src/main/java/org/opensearch/test/rest/yaml/section/DoSection.java",
+      "rest-api-spec/src/main/resources/rest-api-spec/test/search/10_basic.yml"
+    ],
+    "symbols": [
+      "ClientYamlTestSuite",
+      "DoSection",
+      "search"
+    ]
+  },
+  "parity_level": "P1 replay fixture",
+  "dependencies": [
+    "OS-oracle-DatasetManifest-001",
+    "OS-oracle-NormalizeCompare-001"
+  ],
+  "allowed_paths": [
+    "crates/opensearch-oracle/**",
+    "tests/opensearch_compat/oracle/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-index/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch replay manifests declare dataset request method path body expected status and response fixture",
+    "Rust tests validate replay suite shape and reject invalid methods paths and statuses"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p opensearch-oracle replay",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

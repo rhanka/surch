@@ -1,0 +1,22 @@
+{
+  "name": "products_basic",
+  "description": "Basic product indexing dataset",
+  "operations": [
+    {
+      "kind": "create_index",
+      "path": "/products_basic",
+      "expected_status": 200
+    },
+    {
+      "kind": "bulk",
+      "path": "/_bulk",
+      "body": "products_basic.ndjson",
+      "expected_status": 200
+    },
+    {
+      "kind": "refresh",
+      "path": "/products_basic/_refresh",
+      "expected_status": 200
+    }
+  ]
+}

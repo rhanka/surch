@@ -1,0 +1,56 @@
+{
+  "name": "products_search",
+  "dataset": "products_basic",
+  "requests": [
+    {
+      "name": "index_product",
+      "method": "PUT",
+      "path": "/products/_doc/1",
+      "body": {
+        "name": "Trail shoes",
+        "category": "footwear",
+        "price": 89.99
+      },
+      "expected_status": 201,
+      "expected_response": {
+        "result": "created"
+      }
+    },
+    {
+      "name": "refresh_products",
+      "method": "POST",
+      "path": "/products/_refresh",
+      "expected_status": 200
+    },
+    {
+      "name": "search_products",
+      "method": "POST",
+      "path": "/products/_search",
+      "body": {
+        "query": {
+          "match": {
+            "category": "footwear"
+          }
+        }
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "eq"
+          }
+        }
+      }
+    },
+    {
+      "name": "count_products",
+      "method": "GET",
+      "path": "/products/_count",
+      "expected_status": 200,
+      "expected_response": {
+        "count": 1
+      }
+    }
+  ]
+}

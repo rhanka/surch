@@ -1,0 +1,40 @@
+{
+  "id": "OS-oracle-FixtureFiles-001",
+  "title": "Add safe fixture file loading for OpenSearch oracle replays",
+  "owner": "Conductor",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "test/framework/src/main/java/org/opensearch/test/rest/yaml/ClientYamlTestCandidate.java",
+      "test/framework/src/main/java/org/opensearch/test/rest/yaml/section/DoSection.java"
+    ],
+    "symbols": [
+      "ClientYamlTestCandidate",
+      "DoSection",
+      "body"
+    ]
+  },
+  "parity_level": "P1 replay fixture",
+  "dependencies": [],
+  "allowed_paths": [
+    "crates/opensearch-oracle/**",
+    "tests/opensearch_compat/oracle/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "Fixture loader rejects traversal and absolute paths before replaying oracle bodies",
+    "Rust tests cover text JSON invalid JSON and root confinement behavior"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p opensearch-oracle files",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

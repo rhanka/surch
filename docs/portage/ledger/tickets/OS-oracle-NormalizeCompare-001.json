@@ -1,0 +1,41 @@
+{
+  "id": "OS-oracle-NormalizeCompare-001",
+  "title": "Add OpenSearch oracle JSON normalization and comparison",
+  "owner": "Conductor",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "test/framework/src/main/java/org/opensearch/test/rest/yaml/section/MatchAssertion.java",
+      "test/framework/src/main/java/org/opensearch/test/rest/yaml/section/CloseToAssertion.java"
+    ],
+    "symbols": [
+      "MatchAssertion",
+      "CloseToAssertion",
+      "assertThat"
+    ]
+  },
+  "parity_level": "P1 replay fixture",
+  "dependencies": [
+    "OS-api-search-001"
+  ],
+  "allowed_paths": [
+    "crates/opensearch-oracle/**",
+    "tests/opensearch_compat/oracle/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-index/**"
+  ],
+  "golden_tests_required": [
+    "Oracle comparison ignores volatile fields and tolerates score deltas",
+    "Rust tests report mismatched values paths missing paths and out-of-tolerance scores"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p opensearch-oracle normalize",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

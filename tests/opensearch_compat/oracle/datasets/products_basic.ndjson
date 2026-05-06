@@ -1,0 +1,6 @@
+{"index":{"_index":"products_basic","_id":"1"}}
+{"name":"Laptop Pro 14","category":"electronics","price":1299,"in_stock":true}
+{"index":{"_index":"products_basic","_id":"2"}}
+{"name":"Desk Lamp","category":"home","price":49,"in_stock":true}
+{"index":{"_index":"products_basic","_id":"3"}}
+{"name":"Running Shoes","category":"sports","price":89,"in_stock":false}
