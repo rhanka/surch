@@ -1,0 +1,3 @@
+doc_id	title	body	views
+0	Surch Stored Fields	Stored fields preserve original document values for retrieval.	13
+3	Surch Query Planning	Query execution can fetch stored title and body fields.	7

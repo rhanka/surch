@@ -1,0 +1,43 @@
+{
+  "id": "LUCENE-index-StoredFields-001",
+  "title": "Port Lucene stored fields bootstrap reader and writer",
+  "owner": "Indexer",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/codecs/StoredFieldsReader.java",
+      "lucene/core/src/java/org/apache/lucene/codecs/StoredFieldsWriter.java",
+      "lucene/core/src/java/org/apache/lucene/document/StoredField.java"
+    ],
+    "symbols": [
+      "StoredFieldsReader",
+      "StoredFieldsWriter",
+      "StoredField"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-index-Postings-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-index/**",
+    "tests/lucene_parity/index/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers stored field document ids names values and deterministic reads",
+    "Rust tests match stored document retrieval missing documents and duplicate validation"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-index stored_fields",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

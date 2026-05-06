@@ -1,0 +1,5 @@
+term	start_offset	end_offset	position_increment	lowercase
+HELLO	0	5	1	hello
+CAFÉ	4	9	1	café
+İSTANBUL	12	21	3	i̇stanbul
+ΜΙΚΡΌ	0	10	1	μικρό

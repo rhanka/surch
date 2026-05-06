@@ -1,0 +1,90 @@
+use axum::{
+    body::{to_bytes, Body},
+    http::{Method, Request, StatusCode},
+};
+use surch_api::app_router;
+use tower::ServiceExt;
+
+async fn response_json(response: axum::response::Response<Body>) -> serde_json::Value {
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+
+    serde_json::from_slice(&body).expect("response body should be json")
+}
+
+#[tokio::test]
+async fn count_router_accepts_match_all_fixture() {
+    let request_body =
+        include_str!("../../../tests/opensearch_compat/count/match_all_request.json");
+    let expected_response: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/opensearch_compat/count/bootstrap_response.json"
+    ))
+    .expect("response fixture should be valid json");
+
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, expected_response);
+}
+
+#[tokio::test]
+async fn count_router_accepts_empty_object_fixture() {
+    let request_body = include_str!("../../../tests/opensearch_compat/count/empty_request.json");
+    let expected_response: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/opensearch_compat/count/bootstrap_response.json"
+    ))
+    .expect("response fixture should be valid json");
+
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, expected_response);
+}
+
+#[tokio::test]
+async fn count_router_rejects_unknown_query_with_opensearch_error() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"term":{"name":"desk"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "unsupported count query `term`"
+            },
+            "status": 400
+        })
+    );
+}

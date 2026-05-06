@@ -1,0 +1,42 @@
+{
+  "id": "LUCENE-search-BM25-001",
+  "title": "Port Lucene BM25 scoring formula bootstrap",
+  "owner": "SearchEngine",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/search/similarities/BM25Similarity.java",
+      "lucene/core/src/java/org/apache/lucene/search/similarities/Similarity.java"
+    ],
+    "symbols": [
+      "BM25Similarity",
+      "idf",
+      "scorer"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-index-Postings-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-search/**",
+    "tests/lucene_parity/search/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-index/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers BM25 idf and score formula for classic statistics",
+    "Rust tests match score values within explicit floating point tolerance and reject invalid stats"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-search scoring",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

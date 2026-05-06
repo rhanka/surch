@@ -7,6 +7,7 @@ use axum::{
 };
 
 pub mod bulk;
+pub mod count;
 pub mod error;
 pub mod root;
 
@@ -18,6 +19,7 @@ pub fn app_router() -> Router {
     Router::new()
         .route("/", get(root::root_handler))
         .route("/_bulk", post(bulk::bulk_handler))
+        .route("/:index/_count", post(count::count_handler))
 }
 
 /// Short crate purpose used by workspace smoke tests.

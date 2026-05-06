@@ -1,0 +1,42 @@
+{
+  "id": "OS-api-count-001",
+  "title": "Port OpenSearch count API bootstrap",
+  "owner": "APIServer",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "server/src/main/java/org/opensearch/rest/action/search/RestCountAction.java",
+      "server/src/main/java/org/opensearch/action/search/SearchResponse.java"
+    ],
+    "symbols": [
+      "RestCountAction",
+      "prepareRequest",
+      "RestActions.buildBroadcastShardsHeader"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "OS-api-root-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-api/**",
+    "tests/opensearch_compat/count/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-search/**",
+    "crates/surch-index/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch oracle covers count response shape and shard counters",
+    "Rust router tests match match_all request fixture and reject unsupported query shapes"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-api count",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- Added lowercase filtering and SimpleAnalyzer bootstrap for Lucene-like analysis.
+- Added in-memory stored fields reader/writer bootstrap with deterministic document ordering.
+- Added Lucene BM25 scoring formula bootstrap with validation and parity fixture.
+- Added OpenSearch-compatible `_count` bootstrap route with match_all parsing.
 - Added Lucene-like keyword and whitespace analyzer token-stream bootstrap with offset fixtures.
 - Added Lucene-like in-memory lock factory acquire/release semantics.
 - Added deterministic in-memory term dictionary and postings enumeration bootstrap.

@@ -7,6 +7,7 @@ pub mod postings;
 pub mod segment_field_infos;
 pub mod segment_infos;
 pub mod segment_manifest;
+pub mod stored_fields;
 
 /// Short crate purpose used by workspace smoke tests.
 pub const CRATE_PURPOSE: &str = "Lucene-compatible indexing";
