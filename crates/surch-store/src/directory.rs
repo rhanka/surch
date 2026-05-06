@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::index_io::{ByteArrayIndexInput, ByteArrayIndexOutput};
 use thiserror::Error;
@@ -18,6 +18,8 @@ pub enum DirectoryError {
 #[derive(Debug, Clone, Default)]
 pub struct MemoryDirectory {
     files: BTreeMap<String, Vec<u8>>,
+    synced_files: BTreeSet<String>,
+    metadata_synced: bool,
 }
 
 impl MemoryDirectory {
@@ -45,6 +47,8 @@ impl MemoryDirectory {
         }
 
         self.files.insert(name.to_string(), output.into_inner());
+        self.synced_files.remove(name);
+        self.metadata_synced = false;
         Ok(())
     }
 
@@ -67,6 +71,8 @@ impl MemoryDirectory {
         }
 
         self.files.insert(name.to_string(), bytes.to_vec());
+        self.synced_files.remove(name);
+        self.metadata_synced = false;
         Ok(())
     }
 
@@ -84,7 +90,10 @@ impl MemoryDirectory {
         validate_name(name)?;
         self.files
             .remove(name)
-            .map(|_| ())
+            .map(|_| {
+                self.synced_files.remove(name);
+                self.metadata_synced = false;
+            })
             .ok_or_else(|| DirectoryError::FileNotFound {
                 name: name.to_string(),
             })
@@ -108,7 +117,10 @@ impl MemoryDirectory {
             .files
             .remove(source)
             .expect("source presence checked before remove");
+        self.synced_files.remove(source);
+        self.synced_files.remove(target);
         self.files.insert(target.to_string(), bytes);
+        self.metadata_synced = false;
         Ok(())
     }
 
@@ -129,6 +141,45 @@ impl MemoryDirectory {
     pub fn contains_file(&self, name: &str) -> Result<bool> {
         validate_name(name)?;
         Ok(self.files.contains_key(name))
+    }
+
+    pub fn sync<I, S>(&mut self, names: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let names = names
+            .into_iter()
+            .map(|name| {
+                let name = name.as_ref();
+                validate_name(name)?;
+                if !self.files.contains_key(name) {
+                    return Err(DirectoryError::FileNotFound {
+                        name: name.to_string(),
+                    });
+                }
+                Ok(name.to_string())
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for name in names {
+            self.synced_files.insert(name);
+        }
+
+        Ok(())
+    }
+
+    pub fn is_synced(&self, name: &str) -> Result<bool> {
+        validate_name(name)?;
+        Ok(self.synced_files.contains(name))
+    }
+
+    pub fn sync_meta_data(&mut self) {
+        self.metadata_synced = true;
+    }
+
+    pub fn is_metadata_synced(&self) -> bool {
+        self.metadata_synced
     }
 }
 

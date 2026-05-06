@@ -1,0 +1,42 @@
+{
+  "id": "OS-api-document-001",
+  "title": "Port OpenSearch document index API bootstrap",
+  "owner": "APIServer",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "server/src/main/java/org/opensearch/rest/action/document/RestIndexAction.java",
+      "server/src/main/java/org/opensearch/action/index/IndexResponse.java"
+    ],
+    "symbols": [
+      "RestIndexAction",
+      "IndexResponse",
+      "prepareRequest"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "OS-api-root-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-api/**",
+    "tests/opensearch_compat/document/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-index/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch oracle covers document index response shape shard counters and ids",
+    "Rust router tests match create response fixture and reject invalid source bodies"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-api document",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

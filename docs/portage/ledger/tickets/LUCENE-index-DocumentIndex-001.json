@@ -1,0 +1,46 @@
+{
+  "id": "LUCENE-index-DocumentIndex-001",
+  "title": "Build P0 document indexing pipeline from analysis to postings and stored fields",
+  "owner": "Indexer",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/index/IndexWriter.java",
+      "lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java",
+      "lucene/core/src/java/org/apache/lucene/document/Document.java"
+    ],
+    "symbols": [
+      "IndexWriter",
+      "DocumentsWriter",
+      "Document"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-analysis-SimpleAnalyzer-001",
+    "LUCENE-index-Postings-001",
+    "LUCENE-index-StoredFields-001",
+    "LUCENE-index-LiveDocs-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-index/**",
+    "tests/lucene_parity/index/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers document text analysis into field terms and positions",
+    "Rust tests match stored document retrieval terms postings and duplicate validation"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-index document_index",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

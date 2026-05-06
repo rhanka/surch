@@ -1,0 +1,44 @@
+{
+  "id": "LUCENE-search-TermExecution-001",
+  "title": "Execute P0 term queries over postings into TopDocs",
+  "owner": "SearchEngine",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/search/TermQuery.java",
+      "lucene/core/src/java/org/apache/lucene/search/Weight.java",
+      "lucene/core/src/java/org/apache/lucene/search/Scorer.java"
+    ],
+    "symbols": [
+      "TermQuery",
+      "Weight",
+      "Scorer"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-index-Postings-001",
+    "LUCENE-search-TopDocs-001",
+    "LUCENE-search-BM25-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-search/**",
+    "tests/lucene_parity/search/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers term query matching document order and score order",
+    "Rust tests match TopDocs total hits ordering and deterministic scoring for a classic fixture"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-search execution",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

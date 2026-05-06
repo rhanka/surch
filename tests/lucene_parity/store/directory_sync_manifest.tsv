@@ -1,0 +1,11 @@
+# op	name	bytes-or-target
+write	_0.si	segment-info
+sync	_0.si
+sync_meta_data
+write	_0.fnm	field-metadata
+sync	_0.fnm
+sync_meta_data
+rename	_0.si	_1.si
+sync	_1.si
+sync_meta_data
+delete	_0.fnm

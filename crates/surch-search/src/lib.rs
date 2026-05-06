@@ -2,6 +2,7 @@
 //! Lucene-compatible query model, scoring, collectors, and fuzzy automata.
 
 pub mod collector;
+pub mod execution;
 pub mod fuzzy;
 pub mod query;
 pub mod scoring;

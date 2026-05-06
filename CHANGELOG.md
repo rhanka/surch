@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- Added P0 document indexing pipeline from `SimpleAnalyzer` to stored fields and postings.
+- Added BM25-backed term query execution over postings into `TopDocs`.
+- Added OpenSearch-compatible document index bootstrap route.
+- Added `MemoryDirectory` sync and metadata sync state tracking.
 - Added StopAnalyzer bootstrap with stop filtering and Lucene-like position increments.
 - Added live docs deletion mask bootstrap with idempotent deletes.
 - Added TopDocs collector bootstrap with score ordering and tie-breaking.

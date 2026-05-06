@@ -1,0 +1,42 @@
+{
+  "id": "LUCENE-store-DirectorySync-001",
+  "title": "Port Lucene Directory sync and metadata sync semantics",
+  "owner": "StorageEngine",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/store/Directory.java",
+      "lucene/core/src/java/org/apache/lucene/store/BaseDirectory.java"
+    ],
+    "symbols": [
+      "sync",
+      "syncMetaData",
+      "rename"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-store-LockFactory-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-store/**",
+    "tests/lucene_parity/store/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers sync existing files missing file errors and metadata sync",
+    "Rust tests match sync state invalidation for write delete and rename lifecycle operations"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-store directory_sync",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}
