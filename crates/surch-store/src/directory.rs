@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::index_io::{ByteArrayIndexInput, ByteArrayIndexOutput};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, DirectoryError>;
@@ -22,6 +23,39 @@ pub struct MemoryDirectory {
 impl MemoryDirectory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn create_output(&self, name: &str) -> Result<ByteArrayIndexOutput> {
+        validate_name(name)?;
+        if self.files.contains_key(name) {
+            return Err(DirectoryError::AlreadyExists {
+                name: name.to_string(),
+            });
+        }
+
+        Ok(ByteArrayIndexOutput::new())
+    }
+
+    pub fn write_output(&mut self, name: &str, output: ByteArrayIndexOutput) -> Result<()> {
+        validate_name(name)?;
+        if self.files.contains_key(name) {
+            return Err(DirectoryError::AlreadyExists {
+                name: name.to_string(),
+            });
+        }
+
+        self.files.insert(name.to_string(), output.into_inner());
+        Ok(())
+    }
+
+    pub fn open_input(&self, name: &str) -> Result<ByteArrayIndexInput<'_>> {
+        validate_name(name)?;
+        self.files
+            .get(name)
+            .map(|bytes| ByteArrayIndexInput::new(bytes))
+            .ok_or_else(|| DirectoryError::FileNotFound {
+                name: name.to_string(),
+            })
     }
 
     pub fn write_file(&mut self, name: &str, bytes: &[u8]) -> Result<()> {

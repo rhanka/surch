@@ -1,0 +1,8 @@
+# field	query	term	matches query=surch prefix_length=1 max_expansions=3 transpositions=true
+title	surch	surch	true
+title	surch	sruch	true
+title	surch	such	true
+title	surch	surgh	false
+title	surch	lurch	false
+title	surch	search	false
+title	surch	Surch	false

@@ -13,12 +13,16 @@
 - Added Lucene-compatible `DataInput`/`DataOutput` string, string map, and string set encodings in `surch-store`.
 - Added Lucene-like in-memory `IndexInput`/`IndexOutput` primitives with checksum and local parity fixture.
 - Added Lucene-like in-memory `Directory` file lifecycle primitives with local manifest fixture.
+- Added `Directory` `IndexOutput` persistence and `IndexInput` reopening coverage with local manifest fixture.
+- Added single-segment manifest assembly for `_N.fnm` and `segments_N` bootstrap bundles.
 - Added bounded Damerau-Levenshtein fuzzy distance primitives in `surch-search`.
 - Added fuzzy `AUTO`/fixed edit configuration parsing with local classic fuzzy fixture.
 - Added deterministic fuzzy term expansion with prefix filtering and max expansions.
+- Added exact/fuzzy query wrappers and fuzzy rewrite-to-term-query coverage.
 - Added OpenSearch `_bulk` NDJSON parser bootstrap in `surch-api`.
 - Added OpenSearch-like `_bulk` response builder with local NDJSON/JSON compatibility fixtures.
 - Added Axum `_bulk` handler bootstrap with local HTTP compatibility fixtures.
+- Added reusable Axum API router exposing the P0 `_bulk` route.
 - Added Lucene-compatible `CodecUtil` header/footer validation and CRC32 checksum primitives in `surch-codec`.
 - Added Lucene-compatible `DataInput`/`DataOutput` VInt, VLong, and ZLong primitive encodings in `surch-store`.
 - Added Rust parity vectors for Lucene variable-length integer boundary behavior.
