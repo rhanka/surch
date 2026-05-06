@@ -1,3 +1,4 @@
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -25,6 +26,33 @@ pub enum BulkOperation {
     },
 }
 
+/// OpenSearch-compatible `_bulk` response for parsed operations.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BulkResponse {
+    pub took: u64,
+    pub errors: bool,
+    pub items: Vec<BulkResponseItem>,
+}
+
+/// One item in an OpenSearch-compatible `_bulk` response.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkResponseItem {
+    Index(BulkItemStatus),
+    Create(BulkItemStatus),
+    Delete(BulkItemStatus),
+    Update(BulkItemStatus),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BulkItemStatus {
+    #[serde(rename = "_index", skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub status: u16,
+}
+
 /// Error returned when `_bulk` NDJSON cannot be parsed into valid operations.
 #[derive(Debug, Error)]
 pub enum BulkParseError {
@@ -46,6 +74,41 @@ pub enum BulkParseError {
     UnknownAction { line: usize, action: String },
     #[error("missing source line after `{action}` action at line {line}")]
     MissingSource { line: usize, action: &'static str },
+}
+
+/// Build a deterministic P0 OpenSearch-compatible `_bulk` response.
+pub fn build_bulk_response(operations: &[BulkOperation], took: u64) -> BulkResponse {
+    let items = operations
+        .iter()
+        .map(|operation| match operation {
+            BulkOperation::Index { index, id, .. } => {
+                BulkResponseItem::Index(item_status(index, id, 201))
+            }
+            BulkOperation::Create { index, id, .. } => {
+                BulkResponseItem::Create(item_status(index, id, 201))
+            }
+            BulkOperation::Delete { index, id } => {
+                BulkResponseItem::Delete(item_status(index, id, 200))
+            }
+            BulkOperation::Update { index, id, .. } => {
+                BulkResponseItem::Update(item_status(index, id, 200))
+            }
+        })
+        .collect();
+
+    BulkResponse {
+        took,
+        errors: false,
+        items,
+    }
+}
+
+fn item_status(index: &Option<String>, id: &Option<String>, status: u16) -> BulkItemStatus {
+    BulkItemStatus {
+        index: index.clone(),
+        id: id.clone(),
+        status,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1,0 +1,5 @@
+# left	right	expected_edits
+kitten	sitten	1
+surch	sruch	1
+roam	foam	1
+encyclopedia	encyclopaedia	1

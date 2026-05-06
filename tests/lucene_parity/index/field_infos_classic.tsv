@@ -1,0 +1,5 @@
+name	number	index_options	doc_values_type	omit_norms	store_payloads
+title	0	DocsAndFreqsAndPositions	Sorted	false	true
+body	1	DocsAndFreqsAndPositionsAndOffsets	None	false	true
+published_at	2	None	Numeric	true	false
+tags	3	Docs	SortedSet	true	false

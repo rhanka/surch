@@ -1,5 +1,8 @@
 use serde_json::json;
-use surch_api::{parse_bulk_ndjson, BulkOperation, BulkParseError};
+use surch_api::{
+    bulk::{build_bulk_response, BulkResponse},
+    parse_bulk_ndjson, BulkOperation, BulkParseError,
+};
 
 #[test]
 fn bulk_parses_index_and_delete_operations_in_order() {
@@ -143,4 +146,29 @@ fn bulk_rejects_non_json_source_line() {
         err,
         BulkParseError::InvalidSourceJson { line: 2, .. }
     ));
+}
+
+#[test]
+fn bulk_builds_opensearch_compatible_response_from_classic_fixture() {
+    let body = include_str!("../../../tests/opensearch_compat/bulk/classic_bulk.ndjson");
+    let expected_response: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/opensearch_compat/bulk/classic_bulk_response.json"
+    ))
+    .expect("response fixture should be valid json");
+    let operations = parse_bulk_ndjson(body).expect("classic bulk fixture should parse");
+
+    let response = build_bulk_response(&operations, 7);
+
+    assert_eq!(
+        response,
+        BulkResponse {
+            took: 7,
+            errors: false,
+            items: response.items.clone(),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(response).expect("bulk response should serialize"),
+        expected_response
+    );
 }
