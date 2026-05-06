@@ -1,0 +1,43 @@
+{
+  "id": "LUCENE-index-LiveDocs-001",
+  "title": "Port Lucene live docs deletion mask bootstrap",
+  "owner": "Indexer",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/index/LeafReader.java",
+      "lucene/core/src/java/org/apache/lucene/util/Bits.java",
+      "lucene/core/src/java/org/apache/lucene/codecs/LiveDocsFormat.java"
+    ],
+    "symbols": [
+      "getLiveDocs",
+      "Bits",
+      "LiveDocsFormat"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-index-StoredFields-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-index/**",
+    "tests/lucene_parity/index/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers max_doc live count deleted count and deleted doc ids",
+    "Rust tests match live doc iteration deletion idempotence and out-of-range validation"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-index live_docs",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

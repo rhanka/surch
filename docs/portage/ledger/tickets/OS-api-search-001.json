@@ -1,0 +1,43 @@
+{
+  "id": "OS-api-search-001",
+  "title": "Port OpenSearch search API bootstrap",
+  "owner": "APIServer",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "opensearch",
+    "commit": "fead3a928236b61f9c759c61e738b541a148ab9f",
+    "files": [
+      "server/src/main/java/org/opensearch/rest/action/search/RestSearchAction.java",
+      "server/src/main/java/org/opensearch/action/search/SearchResponse.java",
+      "server/src/main/java/org/opensearch/search/SearchHits.java"
+    ],
+    "symbols": [
+      "RestSearchAction",
+      "SearchResponse",
+      "SearchHits"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "OS-api-count-001",
+    "LUCENE-search-TopDocs-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-api/**",
+    "tests/opensearch_compat/search/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-index/**"
+  ],
+  "golden_tests_required": [
+    "OpenSearch oracle covers search response shape hits total max_score and shards",
+    "Rust router tests match match_all fixture and reject unsupported query and pagination shapes"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-api search",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

@@ -1,0 +1,43 @@
+{
+  "id": "LUCENE-search-TopDocs-001",
+  "title": "Port Lucene TopDocs collector bootstrap",
+  "owner": "SearchEngine",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/search/TopDocs.java",
+      "lucene/core/src/java/org/apache/lucene/search/ScoreDoc.java",
+      "lucene/core/src/java/org/apache/lucene/search/TopScoreDocCollector.java"
+    ],
+    "symbols": [
+      "TopDocs",
+      "ScoreDoc",
+      "TopScoreDocCollector"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-search-BM25-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-search/**",
+    "tests/lucene_parity/search/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-index/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers TopDocs score ordering tie break and truncation",
+    "Rust tests match total hits score docs ordering and invalid score rejection"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-search collector",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}

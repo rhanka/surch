@@ -1,0 +1,5 @@
+input_tokens	stop_words	output_tokens
+the:0:3:1|quick:4:9:1|and:10:13:1|brown:14:19:1	the,and	quick:4:9:2|brown:14:19:2
+keep:7:11:3	stop	keep:7:11:3
+a:0:1:1|the:2:5:1	a,the	
+alpha:0:5:1|of:6:8:1|the:9:12:1|omega:13:18:1	of,the	alpha:0:5:1|omega:13:18:3

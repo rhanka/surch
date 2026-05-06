@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Lucene-compatible query model, scoring, collectors, and fuzzy automata.
 
+pub mod collector;
 pub mod fuzzy;
 pub mod query;
 pub mod scoring;

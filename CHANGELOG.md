@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- Added StopAnalyzer bootstrap with stop filtering and Lucene-like position increments.
+- Added live docs deletion mask bootstrap with idempotent deletes.
+- Added TopDocs collector bootstrap with score ordering and tie-breaking.
+- Added OpenSearch-compatible `_search` bootstrap route with match_all parsing.
 - Added lowercase filtering and SimpleAnalyzer bootstrap for Lucene-like analysis.
 - Added in-memory stored fields reader/writer bootstrap with deterministic document ordering.
 - Added Lucene BM25 scoring formula bootstrap with validation and parity fixture.

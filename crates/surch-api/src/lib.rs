@@ -10,6 +10,7 @@ pub mod bulk;
 pub mod count;
 pub mod error;
 pub mod root;
+pub mod search;
 
 pub use bulk::{parse_bulk_ndjson, BulkOperation, BulkParseError};
 pub use error::OpenSearchError;
@@ -20,6 +21,10 @@ pub fn app_router() -> Router {
         .route("/", get(root::root_handler))
         .route("/_bulk", post(bulk::bulk_handler))
         .route("/:index/_count", post(count::count_handler))
+        .route(
+            "/:index/_search",
+            post(search::search_handler).get(search::search_handler),
+        )
 }
 
 /// Short crate purpose used by workspace smoke tests.

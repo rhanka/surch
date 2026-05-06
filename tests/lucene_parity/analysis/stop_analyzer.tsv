@@ -1,0 +1,6 @@
+input	tokens
+The quick brown fox is in the yard.	quick:4:9:2|brown:10:15:1|fox:16:19:1|yard:30:34:4
+	
+the and in	
+Rust, and Search!	rust:0:4:1|search:10:16:2
+Such analysis will not stop these tokens?	analysis:5:13:2|stop:23:27:3|tokens:34:40:2

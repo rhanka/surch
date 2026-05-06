@@ -18,6 +18,13 @@ pub trait Analyzer {
     fn token_stream(&self, text: &str) -> Vec<Token>;
 }
 
+/// Minimal English stop word list used by [`StopAnalyzer`].
+pub const ENGLISH_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
+    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
+    "they", "this", "to", "was", "will", "with",
+];
+
 /// Lowercases token terms while preserving positional metadata.
 pub fn lowercase_tokens(tokens: Vec<Token>) -> Vec<Token> {
     tokens
@@ -29,6 +36,32 @@ pub fn lowercase_tokens(tokens: Vec<Token>) -> Vec<Token> {
             position_increment: token.position_increment,
         })
         .collect()
+}
+
+/// Removes stop words while preserving offsets and accumulating skipped positions.
+pub fn stop_filter<I, S>(tokens: Vec<Token>, stop_words: I) -> Vec<Token>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let stop_words: Vec<String> = stop_words
+        .into_iter()
+        .map(|word| word.as_ref().to_owned())
+        .collect();
+    let mut filtered = Vec::new();
+    let mut skipped_positions = 0;
+
+    for mut token in tokens {
+        if stop_words.iter().any(|word| word == &token.term) {
+            skipped_positions += token.position_increment;
+        } else {
+            token.position_increment += skipped_positions;
+            skipped_positions = 0;
+            filtered.push(token);
+        }
+    }
+
+    filtered
 }
 
 /// Analyzer that keeps the full input as a single token.
@@ -121,5 +154,15 @@ impl Analyzer for SimpleAnalyzer {
         }
 
         tokens
+    }
+}
+
+/// Analyzer that emits simple tokens after removing minimal English stop words.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StopAnalyzer;
+
+impl Analyzer for StopAnalyzer {
+    fn token_stream(&self, text: &str) -> Vec<Token> {
+        stop_filter(SimpleAnalyzer.token_stream(text), ENGLISH_STOP_WORDS)
     }
 }

@@ -1,0 +1,43 @@
+{
+  "id": "LUCENE-analysis-StopAnalyzer-001",
+  "title": "Port Lucene stop filtering and StopAnalyzer bootstrap",
+  "owner": "Indexer",
+  "priority": "High",
+  "upstream_ref": {
+    "repo": "lucene",
+    "commit": "7691b7ef9cfe3b87178646f4f32b3854afa0a567",
+    "files": [
+      "lucene/core/src/java/org/apache/lucene/analysis/StopFilter.java",
+      "lucene/core/src/java/org/apache/lucene/analysis/core/StopAnalyzer.java",
+      "lucene/core/src/java/org/apache/lucene/analysis/CharArraySet.java"
+    ],
+    "symbols": [
+      "StopFilter",
+      "StopAnalyzer",
+      "ENGLISH_STOP_WORDS_SET"
+    ]
+  },
+  "parity_level": "P1 behavior",
+  "dependencies": [
+    "LUCENE-analysis-SimpleAnalyzer-001"
+  ],
+  "allowed_paths": [
+    "crates/surch-analysis/**",
+    "tests/lucene_parity/analysis/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-search/**"
+  ],
+  "golden_tests_required": [
+    "Lucene oracle covers stop word removal and position increments",
+    "Rust StopAnalyzer tests match filtered terms offsets and all-stop input handling"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p surch-analysis stop",
+    "cargo clippy --workspace --all-targets --all-features"
+  ],
+  "status": "discovered"
+}
