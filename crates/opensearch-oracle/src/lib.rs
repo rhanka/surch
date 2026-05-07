@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Offline OpenSearch oracle replay and comparison helpers.
 
+pub mod ban;
 pub mod dataset;
 pub mod files;
 pub mod normalize;

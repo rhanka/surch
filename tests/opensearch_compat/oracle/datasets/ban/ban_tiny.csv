@@ -1,0 +1,4 @@
+id,numero,rep,nom_voie,code_postal,code_insee,nom_commune,lon,lat,type_position
+75101_0001_00001,1,,Rue de Rivoli,75001,75101,Paris 1er Arrondissement,2.3364,48.8609,entrée
+33063_0002_00010B,10,B,Cours de l'Intendance,33000,33063,Bordeaux,-0.5792,44.8412,entrée
+67482_0003_00007,7,,Allée des Érables,67000,67482,Strasbourg,7.7521,48.5734,entrée

@@ -1,0 +1,22 @@
+{
+  "name": "ban_tiny",
+  "description": "Tiny Base Adresse Nationale oracle dataset for deterministic CI replay",
+  "operations": [
+    {
+      "kind": "create_index",
+      "path": "/ban_tiny",
+      "expected_status": 200
+    },
+    {
+      "kind": "bulk",
+      "path": "/_bulk",
+      "body": "ban_tiny.ndjson",
+      "expected_status": 200
+    },
+    {
+      "kind": "refresh",
+      "path": "/ban_tiny/_refresh",
+      "expected_status": 200
+    }
+  ]
+}

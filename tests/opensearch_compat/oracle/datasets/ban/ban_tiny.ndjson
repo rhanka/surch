@@ -1,0 +1,6 @@
+{"index":{"_id":"75101_0001_00001","_index":"ban_tiny"}}
+{"city_code":"75101","city_name":"Paris 1er Arrondissement","house_number":"1","id":"75101_0001_00001","label":"1 Rue de Rivoli 75001 Paris 1er Arrondissement","location":{"lat":48.8609,"lon":2.3364},"postcode":"75001","source":"BAN","street_name":"Rue de Rivoli"}
+{"index":{"_id":"33063_0002_00010B","_index":"ban_tiny"}}
+{"city_code":"33063","city_name":"Bordeaux","house_number":"10B","id":"33063_0002_00010B","label":"10B Cours de l'Intendance 33000 Bordeaux","location":{"lat":44.8412,"lon":-0.5792},"postcode":"33000","source":"BAN","street_name":"Cours de l'Intendance"}
+{"index":{"_id":"67482_0003_00007","_index":"ban_tiny"}}
+{"city_code":"67482","city_name":"Strasbourg","house_number":"7","id":"67482_0003_00007","label":"7 Allée des Érables 67000 Strasbourg","location":{"lat":48.5734,"lon":7.7521},"postcode":"67000","source":"BAN","street_name":"Allée des Érables"}
