@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added an abstract OpenSearch replay runner with BAN tiny replay coverage and stricter BAN CSV validation.
 - Added BAN tiny oracle import helpers with CSV parsing, acquisition profiles, and generated OpenSearch bulk fixtures.
 - Added BM25-aware OpenSearch oracle replay comparison rules and BAN data.gouv dataset governance.
 - Added an offline OpenSearch oracle fixture harness with dataset manifests, replay manifests, safe fixture loading, and normalized JSON response comparison.

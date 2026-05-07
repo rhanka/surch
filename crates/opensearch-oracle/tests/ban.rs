@@ -1,5 +1,5 @@
 use opensearch_oracle::ban::{
-    ban_records_to_bulk_ndjson, parse_ban_csv, BanProfile, BAN_DATASET_ID, BAN_LICENSE,
+    ban_records_to_bulk_ndjson, parse_ban_csv, BanError, BanProfile, BAN_DATASET_ID, BAN_LICENSE,
     BAN_SOURCE_CSV_URL,
 };
 use opensearch_oracle::dataset::{DatasetManifest, DatasetOperationKind};
@@ -54,6 +54,55 @@ fn parses_ban_tiny_fixture_with_accents_and_coordinates() {
     assert_eq!(records[1].house_number.as_deref(), Some("10B"));
     assert_eq!(records[1].street_name, "Cours de l'Intendance");
     assert_eq!(records[2].street_name, "Allée des Érables");
+}
+
+#[test]
+fn parses_semicolon_ban_line_with_quoted_separator_in_field() {
+    let csv = concat!(
+        "id;numero;rep;nom_voie;code_postal;code_insee;nom_commune;lon;lat\n",
+        "75101_0001_00001;1;;\"Rue Alpha; Beta\";75001;75101;Paris 1er Arrondissement;2.3364;48.8609\n",
+    );
+
+    let records = parse_ban_csv(csv).expect("semicolon BAN CSV should parse");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, "75101_0001_00001");
+    assert_eq!(records[0].street_name, "Rue Alpha; Beta");
+    assert_eq!(
+        records[0].label(),
+        "1 Rue Alpha; Beta 75001 Paris 1er Arrondissement"
+    );
+}
+
+#[test]
+fn rejects_out_of_range_ban_coordinates_with_typed_error() {
+    for (field, lon, lat, value) in [
+        ("lon", "181", "48.8609", "181"),
+        ("lat", "2.3364", "91", "91"),
+    ] {
+        let csv = format!(
+            concat!(
+                "id,numero,rep,nom_voie,code_postal,code_insee,nom_commune,lon,lat\n",
+                "75101_0001_00001,1,,Rue de Rivoli,75001,75101,Paris 1er Arrondissement,{},{}\n",
+            ),
+            lon, lat
+        );
+
+        let err = parse_ban_csv(&csv).expect_err("out-of-range coordinate should be rejected");
+
+        assert!(matches!(
+            err,
+            BanError::InvalidCoordinate {
+                row: 2,
+                field: err_field,
+                value: ref err_value
+            } if err_field == field && err_value == value
+        ));
+        assert_eq!(
+            err.to_string(),
+            format!("BAN CSV row 2 field `{field}` is outside the valid coordinate range: {value}")
+        );
+    }
 }
 
 #[test]

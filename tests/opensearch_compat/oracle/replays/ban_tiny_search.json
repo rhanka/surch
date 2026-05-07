@@ -1,0 +1,108 @@
+{
+  "name": "ban_tiny_search",
+  "dataset": "ban_tiny",
+  "comparison": {
+    "ignored_paths": ["took", "_shards.total"],
+    "score_tolerance": 0.001
+  },
+  "requests": [
+    {
+      "name": "count_ban_tiny_addresses",
+      "method": "GET",
+      "path": "/ban_tiny/_count",
+      "expected_status": 200,
+      "expected_response": {
+        "count": 3
+      }
+    },
+    {
+      "name": "search_ban_tiny_by_label",
+      "method": "POST",
+      "path": "/ban_tiny/_search",
+      "body": {
+        "query": {
+          "match": {
+            "label": "Rue de Rivoli"
+          }
+        }
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "eq"
+          },
+          "hits": [
+            {
+              "_index": "ban_tiny",
+              "_id": "75101_0001_00001"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "search_ban_tiny_by_address_fields",
+      "method": "POST",
+      "path": "/ban_tiny/_search",
+      "body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "match": {
+                  "street_name": "Cours de l'Intendance"
+                }
+              },
+              {
+                "match": {
+                  "postcode": "33000"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "eq"
+          },
+          "hits": [
+            {
+              "_index": "ban_tiny",
+              "_id": "33063_0002_00010B"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "future_fuzzy_label_typo",
+      "method": "POST",
+      "path": "/ban_tiny/_search",
+      "body": {
+        "query": {
+          "fuzzy": {
+            "label": {
+              "value": "Ale des Erables",
+              "fuzziness": 2
+            }
+          }
+        }
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "eq"
+          }
+        }
+      }
+    }
+  ]
+}

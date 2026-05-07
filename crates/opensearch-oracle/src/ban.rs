@@ -93,6 +93,12 @@ pub enum BanError {
         field: &'static str,
         value: String,
     },
+    #[error("BAN CSV row {row} field `{field}` is outside the valid coordinate range: {value}")]
+    InvalidCoordinate {
+        row: usize,
+        field: &'static str,
+        value: String,
+    },
     #[error("invalid CSV quoting on row {row}")]
     InvalidCsvQuoting { row: usize },
     #[error("bulk index name must not be empty")]
@@ -200,8 +206,8 @@ fn parse_record(
     let street_name = required_text(row, "nom_voie", &fields[required.street_name])?;
     let postcode = required_text(row, "code_postal", &fields[required.postcode])?;
     let city_name = required_text(row, "nom_commune", &fields[required.city_name])?;
-    let longitude = required_number(row, "lon", &fields[required.longitude])?;
-    let latitude = required_number(row, "lat", &fields[required.latitude])?;
+    let longitude = required_coordinate(row, "lon", &fields[required.longitude], -180.0, 180.0)?;
+    let latitude = required_coordinate(row, "lat", &fields[required.latitude], -90.0, 90.0)?;
 
     let house_number = optional_house_number(
         fields
@@ -250,6 +256,25 @@ fn required_number(row: usize, field: &'static str, value: &str) -> Result<f64, 
         field,
         value: text,
     })
+}
+
+fn required_coordinate(
+    row: usize,
+    field: &'static str,
+    value: &str,
+    min: f64,
+    max: f64,
+) -> Result<f64, BanError> {
+    let coordinate = required_number(row, field, value)?;
+    if (min..=max).contains(&coordinate) {
+        Ok(coordinate)
+    } else {
+        Err(BanError::InvalidCoordinate {
+            row,
+            field,
+            value: value.trim().to_string(),
+        })
+    }
 }
 
 fn optional_house_number(number: &str, suffix: &str) -> Option<String> {

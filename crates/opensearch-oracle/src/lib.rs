@@ -6,6 +6,7 @@ pub mod dataset;
 pub mod files;
 pub mod normalize;
 pub mod replay;
+pub mod runner;
 
 /// Short crate purpose used by workspace smoke tests.
 pub const CRATE_PURPOSE: &str = "OpenSearch oracle replay helpers";

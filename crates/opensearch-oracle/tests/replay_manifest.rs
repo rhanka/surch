@@ -66,6 +66,84 @@ fn replay_fixture_products_bm25_manifest_declares_score_comparison_rules() {
 }
 
 #[test]
+fn replay_fixture_ban_tiny_search_manifest_is_valid_for_oracle_replay() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/opensearch_compat/oracle/replays/ban_tiny_search.json");
+    let manifest_json =
+        std::fs::read_to_string(manifest_path).expect("BAN tiny replay fixture should exist");
+    let manifest = parse_manifest(&manifest_json);
+
+    assert_eq!(manifest.name, "ban_tiny_search");
+    assert_eq!(manifest.dataset, "ban_tiny");
+    assert_eq!(
+        manifest.comparison,
+        ReplayComparison {
+            ignored_paths: vec!["took".to_string(), "_shards.total".to_string()],
+            score_tolerance: 0.001,
+        }
+    );
+    assert_eq!(
+        manifest.comparison.to_normalize_config().score_tolerance,
+        0.001
+    );
+
+    assert_eq!(manifest.requests.len(), 4);
+
+    let count = &manifest.requests[0];
+    assert_eq!(count.name, "count_ban_tiny_addresses");
+    assert_eq!(count.method, HttpMethod::Get);
+    assert_eq!(count.path, "/ban_tiny/_count");
+    assert_eq!(count.expected_status, 200);
+    assert_eq!(count.expected_response.as_ref().unwrap()["count"], 3);
+
+    let match_label = &manifest.requests[1];
+    assert_eq!(match_label.name, "search_ban_tiny_by_label");
+    assert_eq!(match_label.method, HttpMethod::Post);
+    assert_eq!(match_label.path, "/ban_tiny/_search");
+    assert_eq!(match_label.expected_status, 200);
+    assert_eq!(
+        match_label.body.as_ref().unwrap()["query"]["match"]["label"],
+        "Rue de Rivoli"
+    );
+    assert_eq!(
+        match_label.expected_response.as_ref().unwrap()["hits"]["total"]["value"],
+        1
+    );
+
+    let match_address = &manifest.requests[2];
+    assert_eq!(match_address.name, "search_ban_tiny_by_address_fields");
+    assert_eq!(match_address.method, HttpMethod::Post);
+    assert_eq!(match_address.path, "/ban_tiny/_search");
+    assert_eq!(match_address.expected_status, 200);
+    assert_eq!(
+        match_address.body.as_ref().unwrap()["query"]["bool"]["must"][0]["match"]["street_name"],
+        "Cours de l'Intendance"
+    );
+    assert_eq!(
+        match_address.body.as_ref().unwrap()["query"]["bool"]["must"][1]["match"]["postcode"],
+        "33000"
+    );
+
+    let fuzzy = &manifest.requests[3];
+    assert_eq!(fuzzy.name, "future_fuzzy_label_typo");
+    assert_eq!(fuzzy.method, HttpMethod::Post);
+    assert_eq!(fuzzy.path, "/ban_tiny/_search");
+    assert_eq!(fuzzy.expected_status, 200);
+    assert_eq!(
+        fuzzy.body.as_ref().unwrap()["query"]["fuzzy"]["label"]["value"],
+        "Ale des Erables"
+    );
+    assert_eq!(
+        fuzzy.body.as_ref().unwrap()["query"]["fuzzy"]["label"]["fuzziness"],
+        2
+    );
+    assert_eq!(
+        fuzzy.expected_response.as_ref().unwrap()["hits"]["total"]["value"],
+        1
+    );
+}
+
+#[test]
 fn replay_manifest_defaults_to_exact_response_comparison() {
     let manifest = parse_manifest(
         r#"{
