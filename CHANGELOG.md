@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added an in-memory Surch API oracle runner test backed by the OpenSearch replay harness.
 - Added an abstract OpenSearch replay runner with BAN tiny replay coverage and stricter BAN CSV validation.
 - Added BAN tiny oracle import helpers with CSV parsing, acquisition profiles, and generated OpenSearch bulk fixtures.
 - Added BM25-aware OpenSearch oracle replay comparison rules and BAN data.gouv dataset governance.

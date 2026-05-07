@@ -18,4 +18,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+opensearch-oracle = { path = "../opensearch-oracle" }
 tower = { workspace = true, features = ["util"] }

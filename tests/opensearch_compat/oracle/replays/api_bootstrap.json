@@ -1,0 +1,71 @@
+{
+  "name": "api_bootstrap",
+  "dataset": "none",
+  "requests": [
+    {
+      "name": "root",
+      "method": "GET",
+      "path": "/",
+      "expected_status": 200,
+      "expected_response": {
+        "name": "surch-node-0",
+        "cluster_name": "surch-cluster",
+        "cluster_uuid": "00000000-0000-0000-0000-000000000000",
+        "version": {
+          "number": "0.1.0",
+          "distribution": "opensearch"
+        },
+        "tagline": "The OpenSearch Project: https://opensearch.org/"
+      }
+    },
+    {
+      "name": "count_empty_products",
+      "method": "POST",
+      "path": "/products/_count",
+      "body": {
+        "query": {
+          "match_all": {}
+        }
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "count": 0,
+        "_shards": {
+          "total": 1,
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        }
+      }
+    },
+    {
+      "name": "search_empty_products",
+      "method": "POST",
+      "path": "/products/_search",
+      "body": {
+        "query": {
+          "match_all": {}
+        }
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "took": 0,
+        "timed_out": false,
+        "_shards": {
+          "total": 1,
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
+        "hits": {
+          "total": {
+            "value": 0,
+            "relation": "eq"
+          },
+          "max_score": null,
+          "hits": []
+        }
+      }
+    }
+  ]
+}
