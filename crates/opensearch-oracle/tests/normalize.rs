@@ -62,6 +62,37 @@ fn compare_accepts_fixture_when_took_differs_and_scores_are_within_tolerance() {
 }
 
 #[test]
+fn compare_bm25_scores_with_tolerance_without_ignoring_them() {
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/opensearch_compat/oracle/normalize/bm25_expected.json"
+    ))
+    .expect("expected fixture should parse");
+    let actual: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/opensearch_compat/oracle/normalize/bm25_actual.json"
+    ))
+    .expect("actual fixture should parse");
+    let config = NormalizeConfig {
+        ignored_paths: vec!["took".to_string()],
+        score_tolerance: 0.00001,
+    };
+
+    compare_json(&expected, &actual, &config)
+        .expect("BM25 score drift within tolerance should compare equal");
+
+    let mut max_score_mismatch = actual.clone();
+    max_score_mismatch["hits"]["max_score"] = json!(3.2);
+    let err = compare_json(&expected, &max_score_mismatch, &config)
+        .expect_err("max_score outside tolerance should fail");
+    assert!(err.to_string().contains("hits.max_score"));
+
+    let mut hit_score_mismatch = actual;
+    hit_score_mismatch["hits"]["hits"][0]["_score"] = json!(3.2);
+    let err = compare_json(&expected, &hit_score_mismatch, &config)
+        .expect_err("hit _score outside tolerance should fail");
+    assert!(err.to_string().contains("hits.hits.0._score"));
+}
+
+#[test]
 fn compare_rejects_score_mismatch_outside_tolerance() {
     let expected = json!({"hits": {"hits": [{"_id": "1", "_score": 1.0}]}});
     let actual = json!({"hits": {"hits": [{"_id": "1", "_score": 1.5}]}});

@@ -1,0 +1,62 @@
+{
+  "id": "OS-oracle-BAN-001",
+  "title": "Govern BAN data.gouv oracle dataset integration",
+  "owner": "Conductor",
+  "priority": "Critical",
+  "upstream_ref": {
+    "repo": "data.gouv.fr",
+    "commit": "dataset:5530fbacc751df5ff937dddb",
+    "files": [
+      "https://www.data.gouv.fr/fr/datasets/base-adresse-nationale/",
+      "https://adresse.data.gouv.fr/data/ban/adresses/latest/csv"
+    ],
+    "symbols": [
+      "base-adresse-nationale",
+      "lov2",
+      "daily",
+      "ban_tiny",
+      "ban_sample",
+      "ban_full"
+    ]
+  },
+  "parity_level": "P1 external oracle dataset",
+  "dependencies": [
+    "OS-oracle-DatasetManifest-001",
+    "OS-oracle-FixtureFiles-001",
+    "OS-oracle-ReplayManifest-001"
+  ],
+  "allowed_paths": [
+    "tests/opensearch_compat/oracle/datasets/ban/**",
+    "crates/opensearch-oracle/**"
+  ],
+  "forbidden_paths": [
+    "crates/surch-api/**",
+    "crates/surch-index/**",
+    "crates/surch-search/**",
+    "crates/surch-store/**"
+  ],
+  "dataset_scope": {
+    "dataset_id": "5530fbacc751df5ff937dddb",
+    "slug": "base-adresse-nationale",
+    "license": "lov2",
+    "frequency": "daily",
+    "source_csv_url": "https://adresse.data.gouv.fr/data/ban/adresses/latest/csv",
+    "profiles": [
+      "ban_tiny",
+      "ban_sample",
+      "ban_full"
+    ],
+    "storage_policy": "Do not download or commit the full BAN dataset in this ticket; only governance manifests and deterministic tiny/sample references are in scope."
+  },
+  "golden_tests_required": [
+    "BAN oracle governance declares data.gouv dataset id slug license daily frequency and canonical latest CSV URL",
+    "BAN oracle profiles cover ban_tiny ban_sample and ban_full without committing the full external dataset",
+    "Rust oracle tests validate BAN manifest shape allowed paths and dataset acquisition policy"
+  ],
+  "gates": [
+    "cargo run -p portage-ledger -- validate docs/portage/ledger/tickets",
+    "cargo run -p portage-ledger -- language-policy .",
+    "cargo test -p opensearch-oracle ban"
+  ],
+  "status": "discovered"
+}

@@ -1,0 +1,35 @@
+{
+  "took": 21,
+  "timed_out": false,
+  "_shards": {
+    "total": 1,
+    "successful": 1,
+    "skipped": 0,
+    "failed": 0
+  },
+  "hits": {
+    "total": {
+      "value": 2,
+      "relation": "eq"
+    },
+    "max_score": 3.141599,
+    "hits": [
+      {
+        "_index": "products",
+        "_id": "sku-1",
+        "_score": 3.141599,
+        "_source": {
+          "title": "Rust Search"
+        }
+      },
+      {
+        "_index": "products",
+        "_id": "sku-2",
+        "_score": 1.618041,
+        "_source": {
+          "title": "OpenSearch Compatible"
+        }
+      }
+    ]
+  }
+}

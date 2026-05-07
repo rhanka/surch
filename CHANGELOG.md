@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added BM25-aware OpenSearch oracle replay comparison rules and BAN data.gouv dataset governance.
 - Added an offline OpenSearch oracle fixture harness with dataset manifests, replay manifests, safe fixture loading, and normalized JSON response comparison.
 - Added P0 document indexing pipeline from `SimpleAnalyzer` to stored fields and postings.
 - Added BM25-backed term query execution over postings into `TopDocs`.

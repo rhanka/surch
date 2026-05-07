@@ -1,5 +1,7 @@
 //! Replay manifest parsing for OpenSearch parity requests.
 
+use crate::normalize::NormalizeConfig;
+
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
@@ -17,6 +19,8 @@ pub enum HttpMethod {
 pub struct ReplayManifest {
     pub name: String,
     pub dataset: String,
+    #[serde(default)]
+    pub comparison: ReplayComparison,
     pub requests: Vec<ReplayRequest>,
 }
 
@@ -24,6 +28,32 @@ impl ReplayManifest {
     pub fn from_json_str(json: &str) -> Result<Self, ReplayManifestError> {
         let manifest = serde_json::from_str(json)?;
         validate_manifest(manifest)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReplayComparison {
+    #[serde(default)]
+    pub ignored_paths: Vec<String>,
+    #[serde(default)]
+    pub score_tolerance: f64,
+}
+
+impl ReplayComparison {
+    pub fn to_normalize_config(&self) -> NormalizeConfig {
+        NormalizeConfig {
+            ignored_paths: self.ignored_paths.clone(),
+            score_tolerance: self.score_tolerance,
+        }
+    }
+}
+
+impl Default for ReplayComparison {
+    fn default() -> Self {
+        Self {
+            ignored_paths: Vec::new(),
+            score_tolerance: 0.0,
+        }
     }
 }
 
@@ -55,6 +85,10 @@ pub enum ReplayManifestError {
     InvalidExpectedStatus { index: usize, status: u16 },
     #[error("replay request at index {index} expected_response must not be empty when present")]
     EmptyExpectedResponse { index: usize },
+    #[error("replay comparison ignored path at index {index} must not be empty")]
+    EmptyIgnoredComparisonPath { index: usize },
+    #[error("replay comparison score_tolerance must be non-negative, got {tolerance}")]
+    InvalidScoreTolerance { tolerance: f64 },
 }
 
 impl From<serde_json::Error> for ReplayManifestError {
@@ -75,6 +109,8 @@ fn validate_manifest(manifest: ReplayManifest) -> Result<ReplayManifest, ReplayM
     if manifest.requests.is_empty() {
         return Err(ReplayManifestError::EmptyRequests);
     }
+
+    validate_comparison(&manifest.comparison)?;
 
     for (index, request) in manifest.requests.iter().enumerate() {
         if request.name.trim().is_empty() {
@@ -102,6 +138,22 @@ fn validate_manifest(manifest: ReplayManifest) -> Result<ReplayManifest, ReplayM
     }
 
     Ok(manifest)
+}
+
+fn validate_comparison(comparison: &ReplayComparison) -> Result<(), ReplayManifestError> {
+    for (index, ignored_path) in comparison.ignored_paths.iter().enumerate() {
+        if ignored_path.trim().is_empty() {
+            return Err(ReplayManifestError::EmptyIgnoredComparisonPath { index });
+        }
+    }
+
+    if comparison.score_tolerance < 0.0 {
+        return Err(ReplayManifestError::InvalidScoreTolerance {
+            tolerance: comparison.score_tolerance,
+        });
+    }
+
+    Ok(())
 }
 
 fn is_empty_json_value(value: &Value) -> bool {

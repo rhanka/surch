@@ -1,0 +1,78 @@
+{
+  "name": "products_bm25_search",
+  "dataset": "products_basic",
+  "comparison": {
+    "ignored_paths": ["took", "_shards.total"],
+    "score_tolerance": 0.001
+  },
+  "requests": [
+    {
+      "name": "index_product_1",
+      "method": "PUT",
+      "path": "/products/_doc/1",
+      "body": {
+        "name": "Rust Search",
+        "category": "books",
+        "description": "Rust search engine internals and BM25 scoring"
+      },
+      "expected_status": 201,
+      "expected_response": {
+        "result": "created"
+      }
+    },
+    {
+      "name": "index_product_2",
+      "method": "PUT",
+      "path": "/products/_doc/2",
+      "body": {
+        "name": "Search Systems",
+        "category": "books",
+        "description": "Practical search relevance with inverted indexes"
+      },
+      "expected_status": 201,
+      "expected_response": {
+        "result": "created"
+      }
+    },
+    {
+      "name": "refresh_products",
+      "method": "POST",
+      "path": "/products/_refresh",
+      "expected_status": 200
+    },
+    {
+      "name": "search_products_by_text",
+      "method": "POST",
+      "path": "/products/_search",
+      "body": {
+        "query": {
+          "match": {
+            "description": "search"
+          }
+        }
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "hits": {
+          "total": {
+            "value": 2,
+            "relation": "eq"
+          },
+          "max_score": 0.87546873,
+          "hits": [
+            {
+              "_index": "products",
+              "_id": "1",
+              "_score": 0.87546873
+            },
+            {
+              "_index": "products",
+              "_id": "2",
+              "_score": 0.18232156
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
