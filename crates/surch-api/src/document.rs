@@ -1,8 +1,13 @@
-use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::OpenSearchError;
+use crate::{state::AppState, OpenSearchError};
 
 /// OpenSearch-compatible document index response for the P0 bootstrap API.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -49,15 +54,19 @@ pub fn build_document_response(index: String, id: String) -> DocumentResponse {
 
 /// Axum handler for the OpenSearch-compatible `/{index}/_doc/{id}` endpoint.
 pub async fn document_handler(
+    State(state): State<AppState>,
     Path((index, id)): Path<(String, String)>,
     body: String,
 ) -> impl IntoResponse {
     match parse_document_source(&body) {
-        Ok(_source) => (
-            StatusCode::CREATED,
-            Json(build_document_response(index, id)),
-        )
-            .into_response(),
+        Ok(source) => {
+            state.index_document(&index, &id, source);
+            (
+                StatusCode::CREATED,
+                Json(build_document_response(index, id)),
+            )
+                .into_response()
+        }
         Err(error) => error.into_response(),
     }
 }

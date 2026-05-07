@@ -1,4 +1,5 @@
 use axum::{
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -6,6 +7,8 @@ use axum::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
+
+use crate::state::AppState;
 
 /// One parsed OpenSearch `_bulk` NDJSON operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +112,18 @@ pub fn build_bulk_response(operations: &[BulkOperation], took: u64) -> BulkRespo
 }
 
 /// Axum handler for the OpenSearch-compatible `_bulk` endpoint.
+pub async fn bulk_state_handler(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    match parse_bulk_ndjson(&body) {
+        Ok(operations) => {
+            apply_bulk_operations(&state, &operations);
+            let response = build_bulk_response(&operations, 0);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => bulk_parse_error_response(error),
+    }
+}
+
+/// State-less `_bulk` handler used by parser/response bootstrap tests.
 pub async fn bulk_handler(body: String) -> impl IntoResponse {
     match parse_bulk_ndjson(&body) {
         Ok(operations) => {
@@ -116,6 +131,30 @@ pub async fn bulk_handler(body: String) -> impl IntoResponse {
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => bulk_parse_error_response(error),
+    }
+}
+
+fn apply_bulk_operations(state: &AppState, operations: &[BulkOperation]) {
+    for operation in operations {
+        match operation {
+            BulkOperation::Index { index, id, source }
+            | BulkOperation::Create { index, id, source } => {
+                if let (Some(index), Some(id)) = (index, id) {
+                    state.index_document(index, id, source.clone());
+                }
+            }
+            BulkOperation::Update { index, id, source } => {
+                if let (Some(index), Some(id)) = (index, id) {
+                    let source = source.get("doc").cloned().unwrap_or_else(|| source.clone());
+                    state.index_document(index, id, source);
+                }
+            }
+            BulkOperation::Delete { index, id } => {
+                if let (Some(index), Some(id)) = (index, id) {
+                    state.delete_document(index, id);
+                }
+            }
+        }
     }
 }
 

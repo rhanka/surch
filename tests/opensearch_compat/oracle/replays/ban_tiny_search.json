@@ -12,7 +12,12 @@
       "path": "/ban_tiny/_count",
       "expected_status": 200,
       "expected_response": {
-        "count": 3
+        "count": 3,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        }
       }
     },
     {
@@ -28,11 +33,18 @@
       },
       "expected_status": 200,
       "expected_response": {
+        "timed_out": false,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
         "hits": {
           "total": {
             "value": 1,
             "relation": "eq"
           },
+          "max_score": null,
           "hits": [
             {
               "_index": "ban_tiny",
@@ -66,11 +78,18 @@
       },
       "expected_status": 200,
       "expected_response": {
+        "timed_out": false,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
         "hits": {
           "total": {
             "value": 1,
             "relation": "eq"
           },
+          "max_score": null,
           "hits": [
             {
               "_index": "ban_tiny",
@@ -96,11 +115,24 @@
       },
       "expected_status": 200,
       "expected_response": {
+        "timed_out": false,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
         "hits": {
           "total": {
             "value": 1,
             "relation": "eq"
-          }
+          },
+          "max_score": null,
+          "hits": [
+            {
+              "_index": "ban_tiny",
+              "_id": "67482_0003_00007"
+            }
+          ]
         }
       }
     }

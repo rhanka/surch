@@ -1,8 +1,13 @@
-use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::OpenSearchError;
+use crate::{state::AppState, OpenSearchError};
 
 /// OpenSearch-compatible `_count` request body for the P0 bootstrap surface.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,9 +39,9 @@ pub struct CountShards {
 }
 
 /// Build a deterministic P0 OpenSearch-compatible `_count` response.
-pub fn build_count_response() -> CountResponse {
+pub fn build_count_response(count: u64) -> CountResponse {
     CountResponse {
-        count: 0,
+        count,
         shards: CountShards {
             total: 1,
             successful: 1,
@@ -47,9 +52,17 @@ pub fn build_count_response() -> CountResponse {
 }
 
 /// Axum handler for the OpenSearch-compatible `/{index}/_count` endpoint.
-pub async fn count_handler(Path(_index): Path<String>, body: String) -> impl IntoResponse {
+pub async fn count_handler(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+    body: String,
+) -> impl IntoResponse {
     match parse_count_request(&body) {
-        Ok(_request) => (StatusCode::OK, Json(build_count_response())).into_response(),
+        Ok(_request) => (
+            StatusCode::OK,
+            Json(build_count_response(state.count(&index))),
+        )
+            .into_response(),
         Err(error) => error.into_response(),
     }
 }

@@ -10,8 +10,10 @@ pub mod bulk;
 pub mod count;
 pub mod document;
 pub mod error;
+pub mod index;
 pub mod root;
 pub mod search;
+pub mod state;
 
 pub use bulk::{parse_bulk_ndjson, BulkOperation, BulkParseError};
 pub use error::OpenSearchError;
@@ -20,16 +22,25 @@ pub use error::OpenSearchError;
 pub fn app_router() -> Router {
     Router::new()
         .route("/", get(root::root_handler))
-        .route("/_bulk", post(bulk::bulk_handler))
+        .route("/_bulk", post(bulk::bulk_state_handler))
+        .route(
+            "/:index",
+            put(index::create_index_handler).delete(index::delete_index_handler),
+        )
         .route(
             "/:index/_doc/:id",
             put(document::document_handler).post(document::document_handler),
         )
-        .route("/:index/_count", post(count::count_handler))
+        .route("/:index/_refresh", post(index::refresh_index_handler))
+        .route(
+            "/:index/_count",
+            post(count::count_handler).get(count::count_handler),
+        )
         .route(
             "/:index/_search",
             post(search::search_handler).get(search::search_handler),
         )
+        .with_state(state::AppState::default())
 }
 
 /// Short crate purpose used by workspace smoke tests.
