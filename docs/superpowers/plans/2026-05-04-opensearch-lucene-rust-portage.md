@@ -250,3 +250,85 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 - [ ] Add performance baseline harness for indexing and search.
 - [ ] Add dependency audit/deny tooling.
 - [ ] Commit with `security(api): add compatibility safety gates`.
+
+### Task 9: Demo Subproject And BAN Comparison Harness
+
+**Status:** design direction pending user validation before scaffolding `demo/`.
+
+**Files:**
+- Create under `demo/`
+- Create or modify under `docs/poc/`
+- Create or modify under `crates/surch-demo/` or a future benchmark crate
+- Optionally create shell-only lifecycle helpers under `scripts/bench/`
+
+- [ ] Create `demo/` as a TypeScript-only SvelteKit/Svelte 5 app using `@sveltejs/adapter-node`.
+- [ ] Keep Python forbidden in the demo, backend, benchmark, and data tooling.
+- [ ] Use SvelteKit `+server.ts` endpoints as the demo backend for the first version.
+- [ ] Configure engine targets with `SURCH_URL` and `OPENSEARCH_URL`.
+- [ ] Expose a fixed BAN demo surface:
+  - `GET /api/engines`
+  - `GET /api/health`
+  - `GET /api/demo/fixture`
+  - `POST /api/demo/reset`
+  - `POST /api/count`
+  - `POST /api/search`
+  - `POST /api/compare`
+- [ ] Build the first UI as an operational demo, not a landing page:
+  - engine status for Surch and OpenSearch;
+  - switcher for `Surch`, `OpenSearch`, and `Compare`;
+  - BAN load/reset action;
+  - predefined queries for count, match label, bool address, and fuzzy typo;
+  - compact JSON editor;
+  - result panel with total hits, IDs, raw JSON, and normalized diff in compare mode.
+- [ ] Add strict backend validation:
+  - engine enum only;
+  - index fixed to `ban_tiny` for V1;
+  - request body size limits;
+  - short upstream timeouts;
+  - no browser-side direct OpenSearch proxy;
+  - no arbitrary upstream URLs.
+- [ ] Add demo gates:
+  - TypeScript/Svelte check;
+  - unit tests for engine selection, config validation, response normalization, and BAN NDJSON parsing;
+  - API tests with mocked upstream engines;
+  - optional real-engine smoke tests gated by `SURCH_URL` and `OPENSEARCH_URL`;
+  - Playwright flow for load, search, engine switch, and compare mode.
+- [ ] Add or reuse a Surch HTTP server binary before the demo depends on `SURCH_URL`.
+- [ ] Commit with `feat(demo): add ban engine switch demo`.
+
+#### BAN OpenSearch vs Surch Benchmark Positioning
+
+The BAN benchmark is a compatibility and reproducibility benchmark until Surch
+uses the complete indexing, storage, scoring, and HTTP server path. It must not
+be published as an engine-performance comparison while Surch is still measured
+as an in-process in-memory API router.
+
+- [ ] Reuse `tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson` and `tests/opensearch_compat/oracle/replays/ban_tiny_search.json`.
+- [ ] Measure the same operation sequence:
+  - `PUT /ban_tiny`
+  - `POST /_bulk`
+  - `POST /ban_tiny/_refresh`
+  - `GET /ban_tiny/_count`
+  - `POST /ban_tiny/_search` for match, bool, and fuzzy requests.
+- [ ] For OpenSearch, orchestrate a single-node local runtime with shell only:
+  - fixed image/version or digest;
+  - security disabled for local benchmark;
+  - fixed heap;
+  - healthcheck before loading;
+  - index cleanup before each measured run.
+- [ ] For Surch, report runtime mode explicitly:
+  - `Surch in-process` for the current smoke benchmark;
+  - `Surch HTTP` only after a server binary exists.
+- [ ] Record metrics:
+  - ingestion duration and docs/s;
+  - min, p50, p95, p99, max latency;
+  - error count;
+  - total hits and top hit ID;
+  - host, OS, CPU, memory, OpenSearch version/image, heap, Surch commit, Rust profile, dataset size.
+- [ ] Reject benchmark output when responses do not pass the oracle.
+- [ ] Publish guardrails with every result:
+  - `ban_tiny` is a 3-document smoke dataset;
+  - no global Surch/OpenSearch ratio until runtime paths are symmetric;
+  - no production throughput claim;
+  - no scoring comparison while the Surch API path returns `max_score: null`.
+- [ ] Commit with `test(perf): add ban reproducibility benchmark harness`.
