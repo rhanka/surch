@@ -9,6 +9,7 @@ members = [
     "crates/surch-api",
     "crates/opensearch-oracle",
     "crates/portage-ledger",
+    "crates/surch-demo",
 ]
 resolver = "2"
 

@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added a Rust-only `surch-demo` BAN PoC and local in-memory benchmark CLI for publication-ready demos.
 - Added stateful in-memory Surch API execution for BAN tiny OpenSearch oracle count/search/fuzzy replay coverage.
 - Added an in-memory Surch API oracle runner test backed by the OpenSearch replay harness.
 - Added an abstract OpenSearch replay runner with BAN tiny replay coverage and stricter BAN CSV validation.
