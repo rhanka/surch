@@ -46,3 +46,27 @@ fn ban_bench_prints_publishable_metric_labels() {
     assert!(stdout.contains("search_bool_address:"));
     assert!(stdout.contains("search_fuzzy_label:"));
 }
+
+#[test]
+fn ban_compare_plan_prints_guardrails_without_running_engines() {
+    let output = Command::new(env!("CARGO_BIN_EXE_surch-demo"))
+        .arg("ban-compare-plan")
+        .output()
+        .expect("surch-demo binary should run");
+
+    assert!(
+        output.status.success(),
+        "ban-compare-plan should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("Surch BAN compare plan"));
+    assert!(stdout.contains("dataset: ban_tiny"));
+    assert!(stdout.contains("documents: 3"));
+    assert!(stdout.contains("OpenSearch over HTTP"));
+    assert!(stdout.contains("Surch in-process"));
+    assert!(stdout.contains("no global ratio"));
+    assert!(stdout.contains("oracle required"));
+    assert!(stdout.contains("does not start OpenSearch"));
+}

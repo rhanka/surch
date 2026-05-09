@@ -33,6 +33,10 @@ async fn run() -> Result<(), CliError> {
     match args.next().as_deref() {
         Some("ban-poc") => run_ban_poc().await,
         Some("ban-bench") => run_ban_bench(parse_bench_iterations(args)?).await,
+        Some("ban-compare-plan") => {
+            print_ban_compare_plan();
+            Ok(())
+        }
         Some("--help") | Some("-h") | None => {
             print_help();
             Ok(())
@@ -346,6 +350,22 @@ fn print_help() {
     println!("Surch demo commands");
     println!("  ban-poc");
     println!("  ban-bench [--iterations N]");
+    println!("  ban-compare-plan");
+}
+
+fn print_ban_compare_plan() {
+    println!("Surch BAN compare plan");
+    println!("dataset: ban_tiny");
+    println!("documents: 3");
+    println!("oracle required: tests/opensearch_compat/oracle/replays/ban_tiny_search.json");
+    println!("OpenSearch over HTTP: measure only after healthcheck and index reset");
+    println!("Surch in-process: current smoke path; label separately from HTTP runtimes");
+    println!("operations: create index, bulk ingest, refresh, count, match, bool, fuzzy");
+    println!("metrics: ingest duration, docs/s, min, p50, p95, p99, max, errors, top hit id");
+    println!(
+        "guardrail: no global ratio until Surch and OpenSearch use symmetric HTTP engine paths"
+    );
+    println!("guardrail: does not start OpenSearch, Docker, or a Surch server");
 }
 
 #[derive(Debug)]
