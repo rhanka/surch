@@ -1,10 +1,21 @@
 import { json } from '@sveltejs/kit';
 import { runBanQuery, parseEngineId } from '$lib/server/engines';
+import { toDemoErrorResponse } from '$lib/server/demoErrors';
 import type { RequestHandler } from './$types';
 
 export const POST: RequestHandler = async ({ request, fetch }) => {
   const body = await request.json().catch(() => ({}));
   const engine = parseEngineId(body.engine ?? 'surch');
 
-  return json(await runBanQuery({ engine, queryId: 'count' }, fetch));
+  try {
+    return json(await runBanQuery({ engine, queryId: 'count' }, fetch));
+  } catch (error) {
+    const formatted = toDemoErrorResponse(error);
+
+    if (formatted) {
+      return json(formatted.body, { status: formatted.status });
+    }
+
+    throw error;
+  }
 };

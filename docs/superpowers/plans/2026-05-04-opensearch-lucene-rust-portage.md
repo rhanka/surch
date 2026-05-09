@@ -253,7 +253,7 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 
 ### Task 9: Demo Subproject And BAN Comparison Harness
 
-**Status:** design direction pending user validation before scaffolding `demo/`.
+**Status:** V1 scaffold pushed in `c0a1e7d`; V2 address autocomplete/map and external BAN dataset support in progress.
 
 **Files:**
 - Create under `demo/`
@@ -261,11 +261,11 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 - Create or modify under `crates/surch-demo/` or a future benchmark crate
 - Optionally create shell-only lifecycle helpers under `scripts/bench/`
 
-- [ ] Create `demo/` as a TypeScript-only SvelteKit/Svelte 5 app using `@sveltejs/adapter-node`.
-- [ ] Keep Python forbidden in the demo, backend, benchmark, and data tooling.
-- [ ] Use SvelteKit `+server.ts` endpoints as the demo backend for the first version.
-- [ ] Configure engine targets with `SURCH_URL` and `OPENSEARCH_URL`.
-- [ ] Expose a fixed BAN demo surface:
+- [x] Create `demo/` as a TypeScript-only SvelteKit/Svelte 5 app using `@sveltejs/adapter-node`.
+- [x] Keep Python forbidden in the demo, backend, benchmark, and data tooling.
+- [x] Use SvelteKit `+server.ts` endpoints as the demo backend for the first version.
+- [x] Configure engine targets with `SURCH_URL` and `OPENSEARCH_URL`.
+- [x] Expose a fixed BAN demo surface:
   - `GET /api/engines`
   - `GET /api/health`
   - `GET /api/demo/fixture`
@@ -273,28 +273,46 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
   - `POST /api/count`
   - `POST /api/search`
   - `POST /api/compare`
-- [ ] Build the first UI as an operational demo, not a landing page:
+- [x] Build the first UI as an operational demo, not a landing page:
   - engine status for Surch and OpenSearch;
   - switcher for `Surch`, `OpenSearch`, and `Compare`;
   - BAN load/reset action;
   - predefined queries for count, match label, bool address, and fuzzy typo;
   - compact JSON editor;
   - result panel with total hits, IDs, raw JSON, and normalized diff in compare mode.
-- [ ] Add strict backend validation:
+- [x] Add strict backend validation:
   - engine enum only;
   - index fixed to `ban_tiny` for V1;
   - request body size limits;
   - short upstream timeouts;
   - no browser-side direct OpenSearch proxy;
   - no arbitrary upstream URLs.
-- [ ] Add demo gates:
+- [x] Add demo gates:
   - TypeScript/Svelte check;
   - unit tests for engine selection, config validation, response normalization, and BAN NDJSON parsing;
   - API tests with mocked upstream engines;
   - optional real-engine smoke tests gated by `SURCH_URL` and `OPENSEARCH_URL`;
   - Playwright flow for load, search, engine switch, and compare mode.
-- [ ] Add or reuse a Surch HTTP server binary before the demo depends on `SURCH_URL`.
-- [ ] Commit with `feat(demo): add ban engine switch demo`.
+- [x] Add or reuse a Surch HTTP server binary before the demo depends on `SURCH_URL`.
+- [x] Commit with `feat(demo): add ban engine switch demo`.
+
+#### Demo V2 Address Autocomplete And Map
+
+- [ ] Keep `ban_tiny` as the committed offline/CI fixture.
+- [ ] Support an external BAN CSV or CSV.GZ via `BAN_CSV_PATH` without committing the national dataset.
+- [ ] Add bounded TypeScript-only BAN parsing, validation, summary, suggestion, and document hydration helpers.
+- [ ] Add SvelteKit backend endpoints:
+  - `GET /api/ban/dataset`
+  - `POST /api/ban/load`
+  - `POST /api/ban/suggest`
+  - `POST /api/ban/compare`
+- [ ] Replace the V1 query-picker demo with a real address autocomplete flow.
+- [ ] Show selected addresses on an OpenStreetMap/Leaflet map with visible attribution.
+- [ ] Compare Surch and OpenSearch in side-by-side panels with top hit, overlap, timings, and guardrails.
+- [ ] Convert OpenSearch upstream failures, non-JSON responses, and timeouts into structured demo JSON errors instead of opaque SvelteKit 500 pages.
+- [ ] Keep the benchmark guardrail: no global Surch/OpenSearch performance ratio while runtime paths and scoring are not symmetric.
+- [ ] Run `npm run check`, `npm run test`, `npm run build`, Rust targeted tests, and `cargo run -p portage-ledger -- language-policy .`.
+- [ ] Commit with `feat(demo): add ban autocomplete map`.
 
 #### BAN OpenSearch vs Surch Benchmark Positioning
 

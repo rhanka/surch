@@ -19,15 +19,34 @@ describe('engine operations', () => {
     expect(result.engine).toBe('surch');
     expect(result.operations).toEqual([
       { path: '/ban_tiny', status: 200 },
+      { path: '/ban_tiny', status: 200 },
       { path: '/_bulk', status: 200 },
       { path: '/ban_tiny/_refresh', status: 200 }
     ]);
     expect(calls.map((call) => [call.method, new URL(call.url).pathname])).toEqual([
+      ['DELETE', '/ban_tiny'],
       ['PUT', '/ban_tiny'],
       ['POST', '/_bulk'],
       ['POST', '/ban_tiny/_refresh']
     ]);
-    expect(calls[1].body).toContain('75101_0001_00001');
+    expect(calls[2].body).toContain('75101_0001_00001');
+  });
+
+  it('tolerates a missing index while resetting BAN tiny', async () => {
+    const statuses = [404, 200, 200, 200];
+    const fakeFetch = async () => {
+      const status = statuses.shift();
+      if (!status) {
+        throw new Error('unexpected extra request');
+      }
+
+      return Response.json({ acknowledged: true }, { status });
+    };
+
+    const result = await resetBanTiny('opensearch', fakeFetch);
+
+    expect(result.operations[0]).toEqual({ path: '/ban_tiny', status: 404 });
+    expect(result.operations.map((operation) => operation.status)).toEqual([404, 200, 200, 200]);
   });
 
   it('runs predefined queries without accepting arbitrary paths', async () => {
@@ -76,5 +95,34 @@ describe('engine operations', () => {
     expect(result.surch.status).toBe(200);
     expect(result.opensearch.status).toBe(200);
     expect([...seen].sort()).toEqual(['http://127.0.0.1:7700', 'http://127.0.0.1:9200']);
+  });
+
+  it('returns a partial compare result when OpenSearch fails after Surch responds', async () => {
+    const fakeFetch = async (url: URL | RequestInfo) => {
+      const requestUrl = new URL(url.toString());
+
+      if (requestUrl.origin === 'http://127.0.0.1:9200') {
+        throw new Error('connection refused');
+      }
+
+      return Response.json({
+        hits: {
+          total: { value: 1, relation: 'eq' },
+          hits: [{ _id: '67482_0003_00007' }]
+        }
+      });
+    };
+
+    const result = await compareBanQuery('fuzzy_label', fakeFetch);
+
+    expect(result.partial).toBe(true);
+    expect(result.surch.status).toBe(200);
+    expect(result.opensearch).toMatchObject({
+      status: 502,
+      engine: 'opensearch',
+      path: '/ban_tiny/_search',
+      message: expect.stringContaining('connection refused')
+    });
+    expect(result.guardrails.length).toBeGreaterThan(0);
   });
 });

@@ -24,6 +24,19 @@ export type BanDocument = {
   street_name: string;
 };
 
+export type BanSourceProfile = {
+  kind: 'tiny' | 'csv';
+  name: string;
+  offline: boolean;
+  bounded: boolean;
+  path?: string;
+};
+
+export type BanDatasetSummary = {
+  name: string;
+  documentCount: number;
+};
+
 export type FixtureOperation = {
   kind: 'create_index' | 'bulk' | 'refresh';
   path: string;
