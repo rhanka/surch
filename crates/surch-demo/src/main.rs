@@ -19,6 +19,9 @@ const BAN_TINY_ORACLE: &str = "tests/opensearch_compat/oracle/replays/ban_tiny_s
 const BAN_TINY_DOCUMENTS: u64 = 3;
 const SINGLE_HIT_COUNT: u64 = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1_000;
+const DEFAULT_HTTP_BENCH_SURCH_URL: &str = "http://127.0.0.1:7700";
+const DEFAULT_HTTP_BENCH_OPENSEARCH_URL: &str = "http://127.0.0.1:9200";
+const DEFAULT_HTTP_BENCH_INDEX: &str = "ban_tiny";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -40,6 +43,16 @@ async fn run() -> Result<(), CliError> {
             print_ban_compare_plan();
             Ok(())
         }
+        Some("ban-http-bench") => match parse_ban_http_bench_args(args)? {
+            BanHttpBenchCommand::Help => {
+                print_ban_http_bench_help();
+                Ok(())
+            }
+            BanHttpBenchCommand::Plan(plan) => {
+                print_ban_http_bench_plan(&plan);
+                Ok(())
+            }
+        },
         Some("--help") | Some("-h") | None => {
             print_help();
             Ok(())
@@ -437,6 +450,109 @@ fn parse_bench_iterations(mut args: impl Iterator<Item = String>) -> Result<usiz
     Ok(iterations)
 }
 
+#[derive(Debug)]
+struct BanHttpBenchPlan {
+    surch_url: String,
+    opensearch_url: String,
+    index: String,
+    iterations: usize,
+}
+
+impl Default for BanHttpBenchPlan {
+    fn default() -> Self {
+        Self {
+            surch_url: DEFAULT_HTTP_BENCH_SURCH_URL.to_owned(),
+            opensearch_url: DEFAULT_HTTP_BENCH_OPENSEARCH_URL.to_owned(),
+            index: DEFAULT_HTTP_BENCH_INDEX.to_owned(),
+            iterations: DEFAULT_BENCH_ITERATIONS,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BanHttpBenchCommand {
+    Help,
+    Plan(BanHttpBenchPlan),
+}
+
+fn parse_ban_http_bench_args(
+    mut args: impl Iterator<Item = String>,
+) -> Result<BanHttpBenchCommand, CliError> {
+    let mut plan = BanHttpBenchPlan::default();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(BanHttpBenchCommand::Help),
+            "--surch-url" => {
+                let value = option_value(&mut args, "--surch-url")?;
+                validate_http_url("--surch-url", &value)?;
+                plan.surch_url = value;
+            }
+            "--opensearch-url" => {
+                let value = option_value(&mut args, "--opensearch-url")?;
+                validate_http_url("--opensearch-url", &value)?;
+                plan.opensearch_url = value;
+            }
+            "--index" => {
+                let value = option_value(&mut args, "--index")?;
+                validate_index_name(&value)?;
+                plan.index = value;
+            }
+            "--iterations" => {
+                let value = option_value(&mut args, "--iterations")?;
+                plan.iterations = parse_iterations(&value)?;
+            }
+            unknown => return Err(CliError::Usage(format!("unknown option `{unknown}`"))),
+        }
+    }
+
+    Ok(BanHttpBenchCommand::Plan(plan))
+}
+
+fn option_value(
+    args: &mut impl Iterator<Item = String>,
+    option: &'static str,
+) -> Result<String, CliError> {
+    args.next()
+        .ok_or_else(|| CliError::Usage(format!("missing value after {option}")))
+}
+
+fn parse_iterations(value: &str) -> Result<usize, CliError> {
+    let iterations = value
+        .parse::<usize>()
+        .map_err(|_| CliError::Usage("--iterations must be a positive integer".to_owned()))?;
+    if iterations == 0 {
+        return Err(CliError::Usage(
+            "--iterations must be greater than zero".to_owned(),
+        ));
+    }
+
+    Ok(iterations)
+}
+
+fn validate_http_url(option: &'static str, value: &str) -> Result<(), CliError> {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return Ok(());
+    }
+
+    Err(CliError::Usage(format!(
+        "{option} must start with http:// or https://"
+    )))
+}
+
+fn validate_index_name(value: &str) -> Result<(), CliError> {
+    if value.is_empty() {
+        return Err(CliError::Usage("--index must not be empty".to_owned()));
+    }
+    if value.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(CliError::Usage(
+            "--index must not contain whitespace".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn print_metric(metric: &BenchMetric) {
     let latency = metric.latency_summary();
     let total_seconds = latency.total.as_secs_f64().max(f64::EPSILON);
@@ -472,6 +588,7 @@ fn print_help() {
     println!("  ban-poc");
     println!("  ban-bench [--iterations N]");
     println!("  ban-compare-plan");
+    println!("  ban-http-bench [OPTIONS]");
 }
 
 fn print_ban_compare_plan() {
@@ -487,6 +604,46 @@ fn print_ban_compare_plan() {
         "guardrail: no global ratio until Surch and OpenSearch use symmetric HTTP engine paths"
     );
     println!("guardrail: does not start OpenSearch, Docker, or a Surch server");
+}
+
+fn print_ban_http_bench_help() {
+    println!("Surch BAN HTTP bench");
+    println!("usage: surch-demo ban-http-bench [OPTIONS]");
+    println!("prints a dry-run plan; sends no HTTP requests");
+    println!("options:");
+    println!(
+        "  --surch-url URL        Surch HTTP base URL (default: {DEFAULT_HTTP_BENCH_SURCH_URL})"
+    );
+    println!(
+        "  --opensearch-url URL   OpenSearch HTTP base URL (default: {DEFAULT_HTTP_BENCH_OPENSEARCH_URL})"
+    );
+    println!("  --index NAME           target index name (default: {DEFAULT_HTTP_BENCH_INDEX})");
+    println!("  --iterations N         requests per measured operation (default: {DEFAULT_BENCH_ITERATIONS})");
+    println!("  -h, --help             print this help");
+}
+
+fn print_ban_http_bench_plan(plan: &BanHttpBenchPlan) {
+    println!("Surch BAN HTTP bench plan");
+    println!("mode: dry-run");
+    println!("dataset: ban_tiny");
+    println!("documents: {BAN_TINY_DOCUMENTS}");
+    println!("index: {}", plan.index);
+    println!("iterations: {}", plan.iterations);
+    println!("surch_url: {}", plan.surch_url);
+    println!("opensearch_url: {}", plan.opensearch_url);
+    println!("oracle required: {BAN_TINY_ORACLE}");
+    println!("operations:");
+    println!("  - create_index");
+    println!("  - bulk_ingest");
+    println!("  - refresh");
+    println!("  - count");
+    println!("  - search_match_label");
+    println!("  - search_bool_address");
+    println!("  - search_fuzzy_label");
+    println!("metrics: status, elapsed_us, docs, hits_total, top_hit_id, error");
+    println!("guardrail: no HTTP requests are sent by this command yet");
+    println!("guardrail: does not start OpenSearch, Docker, or a Surch server");
+    println!("guardrail: compare only on the same host/build only");
 }
 
 #[derive(Debug)]

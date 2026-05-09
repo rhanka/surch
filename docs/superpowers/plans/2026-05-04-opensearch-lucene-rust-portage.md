@@ -257,9 +257,9 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 
 **Progress Report 2026-05-09**
 
-- **Fait:** official BAN Paris autocomplete uses `adresses-75.csv.gz` with 25,000 bounded rows; the UI no longer shows `ban_tiny` suggestions by default; Surch and OpenSearch both load the active BAN dataset into `ban_addresses` through chunked `_bulk`; the active CSV dataset auto-loads on page mount without clicking `Charger BAN`; Surch `_bulk` now accepts bodies above the Axum default limit; selected-address compare returns the expected top hit on both engines; Playwright verifies auto-load, selection, compare enablement, absence of static tiny suggestions, and `Surch`/`OpenSearch` status `ok`; shell-only OpenSearch lifecycle scripts exist under `scripts/bench/`; `ban-bench` now reports reproducible p50/p95 guardrailed metrics; npm audit is clean with `cookie@0.7.2` overriding the vulnerable transitive dependency.
-- **Reste à faire:** final publishable benchmark report and a symmetric HTTP benchmark implementation remain open. Demo V2 is roughly 96% complete; the publishable benchmark is roughly 45% complete.
-- **Attendu:** UAT can start once this verification commit is pushed; no decision is needed unless the next step is to implement `ban-http-bench`.
+- **Fait:** official BAN Paris autocomplete uses `adresses-75.csv.gz` with 25,000 bounded rows; the UI no longer shows `ban_tiny` suggestions by default; Surch and OpenSearch both load the active BAN dataset into `ban_addresses` through chunked `_bulk`; the active CSV dataset auto-loads on page mount without clicking `Charger BAN`, and `Charger BAN` no longer remains visible after automatic loading succeeds; Surch `_bulk` now accepts bodies above the Axum default limit; selected-address compare returns the expected top hit on both engines; Playwright verifies auto-load, selection, compare enablement, absence of static tiny suggestions, and `Surch`/`OpenSearch` status `ok`; shell-only OpenSearch lifecycle scripts exist under `scripts/bench/`; `ban-bench` now reports reproducible p50/p95 guardrailed metrics; npm audit is clean with `cookie@0.7.2` overriding the vulnerable transitive dependency.
+- **Reste à faire:** the demo UX follow-up is closed; final publishable benchmark reporting now depends on a symmetric HTTP benchmark implementation. Demo V2 is ready for UAT; the publishable benchmark remains roughly 45% complete.
+- **Attendu:** next implementation step is `ban-http-bench`.
 
 **Files:**
 - Create under `demo/`
@@ -320,7 +320,7 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 - [x] Compare Surch and OpenSearch in side-by-side panels with top hit, overlap, timings, and guardrails.
 - [x] Convert OpenSearch upstream failures, non-JSON responses, and timeouts into structured demo JSON errors instead of opaque SvelteKit 500 pages.
 - [x] Load the active external BAN dataset into Surch through the fixed `ban_addresses` index with chunked `_bulk`.
-- [x] Auto-load the active BAN CSV dataset on page mount; keep `Charger BAN` only as a manual reload action.
+- [x] Auto-load the active BAN CSV dataset on page mount; hide `Charger BAN` after automatic loading succeeds.
 - [x] Disable compare until an address suggestion is explicitly selected; Playwright covers the disabled/enabled state.
 - [x] Add shell-only OpenSearch lifecycle scripts for a dedicated local BAN demo node.
 - [x] Raise the Surch API `_bulk` body limit with a targeted route-level test.
