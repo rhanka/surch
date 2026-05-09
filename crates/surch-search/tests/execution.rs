@@ -2,8 +2,11 @@ use std::collections::BTreeMap;
 
 use surch_index::postings::{PostingsBuilder, TermDictionary};
 use surch_search::collector::ScoreDoc;
-use surch_search::execution::{TermQueryExecutionError, TermQueryExecutor, TermQueryStats};
-use surch_search::query::TermQuery;
+use surch_search::execution::{
+    BooleanQueryExecutionError, BooleanQueryExecutor, TermQueryExecutionError, TermQueryExecutor,
+    TermQueryStats,
+};
+use surch_search::query::{BooleanQuery, Query, TermQuery};
 
 const EPSILON: f64 = 0.000_001;
 
@@ -40,6 +43,41 @@ fn classic_dictionary() -> TermDictionary {
 fn classic_stats() -> TermQueryStats {
     TermQueryStats::new(4, 3.5, BTreeMap::from([(1, 4), (2, 3), (3, 6), (4, 1)]))
         .expect("valid classic stats")
+}
+
+fn boolean_dictionary() -> TermDictionary {
+    let mut builder = PostingsBuilder::new();
+
+    builder
+        .add("body", "search", 1, vec![0])
+        .expect("search doc 1");
+    builder
+        .add("body", "search", 2, vec![0])
+        .expect("search doc 2");
+    builder
+        .add("body", "engine", 1, vec![1])
+        .expect("engine doc 1");
+    builder
+        .add("body", "engine", 2, vec![1, 3])
+        .expect("engine doc 2");
+    builder
+        .add("body", "engine", 3, vec![2])
+        .expect("engine doc 3");
+
+    builder.build()
+}
+
+fn boolean_stats() -> TermQueryStats {
+    TermQueryStats::new(3, 4.0, BTreeMap::from([(1, 4), (2, 4), (3, 4)]))
+        .expect("valid boolean stats")
+}
+
+fn score_for(score_docs: &[ScoreDoc], doc_id: u32) -> f64 {
+    score_docs
+        .iter()
+        .find(|score_doc| score_doc.doc_id == doc_id)
+        .map(|score_doc| score_doc.score)
+        .expect("doc score")
 }
 
 #[test]
@@ -151,5 +189,66 @@ fn term_query_executor_rejects_missing_doc_length_for_matching_posting() {
     assert_eq!(
         executor.execute(&query, 10),
         Err(TermQueryExecutionError::MissingDocLen { doc_id: 3 })
+    );
+}
+
+#[test]
+fn boolean_query_execution_intersects_two_must_terms_and_sums_clause_scores() {
+    let dictionary = boolean_dictionary();
+    let stats = boolean_stats();
+    let term_executor = TermQueryExecutor::new(&dictionary, stats.clone());
+    let boolean_executor = BooleanQueryExecutor::new(&dictionary, stats);
+    let search_query = TermQuery::new("body", "search").expect("valid query");
+    let engine_query = TermQuery::new("body", "engine").expect("valid query");
+    let query = BooleanQuery::new(vec![
+        Query::Term(search_query.clone()),
+        Query::Term(engine_query.clone()),
+    ])
+    .expect("valid boolean query");
+
+    let search_docs = term_executor
+        .execute(&search_query, 10)
+        .expect("search execution");
+    let engine_docs = term_executor
+        .execute(&engine_query, 10)
+        .expect("engine execution");
+    let top_docs = boolean_executor
+        .execute(&query, 10)
+        .expect("boolean execution");
+
+    assert_eq!(top_docs.total_hits, 2);
+    assert_eq!(
+        top_docs
+            .score_docs
+            .iter()
+            .map(|score_doc| score_doc.doc_id)
+            .collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert_close(
+        top_docs.score_docs[0].score,
+        score_for(&search_docs.score_docs, 2) + score_for(&engine_docs.score_docs, 2),
+    );
+    assert_close(
+        top_docs.score_docs[1].score,
+        score_for(&search_docs.score_docs, 1) + score_for(&engine_docs.score_docs, 1),
+    );
+}
+
+#[test]
+fn boolean_query_execution_rejects_zero_size() {
+    let dictionary = boolean_dictionary();
+    let executor = BooleanQueryExecutor::new(&dictionary, boolean_stats());
+    let query = BooleanQuery::new(vec![
+        Query::Term(TermQuery::new("body", "search").expect("valid query")),
+        Query::Term(TermQuery::new("body", "engine").expect("valid query")),
+    ])
+    .expect("valid boolean query");
+
+    assert_eq!(
+        executor.execute(&query, 0),
+        Err(BooleanQueryExecutionError::Term(
+            TermQueryExecutionError::SizeMustBePositive
+        ))
     );
 }

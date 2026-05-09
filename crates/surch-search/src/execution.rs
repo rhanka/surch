@@ -6,7 +6,7 @@ use surch_index::postings::TermDictionary;
 use thiserror::Error;
 
 use crate::collector::{CollectorError, TopDocs, TopDocsCollector};
-use crate::query::TermQuery;
+use crate::query::{BooleanQuery, Query, TermQuery};
 use crate::scoring::{bm25_score, Bm25Config, Bm25Error};
 
 /// Document length statistics required to score term matches with BM25.
@@ -23,6 +23,12 @@ pub struct TermQueryExecutor<'a> {
     dictionary: &'a TermDictionary,
     stats: TermQueryStats,
     bm25_config: Bm25Config,
+}
+
+/// Executes boolean must queries by intersecting exact term query results.
+#[derive(Debug, Clone)]
+pub struct BooleanQueryExecutor<'a> {
+    term_executor: TermQueryExecutor<'a>,
 }
 
 /// Errors returned while validating stats or executing term queries.
@@ -42,6 +48,15 @@ pub enum TermQueryExecutionError {
     NonFiniteScore { doc_id: u32 },
     #[error(transparent)]
     Bm25(#[from] Bm25Error),
+}
+
+/// Errors returned while executing boolean queries.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum BooleanQueryExecutionError {
+    #[error("boolean must clause {clause_index} must be a term query")]
+    UnsupportedMustClause { clause_index: usize },
+    #[error(transparent)]
+    Term(#[from] TermQueryExecutionError),
 }
 
 impl TermQueryStats {
@@ -120,6 +135,70 @@ impl<'a> TermQueryExecutor<'a> {
             )?;
 
             collector.collect(posting.doc_id, score)?;
+        }
+
+        Ok(collector.finish())
+    }
+}
+
+impl<'a> BooleanQueryExecutor<'a> {
+    /// Creates a boolean query executor using the term query executor for every clause.
+    pub fn new(dictionary: &'a TermDictionary, stats: TermQueryStats) -> Self {
+        Self {
+            term_executor: TermQueryExecutor::new(dictionary, stats),
+        }
+    }
+
+    /// Executes required term clauses and returns documents present in every clause.
+    pub fn execute(
+        &self,
+        query: &BooleanQuery,
+        size: usize,
+    ) -> Result<TopDocs, BooleanQueryExecutionError> {
+        let mut collector = TopDocsCollector::new(size).map_err(TermQueryExecutionError::from)?;
+        let mut accumulated_scores: Option<BTreeMap<u32, f64>> = None;
+
+        for (clause_index, clause) in query.must.iter().enumerate() {
+            let term_query = match clause {
+                Query::Term(term_query) => term_query,
+                _ => {
+                    return Err(BooleanQueryExecutionError::UnsupportedMustClause { clause_index });
+                }
+            };
+            let clause_top_docs = self.term_executor.execute(term_query, usize::MAX)?;
+            let clause_scores = clause_top_docs
+                .score_docs
+                .into_iter()
+                .map(|score_doc| (score_doc.doc_id, score_doc.score))
+                .collect::<BTreeMap<_, _>>();
+
+            accumulated_scores = Some(match accumulated_scores {
+                None => clause_scores,
+                Some(mut scores) => {
+                    scores.retain(|doc_id, score| {
+                        if let Some(clause_score) = clause_scores.get(doc_id) {
+                            *score += clause_score;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    scores
+                }
+            });
+
+            if accumulated_scores
+                .as_ref()
+                .is_some_and(|scores: &BTreeMap<u32, f64>| scores.is_empty())
+            {
+                break;
+            }
+        }
+
+        for (doc_id, score) in accumulated_scores.unwrap_or_default() {
+            collector
+                .collect(doc_id, score)
+                .map_err(TermQueryExecutionError::from)?;
         }
 
         Ok(collector.finish())
