@@ -31,6 +31,10 @@ pub enum SearchQuery {
         field: String,
         value: String,
     },
+    MatchPhrase {
+        field: String,
+        value: String,
+    },
     Term {
         field: String,
         value: String,
@@ -187,6 +191,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
             "match_all query body must be an empty object",
         )),
         "match" => parse_match_query(query_body),
+        "match_phrase" => parse_match_phrase_query(query_body),
         "term" => parse_term_query(query_body),
         "bool" => parse_bool_query(query_body),
         "fuzzy" => parse_fuzzy_query(query_body),
@@ -203,6 +208,13 @@ fn parse_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     let value = parse_query_text(value, "match query")?;
 
     Ok(SearchQuery::Match { field, value })
+}
+
+fn parse_match_phrase_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let (field, value) = parse_single_field_query("match_phrase", value)?;
+    let value = parse_query_text(value, "match_phrase query")?;
+
+    Ok(SearchQuery::MatchPhrase { field, value })
 }
 
 fn parse_term_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
@@ -407,6 +419,9 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
     match query {
         SearchQuery::MatchAll => true,
         SearchQuery::Match { field, value } => field_matches(source, field, value),
+        SearchQuery::MatchPhrase { field, value } => {
+            match_phrase_field_matches(source, field, value)
+        }
         SearchQuery::Term { field, value } => term_field_matches(source, field, value),
         SearchQuery::BoolMust(queries) => queries.iter().all(|query| query_matches(query, source)),
         SearchQuery::Fuzzy {
@@ -423,6 +438,21 @@ fn field_matches(source: &Value, field: &str, query: &str) -> bool {
         && field_text(source, field)
             .map(|value| normalize_text(&value).contains(&query))
             .unwrap_or(false)
+}
+
+fn match_phrase_field_matches(source: &Value, field: &str, query: &str) -> bool {
+    let query_tokens = tokenize_for_search(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+
+    field_text(source, field)
+        .map(|value| {
+            tokenize_for_search(&value)
+                .windows(query_tokens.len())
+                .any(|field_window| field_window == query_tokens.as_slice())
+        })
+        .unwrap_or(false)
 }
 
 fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {

@@ -120,6 +120,84 @@ async fn search_router_term_returns_exact_text_match_indexed_by_doc_api() {
 }
 
 #[tokio::test]
+async fn search_router_match_phrase_matches_normalized_contiguous_tokens() {
+    let router = app_router();
+
+    let standing_desk_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"Compact Standing Desk"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(standing_desk_response.status(), StatusCode::CREATED);
+
+    let reversed_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-2")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"desk standing"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(reversed_response.status(), StatusCode::CREATED);
+
+    let non_contiguous_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-3")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"standing adjustable desk"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(non_contiguous_response.status(), StatusCode::CREATED);
+
+    let search_response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_phrase":{"name":"standing desk"}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(search_response.status(), StatusCode::OK);
+
+    let search_body = response_json(search_response).await;
+    assert_eq!(search_body["hits"]["total"]["value"], 1);
+    assert_eq!(
+        search_body["hits"]["hits"]
+            .as_array()
+            .expect("hits should be an array"),
+        &[serde_json::json!({
+            "_index": "products",
+            "_id": "sku-1",
+        })]
+    );
+}
+
+#[tokio::test]
 async fn search_router_accepts_match_all_fixture() {
     let request_body =
         include_str!("../../../tests/opensearch_compat/search/match_all_request.json");

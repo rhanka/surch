@@ -23,6 +23,7 @@ pub struct CountRequest {
 pub enum CountQuery {
     MatchAll,
     Term { field: String, value: String },
+    BoolMust(Vec<CountQuery>),
 }
 
 /// OpenSearch-compatible `_count` response for the bootstrap engine-less API.
@@ -129,6 +130,7 @@ fn parse_count_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
             "match_all query body must be an empty object",
         )),
         "term" => parse_term_query(query_body),
+        "bool" => parse_bool_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -142,6 +144,35 @@ fn parse_term_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
     let value = parse_term_value(value)?;
 
     Ok(CountQuery::Term { field, value })
+}
+
+fn parse_bool_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "bool query body must be an object",
+        )
+    })?;
+
+    let must = object
+        .get("must")
+        .and_then(Value::as_array)
+        .filter(|must| !must.is_empty())
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "bool.must must be a non-empty array",
+            )
+        })?;
+
+    let clauses = must
+        .iter()
+        .map(parse_count_query)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(CountQuery::BoolMust(clauses))
 }
 
 fn parse_single_field_query<'a>(
@@ -202,6 +233,7 @@ fn query_matches(query: &CountQuery, source: &Value) -> bool {
     match query {
         CountQuery::MatchAll => true,
         CountQuery::Term { field, value } => term_field_matches(source, field, value),
+        CountQuery::BoolMust(clauses) => clauses.iter().all(|clause| query_matches(clause, source)),
     }
 }
 

@@ -150,6 +150,93 @@ async fn count_router_term_returns_matching_document_count() {
 }
 
 #[tokio::test]
+async fn count_router_bool_must_returns_documents_matching_all_clauses() {
+    let router = app_router();
+
+    for (id, body) in [
+        ("sku-1", r#"{"name":"desk","category":"furniture"}"#),
+        ("sku-2", r#"{"name":"desk","category":"electronics"}"#),
+        ("sku-3", r#"{"name":"chair","category":"furniture"}"#),
+        ("sku-4", r#"{"name":"lamp","category":"lighting"}"#),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/products/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"bool":{"must":[{"term":{"name":"desk"}},{"term":{"category":"furniture"}}]}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "count": 1,
+            "_shards": {
+                "total": 1,
+                "successful": 1,
+                "skipped": 0,
+                "failed": 0
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn count_router_rejects_invalid_bool_must_with_opensearch_error() {
+    for request_body in [
+        r#"{"query":{"bool":{"must":[]}}}"#,
+        r#"{"query":{"bool":{"must":{"term":{"name":"desk"}}}}}"#,
+    ] {
+        let response = app_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/products/_count")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "error": {
+                    "type": "parsing_exception",
+                    "reason": "bool.must must be a non-empty array"
+                },
+                "status": 400
+            })
+        );
+    }
+}
+
+#[tokio::test]
 async fn count_router_rejects_unknown_query_with_opensearch_error() {
     let response = app_router()
         .oneshot(
