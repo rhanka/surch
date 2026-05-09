@@ -11,8 +11,35 @@ export type BanDatasetUiState = {
   usesTinyFallback: boolean;
 };
 
+export type BanLoadStatus = 'idle' | 'loading' | 'loaded' | 'partial' | 'error';
+
+export type BanLoadAction =
+  | {
+      disabled?: boolean;
+      kind: 'button';
+      label: string;
+    }
+  | {
+      kind: 'status';
+      label: string;
+    };
+
 export function shouldRequestSuggestions(query: string): boolean {
   return query.trim().length >= 2;
+}
+
+export function banLoadAction(status: BanLoadStatus): BanLoadAction {
+  switch (status) {
+    case 'loading':
+      return { kind: 'button', label: 'Chargement...', disabled: true };
+    case 'loaded':
+      return { kind: 'status', label: 'BAN chargée' };
+    case 'partial':
+    case 'error':
+      return { kind: 'button', label: 'Réessayer', disabled: false };
+    case 'idle':
+      return { kind: 'status', label: 'Préparation...' };
+  }
 }
 
 export function shouldAutoLoadBanDataset(response: unknown): boolean {

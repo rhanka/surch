@@ -7,6 +7,7 @@ import {
   datasetStatus,
   extractSuggestionDocuments,
   shouldAutoLoadBanDataset,
+  banLoadAction,
   shouldRequestSuggestions
 } from './banUiState';
 
@@ -127,5 +128,13 @@ describe('BAN demo UI state', () => {
         }
       })
     ).toBe(false);
+  });
+
+  it('does not show a Charger BAN action once the active dataset is loaded', () => {
+    expect(banLoadAction('idle')).toEqual({ kind: 'status', label: 'Préparation...' });
+    expect(banLoadAction('loading')).toEqual({ kind: 'button', label: 'Chargement...', disabled: true });
+    expect(banLoadAction('loaded')).toEqual({ kind: 'status', label: 'BAN chargée' });
+    expect(banLoadAction('partial')).toEqual({ kind: 'button', label: 'Réessayer', disabled: false });
+    expect(banLoadAction('error')).toEqual({ kind: 'button', label: 'Réessayer', disabled: false });
   });
 });

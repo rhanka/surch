@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import type { BanLoadStatus } from '$lib/banUiState';
   import {
+    banLoadAction,
     datasetStatus,
     extractSuggestionDocuments,
     shouldAutoLoadBanDataset,
@@ -30,7 +32,7 @@
   let suggestions = $state<BanDocument[]>([]);
   let selected = $state<BanDocument | null>(null);
   let isSuggesting = $state(false);
-  let isLoadingDataset = $state(false);
+  let loadStatus = $state<BanLoadStatus>('idle');
   let isComparing = $state(false);
   let datasetMessage = $state('Chargement du dataset BAN...');
   let errorMessage = $state('');
@@ -42,6 +44,7 @@
 
   const surchEngine = $derived(data.engines.find((engine) => engine.id === 'surch'));
   const opensearchEngine = $derived(data.engines.find((engine) => engine.id === 'opensearch'));
+  const loadAction = $derived(banLoadAction(loadStatus));
 
   onMount(() => {
     void initializeDataset();
@@ -92,11 +95,11 @@
   }
 
   async function loadDataset() {
-    if (isLoadingDataset) {
+    if (loadStatus === 'loading') {
       return;
     }
 
-    isLoadingDataset = true;
+    loadStatus = 'loading';
     datasetMessage = 'Chargement BAN dans Surch et OpenSearch...';
     errorMessage = '';
     rawResult = null;
@@ -106,11 +109,10 @@
       datasetMessage = datasetStatus(response);
       applyLoadResponse(response);
     } catch (error) {
+      loadStatus = 'error';
       datasetMessage = 'Chargement BAN impossible';
       rawResult = { error };
       errorMessage = formatEndpointError('/api/ban/load', error);
-    } finally {
-      isLoadingDataset = false;
     }
   }
 
@@ -123,7 +125,10 @@
     overlap = null;
 
     if (record?.partial === true) {
+      loadStatus = 'partial';
       errorMessage = 'Chargement BAN partiel: au moins un moteur est indisponible.';
+    } else {
+      loadStatus = 'loaded';
     }
   }
 
@@ -337,9 +342,15 @@
           `npm run ban:download:france` récupère la BAN nationale hors repo.
         </p>
       </div>
-      <button type="button" onclick={loadDataset} disabled={isLoadingDataset}>
-        {isLoadingDataset ? 'Chargement...' : 'Charger BAN'}
-      </button>
+      <div class="load-action" aria-live="polite">
+        {#if loadAction.kind === 'button'}
+          <button type="button" onclick={loadDataset} disabled={loadAction.disabled}>
+            {loadAction.label}
+          </button>
+        {:else}
+          <span>{loadAction.label}</span>
+        {/if}
+      </div>
     </section>
 
     {#if errorMessage}
@@ -470,6 +481,19 @@
   .status-band {
     margin-bottom: 14px;
     padding: 14px 16px;
+  }
+
+  .load-action {
+    align-items: center;
+    display: flex;
+    min-width: 120px;
+    justify-content: flex-end;
+  }
+
+  .load-action span {
+    color: #1f6b57;
+    font-weight: 700;
+    white-space: nowrap;
   }
 
   .content-grid {
