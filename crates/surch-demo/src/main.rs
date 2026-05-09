@@ -22,6 +22,8 @@ const DEFAULT_BENCH_ITERATIONS: usize = 1_000;
 const DEFAULT_HTTP_BENCH_SURCH_URL: &str = "http://127.0.0.1:7700";
 const DEFAULT_HTTP_BENCH_OPENSEARCH_URL: &str = "http://127.0.0.1:9200";
 const DEFAULT_HTTP_BENCH_INDEX: &str = "ban_tiny";
+const DEFAULT_HTTP_BENCH_DATASET: &str =
+    "tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -456,6 +458,10 @@ struct BanHttpBenchPlan {
     opensearch_url: String,
     index: String,
     iterations: usize,
+    dataset: String,
+    oracle: String,
+    warmup: usize,
+    report: Option<String>,
 }
 
 impl Default for BanHttpBenchPlan {
@@ -465,6 +471,10 @@ impl Default for BanHttpBenchPlan {
             opensearch_url: DEFAULT_HTTP_BENCH_OPENSEARCH_URL.to_owned(),
             index: DEFAULT_HTTP_BENCH_INDEX.to_owned(),
             iterations: DEFAULT_BENCH_ITERATIONS,
+            dataset: DEFAULT_HTTP_BENCH_DATASET.to_owned(),
+            oracle: BAN_TINY_ORACLE.to_owned(),
+            warmup: 0,
+            report: None,
         }
     }
 }
@@ -501,6 +511,25 @@ fn parse_ban_http_bench_args(
             "--iterations" => {
                 let value = option_value(&mut args, "--iterations")?;
                 plan.iterations = parse_iterations(&value)?;
+            }
+            "--dataset" => {
+                let value = option_value(&mut args, "--dataset")?;
+                validate_dataset_path(&value)?;
+                plan.dataset = value;
+            }
+            "--oracle" => {
+                let value = option_value(&mut args, "--oracle")?;
+                validate_non_empty_path("--oracle", &value)?;
+                plan.oracle = value;
+            }
+            "--warmup" => {
+                let value = option_value(&mut args, "--warmup")?;
+                plan.warmup = parse_warmup(&value)?;
+            }
+            "--report" => {
+                let value = option_value(&mut args, "--report")?;
+                validate_non_empty_path("--report", &value)?;
+                plan.report = Some(value);
             }
             unknown => return Err(CliError::Usage(format!("unknown option `{unknown}`"))),
         }
@@ -548,6 +577,34 @@ fn validate_index_name(value: &str) -> Result<(), CliError> {
         return Err(CliError::Usage(
             "--index must not contain whitespace".to_owned(),
         ));
+    }
+
+    Ok(())
+}
+
+fn parse_warmup(value: &str) -> Result<usize, CliError> {
+    value
+        .parse::<usize>()
+        .map_err(|_| CliError::Usage("--warmup must be a non-negative integer".to_owned()))
+}
+
+fn validate_dataset_path(value: &str) -> Result<(), CliError> {
+    validate_non_empty_path("--dataset", value)?;
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() && character.is_control())
+    {
+        return Err(CliError::Usage(
+            "--dataset must not contain control whitespace".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty_path(option: &'static str, value: &str) -> Result<(), CliError> {
+    if value.is_empty() {
+        return Err(CliError::Usage(format!("{option} must not be empty")));
     }
 
     Ok(())
@@ -619,19 +676,30 @@ fn print_ban_http_bench_help() {
     );
     println!("  --index NAME           target index name (default: {DEFAULT_HTTP_BENCH_INDEX})");
     println!("  --iterations N         requests per measured operation (default: {DEFAULT_BENCH_ITERATIONS})");
+    println!(
+        "  --dataset PATH         NDJSON dataset path (default: {DEFAULT_HTTP_BENCH_DATASET})"
+    );
+    println!("  --oracle PATH          oracle replay path (default: {BAN_TINY_ORACLE})");
+    println!("  --warmup N             warmup requests per operation (default: 0)");
+    println!("  --report PATH          optional report output path");
     println!("  -h, --help             print this help");
 }
 
 fn print_ban_http_bench_plan(plan: &BanHttpBenchPlan) {
     println!("Surch BAN HTTP bench plan");
     println!("mode: dry-run");
-    println!("dataset: ban_tiny");
+    println!("dataset: {}", plan.dataset);
     println!("documents: {BAN_TINY_DOCUMENTS}");
     println!("index: {}", plan.index);
     println!("iterations: {}", plan.iterations);
+    println!("warmup: {}", plan.warmup);
     println!("surch_url: {}", plan.surch_url);
     println!("opensearch_url: {}", plan.opensearch_url);
-    println!("oracle required: {BAN_TINY_ORACLE}");
+    println!("oracle: {}", plan.oracle);
+    match &plan.report {
+        Some(report) => println!("report: {report}"),
+        None => println!("report: <none>"),
+    }
     println!("operations:");
     println!("  - create_index");
     println!("  - bulk_ingest");
