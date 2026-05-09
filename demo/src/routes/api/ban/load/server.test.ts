@@ -77,6 +77,28 @@ describe('POST /api/ban/load', () => {
       { path: '/ban_addresses/_refresh', status: 200 }
     ]);
   });
+
+  it('returns a JSON error when the active BAN CSV cannot be loaded', async () => {
+    const missingCsvPath = join(tmpdir(), 'surch-ban-load-missing.csv');
+    process.env.BAN_CSV_PATH = missingCsvPath;
+
+    const response = await POST({
+      request: new Request('http://localhost/api/ban/load', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ engines: ['surch', 'opensearch'] })
+      }),
+      fetch: async () => Response.json({ acknowledged: true })
+    } as unknown as Parameters<typeof POST>[0]);
+    const body = await response.json();
+
+    expect(response.status).toBe(500);
+    expect(body.error).toMatchObject({
+      type: 'ban_load_error',
+      message: expect.stringContaining('BAN_CSV_PATH does not exist')
+    });
+    expect(body.error.message).not.toContain(missingCsvPath);
+  });
 });
 
 function createActiveCsv(fileName: string): string {

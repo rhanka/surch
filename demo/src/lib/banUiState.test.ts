@@ -6,6 +6,7 @@ import {
   compareAddressError,
   datasetStatus,
   extractSuggestionDocuments,
+  shouldAutoLoadBanDataset,
   shouldRequestSuggestions
 } from './banUiState';
 
@@ -98,5 +99,33 @@ describe('BAN demo UI state', () => {
       status: 'adresses-75.csv.gz: 25000 adresse(s) prêtes',
       usesTinyFallback: false
     });
+  });
+
+  it('requests automatic loading only for an active BAN CSV dataset', () => {
+    expect(
+      shouldAutoLoadBanDataset({
+        summary: {
+          name: 'adresses-75.csv.gz',
+          documentCount: 25000
+        },
+        source: {
+          kind: 'csv',
+          path: 'data/ban/adresses-75.csv.gz'
+        }
+      })
+    ).toBe(true);
+
+    expect(
+      shouldAutoLoadBanDataset({
+        summary: {
+          name: 'ban_tiny',
+          documentCount: 3
+        },
+        source: {
+          kind: 'tiny',
+          offline: true
+        }
+      })
+    ).toBe(false);
   });
 });

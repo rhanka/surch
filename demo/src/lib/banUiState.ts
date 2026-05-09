@@ -15,6 +15,10 @@ export function shouldRequestSuggestions(query: string): boolean {
   return query.trim().length >= 2;
 }
 
+export function shouldAutoLoadBanDataset(response: unknown): boolean {
+  return banDatasetUiState(response).isActiveDataset;
+}
+
 export function extractSuggestionDocuments(response: unknown): BanDocument[] {
   const record = asRecord(response);
   const candidates = record?.suggestions ?? record?.documents ?? record?.hits;

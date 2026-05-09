@@ -25,3 +25,63 @@ Safety notes:
 - `opensearch-stop.sh` only stops/removes a dedicated container name prefixed with `surch-` or `surch_`.
 - `opensearch-cleanup.sh` only deletes a dedicated BAN/Surch index name prefixed with `ban-`, `ban_`, `surch-`, or `surch_`.
 - No Python is used.
+
+## Symmetric HTTP Benchmark Runbook
+
+These scripts manage only the OpenSearch side. For a publishable Surch vs
+OpenSearch benchmark, Surch must also run as an HTTP server; do not compare
+OpenSearch HTTP timings with the current in-process `ban-bench` timings.
+
+Prerequisites:
+
+- release Surch API server in a separate terminal:
+
+  ```sh
+  SURCH_PORT=7700 cargo run -p surch-api --release
+  ```
+
+- local OpenSearch node:
+
+  ```sh
+  scripts/bench/opensearch-start.sh
+  scripts/bench/opensearch-wait.sh
+  ```
+
+- pinned BAN smoke fixture and oracle:
+
+  ```sh
+  DATASET=tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson
+  ORACLE=tests/opensearch_compat/oracle/replays/ban_tiny_search.json
+  SURCH_URL=http://127.0.0.1:7700
+  OPENSEARCH_URL=http://127.0.0.1:9200
+  ```
+
+Before each measured run, reset the benchmark index on both engines:
+
+```sh
+OPENSEARCH_BAN_INDEX=ban_tiny scripts/bench/opensearch-cleanup.sh
+curl -fsS -X DELETE "$SURCH_URL/ban_tiny" >/dev/null || true
+```
+
+The target Rust-only benchmark command to implement before publication is:
+
+```sh
+cargo run -p surch-demo --release -- ban-http-bench \
+  --surch-url "$SURCH_URL" \
+  --opensearch-url "$OPENSEARCH_URL" \
+  --dataset "$DATASET" \
+  --oracle "$ORACLE" \
+  --warmup 100 \
+  --iterations 1000 \
+  --report docs/poc/reports/ban-http-$(git rev-parse --short HEAD).json
+```
+
+Publication guardrails:
+
+- same dataset bytes, index name, query bodies, warmup, iterations, timeout,
+  concurrency, and HTTP client code for both engines;
+- reject the run if oracle validation fails for either engine;
+- report ingestion duration, docs/s, query latency p50/p95/p99, error counts,
+  total hits, and top-hit IDs per operation;
+- label `ban_tiny` as a 3-document smoke benchmark;
+- publish side-by-side per-operation numbers only, not a single global ratio.

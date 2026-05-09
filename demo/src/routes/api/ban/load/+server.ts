@@ -15,52 +15,64 @@ type EngineLoadResult =
   | DemoEngineErrorBody;
 
 export const POST: RequestHandler = async ({ request, fetch }) => {
-  const body = await request.json().catch(() => ({}));
-  const engines = parseRequestedEngines(asRecord(body)?.engines);
-  const repository = await createBanRepository();
-  const summary = repository.summary();
-  const source = repository.sourceProfile();
-  const documents = repository.documents();
-  const payload = getBanLoadPayload({
-    datasetName: summary.name,
-    indexName: BAN_ACTIVE_INDEX,
-    documents
-  });
+  try {
+    const body = await request.json().catch(() => ({}));
+    const engines = parseRequestedEngines(asRecord(body)?.engines);
+    const repository = await createBanRepository();
+    const summary = repository.summary();
+    const source = repository.sourceProfile();
+    const documents = repository.documents();
+    const payload = getBanLoadPayload({
+      datasetName: summary.name,
+      indexName: BAN_ACTIVE_INDEX,
+      documents
+    });
 
-  const loaded = await Promise.allSettled(
-    engines.map(async (engine) => [
-      engine,
-      await loadBanDocuments(engine, BAN_ACTIVE_INDEX, documents, fetch)
-    ] as const)
-  );
-  const engineResults = Object.fromEntries(
-    loaded.map((result, index) => {
-      const engine = engines[index];
-      return [
+    const loaded = await Promise.allSettled(
+      engines.map(async (engine) => [
         engine,
-        result.status === 'fulfilled'
-          ? result.value[1]
-          : engineLoadError(engine, result.reason)
-      ];
-    })
-  ) as Record<EngineId, EngineLoadResult>;
+        await loadBanDocuments(engine, BAN_ACTIVE_INDEX, documents, fetch)
+      ] as const)
+    );
+    const engineResults = Object.fromEntries(
+      loaded.map((result, index) => {
+        const engine = engines[index];
+        return [
+          engine,
+          result.status === 'fulfilled'
+            ? result.value[1]
+            : engineLoadError(engine, result.reason)
+        ];
+      })
+    ) as Record<EngineId, EngineLoadResult>;
 
-  return json({
-    summary: {
-      ...summary,
-      indexName: BAN_ACTIVE_INDEX
-    },
-    source,
-    index: BAN_ACTIVE_INDEX,
-    bulk: {
-      path: payload.bulk.path,
-      contentType: payload.bulk.contentType,
-      documentCount: payload.bulk.documentCount
-    },
-    engines: engineResults,
-    operations: engineResults,
-    partial: loaded.some((result) => result.status === 'rejected')
-  });
+    return json({
+      summary: {
+        ...summary,
+        indexName: BAN_ACTIVE_INDEX
+      },
+      source,
+      index: BAN_ACTIVE_INDEX,
+      bulk: {
+        path: payload.bulk.path,
+        contentType: payload.bulk.contentType,
+        documentCount: payload.bulk.documentCount
+      },
+      engines: engineResults,
+      operations: engineResults,
+      partial: loaded.some((result) => result.status === 'rejected')
+    });
+  } catch (error) {
+    return json(
+      {
+        error: {
+          type: 'ban_load_error',
+          message: banLoadErrorMessage(error)
+        }
+      },
+      { status: banLoadErrorStatus(error) }
+    );
+  }
 };
 
 function engineLoadError(engine: EngineId, error: unknown): DemoEngineErrorBody {
@@ -88,6 +100,20 @@ function parseRequestedEngines(value: unknown): EngineId[] {
   }
 
   return [...new Set(value.map(parseEngineId))];
+}
+
+function banLoadErrorStatus(error: unknown): number {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('engines') || message.includes('unknown engine') ? 400 : 500;
+}
+
+function banLoadErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.startsWith('BAN_CSV_PATH does not exist:')) {
+    return 'BAN_CSV_PATH does not exist';
+  }
+
+  return message;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

@@ -3,6 +3,7 @@
   import {
     datasetStatus,
     extractSuggestionDocuments,
+    shouldAutoLoadBanDataset,
     shouldRequestSuggestions
   } from '$lib/banUiState';
   import AddressAutocomplete from '$lib/components/AddressAutocomplete.svelte';
@@ -43,8 +44,15 @@
   const opensearchEngine = $derived(data.engines.find((engine) => engine.id === 'opensearch'));
 
   onMount(() => {
-    void refreshDatasetSummary();
+    void initializeDataset();
   });
+
+  async function initializeDataset() {
+    const response = await refreshDatasetSummary();
+    if (response && shouldAutoLoadBanDataset(response)) {
+      void loadDataset();
+    }
+  }
 
   async function onQueryChange(value: string) {
     query = value;
@@ -84,7 +92,12 @@
   }
 
   async function loadDataset() {
+    if (isLoadingDataset) {
+      return;
+    }
+
     isLoadingDataset = true;
+    datasetMessage = 'Chargement BAN dans Surch et OpenSearch...';
     errorMessage = '';
     rawResult = null;
 
@@ -148,13 +161,15 @@
     }
   }
 
-  async function refreshDatasetSummary() {
+  async function refreshDatasetSummary(): Promise<unknown | null> {
     try {
       const response = await getJson('/api/ban/dataset');
       datasetMessage = datasetStatus(response);
+      return response;
     } catch (error) {
       datasetMessage = 'Dataset BAN indisponible';
       errorMessage = formatEndpointError('/api/ban/dataset', error);
+      return null;
     }
   }
 
