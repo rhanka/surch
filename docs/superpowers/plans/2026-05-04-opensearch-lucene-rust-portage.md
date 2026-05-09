@@ -298,20 +298,23 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 
 #### Demo V2 Address Autocomplete And Map
 
-- [ ] Keep `ban_tiny` as the committed offline/CI fixture.
-- [ ] Support an external BAN CSV or CSV.GZ via `BAN_CSV_PATH` without committing the national dataset.
-- [ ] Add bounded TypeScript-only BAN parsing, validation, summary, suggestion, and document hydration helpers.
-- [ ] Add SvelteKit backend endpoints:
+- [x] Keep `ban_tiny` as the committed offline/CI fixture.
+- [x] Support an external BAN CSV or CSV.GZ via `BAN_CSV_PATH` without committing the national dataset.
+- [x] Add known official BAN download profiles from data.gouv/adresse.data.gouv.fr:
+  - `adresses-75.csv.gz` for the default Paris demo sample;
+  - `adresses-france.csv.gz` for the full national dataset.
+- [x] Add bounded TypeScript-only BAN parsing, validation, summary, suggestion, and document hydration helpers.
+- [x] Add SvelteKit backend endpoints:
   - `GET /api/ban/dataset`
   - `POST /api/ban/load`
   - `POST /api/ban/suggest`
   - `POST /api/ban/compare`
-- [ ] Replace the V1 query-picker demo with a real address autocomplete flow.
-- [ ] Show selected addresses on an OpenStreetMap/Leaflet map with visible attribution.
-- [ ] Compare Surch and OpenSearch in side-by-side panels with top hit, overlap, timings, and guardrails.
-- [ ] Convert OpenSearch upstream failures, non-JSON responses, and timeouts into structured demo JSON errors instead of opaque SvelteKit 500 pages.
-- [ ] Keep the benchmark guardrail: no global Surch/OpenSearch performance ratio while runtime paths and scoring are not symmetric.
-- [ ] Run `npm run check`, `npm run test`, `npm run build`, Rust targeted tests, and `cargo run -p portage-ledger -- language-policy .`.
+- [x] Replace the V1 query-picker demo with a real address autocomplete flow.
+- [x] Show selected addresses on an OpenStreetMap/Leaflet map with visible attribution.
+- [x] Compare Surch and OpenSearch in side-by-side panels with top hit, overlap, timings, and guardrails.
+- [x] Convert OpenSearch upstream failures, non-JSON responses, and timeouts into structured demo JSON errors instead of opaque SvelteKit 500 pages.
+- [x] Keep the benchmark guardrail: no global Surch/OpenSearch performance ratio while runtime paths and scoring are not symmetric.
+- [x] Run `npm run check`, `npm run test`, `npm run build`, Rust targeted tests, and `cargo run -p portage-ledger -- language-policy .`.
 - [ ] Commit with `feat(demo): add ban autocomplete map`.
 
 #### BAN OpenSearch vs Surch Benchmark Positioning

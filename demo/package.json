@@ -7,7 +7,9 @@
     "dev": "vite",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "build": "vite build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "ban:download": "node --experimental-strip-types scripts/download-ban.ts",
+    "ban:download:france": "node --experimental-strip-types scripts/download-ban.ts --profile france"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.3.1",

@@ -49,6 +49,35 @@ These are local in-memory router measurements. They are useful for tracking
 relative regressions on the same host and build, not for claiming production
 cluster throughput.
 
+## Demo With Official BAN Data
+
+The SvelteKit demo knows the official BAN CSV source published on data.gouv.fr:
+
+- Dataset: `Base Adresse Nationale`
+- CSV directory: `https://adresse.data.gouv.fr/data/ban/adresses/latest/csv`
+- Default demo file: `adresses-75.csv.gz`
+- Full national file: `adresses-france.csv.gz`
+
+Download the default Paris dataset without committing it:
+
+```bash
+cd demo
+npm run ban:download
+BAN_CSV_PATH=data/ban/adresses-75.csv.gz npm run dev
+```
+
+Download the full national BAN only when the machine has enough disk and memory:
+
+```bash
+cd demo
+npm run ban:download:france
+BAN_CSV_PATH=data/ban/adresses-france.csv.gz BAN_SAMPLE_LIMIT=25000 npm run dev
+```
+
+The downloaded files live under `demo/data/ban/`, which is git-ignored.
+The backend parser caps loaded rows through `BAN_SAMPLE_LIMIT` so the demo can
+remain responsive while Surch is still in an in-memory bootstrap mode.
+
 ## Current Scope
 
 This PoC is intentionally small. It proves the HTTP compatibility path, oracle

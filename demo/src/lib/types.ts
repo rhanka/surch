@@ -30,11 +30,14 @@ export type BanSourceProfile = {
   offline: boolean;
   bounded: boolean;
   path?: string;
+  officialUrl?: string;
+  downloadCommand?: string;
 };
 
 export type BanDatasetSummary = {
   name: string;
   documentCount: number;
+  officialSource?: string;
 };
 
 export type FixtureOperation = {

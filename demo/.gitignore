@@ -1,6 +1,8 @@
 node_modules
 .svelte-kit
 build
+data/ban/*.csv
+data/ban/*.csv.gz
 .env
 .env.*
 !.env.example

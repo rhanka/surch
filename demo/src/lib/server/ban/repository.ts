@@ -9,6 +9,7 @@ import {
   MAX_EXTERNAL_BAN_ROWS,
   type BanRepositoryEnv
 } from './schema';
+import { BAN_CSV_DIRECTORY_URL, BAN_DOWNLOAD_PROFILES } from './sources';
 
 export type SuggestRequest = {
   query: string;
@@ -47,7 +48,8 @@ export async function createBanRepository(
       name: fileName(csvPath),
       offline: false,
       bounded: documents.length >= limit,
-      path: csvPath
+      path: csvPath,
+      officialUrl: inferOfficialUrl(csvPath)
     }
   });
 }
@@ -61,7 +63,8 @@ export function createInMemoryBanRepository(input: {
   return {
     summary: () => ({
       name: input.source.name,
-      documentCount: input.documents.length
+      documentCount: input.documents.length,
+      officialSource: BAN_CSV_DIRECTORY_URL
     }),
     sourceProfile: () => input.source,
     documents: () => input.documents,
@@ -89,7 +92,9 @@ function createTinyRepository(): BanRepository {
       kind: 'tiny',
       name: fixture.name,
       offline: true,
-      bounded: false
+      bounded: false,
+      officialUrl: BAN_DOWNLOAD_PROFILES.paris.url,
+      downloadCommand: 'npm run ban:download'
     }
   });
 }
@@ -128,4 +133,9 @@ function parseLimit(value: string | undefined): number {
 
 function fileName(path: string): string {
   return path.split('/').filter(Boolean).at(-1) ?? 'ban.csv';
+}
+
+function inferOfficialUrl(path: string): string | undefined {
+  const name = fileName(path);
+  return Object.values(BAN_DOWNLOAD_PROFILES).find((profile) => profile.fileName === name)?.url;
 }

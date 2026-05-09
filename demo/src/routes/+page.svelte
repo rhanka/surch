@@ -313,8 +313,8 @@
       <div>
         <strong>{datasetMessage}</strong>
         <p>
-          `ban_tiny` reste le fixture offline; `BAN_CSV_PATH` active un fichier BAN externe
-          hors repo.
+          `npm run ban:download` récupère `adresses-75.csv.gz` depuis adresse.data.gouv.fr;
+          `npm run ban:download:france` récupère la BAN nationale hors repo.
         </p>
       </div>
       <button type="button" onclick={loadDataset} disabled={isLoadingDataset}>

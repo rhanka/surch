@@ -9,11 +9,14 @@ describe('GET /api/ban/dataset', () => {
     expect(response.status).toBe(200);
     expect(body.summary).toMatchObject({
       name: 'ban_tiny',
-      documentCount: 3
+      documentCount: 3,
+      officialSource: 'https://adresse.data.gouv.fr/data/ban/adresses/latest/csv'
     });
     expect(body.source).toMatchObject({
       kind: 'tiny',
-      offline: true
+      offline: true,
+      officialUrl: 'https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-75.csv.gz',
+      downloadCommand: 'npm run ban:download'
     });
   });
 });

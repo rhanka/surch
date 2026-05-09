@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import type { BanDocument } from '$lib/types';
 import { MAX_BAN_SUGGESTIONS } from './schema';
 import { createBanRepository, createInMemoryBanRepository } from './repository';
+
+const tinyCsv = `id,numero,rep,nom_voie,code_postal,code_insee,nom_commune,lon,lat
+75101_0001_00001,1,,Rue de Rivoli,75001,75101,Paris 1er Arrondissement,2.3364,48.8609
+33063_0002_00010B,10,B,Cours de l'Intendance,33000,33063,Bordeaux,-0.5792,44.8412
+`;
 
 function makeDocument(index: number): BanDocument {
   return {
@@ -26,11 +35,14 @@ describe('BAN repository', () => {
 
     expect(repository.summary()).toMatchObject({
       name: 'ban_tiny',
-      documentCount: 3
+      documentCount: 3,
+      officialSource: 'https://adresse.data.gouv.fr/data/ban/adresses/latest/csv'
     });
     expect(repository.sourceProfile()).toMatchObject({
       kind: 'tiny',
-      offline: true
+      offline: true,
+      officialUrl: 'https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-75.csv.gz',
+      downloadCommand: 'npm run ban:download'
     });
   });
 
@@ -49,6 +61,25 @@ describe('BAN repository', () => {
     await expect(
       createBanRepository({ BAN_CSV_PATH: '/tmp/surch-ban-missing.csv' })
     ).rejects.toThrow(/BAN_CSV_PATH/);
+  });
+
+  it('loads a gzipped BAN CSV from BAN_CSV_PATH', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'surch-ban-'));
+    const path = join(dir, 'adresses-75.csv.gz');
+    writeFileSync(path, gzipSync(tinyCsv));
+
+    const repository = await createBanRepository({ BAN_CSV_PATH: path, BAN_SAMPLE_LIMIT: '1' });
+
+    expect(repository.summary()).toMatchObject({
+      name: 'adresses-75.csv.gz',
+      documentCount: 1
+    });
+    expect(repository.sourceProfile()).toMatchObject({
+      kind: 'csv',
+      bounded: true,
+      officialUrl: 'https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-75.csv.gz'
+    });
+    expect(repository.suggest({ query: 'rivo' })[0].id).toBe('75101_0001_00001');
   });
 
   it('caps suggestions at the backend maximum', () => {
