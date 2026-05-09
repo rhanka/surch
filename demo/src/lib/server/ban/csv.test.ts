@@ -45,4 +45,15 @@ describe('BAN CSV parser', () => {
       }
     });
   });
+
+  it('stops parsing at the requested limit', async () => {
+    const csvWithInvalidTail = `${officialTinyCsv}unterminated;"quoted`;
+    const documents = await parseBanCsvText(csvWithInvalidTail, {
+      sourceName: 'official.csv',
+      limit: 1
+    });
+
+    expect(documents).toHaveLength(1);
+    expect(documents[0].id).toBe('75103_ka7f7y_00001');
+  });
 });

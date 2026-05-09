@@ -13,7 +13,8 @@ export async function parseBanCsvText(
     columns: true,
     delimiter: detectDelimiter(csv),
     skip_empty_lines: true,
-    trim: true
+    trim: true,
+    to_line: limit + 1
   }) as CsvRow[];
 
   const documents: BanDocument[] = [];

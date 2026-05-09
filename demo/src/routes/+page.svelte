@@ -1,4 +1,10 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import {
+    datasetStatus,
+    extractSuggestionDocuments,
+    shouldRequestSuggestions
+  } from '$lib/banUiState';
   import AddressAutocomplete from '$lib/components/AddressAutocomplete.svelte';
   import AddressMap from '$lib/components/AddressMap.svelte';
   import ComparisonPanel from '$lib/components/ComparisonPanel.svelte';
@@ -19,14 +25,13 @@
   };
 
   let { data }: { data: PageData } = $props();
-  const initialDocuments = $derived(data.fixture.documents);
   let query = $state('');
   let suggestions = $state<BanDocument[]>([]);
   let selected = $state<BanDocument | null>(null);
   let isSuggesting = $state(false);
   let isLoadingDataset = $state(false);
   let isComparing = $state(false);
-  let datasetMessage = $state('BAN tiny chargée localement');
+  let datasetMessage = $state('Chargement du dataset BAN...');
   let errorMessage = $state('');
   let rawResult = $state<unknown>(null);
   let surchCard = $state<EngineCard>({ label: 'Surch', status: 'idle' });
@@ -37,22 +42,20 @@
   const surchEngine = $derived(data.engines.find((engine) => engine.id === 'surch'));
   const opensearchEngine = $derived(data.engines.find((engine) => engine.id === 'opensearch'));
 
-  $effect(() => {
-    if (suggestions.length === 0 && initialDocuments.length > 0) {
-      suggestions = initialDocuments;
-    }
-
-    if (!selected && initialDocuments.length > 0) {
-      selected = initialDocuments[0];
-    }
+  onMount(() => {
+    void refreshDatasetSummary();
   });
 
   async function onQueryChange(value: string) {
     query = value;
+    if (selected?.label !== value) {
+      selected = null;
+    }
+
     const serial = ++suggestionSerial;
 
-    if (value.trim().length < 2) {
-      suggestions = initialDocuments;
+    if (!shouldRequestSuggestions(value)) {
+      suggestions = [];
       return;
     }
 
@@ -60,11 +63,13 @@
     try {
       const response = await postJson('/api/ban/suggest', { query: value, limit: 8 });
       if (serial === suggestionSerial) {
-        suggestions = extractDocuments(response, localSuggestions(value));
+        suggestions = extractSuggestionDocuments(response);
+        errorMessage = '';
       }
-    } catch {
+    } catch (error) {
       if (serial === suggestionSerial) {
-        suggestions = localSuggestions(value);
+        suggestions = [];
+        errorMessage = formatEndpointError('/api/ban/suggest', error);
       }
     } finally {
       if (serial === suggestionSerial) {
@@ -88,12 +93,9 @@
       datasetMessage = datasetStatus(response);
       rawResult = response;
     } catch (error) {
-      const fallback = await loadTinyFallback(error);
-      datasetMessage = fallback.message;
-      rawResult = fallback.raw;
-      if (fallback.error) {
-        errorMessage = fallback.error;
-      }
+      datasetMessage = 'Chargement BAN impossible';
+      rawResult = { error };
+      errorMessage = formatEndpointError('/api/ban/load', error);
     } finally {
       isLoadingDataset = false;
     }
@@ -120,21 +122,32 @@
       });
       applyCompareResponse(response);
     } catch (error) {
-      await compareTinyFallback(error);
+      errorMessage = formatEndpointError('/api/ban/compare', error);
+      rawResult = { error };
+      surchCard = { label: 'Surch', status: 'error', error: 'Comparaison indisponible' };
+      opensearchCard = {
+        label: 'OpenSearch',
+        status: 'error',
+        error: 'Comparaison indisponible'
+      };
     } finally {
       isComparing = false;
     }
   }
 
-  async function postJson(path: string, body: unknown) {
-    const response = await fetch(path, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const parsed = await response.json().catch(() => ({
-      error: { type: 'non_json_response', message: `${response.status} ${response.statusText}` }
-    }));
+  async function refreshDatasetSummary() {
+    try {
+      const response = await getJson('/api/ban/dataset');
+      datasetMessage = datasetStatus(response);
+    } catch (error) {
+      datasetMessage = 'Dataset BAN indisponible';
+      errorMessage = formatEndpointError('/api/ban/dataset', error);
+    }
+  }
+
+  async function getJson(path: string) {
+    const response = await fetch(path);
+    const parsed = await parseJsonResponse(response);
 
     if (!response.ok) {
       throw parsed;
@@ -143,40 +156,25 @@
     return parsed;
   }
 
-  async function loadTinyFallback(error: unknown) {
-    const responses = [];
-    let fallbackError = '';
+  async function postJson(path: string, body: unknown) {
+    const response = await fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const parsed = await parseJsonResponse(response);
 
-    try {
-      responses.push(await postJson('/api/demo/reset', { engine: 'surch' }));
-    } catch (resetError) {
-      fallbackError = formatError(resetError);
+    if (!response.ok) {
+      throw parsed;
     }
 
-    return {
-      message: fallbackError
-        ? 'BAN tiny chargée seulement côté UI; moteur indisponible'
-        : 'BAN tiny chargée dans Surch',
-      error: fallbackError || formatEndpointFallback('/api/ban/load', error),
-      raw: { fallback: responses, originalError: error }
-    };
+    return parsed;
   }
 
-  async function compareTinyFallback(error: unknown) {
-    try {
-      const response = await postJson('/api/compare', { queryId: 'match_label' });
-      applyCompareResponse(response);
-      errorMessage = formatEndpointFallback('/api/ban/compare', error);
-    } catch (fallbackError) {
-      errorMessage = formatError(fallbackError);
-      rawResult = { originalError: error, fallbackError };
-      surchCard = { label: 'Surch', status: 'error', error: 'Comparaison indisponible' };
-      opensearchCard = {
-        label: 'OpenSearch',
-        status: 'error',
-        error: 'Comparaison indisponible'
-      };
-    }
+  async function parseJsonResponse(response: Response) {
+    return response.json().catch(() => ({
+      error: { type: 'non_json_response', message: `${response.status} ${response.statusText}` }
+    }));
   }
 
   function applyCompareResponse(response: unknown) {
@@ -214,32 +212,6 @@
     };
   }
 
-  function datasetStatus(response: unknown): string {
-    const record = asRecord(response);
-    const dataset = asRecord(record?.dataset) ?? record;
-    const count = numberValue(dataset?.documentCount ?? dataset?.documents);
-    const name = typeof dataset?.name === 'string' ? dataset.name : 'BAN';
-
-    return count !== undefined ? `${name}: ${count} adresse(s) prêtes` : `${name}: dataset prêt`;
-  }
-
-  function extractDocuments(response: unknown, fallback: BanDocument[]): BanDocument[] {
-    const record = asRecord(response);
-    const candidates = record?.suggestions ?? record?.documents ?? record?.hits;
-    return Array.isArray(candidates) ? (candidates as BanDocument[]).slice(0, 8) : fallback;
-  }
-
-  function localSuggestions(value: string): BanDocument[] {
-    const normalized = normalizeText(value);
-    return initialDocuments
-      .filter((document) =>
-        normalizeText(
-          `${document.label} ${document.street_name} ${document.city_name} ${document.postcode}`
-        ).includes(normalized)
-      )
-      .slice(0, 8);
-  }
-
   function overlapFromHits(record: Record<string, unknown> | null): number | null {
     const surchIds = hitIds(record?.surch);
     const opensearchIds = hitIds(record?.opensearch);
@@ -268,15 +240,8 @@
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
   }
 
-  function normalizeText(value: string): string {
-    return value
-      .normalize('NFD')
-      .replace(/\p{Diacritic}/gu, '')
-      .toLowerCase();
-  }
-
-  function formatEndpointFallback(path: string, error: unknown): string {
-    return `${path} indisponible; fallback BAN tiny utilisé. ${formatError(error)}`;
+  function formatEndpointError(path: string, error: unknown): string {
+    return `${path} indisponible. ${formatError(error)}`;
   }
 
   function formatError(error: unknown): string {
