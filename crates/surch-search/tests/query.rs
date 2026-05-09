@@ -1,5 +1,7 @@
 use surch_search::fuzzy::{Fuzziness, FuzzyQueryConfig};
-use surch_search::query::{rewrite_fuzzy_query, FuzzyQuery, QueryError, TermQuery};
+use surch_search::query::{
+    rewrite_fuzzy_query, BooleanQuery, FuzzyQuery, Query, QueryError, TermQuery,
+};
 
 fn default_config() -> FuzzyQueryConfig {
     FuzzyQueryConfig::new(Fuzziness::Edits(1), 1, 3, true).expect("valid fuzzy config")
@@ -31,6 +33,38 @@ fn fuzzy_query_rejects_empty_value() {
     let query = FuzzyQuery::new("title", "", default_config());
 
     assert_eq!(query, Err(QueryError::EmptyValue));
+}
+
+#[test]
+fn boolean_query_accepts_non_empty_must_clauses_and_preserves_order() {
+    let term_query = Query::Term(TermQuery::new("title", "surch").expect("term query"));
+    let fuzzy_query =
+        Query::Fuzzy(FuzzyQuery::new("body", "search", default_config()).expect("fuzzy query"));
+
+    let query =
+        BooleanQuery::new(vec![term_query.clone(), fuzzy_query.clone()]).expect("bool query");
+
+    assert_eq!(query.must, vec![term_query, fuzzy_query]);
+}
+
+#[test]
+fn boolean_query_rejects_empty_must_clauses() {
+    let query = BooleanQuery::new(Vec::new());
+
+    assert_eq!(query, Err(QueryError::EmptyMustClauses));
+}
+
+#[test]
+fn query_enum_wraps_boolean_query() {
+    let bool_query = BooleanQuery::new(vec![Query::Term(
+        TermQuery::new("title", "surch").expect("term query"),
+    )])
+    .expect("bool query");
+
+    assert_eq!(
+        Query::Boolean(bool_query.clone()),
+        Query::Boolean(bool_query)
+    );
 }
 
 #[test]

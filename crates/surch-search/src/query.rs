@@ -19,11 +19,18 @@ pub struct FuzzyQuery {
     pub config: FuzzyQueryConfig,
 }
 
-/// P0 query wrapper enum for exact and fuzzy term queries.
+/// Minimal boolean query wrapper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BooleanQuery {
+    pub must: Vec<Query>,
+}
+
+/// P0 query wrapper enum for exact, fuzzy, and boolean queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Query {
     Term(TermQuery),
     Fuzzy(FuzzyQuery),
+    Boolean(BooleanQuery),
 }
 
 /// Errors returned by query wrappers and rewrites.
@@ -35,6 +42,9 @@ pub enum QueryError {
     /// Query values must be explicit.
     #[error("value must not be empty")]
     EmptyValue,
+    /// Boolean queries require at least one required clause.
+    #[error("must clauses must not be empty")]
+    EmptyMustClauses,
     /// Fuzzy expansion failed.
     #[error(transparent)]
     Fuzzy(#[from] FuzzyError),
@@ -67,6 +77,17 @@ impl FuzzyQuery {
             value,
             config,
         })
+    }
+}
+
+impl BooleanQuery {
+    /// Creates a boolean query after validating its required clauses.
+    pub fn new(must: Vec<Query>) -> Result<Self, QueryError> {
+        if must.is_empty() {
+            return Err(QueryError::EmptyMustClauses);
+        }
+
+        Ok(Self { must })
     }
 }
 
