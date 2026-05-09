@@ -63,8 +63,66 @@ async fn count_router_accepts_empty_object_fixture() {
 }
 
 #[tokio::test]
-async fn count_router_rejects_unknown_query_with_opensearch_error() {
-    let response = app_router()
+async fn count_router_term_returns_matching_document_count() {
+    let router = app_router();
+
+    let desk_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"desk"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(desk_response.status(), StatusCode::CREATED);
+
+    let chair_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-2")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"chair"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(chair_response.status(), StatusCode::CREATED);
+
+    let standing_desk_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-3")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"standing desk"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(standing_desk_response.status(), StatusCode::CREATED);
+
+    let desktop_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-4")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"desktop"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(desktop_response.status(), StatusCode::CREATED);
+
+    let response = router
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -76,13 +134,69 @@ async fn count_router_rejects_unknown_query_with_opensearch_error() {
         .await
         .expect("router should respond");
 
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "count": 2,
+            "_shards": {
+                "total": 1,
+                "successful": 1,
+                "skipped": 0,
+                "failed": 0
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn count_router_rejects_unknown_query_with_opensearch_error() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"range":{"price":{"gte":10}}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         response_json(response).await,
         serde_json::json!({
             "error": {
                 "type": "parsing_exception",
-                "reason": "unsupported count query `term`"
+                "reason": "unsupported count query `range`"
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn count_router_rejects_invalid_term_query_with_opensearch_error() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"term":{}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "term query must contain exactly one field"
             },
             "status": 400
         })

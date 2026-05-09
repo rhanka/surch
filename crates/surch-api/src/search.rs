@@ -31,6 +31,10 @@ pub enum SearchQuery {
         field: String,
         value: String,
     },
+    Term {
+        field: String,
+        value: String,
+    },
     BoolMust(Vec<SearchQuery>),
     Fuzzy {
         field: String,
@@ -183,6 +187,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
             "match_all query body must be an empty object",
         )),
         "match" => parse_match_query(query_body),
+        "term" => parse_term_query(query_body),
         "bool" => parse_bool_query(query_body),
         "fuzzy" => parse_fuzzy_query(query_body),
         unknown => Err(OpenSearchError::new(
@@ -198,6 +203,30 @@ fn parse_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     let value = parse_query_text(value, "match query")?;
 
     Ok(SearchQuery::Match { field, value })
+}
+
+fn parse_term_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let (field, value) = parse_single_field_query("term", value)?;
+    let value = parse_term_query_value(value)?;
+
+    Ok(SearchQuery::Term { field, value })
+}
+
+fn parse_term_query_value(value: &Value) -> Result<String, OpenSearchError> {
+    match value {
+        Value::Object(object) => {
+            let query_value = object.get("value").ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "term field query object must contain `value`",
+                )
+            })?;
+
+            parse_scalar_query_text(query_value, "term query value")
+        }
+        _ => parse_scalar_query_text(value, "term query"),
+    }
 }
 
 fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
@@ -309,6 +338,19 @@ fn parse_query_text(value: &Value, context: &str) -> Result<String, OpenSearchEr
     }
 }
 
+fn parse_scalar_query_text(value: &Value, context: &str) -> Result<String, OpenSearchError> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::Bool(flag) => Ok(flag.to_string()),
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{context} must be a scalar value"),
+        )),
+    }
+}
+
 fn parse_fuzzy_query_fuzziness(value: &Value) -> Result<Fuzziness, OpenSearchError> {
     match value {
         Value::String(text) => fuzzy_result(parse_fuzziness(text)),
@@ -365,6 +407,7 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
     match query {
         SearchQuery::MatchAll => true,
         SearchQuery::Match { field, value } => field_matches(source, field, value),
+        SearchQuery::Term { field, value } => term_field_matches(source, field, value),
         SearchQuery::BoolMust(queries) => queries.iter().all(|query| query_matches(query, source)),
         SearchQuery::Fuzzy {
             field,
@@ -380,6 +423,21 @@ fn field_matches(source: &Value, field: &str, query: &str) -> bool {
         && field_text(source, field)
             .map(|value| normalize_text(&value).contains(&query))
             .unwrap_or(false)
+}
+
+fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
+    let query = normalize_text(query);
+    if query.is_empty() {
+        return false;
+    }
+
+    field_text(source, field)
+        .map(|value| {
+            tokenize_for_search(&value)
+                .iter()
+                .any(|field_token| field_token == &query)
+        })
+        .unwrap_or(false)
 }
 
 fn fuzzy_field_matches(source: &Value, field: &str, query: &str, fuzziness: Fuzziness) -> bool {
