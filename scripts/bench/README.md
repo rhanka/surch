@@ -24,7 +24,46 @@ Safety notes:
 
 - `opensearch-stop.sh` only stops/removes a dedicated container name prefixed with `surch-` or `surch_`.
 - `opensearch-cleanup.sh` only deletes a dedicated BAN/Surch index name prefixed with `ban-`, `ban_`, `surch-`, or `surch_`.
+- `ban-http-smoke.sh` resets only the dedicated `ban_tiny` smoke index on Surch and OpenSearch.
 - No Python is used.
+
+## BAN HTTP Smoke
+
+`ban-http-smoke.sh` is a manual shell/curl parity smoke for the committed
+3-document BAN fixture. It does not produce benchmark timings and must not be
+treated as the future measured `ban-http-bench` result.
+
+Prerequisites:
+
+- Surch API running on `http://127.0.0.1:7700`, for example:
+
+  ```sh
+  SURCH_PORT=7700 cargo run -p surch-api --release
+  ```
+
+- OpenSearch running on `http://127.0.0.1:9200`, for example:
+
+  ```sh
+  scripts/bench/opensearch-start.sh
+  scripts/bench/opensearch-wait.sh
+  ```
+
+Run:
+
+```sh
+scripts/bench/ban-http-smoke.sh
+```
+
+Environment variables:
+
+- `SURCH_URL`: Surch API base URL; default `http://127.0.0.1:7700`.
+- `OPENSEARCH_URL`: OpenSearch base URL; default `http://127.0.0.1:9200`.
+- `BAN_HTTP_DATASET`: NDJSON fixture path; default
+  `tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson`.
+- `BAN_HTTP_TIMEOUT`: per-request curl timeout in seconds; default `10`.
+
+The smoke checks both engines, deletes/recreates only `ban_tiny`, loads the
+NDJSON through `_bulk`, refreshes `ban_tiny`, and verifies `_count == 3`.
 
 ## Symmetric HTTP Benchmark Runbook
 

@@ -257,7 +257,7 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 
 **Progress Report 2026-05-09**
 
-- **Fait:** official BAN Paris autocomplete uses `adresses-75.csv.gz` with 25,000 bounded rows; the UI no longer shows `ban_tiny` suggestions by default; Surch and OpenSearch both load the active BAN dataset into `ban_addresses` through chunked `_bulk`; the active CSV dataset auto-loads on page mount without clicking `Charger BAN`, and `Charger BAN` no longer remains visible after automatic loading succeeds; Surch `_bulk` now accepts bodies above the Axum default limit; selected-address compare returns the expected top hit on both engines; Playwright verifies auto-load, selection, compare enablement, absence of static tiny suggestions, and `Surch`/`OpenSearch` status `ok`; shell-only OpenSearch lifecycle scripts exist under `scripts/bench/`; `ban-bench` now reports reproducible p50/p95 guardrailed metrics; npm audit is clean with `cookie@0.7.2` overriding the vulnerable transitive dependency.
+- **Fait:** official BAN Paris autocomplete uses `adresses-75.csv.gz` with 25,000 bounded rows; the UI no longer shows `ban_tiny` suggestions by default; Surch and OpenSearch both load the active BAN dataset into `ban_addresses` through chunked `_bulk`; the active CSV dataset auto-loads on page mount without clicking `Charger BAN`, and `Charger BAN` no longer remains visible after automatic loading succeeds; Surch `_bulk` now accepts bodies above the Axum default limit; selected-address compare returns the expected top hit on both engines; Playwright verifies auto-load, selection, compare enablement, absence of static tiny suggestions, and `Surch`/`OpenSearch` status `ok`; shell-only OpenSearch lifecycle scripts exist under `scripts/bench/`; `scripts/bench/ban-http-smoke.sh` provides an unmeasured Surch HTTP/OpenSearch HTTP smoke for `ban_tiny` load, refresh, and count; `ban-bench` now reports reproducible p50/p95 guardrailed metrics; npm audit is clean with `cookie@0.7.2` overriding the vulnerable transitive dependency.
 - **Reste à faire:** the demo UX follow-up is closed; final publishable benchmark reporting now depends on a symmetric HTTP benchmark implementation. Demo V2 is ready for UAT; the publishable benchmark remains roughly 45% complete.
 - **Attendu:** next implementation step is `ban-http-bench`.
 
@@ -338,6 +338,7 @@ be published as an engine-performance comparison while Surch is still measured
 as an in-process in-memory API router.
 
 - [ ] Reuse `tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson` and `tests/opensearch_compat/oracle/replays/ban_tiny_search.json`.
+- [x] Provide a shell-only HTTP smoke path for both engines with `scripts/bench/ban-http-smoke.sh`: reset `ban_tiny`, load through `_bulk`, refresh, and verify `_count == 3`.
 - [ ] Measure the same operation sequence:
   - `PUT /ban_tiny`
   - `POST /_bulk`
@@ -369,11 +370,15 @@ as an in-process in-memory API router.
 
 #### Symmetric HTTP Benchmark And Report Plan
 
-**BenchPlanner status 2026-05-09:** documentation advanced only. No UI loading,
-no npm dependencies, and no `crates/surch-demo` source changes in this pass.
+**BenchPlanner status 2026-05-09:** documentation advanced for the unmeasured
+HTTP smoke path only. `ban-http-smoke.sh` covers Surch HTTP and OpenSearch HTTP
+load/refresh/count on `ban_tiny`; the measured symmetric `ban-http-bench`
+implementation is still pending. No UI loading, no npm dependencies, and no
+`crates/surch-demo` source changes in this pass.
 
 **Benchmark scope:**
 
+- [x] Document `scripts/bench/ban-http-smoke.sh` as the manual HTTP smoke requiring Surch API on `7700` and OpenSearch on `9200`.
 - [ ] Treat the existing `cargo run -p surch-demo --release -- ban-bench --iterations 1000` as Surch-only smoke/regression data.
 - [ ] Add a separate symmetric HTTP benchmark path before publication; do not fold HTTP OpenSearch measurements into the in-process Surch command.
 - [ ] Drive Surch through `cargo run -p surch-api --release` with `SURCH_PORT=7700`.
