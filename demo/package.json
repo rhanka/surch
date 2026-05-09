@@ -26,5 +26,8 @@
   "dependencies": {
     "csv-parse": "^6.2.1",
     "leaflet": "^1.9.4"
+  },
+  "overrides": {
+    "cookie": "0.7.2"
   }
 }
