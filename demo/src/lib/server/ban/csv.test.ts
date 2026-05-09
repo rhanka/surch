@@ -6,6 +6,10 @@ const tinyCsv = `id,numero,rep,nom_voie,code_postal,code_insee,nom_commune,lon,l
 33063_0002_00010B,10,B,Cours de l'Intendance,33000,33063,Bordeaux,-0.5792,44.8412
 `;
 
+const officialTinyCsv = `id;id_fantoir;numero;rep;nom_voie;code_postal;code_insee;nom_commune;x;y;lon;lat
+75103_ka7f7y_00001;;1;;Voie B/3;75003;75103;Paris 3e Arrondissement;652996.66;6862232.89;2.359369;48.858416
+`;
+
 describe('BAN CSV parser', () => {
   it('parses tiny BAN CSV rows into demo documents', async () => {
     const documents = await parseBanCsvText(tinyCsv, { sourceName: 'unit.csv' });
@@ -26,5 +30,19 @@ describe('BAN CSV parser', () => {
       street_name: 'Rue de Rivoli'
     });
     expect(documents[1].house_number).toBe('10B');
+  });
+
+  it('parses official BAN semicolon CSV rows', async () => {
+    const documents = await parseBanCsvText(officialTinyCsv, { sourceName: 'official.csv' });
+
+    expect(documents).toHaveLength(1);
+    expect(documents[0]).toMatchObject({
+      id: '75103_ka7f7y_00001',
+      label: '1 Voie B/3 75003 Paris 3e Arrondissement',
+      location: {
+        lat: 48.858416,
+        lon: 2.359369
+      }
+    });
   });
 });

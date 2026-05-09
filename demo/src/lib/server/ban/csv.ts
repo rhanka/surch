@@ -11,6 +11,7 @@ export async function parseBanCsvText(
   const limit = clampLimit(options.limit);
   const rows = parse(csv, {
     columns: true,
+    delimiter: detectDelimiter(csv),
     skip_empty_lines: true,
     trim: true
   }) as CsvRow[];
@@ -28,6 +29,11 @@ export async function parseBanCsvText(
   }
 
   return documents;
+}
+
+function detectDelimiter(csv: string): ',' | ';' {
+  const firstLine = csv.split(/\r?\n/, 1)[0] ?? '';
+  return firstLine.includes(';') ? ';' : ',';
 }
 
 function rowToDocument(row: CsvRow): BanDocument | null {
