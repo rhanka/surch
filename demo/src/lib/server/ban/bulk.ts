@@ -3,6 +3,11 @@ import { getBanTinyBulkNdjson } from '../fixture';
 
 export type BanLoadPayload = {
   dataset: string;
+  summary: {
+    name: string;
+    documentCount: number;
+    indexName: string;
+  };
   bulk: {
     path: '/_bulk';
     contentType: 'application/x-ndjson';
@@ -11,16 +16,55 @@ export type BanLoadPayload = {
   };
 };
 
+export type BanLoadPayloadRequest = {
+  datasetName: string;
+  indexName: string;
+  documents: BanDocument[];
+};
+
 export function getBanTinyLoadPayload(): BanLoadPayload {
   const ndjson = getBanTinyBulkNdjson();
+  const documentCount = parseBanBulkNdjson(ndjson).length;
 
+  return createBanLoadPayload({
+    datasetName: 'ban_tiny',
+    indexName: 'ban_tiny',
+    documentCount,
+    ndjson
+  });
+}
+
+export function getBanLoadPayload({
+  datasetName,
+  indexName,
+  documents
+}: BanLoadPayloadRequest): BanLoadPayload {
+  return createBanLoadPayload({
+    datasetName,
+    indexName,
+    documentCount: documents.length,
+    ndjson: documentsToBulkNdjson(indexName, documents)
+  });
+}
+
+function createBanLoadPayload(input: {
+  datasetName: string;
+  indexName: string;
+  documentCount: number;
+  ndjson: string;
+}): BanLoadPayload {
   return {
-    dataset: 'ban_tiny',
+    dataset: input.datasetName,
+    summary: {
+      name: input.datasetName,
+      documentCount: input.documentCount,
+      indexName: input.indexName
+    },
     bulk: {
       path: '/_bulk',
       contentType: 'application/x-ndjson',
-      documentCount: parseBanBulkNdjson(ndjson).length,
-      ndjson
+      documentCount: input.documentCount,
+      ndjson: input.ndjson
     }
   };
 }

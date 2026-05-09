@@ -19,8 +19,8 @@ afterEach(() => {
   }
 });
 
-describe('POST /api/ban/load', () => {
-  it('loads the active BAN dataset instead of the tiny fixture', async () => {
+describe('POST /api/ban/compare', () => {
+  it('builds a label match query from the body against the active dataset index', async () => {
     const csvPath = createActiveCsv('adresses-active.csv');
     process.env.BAN_CSV_PATH = csvPath;
     process.env.BAN_SAMPLE_LIMIT = '1';
@@ -32,55 +32,62 @@ describe('POST /api/ban/load', () => {
         body: typeof init?.body === 'string' ? init.body : undefined
       });
 
-      return Response.json({ acknowledged: true });
+      return Response.json({
+        hits: {
+          total: { value: 1, relation: 'eq' },
+          hits: [{ _id: '75101_7777_00041' }]
+        }
+      });
     };
 
     const response = await POST({
-      request: new Request('http://localhost/api/ban/load', {
+      request: new Request('http://localhost/api/ban/compare', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ engines: ['surch'] })
+        body: JSON.stringify({
+          id: '75101_7777_00041',
+          query: '41 Rue Active 75001 Paris',
+          limit: 2
+        })
       }),
       fetch: fakeFetch
     } as unknown as Parameters<typeof POST>[0]);
     const body = await response.json();
 
     expect(response.status).toBe(200);
+    expect(body.index).toBe('ban_addresses');
     expect(body.summary).toMatchObject({
       name: 'adresses-active.csv',
       documentCount: 1,
       indexName: 'ban_addresses'
     });
-    expect(body.source).toMatchObject({
-      kind: 'csv',
-      path: csvPath
+    expect(body.query).toMatchObject({
+      expectedId: '75101_7777_00041',
+      label: 'Match label: 41 Rue Active 75001 Paris'
     });
-    expect(body.bulk).toMatchObject({
-      path: '/_bulk',
-      contentType: 'application/x-ndjson',
-      documentCount: 1
-    });
-    expect(body.bulk.ndjson).toBeUndefined();
-    expect(body.index).toBe('ban_addresses');
     expect(calls.map((call) => [call.method, new URL(call.url).pathname])).toEqual([
-      ['DELETE', '/ban_addresses'],
-      ['PUT', '/ban_addresses'],
-      ['POST', '/_bulk'],
-      ['POST', '/ban_addresses/_refresh']
+      ['POST', '/ban_addresses/_search'],
+      ['POST', '/ban_addresses/_search']
     ]);
-    expect(calls[2].body).toContain('"_index":"ban_addresses"');
-    expect(calls[2].body).toContain('"Rue Active"');
-    expect(body.engines.surch.operations).toEqual([
-      { path: '/ban_addresses', status: 200 },
-      { path: '/ban_addresses', status: 200 },
-      { path: '/_bulk', status: 200 },
-      { path: '/ban_addresses/_refresh', status: 200 }
-    ]);
+
+    const searchBody = JSON.parse(calls[0].body ?? '{}');
+    expect(searchBody).toEqual({
+      query: {
+        match: {
+          label: '41 Rue Active 75001 Paris'
+        }
+      },
+      size: 2
+    });
+    expect(JSON.stringify(searchBody)).not.toContain('Rue de Rivoli');
+    expect(body.query.body).toEqual(searchBody);
+    expect(body.surch.status).toBe(200);
+    expect(body.opensearch.status).toBe(200);
   });
 });
 
 function createActiveCsv(fileName: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'surch-ban-load-'));
+  const dir = mkdtempSync(join(tmpdir(), 'surch-ban-compare-'));
   tempDirs.push(dir);
   const path = join(dir, fileName);
   writeFileSync(

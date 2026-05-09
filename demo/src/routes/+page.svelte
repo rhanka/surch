@@ -91,13 +91,26 @@
     try {
       const response = await postJson('/api/ban/load', { engines: ['surch', 'opensearch'] });
       datasetMessage = datasetStatus(response);
-      rawResult = response;
+      applyLoadResponse(response);
     } catch (error) {
       datasetMessage = 'Chargement BAN impossible';
       rawResult = { error };
       errorMessage = formatEndpointError('/api/ban/load', error);
     } finally {
       isLoadingDataset = false;
+    }
+  }
+
+  function applyLoadResponse(response: unknown) {
+    rawResult = response;
+    const record = asRecord(response);
+    const engines = asRecord(record?.engines ?? record?.operations);
+    surchCard = loadEngineCard('Surch', engines?.surch);
+    opensearchCard = loadEngineCard('OpenSearch', engines?.opensearch);
+    overlap = null;
+
+    if (record?.partial === true) {
+      errorMessage = 'Chargement BAN partiel: au moins un moteur est indisponible.';
     }
   }
 
@@ -193,13 +206,14 @@
     const hitList = Array.isArray(hits?.hits) ? hits.hits : [];
     const firstHit = asRecord(hitList[0]);
     const error = asRecord(record?.error);
+    const directError = directErrorMessage(record);
 
-    if (error) {
+    if (directError || error) {
       return {
         label,
         status: 'error',
         latencyMs: numberValue(record?.latencyMs),
-        error: String(error.message ?? error.reason ?? 'Erreur moteur')
+        error: directError ?? String(error?.message ?? error?.reason ?? 'Erreur moteur')
       };
     }
 
@@ -210,6 +224,32 @@
       topHit: typeof firstHit?._id === 'string' ? firstHit._id : null,
       total: numberValue(total?.value)
     };
+  }
+
+  function loadEngineCard(label: string, value: unknown): EngineCard {
+    const record = asRecord(value);
+    const directError = directErrorMessage(record);
+
+    if (directError) {
+      return {
+        label,
+        status: 'error',
+        error: directError
+      };
+    }
+
+    return {
+      label,
+      status: record ? 'ok' : 'idle'
+    };
+  }
+
+  function directErrorMessage(record: Record<string, unknown> | null): string | null {
+    if (typeof record?.error !== 'string') {
+      return null;
+    }
+
+    return String(record.message ?? record.error);
   }
 
   function overlapFromHits(record: Record<string, unknown> | null): number | null {

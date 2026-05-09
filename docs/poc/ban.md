@@ -51,6 +51,20 @@ cluster throughput.
 
 ## Demo With Official BAN Data
 
+The BAN demo has three distinct concerns:
+
+1. **Official BAN autocomplete**: the SvelteKit UI can read an official BAN CSV
+   extract from `adresse.data.gouv.fr` and serve address suggestions from the
+   demo repository layer.
+2. **Active engine loading**: Surch and OpenSearch must be loaded through the
+   fixed BAN engine operations before their search responses are compared. This
+   is the active runtime path; it is separate from autocomplete suggestions.
+3. **Comparative benchmark**: the current numbers are not publishable as a
+   global Surch/OpenSearch performance ratio. Surch is still measured through an
+   in-process in-memory router for the local bench, while OpenSearch would run
+   as an HTTP engine. Treat timings as smoke/regression signals only until the
+   runtime paths are symmetric.
+
 The SvelteKit demo knows the official BAN CSV source published on data.gouv.fr:
 
 - Dataset: `Base Adresse Nationale`
@@ -77,6 +91,31 @@ BAN_CSV_PATH=data/ban/adresses-france.csv.gz BAN_SAMPLE_LIMIT=25000 npm run dev
 The downloaded files live under `demo/data/ban/`, which is git-ignored.
 The backend parser caps loaded rows through `BAN_SAMPLE_LIMIT` so the demo can
 remain responsive while Surch is still in an in-memory bootstrap mode.
+
+The demo/benchmark zone is explicitly Rust, TypeScript, and shell only. Do not
+add Python scripts, Python notebooks, or Python one-off tooling here.
+
+## Reproducible Surch/OpenSearch Benchmark Plan
+
+The next publishable benchmark must use the same data, the same queries, and the
+same validation rules for both engines:
+
+- Data: load the same BAN fixture or sampled official BAN CSV into Surch and
+  OpenSearch. Record the exact file, sample limit, Surch commit, Rust profile,
+  OpenSearch version or image digest, heap, host OS, CPU, and memory.
+- Queries: replay the same `_count` and `_search` requests for match, bool, and
+  fuzzy cases. Do not add engine-specific query shortcuts.
+- Oracle validation: before measuring, verify response status, total hits, and
+  expected top-hit IDs against the replay oracle. Reject the run if validation
+  fails.
+- Warmup: run an unmeasured warmup pass after index load and refresh so first-use
+  effects do not dominate the reported sample.
+- Measurements: report ingestion duration, docs/s, error count, and query
+  latency p50 and p95 at minimum. Keep min/max or p99 as secondary diagnostics.
+- Publication rule: publish raw per-operation measurements and methodology only.
+  Do not extrapolate from `ban_tiny`, do not claim production throughput, and do
+  not publish a global Surch/OpenSearch ratio until both engines are measured
+  through comparable runtime paths.
 
 ## Current Scope
 
