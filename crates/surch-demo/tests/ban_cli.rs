@@ -48,6 +48,47 @@ fn ban_bench_prints_publishable_metric_labels() {
 }
 
 #[test]
+fn ban_bench_prints_reproducible_latency_summary_and_guardrails() {
+    let output = Command::new(env!("CARGO_BIN_EXE_surch-demo"))
+        .args(["ban-bench", "--iterations", "3"])
+        .output()
+        .expect("surch-demo binary should run");
+
+    assert!(
+        output.status.success(),
+        "ban-bench should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("dataset: ban_tiny"));
+    assert!(stdout.contains("iterations: 3"));
+    assert!(stdout.contains("oracle: tests/opensearch_compat/oracle/replays/ban_tiny_search.json"));
+    assert!(stdout.contains("runtime: Surch in-process axum router"));
+    assert!(stdout.contains("guardrails:"));
+    assert!(stdout.contains("no OpenSearch ratio"));
+    assert!(stdout.contains("same host/build only"));
+
+    for operation in [
+        "load_ban_tiny",
+        "count_match_all",
+        "search_match_label",
+        "search_bool_address",
+        "search_fuzzy_label",
+    ] {
+        let metric = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{operation}:")))
+            .unwrap_or_else(|| panic!("{operation} metric should be printed"));
+        assert!(metric.contains(&format!("operation={operation}")));
+        assert!(metric.contains("iterations=3"));
+        assert!(metric.contains("count="));
+        assert!(metric.contains("p50_us="));
+        assert!(metric.contains("p95_us="));
+    }
+}
+
+#[test]
 fn ban_compare_plan_prints_guardrails_without_running_engines() {
     let output = Command::new(env!("CARGO_BIN_EXE_surch-demo"))
         .arg("ban-compare-plan")

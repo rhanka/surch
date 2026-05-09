@@ -347,7 +347,7 @@
             <p>Adresse sélectionnée</p>
             <h2>{selected?.label ?? 'Aucune adresse'}</h2>
           </div>
-          <button type="button" class="primary" onclick={compareAddress} disabled={isComparing}>
+          <button type="button" class="primary" onclick={compareAddress} disabled={!selected || isComparing}>
             {isComparing ? 'Comparaison...' : 'Comparer'}
           </button>
         </div>

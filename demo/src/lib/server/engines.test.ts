@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   BAN_ACTIVE_INDEX,
   compareBanIndexSearch,
@@ -21,6 +21,10 @@ describe('engine operations', () => {
     source: 'BAN' as const,
     street_name: 'Rue de Rivoli'
   };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it('resets BAN tiny with fixed OpenSearch-compatible operations', async () => {
     const calls: Array<{ url: string; method: string; body?: string }> = [];
@@ -209,6 +213,33 @@ describe('engine operations', () => {
     expect(bulkCalls).toHaveLength(2);
     expect(bulkCalls[0].body?.includes('75101_0001_00000')).toBe(true);
     expect(bulkCalls[1].body?.includes('75101_0001_01000')).toBe(true);
+  });
+
+  it('allows active BAN lifecycle operations to outlive the generic demo timeout', async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    const fakeFetch = async (url: URL | RequestInfo, init?: RequestInit) => {
+      calls.push(new URL(url.toString()).pathname);
+
+      return new Promise<Response>((resolve, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        signal?.addEventListener('abort', () => {
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+        setTimeout(() => resolve(Response.json({ acknowledged: true })), 3_000);
+      });
+    };
+
+    const load = loadBanDocuments('surch', BAN_ACTIVE_INDEX, [banDocument], fakeFetch);
+    for (let index = 0; index < 4; index += 1) {
+      await vi.advanceTimersByTimeAsync(3_000);
+    }
+
+    await expect(load).resolves.toMatchObject({
+      engine: 'surch',
+      index: BAN_ACTIVE_INDEX
+    });
+    expect(calls).toEqual(['/ban_addresses', '/ban_addresses', '/_bulk', '/ban_addresses/_refresh']);
   });
 
   it('runs a controlled free search on the active BAN index', async () => {

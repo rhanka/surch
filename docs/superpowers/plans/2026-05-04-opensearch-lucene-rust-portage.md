@@ -253,7 +253,13 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 
 ### Task 9: Demo Subproject And BAN Comparison Harness
 
-**Status:** V1 scaffold pushed in `c0a1e7d`; V2 address autocomplete/map and external BAN dataset support in progress.
+**Status:** V1 scaffold pushed in `c0a1e7d`; V2 address autocomplete/map and external BAN dataset support is usable with Surch and local OpenSearch. OpenSearch local orchestration scripts and the in-process BAN benchmark harness are present; the remaining benchmark work is the publishable Surch-vs-OpenSearch methodology/report, not the demo smoke path.
+
+**Progress Report 2026-05-09**
+
+- **Fait:** official BAN Paris autocomplete uses `adresses-75.csv.gz` with 25,000 bounded rows; the UI no longer shows `ban_tiny` suggestions by default; Surch and OpenSearch both load the active BAN dataset into `ban_addresses` through chunked `_bulk`; Surch `_bulk` now accepts bodies above the Axum default limit; selected-address compare returns the expected top hit on both engines; Playwright verifies load, selection, compare enablement, absence of static tiny suggestions, and `Surch`/`OpenSearch` status `ok`; shell-only OpenSearch lifecycle scripts exist under `scripts/bench/`; `ban-bench` now reports reproducible p50/p95 guardrailed metrics.
+- **Reste à faire:** final publishable benchmark report and a symmetric HTTP benchmark mode remain open. Demo V2 is roughly 92% complete; the publishable benchmark is roughly 40% complete.
+- **Attendu:** no user action is needed for the current demo path; UAT can start once this verification commit is pushed.
 
 **Files:**
 - Create under `demo/`
@@ -313,6 +319,11 @@ Expected: reset commit contains only governance, archive moves, cleanup inventor
 - [x] Show selected addresses on an OpenStreetMap/Leaflet map with visible attribution.
 - [x] Compare Surch and OpenSearch in side-by-side panels with top hit, overlap, timings, and guardrails.
 - [x] Convert OpenSearch upstream failures, non-JSON responses, and timeouts into structured demo JSON errors instead of opaque SvelteKit 500 pages.
+- [x] Load the active external BAN dataset into Surch through the fixed `ban_addresses` index with chunked `_bulk`.
+- [x] Disable compare until an address suggestion is explicitly selected; Playwright covers the disabled/enabled state.
+- [x] Add shell-only OpenSearch lifecycle scripts for a dedicated local BAN demo node.
+- [x] Raise the Surch API `_bulk` body limit with a targeted route-level test.
+- [x] Start or orchestrate OpenSearch locally and verify the OpenSearch comparison column becomes `ok`.
 - [x] Keep the benchmark guardrail: no global Surch/OpenSearch performance ratio while runtime paths and scoring are not symmetric.
 - [x] Run `npm run check`, `npm run test`, `npm run build`, Rust targeted tests, and `cargo run -p portage-ledger -- language-policy .`.
 - [ ] Commit with `feat(demo): add ban autocomplete map`.
@@ -337,12 +348,12 @@ as an in-process in-memory API router.
   - fixed heap;
   - healthcheck before loading;
   - index cleanup before each measured run.
-- [ ] For Surch, report runtime mode explicitly:
+- [x] For Surch, report runtime mode explicitly:
   - `Surch in-process` for the current smoke benchmark;
   - `Surch HTTP` only after a server binary exists.
-- [ ] Record metrics:
+- [x] Record smoke-benchmark metrics for the current Surch in-process path:
   - ingestion duration and docs/s;
-  - min, p50, p95, p99, max latency;
+  - min, p50, p95, max latency;
   - error count;
   - total hits and top hit ID;
   - host, OS, CPU, memory, OpenSearch version/image, heap, Surch commit, Rust profile, dataset size.

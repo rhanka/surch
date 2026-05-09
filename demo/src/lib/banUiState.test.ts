@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { BanDocument } from './types';
 import {
+  banDatasetUiState,
+  canCompareAddress,
+  compareAddressError,
   datasetStatus,
   extractSuggestionDocuments,
   shouldRequestSuggestions
@@ -42,5 +45,58 @@ describe('BAN demo UI state', () => {
         }
       })
     ).toBe('adresses-75.csv.gz: 25000 adresse(s) prêtes');
+  });
+
+  it('blocks comparison until a BAN address has been selected', () => {
+    expect(canCompareAddress(null)).toBe(false);
+    expect(compareAddressError(null)).toBe('Sélectionne une adresse avant de comparer.');
+
+    expect(canCompareAddress(officialDocument)).toBe(true);
+    expect(compareAddressError(officialDocument)).toBeNull();
+  });
+
+  it('marks ban_tiny as the local visual fallback instead of the active BAN dataset', () => {
+    expect(
+      banDatasetUiState({
+        summary: {
+          name: 'ban_tiny',
+          documentCount: 3
+        },
+        source: {
+          kind: 'tiny',
+          offline: true,
+          downloadCommand: 'npm run ban:download'
+        }
+      })
+    ).toEqual({
+      documentCount: 3,
+      isActiveDataset: false,
+      name: 'ban_tiny',
+      sourceLabel: 'Fallback local: ban_tiny',
+      status: 'ban_tiny: 3 adresse(s) prêtes',
+      usesTinyFallback: true
+    });
+  });
+
+  it('marks a loaded BAN CSV as the active dataset', () => {
+    expect(
+      banDatasetUiState({
+        summary: {
+          name: 'adresses-75.csv.gz',
+          documentCount: 25000
+        },
+        source: {
+          kind: 'csv',
+          path: 'data/ban/adresses-75.csv.gz'
+        }
+      })
+    ).toEqual({
+      documentCount: 25000,
+      isActiveDataset: true,
+      name: 'adresses-75.csv.gz',
+      sourceLabel: 'Dataset actif: adresses-75.csv.gz',
+      status: 'adresses-75.csv.gz: 25000 adresse(s) prêtes',
+      usesTinyFallback: false
+    });
   });
 });

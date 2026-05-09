@@ -15,6 +15,9 @@ use tower::ServiceExt;
 
 const BAN_TINY_NDJSON: &str =
     include_str!("../../../tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson");
+const BAN_TINY_ORACLE: &str = "tests/opensearch_compat/oracle/replays/ban_tiny_search.json";
+const BAN_TINY_DOCUMENTS: u64 = 3;
+const SINGLE_HIT_COUNT: u64 = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1_000;
 
 #[tokio::main]
@@ -101,22 +104,23 @@ async fn run_ban_poc() -> Result<(), CliError> {
 
     println!("Surch BAN PoC");
     println!("dataset: ban_tiny");
-    println!("documents: 3");
+    println!("documents: {BAN_TINY_DOCUMENTS}");
     println!("count: {count}");
     println!("match label: {match_label}");
     println!("bool address: {bool_address}");
     println!("fuzzy label: {fuzzy_label}");
-    println!("oracle: tests/opensearch_compat/oracle/replays/ban_tiny_search.json");
+    println!("oracle: {BAN_TINY_ORACLE}");
 
     Ok(())
 }
 
 async fn run_ban_bench(iterations: usize) -> Result<(), CliError> {
-    let load_elapsed = bench_load(iterations).await?;
+    let load_metric = bench_load(iterations).await?;
     let router = load_ban_tiny().await?;
-    let count_elapsed = bench_count(router.clone(), iterations).await?;
-    let match_elapsed = bench_search(
+    let count_metric = bench_count(router.clone(), iterations).await?;
+    let match_metric = bench_search(
         router.clone(),
+        "search_match_label",
         iterations,
         json!({
             "query": {
@@ -125,10 +129,12 @@ async fn run_ban_bench(iterations: usize) -> Result<(), CliError> {
                 }
             }
         }),
+        "75101_0001_00001",
     )
     .await?;
-    let bool_elapsed = bench_search(
+    let bool_metric = bench_search(
         router.clone(),
+        "search_bool_address",
         iterations,
         json!({
             "query": {
@@ -148,10 +154,12 @@ async fn run_ban_bench(iterations: usize) -> Result<(), CliError> {
                 }
             }
         }),
+        "33063_0002_00010B",
     )
     .await?;
-    let fuzzy_elapsed = bench_search(
+    let fuzzy_metric = bench_search(
         router,
+        "search_fuzzy_label",
         iterations,
         json!({
             "query": {
@@ -163,19 +171,26 @@ async fn run_ban_bench(iterations: usize) -> Result<(), CliError> {
                 }
             }
         }),
+        "67482_0003_00007",
     )
     .await?;
 
     println!("Surch BAN bench");
     println!("dataset: ban_tiny");
-    println!("documents: 3");
+    println!("documents: {BAN_TINY_DOCUMENTS}");
     println!("iterations: {iterations}");
-    print_metric("load_ban_tiny", iterations, load_elapsed);
-    print_metric("count_match_all", iterations, count_elapsed);
-    print_metric("search_match_label", iterations, match_elapsed);
-    print_metric("search_bool_address", iterations, bool_elapsed);
-    print_metric("search_fuzzy_label", iterations, fuzzy_elapsed);
-    println!("note: local in-memory router benchmark; compare only on the same host/build.");
+    println!("oracle: {BAN_TINY_ORACLE}");
+    println!("runtime: Surch in-process axum router");
+    print_metric(&load_metric);
+    print_metric(&count_metric);
+    print_metric(&match_metric);
+    print_metric(&bool_metric);
+    print_metric(&fuzzy_metric);
+    println!("guardrails:");
+    println!("  - Surch in-process axum router only; no HTTP server is started");
+    println!("  - no OpenSearch ratio; this harness does not run OpenSearch");
+    println!("  - compare only on the same host/build only");
+    println!("  - responses are validated against BAN tiny oracle counts and top hit ids");
 
     Ok(())
 }
@@ -196,7 +211,7 @@ async fn load_ban_tiny() -> Result<Router, CliError> {
 }
 
 async fn count_documents(router: Router) -> Result<u64, CliError> {
-    let response = execute_json(router, Method::POST, "/ban_tiny/_count", None).await?;
+    let response = execute_json(router, Method::GET, "/ban_tiny/_count", None).await?;
     response
         .get("count")
         .and_then(Value::as_u64)
@@ -258,43 +273,115 @@ async fn execute_json(
     Ok(value)
 }
 
-async fn bench_load(iterations: usize) -> Result<Duration, CliError> {
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let _router = load_ban_tiny().await?;
-    }
-
-    Ok(start.elapsed())
+#[derive(Debug)]
+struct BenchMetric {
+    operation: &'static str,
+    iterations: usize,
+    count: u64,
+    latencies: Vec<Duration>,
 }
 
-async fn bench_count(router: Router, iterations: usize) -> Result<Duration, CliError> {
-    let start = Instant::now();
+impl BenchMetric {
+    fn new(
+        operation: &'static str,
+        iterations: usize,
+        count: u64,
+        latencies: Vec<Duration>,
+    ) -> Result<Self, CliError> {
+        if latencies.len() != iterations {
+            return Err(CliError::UnexpectedResponse(
+                "benchmark latency sample count mismatch",
+            ));
+        }
+
+        Ok(Self {
+            operation,
+            iterations,
+            count,
+            latencies,
+        })
+    }
+
+    fn latency_summary(&self) -> LatencySummary {
+        LatencySummary::from_samples(&self.latencies)
+    }
+}
+
+#[derive(Debug)]
+struct LatencySummary {
+    min: Duration,
+    p50: Duration,
+    p95: Duration,
+    max: Duration,
+    total: Duration,
+}
+
+impl LatencySummary {
+    fn from_samples(samples: &[Duration]) -> Self {
+        debug_assert!(!samples.is_empty());
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let total = samples
+            .iter()
+            .copied()
+            .fold(Duration::ZERO, |sum, sample| sum + sample);
+
+        Self {
+            min: sorted[0],
+            p50: percentile(&sorted, 50),
+            p95: percentile(&sorted, 95),
+            max: sorted[sorted.len() - 1],
+            total,
+        }
+    }
+}
+
+async fn bench_load(iterations: usize) -> Result<BenchMetric, CliError> {
+    let mut latencies = Vec::with_capacity(iterations);
     for _ in 0..iterations {
+        let start = Instant::now();
+        let _router = load_ban_tiny().await?;
+        latencies.push(start.elapsed());
+    }
+
+    BenchMetric::new("load_ban_tiny", iterations, BAN_TINY_DOCUMENTS, latencies)
+}
+
+async fn bench_count(router: Router, iterations: usize) -> Result<BenchMetric, CliError> {
+    let mut latencies = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
         let count = count_documents(router.clone()).await?;
-        if count != 3 {
+        latencies.push(start.elapsed());
+        if count != BAN_TINY_DOCUMENTS {
             return Err(CliError::UnexpectedResponse(
                 "count benchmark expected 3 docs",
             ));
         }
     }
 
-    Ok(start.elapsed())
+    BenchMetric::new("count_match_all", iterations, BAN_TINY_DOCUMENTS, latencies)
 }
 
 async fn bench_search(
     router: Router,
+    operation: &'static str,
     iterations: usize,
     body: Value,
-) -> Result<Duration, CliError> {
-    let start = Instant::now();
+    expected_top_hit_id: &'static str,
+) -> Result<BenchMetric, CliError> {
+    let body = body.to_string();
+    let mut latencies = Vec::with_capacity(iterations);
     for _ in 0..iterations {
+        let start = Instant::now();
         let response = execute_json(
             router.clone(),
             Method::POST,
             "/ban_tiny/_search",
-            Some(body.to_string()),
+            Some(body.clone()),
         )
         .await?;
+        latencies.push(start.elapsed());
         let total = response
             .pointer("/hits/total/value")
             .and_then(Value::as_u64)
@@ -306,9 +393,20 @@ async fn bench_search(
                 "search benchmark expected one hit",
             ));
         }
+        let top_hit_id = response
+            .pointer("/hits/hits/0/_id")
+            .and_then(Value::as_str)
+            .ok_or(CliError::UnexpectedResponse(
+                "search benchmark response misses top hit id",
+            ))?;
+        if top_hit_id != expected_top_hit_id {
+            return Err(CliError::UnexpectedResponse(
+                "search benchmark top hit id mismatched oracle",
+            ));
+        }
     }
 
-    Ok(start.elapsed())
+    BenchMetric::new(operation, iterations, SINGLE_HIT_COUNT, latencies)
 }
 
 fn parse_bench_iterations(mut args: impl Iterator<Item = String>) -> Result<usize, CliError> {
@@ -339,11 +437,34 @@ fn parse_bench_iterations(mut args: impl Iterator<Item = String>) -> Result<usiz
     Ok(iterations)
 }
 
-fn print_metric(label: &str, iterations: usize, elapsed: Duration) {
-    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
-    let micros_per_op = seconds * 1_000_000.0 / iterations as f64;
-    let ops_per_second = iterations as f64 / seconds;
-    println!("{label}: {micros_per_op:.2} us/op, {ops_per_second:.2} ops/s");
+fn print_metric(metric: &BenchMetric) {
+    let latency = metric.latency_summary();
+    let total_seconds = latency.total.as_secs_f64().max(f64::EPSILON);
+    let ops_per_second = metric.iterations as f64 / total_seconds;
+
+    println!(
+        "{}: operation={} count={} iterations={} p50_us={:.2} p95_us={:.2} min_us={:.2} max_us={:.2} ops_per_second={:.2}",
+        metric.operation,
+        metric.operation,
+        metric.count,
+        metric.iterations,
+        micros(latency.p50),
+        micros(latency.p95),
+        micros(latency.min),
+        micros(latency.max),
+        ops_per_second,
+    );
+}
+
+fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
+    debug_assert!(!sorted.is_empty());
+    let rank = (percentile as f64 / 100.0 * sorted.len() as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index]
+}
+
+fn micros(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000_000.0
 }
 
 fn print_help() {
@@ -356,8 +477,8 @@ fn print_help() {
 fn print_ban_compare_plan() {
     println!("Surch BAN compare plan");
     println!("dataset: ban_tiny");
-    println!("documents: 3");
-    println!("oracle required: tests/opensearch_compat/oracle/replays/ban_tiny_search.json");
+    println!("documents: {BAN_TINY_DOCUMENTS}");
+    println!("oracle required: {BAN_TINY_ORACLE}");
     println!("OpenSearch over HTTP: measure only after healthcheck and index reset");
     println!("Surch in-process: current smoke path; label separately from HTTP runtimes");
     println!("operations: create index, bulk ingest, refresh, count, match, bool, fuzzy");

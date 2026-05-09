@@ -30,6 +30,8 @@ logs/
 
 # Test coverage
 coverage/
+.playwright-mcp/
+surch-ban-*.png
 
 # Backup files
 *.bak

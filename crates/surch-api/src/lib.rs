@@ -2,6 +2,7 @@
 //! OpenSearch-compatible REST API boundary.
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post, put},
     Router,
 };
@@ -18,11 +19,16 @@ pub mod state;
 pub use bulk::{parse_bulk_ndjson, BulkOperation, BulkParseError};
 pub use error::OpenSearchError;
 
+const BULK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
 /// Build the P0 OpenSearch-compatible API router.
 pub fn app_router() -> Router {
     Router::new()
         .route("/", get(root::root_handler))
-        .route("/_bulk", post(bulk::bulk_state_handler))
+        .route(
+            "/_bulk",
+            post(bulk::bulk_state_handler).layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/:index",
             put(index::create_index_handler).delete(index::delete_index_handler),

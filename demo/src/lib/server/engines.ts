@@ -20,6 +20,7 @@ import { getBanTinyBulkNdjson, getBanTinyFixture } from './fixture';
 type FetchLike = typeof fetch;
 
 const REQUEST_TIMEOUT_MS = 2_500;
+const ACTIVE_LOAD_REQUEST_TIMEOUT_MS = 60_000;
 const BULK_REQUEST_TIMEOUT_MS = 60_000;
 const ACTIVE_SEARCH_TIMEOUT_MS = 30_000;
 const BULK_CHUNK_SIZE = 1_000;
@@ -135,14 +136,29 @@ export async function loadBanDocuments(
   const indexPath = `/${parsedIndex}`;
   const refreshPath = `/${parsedIndex}/_refresh`;
 
-  const deleteResponse = await callEngine(parsedEngine, 'DELETE', indexPath, undefined, fetchImpl);
+  const activeLoadTimeout = { timeoutMs: ACTIVE_LOAD_REQUEST_TIMEOUT_MS };
+  const deleteResponse = await callEngine(
+    parsedEngine,
+    'DELETE',
+    indexPath,
+    undefined,
+    fetchImpl,
+    activeLoadTimeout
+  );
   operations.push({ path: indexPath, status: deleteResponse.status });
 
   if (deleteResponse.status !== 200 && deleteResponse.status !== 404) {
     throwUnexpectedStatus(parsedEngine, indexPath, '200 or 404', deleteResponse);
   }
 
-  const createResponse = await callEngine(parsedEngine, 'PUT', indexPath, undefined, fetchImpl);
+  const createResponse = await callEngine(
+    parsedEngine,
+    'PUT',
+    indexPath,
+    undefined,
+    fetchImpl,
+    activeLoadTimeout
+  );
   operations.push({ path: indexPath, status: createResponse.status });
 
   if (createResponse.status !== 200) {
@@ -165,7 +181,14 @@ export async function loadBanDocuments(
     }
   }
 
-  const refreshResponse = await callEngine(parsedEngine, 'POST', refreshPath, undefined, fetchImpl);
+  const refreshResponse = await callEngine(
+    parsedEngine,
+    'POST',
+    refreshPath,
+    undefined,
+    fetchImpl,
+    activeLoadTimeout
+  );
   operations.push({ path: refreshPath, status: refreshResponse.status });
 
   if (refreshResponse.status !== 200) {

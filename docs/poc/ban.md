@@ -92,6 +92,45 @@ The downloaded files live under `demo/data/ban/`, which is git-ignored.
 The backend parser caps loaded rows through `BAN_SAMPLE_LIMIT` so the demo can
 remain responsive while Surch is still in an in-memory bootstrap mode.
 
+## Local BAN UAT Flow
+
+Expected local flow for the SvelteKit BAN demo:
+
+1. Download the BAN extract:
+
+   ```bash
+   cd demo
+   npm run ban:download
+   ```
+
+2. Start the local Surch API and a local OpenSearch node. The demo defaults are
+   `SURCH_URL=http://127.0.0.1:7700` and
+   `OPENSEARCH_URL=http://127.0.0.1:9200`; override them in the demo environment
+   if either service runs elsewhere. OpenSearch must be running and reachable
+   before loading/comparing if the OpenSearch column is expected to show `ok`.
+
+   ```bash
+   scripts/bench/opensearch-start.sh
+   scripts/bench/opensearch-wait.sh
+   ```
+
+3. Start the demo with the downloaded BAN file:
+
+   ```bash
+   BAN_CSV_PATH=data/ban/adresses-75.csv.gz npm run dev
+   ```
+
+4. In the browser, click **Charger BAN**. This loads the active BAN dataset into
+   Surch and OpenSearch through the fixed `ban_addresses` index. If the page
+   still reports `ban_tiny`, it is showing the local fallback dataset rather
+   than the downloaded BAN extract.
+
+5. Type an address, select one of the BAN suggestions, then click **Comparer**.
+   Comparing without selecting a suggestion is outside the intended UAT path.
+   With both engines running, both comparison columns should report `ok`; if
+   OpenSearch is stopped or unreachable, only the OpenSearch column should show
+   the upstream error.
+
 The demo/benchmark zone is explicitly Rust, TypeScript, and shell only. Do not
 add Python scripts, Python notebooks, or Python one-off tooling here.
 
