@@ -458,7 +458,7 @@ fn parse_track_total_hits(value: &Value) -> Result<TrackTotalHits, OpenSearchErr
     }
 }
 
-fn parse_source_filter(value: &Value) -> Result<SourceFilter, OpenSearchError> {
+pub fn parse_source_filter(value: &Value) -> Result<SourceFilter, OpenSearchError> {
     match value {
         Value::Bool(false) => Ok(SourceFilter::Disabled),
         Value::Bool(true) => Ok(SourceFilter::IncludesExcludes {
@@ -947,7 +947,7 @@ fn build_hit(document: &StoredDocument, filter: Option<&SourceFilter>) -> Value 
     hit
 }
 
-fn apply_source_filter(source: &Value, filter: Option<&SourceFilter>) -> Option<Value> {
+pub fn apply_source_filter(source: &Value, filter: Option<&SourceFilter>) -> Option<Value> {
     match filter {
         None => Some(source.clone()),
         Some(SourceFilter::Disabled) => None,

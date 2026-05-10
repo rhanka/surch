@@ -266,6 +266,17 @@ impl AppState {
             .collect()
     }
 
+    pub fn get_document(&self, index: &str, id: &str) -> Option<Value> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .and_then(|data| data.documents.get(id).cloned())
+    }
+
     pub fn documents(&self, index: &str) -> Vec<StoredDocument> {
         let store = self
             .store

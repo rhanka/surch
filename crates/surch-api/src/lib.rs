@@ -12,6 +12,7 @@ pub mod count;
 pub mod document;
 pub mod error;
 pub mod index;
+pub mod mget;
 pub mod root;
 pub mod search;
 pub mod state;
@@ -55,6 +56,14 @@ pub fn app_router() -> Router {
         .route(
             "/:index/_search",
             post(search::search_handler).get(search::search_handler),
+        )
+        .route(
+            "/_mget",
+            post(mget::mget_state_handler).get(mget::mget_state_handler),
+        )
+        .route(
+            "/:index/_mget",
+            post(mget::index_mget_state_handler).get(mget::index_mget_state_handler),
         )
         .with_state(state::AppState::default())
 }
