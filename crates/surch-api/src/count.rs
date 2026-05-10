@@ -11,9 +11,9 @@ use std::collections::BTreeSet;
 use crate::{
     index::validate_index_name,
     search::{
-        exists_field_matches, parse_exists_clause, parse_prefix_clause, parse_range_bounds,
-        parse_terms_clause, parse_wildcard_clause, prefix_field_matches, range_field_matches,
-        wildcard_field_matches, RangeBounds,
+        exists_field_matches, multi_match_matches, parse_exists_clause, parse_multi_match_clause,
+        parse_prefix_clause, parse_range_bounds, parse_terms_clause, parse_wildcard_clause,
+        prefix_field_matches, range_field_matches, wildcard_field_matches, RangeBounds,
     },
     state::AppState,
     OpenSearchError,
@@ -36,6 +36,7 @@ pub enum CountQuery {
     Terms { field: String, values: Vec<String> },
     Prefix { field: String, value: String },
     Wildcard { field: String, pattern: String },
+    MultiMatch { query: String, fields: Vec<String> },
 }
 
 /// OpenSearch-compatible `_count` response for the bootstrap engine-less API.
@@ -122,7 +123,8 @@ fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64
         | CountQuery::Exists { .. }
         | CountQuery::Terms { .. }
         | CountQuery::Prefix { .. }
-        | CountQuery::Wildcard { .. } => state
+        | CountQuery::Wildcard { .. }
+        | CountQuery::MultiMatch { .. } => state
             .documents(index)
             .into_iter()
             .filter(|document| query_matches(query, &document.source))
@@ -224,6 +226,10 @@ fn parse_count_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
         "wildcard" => {
             let (field, pattern) = parse_wildcard_clause(query_body)?;
             Ok(CountQuery::Wildcard { field, pattern })
+        }
+        "multi_match" => {
+            let (query, fields) = parse_multi_match_clause(query_body)?;
+            Ok(CountQuery::MultiMatch { query, fields })
         }
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -334,6 +340,7 @@ fn query_matches(query: &CountQuery, source: &Value) -> bool {
             .any(|value| term_field_matches(source, field, value)),
         CountQuery::Prefix { field, value } => prefix_field_matches(source, field, value),
         CountQuery::Wildcard { field, pattern } => wildcard_field_matches(source, field, pattern),
+        CountQuery::MultiMatch { query, fields } => multi_match_matches(source, fields, query),
     }
 }
 

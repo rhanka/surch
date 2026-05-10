@@ -1238,3 +1238,155 @@ async fn search_router_rejects_empty_wildcard_with_opensearch_error() {
         })
     );
 }
+
+#[tokio::test]
+async fn search_router_multi_match_matches_query_in_any_listed_field() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-1",
+        r#"{"name":"Rust Search","description":"engine internals"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "sku-2",
+        r#"{"name":"Cooking","description":"rust prevention manual"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "sku-3",
+        r#"{"name":"Kayak","description":"river adventures"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"multi_match":{"query":"rust","fields":["name","description"]}},"sort":[{"name":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-2", "sku-1"]);
+}
+
+#[tokio::test]
+async fn search_router_multi_match_requires_all_query_tokens_in_at_least_one_field() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-1",
+        r#"{"name":"rust","description":"search engine"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "sku-2",
+        r#"{"name":"rust search","description":""}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"multi_match":{"query":"rust search","fields":["name","description"]}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-2"]);
+}
+
+#[tokio::test]
+async fn search_router_rejects_multi_match_without_fields_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"multi_match":{"query":"rust"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "multi_match query must contain `fields`"
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn search_router_rejects_multi_match_unknown_field_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"multi_match":{"query":"rust","fields":["name"],"bogus":1}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "unsupported multi_match field `bogus`"
+            },
+            "status": 400
+        })
+    );
+}

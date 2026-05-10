@@ -103,6 +103,10 @@ pub enum SearchQuery {
         field: String,
         pattern: String,
     },
+    MultiMatch {
+        query: String,
+        fields: Vec<String>,
+    },
 }
 
 /// Inclusive/exclusive numeric or lexicographic bounds for `range` queries.
@@ -603,6 +607,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "terms" => parse_terms_query(query_body),
         "prefix" => parse_prefix_query(query_body),
         "wildcard" => parse_wildcard_query(query_body),
+        "multi_match" => parse_multi_match_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -859,6 +864,84 @@ fn parse_wildcard_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     Ok(SearchQuery::Wildcard { field, pattern })
 }
 
+/// Parse a `multi_match` query body and return `(query_text, fields)`.
+pub fn parse_multi_match_clause(value: &Value) -> Result<(String, Vec<String>), OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "multi_match query body must be an object",
+        )
+    })?;
+
+    let query_value = object.get("query").ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "multi_match query must contain `query`",
+        )
+    })?;
+    let query_text = parse_scalar_query_text(query_value, "multi_match query")?;
+
+    let fields_value = object.get("fields").ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "multi_match query must contain `fields`",
+        )
+    })?;
+    let fields_array = fields_value.as_array().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "multi_match `fields` must be an array",
+        )
+    })?;
+    if fields_array.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "multi_match `fields` must not be empty",
+        ));
+    }
+    let fields = fields_array
+        .iter()
+        .map(|item| match item {
+            Value::String(text) if !text.is_empty() => Ok(text.clone()),
+            Value::String(_) => Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "multi_match `fields` entries must not be empty",
+            )),
+            _ => Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "multi_match `fields` entries must be strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "query" | "fields" | "type" | "operator" | "tie_breaker" | "boost"
+        ) {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("unsupported multi_match field `{key}`"),
+            ));
+        }
+    }
+
+    Ok((query_text, fields))
+}
+
+fn parse_multi_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let (query, fields) = parse_multi_match_clause(value)?;
+    Ok(SearchQuery::MultiMatch { query, fields })
+}
+
 fn parse_range_bound_value(value: &Value) -> Result<RangeValue, OpenSearchError> {
     match value {
         Value::Number(number) => number.as_f64().map(RangeValue::Number).ok_or_else(|| {
@@ -1003,6 +1086,7 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
             .any(|value| term_field_matches(source, field, value)),
         SearchQuery::Prefix { field, value } => prefix_field_matches(source, field, value),
         SearchQuery::Wildcard { field, pattern } => wildcard_field_matches(source, field, pattern),
+        SearchQuery::MultiMatch { query, fields } => multi_match_matches(source, fields, query),
     }
 }
 
@@ -1042,6 +1126,12 @@ fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
                 .any(|field_token| field_token == &query)
         })
         .unwrap_or(false)
+}
+
+pub fn multi_match_matches(source: &Value, fields: &[String], query: &str) -> bool {
+    fields
+        .iter()
+        .any(|field| field_matches(source, field, query))
 }
 
 pub fn prefix_field_matches(source: &Value, field: &str, prefix: &str) -> bool {
