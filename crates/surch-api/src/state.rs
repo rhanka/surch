@@ -18,6 +18,7 @@ pub struct AppState {
 #[derive(Default)]
 struct MemoryStore {
     indices: BTreeMap<String, InMemoryIndex>,
+    aliases: BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -173,6 +174,17 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
         store.indices.remove(index);
+        let stale_aliases: Vec<String> = store
+            .aliases
+            .iter_mut()
+            .filter_map(|(alias, indices)| {
+                indices.remove(index);
+                indices.is_empty().then(|| alias.clone())
+            })
+            .collect();
+        for alias in stale_aliases {
+            store.aliases.remove(&alias);
+        }
     }
 
     pub fn refresh_index(&self, _index: &str) {}
@@ -297,6 +309,82 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         store.indices.keys().cloned().collect()
+    }
+
+    pub fn add_alias(&self, index: &str, alias: &str) -> bool {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if !store.indices.contains_key(index) {
+            return false;
+        }
+        store
+            .aliases
+            .entry(alias.to_owned())
+            .or_default()
+            .insert(index.to_owned());
+        true
+    }
+
+    pub fn remove_alias(&self, index: &str, alias: &str) -> bool {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        let mut removed = false;
+        if let Some(entry) = store.aliases.get_mut(alias) {
+            removed = entry.remove(index);
+            if entry.is_empty() {
+                store.aliases.remove(alias);
+            }
+        }
+        removed
+    }
+
+    pub fn alias_exists(&self, alias: &str) -> bool {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.aliases.contains_key(alias)
+    }
+
+    pub fn aliases_for_index(&self, index: &str) -> Vec<String> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .aliases
+            .iter()
+            .filter(|(_, indices)| indices.contains(index))
+            .map(|(alias, _)| alias.clone())
+            .collect()
+    }
+
+    pub fn indices_for_alias(&self, alias: &str) -> Vec<String> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .aliases
+            .get(alias)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn all_aliases(&self) -> BTreeMap<String, Vec<String>> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .aliases
+            .iter()
+            .map(|(alias, indices)| (alias.clone(), indices.iter().cloned().collect()))
+            .collect()
     }
 
     pub fn all_mappings(&self) -> BTreeMap<String, Value> {

@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 
+pub mod aliases;
 pub mod analyze;
 pub mod bulk;
 pub mod cat;
@@ -110,6 +111,19 @@ pub fn app_router() -> Router {
             get(cluster::cluster_health_index_handler),
         )
         .route("/_cat/indices", get(cat::cat_indices_handler))
+        .route(
+            "/_aliases",
+            post(aliases::aliases_state_handler).put(aliases::aliases_state_handler),
+        )
+        .route("/_alias", get(aliases::list_all_aliases_handler))
+        .route("/_alias/:name", get(aliases::list_alias_by_name_handler))
+        .route("/:index/_alias", get(aliases::list_index_aliases_handler))
+        .route(
+            "/:index/_alias/:name",
+            get(aliases::get_index_alias_handler)
+                .put(aliases::put_index_alias_handler)
+                .delete(aliases::delete_index_alias_handler),
+        )
         .with_state(state::AppState::default())
 }
 
