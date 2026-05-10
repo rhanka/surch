@@ -88,6 +88,13 @@ pub enum SearchQuery {
         field: String,
         bounds: RangeBounds,
     },
+    Exists {
+        field: String,
+    },
+    Terms {
+        field: String,
+        values: Vec<String>,
+    },
 }
 
 /// Inclusive/exclusive numeric or lexicographic bounds for `range` queries.
@@ -584,6 +591,8 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "bool" => parse_bool_query(query_body),
         "fuzzy" => parse_fuzzy_query(query_body),
         "range" => parse_range_query(query_body),
+        "exists" => parse_exists_query(query_body),
+        "terms" => parse_terms_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -744,6 +753,71 @@ fn parse_range_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     Ok(SearchQuery::Range { field, bounds })
 }
 
+/// Parse a `terms` query body and return `(field, values)`.
+pub fn parse_terms_clause(value: &Value) -> Result<(String, Vec<String>), OpenSearchError> {
+    let (field, body) = parse_single_field_query("terms", value)?;
+    let array = body.as_array().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "terms query value must be an array",
+        )
+    })?;
+    if array.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "terms query value array must not be empty",
+        ));
+    }
+    let values = array
+        .iter()
+        .map(|item| parse_scalar_query_text(item, "terms query value"))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((field, values))
+}
+
+fn parse_terms_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let (field, values) = parse_terms_clause(value)?;
+    Ok(SearchQuery::Terms { field, values })
+}
+
+/// Parse an `exists` query body and return the target field name.
+pub fn parse_exists_clause(value: &Value) -> Result<String, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "exists query body must be an object",
+        )
+    })?;
+    let field = object.get("field").ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "exists query must contain `field`",
+        )
+    })?;
+    match field {
+        Value::String(text) if !text.is_empty() => Ok(text.clone()),
+        Value::String(_) => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "exists query `field` must not be empty",
+        )),
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "exists query `field` must be a string",
+        )),
+    }
+}
+
+fn parse_exists_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let field = parse_exists_clause(value)?;
+    Ok(SearchQuery::Exists { field })
+}
+
 fn parse_range_bound_value(value: &Value) -> Result<RangeValue, OpenSearchError> {
     match value {
         Value::Number(number) => number.as_f64().map(RangeValue::Number).ok_or_else(|| {
@@ -882,6 +956,10 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
             fuzziness,
         } => fuzzy_field_matches(source, field, value, *fuzziness),
         SearchQuery::Range { field, bounds } => range_field_matches(source, field, bounds),
+        SearchQuery::Exists { field } => exists_field_matches(source, field),
+        SearchQuery::Terms { field, values } => values
+            .iter()
+            .any(|value| term_field_matches(source, field, value)),
     }
 }
 
@@ -921,6 +999,15 @@ fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
                 .any(|field_token| field_token == &query)
         })
         .unwrap_or(false)
+}
+
+pub fn exists_field_matches(source: &Value, field: &str) -> bool {
+    match source.get(field) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(text)) => !text.is_empty(),
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    }
 }
 
 pub fn range_field_matches(source: &Value, field: &str, bounds: &RangeBounds) -> bool {
