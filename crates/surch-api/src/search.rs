@@ -95,6 +95,14 @@ pub enum SearchQuery {
         field: String,
         values: Vec<String>,
     },
+    Prefix {
+        field: String,
+        value: String,
+    },
+    Wildcard {
+        field: String,
+        pattern: String,
+    },
 }
 
 /// Inclusive/exclusive numeric or lexicographic bounds for `range` queries.
@@ -593,6 +601,8 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "range" => parse_range_query(query_body),
         "exists" => parse_exists_query(query_body),
         "terms" => parse_terms_query(query_body),
+        "prefix" => parse_prefix_query(query_body),
+        "wildcard" => parse_wildcard_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -818,6 +828,37 @@ fn parse_exists_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     Ok(SearchQuery::Exists { field })
 }
 
+/// Parse a `prefix` query body and return `(field, value)`.
+pub fn parse_prefix_clause(value: &Value) -> Result<(String, String), OpenSearchError> {
+    let (field, body) = parse_single_field_query("prefix", value)?;
+    let value = parse_term_query_value(body)?;
+    Ok((field, value))
+}
+
+fn parse_prefix_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let (field, value) = parse_prefix_clause(value)?;
+    Ok(SearchQuery::Prefix { field, value })
+}
+
+/// Parse a `wildcard` query body and return `(field, pattern)`.
+pub fn parse_wildcard_clause(value: &Value) -> Result<(String, String), OpenSearchError> {
+    let (field, body) = parse_single_field_query("wildcard", value)?;
+    let pattern = parse_term_query_value(body)?;
+    if pattern.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "wildcard query value must not be empty",
+        ));
+    }
+    Ok((field, pattern))
+}
+
+fn parse_wildcard_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let (field, pattern) = parse_wildcard_clause(value)?;
+    Ok(SearchQuery::Wildcard { field, pattern })
+}
+
 fn parse_range_bound_value(value: &Value) -> Result<RangeValue, OpenSearchError> {
     match value {
         Value::Number(number) => number.as_f64().map(RangeValue::Number).ok_or_else(|| {
@@ -960,6 +1001,8 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
         SearchQuery::Terms { field, values } => values
             .iter()
             .any(|value| term_field_matches(source, field, value)),
+        SearchQuery::Prefix { field, value } => prefix_field_matches(source, field, value),
+        SearchQuery::Wildcard { field, pattern } => wildcard_field_matches(source, field, pattern),
     }
 }
 
@@ -999,6 +1042,75 @@ fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
                 .any(|field_token| field_token == &query)
         })
         .unwrap_or(false)
+}
+
+pub fn prefix_field_matches(source: &Value, field: &str, prefix: &str) -> bool {
+    let prefix = normalize_text(prefix);
+    if prefix.is_empty() {
+        return false;
+    }
+    let Some(text) = field_text(source, field) else {
+        return false;
+    };
+    tokenize_for_search(&text)
+        .iter()
+        .any(|token| token.starts_with(&prefix))
+}
+
+pub fn wildcard_field_matches(source: &Value, field: &str, pattern: &str) -> bool {
+    let pattern = normalize_wildcard_pattern(pattern);
+    if pattern.is_empty() {
+        return false;
+    }
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let Some(text) = field_text(source, field) else {
+        return false;
+    };
+    tokenize_for_search(&text).iter().any(|token| {
+        let token_chars: Vec<char> = token.chars().collect();
+        wildcard_pattern_matches(&pattern_chars, &token_chars)
+    })
+}
+
+fn normalize_wildcard_pattern(pattern: &str) -> String {
+    pattern
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| match character {
+            '*' | '?' => character,
+            other => fold_search_char(other),
+        })
+        .collect()
+}
+
+fn wildcard_pattern_matches(pattern: &[char], text: &[char]) -> bool {
+    let mut pi = 0;
+    let mut ti = 0;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0;
+
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+
+    pi >= pattern.len()
 }
 
 pub fn exists_field_matches(source: &Value, field: &str) -> bool {

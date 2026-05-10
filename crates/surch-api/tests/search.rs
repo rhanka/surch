@@ -1131,3 +1131,110 @@ async fn search_router_rejects_exists_without_field_with_opensearch_error() {
         })
     );
 }
+
+#[tokio::test]
+async fn search_router_prefix_query_matches_token_prefix() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desktop"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"deck chair"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"lamp"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"prefix":{"name":"des"}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn search_router_wildcard_query_matches_star_and_question_patterns() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"desktop"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"chair"}"#).await;
+    index_product(&router, "sku-4", r#"{"name":"dusk"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"wildcard":{"name":"d?s*"}},"sort":[{"name":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1", "sku-2", "sku-4"]);
+}
+
+#[tokio::test]
+async fn search_router_wildcard_query_accepts_value_wrapper() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"wildcard":{"name":{"value":"*esk"}}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn search_router_rejects_empty_wildcard_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"wildcard":{"name":""}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "wildcard query value must not be empty"
+            },
+            "status": 400
+        })
+    );
+}
