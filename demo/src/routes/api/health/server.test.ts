@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { GET } from './+server';
 
 const originalBanCsvPath = process.env.BAN_CSV_PATH;
+const originalBanDataDir = process.env.BAN_DATA_DIR;
 const originalBanSampleLimit = process.env.BAN_SAMPLE_LIMIT;
 const tempDirs: string[] = [];
 
@@ -21,6 +22,8 @@ afterEach(() => {
 
 describe('GET /api/health', () => {
   it('returns demo health without contacting external engines', async () => {
+    process.env.BAN_DATA_DIR = missingBanDataDir();
+
     const response = await GET();
     const body = await response.json();
 
@@ -72,9 +75,19 @@ function restoreBanEnv() {
     process.env.BAN_CSV_PATH = originalBanCsvPath;
   }
 
+  if (originalBanDataDir === undefined) {
+    delete process.env.BAN_DATA_DIR;
+  } else {
+    process.env.BAN_DATA_DIR = originalBanDataDir;
+  }
+
   if (originalBanSampleLimit === undefined) {
     delete process.env.BAN_SAMPLE_LIMIT;
   } else {
     process.env.BAN_SAMPLE_LIMIT = originalBanSampleLimit;
   }
+}
+
+function missingBanDataDir(): string {
+  return join(tmpdir(), 'surch-ban-health-missing');
 }

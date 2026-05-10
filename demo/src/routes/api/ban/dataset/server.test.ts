@@ -1,8 +1,22 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { GET } from './+server';
 
+const originalBanDataDir = process.env.BAN_DATA_DIR;
+
+afterEach(() => {
+  if (originalBanDataDir === undefined) {
+    delete process.env.BAN_DATA_DIR;
+  } else {
+    process.env.BAN_DATA_DIR = originalBanDataDir;
+  }
+});
+
 describe('GET /api/ban/dataset', () => {
-  it('returns the active BAN dataset summary and source profile', async () => {
+  it('returns the tiny fallback summary when no downloaded BAN CSV is available', async () => {
+    process.env.BAN_DATA_DIR = missingBanDataDir();
+
     const response = await GET({} as unknown as Parameters<typeof GET>[0]);
     const body = await response.json();
 
@@ -20,3 +34,7 @@ describe('GET /api/ban/dataset', () => {
     });
   });
 });
+
+function missingBanDataDir(): string {
+  return join(tmpdir(), 'surch-ban-dataset-missing');
+}

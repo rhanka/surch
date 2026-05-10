@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import type { BanDatasetSummary, BanDocument, BanSourceProfile } from '$lib/types';
 import { getBanTinyFixture } from '../fixture';
@@ -27,7 +28,7 @@ export type BanRepository = {
 export async function createBanRepository(
   env: BanRepositoryEnv = process.env
 ): Promise<BanRepository> {
-  const csvPath = env.BAN_CSV_PATH;
+  const csvPath = resolveBanCsvPath(env);
   if (!csvPath) {
     return createTinyRepository();
   }
@@ -52,6 +53,23 @@ export async function createBanRepository(
       officialUrl: inferOfficialUrl(csvPath)
     }
   });
+}
+
+function resolveBanCsvPath(env: BanRepositoryEnv): string | null {
+  if (env.BAN_CSV_PATH) {
+    return env.BAN_CSV_PATH;
+  }
+
+  const dataDir = env.BAN_DATA_DIR?.trim() || 'data/ban';
+  const candidates = [BAN_DOWNLOAD_PROFILES.france, BAN_DOWNLOAD_PROFILES.paris];
+  for (const profile of candidates) {
+    const candidate = join(dataDir, profile.fileName);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 export function createInMemoryBanRepository(input: {

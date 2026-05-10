@@ -1,9 +1,23 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MAX_BAN_SUGGESTIONS } from '$lib/server/ban/schema';
 import { POST } from './+server';
 
+const originalBanDataDir = process.env.BAN_DATA_DIR;
+
+afterEach(() => {
+  if (originalBanDataDir === undefined) {
+    delete process.env.BAN_DATA_DIR;
+  } else {
+    process.env.BAN_DATA_DIR = originalBanDataDir;
+  }
+});
+
 describe('POST /api/ban/suggest', () => {
   it('returns bounded BAN suggestions for a query', async () => {
+    process.env.BAN_DATA_DIR = missingBanDataDir();
+
     const response = await POST({
       request: new Request('http://localhost/api/ban/suggest', {
         method: 'POST',
@@ -21,6 +35,8 @@ describe('POST /api/ban/suggest', () => {
   });
 
   it('caps requested limits at the backend maximum', async () => {
+    process.env.BAN_DATA_DIR = missingBanDataDir();
+
     const response = await POST({
       request: new Request('http://localhost/api/ban/suggest', {
         method: 'POST',
@@ -34,3 +50,7 @@ describe('POST /api/ban/suggest', () => {
     expect(body.suggestions.length).toBeLessThanOrEqual(MAX_BAN_SUGGESTIONS);
   });
 });
+
+function missingBanDataDir(): string {
+  return join(tmpdir(), 'surch-ban-suggest-missing');
+}

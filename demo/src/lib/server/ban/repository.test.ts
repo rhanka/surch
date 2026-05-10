@@ -31,7 +31,7 @@ function makeDocument(index: number): BanDocument {
 
 describe('BAN repository', () => {
   it('uses ban_tiny as the default offline dataset', async () => {
-    const repository = await createBanRepository({});
+    const repository = await createBanRepository({ BAN_DATA_DIR: missingBanDataDir() });
 
     expect(repository.summary()).toMatchObject({
       name: 'ban_tiny',
@@ -47,7 +47,7 @@ describe('BAN repository', () => {
   });
 
   it('suggests Rue de Rivoli for a contains query on the street label', async () => {
-    const repository = await createBanRepository({});
+    const repository = await createBanRepository({ BAN_DATA_DIR: missingBanDataDir() });
     const suggestions = repository.suggest({ query: 'rivo' });
 
     expect(suggestions[0]).toMatchObject({
@@ -82,6 +82,26 @@ describe('BAN repository', () => {
     expect(repository.suggest({ query: 'rivo' })[0].id).toBe('75101_0001_00001');
   });
 
+  it('discovers a downloaded BAN CSV from BAN_DATA_DIR when BAN_CSV_PATH is unset', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'surch-ban-data-'));
+    const path = join(dir, 'adresses-75.csv.gz');
+    writeFileSync(path, gzipSync(tinyCsv));
+
+    const repository = await createBanRepository({ BAN_DATA_DIR: dir, BAN_SAMPLE_LIMIT: '2' });
+
+    expect(repository.summary()).toMatchObject({
+      name: 'adresses-75.csv.gz',
+      documentCount: 2
+    });
+    expect(repository.sourceProfile()).toMatchObject({
+      kind: 'csv',
+      path,
+      offline: false,
+      officialUrl: 'https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-75.csv.gz'
+    });
+    expect(repository.suggest({ query: 'intendance' })[0].id).toBe('33063_0002_00010B');
+  });
+
   it('caps suggestions at the backend maximum', () => {
     const repository = createInMemoryBanRepository({
       documents: Array.from({ length: MAX_BAN_SUGGESTIONS + 5 }, (_, index) => makeDocument(index)),
@@ -96,3 +116,7 @@ describe('BAN repository', () => {
     expect(repository.suggest({ query: 'rivoli', limit: 999 })).toHaveLength(MAX_BAN_SUGGESTIONS);
   });
 });
+
+function missingBanDataDir(): string {
+  return join(tmpdir(), 'surch-ban-data-missing');
+}
