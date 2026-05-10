@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import type { BanDatasetSummary, BanDocument, BanSourceProfile } from '$lib/types';
@@ -25,6 +25,14 @@ export type BanRepository = {
   hydrate: (ids: string[]) => BanDocument[];
 };
 
+type RepositoryCache = {
+  key: string;
+  repository: BanRepository;
+};
+
+let csvRepositoryCache: RepositoryCache | null = null;
+let tinyRepositoryCache: BanRepository | null = null;
+
 export async function createBanRepository(
   env: BanRepositoryEnv = process.env
 ): Promise<BanRepository> {
@@ -38,11 +46,16 @@ export async function createBanRepository(
   }
 
   const limit = parseLimit(env.BAN_SAMPLE_LIMIT);
+  const cacheKey = repositoryCacheKey(csvPath, limit);
+  if (csvRepositoryCache?.key === cacheKey) {
+    return csvRepositoryCache.repository;
+  }
+
   const raw = readFileSync(csvPath);
   const csv = csvPath.endsWith('.gz') ? gunzipSync(raw).toString('utf8') : raw.toString('utf8');
   const documents = await parseBanCsvText(csv, { sourceName: csvPath, limit });
 
-  return createInMemoryBanRepository({
+  const repository = createInMemoryBanRepository({
     documents,
     source: {
       kind: 'csv',
@@ -53,6 +66,9 @@ export async function createBanRepository(
       officialUrl: inferOfficialUrl(csvPath)
     }
   });
+  csvRepositoryCache = { key: cacheKey, repository };
+
+  return repository;
 }
 
 function resolveBanCsvPath(env: BanRepositoryEnv): string | null {
@@ -103,8 +119,12 @@ export function createInMemoryBanRepository(input: {
 }
 
 function createTinyRepository(): BanRepository {
+  if (tinyRepositoryCache) {
+    return tinyRepositoryCache;
+  }
+
   const fixture = getBanTinyFixture();
-  return createInMemoryBanRepository({
+  tinyRepositoryCache = createInMemoryBanRepository({
     documents: fixture.documents,
     source: {
       kind: 'tiny',
@@ -115,6 +135,8 @@ function createTinyRepository(): BanRepository {
       downloadCommand: 'npm run ban:download'
     }
   });
+
+  return tinyRepositoryCache;
 }
 
 function searchableText(document: BanDocument): string {
@@ -147,6 +169,11 @@ function parseLimit(value: string | undefined): number {
   return Number.isFinite(parsed) && parsed > 0
     ? Math.min(Math.trunc(parsed), MAX_EXTERNAL_BAN_ROWS)
     : MAX_EXTERNAL_BAN_ROWS;
+}
+
+function repositoryCacheKey(csvPath: string, limit: number): string {
+  const stats = statSync(csvPath);
+  return `${csvPath}:${limit}:${stats.size}:${stats.mtimeMs}`;
 }
 
 function fileName(path: string): string {

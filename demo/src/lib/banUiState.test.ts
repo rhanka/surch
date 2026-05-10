@@ -5,6 +5,7 @@ import {
   canCompareAddress,
   compareAddressError,
   datasetStatus,
+  emptySuggestionMessage,
   extractSuggestionDocuments,
   shouldAutoLoadBanDataset,
   banLoadAction,
@@ -28,6 +29,9 @@ describe('BAN demo UI state', () => {
     expect(shouldRequestSuggestions('')).toBe(false);
     expect(shouldRequestSuggestions('r')).toBe(false);
     expect(extractSuggestionDocuments({})).toEqual([]);
+    expect(emptySuggestionMessage('', false)).toBe(
+      'Saisis au moins deux caractères pour filtrer les adresses.'
+    );
   });
 
   it('uses API suggestions without falling back to the tiny fixture', () => {
@@ -36,6 +40,11 @@ describe('BAN demo UI state', () => {
       officialDocument
     ]);
     expect(extractSuggestionDocuments({ suggestions: [] })).toEqual([]);
+  });
+
+  it('distinguishes loading and empty autocomplete states', () => {
+    expect(emptySuggestionMessage('9 rue de rivoli', true)).toBe('Recherche en cours...');
+    expect(emptySuggestionMessage('9 rue de rivoli', false)).toBe('Aucune adresse trouvée.');
   });
 
   it('formats the active dataset summary returned by the API', () => {

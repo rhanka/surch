@@ -102,6 +102,21 @@ describe('BAN repository', () => {
     expect(repository.suggest({ query: 'intendance' })[0].id).toBe('33063_0002_00010B');
   });
 
+  it('reuses an already loaded BAN CSV repository for repeated autocomplete calls', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'surch-ban-cache-'));
+    const path = join(dir, 'adresses-75.csv.gz');
+    writeFileSync(path, gzipSync(tinyCsv));
+
+    const first = await createBanRepository({ BAN_DATA_DIR: dir, BAN_SAMPLE_LIMIT: '2' });
+    const second = await createBanRepository({ BAN_DATA_DIR: dir, BAN_SAMPLE_LIMIT: '2' });
+
+    expect(second).toBe(first);
+    expect(second.suggest({ query: '1 rue de rivoli' })[0]).toMatchObject({
+      id: '75101_0001_00001',
+      street_name: 'Rue de Rivoli'
+    });
+  });
+
   it('caps suggestions at the backend maximum', () => {
     const repository = createInMemoryBanRepository({
       documents: Array.from({ length: MAX_BAN_SUGGESTIONS + 5 }, (_, index) => makeDocument(index)),

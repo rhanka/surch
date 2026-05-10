@@ -1,6 +1,9 @@
 import type { BanDocument } from './types';
 
 const COMPARE_SELECTION_ERROR = 'Sélectionne une adresse avant de comparer.';
+const PROMPT_FOR_QUERY = 'Saisis au moins deux caractères pour filtrer les adresses.';
+const SEARCH_IN_PROGRESS = 'Recherche en cours...';
+const NO_SUGGESTIONS = 'Aucune adresse trouvée.';
 
 export type BanDatasetUiState = {
   documentCount?: number;
@@ -26,6 +29,14 @@ export type BanLoadAction =
 
 export function shouldRequestSuggestions(query: string): boolean {
   return query.trim().length >= 2;
+}
+
+export function emptySuggestionMessage(query: string, isLoading: boolean): string {
+  if (isLoading) {
+    return SEARCH_IN_PROGRESS;
+  }
+
+  return shouldRequestSuggestions(query) ? NO_SUGGESTIONS : PROMPT_FOR_QUERY;
 }
 
 export function banLoadAction(status: BanLoadStatus): BanLoadAction {

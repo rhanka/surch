@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { emptySuggestionMessage } from '$lib/banUiState';
   import type { BanDocument } from '$lib/types';
 
   type Props = {
@@ -18,6 +19,8 @@
     onQueryChange = () => {},
     onSelect = () => {}
   }: Props = $props();
+
+  const emptyMessage = $derived(emptySuggestionMessage(query, isLoading));
 </script>
 
 <section class="autocomplete" aria-labelledby="address-search-title">
@@ -53,7 +56,7 @@
         <span>{suggestion.postcode} {suggestion.city_name}</span>
       </button>
     {:else}
-      <p class="empty">Saisis au moins deux caractères pour filtrer les adresses.</p>
+      <p class="empty">{emptyMessage}</p>
     {/each}
   </div>
 </section>
