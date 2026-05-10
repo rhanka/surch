@@ -13,6 +13,7 @@ pub mod document;
 pub mod error;
 pub mod index;
 pub mod mget;
+pub mod msearch;
 pub mod root;
 pub mod search;
 pub mod state;
@@ -64,6 +65,18 @@ pub fn app_router() -> Router {
         .route(
             "/:index/_mget",
             post(mget::index_mget_state_handler).get(mget::index_mget_state_handler),
+        )
+        .route(
+            "/_msearch",
+            post(msearch::msearch_state_handler)
+                .get(msearch::msearch_state_handler)
+                .layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/:index/_msearch",
+            post(msearch::index_msearch_state_handler)
+                .get(msearch::index_msearch_state_handler)
+                .layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
         )
         .with_state(state::AppState::default())
 }

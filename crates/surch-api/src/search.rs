@@ -243,55 +243,51 @@ pub async fn search_handler(
         .into_response();
     }
 
-    let started_at = Instant::now();
     match parse_search_request(&body) {
         Ok(request) => {
-            let matched_documents: Vec<StoredDocument> = match request.query.as_ref() {
-                None => state.documents(&index),
-                Some(query) => match query {
-                    SearchQuery::Term { field, value } => {
-                        documents_by_term(&state, &index, field, value)
-                    }
-                    SearchQuery::BoolMust(queries) => {
-                        if let Some(ids) = intersect_term_clauses(&state, &index, queries) {
-                            documents_for_ids(&state, &index, &ids)
-                        } else {
-                            state
-                                .documents(&index)
-                                .into_iter()
-                                .filter(|document| query_matches(query, &document.source))
-                                .collect()
-                        }
-                    }
-                    SearchQuery::MatchAll => state.documents(&index),
-                    _ => state
-                        .documents(&index)
-                        .into_iter()
-                        .filter(|document| query_matches(query, &document.source))
-                        .collect(),
-                },
-            };
-            let mut matched_documents = matched_documents;
-            sort_documents(&mut matched_documents, &request.sort);
-            let total = matched_documents.len() as u64;
-            let hits = paginate_hits(&request, &matched_documents);
-            let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
-
-            (
-                StatusCode::OK,
-                Json(build_search_response_with_total(
-                    hits,
-                    total_summary,
-                    started_at.elapsed().as_millis() as u64,
-                )),
-            )
-                .into_response()
+            let response = run_search(&state, &index, &request);
+            (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => error.into_response(),
     }
 }
 
-fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
+/// Execute a parsed search request against an existing index and build the response.
+pub fn run_search(state: &AppState, index: &str, request: &SearchRequest) -> SearchResponse {
+    let started_at = Instant::now();
+    let matched_documents: Vec<StoredDocument> = match request.query.as_ref() {
+        None => state.documents(index),
+        Some(query) => match query {
+            SearchQuery::Term { field, value } => documents_by_term(state, index, field, value),
+            SearchQuery::BoolMust(queries) => {
+                if let Some(ids) = intersect_term_clauses(state, index, queries) {
+                    documents_for_ids(state, index, &ids)
+                } else {
+                    state
+                        .documents(index)
+                        .into_iter()
+                        .filter(|document| query_matches(query, &document.source))
+                        .collect()
+                }
+            }
+            SearchQuery::MatchAll => state.documents(index),
+            _ => state
+                .documents(index)
+                .into_iter()
+                .filter(|document| query_matches(query, &document.source))
+                .collect(),
+        },
+    };
+    let mut matched_documents = matched_documents;
+    sort_documents(&mut matched_documents, &request.sort);
+    let total = matched_documents.len() as u64;
+    let hits = paginate_hits(request, &matched_documents);
+    let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
+
+    build_search_response_with_total(hits, total_summary, started_at.elapsed().as_millis() as u64)
+}
+
+pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
     if body.trim().is_empty() {
         return Ok(SearchRequest {
             query: None,
