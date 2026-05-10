@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 
+pub mod analyze;
 pub mod bulk;
 pub mod count;
 pub mod document;
@@ -87,6 +88,14 @@ pub fn app_router() -> Router {
             "/:index/_field_caps",
             post(field_caps::index_field_caps_state_handler)
                 .get(field_caps::index_field_caps_state_handler),
+        )
+        .route(
+            "/_analyze",
+            post(analyze::analyze_state_handler).get(analyze::analyze_state_handler),
+        )
+        .route(
+            "/:index/_analyze",
+            post(analyze::index_analyze_state_handler).get(analyze::index_analyze_state_handler),
         )
         .with_state(state::AppState::default())
 }

@@ -8,6 +8,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+surch-analysis = { path = "../surch-analysis" }
 surch-index = { path = "../surch-index" }
 surch-search = { path = "../surch-search" }
 surch-types = { path = "../surch-types" }
