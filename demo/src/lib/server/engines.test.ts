@@ -267,6 +267,7 @@ describe('engine operations', () => {
 
     expect(result.engine).toBe('opensearch');
     expect(result.index).toBe('ban_addresses');
+    expect(result.latencyMs).toEqual(expect.any(Number));
     expect(result.response).toMatchObject({ hits: { total: { value: 1 } } });
     expect(calls.map((call) => [call.method, new URL(call.url).pathname, call.body])).toEqual([
       ['POST', '/ban_addresses/_search', JSON.stringify(searchBody)]

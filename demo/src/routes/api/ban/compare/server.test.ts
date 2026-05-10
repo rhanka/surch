@@ -20,7 +20,7 @@ afterEach(() => {
 });
 
 describe('POST /api/ban/compare', () => {
-  it('builds a label match query from the body against the active dataset index', async () => {
+  it('builds an exact label phrase query from the body against the active dataset index', async () => {
     const csvPath = createActiveCsv('adresses-active.csv');
     process.env.BAN_CSV_PATH = csvPath;
     process.env.BAN_SAMPLE_LIMIT = '1';
@@ -63,7 +63,7 @@ describe('POST /api/ban/compare', () => {
     });
     expect(body.query).toMatchObject({
       expectedId: '75101_7777_00041',
-      label: 'Match label: 41 Rue Active 75001 Paris'
+      label: 'Exact label: 41 Rue Active 75001 Paris'
     });
     expect(calls.map((call) => [call.method, new URL(call.url).pathname])).toEqual([
       ['POST', '/ban_addresses/_search'],
@@ -73,11 +73,12 @@ describe('POST /api/ban/compare', () => {
     const searchBody = JSON.parse(calls[0].body ?? '{}');
     expect(searchBody).toEqual({
       query: {
-        match: {
+        match_phrase: {
           label: '41 Rue Active 75001 Paris'
         }
       },
-      size: 2
+      size: 2,
+      track_total_hits: true
     });
     expect(JSON.stringify(searchBody)).not.toContain('Rue de Rivoli');
     expect(body.query.body).toEqual(searchBody);

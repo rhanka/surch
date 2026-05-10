@@ -69,6 +69,7 @@ export type EngineOperationResult = {
 
 export type EngineResponse = {
   engine: EngineId;
+  latencyMs?: number;
   status: number;
   response: unknown;
 };

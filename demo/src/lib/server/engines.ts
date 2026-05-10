@@ -216,6 +216,7 @@ export async function runBanQuery(
 
   return {
     engine,
+    latencyMs: response.latencyMs,
     query,
     status: response.status,
     response: response.body
@@ -236,6 +237,7 @@ export async function runBanIndexSearch(
   return {
     engine,
     index,
+    latencyMs: response.latencyMs,
     status: response.status,
     response: response.body
   };
@@ -325,7 +327,7 @@ async function callEngine(
   body: string | undefined,
   fetchImpl: FetchLike,
   options: { timeoutMs?: number } = {}
-): Promise<{ status: number; body: unknown }> {
+): Promise<{ status: number; body: unknown; latencyMs: number }> {
   if (!isFixedDemoPath(path)) {
     throw new Error('engine path is outside the fixed BAN demo surface');
   }
@@ -335,6 +337,7 @@ async function callEngine(
   const controller = new AbortController();
   const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS;
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = performance.now();
 
   try {
     let response: Response;
@@ -377,7 +380,7 @@ async function callEngine(
     }
     const parsed = parseEngineBody(engine, path, response.status, text);
 
-    return { status: response.status, body: parsed };
+    return { status: response.status, body: parsed, latencyMs: elapsedMs(startedAt) };
   } finally {
     clearTimeout(timeout);
   }
@@ -427,9 +430,14 @@ function documentChunks(documents: BanDocument[], size: number): BanDocument[][]
 function toEngineResponse(result: EngineResponse): EngineResponse {
   return {
     engine: result.engine,
+    latencyMs: result.latencyMs,
     status: result.status,
     response: result.response
   };
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.max(0, Math.round((performance.now() - startedAt) * 10) / 10);
 }
 
 function parseEngineBody(

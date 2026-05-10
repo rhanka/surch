@@ -19,15 +19,16 @@ export const POST: RequestHandler = async ({ request, fetch }) => {
   const source = repository.sourceProfile();
   const searchBody = {
     query: {
-      match: {
+      match_phrase: {
         label: query
       }
     },
-    size: limit
+    size: limit,
+    track_total_hits: true
   };
   const queryDescriptor = {
-    id: 'active_label_match',
-    label: `Match label: ${query}`,
+    id: 'active_label_phrase',
+    label: `Exact label: ${query}`,
     kind: 'search',
     expectedId,
     body: searchBody
