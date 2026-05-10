@@ -12,4 +12,5 @@ surch-analysis = { path = "../surch-analysis" }
 surch-codec = { path = "../surch-codec" }
 surch-store = { path = "../surch-store" }
 surch-types = { path = "../surch-types" }
+serde_json = { workspace = true }
 thiserror = { workspace = true }

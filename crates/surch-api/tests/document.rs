@@ -114,3 +114,30 @@ async fn document_router_rejects_invalid_json_with_opensearch_error() {
         })
     );
 }
+
+#[tokio::test]
+async fn document_router_rejects_invalid_index_name() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/Products/_doc/sku-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"desk"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "invalid index name"
+            },
+            "status": 400
+        })
+    );
+}

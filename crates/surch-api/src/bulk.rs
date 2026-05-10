@@ -1,13 +1,15 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::time::Instant;
 use thiserror::Error;
 
+use crate::index::validate_index_name;
 use crate::state::AppState;
 
 /// One parsed OpenSearch `_bulk` NDJSON operation.
@@ -113,10 +115,39 @@ pub fn build_bulk_response(operations: &[BulkOperation], took: u64) -> BulkRespo
 
 /// Axum handler for the OpenSearch-compatible `_bulk` endpoint.
 pub async fn bulk_state_handler(State(state): State<AppState>, body: String) -> impl IntoResponse {
+    let started_at = Instant::now();
     match parse_bulk_ndjson(&body) {
         Ok(operations) => {
             apply_bulk_operations(&state, &operations);
-            let response = build_bulk_response(&operations, 0);
+            let response =
+                build_bulk_response(&operations, started_at.elapsed().as_millis() as u64);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => bulk_parse_error_response(error),
+    }
+}
+
+/// Axum handler for `POST|PUT /:index/_bulk` with path-index default.
+pub async fn index_bulk_state_handler(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+    body: String,
+) -> impl IntoResponse {
+    if let Err(error) = validate_index_name(&index) {
+        return error.into_response();
+    }
+
+    let started_at = Instant::now();
+    match parse_bulk_ndjson(&body) {
+        Ok(operations) => {
+            let operations: Vec<BulkOperation> = operations
+                .into_iter()
+                .map(|operation| apply_default_index(&operation, Some(index.as_str())))
+                .collect();
+
+            apply_bulk_operations(&state, &operations);
+            let response =
+                build_bulk_response(&operations, started_at.elapsed().as_millis() as u64);
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => bulk_parse_error_response(error),
@@ -136,25 +167,53 @@ pub async fn bulk_handler(body: String) -> impl IntoResponse {
 
 fn apply_bulk_operations(state: &AppState, operations: &[BulkOperation]) {
     for operation in operations {
-        match operation {
-            BulkOperation::Index { index, id, source }
-            | BulkOperation::Create { index, id, source } => {
-                if let (Some(index), Some(id)) = (index, id) {
-                    state.index_document(index, id, source.clone());
-                }
-            }
-            BulkOperation::Update { index, id, source } => {
-                if let (Some(index), Some(id)) = (index, id) {
-                    let source = source.get("doc").cloned().unwrap_or_else(|| source.clone());
-                    state.index_document(index, id, source);
-                }
-            }
-            BulkOperation::Delete { index, id } => {
-                if let (Some(index), Some(id)) = (index, id) {
-                    state.delete_document(index, id);
-                }
+        apply_bulk_operation(state, operation);
+    }
+}
+
+fn apply_bulk_operation(state: &AppState, operation: &BulkOperation) {
+    match operation {
+        BulkOperation::Index { index, id, source }
+        | BulkOperation::Create { index, id, source } => {
+            if let (Some(index), Some(id)) = (index, id) {
+                state.index_document(index, id, source.clone());
             }
         }
+        BulkOperation::Update { index, id, source } => {
+            if let (Some(index), Some(id)) = (index, id) {
+                let source = source.get("doc").cloned().unwrap_or_else(|| source.clone());
+                state.index_document(index, id, source);
+            }
+        }
+        BulkOperation::Delete { index, id } => {
+            if let (Some(index), Some(id)) = (index, id) {
+                state.delete_document(index, id);
+            }
+        }
+    }
+}
+
+fn apply_default_index(operation: &BulkOperation, default_index: Option<&str>) -> BulkOperation {
+    match operation {
+        BulkOperation::Index { index, id, source } => BulkOperation::Index {
+            index: index.clone().or_else(|| default_index.map(str::to_owned)),
+            id: id.clone(),
+            source: source.clone(),
+        },
+        BulkOperation::Create { index, id, source } => BulkOperation::Create {
+            index: index.clone().or_else(|| default_index.map(str::to_owned)),
+            id: id.clone(),
+            source: source.clone(),
+        },
+        BulkOperation::Delete { index, id } => BulkOperation::Delete {
+            index: index.clone().or_else(|| default_index.map(str::to_owned)),
+            id: id.clone(),
+        },
+        BulkOperation::Update { index, id, source } => BulkOperation::Update {
+            index: index.clone().or_else(|| default_index.map(str::to_owned)),
+            id: id.clone(),
+            source: source.clone(),
+        },
     }
 }
 
@@ -278,7 +337,15 @@ fn optional_string_field(
     field: &'static str,
 ) -> Result<Option<String>, BulkParseError> {
     match value {
-        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::String(value)) => {
+            if field == "_index" && validate_index_name(value).is_err() {
+                return Err(BulkParseError::InvalidAction {
+                    line,
+                    reason: "_index metadata must be a valid index name",
+                });
+            }
+            Ok(Some(value.clone()))
+        }
         Some(_) => Err(BulkParseError::InvalidAction {
             line,
             reason: match field {

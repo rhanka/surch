@@ -68,6 +68,10 @@ where
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeywordAnalyzer;
 
+/// Analyzer that keeps alphanumeric sequences as lowercased tokens.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StandardAnalyzer;
+
 impl Analyzer for KeywordAnalyzer {
     fn token_stream(&self, text: &str) -> Vec<Token> {
         if text.is_empty() {
@@ -80,6 +84,39 @@ impl Analyzer for KeywordAnalyzer {
             end_offset: text.len(),
             position_increment: 1,
         }]
+    }
+}
+
+impl Analyzer for StandardAnalyzer {
+    fn token_stream(&self, text: &str) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        let mut token_start = None;
+
+        for (offset, character) in text.char_indices() {
+            if character.is_alphanumeric() {
+                if token_start.is_none() {
+                    token_start = Some(offset);
+                }
+            } else if let Some(start_offset) = token_start.take() {
+                tokens.push(Token {
+                    term: text[start_offset..offset].to_lowercase(),
+                    start_offset,
+                    end_offset: offset,
+                    position_increment: 1,
+                });
+            }
+        }
+
+        if let Some(start_offset) = token_start {
+            tokens.push(Token {
+                term: text[start_offset..].to_lowercase(),
+                start_offset,
+                end_offset: text.len(),
+                position_increment: 1,
+            });
+        }
+
+        tokens
     }
 }
 

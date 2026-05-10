@@ -5,6 +5,7 @@ pub mod document_index;
 pub mod field_infos;
 pub mod field_infos_codec;
 pub mod live_docs;
+pub mod mapping;
 pub mod postings;
 pub mod segment_field_infos;
 pub mod segment_infos;

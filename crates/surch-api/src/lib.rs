@@ -27,11 +27,21 @@ pub fn app_router() -> Router {
         .route("/", get(root::root_handler))
         .route(
             "/_bulk",
-            post(bulk::bulk_state_handler).layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
+            post(bulk::bulk_state_handler)
+                .put(bulk::bulk_state_handler)
+                .layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
         )
+        .route("/_mapping", get(index::mappings_handler))
+        .route("/:index/_mapping", get(index::mapping_handler))
         .route(
             "/:index",
             put(index::create_index_handler).delete(index::delete_index_handler),
+        )
+        .route(
+            "/:index/_bulk",
+            post(bulk::index_bulk_state_handler)
+                .put(bulk::index_bulk_state_handler)
+                .layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
         )
         .route(
             "/:index/_doc/:id",

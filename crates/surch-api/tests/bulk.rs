@@ -149,6 +149,23 @@ fn bulk_rejects_non_json_source_line() {
 }
 
 #[test]
+fn bulk_rejects_invalid_index_name_in_metadata() {
+    let body = r#"{"index":{"_index":"InvalidIndex","_id":"1"}}"#.to_owned()
+        + "\n"
+        + r#"{"title":"Rust Search"}"#;
+    let err =
+        parse_bulk_ndjson(&body).expect_err("bulk action with invalid index should be rejected");
+
+    assert!(matches!(
+        err,
+        BulkParseError::InvalidAction {
+            line: 1,
+            reason
+        } if reason == "_index metadata must be a valid index name"
+    ));
+}
+
+#[test]
 fn bulk_builds_opensearch_compatible_response_from_classic_fixture() {
     let body = include_str!("../../../tests/opensearch_compat/bulk/classic_bulk.ndjson");
     let expected_response: serde_json::Value = serde_json::from_str(include_str!(

@@ -10,4 +10,6 @@ repository.workspace = true
 [dependencies]
 surch-codec = { path = "../surch-codec" }
 surch-types = { path = "../surch-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -219,7 +219,10 @@ async fn search_router_accepts_match_all_fixture() {
         .expect("router should respond");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_json(response).await, expected_response);
+    let response = response_json(response).await;
+    assert_eq!(response["timed_out"], expected_response["timed_out"]);
+    assert_eq!(response["_shards"], expected_response["_shards"]);
+    assert_eq!(response["hits"], expected_response["hits"]);
 }
 
 #[tokio::test]
@@ -243,7 +246,37 @@ async fn search_router_accepts_empty_object_fixture() {
         .expect("router should respond");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_json(response).await, expected_response);
+    let response = response_json(response).await;
+    assert_eq!(response["timed_out"], expected_response["timed_out"]);
+    assert_eq!(response["_shards"], expected_response["_shards"]);
+    assert_eq!(response["hits"], expected_response["hits"]);
+}
+
+#[tokio::test]
+async fn search_router_rejects_invalid_index_name_with_open_search_error() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/Products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "invalid index name"
+            },
+            "status": 400
+        })
+    );
 }
 
 #[tokio::test]

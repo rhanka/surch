@@ -6,11 +6,9 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
-use crate::{
-    state::{AppState, StoredDocument},
-    OpenSearchError,
-};
+use crate::{index::validate_index_name, state::AppState, OpenSearchError};
 
 /// OpenSearch-compatible `_count` request body for the P0 bootstrap surface.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,18 +60,66 @@ pub async fn count_handler(
     Path(index): Path<String>,
     body: String,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_index_name(&index) {
+        return error.into_response();
+    }
+
     match parse_count_request(&body) {
         Ok(request) => {
-            let count = state
-                .documents(&index)
-                .into_iter()
-                .filter(|document| request_matches(&request, document))
-                .count() as u64;
+            let count = count_matches(&state, &index, &request);
 
             (StatusCode::OK, Json(build_count_response(count))).into_response()
         }
         Err(error) => error.into_response(),
     }
+}
+
+fn count_matches(state: &AppState, index: &str, request: &CountRequest) -> u64 {
+    match request.query.as_ref() {
+        None => state.count(index),
+        Some(query) => count_query_matches(state, index, query),
+    }
+}
+
+fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64 {
+    match query {
+        CountQuery::MatchAll => state.count(index),
+        CountQuery::Term { field, value } => state.term_matches_count(index, field, value) as u64,
+        CountQuery::BoolMust(clauses) => {
+            if let Some(documents) = intersect_term_clauses(state, index, clauses) {
+                documents.len() as u64
+            } else {
+                let documents = state.documents(index);
+                documents
+                    .into_iter()
+                    .filter(|document| query_matches(query, &document.source))
+                    .count() as u64
+            }
+        }
+    }
+}
+
+fn intersect_term_clauses(
+    state: &AppState,
+    index: &str,
+    clauses: &[CountQuery],
+) -> Option<Vec<String>> {
+    let mut matches: Option<BTreeSet<String>> = None;
+    for clause in clauses {
+        match clause {
+            CountQuery::Term { field, value } => {
+                let ids = state.documents_for_term(index, field, value);
+                let current = ids.into_iter().collect::<BTreeSet<_>>();
+                matches = Some(match matches {
+                    Some(previous) => previous.intersection(&current).cloned().collect(),
+                    None => current,
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    matches.map(|ids: BTreeSet<String>| ids.into_iter().collect())
 }
 
 fn parse_count_request(body: &str) -> Result<CountRequest, OpenSearchError> {
@@ -219,13 +265,6 @@ fn parse_term_value(value: &Value) -> Result<String, OpenSearchError> {
             "parsing_exception",
             "term query value must be a scalar value",
         )),
-    }
-}
-
-fn request_matches(request: &CountRequest, document: &StoredDocument) -> bool {
-    match request.query.as_ref() {
-        Some(query) => query_matches(query, &document.source),
-        None => true,
     }
 }
 

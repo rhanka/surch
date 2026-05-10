@@ -7,6 +7,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::index::validate_index_name;
 use crate::{state::AppState, OpenSearchError};
 
 /// OpenSearch-compatible document index response for the P0 bootstrap API.
@@ -58,6 +59,19 @@ pub async fn document_handler(
     Path((index, id)): Path<(String, String)>,
     body: String,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_index_name(&index) {
+        return error.into_response();
+    }
+
+    if id.trim().is_empty() {
+        return OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "document id must not be empty",
+        )
+        .into_response();
+    }
+
     match parse_document_source(&body) {
         Ok(source) => {
             state.index_document(&index, &id, source);

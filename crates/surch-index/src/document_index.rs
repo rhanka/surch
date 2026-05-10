@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 
-use surch_analysis::{Analyzer, SimpleAnalyzer};
+use surch_analysis::{
+    Analyzer, KeywordAnalyzer, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer, WhitespaceAnalyzer,
+};
 use thiserror::Error;
 
+use crate::mapping::{AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum};
 use crate::stored_fields::{StoredDocument, StoredFieldsError, StoredValue};
 
@@ -38,6 +41,20 @@ impl DocumentIndex {
         K: Into<String>,
         V: Into<String>,
     {
+        self.add_document_with_mapping(doc_id, fields, &IndexMapping::default())
+    }
+
+    pub fn add_document_with_mapping<I, K, V>(
+        &mut self,
+        doc_id: u32,
+        fields: I,
+        mapping: &IndexMapping,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
         if self.documents.contains_key(&doc_id) {
             return Err(DocumentIndexError::DuplicateDocId { doc_id });
         }
@@ -58,9 +75,14 @@ impl DocumentIndex {
             document.insert(name.clone(), StoredValue::String(value.clone()))?;
         }
 
-        let analyzer = SimpleAnalyzer;
         for (field, value) in &fields {
-            for ((field, term), positions) in analyzed_terms(&analyzer, field, value) {
+            let field_mapping = mapping.field(field);
+            let analyzer = field_mapping
+                .map_or(AnalyzerName::default_for(FieldType::Text), |field| {
+                    field.analyzer()
+                });
+
+            for ((field, term), positions) in analyzed_terms(analyzer, field, value) {
                 self.postings_builder.add(field, term, doc_id, positions)?;
             }
         }
@@ -69,6 +91,12 @@ impl DocumentIndex {
         self.terms = self.postings_builder.clone().build();
 
         Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.documents.clear();
+        self.postings_builder = PostingsBuilder::new();
+        self.terms = TermDictionary::default();
     }
 
     pub fn doc_ids(&self) -> Vec<u32> {
@@ -97,14 +125,22 @@ impl DocumentIndex {
 }
 
 fn analyzed_terms(
-    analyzer: &impl Analyzer,
+    analyzer: AnalyzerName,
     field: &str,
     value: &str,
 ) -> BTreeMap<(String, String), Vec<u32>> {
+    let tokenized = match analyzer {
+        AnalyzerName::Standard => StandardAnalyzer.token_stream(value),
+        AnalyzerName::Simple => SimpleAnalyzer.token_stream(value),
+        AnalyzerName::Stop => StopAnalyzer.token_stream(value),
+        AnalyzerName::Keyword => KeywordAnalyzer.token_stream(value),
+        AnalyzerName::Whitespace => WhitespaceAnalyzer.token_stream(value),
+    };
+
     let mut terms = BTreeMap::<(String, String), Vec<u32>>::new();
     let mut position = 0_u32;
 
-    for token in analyzer.token_stream(value) {
+    for token in tokenized {
         position += token.position_increment;
         terms
             .entry((field.to_owned(), token.term))

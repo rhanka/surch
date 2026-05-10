@@ -35,7 +35,9 @@ async fn bulk_router_accepts_post_bulk_http_fixture() {
         .expect("router should respond");
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_json(response).await, expected_response);
+    let response = response_json(response).await;
+    assert_eq!(response["errors"], expected_response["errors"]);
+    assert_eq!(response["items"], expected_response["items"]);
 }
 
 #[tokio::test]
@@ -78,4 +80,47 @@ async fn bulk_router_does_not_accept_unknown_route_as_success() {
         .expect("router should respond");
 
     assert!(!response.status().is_success());
+}
+
+#[tokio::test]
+async fn bulk_router_accepts_index_route_with_default_index() {
+    let router = app_router();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"1"}}
+{"title":"first item"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["errors"], false);
+    assert_eq!(response["items"][0]["index"]["_index"], "catalog");
+
+    let search_response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let search_response = response_json(search_response).await;
+    assert_eq!(search_response["hits"]["hits"][0]["_id"], "1");
 }

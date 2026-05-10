@@ -6,11 +6,14 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
+use std::time::Instant;
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
 
 use crate::{
+    index::validate_index_name,
     state::{AppState, StoredDocument},
     OpenSearchError,
 };
@@ -81,10 +84,9 @@ pub struct SearchHitsTotal {
     pub relation: &'static str,
 }
 
-/// Build a deterministic P0 OpenSearch-compatible `_search` response.
-pub fn build_search_response(hits: Vec<Value>, total: u64) -> SearchResponse {
+pub fn build_search_response(hits: Vec<Value>, total: u64, took: u64) -> SearchResponse {
     SearchResponse {
-        took: 0,
+        took,
         timed_out: false,
         shards: SearchShards {
             total: 1,
@@ -103,23 +105,103 @@ pub fn build_search_response(hits: Vec<Value>, total: u64) -> SearchResponse {
     }
 }
 
+fn documents_by_term(
+    state: &AppState,
+    index: &str,
+    field: &str,
+    value: &str,
+) -> Vec<StoredDocument> {
+    documents_for_ids(state, index, &state.documents_for_term(index, field, value))
+}
+
+fn documents_for_ids(state: &AppState, index: &str, ids: &[String]) -> Vec<StoredDocument> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+
+    let wanted = ids.iter().collect::<BTreeSet<_>>();
+    state
+        .documents(index)
+        .into_iter()
+        .filter(|document| wanted.contains(&document.id))
+        .collect()
+}
+
+fn intersect_term_clauses(
+    state: &AppState,
+    index: &str,
+    queries: &[SearchQuery],
+) -> Option<Vec<String>> {
+    let mut matches: Option<BTreeSet<String>> = None;
+    for query in queries {
+        match query {
+            SearchQuery::Term { field, value } => {
+                let current: BTreeSet<String> = state
+                    .documents_for_term(index, field, value)
+                    .into_iter()
+                    .collect();
+                matches = Some(match matches {
+                    Some(previous) => previous.intersection(&current).cloned().collect(),
+                    None => current,
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    matches.map(|ids: BTreeSet<String>| ids.into_iter().collect())
+}
+
 /// Axum handler for the OpenSearch-compatible `/{index}/_search` endpoint.
 pub async fn search_handler(
     State(state): State<AppState>,
     Path(index): Path<String>,
     body: String,
 ) -> impl IntoResponse {
+    if let Err(error) = validate_index_name(&index) {
+        return error.into_response();
+    }
+
+    let started_at = Instant::now();
     match parse_search_request(&body) {
         Ok(request) => {
-            let matched_documents: Vec<StoredDocument> = state
-                .documents(&index)
-                .into_iter()
-                .filter(|document| request_matches(&request, document))
-                .collect();
+            let matched_documents: Vec<StoredDocument> = match request.query.as_ref() {
+                None => state.documents(&index),
+                Some(query) => match query {
+                    SearchQuery::Term { field, value } => {
+                        documents_by_term(&state, &index, field, value)
+                    }
+                    SearchQuery::BoolMust(queries) => {
+                        if let Some(ids) = intersect_term_clauses(&state, &index, queries) {
+                            documents_for_ids(&state, &index, &ids)
+                        } else {
+                            state
+                                .documents(&index)
+                                .into_iter()
+                                .filter(|document| query_matches(query, &document.source))
+                                .collect()
+                        }
+                    }
+                    SearchQuery::MatchAll => state.documents(&index),
+                    _ => state
+                        .documents(&index)
+                        .into_iter()
+                        .filter(|document| query_matches(query, &document.source))
+                        .collect(),
+                },
+            };
             let total = matched_documents.len() as u64;
             let hits = paginate_hits(&request, &matched_documents);
 
-            (StatusCode::OK, Json(build_search_response(hits, total))).into_response()
+            (
+                StatusCode::OK,
+                Json(build_search_response(
+                    hits,
+                    total,
+                    started_at.elapsed().as_millis() as u64,
+                )),
+            )
+                .into_response()
         }
         Err(error) => error.into_response(),
     }
@@ -406,13 +488,6 @@ fn parse_non_negative_integer(field: &str, value: &Value) -> Result<u64, OpenSea
             format!("search `{field}` must be a non-negative integer"),
         )
     })
-}
-
-fn request_matches(request: &SearchRequest, document: &StoredDocument) -> bool {
-    match request.query.as_ref() {
-        Some(query) => query_matches(query, &document.source),
-        None => true,
-    }
 }
 
 fn query_matches(query: &SearchQuery, source: &Value) -> bool {
