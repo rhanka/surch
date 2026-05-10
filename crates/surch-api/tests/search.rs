@@ -727,3 +727,168 @@ async fn search_router_rejects_invalid_track_total_hits_with_opensearch_error() 
         })
     );
 }
+
+async fn search_with_body(router: &axum::Router, body: &'static str) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_json(response).await
+}
+
+#[tokio::test]
+async fn search_router_sorts_documents_by_field_ascending_by_default() {
+    let router = app_router();
+    index_product(&router, "sku-3", r#"{"name":"Cap","price":15}"#).await;
+    index_product(&router, "sku-1", r#"{"name":"Cap","price":5}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"Cap","price":10}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"price":"asc"}],"_source":["price"]}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    let prices: Vec<i64> = hits
+        .iter()
+        .map(|hit| hit["_source"]["price"].as_i64().expect("price"))
+        .collect();
+    assert_eq!(prices, vec![5, 10, 15]);
+}
+
+#[tokio::test]
+async fn search_router_sorts_documents_by_field_descending() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"alpha"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"charlie"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"bravo"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"name":{"order":"desc"}}],"_source":["name"]}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    let names: Vec<String> = hits
+        .iter()
+        .map(|hit| {
+            hit["_source"]["name"]
+                .as_str()
+                .map(str::to_owned)
+                .expect("name")
+        })
+        .collect();
+    assert_eq!(names, vec!["charlie", "bravo", "alpha"]);
+}
+
+#[tokio::test]
+async fn search_router_sorts_with_secondary_clause_breaking_ties() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"category":"a","price":20}"#).await;
+    index_product(&router, "sku-2", r#"{"category":"a","price":10}"#).await;
+    index_product(&router, "sku-3", r#"{"category":"b","price":5}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"category":"asc"},{"price":"desc"}],"_source":["category","price"]}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    let extracted: Vec<(String, i64)> = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit["_source"]["category"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .expect("category"),
+                hit["_source"]["price"].as_i64().expect("price"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        extracted,
+        vec![
+            ("a".to_owned(), 20),
+            ("a".to_owned(), 10),
+            ("b".to_owned(), 5),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn search_router_sorts_pushes_missing_field_documents_to_the_end() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"price":5}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"only name"}"#).await;
+    index_product(&router, "sku-3", r#"{"price":10}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"price":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1", "sku-3", "sku-2"]);
+}
+
+#[tokio::test]
+async fn search_router_rejects_unknown_sort_order_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"sort":[{"price":"sideways"}]}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "unknown `sort` order `sideways`"
+            },
+            "status": 400
+        })
+    );
+}

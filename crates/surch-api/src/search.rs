@@ -26,6 +26,21 @@ pub struct SearchRequest {
     pub size: Option<u64>,
     pub source: Option<SourceFilter>,
     pub track_total_hits: Option<TrackTotalHits>,
+    pub sort: Vec<SortClause>,
+}
+
+/// Single OpenSearch `sort` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SortClause {
+    pub field: String,
+    pub order: SortOrder,
+}
+
+/// Direction component of a `sort` clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortOrder {
+    Asc,
+    Desc,
 }
 
 /// OpenSearch-compatible `track_total_hits` request mode.
@@ -256,6 +271,8 @@ pub async fn search_handler(
                         .collect(),
                 },
             };
+            let mut matched_documents = matched_documents;
+            sort_documents(&mut matched_documents, &request.sort);
             let total = matched_documents.len() as u64;
             let hits = paginate_hits(&request, &matched_documents);
             let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
@@ -282,6 +299,7 @@ fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
             size: None,
             source: None,
             track_total_hits: None,
+            sort: Vec::new(),
         });
     }
 
@@ -315,6 +333,11 @@ fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
         .get("track_total_hits")
         .map(parse_track_total_hits)
         .transpose()?;
+    let sort = object
+        .get("sort")
+        .map(parse_sort)
+        .transpose()?
+        .unwrap_or_default();
 
     Ok(SearchRequest {
         query,
@@ -322,7 +345,95 @@ fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
         size,
         source,
         track_total_hits,
+        sort,
     })
+}
+
+fn parse_sort(value: &Value) -> Result<Vec<SortClause>, OpenSearchError> {
+    match value {
+        Value::String(field) => Ok(vec![SortClause {
+            field: parse_sort_field_name(field)?,
+            order: SortOrder::Asc,
+        }]),
+        Value::Array(items) => items.iter().map(parse_sort_entry).collect(),
+        Value::Object(_) => parse_sort_entry(value).map(|clause| vec![clause]),
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`sort` must be a string, object, or array",
+        )),
+    }
+}
+
+fn parse_sort_entry(value: &Value) -> Result<SortClause, OpenSearchError> {
+    match value {
+        Value::String(field) => Ok(SortClause {
+            field: parse_sort_field_name(field)?,
+            order: SortOrder::Asc,
+        }),
+        Value::Object(object) => {
+            if object.len() != 1 {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "`sort` object must contain exactly one field",
+                ));
+            }
+            let (field, body) = object.iter().next().expect("object has one field");
+            let field = parse_sort_field_name(field)?;
+            let order = parse_sort_order(body)?;
+            Ok(SortClause { field, order })
+        }
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`sort` entries must be strings or objects",
+        )),
+    }
+}
+
+fn parse_sort_field_name(field: &str) -> Result<String, OpenSearchError> {
+    if field.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`sort` field name must not be empty",
+        ));
+    }
+    Ok(field.to_owned())
+}
+
+fn parse_sort_order(value: &Value) -> Result<SortOrder, OpenSearchError> {
+    let order_string = match value {
+        Value::String(text) => text.clone(),
+        Value::Object(object) => match object.get("order") {
+            Some(Value::String(text)) => text.clone(),
+            Some(_) => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "`sort.order` must be a string",
+                ));
+            }
+            None => "asc".to_owned(),
+        },
+        _ => {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "`sort` order must be a string or object",
+            ));
+        }
+    };
+    match order_string.as_str() {
+        "asc" => Ok(SortOrder::Asc),
+        "desc" => Ok(SortOrder::Desc),
+        unknown => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("unknown `sort` order `{unknown}`"),
+        )),
+    }
 }
 
 fn parse_track_total_hits(value: &Value) -> Result<TrackTotalHits, OpenSearchError> {
@@ -758,6 +869,56 @@ fn field_text(source: &Value, field: &str) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(flag) => Some(flag.to_string()),
         _ => None,
+    }
+}
+
+fn sort_documents(documents: &mut [StoredDocument], clauses: &[SortClause]) {
+    if clauses.is_empty() {
+        return;
+    }
+    documents.sort_by(|left, right| {
+        for clause in clauses {
+            let ordering = compare_field(
+                left.source.get(&clause.field),
+                right.source.get(&clause.field),
+                clause.order,
+            );
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+fn compare_field(
+    left: Option<&Value>,
+    right: Option<&Value>,
+    order: SortOrder,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(a), Some(b)) => {
+            let base = compare_values(a, b);
+            match order {
+                SortOrder::Asc => base,
+                SortOrder::Desc => base.reverse(),
+            }
+        }
+    }
+}
+
+fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
+    match (left, right) {
+        (Value::Number(a), Value::Number(b)) => a
+            .as_f64()
+            .partial_cmp(&b.as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
