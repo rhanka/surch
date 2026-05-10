@@ -24,6 +24,18 @@ pub struct SearchRequest {
     pub query: Option<SearchQuery>,
     pub from: Option<u64>,
     pub size: Option<u64>,
+    pub source: Option<SourceFilter>,
+}
+
+/// OpenSearch-compatible `_source` filter request mode.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SourceFilter {
+    Disabled,
+    Includes(Vec<String>),
+    IncludesExcludes {
+        includes: Vec<String>,
+        excludes: Vec<String>,
+    },
 }
 
 /// Supported P0 `_search` queries.
@@ -221,6 +233,7 @@ fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
             query: None,
             from: None,
             size: None,
+            source: None,
         });
     }
 
@@ -249,8 +262,91 @@ fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
         .get("size")
         .map(|value| parse_non_negative_integer("size", value))
         .transpose()?;
+    let source = object.get("_source").map(parse_source_filter).transpose()?;
 
-    Ok(SearchRequest { query, from, size })
+    Ok(SearchRequest {
+        query,
+        from,
+        size,
+        source,
+    })
+}
+
+fn parse_source_filter(value: &Value) -> Result<SourceFilter, OpenSearchError> {
+    match value {
+        Value::Bool(false) => Ok(SourceFilter::Disabled),
+        Value::Bool(true) => Ok(SourceFilter::IncludesExcludes {
+            includes: Vec::new(),
+            excludes: Vec::new(),
+        }),
+        Value::String(text) => Ok(SourceFilter::Includes(vec![text.clone()])),
+        Value::Array(items) => Ok(SourceFilter::Includes(parse_source_field_array(
+            items, "_source",
+        )?)),
+        Value::Object(object) => {
+            for key in object.keys() {
+                if !matches!(key.as_str(), "includes" | "excludes") {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        format!("unsupported `_source` field `{key}`"),
+                    ));
+                }
+            }
+            let includes = match object.get("includes") {
+                Some(Value::Array(items)) => parse_source_field_array(items, "_source.includes")?,
+                Some(Value::String(text)) => vec![text.clone()],
+                Some(_) => {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`_source.includes` must be a string or array of strings",
+                    ));
+                }
+                None => Vec::new(),
+            };
+            let excludes = match object.get("excludes") {
+                Some(Value::Array(items)) => parse_source_field_array(items, "_source.excludes")?,
+                Some(Value::String(text)) => vec![text.clone()],
+                Some(_) => {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`_source.excludes` must be a string or array of strings",
+                    ));
+                }
+                None => Vec::new(),
+            };
+            Ok(SourceFilter::IncludesExcludes { includes, excludes })
+        }
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`_source` must be a boolean, string, array, or object",
+        )),
+    }
+}
+
+fn parse_source_field_array(
+    items: &[Value],
+    context: &str,
+) -> Result<Vec<String>, OpenSearchError> {
+    items
+        .iter()
+        .map(|item| match item {
+            Value::String(text) if !text.is_empty() => Ok(text.clone()),
+            Value::String(_) => Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`{context}` field name must not be empty"),
+            )),
+            _ => Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`{context}` entries must be strings"),
+            )),
+        })
+        .collect()
 }
 
 fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
@@ -598,13 +694,51 @@ fn paginate_hits(request: &SearchRequest, documents: &[StoredDocument]) -> Vec<V
         .iter()
         .skip(from)
         .take(size)
-        .map(|document| {
-            json!({
-                "_index": document.index,
-                "_id": document.id,
-            })
-        })
+        .map(|document| build_hit(document, request.source.as_ref()))
         .collect()
+}
+
+fn build_hit(document: &StoredDocument, filter: Option<&SourceFilter>) -> Value {
+    let mut hit = json!({
+        "_index": document.index,
+        "_id": document.id,
+    });
+    if let Some(source) = apply_source_filter(&document.source, filter) {
+        hit.as_object_mut()
+            .expect("hit object")
+            .insert("_source".to_owned(), source);
+    }
+    hit
+}
+
+fn apply_source_filter(source: &Value, filter: Option<&SourceFilter>) -> Option<Value> {
+    match filter {
+        None => Some(source.clone()),
+        Some(SourceFilter::Disabled) => None,
+        Some(SourceFilter::Includes(fields)) => Some(filter_source_fields(source, fields, &[])),
+        Some(SourceFilter::IncludesExcludes { includes, excludes }) => {
+            Some(filter_source_fields(source, includes, excludes))
+        }
+    }
+}
+
+fn filter_source_fields(source: &Value, includes: &[String], excludes: &[String]) -> Value {
+    let Value::Object(object) = source else {
+        return source.clone();
+    };
+
+    let mut filtered = serde_json::Map::new();
+    for (key, value) in object {
+        if !includes.is_empty() && !includes.iter().any(|field| field == key) {
+            continue;
+        }
+        if excludes.iter().any(|field| field == key) {
+            continue;
+        }
+        filtered.insert(key.clone(), value.clone());
+    }
+
+    Value::Object(filtered)
 }
 
 fn tokenize_for_search(value: &str) -> Vec<String> {

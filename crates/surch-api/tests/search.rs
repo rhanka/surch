@@ -54,6 +54,7 @@ async fn search_router_match_all_returns_document_indexed_by_doc_api() {
         &[serde_json::json!({
             "_index": "products",
             "_id": "sku-1",
+            "_source": {"name": "desk"},
         })]
     );
 }
@@ -115,6 +116,7 @@ async fn search_router_term_returns_exact_text_match_indexed_by_doc_api() {
         &[serde_json::json!({
             "_index": "products",
             "_id": "sku-1",
+            "_source": {"name": "desk"},
         })]
     );
 }
@@ -193,6 +195,7 @@ async fn search_router_match_phrase_matches_normalized_contiguous_tokens() {
         &[serde_json::json!({
             "_index": "products",
             "_id": "sku-1",
+            "_source": {"name": "Compact Standing Desk"},
         })]
     );
 }
@@ -455,6 +458,147 @@ async fn search_router_rejects_missing_index() {
                 "reason": "index [missing] missing"
             },
             "status": 404
+        })
+    );
+}
+
+async fn index_product(router: &axum::Router, id: &str, source: &str) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/products/_doc/{id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(source.to_owned()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn search_router_omits_source_when_disabled() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk","price":42}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{}},"_source":false}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["hits"]["hits"]
+            .as_array()
+            .expect("hits should be an array"),
+        &[serde_json::json!({
+            "_index": "products",
+            "_id": "sku-1",
+        })]
+    );
+}
+
+#[tokio::test]
+async fn search_router_includes_only_selected_fields_when_source_array() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk","price":42,"sku":"S1"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"_source":["name","sku"]}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["hits"]["hits"][0]["_source"],
+        serde_json::json!({"name": "desk", "sku": "S1"})
+    );
+}
+
+#[tokio::test]
+async fn search_router_excludes_listed_fields_when_source_object() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk","price":42,"sku":"S1"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"_source":{"excludes":["price"]}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["hits"]["hits"][0]["_source"],
+        serde_json::json!({"name": "desk", "sku": "S1"})
+    );
+}
+
+#[tokio::test]
+async fn search_router_rejects_invalid_source_filter_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{}},"_source":42}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "`_source` must be a boolean, string, array, or object"
+            },
+            "status": 400
         })
     );
 }

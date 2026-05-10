@@ -29,7 +29,8 @@
           "match": {
             "label": "Rue de Rivoli"
           }
-        }
+        },
+        "_source": false
       },
       "expected_status": 200,
       "expected_response": {
@@ -74,7 +75,8 @@
               }
             ]
           }
-        }
+        },
+        "_source": false
       },
       "expected_status": 200,
       "expected_response": {
@@ -111,7 +113,8 @@
               "fuzziness": 2
             }
           }
-        }
+        },
+        "_source": false
       },
       "expected_status": 200,
       "expected_response": {
