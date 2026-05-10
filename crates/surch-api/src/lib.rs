@@ -11,6 +11,7 @@ pub mod bulk;
 pub mod count;
 pub mod document;
 pub mod error;
+pub mod field_caps;
 pub mod index;
 pub mod mget;
 pub mod msearch;
@@ -77,6 +78,15 @@ pub fn app_router() -> Router {
             post(msearch::index_msearch_state_handler)
                 .get(msearch::index_msearch_state_handler)
                 .layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/_field_caps",
+            post(field_caps::field_caps_state_handler).get(field_caps::field_caps_state_handler),
+        )
+        .route(
+            "/:index/_field_caps",
+            post(field_caps::index_field_caps_state_handler)
+                .get(field_caps::index_field_caps_state_handler),
         )
         .with_state(state::AppState::default())
 }
