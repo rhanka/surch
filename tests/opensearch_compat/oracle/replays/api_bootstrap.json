@@ -19,6 +19,17 @@
       }
     },
     {
+      "name": "create_products_index",
+      "method": "PUT",
+      "path": "/products",
+      "expected_status": 200,
+      "expected_response": {
+        "acknowledged": true,
+        "shards_acknowledged": true,
+        "index": "products"
+      }
+    },
+    {
       "name": "count_empty_products",
       "method": "POST",
       "path": "/products/_count",

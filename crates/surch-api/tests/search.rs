@@ -205,8 +205,22 @@ async fn search_router_accepts_match_all_fixture() {
         "../../../tests/opensearch_compat/search/bootstrap_response.json"
     ))
     .expect("response fixture should be valid json");
+    let router = app_router();
 
-    let response = app_router()
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -232,8 +246,22 @@ async fn search_router_accepts_empty_object_fixture() {
         "../../../tests/opensearch_compat/search/bootstrap_response.json"
     ))
     .expect("response fixture should be valid json");
+    let router = app_router();
 
-    let response = app_router()
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -281,7 +309,21 @@ async fn search_router_rejects_invalid_index_name_with_open_search_error() {
 
 #[tokio::test]
 async fn search_router_rejects_unknown_query_with_opensearch_error() {
-    let response = app_router()
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -308,7 +350,21 @@ async fn search_router_rejects_unknown_query_with_opensearch_error() {
 
 #[tokio::test]
 async fn search_router_rejects_term_query_object_without_value_with_opensearch_error() {
-    let response = app_router()
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -337,7 +393,21 @@ async fn search_router_rejects_term_query_object_without_value_with_opensearch_e
 
 #[tokio::test]
 async fn search_router_rejects_invalid_pagination_with_opensearch_error() {
-    let response = app_router()
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -358,6 +428,33 @@ async fn search_router_rejects_invalid_pagination_with_opensearch_error() {
                 "reason": "search `from` must be a non-negative integer"
             },
             "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn search_router_rejects_missing_index() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/missing/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "index_not_found_exception",
+                "reason": "index [missing] missing"
+            },
+            "status": 404
         })
     );
 }

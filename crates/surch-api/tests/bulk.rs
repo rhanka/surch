@@ -149,6 +149,20 @@ fn bulk_rejects_non_json_source_line() {
 }
 
 #[test]
+fn bulk_rejects_non_object_source_line() {
+    let body = "{\"create\":{\"_index\":\"books\",\"_id\":\"1\"}}\n123\n".to_owned();
+    let err = parse_bulk_ndjson(&body).expect_err("bulk action source must be an object");
+
+    assert!(matches!(
+        err,
+        BulkParseError::SourceNotObject {
+            line: 2,
+            action: "create"
+        }
+    ));
+}
+
+#[test]
 fn bulk_rejects_invalid_index_name_in_metadata() {
     let body = r#"{"index":{"_index":"InvalidIndex","_id":"1"}}"#.to_owned()
         + "\n"

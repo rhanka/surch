@@ -28,10 +28,11 @@ fn api_router_replays_bootstrap_oracle_manifest_in_memory() {
 
     assert_eq!(report.manifest_name, "api_bootstrap");
     assert_eq!(report.dataset, "none");
-    assert_eq!(report.steps.len(), 3);
+    assert_eq!(report.steps.len(), 4);
     assert_eq!(report.steps[0].request_name, "root");
-    assert_eq!(report.steps[1].request_name, "count_empty_products");
-    assert_eq!(report.steps[2].request_name, "search_empty_products");
+    assert_eq!(report.steps[1].request_name, "create_products_index");
+    assert_eq!(report.steps[2].request_name, "count_empty_products");
+    assert_eq!(report.steps[3].request_name, "search_empty_products");
 }
 
 #[test]

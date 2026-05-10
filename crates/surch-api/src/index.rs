@@ -73,6 +73,15 @@ pub async fn create_index_handler(
         Err(error) => return error.into_response(),
     };
 
+    if state.index_exists(&index) {
+        return OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "resource_already_exists_exception",
+            format!("index [{index}] already exists"),
+        )
+        .into_response();
+    }
+
     state.create_index(&index, Some(request.mapping));
 
     (
@@ -92,6 +101,15 @@ pub async fn delete_index_handler(
 ) -> impl IntoResponse {
     if let Err(error) = validate_index_name(&index) {
         return error.into_response();
+    }
+
+    if !state.index_exists(&index) {
+        return OpenSearchError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("index [{index}] missing"),
+        )
+        .into_response();
     }
 
     state.delete_index(&index);
@@ -197,13 +215,56 @@ fn parse_create_index_request(body: &str) -> Result<CreateIndexRequest, OpenSear
         }
     }
 
-    let mapping = object
-        .get("mappings")
-        .and_then(Value::as_object)
-        .and_then(|mappings| mappings.get("properties"))
-        .and_then(Value::as_object)
-        .map(|properties| Value::Object(properties.clone()))
-        .unwrap_or_else(|| json!({}));
+    if let Some(settings) = object.get("settings") {
+        if !settings.is_object() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "index request `settings` must be an object",
+            ));
+        }
+    }
+
+    if let Some(aliases) = object.get("aliases") {
+        if !aliases.is_object() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "index request `aliases` must be an object",
+            ));
+        }
+    }
+
+    let mapping = match object.get("mappings") {
+        Some(Value::Object(mappings)) => {
+            if let Some(properties) = mappings.get("properties") {
+                parse_properties_object(Some(properties), "mappings.properties")?
+            } else if matches!(mappings.get("_doc"), Some(Value::Object(_doc_mapping))) {
+                parse_properties_object(
+                    mappings
+                        .get("_doc")
+                        .and_then(|doc_mapping| doc_mapping.get("properties")),
+                    "mappings._doc.properties",
+                )?
+            } else if mappings.is_empty() {
+                json!({})
+            } else {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "index request `mappings` body is invalid",
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "index request `mappings` must be an object",
+            ));
+        }
+        None => json!({}),
+    };
     let mapping = IndexMapping::from_properties_value(&mapping).map_err(|error| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -213,6 +274,25 @@ fn parse_create_index_request(body: &str) -> Result<CreateIndexRequest, OpenSear
     })?;
 
     Ok(CreateIndexRequest { mapping })
+}
+
+fn parse_properties_object(
+    properties: Option<&Value>,
+    context: &str,
+) -> Result<Value, OpenSearchError> {
+    if let Some(properties) = properties {
+        if !properties.is_object() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("{context} must be an object"),
+            ));
+        }
+
+        return Ok(properties.clone());
+    }
+
+    Ok(json!({}))
 }
 
 pub fn validate_index_name(index: &str) -> Result<(), OpenSearchError> {

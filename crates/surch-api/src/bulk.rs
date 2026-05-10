@@ -61,6 +61,15 @@ pub struct BulkItemStatus {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<BulkItemError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BulkItemError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub reason: String,
 }
 
 /// Error returned when `_bulk` NDJSON cannot be parsed into valid operations.
@@ -84,6 +93,8 @@ pub enum BulkParseError {
     UnknownAction { line: usize, action: String },
     #[error("missing source line after `{action}` action at line {line}")]
     MissingSource { line: usize, action: &'static str },
+    #[error("bulk {action} source line at line {line} must be a JSON object")]
+    SourceNotObject { line: usize, action: &'static str },
 }
 
 /// Build a deterministic P0 OpenSearch-compatible `_bulk` response.
@@ -118,9 +129,12 @@ pub async fn bulk_state_handler(State(state): State<AppState>, body: String) -> 
     let started_at = Instant::now();
     match parse_bulk_ndjson(&body) {
         Ok(operations) => {
-            apply_bulk_operations(&state, &operations);
-            let response =
-                build_bulk_response(&operations, started_at.elapsed().as_millis() as u64);
+            let (items, errors) = apply_bulk_operations(&state, &operations);
+            let response = BulkResponse {
+                took: started_at.elapsed().as_millis() as u64,
+                errors,
+                items,
+            };
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => bulk_parse_error_response(error),
@@ -145,9 +159,12 @@ pub async fn index_bulk_state_handler(
                 .map(|operation| apply_default_index(&operation, Some(index.as_str())))
                 .collect();
 
-            apply_bulk_operations(&state, &operations);
-            let response =
-                build_bulk_response(&operations, started_at.elapsed().as_millis() as u64);
+            let (items, errors) = apply_bulk_operations(&state, &operations);
+            let response = BulkResponse {
+                took: started_at.elapsed().as_millis() as u64,
+                errors,
+                items,
+            };
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => bulk_parse_error_response(error),
@@ -165,31 +182,131 @@ pub async fn bulk_handler(body: String) -> impl IntoResponse {
     }
 }
 
-fn apply_bulk_operations(state: &AppState, operations: &[BulkOperation]) {
-    for operation in operations {
-        apply_bulk_operation(state, operation);
+fn apply_bulk_operations(
+    state: &AppState,
+    operations: &[BulkOperation],
+) -> (Vec<BulkResponseItem>, bool) {
+    let mut has_error = false;
+    let items = operations
+        .iter()
+        .map(|operation| {
+            let item = apply_bulk_operation(state, operation);
+            has_error |= item_has_error(&item);
+            item
+        })
+        .collect();
+
+    (items, has_error)
+}
+
+fn apply_bulk_operation(state: &AppState, operation: &BulkOperation) -> BulkResponseItem {
+    match operation {
+        BulkOperation::Index { index, id, source } => BulkResponseItem::Index(
+            apply_index_like_operation(state, index.as_deref(), id.as_deref(), source, 201),
+        ),
+        BulkOperation::Create { index, id, source } => {
+            let status = match (index.as_deref(), id.as_deref()) {
+                (Some(index), Some(id)) => {
+                    if state.create_document(index, id, source.clone()) {
+                        item_status(&Some(index.to_owned()), &Some(id.to_owned()), 201)
+                    } else {
+                        item_status_with_error(
+                            Some(index),
+                            Some(id),
+                            409,
+                            "version_conflict_engine_exception",
+                            "document already exists",
+                        )
+                    }
+                }
+                (None, Some(id)) => item_status_with_error(
+                    None,
+                    Some(id),
+                    400,
+                    "illegal_argument_exception",
+                    "missing _index in bulk operation metadata",
+                ),
+                (_, None) => item_status_with_error(
+                    index.as_deref(),
+                    None,
+                    400,
+                    "illegal_argument_exception",
+                    "missing _id in bulk operation metadata",
+                ),
+            };
+            BulkResponseItem::Create(status)
+        }
+        BulkOperation::Update { index, id, source } => {
+            let status = apply_index_like_operation(
+                state,
+                index.as_deref(),
+                id.as_deref(),
+                &source.get("doc").cloned().unwrap_or_else(|| source.clone()),
+                200,
+            );
+            BulkResponseItem::Update(status)
+        }
+        BulkOperation::Delete { index, id } => {
+            let status = match (index.as_deref(), id.as_deref()) {
+                (Some(index), Some(id)) => {
+                    state.delete_document(index, id);
+                    item_status(&Some(index.to_owned()), &Some(id.to_owned()), 200)
+                }
+                (None, Some(id)) => item_status_with_error(
+                    None,
+                    Some(id),
+                    400,
+                    "illegal_argument_exception",
+                    "missing _index in bulk operation metadata",
+                ),
+                (_, None) => item_status_with_error(
+                    index.as_deref(),
+                    None,
+                    400,
+                    "illegal_argument_exception",
+                    "missing _id in bulk operation metadata",
+                ),
+            };
+            BulkResponseItem::Delete(status)
+        }
     }
 }
 
-fn apply_bulk_operation(state: &AppState, operation: &BulkOperation) {
-    match operation {
-        BulkOperation::Index { index, id, source }
-        | BulkOperation::Create { index, id, source } => {
-            if let (Some(index), Some(id)) = (index, id) {
-                state.index_document(index, id, source.clone());
-            }
+fn apply_index_like_operation(
+    state: &AppState,
+    index: Option<&str>,
+    id: Option<&str>,
+    source: &Value,
+    status: u16,
+) -> BulkItemStatus {
+    match (index, id) {
+        (Some(index), Some(id)) => {
+            state.index_document(index, id, source.clone());
+            item_status(&Some(index.to_owned()), &Some(id.to_owned()), status)
         }
-        BulkOperation::Update { index, id, source } => {
-            if let (Some(index), Some(id)) = (index, id) {
-                let source = source.get("doc").cloned().unwrap_or_else(|| source.clone());
-                state.index_document(index, id, source);
-            }
-        }
-        BulkOperation::Delete { index, id } => {
-            if let (Some(index), Some(id)) = (index, id) {
-                state.delete_document(index, id);
-            }
-        }
+        (None, Some(id)) => item_status_with_error(
+            None,
+            Some(id),
+            400,
+            "illegal_argument_exception",
+            "missing _index in bulk operation metadata",
+        ),
+        (_, None) => item_status_with_error(
+            index,
+            None,
+            400,
+            "illegal_argument_exception",
+            "missing _id in bulk operation metadata",
+        ),
+    }
+}
+
+fn item_has_error(item: &BulkResponseItem) -> bool {
+    match item {
+        BulkResponseItem::Index(status)
+        | BulkResponseItem::Create(status)
+        | BulkResponseItem::Delete(status)
+        | BulkResponseItem::Update(status) => status.error.is_some(),
     }
 }
 
@@ -236,6 +353,25 @@ fn item_status(index: &Option<String>, id: &Option<String>, status: u16) -> Bulk
         index: index.clone(),
         id: id.clone(),
         status,
+        error: None,
+    }
+}
+
+fn item_status_with_error(
+    index: Option<&str>,
+    id: Option<&str>,
+    status: u16,
+    error_type: &str,
+    reason: &str,
+) -> BulkItemStatus {
+    BulkItemStatus {
+        index: index.map(ToString::to_string),
+        id: id.map(ToString::to_string),
+        status,
+        error: Some(BulkItemError {
+            error_type: error_type.to_owned(),
+            reason: reason.to_owned(),
+        }),
     }
 }
 
@@ -338,6 +474,16 @@ fn optional_string_field(
 ) -> Result<Option<String>, BulkParseError> {
     match value {
         Some(Value::String(value)) => {
+            if value.is_empty() {
+                return Err(BulkParseError::InvalidAction {
+                    line,
+                    reason: match field {
+                        "_index" => "_index metadata must not be empty",
+                        "_id" => "_id metadata must not be empty",
+                        _ => "metadata field must not be empty",
+                    },
+                });
+            }
             if field == "_index" && validate_index_name(value).is_err() {
                 return Err(BulkParseError::InvalidAction {
                     line,
@@ -372,6 +518,11 @@ where
     })?;
     let line = source_line_index + 1;
 
-    serde_json::from_str(source_line)
-        .map_err(|source| BulkParseError::InvalidSourceJson { line, source })
+    let source: Value = serde_json::from_str(source_line)
+        .map_err(|source| BulkParseError::InvalidSourceJson { line, source })?;
+    if !source.is_object() {
+        return Err(BulkParseError::SourceNotObject { line, action });
+    }
+
+    Ok(source)
 }

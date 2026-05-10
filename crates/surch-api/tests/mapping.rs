@@ -119,6 +119,72 @@ async fn mapping_router_returns_all_mappings() {
 }
 
 #[tokio::test]
+async fn mapping_router_accepts_legacy_doc_type_wrapper() {
+    let legacy_body = r#"{"mappings":{"_doc":{"properties":{"title":{"type":"text"}}}}}"#;
+
+    let router = app_router();
+    let create_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/legacy")
+                .header("content-type", "application/json")
+                .body(Body::from(legacy_body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/legacy/_mapping")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["legacy"]["mappings"]["properties"]["title"]["type"],
+        "text"
+    );
+}
+
+#[tokio::test]
+async fn mapping_router_rejects_invalid_mappings_type() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/invalid-mappings")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"mappings": "not-object"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "index request `mappings` must be an object"
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
 async fn mapping_router_index_not_found() {
     let response = app_router()
         .oneshot(

@@ -63,6 +63,14 @@ pub async fn count_handler(
     if let Err(error) = validate_index_name(&index) {
         return error.into_response();
     }
+    if !state.index_exists(&index) {
+        return OpenSearchError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("index [{index}] missing"),
+        )
+        .into_response();
+    }
 
     match parse_count_request(&body) {
         Ok(request) => {

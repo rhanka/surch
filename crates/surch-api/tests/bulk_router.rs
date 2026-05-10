@@ -124,3 +124,87 @@ async fn bulk_router_accepts_index_route_with_default_index() {
     let search_response = response_json(search_response).await;
     assert_eq!(search_response["hits"]["hits"][0]["_id"], "1");
 }
+
+#[tokio::test]
+async fn bulk_router_reports_missing_id_as_item_error() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_index":"products"}}
+{"title":"Missing id"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["errors"], true);
+    assert_eq!(response["items"][0]["index"]["_index"], "products");
+    assert_eq!(response["items"][0]["index"]["status"], 400);
+    assert_eq!(
+        response["items"][0]["index"]["error"]["type"],
+        "illegal_argument_exception"
+    );
+    assert_eq!(
+        response["items"][0]["index"]["error"]["reason"],
+        "missing _id in bulk operation metadata"
+    );
+}
+
+#[tokio::test]
+async fn bulk_router_reports_duplicate_create_as_conflict() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"create":{"_id":"sku-1"}}
+{"name":"first"}
+{"create":{"_id":"sku-1"}}
+{"name":"second"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["errors"], true);
+    assert_eq!(response["items"][1]["create"]["status"], 409);
+    assert_eq!(
+        response["items"][1]["create"]["error"]["type"],
+        "version_conflict_engine_exception"
+    );
+}
+
+#[tokio::test]
+async fn bulk_router_rejects_non_object_source_with_parse_error() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_index":"products","_id":"sku-1"}}
+42
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

@@ -161,6 +161,14 @@ pub async fn search_handler(
     if let Err(error) = validate_index_name(&index) {
         return error.into_response();
     }
+    if !state.index_exists(&index) {
+        return OpenSearchError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("index [{index}] missing"),
+        )
+        .into_response();
+    }
 
     let started_at = Instant::now();
     match parse_search_request(&body) {

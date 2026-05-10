@@ -72,6 +72,10 @@ impl InMemoryIndex {
         self.mapping.as_value()
     }
 
+    fn has_document(&self, id: &str) -> bool {
+        self.document_ids.contains_key(id)
+    }
+
     fn rebuild_index(&mut self) {
         self.index.clear();
         for (id, source) in &self.documents {
@@ -154,19 +158,10 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        match store.indices.get_mut(index) {
-            Some(data) => {
-                if let Some(mapping) = mapping {
-                    data.set_mapping(mapping);
-                }
-            }
-            None => {
-                store.indices.insert(
-                    index.to_owned(),
-                    InMemoryIndex::new(mapping.unwrap_or_default()),
-                );
-            }
-        }
+        store
+            .indices
+            .entry(index.to_owned())
+            .or_insert_with(|| InMemoryIndex::new(mapping.unwrap_or_default()));
     }
 
     pub fn delete_index(&self, index: &str) {
@@ -179,6 +174,14 @@ impl AppState {
 
     pub fn refresh_index(&self, _index: &str) {}
 
+    pub fn index_exists(&self, index: &str) -> bool {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.contains_key(index)
+    }
+
     pub fn index_document(&self, index: &str, id: &str, source: Value) {
         let mut store = self
             .store
@@ -190,6 +193,24 @@ impl AppState {
             .entry(index.to_owned())
             .or_insert_with(|| InMemoryIndex::new(IndexMapping::default()));
         data.upsert_document(id, source);
+    }
+
+    pub fn create_document(&self, index: &str, id: &str, source: Value) -> bool {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+
+        let data = store
+            .indices
+            .entry(index.to_owned())
+            .or_insert_with(|| InMemoryIndex::new(IndexMapping::default()));
+        if data.has_document(id) {
+            return false;
+        }
+
+        data.upsert_document(id, source);
+        true
     }
 
     pub fn set_mapping(&self, index: &str, mapping: IndexMapping) {

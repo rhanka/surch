@@ -38,8 +38,92 @@ async fn index_router_creates_index_with_opensearch_acknowledgement() {
 }
 
 #[tokio::test]
-async fn index_router_deletes_index_with_opensearch_acknowledgement() {
+async fn index_router_rejects_duplicate_index_creation() {
+    let router = app_router();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["index"], "products");
+
+    let duplicate = router
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(duplicate).await,
+        serde_json::json!({
+            "error": {
+                "type": "resource_already_exists_exception",
+                "reason": "index [products] already exists"
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn index_router_delete_missing_index_returns_not_found() {
     let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/missing")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "index_not_found_exception",
+                "reason": "index [missing] missing"
+            },
+            "status": 404
+        })
+    );
+}
+
+#[tokio::test]
+async fn index_router_deletes_index_with_opensearch_acknowledgement() {
+    let router = app_router();
+
+    let create_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_response.status().is_success());
+
+    let response = router
         .oneshot(
             Request::builder()
                 .method(Method::DELETE)
