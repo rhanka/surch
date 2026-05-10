@@ -27,7 +27,6 @@ impl Default for IndexStoreConfig {
 
 #[derive(Debug, Clone)]
 pub struct IndexStore {
-    root: PathBuf,
     wal: WriteAheadLog,
     segments: SegmentStore,
     config: IndexStoreConfig,
@@ -60,7 +59,6 @@ impl IndexStore {
         .map_err(IndexStoreError::Segment)?;
 
         let mut store = Self {
-            root,
             wal,
             segments,
             config,
@@ -119,7 +117,35 @@ impl IndexStore {
     }
 
     fn recover_from_disk(&mut self) -> Result<()> {
-        let _ = &self.root;
+        let persisted_records = self
+            .segments
+            .all_records()
+            .map_err(IndexStoreError::Segment)?;
+        let mut max_persisted_sequence = persisted_records.iter().map(|entry| entry.sequence).max();
+
+        let wal_records = self.wal.entries();
+        let replay_records = match max_persisted_sequence {
+            Some(max_sequence) => wal_records
+                .iter()
+                .filter(|record| record.sequence > max_sequence)
+                .cloned()
+                .collect::<Vec<_>>(),
+            None => wal_records.to_vec(),
+        };
+
+        if !replay_records.is_empty() {
+            if let Some(max_replay_sequence) =
+                replay_records.iter().map(|entry| entry.sequence).max()
+            {
+                max_persisted_sequence = Some(max_replay_sequence);
+            }
+            self.segments
+                .append_entries(replay_records)
+                .map_err(IndexStoreError::Segment)?;
+        }
+
+        self.wal
+            .retain_entries_greater_than(max_persisted_sequence.unwrap_or(0))?;
         Ok(())
     }
 }

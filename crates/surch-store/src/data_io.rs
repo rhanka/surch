@@ -8,6 +8,8 @@ pub type Result<T> = std::result::Result<T, DataIoError>;
 pub enum DataIoError {
     #[error("unexpected end of input at byte position {position}")]
     UnexpectedEof { position: usize },
+    #[error("invalid varint encoding for {kind}")]
+    InvalidVarintEncoding { kind: &'static str },
     #[error("invalid UTF-8 string data")]
     InvalidUtf8,
     #[error("invalid negative length {length}")]
@@ -34,10 +36,15 @@ pub trait DataInput {
             let byte = self.read_byte()?;
             value |= u32::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
-                break;
+                return Ok(value as i32);
+            }
+
+            if shift >= 28 {
+                return Err(DataIoError::InvalidVarintEncoding { kind: "vint" });
             }
         }
-        Ok(value as i32)
+
+        Err(DataIoError::InvalidVarintEncoding { kind: "vint" })
     }
 
     fn read_vlong(&mut self) -> Result<i64> {
@@ -46,10 +53,15 @@ pub trait DataInput {
             let byte = self.read_byte()?;
             value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
-                break;
+                return Ok(value as i64);
+            }
+
+            if shift >= 63 {
+                return Err(DataIoError::InvalidVarintEncoding { kind: "vlong" });
             }
         }
-        Ok(value as i64)
+
+        Err(DataIoError::InvalidVarintEncoding { kind: "vlong" })
     }
 
     fn read_zlong(&mut self) -> Result<i64> {
@@ -212,4 +224,29 @@ fn checked_vint_length(length: i32) -> Result<usize> {
 
 fn checked_usize_length(length: usize) -> Result<i32> {
     i32::try_from(length).map_err(|_| DataIoError::LengthOverflow { length })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_vint_rejects_non_canonical_encoding() {
+        let mut input = ByteArrayDataInput::new(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x01]);
+        assert!(matches!(
+            input.read_vint(),
+            Err(DataIoError::InvalidVarintEncoding { kind: "vint" })
+        ));
+    }
+
+    #[test]
+    fn read_vlong_rejects_non_canonical_encoding() {
+        let mut input = ByteArrayDataInput::new(&[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        ]);
+        assert!(matches!(
+            input.read_vlong(),
+            Err(DataIoError::InvalidVarintEncoding { kind: "vlong" })
+        ));
+    }
 }

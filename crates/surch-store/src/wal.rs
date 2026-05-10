@@ -15,6 +15,7 @@ use surch_codec::codec_util::{
 const WAL_FILE_NAME: &str = "wal.log";
 const WAL_CODEC: &str = "wal";
 const WAL_VERSION: i32 = 1;
+const MAX_WAL_BINARY_FIELD_BYTES: usize = 4 * 1024 * 1024;
 
 pub type Result<T> = std::result::Result<T, WalError>;
 
@@ -25,6 +26,13 @@ pub enum WalError {
 
     #[error("WAL data is corrupt: {message}")]
     Corrupt { message: String },
+
+    #[error("WAL field `{field}` too large: {length} bytes exceeds limit {limit}")]
+    FieldTooLarge {
+        field: &'static str,
+        length: usize,
+        limit: usize,
+    },
 
     #[error("invalid WAL identifier `{value}` for {field}")]
     InvalidIdentifier { field: &'static str, value: String },
@@ -53,13 +61,13 @@ impl WalRecord {
         write_u64(self.sequence, bytes);
         write_u64(self.timestamp_millis, bytes);
 
-        write_prefixed_bytes(self.index.as_bytes(), bytes);
-        write_prefixed_bytes(self.doc_id.as_bytes(), bytes);
+        write_prefixed_bytes("index", self.index.as_bytes(), bytes)?;
+        write_prefixed_bytes("doc_id", self.doc_id.as_bytes(), bytes)?;
 
         match &self.operation {
             WalOperation::Index { source } => {
                 bytes.push(1);
-                write_prefixed_bytes(source, bytes);
+                write_prefixed_bytes("source", source, bytes)?;
             }
             WalOperation::Delete => {
                 bytes.push(2);
@@ -193,8 +201,22 @@ impl WriteAheadLog {
         std::mem::take(&mut self.entries)
     }
 
+    pub fn retain_entries_greater_than(&mut self, min_sequence_inclusive: u64) -> Result<()> {
+        self.entries = self
+            .entries
+            .iter()
+            .filter(|entry| entry.sequence > min_sequence_inclusive)
+            .cloned()
+            .collect();
+
+        self.next_sequence = self.entries.last().map(|entry| entry.sequence).unwrap_or(0);
+
+        self.flush()
+    }
+
     pub fn clear(&mut self) -> Result<()> {
         self.entries.clear();
+        self.next_sequence = 0;
         self.flush()
     }
 
@@ -330,9 +352,18 @@ fn _write_u8(bytes: &mut Vec<u8>, value: u8) {
     bytes.push(value);
 }
 
-fn write_prefixed_bytes(value: &[u8], bytes: &mut Vec<u8>) {
+fn write_prefixed_bytes(field: &'static str, value: &[u8], bytes: &mut Vec<u8>) -> Result<()> {
+    if value.len() > MAX_WAL_BINARY_FIELD_BYTES {
+        return Err(WalError::FieldTooLarge {
+            field,
+            length: value.len(),
+            limit: MAX_WAL_BINARY_FIELD_BYTES,
+        });
+    }
+
     write_u32(value.len() as u32, bytes);
     bytes.extend_from_slice(value);
+    Ok(())
 }
 
 fn write_u32(value: u32, bytes: &mut Vec<u8>) {
@@ -378,6 +409,14 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 
 fn read_prefixed_bytes(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
     let length = read_u32(bytes, cursor)? as usize;
+    if length > MAX_WAL_BINARY_FIELD_BYTES {
+        return Err(WalError::FieldTooLarge {
+            field: "prefixed_data",
+            length,
+            limit: MAX_WAL_BINARY_FIELD_BYTES,
+        });
+    }
+
     let end = cursor
         .checked_add(length)
         .ok_or_else(|| WalError::Corrupt {
@@ -417,13 +456,40 @@ mod tests {
 
         for value in values {
             let mut bytes = Vec::new();
-            write_prefixed_bytes(value, &mut bytes);
+            write_prefixed_bytes("roundtrip", value, &mut bytes).expect("encode");
 
             let mut cursor = 0;
             let actual = read_prefixed_bytes(&bytes, &mut cursor).expect("decode");
             assert_eq!(actual, value.to_vec());
             assert_eq!(cursor, bytes.len());
         }
+    }
+
+    #[test]
+    fn write_prefixed_rejects_oversized_value() {
+        let mut bytes = Vec::new();
+        let oversized = vec![0_u8; MAX_WAL_BINARY_FIELD_BYTES + 1];
+        let error =
+            write_prefixed_bytes("source", &oversized, &mut bytes).expect_err("oversized payload");
+        assert!(matches!(error, WalError::FieldTooLarge { field, .. } if field == "source"));
+    }
+
+    #[test]
+    fn read_prefixed_rejects_length_above_limit() {
+        let mut bytes = Vec::new();
+        write_u32((MAX_WAL_BINARY_FIELD_BYTES as u32) + 1, &mut bytes);
+        bytes.extend_from_slice(b"x");
+
+        let mut cursor = 0;
+        let error =
+            read_prefixed_bytes(&bytes, &mut cursor).expect_err("oversize length should fail");
+        assert!(matches!(
+            error,
+            WalError::FieldTooLarge {
+                field: "prefixed_data",
+                ..
+            }
+        ));
     }
 
     #[test]

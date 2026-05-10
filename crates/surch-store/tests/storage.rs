@@ -242,6 +242,78 @@ fn index_store_round_trips_state_and_respects_merge_policy() -> Result<(), Index
 }
 
 #[test]
+fn index_store_recovers_stale_wal_entries_after_restart() -> Result<(), IndexStoreError> {
+    let root = unique_temp_dir("surch-index-store-recover-stale");
+    let config = IndexStoreConfig {
+        merge_threshold: 8,
+        keep_recent_segments: 1,
+    };
+
+    {
+        let mut store = IndexStore::open(root.clone(), config.clone())?;
+        store.append_index("products", "doc-1", b"{\"title\":\"one\"}".to_vec())?;
+        store.append_index("products", "doc-2", b"{\"title\":\"two\"}".to_vec())?;
+        store.flush_wal()?;
+    }
+
+    let wal_before_restart = WriteAheadLog::new(root.join("wal"))?;
+    assert_eq!(wal_before_restart.len(), 2);
+
+    {
+        let reopened = IndexStore::open(root.clone(), config.clone())?;
+        let records = reopened.all_segment_records()?;
+        let mut sequences = records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![1, 2]);
+
+        let wal_after_restart = WriteAheadLog::new(root.join("wal"))?;
+        assert_eq!(wal_after_restart.len(), 0);
+        assert_eq!(reopened.segment_count(), 1);
+    }
+
+    remove_dir(&root);
+    Ok(())
+}
+
+#[test]
+fn index_store_replays_pending_wal_entries() -> Result<(), IndexStoreError> {
+    let root = unique_temp_dir("surch-index-store-replay-pending");
+    let config = IndexStoreConfig {
+        merge_threshold: 8,
+        keep_recent_segments: 1,
+    };
+
+    {
+        let mut store = IndexStore::open(root.clone(), config.clone())?;
+        store.append_index("products", "doc-1", b"{\"title\":\"one\"}".to_vec())?;
+        store.flush_wal()?;
+    }
+
+    let mut pending_wal = WriteAheadLog::new(root.join("wal"))?;
+    pending_wal.append_index("products", "doc-2", b"{\"title\":\"two\"}".to_vec())?;
+    pending_wal.flush()?;
+
+    {
+        let reopened = IndexStore::open(root.clone(), config.clone())?;
+        let records = reopened.all_segment_records()?;
+        let mut sequences = records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![1, 2]);
+        let wal_after_restart = WriteAheadLog::new(root.join("wal"))?;
+        assert_eq!(wal_after_restart.len(), 0);
+    }
+
+    remove_dir(&root);
+    Ok(())
+}
+
+#[test]
 fn segment_store_returns_stable_error_on_invalid_identifier() {
     let root = unique_temp_dir("surch-store-invalid-id");
     let mut wal = WriteAheadLog::new(root.join("wal")).expect("create WAL");

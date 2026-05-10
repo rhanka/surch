@@ -35,7 +35,7 @@ pub struct SegmentStore {
     path: PathBuf,
     segments: Vec<SegmentMetadata>,
     next_segment_id: u64,
-    _keep_recent_segments: usize,
+    keep_recent_segments: usize,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -77,7 +77,7 @@ impl SegmentStore {
             path,
             segments,
             next_segment_id,
-            _keep_recent_segments: config.keep_recent_segments,
+            keep_recent_segments: config.keep_recent_segments.max(1),
         })
     }
 
@@ -116,7 +116,11 @@ impl SegmentStore {
             return Ok(None);
         }
 
-        let to_merge = count.min(self.segments.len() - 1);
+        let safe_to_merge = self
+            .keep_recent_segments
+            .min(self.segments.len().saturating_sub(1));
+        let available = self.segments.len().saturating_sub(safe_to_merge);
+        let to_merge = count.min(available);
         if to_merge == 0 {
             return Ok(None);
         }
@@ -129,14 +133,17 @@ impl SegmentStore {
             .flat_map(|records| records.into_iter())
             .collect::<Vec<_>>();
 
-        for segment in &self.segments[..to_merge] {
-            let _ = fs::remove_file(self.path.join(&segment.file_name));
-        }
-
         let metadata = SegmentMetadata {
             file_name: self.next_segment_name(),
             records: merged_records.len(),
         };
+        let to_merge_file_names = self
+            .segments
+            .iter()
+            .take(to_merge)
+            .map(|segment| segment.file_name.clone())
+            .collect::<Vec<_>>();
+
         let payload = PersistedSegment {
             metadata: metadata.clone(),
             records: merged_records,
@@ -146,6 +153,15 @@ impl SegmentStore {
                 file_name: metadata.file_name.clone(),
             })?;
         write_atomic(&self.path.join(&metadata.file_name), &bytes)?;
+
+        for file_name in &to_merge_file_names {
+            fs::remove_file(self.path.join(file_name)).map_err(|error| {
+                SegmentStoreError::Io(format!(
+                    "remove merged source segment {}: {error}",
+                    file_name
+                ))
+            })?;
+        }
 
         let mut segments = self.segments.split_off(to_merge);
         segments.insert(0, metadata.clone());
