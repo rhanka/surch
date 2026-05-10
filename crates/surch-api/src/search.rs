@@ -84,6 +84,26 @@ pub enum SearchQuery {
         value: String,
         fuzziness: Fuzziness,
     },
+    Range {
+        field: String,
+        bounds: RangeBounds,
+    },
+}
+
+/// Inclusive/exclusive numeric or lexicographic bounds for `range` queries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RangeBounds {
+    pub gt: Option<RangeValue>,
+    pub gte: Option<RangeValue>,
+    pub lt: Option<RangeValue>,
+    pub lte: Option<RangeValue>,
+}
+
+/// Scalar bound for a `range` query (numeric or string).
+#[derive(Clone, Debug, PartialEq)]
+pub enum RangeValue {
+    Number(f64),
+    Text(String),
 }
 
 /// OpenSearch-compatible `_search` response for the bootstrap engine-less API.
@@ -563,6 +583,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "term" => parse_term_query(query_body),
         "bool" => parse_bool_query(query_body),
         "fuzzy" => parse_fuzzy_query(query_body),
+        "range" => parse_range_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -669,6 +690,76 @@ fn parse_fuzzy_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         value,
         fuzziness,
     })
+}
+
+/// Parse the body of a `range` query into typed bounds.
+pub fn parse_range_bounds(value: &Value) -> Result<RangeBounds, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "range field query body must be an object",
+        )
+    })?;
+
+    let mut bounds = RangeBounds {
+        gt: None,
+        gte: None,
+        lt: None,
+        lte: None,
+    };
+
+    for (key, raw) in object {
+        let parsed = parse_range_bound_value(raw)?;
+        match key.as_str() {
+            "gt" => bounds.gt = Some(parsed),
+            "gte" => bounds.gte = Some(parsed),
+            "lt" => bounds.lt = Some(parsed),
+            "lte" => bounds.lte = Some(parsed),
+            "boost" | "format" | "relation" | "time_zone" => {}
+            unknown => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("unsupported range query field `{unknown}`"),
+                ));
+            }
+        }
+    }
+
+    if bounds.gt.is_none() && bounds.gte.is_none() && bounds.lt.is_none() && bounds.lte.is_none() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "range query must contain at least one of `gt`, `gte`, `lt`, `lte`",
+        ));
+    }
+
+    Ok(bounds)
+}
+
+fn parse_range_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let (field, body) = parse_single_field_query("range", value)?;
+    let bounds = parse_range_bounds(body)?;
+    Ok(SearchQuery::Range { field, bounds })
+}
+
+fn parse_range_bound_value(value: &Value) -> Result<RangeValue, OpenSearchError> {
+    match value {
+        Value::Number(number) => number.as_f64().map(RangeValue::Number).ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "range bound number must fit in a 64-bit float",
+            )
+        }),
+        Value::String(text) => Ok(RangeValue::Text(text.clone())),
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "range bound must be a number or string",
+        )),
+    }
 }
 
 fn parse_single_field_query<'a>(
@@ -790,6 +881,7 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
             value,
             fuzziness,
         } => fuzzy_field_matches(source, field, value, *fuzziness),
+        SearchQuery::Range { field, bounds } => range_field_matches(source, field, bounds),
     }
 }
 
@@ -829,6 +921,67 @@ fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
                 .any(|field_token| field_token == &query)
         })
         .unwrap_or(false)
+}
+
+pub fn range_field_matches(source: &Value, field: &str, bounds: &RangeBounds) -> bool {
+    let Some(field_value) = source.get(field) else {
+        return false;
+    };
+    if let Some(number) = field_value.as_f64() {
+        return numeric_in_bounds(number, bounds);
+    }
+    if let Some(text) = field_value.as_str() {
+        return text_in_bounds(text, bounds);
+    }
+    false
+}
+
+fn numeric_in_bounds(value: f64, bounds: &RangeBounds) -> bool {
+    if let Some(RangeValue::Number(threshold)) = &bounds.gt {
+        if value <= *threshold {
+            return false;
+        }
+    }
+    if let Some(RangeValue::Number(threshold)) = &bounds.gte {
+        if value < *threshold {
+            return false;
+        }
+    }
+    if let Some(RangeValue::Number(threshold)) = &bounds.lt {
+        if value >= *threshold {
+            return false;
+        }
+    }
+    if let Some(RangeValue::Number(threshold)) = &bounds.lte {
+        if value > *threshold {
+            return false;
+        }
+    }
+    true
+}
+
+fn text_in_bounds(value: &str, bounds: &RangeBounds) -> bool {
+    if let Some(RangeValue::Text(threshold)) = &bounds.gt {
+        if value <= threshold.as_str() {
+            return false;
+        }
+    }
+    if let Some(RangeValue::Text(threshold)) = &bounds.gte {
+        if value < threshold.as_str() {
+            return false;
+        }
+    }
+    if let Some(RangeValue::Text(threshold)) = &bounds.lt {
+        if value >= threshold.as_str() {
+            return false;
+        }
+    }
+    if let Some(RangeValue::Text(threshold)) = &bounds.lte {
+        if value > threshold.as_str() {
+            return false;
+        }
+    }
+    true
 }
 
 fn fuzzy_field_matches(source: &Value, field: &str, query: &str, fuzziness: Fuzziness) -> bool {

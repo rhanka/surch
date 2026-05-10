@@ -332,7 +332,7 @@ async fn search_router_rejects_unknown_query_with_opensearch_error() {
                 .method(Method::POST)
                 .uri("/products/_search")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"query":{"range":{"price":{"gte":10}}}}"#))
+                .body(Body::from(r#"{"query":{"regexp":{"name":"des.*"}}}"#))
                 .expect("request should build"),
         )
         .await
@@ -344,7 +344,7 @@ async fn search_router_rejects_unknown_query_with_opensearch_error() {
         serde_json::json!({
             "error": {
                 "type": "parsing_exception",
-                "reason": "unsupported search query `range`"
+                "reason": "unsupported search query `regexp`"
             },
             "status": 400
         })
@@ -887,6 +887,119 @@ async fn search_router_rejects_unknown_sort_order_with_opensearch_error() {
             "error": {
                 "type": "parsing_exception",
                 "reason": "unknown `sort` order `sideways`"
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn search_router_range_query_filters_numeric_field_with_inclusive_bounds() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"a","price":5}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"b","price":10}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"c","price":20}"#).await;
+    index_product(&router, "sku-4", r#"{"name":"d","price":50}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"range":{"price":{"gte":10,"lte":20}}},"sort":[{"price":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-2", "sku-3"]);
+}
+
+#[tokio::test]
+async fn search_router_range_query_excludes_strict_bounds_for_text_field() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"sku":"alpha"}"#).await;
+    index_product(&router, "sku-2", r#"{"sku":"bravo"}"#).await;
+    index_product(&router, "sku-3", r#"{"sku":"charlie"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"range":{"sku":{"gt":"alpha","lt":"charlie"}}},"_source":["sku"]}"#,
+    )
+    .await;
+
+    let skus: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| {
+            hit["_source"]["sku"]
+                .as_str()
+                .map(str::to_owned)
+                .expect("sku")
+        })
+        .collect();
+    assert_eq!(skus, vec!["bravo"]);
+}
+
+#[tokio::test]
+async fn search_router_range_query_combines_with_bool_must() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"category":"a","price":5}"#).await;
+    index_product(&router, "sku-2", r#"{"category":"a","price":50}"#).await;
+    index_product(&router, "sku-3", r#"{"category":"b","price":50}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"term":{"category":"a"}},{"range":{"price":{"gte":10}}}]}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-2"]);
+}
+
+#[tokio::test]
+async fn search_router_rejects_empty_range_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"range":{"price":{}}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "range query must contain at least one of `gt`, `gte`, `lt`, `lte`"
             },
             "status": 400
         })

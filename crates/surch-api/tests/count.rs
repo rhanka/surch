@@ -300,7 +300,7 @@ async fn count_router_rejects_unknown_query_with_opensearch_error() {
                 .method(Method::POST)
                 .uri("/products/_count")
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"query":{"range":{"price":{"gte":10}}}}"#))
+                .body(Body::from(r#"{"query":{"regexp":{"name":"des.*"}}}"#))
                 .expect("request should build"),
         )
         .await
@@ -312,7 +312,7 @@ async fn count_router_rejects_unknown_query_with_opensearch_error() {
         serde_json::json!({
             "error": {
                 "type": "parsing_exception",
-                "reason": "unsupported count query `range`"
+                "reason": "unsupported count query `regexp`"
             },
             "status": 400
         })
@@ -385,4 +385,48 @@ async fn count_router_rejects_missing_index() {
             "status": 404
         })
     );
+}
+
+#[tokio::test]
+async fn count_router_range_query_counts_documents_within_numeric_bounds() {
+    let router = app_router();
+
+    for (id, body) in [
+        ("sku-1", r#"{"price":5}"#),
+        ("sku-2", r#"{"price":15}"#),
+        ("sku-3", r#"{"price":25}"#),
+        ("sku-4", r#"{"price":50}"#),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/products/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"range":{"price":{"gt":5,"lte":25}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["count"], 2);
 }

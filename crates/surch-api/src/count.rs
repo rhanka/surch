@@ -8,7 +8,12 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-use crate::{index::validate_index_name, state::AppState, OpenSearchError};
+use crate::{
+    index::validate_index_name,
+    search::{parse_range_bounds, range_field_matches, RangeBounds},
+    state::AppState,
+    OpenSearchError,
+};
 
 /// OpenSearch-compatible `_count` request body for the P0 bootstrap surface.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +27,7 @@ pub enum CountQuery {
     MatchAll,
     Term { field: String, value: String },
     BoolMust(Vec<CountQuery>),
+    Range { field: String, bounds: RangeBounds },
 }
 
 /// OpenSearch-compatible `_count` response for the bootstrap engine-less API.
@@ -104,6 +110,11 @@ fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64
                     .count() as u64
             }
         }
+        CountQuery::Range { .. } => state
+            .documents(index)
+            .into_iter()
+            .filter(|document| query_matches(query, &document.source))
+            .count() as u64,
     }
 }
 
@@ -185,12 +196,19 @@ fn parse_count_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
         )),
         "term" => parse_term_query(query_body),
         "bool" => parse_bool_query(query_body),
+        "range" => parse_range_count_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
             format!("unsupported count query `{unknown}`"),
         )),
     }
+}
+
+fn parse_range_count_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
+    let (field, body) = parse_single_field_query("range", value)?;
+    let bounds = parse_range_bounds(body)?;
+    Ok(CountQuery::Range { field, bounds })
 }
 
 fn parse_term_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
@@ -281,6 +299,7 @@ fn query_matches(query: &CountQuery, source: &Value) -> bool {
         CountQuery::MatchAll => true,
         CountQuery::Term { field, value } => term_field_matches(source, field, value),
         CountQuery::BoolMust(clauses) => clauses.iter().all(|clause| query_matches(clause, source)),
+        CountQuery::Range { field, bounds } => range_field_matches(source, field, bounds),
     }
 }
 

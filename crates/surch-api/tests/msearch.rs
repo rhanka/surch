@@ -112,7 +112,7 @@ async fn msearch_reports_invalid_query_body_per_pair() {
     index_doc(&router, "products", "sku-1", r#"{"name":"desk"}"#).await;
 
     let body = "{\"index\":\"products\"}\n\
-                {\"query\":{\"range\":{\"price\":{\"gte\":10}}}}\n"
+                {\"query\":{\"regexp\":{\"name\":\"des.*\"}}}\n"
         .to_owned();
 
     let response = post_msearch(&router, "/_msearch", body).await;
