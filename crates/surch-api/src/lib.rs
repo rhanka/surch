@@ -9,6 +9,7 @@ use axum::{
 
 pub mod analyze;
 pub mod bulk;
+pub mod cat;
 pub mod cluster;
 pub mod count;
 pub mod document;
@@ -108,6 +109,7 @@ pub fn app_router() -> Router {
             "/_cluster/health/:index",
             get(cluster::cluster_health_index_handler),
         )
+        .route("/_cat/indices", get(cat::cat_indices_handler))
         .with_state(state::AppState::default())
 }
 
