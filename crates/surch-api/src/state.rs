@@ -4,7 +4,10 @@ use std::{
 };
 
 use serde_json::Value;
-use surch_index::{document_index::DocumentIndex, mapping::IndexMapping};
+use surch_index::{
+    document_index::DocumentIndex,
+    mapping::{FieldMapping, IndexMapping},
+};
 
 /// Shared in-memory API state used by API handlers.
 #[derive(Clone, Default)]
@@ -223,6 +226,40 @@ impl AppState {
             .entry(index.to_owned())
             .or_insert_with(|| InMemoryIndex::new(IndexMapping::default()))
             .set_mapping(mapping);
+    }
+
+    /// Merge the supplied field mappings into the existing index mapping.
+    ///
+    /// Returns the field name on the first type conflict; new fields are appended.
+    pub fn merge_field_mappings(
+        &self,
+        index: &str,
+        new_fields: &[(String, FieldMapping)],
+    ) -> Result<(), String> {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        let Some(data) = store.indices.get_mut(index) else {
+            return Err(format!("index [{index}] missing"));
+        };
+
+        let mut merged = data.mapping.clone();
+        for (field, mapping) in new_fields {
+            if let Some(existing) = merged.field(field) {
+                if existing.field_type != mapping.field_type {
+                    return Err(format!(
+                        "mapper [{field}] of different type, current_type [{}], merged_type [{}]",
+                        existing.field_type.as_str(),
+                        mapping.field_type.as_str(),
+                    ));
+                }
+            }
+            merged.set_field_mapping(field.clone(), *mapping);
+        }
+
+        data.set_mapping(merged);
+        Ok(())
     }
 
     pub fn delete_document(&self, index: &str, id: &str) {

@@ -36,7 +36,12 @@ pub fn app_router() -> Router {
                 .layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
         )
         .route("/_mapping", get(index::mappings_handler))
-        .route("/:index/_mapping", get(index::mapping_handler))
+        .route(
+            "/:index/_mapping",
+            get(index::mapping_handler)
+                .put(index::put_mapping_handler)
+                .post(index::put_mapping_handler),
+        )
         .route(
             "/:index",
             put(index::create_index_handler).delete(index::delete_index_handler),

@@ -209,3 +209,205 @@ async fn mapping_router_index_not_found() {
         })
     );
 }
+
+async fn create_products_index(router: &axum::Router, body: &'static str) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(response.status().is_success());
+}
+
+#[tokio::test]
+async fn put_mapping_adds_new_field_to_existing_index() {
+    let router = app_router();
+    create_products_index(
+        &router,
+        r#"{"mappings":{"properties":{"name":{"type":"text"}}}}"#,
+    )
+    .await;
+
+    let put_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products/_mapping")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"properties":{"price":{"type":"long"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(put_response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(put_response).await,
+        serde_json::json!({"acknowledged": true})
+    );
+
+    let get_response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/products/_mapping")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let body = response_json(get_response).await;
+    assert_eq!(
+        body["products"]["mappings"]["properties"]["name"]["type"],
+        "text"
+    );
+    assert_eq!(
+        body["products"]["mappings"]["properties"]["price"]["type"],
+        "long"
+    );
+}
+
+#[tokio::test]
+async fn put_mapping_accepts_raw_properties_body() {
+    let router = app_router();
+    create_products_index(&router, "").await;
+
+    let put_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products/_mapping")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"sku":{"type":"keyword"}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(put_response.status(), StatusCode::OK);
+
+    let get_response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/products/_mapping")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(
+        response_json(get_response).await["products"]["mappings"]["properties"]["sku"]["type"],
+        "keyword"
+    );
+}
+
+#[tokio::test]
+async fn put_mapping_rejects_type_conflict_with_opensearch_error() {
+    let router = app_router();
+    create_products_index(
+        &router,
+        r#"{"mappings":{"properties":{"price":{"type":"long"}}}}"#,
+    )
+    .await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products/_mapping")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"properties":{"price":{"type":"keyword"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert!(body["error"]["reason"]
+        .as_str()
+        .expect("reason string")
+        .contains("price"));
+}
+
+#[tokio::test]
+async fn put_mapping_returns_404_for_missing_index() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/missing/_mapping")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"properties":{"a":{"type":"text"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response_json(response).await["error"]["type"],
+        "index_not_found_exception"
+    );
+}
+
+#[tokio::test]
+async fn put_mapping_keeps_documents_searchable_via_added_field() {
+    let router = app_router();
+    create_products_index(&router, "").await;
+
+    let index_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"desk","price":42}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(index_response.status(), StatusCode::CREATED);
+
+    let put_mapping = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products/_mapping")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"properties":{"category":{"type":"keyword"}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(put_mapping.status(), StatusCode::OK);
+
+    let search = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"range":{"price":{"gte":10}}},"_source":false}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(search.status(), StatusCode::OK);
+    assert_eq!(response_json(search).await["hits"]["total"]["value"], 1);
+}

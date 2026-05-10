@@ -169,6 +169,85 @@ pub async fn mapping_handler(
     }
 }
 
+pub async fn put_mapping_handler(
+    State(state): State<AppState>,
+    Path(index): Path<String>,
+    body: String,
+) -> impl IntoResponse {
+    if let Err(error) = validate_index_name(&index) {
+        return error.into_response();
+    }
+    if !state.index_exists(&index) {
+        return OpenSearchError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("index [{index}] missing"),
+        )
+        .into_response();
+    }
+
+    let properties = match parse_put_mapping_request(&body) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let mapping = match IndexMapping::from_properties_value(&properties) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            return OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "mapper_parsing_exception",
+                error.to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    let fields: Vec<_> = mapping
+        .fields()
+        .map(|(field, mapping)| (field.to_owned(), *mapping))
+        .collect();
+    if let Err(reason) = state.merge_field_mappings(&index, &fields) {
+        return OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            reason,
+        )
+        .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(AcknowledgedResponse { acknowledged: true }),
+    )
+        .into_response()
+}
+
+fn parse_put_mapping_request(body: &str) -> Result<Value, OpenSearchError> {
+    if body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let value: Value = serde_json::from_str(body).map_err(|error| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            error.to_string(),
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "_mapping request body must be an object",
+        )
+    })?;
+    if let Some(properties) = object.get("properties") {
+        parse_properties_object(Some(properties), "properties")
+    } else {
+        // Allow the request body to be the properties map directly.
+        Ok(Value::Object(object.clone()))
+    }
+}
+
 pub async fn mappings_handler(State(state): State<AppState>) -> impl IntoResponse {
     let mappings = state.all_mappings();
     if mappings.is_empty() {
