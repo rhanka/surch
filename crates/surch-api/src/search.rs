@@ -25,6 +25,15 @@ pub struct SearchRequest {
     pub from: Option<u64>,
     pub size: Option<u64>,
     pub source: Option<SourceFilter>,
+    pub track_total_hits: Option<TrackTotalHits>,
+}
+
+/// OpenSearch-compatible `track_total_hits` request mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackTotalHits {
+    Disabled,
+    Exact,
+    UpTo(u64),
 }
 
 /// OpenSearch-compatible `_source` filter request mode.
@@ -84,7 +93,8 @@ pub struct SearchShards {
 /// OpenSearch-compatible hit summary for `_search`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SearchHits {
-    pub total: SearchHitsTotal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<SearchHitsTotal>,
     pub max_score: Option<f64>,
     pub hits: Vec<Value>,
 }
@@ -97,6 +107,21 @@ pub struct SearchHitsTotal {
 }
 
 pub fn build_search_response(hits: Vec<Value>, total: u64, took: u64) -> SearchResponse {
+    build_search_response_with_total(
+        hits,
+        Some(SearchHitsTotal {
+            value: total,
+            relation: "eq",
+        }),
+        took,
+    )
+}
+
+pub fn build_search_response_with_total(
+    hits: Vec<Value>,
+    total: Option<SearchHitsTotal>,
+    took: u64,
+) -> SearchResponse {
     SearchResponse {
         took,
         timed_out: false,
@@ -107,13 +132,34 @@ pub fn build_search_response(hits: Vec<Value>, total: u64, took: u64) -> SearchR
             failed: 0,
         },
         hits: SearchHits {
-            total: SearchHitsTotal {
-                value: total,
-                relation: "eq",
-            },
+            total,
             max_score: None,
             hits,
         },
+    }
+}
+
+/// Resolve the OpenSearch `hits.total` field shape from a `track_total_hits` mode.
+pub fn resolve_total_hits(total: u64, mode: Option<&TrackTotalHits>) -> Option<SearchHitsTotal> {
+    match mode {
+        None | Some(TrackTotalHits::Exact) => Some(SearchHitsTotal {
+            value: total,
+            relation: "eq",
+        }),
+        Some(TrackTotalHits::Disabled) => None,
+        Some(TrackTotalHits::UpTo(limit)) => {
+            if total <= *limit {
+                Some(SearchHitsTotal {
+                    value: total,
+                    relation: "eq",
+                })
+            } else {
+                Some(SearchHitsTotal {
+                    value: *limit,
+                    relation: "gte",
+                })
+            }
+        }
     }
 }
 
@@ -212,12 +258,13 @@ pub async fn search_handler(
             };
             let total = matched_documents.len() as u64;
             let hits = paginate_hits(&request, &matched_documents);
+            let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
 
             (
                 StatusCode::OK,
-                Json(build_search_response(
+                Json(build_search_response_with_total(
                     hits,
-                    total,
+                    total_summary,
                     started_at.elapsed().as_millis() as u64,
                 )),
             )
@@ -234,6 +281,7 @@ fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
             from: None,
             size: None,
             source: None,
+            track_total_hits: None,
         });
     }
 
@@ -263,13 +311,40 @@ fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
         .map(|value| parse_non_negative_integer("size", value))
         .transpose()?;
     let source = object.get("_source").map(parse_source_filter).transpose()?;
+    let track_total_hits = object
+        .get("track_total_hits")
+        .map(parse_track_total_hits)
+        .transpose()?;
 
     Ok(SearchRequest {
         query,
         from,
         size,
         source,
+        track_total_hits,
     })
+}
+
+fn parse_track_total_hits(value: &Value) -> Result<TrackTotalHits, OpenSearchError> {
+    match value {
+        Value::Bool(true) => Ok(TrackTotalHits::Exact),
+        Value::Bool(false) => Ok(TrackTotalHits::Disabled),
+        Value::Number(number) => {
+            let limit = number.as_u64().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "`track_total_hits` must be a non-negative integer or boolean",
+                )
+            })?;
+            Ok(TrackTotalHits::UpTo(limit))
+        }
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`track_total_hits` must be a boolean or non-negative integer",
+        )),
+    }
 }
 
 fn parse_source_filter(value: &Value) -> Result<SourceFilter, OpenSearchError> {

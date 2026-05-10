@@ -602,3 +602,128 @@ async fn search_router_rejects_invalid_source_filter_with_opensearch_error() {
         })
     );
 }
+
+#[tokio::test]
+async fn search_router_track_total_hits_false_omits_total_object() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"track_total_hits":false}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert!(body["hits"].get("total").is_none());
+    assert_eq!(body["hits"]["hits"].as_array().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn search_router_track_total_hits_int_caps_value_with_gte_relation() {
+    let router = app_router();
+    for index in 0..5 {
+        index_product(
+            &router,
+            &format!("sku-{index}"),
+            &format!(r#"{{"name":"item-{index}"}}"#),
+        )
+        .await;
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"track_total_hits":2,"size":0}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["hits"]["total"]["value"], 2);
+    assert_eq!(body["hits"]["total"]["relation"], "gte");
+}
+
+#[tokio::test]
+async fn search_router_track_total_hits_int_returns_eq_when_total_within_limit() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"track_total_hits":10}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["hits"]["total"]["value"], 1);
+    assert_eq!(body["hits"]["total"]["relation"], "eq");
+}
+
+#[tokio::test]
+async fn search_router_rejects_invalid_track_total_hits_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"track_total_hits":"yes"}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "`track_total_hits` must be a boolean or non-negative integer"
+            },
+            "status": 400
+        })
+    );
+}
