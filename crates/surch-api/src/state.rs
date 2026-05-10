@@ -291,6 +291,14 @@ impl AppState {
         store.indices.get(index).map(|data| data.mapping_value())
     }
 
+    pub fn index_names(&self) -> Vec<String> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.keys().cloned().collect()
+    }
+
     pub fn all_mappings(&self) -> BTreeMap<String, Value> {
         let store = self
             .store

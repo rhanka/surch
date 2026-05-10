@@ -9,6 +9,7 @@ use axum::{
 
 pub mod analyze;
 pub mod bulk;
+pub mod cluster;
 pub mod count;
 pub mod document;
 pub mod error;
@@ -101,6 +102,11 @@ pub fn app_router() -> Router {
         .route(
             "/:index/_analyze",
             post(analyze::index_analyze_state_handler).get(analyze::index_analyze_state_handler),
+        )
+        .route("/_cluster/health", get(cluster::cluster_health_handler))
+        .route(
+            "/_cluster/health/:index",
+            get(cluster::cluster_health_index_handler),
         )
         .with_state(state::AppState::default())
 }
