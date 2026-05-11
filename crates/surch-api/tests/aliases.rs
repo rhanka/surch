@@ -246,6 +246,128 @@ async fn delete_index_drops_associated_aliases() {
     assert_eq!(response, serde_json::json!({}));
 }
 
+async fn index_doc(router: &Router, index: &str, id: &str, source: &str) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{index}/_doc/{id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(source.to_owned()))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn search_through_alias_returns_documents_from_pointed_index() {
+    let router = app_router();
+    create_index(&router, "products_v1").await;
+    index_doc(&router, "products_v1", "sku-1", r#"{"name":"desk"}"#).await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"products_v1","alias":"products"}}]}"#,
+    )
+    .await;
+
+    let search_response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{}},"_source":false}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let body = response_json(search_response).await;
+    assert_eq!(body["hits"]["total"]["value"], 1);
+    assert_eq!(body["hits"]["hits"][0]["_index"], "products_v1");
+    assert_eq!(body["hits"]["hits"][0]["_id"], "sku-1");
+}
+
+#[tokio::test]
+async fn search_through_alias_fans_out_over_multiple_indices() {
+    let router = app_router();
+    create_index(&router, "logs_2025").await;
+    create_index(&router, "logs_2026").await;
+    index_doc(&router, "logs_2025", "a", r#"{"message":"old"}"#).await;
+    index_doc(&router, "logs_2026", "b", r#"{"message":"recent"}"#).await;
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_2025","alias":"logs"}},
+            {"add":{"index":"logs_2026","alias":"logs"}}
+        ]}"#,
+    )
+    .await;
+
+    let body = response_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/logs/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":{"match_all":{}},"_source":false}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond"),
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 2);
+    let mut hit_indices: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_index"].as_str().map(str::to_owned).expect("index"))
+        .collect();
+    hit_indices.sort();
+    assert_eq!(hit_indices, vec!["logs_2025", "logs_2026"]);
+}
+
+#[tokio::test]
+async fn count_through_alias_sums_documents_across_pointed_indices() {
+    let router = app_router();
+    create_index(&router, "logs_2025").await;
+    create_index(&router, "logs_2026").await;
+    index_doc(&router, "logs_2025", "a", r#"{"level":"info"}"#).await;
+    index_doc(&router, "logs_2025", "b", r#"{"level":"warn"}"#).await;
+    index_doc(&router, "logs_2026", "c", r#"{"level":"info"}"#).await;
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_2025","alias":"logs"}},
+            {"add":{"index":"logs_2026","alias":"logs"}}
+        ]}"#,
+    )
+    .await;
+
+    let body = response_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/logs/_count")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":{"match_all":{}}}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond"),
+    )
+    .await;
+    assert_eq!(body["count"], 3);
+}
+
 #[tokio::test]
 async fn get_alias_by_name_returns_404_when_unknown() {
     let response = app_router()

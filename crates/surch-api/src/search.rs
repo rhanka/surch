@@ -267,34 +267,56 @@ fn intersect_term_clauses(
 /// Axum handler for the OpenSearch-compatible `/{index}/_search` endpoint.
 pub async fn search_handler(
     State(state): State<AppState>,
-    Path(index): Path<String>,
+    Path(target): Path<String>,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_index_name(&index) {
+    if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
-    if !state.index_exists(&index) {
+    let indices = state.resolve_index(&target);
+    if indices.is_empty() {
         return OpenSearchError::new(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("index [{index}] missing"),
+            format!("index [{target}] missing"),
         )
         .into_response();
     }
 
     match parse_search_request(&body) {
         Ok(request) => {
-            let response = run_search(&state, &index, &request);
+            let response = run_search(&state, &indices, &request);
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(error) => error.into_response(),
     }
 }
 
-/// Execute a parsed search request against an existing index and build the response.
-pub fn run_search(state: &AppState, index: &str, request: &SearchRequest) -> SearchResponse {
+/// Execute a parsed search request against a set of physical indices and build the response.
+pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest) -> SearchResponse {
     let started_at = Instant::now();
-    let matched_documents: Vec<StoredDocument> = match request.query.as_ref() {
+    let mut matched_documents: Vec<StoredDocument> = Vec::new();
+    for index in indices {
+        matched_documents.extend(match_documents_for_index(
+            state,
+            index,
+            request.query.as_ref(),
+        ));
+    }
+    sort_documents(&mut matched_documents, &request.sort);
+    let total = matched_documents.len() as u64;
+    let hits = paginate_hits(request, &matched_documents);
+    let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
+
+    build_search_response_with_total(hits, total_summary, started_at.elapsed().as_millis() as u64)
+}
+
+fn match_documents_for_index(
+    state: &AppState,
+    index: &str,
+    query: Option<&SearchQuery>,
+) -> Vec<StoredDocument> {
+    match query {
         None => state.documents(index),
         Some(query) => match query {
             SearchQuery::Term { field, value } => documents_by_term(state, index, field, value),
@@ -316,14 +338,7 @@ pub fn run_search(state: &AppState, index: &str, request: &SearchRequest) -> Sea
                 .filter(|document| query_matches(query, &document.source))
                 .collect(),
         },
-    };
-    let mut matched_documents = matched_documents;
-    sort_documents(&mut matched_documents, &request.sort);
-    let total = matched_documents.len() as u64;
-    let hits = paginate_hits(request, &matched_documents);
-    let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
-
-    build_search_response_with_total(hits, total_summary, started_at.elapsed().as_millis() as u64)
+    }
 }
 
 pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {

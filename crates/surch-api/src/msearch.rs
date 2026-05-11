@@ -148,7 +148,8 @@ fn build_pair_response(state: &AppState, pair: PairResolution) -> Value {
     match pair {
         PairResolution::HeaderError(error) => error_to_value(&error),
         PairResolution::Ready { index, query_body } => {
-            if !state.index_exists(&index) {
+            let resolved = state.resolve_index(&index);
+            if resolved.is_empty() {
                 return error_to_value(&OpenSearchError::new(
                     StatusCode::NOT_FOUND,
                     "index_not_found_exception",
@@ -157,7 +158,7 @@ fn build_pair_response(state: &AppState, pair: PairResolution) -> Value {
             }
             match parse_search_request(&query_body) {
                 Ok(request) => {
-                    let response = run_search(state, &index, &request);
+                    let response = run_search(state, &resolved, &request);
                     let mut value =
                         serde_json::to_value(response).expect("search response should serialize");
                     value

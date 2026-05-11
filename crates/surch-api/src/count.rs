@@ -72,24 +72,28 @@ pub fn build_count_response(count: u64) -> CountResponse {
 /// Axum handler for the OpenSearch-compatible `/{index}/_count` endpoint.
 pub async fn count_handler(
     State(state): State<AppState>,
-    Path(index): Path<String>,
+    Path(target): Path<String>,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_index_name(&index) {
+    if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
-    if !state.index_exists(&index) {
+    let indices = state.resolve_index(&target);
+    if indices.is_empty() {
         return OpenSearchError::new(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("index [{index}] missing"),
+            format!("index [{target}] missing"),
         )
         .into_response();
     }
 
     match parse_count_request(&body) {
         Ok(request) => {
-            let count = count_matches(&state, &index, &request);
+            let count: u64 = indices
+                .iter()
+                .map(|index| count_matches(&state, index, &request))
+                .sum();
 
             (StatusCode::OK, Json(build_count_response(count))).into_response()
         }

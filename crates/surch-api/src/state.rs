@@ -375,6 +375,26 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Resolve a path-level target into the set of physical indices it points to.
+    ///
+    /// - Existing index name → `[name]`.
+    /// - Known alias → the list of indices the alias points to.
+    /// - Unknown name → empty.
+    pub fn resolve_index(&self, target: &str) -> Vec<String> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        if store.indices.contains_key(target) {
+            return vec![target.to_owned()];
+        }
+        store
+            .aliases
+            .get(target)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn all_aliases(&self) -> BTreeMap<String, Vec<String>> {
         let store = self
             .store
