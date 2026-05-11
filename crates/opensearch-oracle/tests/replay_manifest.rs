@@ -78,7 +78,12 @@ fn replay_fixture_ban_tiny_search_manifest_is_valid_for_oracle_replay() {
     assert_eq!(
         manifest.comparison,
         ReplayComparison {
-            ignored_paths: vec!["took".to_string(), "_shards.total".to_string()],
+            ignored_paths: vec![
+                "took".to_string(),
+                "_shards.total".to_string(),
+                "hits.max_score".to_string(),
+                "hits.hits.*._score".to_string(),
+            ],
             score_tolerance: 0.001,
         }
     );

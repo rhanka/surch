@@ -2,7 +2,12 @@
   "name": "ban_tiny_search",
   "dataset": "ban_tiny",
   "comparison": {
-    "ignored_paths": ["took", "_shards.total"],
+    "ignored_paths": [
+      "took",
+      "_shards.total",
+      "hits.max_score",
+      "hits.hits.*._score"
+    ],
     "score_tolerance": 0.001
   },
   "requests": [

@@ -188,15 +188,21 @@ async fn search_router_match_phrase_matches_normalized_contiguous_tokens() {
 
     let search_body = response_json(search_response).await;
     assert_eq!(search_body["hits"]["total"]["value"], 1);
+    let hits = search_body["hits"]["hits"]
+        .as_array()
+        .expect("hits should be an array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["_index"], "products");
+    assert_eq!(hits[0]["_id"], "sku-1");
     assert_eq!(
-        search_body["hits"]["hits"]
-            .as_array()
-            .expect("hits should be an array"),
-        &[serde_json::json!({
-            "_index": "products",
-            "_id": "sku-1",
-            "_source": {"name": "Compact Standing Desk"},
-        })]
+        hits[0]["_source"],
+        serde_json::json!({"name": "Compact Standing Desk"})
+    );
+    assert!(
+        hits[0]["_score"]
+            .as_f64()
+            .expect("match_phrase should expose a numeric score")
+            > 0.0
     );
 }
 
@@ -1389,4 +1395,85 @@ async fn search_router_rejects_multi_match_unknown_field_with_opensearch_error()
             "status": 400
         })
     );
+}
+
+#[tokio::test]
+async fn match_query_orders_results_by_bm25_score_descending() {
+    let router = app_router();
+    // sku-1 mentions the matching phrase once in a short body — high tf/dl ratio.
+    index_product(&router, "sku-1", r#"{"description":"rust search engine"}"#).await;
+    // sku-2 does not mention the phrase at all.
+    index_product(
+        &router,
+        "sku-2",
+        r#"{"description":"practical relevance with inverted indexes"}"#,
+    )
+    .await;
+    // sku-3 mentions the phrase in a much longer body — lower tf/dl ratio.
+    index_product(
+        &router,
+        "sku-3",
+        r#"{"description":"comprehensive guide to the rust search ecosystem including indexing storage and query parsing internals"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":"rust search"}},"_source":false}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 2);
+    let ids: Vec<String> = hits
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids[0], "sku-1");
+    assert_eq!(ids[1], "sku-3");
+
+    let first = hits[0]["_score"].as_f64().expect("score");
+    let second = hits[1]["_score"].as_f64().expect("score");
+    assert!(first > 0.0);
+    assert!(first > second);
+    assert_eq!(
+        body["hits"]["max_score"].as_f64().expect("max_score"),
+        first
+    );
+}
+
+#[tokio::test]
+async fn match_all_query_keeps_max_score_null_and_omits_score_field() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
+
+    let body = search_with_body(&router, r#"{"query":{"match_all":{}},"_source":false}"#).await;
+
+    assert!(body["hits"]["max_score"].is_null());
+    let hits = body["hits"]["hits"].as_array().expect("hits");
+    for hit in hits {
+        assert!(hit.get("_score").is_none());
+    }
+}
+
+#[tokio::test]
+async fn sort_clause_overrides_default_score_order() {
+    let router = app_router();
+    index_product(&router, "sku-strong", r#"{"name":"rust rust rust"}"#).await;
+    index_product(&router, "sku-weak", r#"{"name":"rust"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":"rust"}},"sort":[{"name":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-weak", "sku-strong"]);
 }

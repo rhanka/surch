@@ -11,6 +11,7 @@ use std::time::Instant;
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
+use surch_search::scoring::{bm25_score, Bm25Config};
 
 use crate::{
     index::validate_index_name,
@@ -292,10 +293,17 @@ pub async fn search_handler(
     }
 }
 
+/// A matched document paired with its `_score`.
+#[derive(Clone, Debug)]
+struct ScoredDocument {
+    doc: StoredDocument,
+    score: f64,
+}
+
 /// Execute a parsed search request against a set of physical indices and build the response.
 pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest) -> SearchResponse {
     let started_at = Instant::now();
-    let mut matched_documents: Vec<StoredDocument> = Vec::new();
+    let mut matched_documents: Vec<ScoredDocument> = Vec::new();
     for index in indices {
         matched_documents.extend(match_documents_for_index(
             state,
@@ -303,20 +311,53 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
             request.query.as_ref(),
         ));
     }
-    sort_documents(&mut matched_documents, &request.sort);
+    let scoring_enabled = request.query.as_ref().is_some_and(is_scoring_query);
+    sort_scored_documents(&mut matched_documents, &request.sort, scoring_enabled);
+    let max_score = compute_max_score(&matched_documents, scoring_enabled);
     let total = matched_documents.len() as u64;
-    let hits = paginate_hits(request, &matched_documents);
+    let hits = paginate_hits(request, &matched_documents, scoring_enabled);
     let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
 
-    build_search_response_with_total(hits, total_summary, started_at.elapsed().as_millis() as u64)
+    let mut response = build_search_response_with_total(
+        hits,
+        total_summary,
+        started_at.elapsed().as_millis() as u64,
+    );
+    response.hits.max_score = max_score;
+    response
+}
+
+fn is_scoring_query(query: &SearchQuery) -> bool {
+    matches!(
+        query,
+        SearchQuery::Match { .. }
+            | SearchQuery::MatchPhrase { .. }
+            | SearchQuery::MultiMatch { .. }
+            | SearchQuery::Fuzzy { .. }
+            | SearchQuery::BoolMust(_)
+    )
+}
+
+fn compute_max_score(documents: &[ScoredDocument], scoring_enabled: bool) -> Option<f64> {
+    if !scoring_enabled || documents.is_empty() {
+        return None;
+    }
+    documents
+        .iter()
+        .map(|d| d.score)
+        .fold(None, |acc, score| match acc {
+            None => Some(score),
+            Some(current) if score > current => Some(score),
+            other => other,
+        })
 }
 
 fn match_documents_for_index(
     state: &AppState,
     index: &str,
     query: Option<&SearchQuery>,
-) -> Vec<StoredDocument> {
-    match query {
+) -> Vec<ScoredDocument> {
+    let plain = match query {
         None => state.documents(index),
         Some(query) => match query {
             SearchQuery::Term { field, value } => documents_by_term(state, index, field, value),
@@ -338,6 +379,137 @@ fn match_documents_for_index(
                 .filter(|document| query_matches(query, &document.source))
                 .collect(),
         },
+    };
+    score_documents(state, index, query, plain)
+}
+
+fn score_documents(
+    state: &AppState,
+    index: &str,
+    query: Option<&SearchQuery>,
+    documents: Vec<StoredDocument>,
+) -> Vec<ScoredDocument> {
+    let Some(query) = query else {
+        return documents
+            .into_iter()
+            .map(|doc| ScoredDocument { doc, score: 1.0 })
+            .collect();
+    };
+
+    let doc_count = state.count(index);
+    documents
+        .into_iter()
+        .map(|doc| {
+            let score = score_for_query(state, index, query, &doc, doc_count);
+            ScoredDocument { doc, score }
+        })
+        .collect()
+}
+
+fn score_for_query(
+    state: &AppState,
+    index: &str,
+    query: &SearchQuery,
+    document: &StoredDocument,
+    doc_count: u64,
+) -> f64 {
+    match query {
+        SearchQuery::Match { field, value } => {
+            bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
+        }
+        SearchQuery::MultiMatch { query, fields } => fields
+            .iter()
+            .map(|field| {
+                bm25_field_score(state, index, field, query, &document.source, doc_count)
+                    .unwrap_or(0.0)
+            })
+            .fold(0.0_f64, f64::max)
+            .max(1.0 / 1e9_f64.max(1.0)),
+        SearchQuery::MatchPhrase { field, value } => {
+            bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
+        }
+        SearchQuery::Fuzzy { field, value, .. } => {
+            bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
+        }
+        SearchQuery::BoolMust(clauses) => clauses
+            .iter()
+            .map(|clause| score_for_query(state, index, clause, document, doc_count))
+            .sum(),
+        _ => 1.0,
+    }
+}
+
+fn bm25_field_score(
+    state: &AppState,
+    index: &str,
+    field: &str,
+    query: &str,
+    source: &Value,
+    doc_count: u64,
+) -> Option<f64> {
+    let query_tokens = tokenize_for_search(query);
+    if query_tokens.is_empty() || doc_count == 0 {
+        return None;
+    }
+    let field_tokens = field_tokens_for_source(source, field);
+    if field_tokens.is_empty() {
+        return None;
+    }
+    let doc_len = field_tokens.len() as u64;
+    let avg_doc_len = compute_avg_doc_len(state, index, field)?;
+    if avg_doc_len <= 0.0 {
+        return None;
+    }
+    let config = Bm25Config::default();
+    let mut total = 0.0_f64;
+    for query_token in &query_tokens {
+        let term_freq = field_tokens
+            .iter()
+            .filter(|token| token.as_str() == query_token.as_str())
+            .count() as u64;
+        if term_freq == 0 {
+            continue;
+        }
+        let doc_freq = state.documents_for_term(index, field, query_token).len() as u64;
+        if doc_freq == 0 || doc_freq > doc_count {
+            continue;
+        }
+        if let Ok(score) = bm25_score(config, doc_count, doc_freq, term_freq, doc_len, avg_doc_len)
+        {
+            total += score;
+        }
+    }
+    if total > 0.0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn field_tokens_for_source(source: &Value, field: &str) -> Vec<String> {
+    field_text(source, field)
+        .map(|text| tokenize_for_search(&text))
+        .unwrap_or_default()
+}
+
+fn compute_avg_doc_len(state: &AppState, index: &str, field: &str) -> Option<f64> {
+    let documents = state.documents(index);
+    if documents.is_empty() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    let mut docs_with_field: u64 = 0;
+    for doc in &documents {
+        let tokens = field_tokens_for_source(&doc.source, field);
+        if !tokens.is_empty() {
+            total += tokens.len() as u64;
+            docs_with_field += 1;
+        }
+    }
+    if docs_with_field == 0 {
+        None
+    } else {
+        Some(total as f64 / docs_with_field as f64)
     }
 }
 
@@ -1325,15 +1497,27 @@ fn field_text(source: &Value, field: &str) -> Option<String> {
     }
 }
 
-fn sort_documents(documents: &mut [StoredDocument], clauses: &[SortClause]) {
+fn sort_scored_documents(
+    documents: &mut [ScoredDocument],
+    clauses: &[SortClause],
+    scoring_enabled: bool,
+) {
     if clauses.is_empty() {
+        if scoring_enabled {
+            documents.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         return;
     }
     documents.sort_by(|left, right| {
         for clause in clauses {
             let ordering = compare_field(
-                left.source.get(&clause.field),
-                right.source.get(&clause.field),
+                left.doc.source.get(&clause.field),
+                right.doc.source.get(&clause.field),
                 clause.order,
             );
             if ordering != std::cmp::Ordering::Equal {
@@ -1375,7 +1559,11 @@ fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
     }
 }
 
-fn paginate_hits(request: &SearchRequest, documents: &[StoredDocument]) -> Vec<Value> {
+fn paginate_hits(
+    request: &SearchRequest,
+    documents: &[ScoredDocument],
+    scoring_enabled: bool,
+) -> Vec<Value> {
     let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
     let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
 
@@ -1383,19 +1571,31 @@ fn paginate_hits(request: &SearchRequest, documents: &[StoredDocument]) -> Vec<V
         .iter()
         .skip(from)
         .take(size)
-        .map(|document| build_hit(document, request.source.as_ref()))
+        .map(|scored| {
+            build_hit(
+                &scored.doc,
+                request.source.as_ref(),
+                scoring_enabled.then_some(scored.score),
+            )
+        })
         .collect()
 }
 
-fn build_hit(document: &StoredDocument, filter: Option<&SourceFilter>) -> Value {
+fn build_hit(
+    document: &StoredDocument,
+    filter: Option<&SourceFilter>,
+    score: Option<f64>,
+) -> Value {
     let mut hit = json!({
         "_index": document.index,
         "_id": document.id,
     });
+    let object = hit.as_object_mut().expect("hit object");
+    if let Some(score) = score {
+        object.insert("_score".to_owned(), json!(score));
+    }
     if let Some(source) = apply_source_filter(&document.source, filter) {
-        hit.as_object_mut()
-            .expect("hit object")
-            .insert("_source".to_owned(), source);
+        object.insert("_source".to_owned(), source);
     }
     hit
 }
