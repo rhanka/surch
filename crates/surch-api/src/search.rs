@@ -44,6 +44,14 @@ pub enum SortOrder {
     Desc,
 }
 
+/// Boolean combination of analyzed query tokens for `match`/`multi_match`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MatchOperator {
+    #[default]
+    Or,
+    And,
+}
+
 /// OpenSearch-compatible `track_total_hits` request mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackTotalHits {
@@ -70,6 +78,7 @@ pub enum SearchQuery {
     Match {
         field: String,
         value: String,
+        operator: MatchOperator,
     },
     MatchPhrase {
         field: String,
@@ -414,7 +423,7 @@ fn score_for_query(
     doc_count: u64,
 ) -> f64 {
     match query {
-        SearchQuery::Match { field, value } => {
+        SearchQuery::Match { field, value, .. } => {
             bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
         }
         SearchQuery::MultiMatch { query, fields } => fields
@@ -804,10 +813,40 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
 }
 
 fn parse_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
-    let (field, value) = parse_single_field_query("match", value)?;
-    let value = parse_query_text(value, "match query")?;
+    let (field, body) = parse_single_field_query("match", value)?;
+    let query_text = parse_query_text(body, "match query")?;
+    let operator = parse_match_operator(body, "match")?;
 
-    Ok(SearchQuery::Match { field, value })
+    Ok(SearchQuery::Match {
+        field,
+        value: query_text,
+        operator,
+    })
+}
+
+fn parse_match_operator(body: &Value, context: &str) -> Result<MatchOperator, OpenSearchError> {
+    let Value::Object(object) = body else {
+        return Ok(MatchOperator::default());
+    };
+    let Some(raw) = object.get("operator") else {
+        return Ok(MatchOperator::default());
+    };
+    match raw {
+        Value::String(text) => match text.to_ascii_lowercase().as_str() {
+            "or" => Ok(MatchOperator::Or),
+            "and" => Ok(MatchOperator::And),
+            unknown => Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("{context} `operator` must be `OR` or `AND`, got `{unknown}`"),
+            )),
+        },
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{context} `operator` must be a string"),
+        )),
+    }
 }
 
 fn parse_match_phrase_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
@@ -1255,7 +1294,11 @@ fn parse_non_negative_integer(field: &str, value: &Value) -> Result<u64, OpenSea
 fn query_matches(query: &SearchQuery, source: &Value) -> bool {
     match query {
         SearchQuery::MatchAll => true,
-        SearchQuery::Match { field, value } => field_matches(source, field, value),
+        SearchQuery::Match {
+            field,
+            value,
+            operator,
+        } => field_matches(source, field, value, *operator),
         SearchQuery::MatchPhrase { field, value } => {
             match_phrase_field_matches(source, field, value)
         }
@@ -1277,12 +1320,26 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
     }
 }
 
-fn field_matches(source: &Value, field: &str, query: &str) -> bool {
-    let query = normalize_text(query);
-    !query.is_empty()
-        && field_text(source, field)
-            .map(|value| normalize_text(&value).contains(&query))
-            .unwrap_or(false)
+fn field_matches(source: &Value, field: &str, query: &str, operator: MatchOperator) -> bool {
+    let query_tokens = tokenize_for_search(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    let Some(text) = field_text(source, field) else {
+        return false;
+    };
+    let field_tokens = tokenize_for_search(&text);
+    if field_tokens.is_empty() {
+        return false;
+    }
+    match operator {
+        MatchOperator::Or => query_tokens
+            .iter()
+            .any(|token| field_tokens.iter().any(|field_token| field_token == token)),
+        MatchOperator::And => query_tokens
+            .iter()
+            .all(|token| field_tokens.iter().any(|field_token| field_token == token)),
+    }
 }
 
 fn match_phrase_field_matches(source: &Value, field: &str, query: &str) -> bool {
@@ -1318,7 +1375,7 @@ fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
 pub fn multi_match_matches(source: &Value, fields: &[String], query: &str) -> bool {
     fields
         .iter()
-        .any(|field| field_matches(source, field, query))
+        .any(|field| field_matches(source, field, query, MatchOperator::Or))
 }
 
 pub fn prefix_field_matches(source: &Value, field: &str, prefix: &str) -> bool {

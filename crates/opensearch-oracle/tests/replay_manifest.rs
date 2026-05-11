@@ -107,8 +107,12 @@ fn replay_fixture_ban_tiny_search_manifest_is_valid_for_oracle_replay() {
     assert_eq!(match_label.path, "/ban_tiny/_search");
     assert_eq!(match_label.expected_status, 200);
     assert_eq!(
-        match_label.body.as_ref().unwrap()["query"]["match"]["label"],
+        match_label.body.as_ref().unwrap()["query"]["match"]["label"]["query"],
         "Rue de Rivoli"
+    );
+    assert_eq!(
+        match_label.body.as_ref().unwrap()["query"]["match"]["label"]["operator"],
+        "AND"
     );
     assert_eq!(
         match_label.expected_response.as_ref().unwrap()["hits"]["total"]["value"],
@@ -121,7 +125,8 @@ fn replay_fixture_ban_tiny_search_manifest_is_valid_for_oracle_replay() {
     assert_eq!(match_address.path, "/ban_tiny/_search");
     assert_eq!(match_address.expected_status, 200);
     assert_eq!(
-        match_address.body.as_ref().unwrap()["query"]["bool"]["must"][0]["match"]["street_name"],
+        match_address.body.as_ref().unwrap()["query"]["bool"]["must"][0]["match"]["street_name"]
+            ["query"],
         "Cours de l'Intendance"
     );
     assert_eq!(

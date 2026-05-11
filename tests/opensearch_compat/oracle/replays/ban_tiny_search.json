@@ -32,7 +32,10 @@
       "body": {
         "query": {
           "match": {
-            "label": "Rue de Rivoli"
+            "label": {
+              "query": "Rue de Rivoli",
+              "operator": "AND"
+            }
           }
         },
         "_source": false
@@ -70,7 +73,10 @@
             "must": [
               {
                 "match": {
-                  "street_name": "Cours de l'Intendance"
+                  "street_name": {
+                    "query": "Cours de l'Intendance",
+                    "operator": "AND"
+                  }
                 }
               },
               {

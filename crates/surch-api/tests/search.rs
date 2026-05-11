@@ -1283,18 +1283,24 @@ async fn search_router_multi_match_matches_query_in_any_listed_field() {
 }
 
 #[tokio::test]
-async fn search_router_multi_match_requires_all_query_tokens_in_at_least_one_field() {
+async fn search_router_multi_match_returns_any_field_containing_query_token() {
     let router = app_router();
     index_product(
         &router,
-        "sku-1",
-        r#"{"name":"rust","description":"search engine"}"#,
+        "sku-rust-name",
+        r#"{"name":"rust","description":"cookbook"}"#,
     )
     .await;
     index_product(
         &router,
-        "sku-2",
-        r#"{"name":"rust search","description":""}"#,
+        "sku-search-description",
+        r#"{"name":"manual","description":"search engine"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "sku-no-overlap",
+        r#"{"name":"chair","description":"furniture"}"#,
     )
     .await;
 
@@ -1304,13 +1310,14 @@ async fn search_router_multi_match_requires_all_query_tokens_in_at_least_one_fie
     )
     .await;
 
-    let ids: Vec<String> = body["hits"]["hits"]
+    let mut ids: Vec<String> = body["hits"]["hits"]
         .as_array()
         .expect("hits array")
         .iter()
         .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
         .collect();
-    assert_eq!(ids, vec!["sku-2"]);
+    ids.sort();
+    assert_eq!(ids, vec!["sku-rust-name", "sku-search-description"]);
 }
 
 #[tokio::test]
@@ -1476,4 +1483,98 @@ async fn sort_clause_overrides_default_score_order() {
         .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
         .collect();
     assert_eq!(ids, vec!["sku-weak", "sku-strong"]);
+}
+
+#[tokio::test]
+async fn match_query_defaults_to_or_operator_across_query_tokens() {
+    let router = app_router();
+    index_product(&router, "sku-rust", r#"{"description":"rust internals"}"#).await;
+    index_product(
+        &router,
+        "sku-search",
+        r#"{"description":"search engine indexing"}"#,
+    )
+    .await;
+    index_product(&router, "sku-noop", r#"{"description":"cooking guide"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":"rust search"}},"_source":false}"#,
+    )
+    .await;
+
+    let mut ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["sku-rust", "sku-search"]);
+}
+
+#[tokio::test]
+async fn match_query_with_and_operator_requires_all_query_tokens() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-both",
+        r#"{"description":"rust search engine"}"#,
+    )
+    .await;
+    index_product(&router, "sku-rust", r#"{"description":"rust internals"}"#).await;
+    index_product(&router, "sku-search", r#"{"description":"search engine"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":{"query":"rust search","operator":"AND"}}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-both"]);
+}
+
+#[tokio::test]
+async fn match_query_rejects_unknown_operator_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match":{"description":{"query":"rust","operator":"BOTH"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert!(body["error"]["reason"]
+        .as_str()
+        .expect("reason string")
+        .contains("operator"));
 }

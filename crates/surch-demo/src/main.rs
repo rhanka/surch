@@ -140,7 +140,10 @@ async fn run_ban_bench(iterations: usize) -> Result<(), CliError> {
         json!({
             "query": {
                 "match": {
-                    "label": "Rue de Rivoli"
+                    "label": {
+                        "query": "Rue de Rivoli",
+                        "operator": "AND"
+                    }
                 }
             }
         }),
@@ -157,7 +160,10 @@ async fn run_ban_bench(iterations: usize) -> Result<(), CliError> {
                     "must": [
                         {
                             "match": {
-                                "street_name": "Cours de l'Intendance"
+                                "street_name": {
+                                    "query": "Cours de l'Intendance",
+                                    "operator": "AND"
+                                }
                             }
                         },
                         {
