@@ -28,6 +28,7 @@ pub struct SearchRequest {
     pub source: Option<SourceFilter>,
     pub track_total_hits: Option<TrackTotalHits>,
     pub sort: Vec<SortClause>,
+    pub highlight: Option<HighlightRequest>,
 }
 
 /// Single OpenSearch `sort` clause.
@@ -69,6 +70,14 @@ pub enum SourceFilter {
         includes: Vec<String>,
         excludes: Vec<String>,
     },
+}
+
+/// OpenSearch-compatible highlight request subset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HighlightRequest {
+    pub fields: Vec<String>,
+    pub pre_tag: String,
+    pub post_tag: String,
 }
 
 /// Supported P0 `_search` queries.
@@ -531,6 +540,7 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
             source: None,
             track_total_hits: None,
             sort: Vec::new(),
+            highlight: None,
         });
     }
 
@@ -569,6 +579,7 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
         .map(parse_sort)
         .transpose()?
         .unwrap_or_default();
+    let highlight = object.get("highlight").map(parse_highlight).transpose()?;
 
     Ok(SearchRequest {
         query,
@@ -577,7 +588,118 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
         source,
         track_total_hits,
         sort,
+        highlight,
     })
+}
+
+fn parse_highlight(value: &Value) -> Result<HighlightRequest, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`highlight` must be an object",
+        )
+    })?;
+
+    for key in object.keys() {
+        if !matches!(key.as_str(), "fields" | "pre_tags" | "post_tags") {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("unsupported `highlight` field `{key}`"),
+            ));
+        }
+    }
+
+    let fields_value = object.get("fields").ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`highlight` must contain `fields`",
+        )
+    })?;
+    let fields_object = fields_value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`highlight.fields` must be an object",
+        )
+    })?;
+    if fields_object.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`highlight.fields` must not be empty",
+        ));
+    }
+
+    let mut fields = Vec::with_capacity(fields_object.len());
+    for (field, config) in fields_object {
+        if field.is_empty() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "`highlight.fields` entries must not be empty",
+            ));
+        }
+        if !config.is_object() && !config.is_null() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`highlight.fields.{field}` must be an object or null"),
+            ));
+        }
+        fields.push(field.clone());
+    }
+
+    let pre_tag = object
+        .get("pre_tags")
+        .map(|value| parse_highlight_tag(value, "pre_tags"))
+        .transpose()?
+        .unwrap_or_else(|| "<em>".to_owned());
+    let post_tag = object
+        .get("post_tags")
+        .map(|value| parse_highlight_tag(value, "post_tags"))
+        .transpose()?
+        .unwrap_or_else(|| "</em>".to_owned());
+
+    Ok(HighlightRequest {
+        fields,
+        pre_tag,
+        post_tag,
+    })
+}
+
+fn parse_highlight_tag(value: &Value, field: &str) -> Result<String, OpenSearchError> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Array(items) if !items.is_empty() => {
+            let mut tags = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(text) => tags.push(text.clone()),
+                    _ => {
+                        return Err(OpenSearchError::new(
+                            StatusCode::BAD_REQUEST,
+                            "parsing_exception",
+                            format!("`highlight.{field}` entries must be strings"),
+                        ));
+                    }
+                }
+            }
+            Ok(tags[0].clone())
+        }
+        Value::Array(_) => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`highlight.{field}` must not be empty"),
+        )),
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`highlight.{field}` must be a string or array of strings"),
+        )),
+    }
 }
 
 fn parse_sort(value: &Value) -> Result<Vec<SortClause>, OpenSearchError> {
@@ -1633,6 +1755,8 @@ fn paginate_hits(
                 &scored.doc,
                 request.source.as_ref(),
                 scoring_enabled.then_some(scored.score),
+                request.highlight.as_ref(),
+                request.query.as_ref(),
             )
         })
         .collect()
@@ -1642,6 +1766,8 @@ fn build_hit(
     document: &StoredDocument,
     filter: Option<&SourceFilter>,
     score: Option<f64>,
+    highlight: Option<&HighlightRequest>,
+    query: Option<&SearchQuery>,
 ) -> Value {
     let mut hit = json!({
         "_index": document.index,
@@ -1654,7 +1780,276 @@ fn build_hit(
     if let Some(source) = apply_source_filter(&document.source, filter) {
         object.insert("_source".to_owned(), source);
     }
+    if let Some(highlight) =
+        highlight.and_then(|request| build_highlight(&document.source, query, request))
+    {
+        object.insert("highlight".to_owned(), highlight);
+    }
     hit
+}
+
+fn build_highlight(
+    source: &Value,
+    query: Option<&SearchQuery>,
+    request: &HighlightRequest,
+) -> Option<Value> {
+    let query = query?;
+    let mut highlighted_fields = serde_json::Map::new();
+
+    for field in &request.fields {
+        let Some(text) = field_text(source, field) else {
+            continue;
+        };
+        let Some(fragment) = highlight_field_fragment(&text, query, field, request) else {
+            continue;
+        };
+        highlighted_fields.insert(field.clone(), json!([fragment]));
+    }
+
+    if highlighted_fields.is_empty() {
+        None
+    } else {
+        Some(Value::Object(highlighted_fields))
+    }
+}
+
+fn highlight_field_fragment(
+    text: &str,
+    query: &SearchQuery,
+    field: &str,
+    request: &HighlightRequest,
+) -> Option<String> {
+    let spans = highlight_spans_for_query(text, query, field);
+    if spans.is_empty() {
+        return None;
+    }
+
+    Some(render_highlight_fragment(
+        text,
+        &spans,
+        &request.pre_tag,
+        &request.post_tag,
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TextTokenSpan {
+    start: usize,
+    end: usize,
+    normalized: String,
+}
+
+fn highlight_spans_for_query(text: &str, query: &SearchQuery, field: &str) -> Vec<(usize, usize)> {
+    let tokens = text_token_spans(text);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut spans = match query {
+        SearchQuery::Match {
+            field: query_field,
+            value,
+            ..
+        } if query_field == field => exact_token_spans(&tokens, &tokenize_for_search(value)),
+        SearchQuery::MatchPhrase {
+            field: query_field,
+            value,
+        } if query_field == field => phrase_token_spans(&tokens, &tokenize_for_search(value)),
+        SearchQuery::Term {
+            field: query_field,
+            value,
+        } if query_field == field => exact_token_spans(&tokens, &[normalize_text(value)]),
+        SearchQuery::Terms {
+            field: query_field,
+            values,
+        } if query_field == field => {
+            let query_tokens = values
+                .iter()
+                .map(|value| normalize_text(value))
+                .collect::<Vec<_>>();
+            exact_token_spans(&tokens, &query_tokens)
+        }
+        SearchQuery::Fuzzy {
+            field: query_field,
+            value,
+            fuzziness,
+        } if query_field == field => {
+            fuzzy_token_spans(&tokens, &tokenize_for_search(value), *fuzziness)
+        }
+        SearchQuery::Prefix {
+            field: query_field,
+            value,
+        } if query_field == field => prefix_token_spans(&tokens, value),
+        SearchQuery::Wildcard {
+            field: query_field,
+            pattern,
+        } if query_field == field => wildcard_token_spans(&tokens, pattern),
+        SearchQuery::MultiMatch { query, fields }
+            if fields.iter().any(|candidate| candidate == field) =>
+        {
+            exact_token_spans(&tokens, &tokenize_for_search(query))
+        }
+        SearchQuery::BoolMust(clauses) => clauses
+            .iter()
+            .flat_map(|clause| highlight_spans_for_query(text, clause, field))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    spans.sort_unstable();
+    spans.dedup();
+    spans
+}
+
+fn text_token_spans(text: &str) -> Vec<TextTokenSpan> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut normalized = String::new();
+
+    for (index, character) in text.char_indices() {
+        let folded = normalized_token_piece(character);
+        if folded.is_empty() {
+            if let Some(span_start) = start.take() {
+                spans.push(TextTokenSpan {
+                    start: span_start,
+                    end: index,
+                    normalized: std::mem::take(&mut normalized),
+                });
+            }
+            continue;
+        }
+
+        if start.is_none() {
+            start = Some(index);
+        }
+        normalized.push_str(&folded);
+    }
+
+    if let Some(span_start) = start {
+        spans.push(TextTokenSpan {
+            start: span_start,
+            end: text.len(),
+            normalized,
+        });
+    }
+
+    spans
+}
+
+fn normalized_token_piece(character: char) -> String {
+    character
+        .to_lowercase()
+        .map(fold_search_char)
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn exact_token_spans(tokens: &[TextTokenSpan], query_tokens: &[String]) -> Vec<(usize, usize)> {
+    let wanted = query_tokens
+        .iter()
+        .filter(|token| !token.is_empty())
+        .collect::<BTreeSet<_>>();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    tokens
+        .iter()
+        .filter(|token| wanted.contains(&token.normalized))
+        .map(|token| (token.start, token.end))
+        .collect()
+}
+
+fn phrase_token_spans(tokens: &[TextTokenSpan], query_tokens: &[String]) -> Vec<(usize, usize)> {
+    if query_tokens.is_empty() || query_tokens.len() > tokens.len() {
+        return Vec::new();
+    }
+
+    let mut spans = Vec::new();
+    for window in tokens.windows(query_tokens.len()) {
+        if window
+            .iter()
+            .map(|token| token.normalized.as_str())
+            .eq(query_tokens.iter().map(String::as_str))
+        {
+            spans.extend(window.iter().map(|token| (token.start, token.end)));
+        }
+    }
+    spans
+}
+
+fn fuzzy_token_spans(
+    tokens: &[TextTokenSpan],
+    query_tokens: &[String],
+    fuzziness: Fuzziness,
+) -> Vec<(usize, usize)> {
+    if query_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    tokens
+        .iter()
+        .filter(|token| {
+            query_tokens.iter().any(|query_token| {
+                !query_token.is_empty()
+                    && fuzzy_token_matches(query_token, &token.normalized, fuzziness)
+            })
+        })
+        .map(|token| (token.start, token.end))
+        .collect()
+}
+
+fn prefix_token_spans(tokens: &[TextTokenSpan], prefix: &str) -> Vec<(usize, usize)> {
+    let prefix = normalize_text(prefix);
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    tokens
+        .iter()
+        .filter(|token| token.normalized.starts_with(&prefix))
+        .map(|token| (token.start, token.end))
+        .collect()
+}
+
+fn wildcard_token_spans(tokens: &[TextTokenSpan], pattern: &str) -> Vec<(usize, usize)> {
+    let pattern = normalize_wildcard_pattern(pattern);
+    if pattern.is_empty() {
+        return Vec::new();
+    }
+    let pattern_chars = pattern.chars().collect::<Vec<_>>();
+
+    tokens
+        .iter()
+        .filter(|token| {
+            let token_chars = token.normalized.chars().collect::<Vec<_>>();
+            wildcard_pattern_matches(&pattern_chars, &token_chars)
+        })
+        .map(|token| (token.start, token.end))
+        .collect()
+}
+
+fn render_highlight_fragment(
+    text: &str,
+    spans: &[(usize, usize)],
+    pre_tag: &str,
+    post_tag: &str,
+) -> String {
+    let mut fragment = String::new();
+    let mut cursor = 0;
+
+    for (start, end) in spans {
+        if *start < cursor {
+            continue;
+        }
+        fragment.push_str(&text[cursor..*start]);
+        fragment.push_str(pre_tag);
+        fragment.push_str(&text[*start..*end]);
+        fragment.push_str(post_tag);
+        cursor = *end;
+    }
+    fragment.push_str(&text[cursor..]);
+    fragment
 }
 
 pub fn apply_source_filter(source: &Value, filter: Option<&SourceFilter>) -> Option<Value> {

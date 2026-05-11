@@ -752,6 +752,32 @@ async fn search_with_body(router: &axum::Router, body: &'static str) -> serde_js
 }
 
 #[tokio::test]
+async fn search_router_returns_highlight_fragments_for_requested_match_field() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-1",
+        r#"{"description":"Rust search engine with safe indexing"}"#,
+    )
+    .await;
+    index_product(&router, "sku-2", r#"{"description":"cooking guide"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":"rust search"}},"highlight":{"fields":{"description":{}}},"_source":false}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["_id"], "sku-1");
+    assert_eq!(
+        hits[0]["highlight"]["description"],
+        serde_json::json!(["<em>Rust</em> <em>search</em> engine with safe indexing"])
+    );
+}
+
+#[tokio::test]
 async fn search_router_sorts_documents_by_field_ascending_by_default() {
     let router = app_router();
     index_product(&router, "sku-3", r#"{"name":"Cap","price":15}"#).await;
