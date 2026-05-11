@@ -67,17 +67,17 @@ pub async fn analyze_state_handler(
 /// Axum handler for `GET|POST /{index}/_analyze`.
 pub async fn index_analyze_state_handler(
     State(state): State<AppState>,
-    Path(index): Path<String>,
+    Path(target): Path<String>,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_index_name(&index) {
+    if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
-    if !state.index_exists(&index) {
+    if state.resolve_index(&target).is_empty() {
         return OpenSearchError::new(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("index [{index}] missing"),
+            format!("index [{target}] missing"),
         )
         .into_response();
     }

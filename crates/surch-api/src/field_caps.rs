@@ -27,26 +27,27 @@ pub async fn field_caps_state_handler(
 /// Axum handler for `GET|POST /{index}/_field_caps`.
 pub async fn index_field_caps_state_handler(
     State(state): State<AppState>,
-    Path(index): Path<String>,
+    Path(target): Path<String>,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_index_name(&index) {
+    if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
-    if !state.index_exists(&index) {
+    let resolved = state.resolve_index(&target);
+    if resolved.is_empty() {
         return OpenSearchError::new(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("index [{index}] missing"),
+            format!("index [{target}] missing"),
         )
         .into_response();
     }
-    handle_field_caps(&state, Some(index.as_str()), &body)
+    handle_field_caps(&state, Some(&resolved), &body)
 }
 
 fn handle_field_caps(
     state: &AppState,
-    requested_index: Option<&str>,
+    requested_indices: Option<&[String]>,
     body: &str,
 ) -> axum::response::Response {
     let request = match parse_field_caps_request(body) {
@@ -54,11 +55,16 @@ fn handle_field_caps(
         Err(error) => return error.into_response(),
     };
 
-    let mappings = match requested_index {
-        Some(index) => match state.mapping(index) {
-            Some(mapping) => BTreeMap::from_iter([(index.to_owned(), mapping)]),
-            None => BTreeMap::new(),
-        },
+    let mappings = match requested_indices {
+        Some(indices) => {
+            let mut entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for index in indices {
+                if let Some(mapping) = state.mapping(index) {
+                    entries.insert(index.clone(), mapping);
+                }
+            }
+            entries
+        }
         None => state.all_mappings(),
     };
 

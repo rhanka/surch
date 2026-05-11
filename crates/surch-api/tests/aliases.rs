@@ -388,6 +388,178 @@ async fn get_alias_by_name_returns_404_when_unknown() {
 }
 
 #[tokio::test]
+async fn field_caps_through_alias_aggregates_pointed_indices() {
+    let router = app_router();
+    create_index(&router, "products_v1").await;
+    index_doc(
+        &router,
+        "products_v1",
+        "sku-1",
+        r#"{"name":"desk","price":42}"#,
+    )
+    .await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"products_v1","alias":"products"}}]}"#,
+    )
+    .await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_field_caps")
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["indices"], serde_json::json!(["products_v1"]));
+    assert!(body["fields"].get("name").is_some());
+    assert!(body["fields"].get("price").is_some());
+}
+
+#[tokio::test]
+async fn analyze_through_alias_validates_target_and_runs_analyzer() {
+    let router = app_router();
+    create_index(&router, "logs_2026").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"logs_2026","alias":"logs"}}]}"#,
+    )
+    .await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/logs/_analyze")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"Hello World"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["tokens"][0]["token"], "hello");
+    assert_eq!(body["tokens"][1]["token"], "world");
+}
+
+#[tokio::test]
+async fn mapping_through_alias_returns_all_pointed_indices() {
+    let router = app_router();
+    let create_with_mapping = |name: &'static str, props: &'static str| {
+        let router = router.clone();
+        async move {
+            let body = format!(r#"{{"mappings":{{"properties":{props}}}}}"#);
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri(format!("/{name}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .expect("request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert!(response.status().is_success());
+        }
+    };
+    create_with_mapping("logs_2025", r#"{"level":{"type":"keyword"}}"#).await;
+    create_with_mapping("logs_2026", r#"{"message":{"type":"text"}}"#).await;
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_2025","alias":"logs"}},
+            {"add":{"index":"logs_2026","alias":"logs"}}
+        ]}"#,
+    )
+    .await;
+
+    let (status, body) = get_json(&router, "/logs/_mapping").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["logs_2025"]["mappings"]["properties"]["level"]["type"],
+        "keyword"
+    );
+    assert_eq!(
+        body["logs_2026"]["mappings"]["properties"]["message"]["type"],
+        "text"
+    );
+}
+
+#[tokio::test]
+async fn put_mapping_through_single_target_alias_writes_to_pointed_index() {
+    let router = app_router();
+    create_index(&router, "products_v1").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"products_v1","alias":"products"}}]}"#,
+    )
+    .await;
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products/_mapping")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"properties":{"sku":{"type":"keyword"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (status, body) = get_json(&router, "/products_v1/_mapping").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["products_v1"]["mappings"]["properties"]["sku"]["type"],
+        "keyword"
+    );
+}
+
+#[tokio::test]
+async fn put_mapping_through_multi_target_alias_returns_400() {
+    let router = app_router();
+    create_index(&router, "logs_a").await;
+    create_index(&router, "logs_b").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_a","alias":"logs"}},
+            {"add":{"index":"logs_b","alias":"logs"}}
+        ]}"#,
+    )
+    .await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/logs/_mapping")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"properties":{"foo":{"type":"keyword"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert!(body["error"]["reason"]
+        .as_str()
+        .expect("reason string")
+        .contains("no write index"));
+}
+
+#[tokio::test]
 async fn document_index_through_single_target_alias_writes_to_pointed_index() {
     let router = app_router();
     create_index(&router, "products_v1").await;

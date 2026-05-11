@@ -7,7 +7,6 @@ use axum::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::iter::once;
 
 use surch_index::mapping::IndexMapping;
 
@@ -146,37 +145,50 @@ pub async fn refresh_index_handler(
 
 pub async fn mapping_handler(
     State(state): State<AppState>,
-    Path(index): Path<String>,
+    Path(target): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_index_name(&index) {
+    if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
 
-    match state.mapping(&index) {
-        Some(mapping) => (
-            StatusCode::OK,
-            Json(IndexMappingsResponse {
-                entries: BTreeMap::from_iter(once((index, MappingsResponse { mappings: mapping }))),
-            }),
-        )
-            .into_response(),
-        None => OpenSearchError::new(
+    let indices = state.resolve_index(&target);
+    if indices.is_empty() {
+        return OpenSearchError::new(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
-            format!("index [{index}] missing"),
+            format!("index [{target}] missing"),
         )
-        .into_response(),
+        .into_response();
     }
+
+    let mut entries = BTreeMap::new();
+    for index in indices {
+        if let Some(mapping) = state.mapping(&index) {
+            entries.insert(index, MappingsResponse { mappings: mapping });
+        }
+    }
+    (StatusCode::OK, Json(IndexMappingsResponse { entries })).into_response()
 }
 
 pub async fn put_mapping_handler(
     State(state): State<AppState>,
-    Path(index): Path<String>,
+    Path(target): Path<String>,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_index_name(&index) {
+    if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
+    let index = match state.resolve_write_target(&target) {
+        Ok(index) => index,
+        Err(reason) => {
+            return OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                reason,
+            )
+            .into_response();
+        }
+    };
     if !state.index_exists(&index) {
         return OpenSearchError::new(
             StatusCode::NOT_FOUND,
