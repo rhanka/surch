@@ -56,10 +56,10 @@ pub fn build_document_response(index: String, id: String) -> DocumentResponse {
 /// Axum handler for the OpenSearch-compatible `/{index}/_doc/{id}` endpoint.
 pub async fn document_handler(
     State(state): State<AppState>,
-    Path((index, id)): Path<(String, String)>,
+    Path((target, id)): Path<(String, String)>,
     body: String,
 ) -> impl IntoResponse {
-    if let Err(error) = validate_index_name(&index) {
+    if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
 
@@ -71,6 +71,18 @@ pub async fn document_handler(
         )
         .into_response();
     }
+
+    let index = match state.resolve_write_target(&target) {
+        Ok(index) => index,
+        Err(reason) => {
+            return OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                reason,
+            )
+            .into_response();
+        }
+    };
 
     match parse_document_source(&body) {
         Ok(source) => {

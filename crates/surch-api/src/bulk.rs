@@ -205,13 +205,15 @@ fn apply_bulk_operation(state: &AppState, operation: &BulkOperation) -> BulkResp
             apply_index_like_operation(state, index.as_deref(), id.as_deref(), source, 201),
         ),
         BulkOperation::Create { index, id, source } => {
-            let status = match (index.as_deref(), id.as_deref()) {
-                (Some(index), Some(id)) => {
-                    if state.create_document(index, id, source.clone()) {
-                        item_status(&Some(index.to_owned()), &Some(id.to_owned()), 201)
+            let status = match resolve_bulk_target(state, index.as_deref(), id.as_deref()) {
+                Err(status) => status,
+                Ok(resolved) => {
+                    let id = id.as_deref().expect("resolved target ensures id is Some");
+                    if state.create_document(&resolved, id, source.clone()) {
+                        item_status(&Some(resolved), &Some(id.to_owned()), 201)
                     } else {
                         item_status_with_error(
-                            Some(index),
+                            Some(resolved.as_str()),
                             Some(id),
                             409,
                             "version_conflict_engine_exception",
@@ -219,20 +221,6 @@ fn apply_bulk_operation(state: &AppState, operation: &BulkOperation) -> BulkResp
                         )
                     }
                 }
-                (None, Some(id)) => item_status_with_error(
-                    None,
-                    Some(id),
-                    400,
-                    "illegal_argument_exception",
-                    "missing _index in bulk operation metadata",
-                ),
-                (_, None) => item_status_with_error(
-                    index.as_deref(),
-                    None,
-                    400,
-                    "illegal_argument_exception",
-                    "missing _id in bulk operation metadata",
-                ),
             };
             BulkResponseItem::Create(status)
         }
@@ -247,29 +235,51 @@ fn apply_bulk_operation(state: &AppState, operation: &BulkOperation) -> BulkResp
             BulkResponseItem::Update(status)
         }
         BulkOperation::Delete { index, id } => {
-            let status = match (index.as_deref(), id.as_deref()) {
-                (Some(index), Some(id)) => {
-                    state.delete_document(index, id);
-                    item_status(&Some(index.to_owned()), &Some(id.to_owned()), 200)
+            let status = match resolve_bulk_target(state, index.as_deref(), id.as_deref()) {
+                Err(status) => status,
+                Ok(resolved) => {
+                    let id = id.as_deref().expect("resolved target ensures id is Some");
+                    state.delete_document(&resolved, id);
+                    item_status(&Some(resolved), &Some(id.to_owned()), 200)
                 }
-                (None, Some(id)) => item_status_with_error(
-                    None,
-                    Some(id),
-                    400,
-                    "illegal_argument_exception",
-                    "missing _index in bulk operation metadata",
-                ),
-                (_, None) => item_status_with_error(
-                    index.as_deref(),
-                    None,
-                    400,
-                    "illegal_argument_exception",
-                    "missing _id in bulk operation metadata",
-                ),
             };
             BulkResponseItem::Delete(status)
         }
     }
+}
+
+fn resolve_bulk_target(
+    state: &AppState,
+    index: Option<&str>,
+    id: Option<&str>,
+) -> Result<String, BulkItemStatus> {
+    let Some(id) = id else {
+        return Err(item_status_with_error(
+            index,
+            None,
+            400,
+            "illegal_argument_exception",
+            "missing _id in bulk operation metadata",
+        ));
+    };
+    let Some(index) = index else {
+        return Err(item_status_with_error(
+            None,
+            Some(id),
+            400,
+            "illegal_argument_exception",
+            "missing _index in bulk operation metadata",
+        ));
+    };
+    state.resolve_write_target(index).map_err(|reason| {
+        item_status_with_error(
+            Some(index),
+            Some(id),
+            400,
+            "illegal_argument_exception",
+            &reason,
+        )
+    })
 }
 
 fn apply_index_like_operation(
@@ -279,25 +289,13 @@ fn apply_index_like_operation(
     source: &Value,
     status: u16,
 ) -> BulkItemStatus {
-    match (index, id) {
-        (Some(index), Some(id)) => {
-            state.index_document(index, id, source.clone());
-            item_status(&Some(index.to_owned()), &Some(id.to_owned()), status)
+    match resolve_bulk_target(state, index, id) {
+        Ok(resolved) => {
+            let id = id.expect("resolved target ensures id is Some");
+            state.index_document(&resolved, id, source.clone());
+            item_status(&Some(resolved), &Some(id.to_owned()), status)
         }
-        (None, Some(id)) => item_status_with_error(
-            None,
-            Some(id),
-            400,
-            "illegal_argument_exception",
-            "missing _index in bulk operation metadata",
-        ),
-        (_, None) => item_status_with_error(
-            index,
-            None,
-            400,
-            "illegal_argument_exception",
-            "missing _id in bulk operation metadata",
-        ),
+        Err(status_err) => status_err,
     }
 }
 

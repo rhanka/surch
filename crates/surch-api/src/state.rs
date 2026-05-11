@@ -375,6 +375,31 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Resolve a write-side path target to a single physical index name.
+    ///
+    /// - Existing index → returns that index.
+    /// - Unknown name (will be implicitly created) → returns the name as-is.
+    /// - Alias pointing to exactly one index → returns that index.
+    /// - Alias pointing to several indices → `Err` with the OpenSearch reason.
+    pub fn resolve_write_target(&self, target: &str) -> Result<String, String> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        if store.indices.contains_key(target) {
+            return Ok(target.to_owned());
+        }
+        if let Some(set) = store.aliases.get(target) {
+            return match set.len() {
+                1 => Ok(set.iter().next().expect("non-empty set").clone()),
+                _ => Err(format!(
+                    "no write index is defined for alias [{target}], target alias must point to a single index"
+                )),
+            };
+        }
+        Ok(target.to_owned())
+    }
+
     /// Resolve a path-level target into the set of physical indices it points to.
     ///
     /// - Existing index name → `[name]`.

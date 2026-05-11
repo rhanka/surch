@@ -234,10 +234,18 @@ fn build_response_item(
     root_source: Option<&SourceFilter>,
 ) -> Value {
     let filter = item.source.as_ref().or(root_source);
-    match state.get_document(&item.index, &item.id) {
-        Some(source) => {
+    let candidates = state.resolve_index(&item.index);
+    if candidates.is_empty() {
+        return json!({
+            "_index": item.index,
+            "_id": item.id,
+            "found": false,
+        });
+    }
+    for index in &candidates {
+        if let Some(source) = state.get_document(index, &item.id) {
             let mut response = json!({
-                "_index": item.index,
+                "_index": index,
                 "_id": item.id,
                 "found": true,
             });
@@ -247,12 +255,16 @@ fn build_response_item(
                     .expect("response object")
                     .insert("_source".to_owned(), filtered);
             }
-            response
+            return response;
         }
-        None => json!({
-            "_index": item.index,
-            "_id": item.id,
-            "found": false,
-        }),
     }
+    let display_index = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| item.index.clone());
+    json!({
+        "_index": display_index,
+        "_id": item.id,
+        "found": false,
+    })
 }

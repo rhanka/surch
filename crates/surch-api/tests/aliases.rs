@@ -386,3 +386,188 @@ async fn get_alias_by_name_returns_404_when_unknown() {
         "aliases_not_found_exception"
     );
 }
+
+#[tokio::test]
+async fn document_index_through_single_target_alias_writes_to_pointed_index() {
+    let router = app_router();
+    create_index(&router, "products_v1").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"products_v1","alias":"products"}}]}"#,
+    )
+    .await;
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"desk"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response_json(response).await;
+    assert_eq!(body["_index"], "products_v1");
+    assert_eq!(body["_id"], "sku-1");
+
+    let (status, search) = get_json(&router, "/products_v1/_search").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search["hits"]["total"]["value"], 1);
+}
+
+#[tokio::test]
+async fn bulk_index_through_single_target_alias_writes_to_pointed_index() {
+    let router = app_router();
+    create_index(&router, "products_v1").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"products_v1","alias":"products"}}]}"#,
+    )
+    .await;
+
+    let body = "{\"index\":{\"_index\":\"products\",\"_id\":\"sku-1\"}}\n\
+                {\"name\":\"desk\"}\n";
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["errors"], false);
+    assert_eq!(body["items"][0]["index"]["_index"], "products_v1");
+
+    let (status, search) = get_json(&router, "/products_v1/_search").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search["hits"]["total"]["value"], 1);
+}
+
+#[tokio::test]
+async fn bulk_index_through_multi_target_alias_reports_item_error() {
+    let router = app_router();
+    create_index(&router, "logs_a").await;
+    create_index(&router, "logs_b").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_a","alias":"logs"}},
+            {"add":{"index":"logs_b","alias":"logs"}}
+        ]}"#,
+    )
+    .await;
+
+    let body = "{\"index\":{\"_index\":\"logs\",\"_id\":\"1\"}}\n\
+                {\"event\":\"hello\"}\n";
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["errors"], true);
+    assert_eq!(body["items"][0]["index"]["status"], 400);
+    assert_eq!(
+        body["items"][0]["index"]["error"]["type"],
+        "illegal_argument_exception"
+    );
+}
+
+#[tokio::test]
+async fn mget_through_alias_returns_documents_from_pointed_indices() {
+    let router = app_router();
+    create_index(&router, "logs_2025").await;
+    create_index(&router, "logs_2026").await;
+    index_doc(&router, "logs_2025", "old", r#"{"msg":"a"}"#).await;
+    index_doc(&router, "logs_2026", "new", r#"{"msg":"b"}"#).await;
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_2025","alias":"logs"}},
+            {"add":{"index":"logs_2026","alias":"logs"}}
+        ]}"#,
+    )
+    .await;
+
+    let body = response_json(
+        router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/_mget")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"docs":[{"_index":"logs","_id":"old"},{"_index":"logs","_id":"new"},{"_index":"logs","_id":"missing"}]}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond"),
+    )
+    .await;
+
+    let docs = body["docs"].as_array().expect("docs array");
+    assert_eq!(docs.len(), 3);
+    let old = docs.iter().find(|d| d["_id"] == "old").expect("old doc");
+    assert_eq!(old["found"], true);
+    assert_eq!(old["_index"], "logs_2025");
+    let new = docs.iter().find(|d| d["_id"] == "new").expect("new doc");
+    assert_eq!(new["found"], true);
+    assert_eq!(new["_index"], "logs_2026");
+    let missing = docs
+        .iter()
+        .find(|d| d["_id"] == "missing")
+        .expect("missing doc");
+    assert_eq!(missing["found"], false);
+}
+
+#[tokio::test]
+async fn document_index_through_multi_target_alias_returns_400() {
+    let router = app_router();
+    create_index(&router, "logs_a").await;
+    create_index(&router, "logs_b").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_a","alias":"logs"}},
+            {"add":{"index":"logs_b","alias":"logs"}}
+        ]}"#,
+    )
+    .await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/logs/_doc/1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"event":"hello"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "illegal_argument_exception");
+    assert!(body["error"]["reason"]
+        .as_str()
+        .expect("reason string")
+        .contains("no write index is defined for alias"));
+}
