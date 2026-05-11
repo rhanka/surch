@@ -111,6 +111,11 @@ pub fn app_router() -> Router {
             get(cluster::cluster_health_index_handler),
         )
         .route("/_cat/indices", get(cat::cat_indices_handler))
+        .route("/_cat/health", get(cat::cat_health_handler))
+        .route("/_cat/aliases", get(cat::cat_aliases_handler))
+        .route("/_cat/aliases/:name", get(cat::cat_aliases_by_name_handler))
+        .route("/_cat/count", get(cat::cat_count_handler))
+        .route("/_cat/count/:index", get(cat::cat_count_index_handler))
         .route(
             "/_aliases",
             post(aliases::aliases_state_handler).put(aliases::aliases_state_handler),
