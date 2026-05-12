@@ -48,8 +48,8 @@ operational recovery, and real MatchID query replay are proven.
 2. Symmetric HTTP benchmark has an initial implementation but still needs real repeated runs.
    `ban-http-bench` now exercises Surch HTTP and OpenSearch HTTP through the same persistent
    Rust HTTP/1.1 client, with configurable timeout and oracle response comparison.
-   The current blocker is evidence: no committed `ban_tiny`/Paris/MatchID run report has passed
-   the repeated-run publication gates yet.
+   The current blocker is scale evidence: `ban_tiny` passes, but the first Paris attempt shows
+   Surch `_bulk` timeouts at 500 and 25,000 documents and slow match queries at 100 documents.
 
 3. Production-like dataset benchmark is not pinned.
    `ban_tiny` has 3 documents and is only a smoke fixture. A real performance decision needs
@@ -66,7 +66,11 @@ operational recovery, and real MatchID query replay are proven.
    BM25 correctness exists, but the API path is not yet using postings as the primary execution
    plan for all scoring queries. This is the main performance risk as data grows.
 
-3. Operational envelope is not proven.
+3. API `_bulk` ingestion is too slow for larger-than-tiny HTTP datasets.
+   The Paris attempt in `docs/poc/reports/ban-paris-http-019d91e.md` loaded 25,000 and 500
+   documents in OpenSearch, while Surch timed out after 120s and left partial data visible.
+
+4. Operational envelope is not proven.
    There is no production runbook yet for index rebuild, backup/restore, schema migration,
    memory sizing, slow query diagnosis, or rollback.
 
@@ -104,8 +108,8 @@ Exit criteria:
 
 ### Milestone 2: Symmetric HTTP Benchmark
 
-Estimate: harness implemented; next 1-2 days should produce Paris BAN or
-MatchID-sized repeated runs.
+Estimate: harness implemented; repeated runs are blocked until Surch API ingestion/search
+performance improves beyond tiny fixtures.
 
 Deliverables:
 
@@ -118,6 +122,9 @@ Exit criteria:
 
 - `ban_tiny` smoke passes for both engines
   (`docs/poc/reports/ban-http-4c35045.{json,md}`).
+- Paris attempt is documented
+  (`docs/poc/reports/ban-paris-http-019d91e.md`) and currently marks ingestion/search
+  performance as a blocker.
 - Paris BAN or MatchID-sized sample produces 5 successful repeated runs.
 - p95 variance is <= 15% or the variance is explicitly reported.
 - No global ratio is published; report per-operation latency and throughput.

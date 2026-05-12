@@ -177,6 +177,32 @@ fn replay_fixture_ban_tiny_http_bench_manifest_excludes_known_fuzzy_gap() {
 }
 
 #[test]
+fn replay_fixture_ban_paris_100_http_bench_manifest_is_valid() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/opensearch_compat/oracle/replays/ban_paris_100_http_bench.json");
+    let manifest_json =
+        std::fs::read_to_string(manifest_path).expect("BAN Paris 100 replay should exist");
+    let manifest = parse_manifest(&manifest_json);
+
+    assert_eq!(manifest.name, "ban_paris_100_http_bench");
+    assert_eq!(manifest.dataset, "ban_paris_100");
+    assert_eq!(manifest.requests.len(), 3);
+    assert_eq!(manifest.requests[0].name, "count_ban_paris_100_addresses");
+    assert_eq!(
+        manifest.requests[1].name,
+        "search_ban_paris_100_place_patrice_chereau"
+    );
+    assert_eq!(
+        manifest.requests[2].name,
+        "search_ban_paris_100_rue_payenne"
+    );
+    assert_eq!(
+        manifest.requests[2].expected_response.as_ref().unwrap()["hits"]["total"]["value"],
+        18
+    );
+}
+
+#[test]
 fn replay_manifest_defaults_to_exact_response_comparison() {
     let manifest = parse_manifest(
         r#"{

@@ -1,0 +1,14 @@
+# Raw or locally staged MatchID captures must never be committed.
+raw/
+incoming/
+local/
+private/
+unredacted/
+
+# Common raw capture formats. Commit only reviewed sanitized fixtures.
+*.har
+*.pcap
+*.dump
+*.log
+*.secret*
+*.prod*

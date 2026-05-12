@@ -580,30 +580,38 @@ async fn run_ban_http_bench(plan: BanHttpBenchPlan) -> Result<(), CliError> {
     if let Some(report) = &plan.report {
         write_json_report(
             report,
-            json!({
-                "benchmark": "ban-http-bench",
-                "dataset": plan.dataset,
-                "dataset_bytes": dataset.bytes,
-                "documents": dataset.documents,
-                "index": plan.index,
-                "oracle": plan.oracle,
-                "iterations": plan.iterations,
-                "warmup": plan.warmup,
-                "timeout_seconds": plan.timeout_seconds,
-                "runtime": "symmetric HTTP",
-                "http_client": "persistent HTTP/1.1 keep-alive per engine",
-                "engines": reports.iter().map(EngineBenchReport::to_json).collect::<Vec<_>>(),
-                "guardrails": [
-                    "same Rust HTTP client path for both engines",
-                    "persistent HTTP/1.1 connections are reused across warmup and measured samples",
-                    "oracle validation is required before measured query iterations",
-                    "no global Surch/OpenSearch ratio is emitted"
-                ]
-            }),
+            ban_http_bench_report_json(&plan, &dataset, &reports),
         )?;
     }
 
     Ok(())
+}
+
+fn ban_http_bench_report_json(
+    plan: &BanHttpBenchPlan,
+    dataset: &BulkDataset,
+    reports: &[EngineBenchReport],
+) -> Value {
+    json!({
+        "benchmark": "ban-http-bench",
+        "dataset": &plan.dataset,
+        "dataset_bytes": dataset.bytes,
+        "documents": dataset.documents,
+        "index": &plan.index,
+        "oracle": &plan.oracle,
+        "iterations": plan.iterations,
+        "warmup": plan.warmup,
+        "timeout_seconds": plan.timeout_seconds,
+        "runtime": "symmetric HTTP",
+        "http_client": "persistent HTTP/1.1 keep-alive per engine",
+        "engines": reports.iter().map(EngineBenchReport::to_json).collect::<Vec<_>>(),
+        "guardrails": [
+            "same Rust HTTP client path for both engines",
+            "persistent HTTP/1.1 connections are reused across warmup and measured samples",
+            "oracle validation is required before measured query iterations",
+            "no global Surch/OpenSearch ratio is emitted"
+        ]
+    })
 }
 
 fn run_engine_http_bench(
@@ -1836,5 +1844,191 @@ impl std::error::Error for CliError {}
 impl From<serde_json::Error> for CliError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_metric_to_json_serializes_latency_rates_and_hits() {
+        let metric = OperationMetric {
+            operation: "search_ban_tiny_by_label".to_owned(),
+            status: 200,
+            iterations: 5,
+            samples: vec![
+                Duration::from_micros(500),
+                Duration::from_micros(100),
+                Duration::from_micros(300),
+                Duration::from_micros(200),
+                Duration::from_micros(400),
+            ],
+            docs: Some(3),
+            bytes: Some(900),
+            error_count: 0,
+            hits: Some(1),
+            top_hit_id: Some("75101_0001_00001".to_owned()),
+            server_took_ms: Some(7),
+        };
+
+        let value = metric.to_json();
+
+        assert_eq!(value["operation"], json!("search_ban_tiny_by_label"));
+        assert_eq!(value["status"], json!(200));
+        assert_eq!(value["iterations"], json!(5));
+        assert_eq!(value["docs"], json!(3));
+        assert_eq!(value["bytes"], json!(900));
+        assert_eq!(value["error_count"], json!(0));
+        assert_eq!(value["hits"], json!(1));
+        assert_eq!(value["top_hit_id"], json!("75101_0001_00001"));
+        assert_eq!(value["server_took_ms"], json!(7));
+        assert_eq!(
+            value["latency_us"],
+            json!({
+                "min": 100,
+                "p50": 300,
+                "p95": 500,
+                "p99": 500,
+                "max": 500,
+                "total": 1500
+            })
+        );
+        assert_eq!(value["samples_us"], json!([500, 100, 300, 200, 400]));
+        assert_eq!(value["docs_per_second"].as_f64().unwrap(), 2_000.0);
+        assert_eq!(value["bytes_per_second"].as_f64().unwrap(), 600_000.0);
+    }
+
+    #[test]
+    fn ban_http_bench_report_json_serializes_metadata_engines_and_guardrails() {
+        let plan = BanHttpBenchPlan {
+            surch_url: "http://127.0.0.1:7700".to_owned(),
+            opensearch_url: "http://127.0.0.1:9200".to_owned(),
+            index: "ban_ci".to_owned(),
+            iterations: 2,
+            dataset: "tests/fixtures/ban.ndjson".to_owned(),
+            oracle: "tests/fixtures/ban_oracle.json".to_owned(),
+            warmup: 1,
+            report: Some("target/ban-http-bench.json".to_owned()),
+            timeout_seconds: 15,
+            dry_run: false,
+        };
+        let dataset = BulkDataset {
+            body: String::new(),
+            documents: 3,
+            bytes: 941,
+        };
+        let reports = vec![EngineBenchReport {
+            name: "surch".to_owned(),
+            url: "http://127.0.0.1:7700".to_owned(),
+            metrics: vec![OperationMetric {
+                operation: "bulk_ingest".to_owned(),
+                status: 200,
+                iterations: 1,
+                samples: vec![Duration::from_micros(400)],
+                docs: Some(3),
+                bytes: Some(941),
+                error_count: 0,
+                hits: None,
+                top_hit_id: None,
+                server_took_ms: Some(0),
+            }],
+        }];
+
+        let value = ban_http_bench_report_json(&plan, &dataset, &reports);
+
+        assert_eq!(value["benchmark"], json!("ban-http-bench"));
+        assert_eq!(value["dataset"], json!("tests/fixtures/ban.ndjson"));
+        assert_eq!(value["dataset_bytes"], json!(941));
+        assert_eq!(value["documents"], json!(3));
+        assert_eq!(value["index"], json!("ban_ci"));
+        assert_eq!(value["oracle"], json!("tests/fixtures/ban_oracle.json"));
+        assert_eq!(value["iterations"], json!(2));
+        assert_eq!(value["warmup"], json!(1));
+        assert_eq!(value["timeout_seconds"], json!(15));
+        assert_eq!(value["runtime"], json!("symmetric HTTP"));
+        assert_eq!(
+            value["http_client"],
+            json!("persistent HTTP/1.1 keep-alive per engine")
+        );
+        assert_eq!(value["engines"][0]["name"], json!("surch"));
+        assert_eq!(value["engines"][0]["url"], json!("http://127.0.0.1:7700"));
+        assert_eq!(
+            value["engines"][0]["metrics"][0]["operation"],
+            json!("bulk_ingest")
+        );
+        assert_eq!(value["engines"][0]["metrics"][0]["docs"], json!(3));
+        assert!(value["guardrails"]
+            .as_array()
+            .expect("guardrails should be an array")
+            .contains(&json!("no global Surch/OpenSearch ratio is emitted")));
+    }
+
+    #[test]
+    fn validate_oracle_response_rejects_total_hit_mismatch() {
+        let request = oracle_search_request();
+        let response = HttpJsonResponse {
+            status: 200,
+            body: json!({
+                "hits": {
+                    "total": { "value": 2 },
+                    "hits": [{ "_id": "75101_0001_00001" }]
+                }
+            }),
+            elapsed: Duration::from_micros(100),
+        };
+
+        let error = validate_oracle_response(&request, &response).unwrap_err();
+
+        match error {
+            CliError::OracleMismatch(message) => {
+                assert!(message.contains("$.hits.total.value"));
+            }
+            other => panic!("expected oracle mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_oracle_response_rejects_top_hit_mismatch() {
+        let request = oracle_search_request();
+        let response = HttpJsonResponse {
+            status: 200,
+            body: json!({
+                "hits": {
+                    "total": { "value": 1 },
+                    "hits": [{ "_id": "wrong_top_hit" }]
+                }
+            }),
+            elapsed: Duration::from_micros(100),
+        };
+
+        let error = validate_oracle_response(&request, &response).unwrap_err();
+
+        match error {
+            CliError::OracleMismatch(message) => {
+                assert!(message.contains("$.hits.hits.0._id"));
+            }
+            other => panic!("expected oracle mismatch, got {other:?}"),
+        }
+    }
+
+    fn oracle_search_request() -> OracleRequest {
+        OracleRequest {
+            name: "search_ban_tiny_by_label".to_owned(),
+            method: "POST".to_owned(),
+            path: "/ban_ci/_search".to_owned(),
+            body: None,
+            expected_status: 200,
+            expected_response: Some(json!({
+                "hits": {
+                    "total": { "value": 1 },
+                    "hits": [{ "_id": "75101_0001_00001" }]
+                }
+            })),
+            comparison: OracleComparison {
+                ignored_paths: Vec::new(),
+                score_tolerance: 0.0,
+            },
+        }
     }
 }

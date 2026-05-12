@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "export_id": "matchid_sanitized_YYYY_MM_DD_v1",
+  "status": "template",
+  "capture": {
+    "reference_engine": "elasticsearch-or-opensearch",
+    "reference_version": "x.y.z",
+    "capture_window_utc": {
+      "start": "YYYY-MM-DDTHH:MM:SSZ",
+      "end": "YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "source_environment": "sanitized-non-sensitive-label",
+    "captured_request_count": 0,
+    "excluded_traffic_classes": []
+  },
+  "files": {
+    "dataset_manifest": "datasets/matchid_sanitized_YYYY_MM_DD_v1.json",
+    "create_index_body": "datasets/matchid_sanitized_YYYY_MM_DD_v1.create_index.json",
+    "bulk_ndjson": "datasets/matchid_sanitized_YYYY_MM_DD_v1.ndjson",
+    "critical_replay_manifest": "replays/matchid_sanitized_YYYY_MM_DD_v1_critical.json",
+    "redaction_notes": "redaction/matchid_sanitized_YYYY_MM_DD_v1.md"
+  },
+  "redaction": {
+    "approved_for_commit": false,
+    "reviewer": "role-or-person-to-fill",
+    "mapping_table_committed": false,
+    "assertions": [
+      "no production secrets",
+      "no customer data",
+      "no raw identifiers",
+      "no reversible hashes or encrypted production values",
+      "synthetic IDs are stable across documents, queries, and expected responses",
+      "field names, types, analyzers, nullability, arrays, nested objects, and sort/filter distributions are preserved"
+    ],
+    "known_lossy_transformations": []
+  },
+  "coverage": {
+    "required_endpoints": [
+      "PUT /<index>",
+      "GET /<index>/_mapping",
+      "GET /<index>/_settings",
+      "POST /_bulk",
+      "POST /<index>/_refresh",
+      "GET|POST /<index>/_search",
+      "GET|POST /<index>/_count",
+      "GET|POST /<index>/_mget",
+      "GET|POST /<index>/_msearch"
+    ],
+    "captured_endpoints": [],
+    "critical_workflows": [
+      {
+        "name": "candidate_lookup",
+        "criticality": "P0",
+        "request_names": [],
+        "covered": false
+      },
+      {
+        "name": "bulk_profile_mget",
+        "criticality": "P0",
+        "request_names": [],
+        "covered": false
+      },
+      {
+        "name": "dashboard_count",
+        "criticality": "P1",
+        "request_names": [],
+        "covered": false
+      },
+      {
+        "name": "multi_search_batch",
+        "criticality": "P1",
+        "request_names": [],
+        "covered": false
+      }
+    ],
+    "known_absent_or_out_of_scope_workflows": []
+  },
+  "normalization": {
+    "default_ignored_paths": [
+      "took",
+      "_shards.total"
+    ],
+    "score_policy": "ignore score fields for identity/order gates; use score_tolerance only when score parity is asserted",
+    "request_specific_ignored_paths": []
+  },
+  "uat_gate": {
+    "reference_replay_passed": false,
+    "surch_replay_passed": false,
+    "all_p0_p1_workflows_covered": false,
+    "all_mismatches_classified": false,
+    "symmetric_http_benchmark_available": false,
+    "rollback_path_documented": false,
+    "go_shadow_uat": false,
+    "blockers": [
+      "template must be copied and completed before use"
+    ]
+  }
+}

@@ -128,3 +128,17 @@ Publication guardrails:
   operation;
 - label `ban_tiny` as a 3-document smoke benchmark;
 - publish side-by-side per-operation numbers only, not a single global ratio.
+
+For bounded official BAN samples, generate local NDJSON under `target/ban-bench`
+with the Rust converter and keep the data out of git:
+
+```sh
+mkdir -p target/ban-bench
+gzip -dc demo/data/ban/adresses-75.csv.gz | sed -n '1,101p' \
+  > target/ban-bench/ban-paris-100.csv
+cargo run -p opensearch-oracle --bin ban-to-ndjson -- \
+  --input target/ban-bench/ban-paris-100.csv \
+  --output target/ban-bench/ban-paris-100.ndjson \
+  --index ban_paris_100 \
+  --limit 100
+```

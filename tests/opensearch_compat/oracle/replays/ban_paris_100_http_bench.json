@@ -1,0 +1,106 @@
+{
+  "name": "ban_paris_100_http_bench",
+  "dataset": "ban_paris_100",
+  "comparison": {
+    "ignored_paths": [
+      "took",
+      "_shards.total",
+      "hits.max_score",
+      "hits.hits.*._score"
+    ],
+    "score_tolerance": 0.001
+  },
+  "requests": [
+    {
+      "name": "count_ban_paris_100_addresses",
+      "method": "GET",
+      "path": "/ban_paris_100/_count",
+      "expected_status": 200,
+      "expected_response": {
+        "count": 100,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        }
+      }
+    },
+    {
+      "name": "search_ban_paris_100_place_patrice_chereau",
+      "method": "POST",
+      "path": "/ban_paris_100/_search",
+      "body": {
+        "query": {
+          "match": {
+            "label": {
+              "query": "Place Patrice Chéreau",
+              "operator": "AND"
+            }
+          }
+        },
+        "_source": false
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "timed_out": false,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "eq"
+          },
+          "max_score": null,
+          "hits": [
+            {
+              "_index": "ban_paris_100",
+              "_id": "75103_vaip3v_00001"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "search_ban_paris_100_rue_payenne",
+      "method": "POST",
+      "path": "/ban_paris_100/_search",
+      "body": {
+        "query": {
+          "match": {
+            "label": {
+              "query": "Rue Payenne",
+              "operator": "AND"
+            }
+          }
+        },
+        "_source": false,
+        "size": 1
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "timed_out": false,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
+        "hits": {
+          "total": {
+            "value": 18,
+            "relation": "eq"
+          },
+          "max_score": null,
+          "hits": [
+            {
+              "_index": "ban_paris_100",
+              "_id": "75103_7205_00001"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

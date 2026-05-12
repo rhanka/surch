@@ -85,6 +85,19 @@ npm run ban:download
 BAN_CSV_PATH=data/ban/adresses-75.csv.gz npm run dev
 ```
 
+Convert a bounded Paris extract to benchmark NDJSON without committing the data:
+
+```bash
+mkdir -p target/ban-bench
+gzip -dc demo/data/ban/adresses-75.csv.gz | sed -n '1,101p' \
+  > target/ban-bench/ban-paris-100.csv
+cargo run -p opensearch-oracle --bin ban-to-ndjson -- \
+  --input target/ban-bench/ban-paris-100.csv \
+  --output target/ban-bench/ban-paris-100.ndjson \
+  --index ban_paris_100 \
+  --limit 100
+```
+
 Download the full national BAN only when the machine has enough disk and memory:
 
 ```bash
@@ -276,6 +289,13 @@ The command uses the same Rust HTTP/1.1 keep-alive client for both engines and
 validates the full expected replay response, minus the replay `ignored_paths`.
 Use `--dry-run` to print the dataset/oracle-derived plan without sending HTTP
 requests.
+
+Current reports:
+
+- `docs/poc/reports/ban-http-4c35045.md`: 3-document `ban_tiny` smoke run.
+- `docs/poc/reports/ban-paris-http-019d91e.md`: Paris 25k/500/100 attempt;
+  documents the current Surch `_bulk` timeout and slow search behavior on
+  larger-than-tiny HTTP data.
 
 ### Metrics
 

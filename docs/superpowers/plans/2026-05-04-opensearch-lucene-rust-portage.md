@@ -428,7 +428,8 @@ cargo run -p surch-demo --release -- ban-http-bench \
 
 - [x] Implement `ban-http-bench` in Rust in `crates/surch-demo` or a future benchmark crate.
 - [x] Add tests for CLI argument validation and failed upstream HTTP responses.
-- [ ] Add oracle mismatch rejection and report serialization tests that do not require local TCP bind permissions.
+- [x] Add oracle mismatch rejection and report serialization tests that do not require local TCP bind permissions.
 - [x] Add a Markdown summary under `docs/poc/reports/`; JSON report output is implemented.
 - [x] Run the harness first on `ban_tiny`.
-- [ ] Run the harness on a pinned Paris BAN sample with the exact source and checksum recorded.
+- [x] Attempt a pinned Paris BAN sample with exact source and checksum recorded.
+- [ ] Fix Surch API ingestion/search performance before repeated Paris or MatchID-sized runs.
