@@ -132,12 +132,15 @@ fn parse_index_template_request(body: &str) -> Result<StoredIndexTemplate, OpenS
 
     let index_patterns = parse_index_patterns(object.get("index_patterns"))?;
     let priority = parse_priority(object.get("priority"))?;
-    let mapping = parse_template_mapping(object)?;
+    let template = parse_template_object(object.get("template"))?;
+    let mapping = parse_template_mapping(template)?;
+    let aliases = parse_template_aliases(template)?;
 
     Ok(StoredIndexTemplate {
         index_template: value,
         index_patterns,
         mapping,
+        aliases,
         priority,
     })
 }
@@ -208,19 +211,27 @@ fn parse_priority(value: Option<&Value>) -> Result<i64, OpenSearchError> {
     Ok(priority)
 }
 
-fn parse_template_mapping(
-    object: &serde_json::Map<String, Value>,
-) -> Result<IndexMapping, OpenSearchError> {
-    let Some(template) = object.get("template") else {
-        return Ok(IndexMapping::default());
+fn parse_template_object(
+    template: Option<&Value>,
+) -> Result<Option<&serde_json::Map<String, Value>>, OpenSearchError> {
+    let Some(template) = template else {
+        return Ok(None);
     };
-    let template = template.as_object().ok_or_else(|| {
+    template.as_object().map(Some).ok_or_else(|| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
             "_index_template `template` must be an object",
         )
-    })?;
+    })
+}
+
+fn parse_template_mapping(
+    template: Option<&serde_json::Map<String, Value>>,
+) -> Result<IndexMapping, OpenSearchError> {
+    let Some(template) = template else {
+        return Ok(IndexMapping::default());
+    };
 
     for (field, reason) in [
         (
@@ -247,6 +258,44 @@ fn parse_template_mapping(
         return Ok(IndexMapping::default());
     };
     parse_template_mappings_value(mappings)
+}
+
+fn parse_template_aliases(
+    template: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<String>, OpenSearchError> {
+    let Some(template) = template else {
+        return Ok(Vec::new());
+    };
+    let Some(aliases) = template.get("aliases") else {
+        return Ok(Vec::new());
+    };
+    let aliases = aliases.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "_index_template `template.aliases` must be an object",
+        )
+    })?;
+
+    let mut names = Vec::new();
+    for (alias, body) in aliases {
+        if alias.trim().is_empty() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "_index_template `template.aliases` names must not be empty",
+            ));
+        }
+        if !body.is_object() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("_index_template `template.aliases.{alias}` must be an object"),
+            ));
+        }
+        names.push(alias.clone());
+    }
+    Ok(names)
 }
 
 fn parse_template_mappings_value(mappings: &Value) -> Result<IndexMapping, OpenSearchError> {

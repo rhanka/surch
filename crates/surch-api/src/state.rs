@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
 };
 
@@ -18,7 +18,7 @@ pub struct AppState {
 #[derive(Default)]
 struct MemoryStore {
     indices: BTreeMap<String, InMemoryIndex>,
-    aliases: BTreeMap<String, std::collections::BTreeSet<String>>,
+    aliases: BTreeMap<String, BTreeSet<String>>,
     index_templates: BTreeMap<String, StoredIndexTemplate>,
 }
 
@@ -44,6 +44,7 @@ pub struct StoredIndexTemplate {
     pub index_template: Value,
     pub index_patterns: Vec<String>,
     pub mapping: IndexMapping,
+    pub aliases: Vec<String>,
     pub priority: i64,
 }
 
@@ -171,13 +172,7 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        if !store.indices.contains_key(index) {
-            let mapping =
-                mapping_for_new_index(index, &store.index_templates, mapping.unwrap_or_default());
-            store
-                .indices
-                .insert(index.to_owned(), InMemoryIndex::new(mapping));
-        }
+        create_index_if_missing(&mut store, index, mapping.unwrap_or_default());
     }
 
     pub fn put_index_template(&self, name: &str, template: StoredIndexTemplate) {
@@ -247,13 +242,7 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        if !store.indices.contains_key(index) {
-            let mapping =
-                mapping_for_new_index(index, &store.index_templates, IndexMapping::default());
-            store
-                .indices
-                .insert(index.to_owned(), InMemoryIndex::new(mapping));
-        }
+        create_index_if_missing(&mut store, index, IndexMapping::default());
         let data = store
             .indices
             .get_mut(index)
@@ -267,13 +256,7 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        if !store.indices.contains_key(index) {
-            let mapping =
-                mapping_for_new_index(index, &store.index_templates, IndexMapping::default());
-            store
-                .indices
-                .insert(index.to_owned(), InMemoryIndex::new(mapping));
-        }
+        create_index_if_missing(&mut store, index, IndexMapping::default());
         let data = store
             .indices
             .get_mut(index)
@@ -555,12 +538,32 @@ impl AppState {
     }
 }
 
-fn mapping_for_new_index(
+fn create_index_if_missing(store: &mut MemoryStore, index: &str, explicit_mapping: IndexMapping) {
+    if store.indices.contains_key(index) {
+        return;
+    }
+
+    let templates = matching_index_templates(index, &store.index_templates);
+    let mapping = mapping_for_new_index(&templates, explicit_mapping);
+    store
+        .indices
+        .insert(index.to_owned(), InMemoryIndex::new(mapping));
+
+    for (_, template) in templates {
+        for alias in &template.aliases {
+            store
+                .aliases
+                .entry(alias.clone())
+                .or_default()
+                .insert(index.to_owned());
+        }
+    }
+}
+
+fn matching_index_templates<'a>(
     index: &str,
-    index_templates: &BTreeMap<String, StoredIndexTemplate>,
-    explicit_mapping: IndexMapping,
-) -> IndexMapping {
-    let mut mapping = IndexMapping::default();
+    index_templates: &'a BTreeMap<String, StoredIndexTemplate>,
+) -> Vec<(&'a String, &'a StoredIndexTemplate)> {
     let mut matching_templates = index_templates
         .iter()
         .filter(|(_, template)| {
@@ -576,7 +579,14 @@ fn mapping_for_new_index(
             .cmp(&right.priority)
             .then_with(|| left_name.cmp(right_name))
     });
+    matching_templates
+}
 
+fn mapping_for_new_index(
+    matching_templates: &[(&String, &StoredIndexTemplate)],
+    explicit_mapping: IndexMapping,
+) -> IndexMapping {
+    let mut mapping = IndexMapping::default();
     for (_, template) in matching_templates {
         merge_mapping_fields(&mut mapping, &template.mapping);
     }
