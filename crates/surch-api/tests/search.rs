@@ -1347,6 +1347,43 @@ async fn search_router_multi_match_returns_any_field_containing_query_token() {
 }
 
 #[tokio::test]
+async fn search_router_multi_match_and_operator_requires_all_tokens_in_one_field() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-same-field",
+        r#"{"name":"rust search guide","description":"engine internals"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "sku-split-fields",
+        r#"{"name":"rust","description":"search guide"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "sku-one-token",
+        r#"{"name":"rust systems","description":"engine internals"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"multi_match":{"query":"rust search","fields":["name","description"],"operator":"AND"}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-same-field"]);
+}
+
+#[tokio::test]
 async fn search_router_rejects_multi_match_without_fields_with_opensearch_error() {
     let router = app_router();
     let create_index = router

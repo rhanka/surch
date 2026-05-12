@@ -125,6 +125,7 @@ pub enum SearchQuery {
     MultiMatch {
         query: String,
         fields: Vec<String>,
+        operator: MatchOperator,
     },
 }
 
@@ -435,7 +436,7 @@ fn score_for_query(
         SearchQuery::Match { field, value, .. } => {
             bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
         }
-        SearchQuery::MultiMatch { query, fields } => fields
+        SearchQuery::MultiMatch { query, fields, .. } => fields
             .iter()
             .map(|field| {
                 bm25_field_score(state, index, field, query, &document.source, doc_count)
@@ -1212,8 +1213,10 @@ fn parse_wildcard_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     Ok(SearchQuery::Wildcard { field, pattern })
 }
 
-/// Parse a `multi_match` query body and return `(query_text, fields)`.
-pub fn parse_multi_match_clause(value: &Value) -> Result<(String, Vec<String>), OpenSearchError> {
+/// Parse a `multi_match` query body and return `(query_text, fields, operator)`.
+pub fn parse_multi_match_clause(
+    value: &Value,
+) -> Result<(String, Vec<String>, MatchOperator), OpenSearchError> {
     let object = value.as_object().ok_or_else(|| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -1281,13 +1284,18 @@ pub fn parse_multi_match_clause(value: &Value) -> Result<(String, Vec<String>), 
             ));
         }
     }
+    let operator = parse_match_operator(value, "multi_match")?;
 
-    Ok((query_text, fields))
+    Ok((query_text, fields, operator))
 }
 
 fn parse_multi_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
-    let (query, fields) = parse_multi_match_clause(value)?;
-    Ok(SearchQuery::MultiMatch { query, fields })
+    let (query, fields, operator) = parse_multi_match_clause(value)?;
+    Ok(SearchQuery::MultiMatch {
+        query,
+        fields,
+        operator,
+    })
 }
 
 fn parse_range_bound_value(value: &Value) -> Result<RangeValue, OpenSearchError> {
@@ -1438,7 +1446,11 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
             .any(|value| term_field_matches(source, field, value)),
         SearchQuery::Prefix { field, value } => prefix_field_matches(source, field, value),
         SearchQuery::Wildcard { field, pattern } => wildcard_field_matches(source, field, pattern),
-        SearchQuery::MultiMatch { query, fields } => multi_match_matches(source, fields, query),
+        SearchQuery::MultiMatch {
+            query,
+            fields,
+            operator,
+        } => multi_match_matches(source, fields, query, *operator),
     }
 }
 
@@ -1494,10 +1506,15 @@ fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn multi_match_matches(source: &Value, fields: &[String], query: &str) -> bool {
+pub fn multi_match_matches(
+    source: &Value,
+    fields: &[String],
+    query: &str,
+    operator: MatchOperator,
+) -> bool {
     fields
         .iter()
-        .any(|field| field_matches(source, field, query, MatchOperator::Or))
+        .any(|field| field_matches(source, field, query, operator))
 }
 
 pub fn prefix_field_matches(source: &Value, field: &str, prefix: &str) -> bool {
@@ -1884,7 +1901,7 @@ fn highlight_spans_for_query(text: &str, query: &SearchQuery, field: &str) -> Ve
             field: query_field,
             pattern,
         } if query_field == field => wildcard_token_spans(&tokens, pattern),
-        SearchQuery::MultiMatch { query, fields }
+        SearchQuery::MultiMatch { query, fields, .. }
             if fields.iter().any(|candidate| candidate == field) =>
         {
             exact_token_spans(&tokens, &tokenize_for_search(query))

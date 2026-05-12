@@ -13,7 +13,8 @@ use crate::{
     search::{
         exists_field_matches, multi_match_matches, parse_exists_clause, parse_multi_match_clause,
         parse_prefix_clause, parse_range_bounds, parse_terms_clause, parse_wildcard_clause,
-        prefix_field_matches, range_field_matches, wildcard_field_matches, RangeBounds,
+        prefix_field_matches, range_field_matches, wildcard_field_matches, MatchOperator,
+        RangeBounds,
     },
     state::AppState,
     OpenSearchError,
@@ -29,14 +30,35 @@ pub struct CountRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CountQuery {
     MatchAll,
-    Term { field: String, value: String },
+    Term {
+        field: String,
+        value: String,
+    },
     BoolMust(Vec<CountQuery>),
-    Range { field: String, bounds: RangeBounds },
-    Exists { field: String },
-    Terms { field: String, values: Vec<String> },
-    Prefix { field: String, value: String },
-    Wildcard { field: String, pattern: String },
-    MultiMatch { query: String, fields: Vec<String> },
+    Range {
+        field: String,
+        bounds: RangeBounds,
+    },
+    Exists {
+        field: String,
+    },
+    Terms {
+        field: String,
+        values: Vec<String>,
+    },
+    Prefix {
+        field: String,
+        value: String,
+    },
+    Wildcard {
+        field: String,
+        pattern: String,
+    },
+    MultiMatch {
+        query: String,
+        fields: Vec<String>,
+        operator: MatchOperator,
+    },
 }
 
 /// OpenSearch-compatible `_count` response for the bootstrap engine-less API.
@@ -232,8 +254,12 @@ fn parse_count_query(value: &Value) -> Result<CountQuery, OpenSearchError> {
             Ok(CountQuery::Wildcard { field, pattern })
         }
         "multi_match" => {
-            let (query, fields) = parse_multi_match_clause(query_body)?;
-            Ok(CountQuery::MultiMatch { query, fields })
+            let (query, fields, operator) = parse_multi_match_clause(query_body)?;
+            Ok(CountQuery::MultiMatch {
+                query,
+                fields,
+                operator,
+            })
         }
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -344,7 +370,11 @@ fn query_matches(query: &CountQuery, source: &Value) -> bool {
             .any(|value| term_field_matches(source, field, value)),
         CountQuery::Prefix { field, value } => prefix_field_matches(source, field, value),
         CountQuery::Wildcard { field, pattern } => wildcard_field_matches(source, field, pattern),
-        CountQuery::MultiMatch { query, fields } => multi_match_matches(source, fields, query),
+        CountQuery::MultiMatch {
+            query,
+            fields,
+            operator,
+        } => multi_match_matches(source, fields, query, *operator),
     }
 }
 

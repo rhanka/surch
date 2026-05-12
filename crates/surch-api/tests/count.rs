@@ -430,3 +430,55 @@ async fn count_router_range_query_counts_documents_within_numeric_bounds() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await["count"], 2);
 }
+
+#[tokio::test]
+async fn count_router_multi_match_and_operator_requires_all_tokens_in_one_field() {
+    let router = app_router();
+
+    for (id, body) in [
+        (
+            "sku-same-field",
+            r#"{"name":"rust search guide","description":"engine internals"}"#,
+        ),
+        (
+            "sku-split-fields",
+            r#"{"name":"rust","description":"search guide"}"#,
+        ),
+        (
+            "sku-one-token",
+            r#"{"name":"rust systems","description":"engine internals"}"#,
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/products/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"multi_match":{"query":"rust search","fields":["name","description"],"operator":"AND"}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["count"], 1);
+}
