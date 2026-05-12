@@ -10,7 +10,7 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::index::validate_index_name;
-use crate::state::AppState;
+use crate::state::{AppState, DocumentWriteOperation, DocumentWriteResult};
 
 /// One parsed OpenSearch `_bulk` NDJSON operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -186,64 +186,104 @@ fn apply_bulk_operations(
     state: &AppState,
     operations: &[BulkOperation],
 ) -> (Vec<BulkResponseItem>, bool) {
-    let mut has_error = false;
-    let items = operations
-        .iter()
-        .map(|operation| {
-            let item = apply_bulk_operation(state, operation);
-            has_error |= item_has_error(&item);
-            item
-        })
-        .collect();
+    let mut items = vec![None; operations.len()];
+    let mut writes = Vec::new();
+
+    for (position, operation) in operations.iter().enumerate() {
+        match build_bulk_write_operation(state, operation) {
+            Ok((kind, write)) => writes.push((position, kind, write)),
+            Err(item) => items[position] = Some(item),
+        }
+    }
+
+    let write_results = state.apply_document_writes(
+        writes
+            .iter()
+            .map(|(_, _, operation)| operation.clone())
+            .collect(),
+    );
+
+    for ((position, kind, _), result) in writes.into_iter().zip(write_results) {
+        items[position] = Some(bulk_item_from_write_result(kind, result));
+    }
+
+    let items = items
+        .into_iter()
+        .map(|item| item.expect("each bulk operation should yield a response item"))
+        .collect::<Vec<_>>();
+    let has_error = items.iter().any(item_has_error);
 
     (items, has_error)
 }
 
-fn apply_bulk_operation(state: &AppState, operation: &BulkOperation) -> BulkResponseItem {
+#[derive(Clone, Copy)]
+enum BulkActionKind {
+    Index,
+    Create,
+    Delete,
+    Update,
+}
+
+fn build_bulk_write_operation(
+    state: &AppState,
+    operation: &BulkOperation,
+) -> Result<(BulkActionKind, DocumentWriteOperation), BulkResponseItem> {
     match operation {
-        BulkOperation::Index { index, id, source } => BulkResponseItem::Index(
-            apply_index_like_operation(state, index.as_deref(), id.as_deref(), source, 201),
+        BulkOperation::Index { index, id, source } => build_index_like_write_operation(
+            state,
+            index.as_deref(),
+            id.as_deref(),
+            source,
+            201,
+            BulkActionKind::Index,
         ),
-        BulkOperation::Create { index, id, source } => {
-            let status = match resolve_bulk_target(state, index.as_deref(), id.as_deref()) {
-                Err(status) => status,
-                Ok(resolved) => {
-                    let id = id.as_deref().expect("resolved target ensures id is Some");
-                    if state.create_document(&resolved, id, source.clone()) {
-                        item_status(&Some(resolved), &Some(id.to_owned()), 201)
-                    } else {
-                        item_status_with_error(
-                            Some(resolved.as_str()),
-                            Some(id),
-                            409,
-                            "version_conflict_engine_exception",
-                            "document already exists",
-                        )
-                    }
-                }
-            };
-            BulkResponseItem::Create(status)
-        }
         BulkOperation::Update { index, id, source } => {
-            let status = apply_index_like_operation(
+            let source = source.get("doc").cloned().unwrap_or_else(|| source.clone());
+            build_index_like_write_operation(
                 state,
                 index.as_deref(),
                 id.as_deref(),
-                &source.get("doc").cloned().unwrap_or_else(|| source.clone()),
+                &source,
                 200,
-            );
-            BulkResponseItem::Update(status)
+                BulkActionKind::Update,
+            )
+        }
+        BulkOperation::Create { index, id, source } => {
+            match resolve_bulk_target(state, index.as_deref(), id.as_deref()) {
+                Ok(resolved) => {
+                    let id = id
+                        .as_ref()
+                        .expect("resolved target ensures id is Some")
+                        .clone();
+                    Ok((
+                        BulkActionKind::Create,
+                        DocumentWriteOperation::Create {
+                            index: resolved,
+                            id,
+                            source: source.clone(),
+                        },
+                    ))
+                }
+                Err(status) => Err(BulkResponseItem::Create(status)),
+            }
         }
         BulkOperation::Delete { index, id } => {
-            let status = match resolve_bulk_target(state, index.as_deref(), id.as_deref()) {
-                Err(status) => status,
+            match resolve_bulk_target(state, index.as_deref(), id.as_deref()) {
                 Ok(resolved) => {
-                    let id = id.as_deref().expect("resolved target ensures id is Some");
-                    state.delete_document(&resolved, id);
-                    item_status(&Some(resolved), &Some(id.to_owned()), 200)
+                    let id = id
+                        .as_ref()
+                        .expect("resolved target ensures id is Some")
+                        .clone();
+                    Ok((
+                        BulkActionKind::Delete,
+                        DocumentWriteOperation::Delete {
+                            index: resolved,
+                            id,
+                        },
+                    ))
                 }
-            };
-            BulkResponseItem::Delete(status)
+                Err(status) => Err(BulkResponseItem::Delete(status)),
+            }
         }
     }
 }
@@ -282,20 +322,58 @@ fn resolve_bulk_target(
     })
 }
 
-fn apply_index_like_operation(
+fn build_index_like_write_operation(
     state: &AppState,
     index: Option<&str>,
     id: Option<&str>,
     source: &Value,
     status: u16,
-) -> BulkItemStatus {
+    kind: BulkActionKind,
+) -> Result<(BulkActionKind, DocumentWriteOperation), BulkResponseItem> {
     match resolve_bulk_target(state, index, id) {
         Ok(resolved) => {
-            let id = id.expect("resolved target ensures id is Some");
-            state.index_document(&resolved, id, source.clone());
-            item_status(&Some(resolved), &Some(id.to_owned()), status)
+            let id = id.expect("resolved target ensures id is Some").to_owned();
+            Ok((
+                kind,
+                DocumentWriteOperation::Index {
+                    index: resolved,
+                    id,
+                    source: source.clone(),
+                    status,
+                },
+            ))
         }
-        Err(status_err) => status_err,
+        Err(status) => Err(match kind {
+            BulkActionKind::Index => BulkResponseItem::Index(status),
+            BulkActionKind::Create => BulkResponseItem::Create(status),
+            BulkActionKind::Delete => BulkResponseItem::Delete(status),
+            BulkActionKind::Update => BulkResponseItem::Update(status),
+        }),
+    }
+}
+
+fn bulk_item_from_write_result(
+    kind: BulkActionKind,
+    result: DocumentWriteResult,
+) -> BulkResponseItem {
+    let status = match result {
+        DocumentWriteResult::Applied { index, id, status } => {
+            item_status(&Some(index), &Some(id), status)
+        }
+        DocumentWriteResult::VersionConflict { index, id } => item_status_with_error(
+            Some(index.as_str()),
+            Some(id.as_str()),
+            409,
+            "version_conflict_engine_exception",
+            "document already exists",
+        ),
+    };
+
+    match kind {
+        BulkActionKind::Index => BulkResponseItem::Index(status),
+        BulkActionKind::Create => BulkResponseItem::Create(status),
+        BulkActionKind::Delete => BulkResponseItem::Delete(status),
+        BulkActionKind::Update => BulkResponseItem::Update(status),
     }
 }
 

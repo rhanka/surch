@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use surch_analysis::{
     Analyzer, KeywordAnalyzer, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer, WhitespaceAnalyzer,
@@ -55,39 +55,47 @@ impl DocumentIndex {
         K: Into<String>,
         V: Into<String>,
     {
-        if self.documents.contains_key(&doc_id) {
-            return Err(DocumentIndexError::DuplicateDocId { doc_id });
-        }
+        self.add_documents_with_mapping([(doc_id, fields)], mapping)
+    }
 
-        let fields = fields
+    pub fn add_documents_with_mapping<D, I, K, V>(
+        &mut self,
+        documents: D,
+        mapping: &IndexMapping,
+    ) -> Result<()>
+    where
+        D: IntoIterator<Item = (u32, I)>,
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut seen = BTreeSet::new();
+        let mut documents = documents
             .into_iter()
-            .map(|(name, value)| (name.into(), value.into()))
-            .collect::<Vec<_>>();
+            .map(|(doc_id, fields)| {
+                if self.documents.contains_key(&doc_id) || !seen.insert(doc_id) {
+                    return Err(DocumentIndexError::DuplicateDocId { doc_id });
+                }
 
-        for (name, _) in &fields {
-            if name.trim().is_empty() {
-                return Err(DocumentIndexError::EmptyFieldName);
-            }
+                let fields = fields
+                    .into_iter()
+                    .map(|(name, value)| (name.into(), value.into()))
+                    .collect::<Vec<_>>();
+
+                for (name, _) in &fields {
+                    if name.trim().is_empty() {
+                        return Err(DocumentIndexError::EmptyFieldName);
+                    }
+                }
+
+                Ok((doc_id, fields))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for (doc_id, fields) in documents.drain(..) {
+            self.add_validated_document(doc_id, fields, mapping)?;
         }
 
-        let mut document = StoredDocument::new();
-        for (name, value) in &fields {
-            document.insert(name.clone(), StoredValue::String(value.clone()))?;
-        }
-
-        for (field, value) in &fields {
-            let field_mapping = mapping.field(field);
-            let analyzer = field_mapping
-                .map_or(AnalyzerName::default_for(FieldType::Text), |field| {
-                    field.analyzer()
-                });
-
-            for ((field, term), positions) in analyzed_terms(analyzer, field, value) {
-                self.postings_builder.add(field, term, doc_id, positions)?;
-            }
-        }
-
-        self.documents.insert(doc_id, document);
         self.terms = self.postings_builder.clone().build();
 
         Ok(())
@@ -121,6 +129,33 @@ impl DocumentIndex {
 
     pub fn live_docs(&self) -> Vec<u32> {
         self.doc_ids()
+    }
+
+    fn add_validated_document(
+        &mut self,
+        doc_id: u32,
+        fields: Vec<(String, String)>,
+        mapping: &IndexMapping,
+    ) -> Result<()> {
+        let mut document = StoredDocument::new();
+        for (name, value) in &fields {
+            document.insert(name.clone(), StoredValue::String(value.clone()))?;
+        }
+
+        for (field, value) in &fields {
+            let field_mapping = mapping.field(field);
+            let analyzer = field_mapping
+                .map_or(AnalyzerName::default_for(FieldType::Text), |field| {
+                    field.analyzer()
+                });
+
+            for ((field, term), positions) in analyzed_terms(analyzer, field, value) {
+                self.postings_builder.add(field, term, doc_id, positions)?;
+            }
+        }
+
+        self.documents.insert(doc_id, document);
+        Ok(())
     }
 }
 

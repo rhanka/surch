@@ -126,6 +126,55 @@ async fn bulk_router_accepts_index_route_with_default_index() {
 }
 
 #[tokio::test]
+async fn bulk_router_makes_batched_documents_searchable() {
+    let router = app_router();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"1"}}
+{"title":"alpha road"}
+{"index":{"_id":"2"}}
+{"title":"beta road"}
+{"index":{"_id":"3"}}
+{"title":"alpha square"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = response_json(response).await;
+    assert_eq!(response["errors"], false);
+    assert_eq!(response["items"].as_array().expect("items array").len(), 3);
+
+    let search_response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match":{"title":"alpha"}},"size":10}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(search_response.status(), StatusCode::OK);
+    let search_response = response_json(search_response).await;
+    assert_eq!(search_response["hits"]["total"]["value"], 2);
+}
+
+#[tokio::test]
 async fn bulk_router_reports_missing_id_as_item_error() {
     let response = app_router()
         .oneshot(

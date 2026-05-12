@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
 };
 
@@ -78,6 +78,11 @@ impl InMemoryIndex {
     }
 
     fn upsert_document(&mut self, id: &str, source: Value) {
+        self.upsert_document_deferred(id, source);
+        self.rebuild_index();
+    }
+
+    fn upsert_document_deferred(&mut self, id: &str, source: Value) {
         self.document_ids.entry(id.to_owned()).or_insert_with(|| {
             let doc_id = self.next_doc_id;
             self.next_doc_id += 1;
@@ -91,15 +96,21 @@ impl InMemoryIndex {
             .get(id)
             .expect("document must exist after insertion");
         self.mapping.ensure_fields(inserted_source);
-        self.rebuild_index();
     }
 
     fn delete_document(&mut self, id: &str) {
+        if self.delete_document_deferred(id) {
+            self.rebuild_index();
+        }
+    }
+
+    fn delete_document_deferred(&mut self, id: &str) -> bool {
         if let Some(doc_id) = self.document_ids.remove(id) {
             self.documents.remove(id);
             self.reverse_document_ids.remove(&doc_id);
-            self.rebuild_index();
+            return true;
         }
+        false
     }
 
     fn mapping_value(&self) -> Value {
@@ -116,14 +127,18 @@ impl InMemoryIndex {
 
     fn rebuild_index(&mut self) {
         self.index.clear();
-        for (id, source) in &self.documents {
-            if let Some(doc_id) = self.document_ids.get(id) {
-                let fields = indexed_fields_for_document(source, &self.mapping);
-                let _ = self
-                    .index
-                    .add_document_with_mapping(*doc_id, fields, &self.mapping);
-            }
-        }
+        let documents = self
+            .documents
+            .iter()
+            .filter_map(|(id, source)| {
+                self.document_ids
+                    .get(id)
+                    .map(|doc_id| (*doc_id, indexed_fields_for_document(source, &self.mapping)))
+            })
+            .collect::<Vec<_>>();
+        let _ = self
+            .index
+            .add_documents_with_mapping(documents, &self.mapping);
     }
 
     fn set_mapping(&mut self, mapping: IndexMapping) {
@@ -152,6 +167,38 @@ impl InMemoryIndex {
     fn count_term_hits(&self, field: &str, value: &str) -> usize {
         self.term_hits(field, value).len()
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DocumentWriteOperation {
+    Index {
+        index: String,
+        id: String,
+        source: Value,
+        status: u16,
+    },
+    Create {
+        index: String,
+        id: String,
+        source: Value,
+    },
+    Delete {
+        index: String,
+        id: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentWriteResult {
+    Applied {
+        index: String,
+        id: String,
+        status: u16,
+    },
+    VersionConflict {
+        index: String,
+        id: String,
+    },
 }
 
 fn normalized_term_for_field(value: &str, field: &str, mapping: &IndexMapping) -> String {
@@ -411,6 +458,88 @@ impl AppState {
         if let Some(data) = store.indices.get_mut(index) {
             data.delete_document(id);
         }
+    }
+
+    pub fn apply_document_writes(
+        &self,
+        operations: Vec<DocumentWriteOperation>,
+    ) -> Vec<DocumentWriteResult> {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        let mut touched = BTreeSet::new();
+        let mut results = Vec::with_capacity(operations.len());
+
+        for operation in operations {
+            match operation {
+                DocumentWriteOperation::Index {
+                    index,
+                    id,
+                    source,
+                    status,
+                } => {
+                    create_index_if_missing(
+                        &mut store,
+                        &index,
+                        IndexMapping::default(),
+                        Value::Object(Default::default()),
+                        BTreeMap::new(),
+                    );
+                    let data = store
+                        .indices
+                        .get_mut(&index)
+                        .expect("index must exist after implicit creation");
+                    data.upsert_document_deferred(&id, source);
+                    touched.insert(index.clone());
+                    results.push(DocumentWriteResult::Applied { index, id, status });
+                }
+                DocumentWriteOperation::Create { index, id, source } => {
+                    create_index_if_missing(
+                        &mut store,
+                        &index,
+                        IndexMapping::default(),
+                        Value::Object(Default::default()),
+                        BTreeMap::new(),
+                    );
+                    let data = store
+                        .indices
+                        .get_mut(&index)
+                        .expect("index must exist after implicit creation");
+                    if data.has_document(&id) {
+                        results.push(DocumentWriteResult::VersionConflict { index, id });
+                    } else {
+                        data.upsert_document_deferred(&id, source);
+                        touched.insert(index.clone());
+                        results.push(DocumentWriteResult::Applied {
+                            index,
+                            id,
+                            status: 201,
+                        });
+                    }
+                }
+                DocumentWriteOperation::Delete { index, id } => {
+                    if let Some(data) = store.indices.get_mut(&index) {
+                        if data.delete_document_deferred(&id) {
+                            touched.insert(index.clone());
+                        }
+                    }
+                    results.push(DocumentWriteResult::Applied {
+                        index,
+                        id,
+                        status: 200,
+                    });
+                }
+            }
+        }
+
+        for index in touched {
+            if let Some(data) = store.indices.get_mut(&index) {
+                data.rebuild_index();
+            }
+        }
+
+        results
     }
 
     pub fn count(&self, index: &str) -> u64 {

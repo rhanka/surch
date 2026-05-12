@@ -60,6 +60,34 @@ fn document_index_stores_documents_and_indexes_terms_with_positions_by_field() {
 }
 
 #[test]
+fn document_index_batch_adds_documents_and_builds_terms_once() {
+    let mut index = DocumentIndex::new();
+
+    index
+        .add_documents_with_mapping(
+            [
+                (0, [("title", "Surch Search"), ("body", "fast search")]),
+                (1, [("title", "Rust Index"), ("body", "fast index")]),
+            ],
+            &Default::default(),
+        )
+        .expect("batch add documents");
+
+    assert_eq!(index.doc_ids(), vec![0, 1]);
+    assert_eq!(
+        index.terms("body").collect::<Vec<_>>(),
+        ["fast", "index", "search"]
+    );
+    let fast = index
+        .postings("body", "fast")
+        .expect("body/fast postings")
+        .collect::<Vec<_>>();
+    assert_eq!(fast.len(), 2);
+    assert_eq!(fast[0].doc_id, 0);
+    assert_eq!(fast[1].doc_id, 1);
+}
+
+#[test]
 fn document_index_rejects_duplicate_doc_ids() {
     let mut index = DocumentIndex::new();
     index
