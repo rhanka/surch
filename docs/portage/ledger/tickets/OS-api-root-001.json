@@ -36,5 +36,5 @@
     "cargo test -p surch-api root",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }

@@ -38,5 +38,5 @@
     "cargo test -p surch-api bulk",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }

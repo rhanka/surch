@@ -39,5 +39,5 @@
     "cargo test -p surch-search collector",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }
