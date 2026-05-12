@@ -198,6 +198,19 @@ async fn component_template_router_accepts_payload_and_acknowledges() {
 }
 
 #[tokio::test]
+async fn component_template_router_rejects_invalid_template_name() {
+    let router = app_router();
+    let (status, response) =
+        put_component_template_response(&router, "bad,name", &component_payload()).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response["error"]["reason"],
+        "component template name contains invalid characters"
+    );
+}
+
+#[tokio::test]
 async fn component_template_router_get_one_returns_name_and_payload() {
     let router = app_router();
     let payload = component_payload();

@@ -13,7 +13,7 @@ use crate::{
     index::AcknowledgedResponse,
     index_template::{
         parse_template_aliases, parse_template_mapping, parse_template_object,
-        parse_template_settings,
+        parse_template_settings, validate_template_name,
     },
     state::{AppState, StoredComponentTemplate},
     OpenSearchError,
@@ -150,14 +150,7 @@ fn parse_component_template_request(
 }
 
 fn validate_component_template_name(name: &str) -> Result<(), OpenSearchError> {
-    if name.trim().is_empty() {
-        return Err(OpenSearchError::new(
-            StatusCode::BAD_REQUEST,
-            "parsing_exception",
-            "component template name must not be empty",
-        ));
-    }
-    Ok(())
+    validate_template_name(name, "component")
 }
 
 fn missing_component_template_error(name: &str) -> OpenSearchError {

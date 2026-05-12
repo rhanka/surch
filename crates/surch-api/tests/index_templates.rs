@@ -37,6 +37,16 @@ async fn put_index_template(
     name: &str,
     body: &serde_json::Value,
 ) -> serde_json::Value {
+    let (status, response) = put_index_template_response(router, name, body).await;
+    assert_eq!(status, StatusCode::OK);
+    response
+}
+
+async fn put_index_template_response(
+    router: &Router,
+    name: &str,
+    body: &serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let response = router
         .clone()
         .oneshot(
@@ -49,9 +59,9 @@ async fn put_index_template(
         )
         .await
         .expect("router should respond");
-    assert_eq!(response.status(), StatusCode::OK);
 
-    response_json(response).await
+    let status = response.status();
+    (status, response_json(response).await)
 }
 
 async fn get_index_template(router: &Router, name: &str) -> (StatusCode, serde_json::Value) {
@@ -113,6 +123,19 @@ async fn index_template_router_accepts_minimal_template_payload() {
     let response = put_index_template(&router, "products_template", &base_template_payload()).await;
 
     assert_eq!(response["acknowledged"], true);
+}
+
+#[tokio::test]
+async fn index_template_router_rejects_invalid_template_name() {
+    let router = app_router();
+    let (status, response) =
+        put_index_template_response(&router, "bad,name", &base_template_payload()).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response["error"]["reason"],
+        "index template name contains invalid characters"
+    );
 }
 
 #[tokio::test]

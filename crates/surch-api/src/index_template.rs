@@ -17,6 +17,9 @@ use crate::{
     OpenSearchError,
 };
 
+const TEMPLATE_NAME_FORBIDDEN_CHARACTERS: [char; 10] =
+    ['"', '*', '/', '\\', '|', '?', '#', '>', '<', ','];
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 struct IndexTemplatesResponse {
     pub index_templates: Vec<IndexTemplateEntry>,
@@ -420,13 +423,33 @@ fn parse_properties_object(
 }
 
 fn validate_index_template_name(name: &str) -> Result<(), OpenSearchError> {
+    validate_template_name(name, "index")
+}
+
+pub(crate) fn validate_template_name(
+    name: &str,
+    template_kind: &str,
+) -> Result<(), OpenSearchError> {
     if name.trim().is_empty() {
         return Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
-            "index template name must not be empty",
+            format!("{template_kind} template name must not be empty"),
         ));
     }
+    if name != name.trim()
+        || name.chars().any(char::is_whitespace)
+        || name
+            .chars()
+            .any(|character| TEMPLATE_NAME_FORBIDDEN_CHARACTERS.contains(&character))
+    {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{template_kind} template name contains invalid characters"),
+        ));
+    }
+
     Ok(())
 }
 
