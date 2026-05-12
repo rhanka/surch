@@ -114,6 +114,52 @@ async fn aliases_action_supports_atomic_add_and_remove() {
 }
 
 #[tokio::test]
+async fn aliases_action_preserves_definition_and_uses_write_index() {
+    let router = app_router();
+    create_index(&router, "logs_a").await;
+    create_index(&router, "logs_b").await;
+
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"add":{"index":"logs_a","alias":"logs","routing":"archive","is_write_index":false}},
+            {"add":{"index":"logs_b","alias":"logs","routing":"current","is_write_index":true}}
+        ]}"#,
+    )
+    .await;
+
+    let (status, aliases) = get_json(&router, "/_alias/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        aliases,
+        serde_json::json!({
+            "logs_a": {"aliases": {"logs": {"routing": "archive", "is_write_index": false}}},
+            "logs_b": {"aliases": {"logs": {"routing": "current", "is_write_index": true}}}
+        })
+    );
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/logs/_doc/1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"event":"hello"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response_json(response).await;
+    assert_eq!(body["_index"], "logs_b");
+
+    let (status, search) = get_json(&router, "/logs_b/_search").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search["hits"]["total"]["value"], 1);
+}
+
+#[tokio::test]
 async fn aliases_action_rejects_add_on_missing_index() {
     let response = app_router()
         .oneshot(

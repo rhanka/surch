@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, RwLock},
 };
 
@@ -18,7 +18,8 @@ pub struct AppState {
 #[derive(Default)]
 struct MemoryStore {
     indices: BTreeMap<String, InMemoryIndex>,
-    aliases: BTreeMap<String, BTreeSet<String>>,
+    aliases: BTreeMap<String, BTreeMap<String, Value>>,
+    component_templates: BTreeMap<String, StoredComponentTemplate>,
     index_templates: BTreeMap<String, StoredIndexTemplate>,
 }
 
@@ -42,18 +43,27 @@ pub struct StoredDocument {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IndexMetadata {
-    pub aliases: Vec<String>,
+    pub aliases: BTreeMap<String, Value>,
     pub mapping: Value,
     pub settings: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredComponentTemplate {
+    pub component_template: Value,
+    pub mapping: IndexMapping,
+    pub settings: Value,
+    pub aliases: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredIndexTemplate {
     pub index_template: Value,
     pub index_patterns: Vec<String>,
+    pub composed_of: Vec<String>,
     pub mapping: IndexMapping,
     pub settings: Value,
-    pub aliases: Vec<String>,
+    pub aliases: BTreeMap<String, Value>,
     pub priority: i64,
 }
 
@@ -185,7 +195,7 @@ impl AppState {
         index: &str,
         mapping: Option<IndexMapping>,
         settings: Value,
-        aliases: Vec<String>,
+        aliases: BTreeMap<String, Value>,
     ) {
         let mut store = self
             .store
@@ -201,12 +211,18 @@ impl AppState {
         );
     }
 
-    pub fn put_index_template(&self, name: &str, template: StoredIndexTemplate) {
+    pub fn put_index_template(
+        &self,
+        name: &str,
+        mut template: StoredIndexTemplate,
+    ) -> Result<(), String> {
         let mut store = self
             .store
             .write()
             .expect("in-memory API state lock should not be poisoned");
+        snapshot_component_templates(&mut template, &store.component_templates)?;
         store.index_templates.insert(name.to_owned(), template);
+        Ok(())
     }
 
     pub fn index_template(&self, name: &str) -> Option<StoredIndexTemplate> {
@@ -231,6 +247,38 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
         store.index_templates.remove(name).is_some()
+    }
+
+    pub fn put_component_template(&self, name: &str, template: StoredComponentTemplate) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        store.component_templates.insert(name.to_owned(), template);
+    }
+
+    pub fn component_template(&self, name: &str) -> Option<StoredComponentTemplate> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.component_templates.get(name).cloned()
+    }
+
+    pub fn all_component_templates(&self) -> BTreeMap<String, StoredComponentTemplate> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.component_templates.clone()
+    }
+
+    pub fn delete_component_template(&self, name: &str) -> bool {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        store.component_templates.remove(name).is_some()
     }
 
     pub fn delete_index(&self, index: &str) {
@@ -273,7 +321,7 @@ impl AppState {
             index,
             IndexMapping::default(),
             Value::Object(Default::default()),
-            Vec::new(),
+            BTreeMap::new(),
         );
         let data = store
             .indices
@@ -293,7 +341,7 @@ impl AppState {
             index,
             IndexMapping::default(),
             Value::Object(Default::default()),
-            Vec::new(),
+            BTreeMap::new(),
         );
         let data = store
             .indices
@@ -393,8 +441,11 @@ impl AppState {
         let aliases = store
             .aliases
             .iter()
-            .filter(|(_, indices)| indices.contains(index))
-            .map(|(alias, _)| alias.clone())
+            .filter_map(|(alias, indices)| {
+                indices
+                    .get(index)
+                    .map(|definition| (alias.clone(), definition.clone()))
+            })
             .collect();
         Some(IndexMetadata {
             aliases,
@@ -412,6 +463,10 @@ impl AppState {
     }
 
     pub fn add_alias(&self, index: &str, alias: &str) -> bool {
+        self.add_alias_with_definition(index, alias, Value::Object(Default::default()))
+    }
+
+    pub fn add_alias_with_definition(&self, index: &str, alias: &str, definition: Value) -> bool {
         let mut store = self
             .store
             .write()
@@ -423,7 +478,7 @@ impl AppState {
             .aliases
             .entry(alias.to_owned())
             .or_default()
-            .insert(index.to_owned());
+            .insert(index.to_owned(), definition);
         true
     }
 
@@ -434,7 +489,7 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let mut removed = false;
         if let Some(entry) = store.aliases.get_mut(alias) {
-            removed = entry.remove(index);
+            removed = entry.remove(index).is_some();
             if entry.is_empty() {
                 store.aliases.remove(alias);
             }
@@ -458,8 +513,24 @@ impl AppState {
         store
             .aliases
             .iter()
-            .filter(|(_, indices)| indices.contains(index))
+            .filter(|(_, indices)| indices.contains_key(index))
             .map(|(alias, _)| alias.clone())
+            .collect()
+    }
+
+    pub fn alias_definitions_for_index(&self, index: &str) -> BTreeMap<String, Value> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .aliases
+            .iter()
+            .filter_map(|(alias, indices)| {
+                indices
+                    .get(index)
+                    .map(|definition| (alias.clone(), definition.clone()))
+            })
             .collect()
     }
 
@@ -471,7 +542,7 @@ impl AppState {
         store
             .aliases
             .get(alias)
-            .map(|set| set.iter().cloned().collect())
+            .map(|indices| indices.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -489,12 +560,27 @@ impl AppState {
         if store.indices.contains_key(target) {
             return Ok(target.to_owned());
         }
-        if let Some(set) = store.aliases.get(target) {
-            return match set.len() {
-                1 => Ok(set.iter().next().expect("non-empty set").clone()),
-                _ => Err(format!(
+        if let Some(indices) = store.aliases.get(target) {
+            return match indices.len() {
+                1 => Ok(indices.keys().next().expect("non-empty alias map").clone()),
+                _ => {
+                    let write_indices = indices
+                        .iter()
+                        .filter(|(_, definition)| {
+                            definition
+                                .get("is_write_index")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                        })
+                        .map(|(index, _)| index.clone())
+                        .collect::<Vec<_>>();
+                    if write_indices.len() == 1 {
+                        return Ok(write_indices[0].clone());
+                    }
+                    Err(format!(
                     "no write index is defined for alias [{target}], target alias must point to a single index"
-                )),
+                    ))
+                }
             };
         }
         Ok(target.to_owned())
@@ -516,7 +602,7 @@ impl AppState {
         store
             .aliases
             .get(target)
-            .map(|set| set.iter().cloned().collect())
+            .map(|indices| indices.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -528,7 +614,7 @@ impl AppState {
         store
             .aliases
             .iter()
-            .map(|(alias, indices)| (alias.clone(), indices.iter().cloned().collect()))
+            .map(|(alias, indices)| (alias.clone(), indices.keys().cloned().collect()))
             .collect()
     }
 
@@ -602,34 +688,30 @@ fn create_index_if_missing(
     index: &str,
     explicit_mapping: IndexMapping,
     explicit_settings: Value,
-    explicit_aliases: Vec<String>,
+    explicit_aliases: BTreeMap<String, Value>,
 ) {
     if store.indices.contains_key(index) {
         return;
     }
 
     let templates = matching_index_templates(index, &store.index_templates);
-    let mapping = mapping_for_new_index(&templates, explicit_mapping);
-    let settings = settings_for_new_index(&templates, explicit_settings);
+    let defaults = template_defaults_for_new_index(&templates);
+    let mut mapping = defaults.mapping;
+    merge_mapping_fields(&mut mapping, &explicit_mapping);
+    let mut settings = defaults.settings;
+    merge_settings(&mut settings, &explicit_settings);
+    let mut aliases = defaults.aliases;
+    aliases.extend(explicit_aliases);
     store
         .indices
         .insert(index.to_owned(), InMemoryIndex::new(mapping, settings));
 
-    for (_, template) in templates {
-        for alias in &template.aliases {
-            store
-                .aliases
-                .entry(alias.clone())
-                .or_default()
-                .insert(index.to_owned());
-        }
-    }
-    for alias in explicit_aliases {
+    for (alias, definition) in aliases {
         store
             .aliases
             .entry(alias)
             .or_default()
-            .insert(index.to_owned());
+            .insert(index.to_owned(), definition);
     }
 }
 
@@ -655,28 +737,55 @@ fn matching_index_templates<'a>(
     matching_templates
 }
 
-fn mapping_for_new_index(
-    matching_templates: &[(&String, &StoredIndexTemplate)],
-    explicit_mapping: IndexMapping,
-) -> IndexMapping {
-    let mut mapping = IndexMapping::default();
-    for (_, template) in matching_templates {
-        merge_mapping_fields(&mut mapping, &template.mapping);
-    }
-    merge_mapping_fields(&mut mapping, &explicit_mapping);
-    mapping
+#[derive(Default)]
+struct TemplateDefaults {
+    mapping: IndexMapping,
+    settings: Value,
+    aliases: BTreeMap<String, Value>,
 }
 
-fn settings_for_new_index(
+fn template_defaults_for_new_index(
     matching_templates: &[(&String, &StoredIndexTemplate)],
-    explicit_settings: Value,
-) -> Value {
-    let mut settings = Value::Object(Default::default());
+) -> TemplateDefaults {
+    let mut defaults = TemplateDefaults {
+        mapping: IndexMapping::default(),
+        settings: Value::Object(Default::default()),
+        aliases: BTreeMap::new(),
+    };
+
     for (_, template) in matching_templates {
-        merge_settings(&mut settings, &template.settings);
+        merge_mapping_fields(&mut defaults.mapping, &template.mapping);
+        merge_settings(&mut defaults.settings, &template.settings);
+        defaults.aliases.extend(template.aliases.clone());
     }
-    merge_settings(&mut settings, &explicit_settings);
-    settings
+    defaults
+}
+
+fn snapshot_component_templates(
+    template: &mut StoredIndexTemplate,
+    component_templates: &BTreeMap<String, StoredComponentTemplate>,
+) -> Result<(), String> {
+    let inline_mapping = template.mapping.clone();
+    let inline_settings = template.settings.clone();
+    let inline_aliases = template.aliases.clone();
+
+    template.mapping = IndexMapping::default();
+    template.settings = Value::Object(Default::default());
+    template.aliases.clear();
+
+    for component_name in &template.composed_of {
+        let component = component_templates
+            .get(component_name)
+            .ok_or_else(|| component_name.clone())?;
+        merge_mapping_fields(&mut template.mapping, &component.mapping);
+        merge_settings(&mut template.settings, &component.settings);
+        template.aliases.extend(component.aliases.clone());
+    }
+
+    merge_mapping_fields(&mut template.mapping, &inline_mapping);
+    merge_settings(&mut template.settings, &inline_settings);
+    template.aliases.extend(inline_aliases);
+    Ok(())
 }
 
 fn merge_mapping_fields(target: &mut IndexMapping, source: &IndexMapping) {

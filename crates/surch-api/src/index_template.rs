@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use surch_index::mapping::IndexMapping;
 
 use crate::{
@@ -41,7 +42,14 @@ pub async fn put_index_template_handler(
         Err(error) => return error.into_response(),
     };
 
-    state.put_index_template(&name, template);
+    if let Err(component) = state.put_index_template(&name, template) {
+        return OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "illegal_argument_exception",
+            format!("component template [{component}] missing"),
+        )
+        .into_response();
+    }
     (
         StatusCode::OK,
         Json(AcknowledgedResponse { acknowledged: true }),
@@ -131,6 +139,7 @@ fn parse_index_template_request(body: &str) -> Result<StoredIndexTemplate, OpenS
     })?;
 
     let index_patterns = parse_index_patterns(object.get("index_patterns"))?;
+    let composed_of = parse_composed_of(object.get("composed_of"))?;
     let priority = parse_priority(object.get("priority"))?;
     let template = parse_template_object(object.get("template"))?;
     let mapping = parse_template_mapping(template)?;
@@ -140,6 +149,7 @@ fn parse_index_template_request(body: &str) -> Result<StoredIndexTemplate, OpenS
     Ok(StoredIndexTemplate {
         index_template: value,
         index_patterns,
+        composed_of,
         mapping,
         settings,
         aliases,
@@ -192,6 +202,40 @@ fn parse_index_patterns(value: Option<&Value>) -> Result<Vec<String>, OpenSearch
         .collect()
 }
 
+fn parse_composed_of(value: Option<&Value>) -> Result<Vec<String>, OpenSearchError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let components = value.as_array().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "_index_template `composed_of` must be an array",
+        )
+    })?;
+
+    components
+        .iter()
+        .map(|component| {
+            let component = component.as_str().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "_index_template `composed_of` entries must be strings",
+                )
+            })?;
+            if component.trim().is_empty() {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "_index_template `composed_of` entries must not be empty",
+                ));
+            }
+            Ok(component.to_owned())
+        })
+        .collect()
+}
+
 fn parse_priority(value: Option<&Value>) -> Result<i64, OpenSearchError> {
     let Some(value) = value else {
         return Ok(0);
@@ -213,7 +257,7 @@ fn parse_priority(value: Option<&Value>) -> Result<i64, OpenSearchError> {
     Ok(priority)
 }
 
-fn parse_template_object(
+pub(crate) fn parse_template_object(
     template: Option<&Value>,
 ) -> Result<Option<&serde_json::Map<String, Value>>, OpenSearchError> {
     let Some(template) = template else {
@@ -228,7 +272,7 @@ fn parse_template_object(
     })
 }
 
-fn parse_template_mapping(
+pub(crate) fn parse_template_mapping(
     template: Option<&serde_json::Map<String, Value>>,
 ) -> Result<IndexMapping, OpenSearchError> {
     let Some(template) = template else {
@@ -262,7 +306,7 @@ fn parse_template_mapping(
     parse_template_mappings_value(mappings)
 }
 
-fn parse_template_settings(
+pub(crate) fn parse_template_settings(
     template: Option<&serde_json::Map<String, Value>>,
 ) -> Result<Value, OpenSearchError> {
     let Some(template) = template else {
@@ -281,14 +325,14 @@ fn parse_template_settings(
     Ok(settings.clone())
 }
 
-fn parse_template_aliases(
+pub(crate) fn parse_template_aliases(
     template: Option<&serde_json::Map<String, Value>>,
-) -> Result<Vec<String>, OpenSearchError> {
+) -> Result<BTreeMap<String, Value>, OpenSearchError> {
     let Some(template) = template else {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     };
     let Some(aliases) = template.get("aliases") else {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     };
     let aliases = aliases.as_object().ok_or_else(|| {
         OpenSearchError::new(
@@ -298,7 +342,7 @@ fn parse_template_aliases(
         )
     })?;
 
-    let mut names = Vec::new();
+    let mut definitions = BTreeMap::new();
     for (alias, body) in aliases {
         if alias.trim().is_empty() {
             return Err(OpenSearchError::new(
@@ -314,9 +358,9 @@ fn parse_template_aliases(
                 format!("_index_template `template.aliases.{alias}` must be an object"),
             ));
         }
-        names.push(alias.clone());
+        definitions.insert(alias.clone(), body.clone());
     }
-    Ok(names)
+    Ok(definitions)
 }
 
 fn parse_template_mappings_value(mappings: &Value) -> Result<IndexMapping, OpenSearchError> {

@@ -12,8 +12,15 @@ use crate::{index::validate_index_name, state::AppState, OpenSearchError};
 
 #[derive(Debug, Clone)]
 enum AliasAction {
-    Add { index: String, alias: String },
-    Remove { index: String, alias: String },
+    Add {
+        index: String,
+        alias: String,
+        definition: Value,
+    },
+    Remove {
+        index: String,
+        alias: String,
+    },
 }
 
 /// Axum handler for `POST /_aliases` (atomic add/remove batch).
@@ -44,8 +51,12 @@ pub async fn aliases_state_handler(
 
     for action in actions {
         match action {
-            AliasAction::Add { index, alias } => {
-                state.add_alias(&index, &alias);
+            AliasAction::Add {
+                index,
+                alias,
+                definition,
+            } => {
+                state.add_alias_with_definition(&index, &alias, definition);
             }
             AliasAction::Remove { index, alias } => {
                 state.remove_alias(&index, &alias);
@@ -191,13 +202,13 @@ fn build_indices_alias_map(
     let mut root = Map::new();
     for index in indices {
         let mut alias_map = Map::new();
-        for alias in state.aliases_for_index(index) {
+        for (alias, definition) in state.alias_definitions_for_index(index) {
             if let Some(name) = filter_alias {
                 if alias != name {
                     continue;
                 }
             }
-            alias_map.insert(alias, Value::Object(Map::new()));
+            alias_map.insert(alias, definition);
         }
         let mut entry = Map::new();
         entry.insert("aliases".to_owned(), Value::Object(alias_map));
@@ -304,7 +315,11 @@ fn parse_alias_action(value: &Value) -> Result<AliasAction, OpenSearchError> {
         }
     };
     match op.as_str() {
-        "add" => Ok(AliasAction::Add { index, alias }),
+        "add" => Ok(AliasAction::Add {
+            index,
+            alias,
+            definition: alias_definition_from_action(inner),
+        }),
         "remove" => Ok(AliasAction::Remove { index, alias }),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -312,4 +327,14 @@ fn parse_alias_action(value: &Value) -> Result<AliasAction, OpenSearchError> {
             format!("unsupported alias action `{unknown}`"),
         )),
     }
+}
+
+fn alias_definition_from_action(inner: &Map<String, Value>) -> Value {
+    let mut definition = Map::new();
+    for (key, value) in inner {
+        if !matches!(key.as_str(), "index" | "alias") {
+            definition.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(definition)
 }

@@ -57,7 +57,7 @@ struct IndexMappingsResponse {
 struct CreateIndexRequest {
     pub mapping: IndexMapping,
     pub settings: Value,
-    pub aliases: Vec<String>,
+    pub aliases: BTreeMap<String, Value>,
 }
 
 pub async fn create_index_handler(
@@ -123,8 +123,8 @@ pub async fn index_metadata_handler(
     for index in indices {
         if let Some(metadata) = state.index_metadata(&index) {
             let mut aliases = Map::new();
-            for alias in metadata.aliases {
-                aliases.insert(alias, json!({}));
+            for (alias, definition) in metadata.aliases {
+                aliases.insert(alias, definition);
             }
             entries.insert(
                 index,
@@ -327,7 +327,7 @@ fn parse_create_index_request(body: &str) -> Result<CreateIndexRequest, OpenSear
         return Ok(CreateIndexRequest {
             mapping: IndexMapping::default(),
             settings: json!({}),
-            aliases: Vec::new(),
+            aliases: BTreeMap::new(),
         });
     }
 
@@ -418,9 +418,11 @@ fn parse_create_index_settings(settings: Option<&Value>) -> Result<Value, OpenSe
     Ok(settings.clone())
 }
 
-fn parse_create_index_aliases(aliases: Option<&Value>) -> Result<Vec<String>, OpenSearchError> {
+fn parse_create_index_aliases(
+    aliases: Option<&Value>,
+) -> Result<BTreeMap<String, Value>, OpenSearchError> {
     let Some(aliases) = aliases else {
-        return Ok(Vec::new());
+        return Ok(BTreeMap::new());
     };
     let aliases = aliases.as_object().ok_or_else(|| {
         OpenSearchError::new(
@@ -430,7 +432,7 @@ fn parse_create_index_aliases(aliases: Option<&Value>) -> Result<Vec<String>, Op
         )
     })?;
 
-    let mut names = Vec::new();
+    let mut definitions = BTreeMap::new();
     for (alias, body) in aliases {
         if alias.trim().is_empty() {
             return Err(OpenSearchError::new(
@@ -446,9 +448,9 @@ fn parse_create_index_aliases(aliases: Option<&Value>) -> Result<Vec<String>, Op
                 format!("index request `aliases.{alias}` must be an object"),
             ));
         }
-        names.push(alias.clone());
+        definitions.insert(alias.clone(), body.clone());
     }
-    Ok(names)
+    Ok(definitions)
 }
 
 fn parse_properties_object(

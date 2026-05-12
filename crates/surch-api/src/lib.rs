@@ -12,6 +12,7 @@ pub mod analyze;
 pub mod bulk;
 pub mod cat;
 pub mod cluster;
+pub mod component_template;
 pub mod count;
 pub mod document;
 pub mod error;
@@ -49,6 +50,16 @@ pub fn app_router() -> Router {
             get(index_template::get_index_template_handler)
                 .put(index_template::put_index_template_handler)
                 .delete(index_template::delete_index_template_handler),
+        )
+        .route(
+            "/_component_template",
+            get(component_template::list_component_templates_handler),
+        )
+        .route(
+            "/_component_template/:name",
+            get(component_template::get_component_template_handler)
+                .put(component_template::put_component_template_handler)
+                .delete(component_template::delete_component_template_handler),
         )
         .route(
             "/:index/_mapping",
