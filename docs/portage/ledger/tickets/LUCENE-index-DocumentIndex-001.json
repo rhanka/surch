@@ -42,5 +42,5 @@
     "cargo test -p surch-index document_index",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }

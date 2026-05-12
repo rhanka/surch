@@ -58,5 +58,5 @@
     "cargo run -p portage-ledger -- language-policy .",
     "cargo test -p opensearch-oracle ban"
   ],
-  "status": "discovered"
+  "status": "done"
 }

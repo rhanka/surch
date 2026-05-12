@@ -39,5 +39,5 @@
     "cargo test -p surch-index live_docs",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }

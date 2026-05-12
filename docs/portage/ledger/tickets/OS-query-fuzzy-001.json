@@ -40,5 +40,5 @@
     "cargo test -p surch-search opensearch_fuzzy_query",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }

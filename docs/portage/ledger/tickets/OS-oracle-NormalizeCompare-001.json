@@ -37,5 +37,5 @@
     "cargo test -p opensearch-oracle normalize",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }

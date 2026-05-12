@@ -37,5 +37,5 @@
     "cargo test -p surch-store lock",
     "cargo clippy --workspace --all-targets --all-features"
   ],
-  "status": "discovered"
+  "status": "done"
 }
