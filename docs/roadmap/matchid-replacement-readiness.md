@@ -45,9 +45,11 @@ operational recovery, and real MatchID query replay are proven.
    bulk payloads, representative `_search`, `_msearch`, `_count`, `_mget`, aliases, and
    expected Elasticsearch responses.
 
-2. Symmetric HTTP benchmark is not implemented yet.
-   The current `ban-bench` is an in-process Surch regression benchmark. It is useful, but
-   it cannot justify replacing Elasticsearch because OpenSearch is measured over HTTP.
+2. Symmetric HTTP benchmark has an initial implementation but still needs real repeated runs.
+   `ban-http-bench` now exercises Surch HTTP and OpenSearch HTTP through the same persistent
+   Rust HTTP/1.1 client, with configurable timeout and oracle response comparison.
+   The current blocker is evidence: no committed `ban_tiny`/Paris/MatchID run report has passed
+   the repeated-run publication gates yet.
 
 3. Production-like dataset benchmark is not pinned.
    `ban_tiny` has 3 documents and is only a smoke fixture. A real performance decision needs
@@ -167,8 +169,8 @@ multi-week target, not the next immediate milestone.
 
 ## Immediate Next Work
 
-1. Implement the symmetric `ban-http-bench` runner.
-2. Produce the first BAN HTTP report on `ban_tiny` and then the pinned Paris BAN sample.
+1. Produce the first BAN HTTP report on `ban_tiny` and then the pinned Paris BAN sample.
+2. Add no-bind tests for `ban-http-bench` report serialization and oracle mismatch rejection.
 3. Add a `tests/matchid_compat/README.md` and fixture contract so MatchID traffic can be
    sanitized and replayed without leaking production data.
 4. Inspect MatchID Elasticsearch usage and classify every API/query feature as supported,

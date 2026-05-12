@@ -242,9 +242,12 @@ The expected top-hit identifiers are:
 - bool address: `33063_0002_00010B`;
 - fuzzy label: `67482_0003_00007`.
 
-### Target Benchmark Command
+### Symmetric HTTP Benchmark Command
 
-Add a Rust-only HTTP harness before publication. The target CLI should be:
+The Rust-only HTTP harness is implemented as `ban-http-bench`. It loads both
+engines, refreshes both indexes, validates both engines against the replay
+oracle, runs warmup requests, runs measured request iterations, and can write a
+JSON report.
 
 ```bash
 cargo run -p surch-demo --release -- ban-http-bench \
@@ -253,31 +256,35 @@ cargo run -p surch-demo --release -- ban-http-bench \
   --dataset "$DATASET" \
   --oracle "$ORACLE" \
   --warmup 100 \
+  --timeout-seconds 30 \
   --iterations 1000 \
   --report docs/poc/reports/ban-http-$(git rev-parse --short HEAD).json
 ```
 
-The command must load both engines, refresh both indexes, validate both engines
-against the oracle before timing, run the same warmup and measured request
-sequence through the same HTTP client code, and write raw per-operation samples
-plus a human-readable summary.
+The command uses the same Rust HTTP/1.1 keep-alive client for both engines and
+validates the full expected replay response, minus the replay `ignored_paths`.
+Use `--dry-run` to print the dataset/oracle-derived plan without sending HTTP
+requests.
 
 ### Metrics
 
-Record these fields for every publishable run:
+The JSON report emitted by `ban-http-bench` records:
+
+- benchmark input: dataset path, dataset byte size, document count, index name,
+  oracle path, warmup count, iteration count, timeout, and HTTP client mode;
+- ingestion: create-index, bulk, and refresh latency summaries, HTTP status,
+  document count, byte count, docs/s, bytes/s, and error count;
+- queries: per-operation status, latency min/p50/p95/p99/max/total, raw samples,
+  total hits, top-hit ID, server `took` when present, and error count;
+- validation: each engine must pass the replay oracle before warmup and measured
+  iterations start; a mismatch rejects the run.
+
+Publishable reports must add external run metadata:
 
 - run metadata: UTC timestamp, Surch commit, dirty-worktree flag, Rust version,
   Cargo profile, host OS/kernel, CPU model/count, memory, OpenSearch image or
   digest, OpenSearch heap, dataset path, dataset byte size, document count, and
-  sample limit;
-- ingestion: create-index duration, bulk duration, refresh duration, total load
-  duration, docs/s, bytes/s, HTTP status, and bulk item error count per engine;
-- queries: client-observed latency min, p50, p95, p99, max, sample count,
-  timeout count, HTTP error count, OpenSearch `took` when present, total hits,
-  top-hit ID, and max score recorded separately from latency;
-- validation: oracle status for each request, expected top-hit ID, actual
-  top-hit ID, expected hit count, actual hit count, and explicit failure reason
-  when a sample is rejected.
+  sample limit.
 
 ### Guardrails
 
@@ -298,8 +305,8 @@ Record these fields for every publishable run:
 ### Criteria Before Publication
 
 - The Rust-only HTTP harness exists, is documented, and has tests for argument
-  validation, oracle rejection, report serialization, and failed upstream HTTP
-  responses.
+  validation and failed upstream HTTP responses. Report serialization and oracle
+  mismatch tests still need a no-bind test seam or a permitted local HTTP test.
 - `cargo test --workspace` passes after the harness change.
 - Surch and OpenSearch both pass the replay oracle before timing on `ban_tiny`.
 - The official BAN sample run records the exact CSV/GZ file, sample limit, and
@@ -312,13 +319,11 @@ Record these fields for every publishable run:
 
 ### Next Tasks
 
-1. Add `ban-http-bench` as a Rust-only CLI command in `crates/surch-demo` or a
-   future benchmark crate, without touching UI loading or npm dependencies.
-2. Implement oracle validation before measurement and fail closed on any mismatch.
-3. Emit JSON plus a compact Markdown summary under `docs/poc/reports/`.
-4. Run the manual HTTP parity smoke on `ban_tiny`.
-5. Run the harness on `ban_tiny`, then on the pinned Paris BAN sample.
-6. Review the generated report for methodology, caveats, and reproducibility
+1. Run the manual HTTP parity smoke on `ban_tiny`.
+2. Run `ban-http-bench` on `ban_tiny`, then on the pinned Paris BAN sample.
+3. Add a compact Markdown summary beside the JSON report under `docs/poc/reports/`.
+4. Add no-bind tests for report serialization and oracle mismatch rejection.
+5. Review the generated report for methodology, caveats, and reproducibility
    before publishing.
 
 ## Current Scope

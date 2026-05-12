@@ -102,7 +102,9 @@ OPENSEARCH_BAN_INDEX=ban_tiny scripts/bench/opensearch-cleanup.sh
 curl -fsS -X DELETE "$SURCH_URL/ban_tiny" >/dev/null || true
 ```
 
-The target Rust-only benchmark command to implement before publication is:
+The Rust-only benchmark command is implemented in `surch-demo` and executes the
+same HTTP load/refresh/oracle/query sequence against Surch and OpenSearch. Use
+`--dry-run` only when you want to print the plan without sending HTTP requests.
 
 ```sh
 cargo run -p surch-demo --release -- ban-http-bench \
@@ -111,6 +113,7 @@ cargo run -p surch-demo --release -- ban-http-bench \
   --dataset "$DATASET" \
   --oracle "$ORACLE" \
   --warmup 100 \
+  --timeout-seconds 30 \
   --iterations 1000 \
   --report docs/poc/reports/ban-http-$(git rev-parse --short HEAD).json
 ```
@@ -118,9 +121,10 @@ cargo run -p surch-demo --release -- ban-http-bench \
 Publication guardrails:
 
 - same dataset bytes, index name, query bodies, warmup, iterations, timeout,
-  concurrency, and HTTP client code for both engines;
+  and persistent HTTP/1.1 client code for both engines;
 - reject the run if oracle validation fails for either engine;
-- report ingestion duration, docs/s, query latency p50/p95/p99, error counts,
-  total hits, and top-hit IDs per operation;
+- report ingestion status/latency/docs/s/bytes/s and query
+  status/p50/p95/p99/raw samples/error counts/total hits/top-hit IDs per
+  operation;
 - label `ban_tiny` as a 3-document smoke benchmark;
 - publish side-by-side per-operation numbers only, not a single global ratio.

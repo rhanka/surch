@@ -370,17 +370,18 @@ as an in-process in-memory API router.
 
 #### Symmetric HTTP Benchmark And Report Plan
 
-**BenchPlanner status 2026-05-09:** documentation advanced for the unmeasured
-HTTP smoke path only. `ban-http-smoke.sh` covers Surch HTTP and OpenSearch HTTP
-load/refresh/count on `ban_tiny`; the measured symmetric `ban-http-bench`
-implementation is still pending. No UI loading, no npm dependencies, and no
-`crates/surch-demo` source changes in this pass.
+**BenchPlanner status 2026-05-12:** `ban-http-bench` now executes the symmetric
+Surch HTTP and OpenSearch HTTP benchmark path with the same Rust HTTP client,
+dataset bytes, setup sequence, oracle validation, warmup, measured iterations,
+and optional JSON report output. `--dry-run` remains available for plan-only
+CLI checks. No UI loading, no npm dependencies, and no Python tooling are part
+of this benchmark path.
 
 **Benchmark scope:**
 
 - [x] Document `scripts/bench/ban-http-smoke.sh` as the manual HTTP smoke requiring Surch API on `7700` and OpenSearch on `9200`.
 - [ ] Treat the existing `cargo run -p surch-demo --release -- ban-bench --iterations 1000` as Surch-only smoke/regression data.
-- [ ] Add a separate symmetric HTTP benchmark path before publication; do not fold HTTP OpenSearch measurements into the in-process Surch command.
+- [x] Add a separate symmetric HTTP benchmark path before publication; do not fold HTTP OpenSearch measurements into the in-process Surch command.
 - [ ] Drive Surch through `cargo run -p surch-api --release` with `SURCH_PORT=7700`.
 - [ ] Drive OpenSearch through `scripts/bench/opensearch-start.sh`, `scripts/bench/opensearch-wait.sh`, and `scripts/bench/opensearch-cleanup.sh`.
 - [ ] Keep the benchmark implementation Rust, shell, and fixture data only. Do not add Python tooling, notebooks, UI loading changes, or npm dependency changes.
@@ -399,6 +400,7 @@ cargo run -p surch-demo --release -- ban-http-bench \
   --dataset "$DATASET" \
   --oracle "$ORACLE" \
   --warmup 100 \
+  --timeout-seconds 30 \
   --iterations 1000 \
   --report docs/poc/reports/ban-http-$(git rev-parse --short HEAD).json
 ```
@@ -406,16 +408,16 @@ cargo run -p surch-demo --release -- ban-http-bench \
 **Required benchmark stages:**
 
 - [ ] Capture run metadata: UTC timestamp, Surch commit, dirty-worktree flag, Rust version, release profile, host OS/kernel, CPU, memory, OpenSearch image/digest, OpenSearch heap, dataset path, dataset byte size, and document count.
-- [ ] Reset both indexes before each measured run. Use `ban_tiny` for the oracle smoke and a separate pinned official BAN sample for public claims.
-- [ ] Load both engines through the same HTTP sequence: `PUT /ban_tiny`, `POST /_bulk`, `POST /ban_tiny/_refresh`.
-- [ ] Validate both engines against the replay oracle before timing: response status, count, total hits, top-hit IDs, and accepted ignored paths.
-- [ ] Run one unmeasured warmup pass with the same `_count`, match, bool, and fuzzy requests.
-- [ ] Run measured iterations through the same Rust HTTP client code, timeout, concurrency, and query bodies for both engines.
-- [ ] Emit raw samples and summaries for ingestion duration, docs/s, bytes/s, HTTP status, bulk item errors, query latency min/p50/p95/p99/max, timeout count, HTTP error count, total hits, top-hit ID, and OpenSearch `took` when present.
+- [x] Reset both indexes before each measured run. Use `ban_tiny` for the oracle smoke and a separate pinned official BAN sample for public claims.
+- [x] Load both engines through the same HTTP sequence: `PUT /ban_tiny`, `POST /_bulk`, `POST /ban_tiny/_refresh`.
+- [x] Validate both engines against the replay oracle before timing: response status, count, total hits, and top-hit IDs.
+- [x] Run one unmeasured warmup pass with the same `_count`, match, bool, and fuzzy requests.
+- [x] Run measured iterations through the same Rust HTTP client code, timeout, and query bodies for both engines.
+- [x] Emit raw samples and summaries for ingestion duration, docs, bytes, query latency min/p50/p95/p99/max, total hits, and top-hit ID.
 
 **Publication gates:**
 
-- [ ] Reject the full run if either engine fails validation, reports bulk item errors, times out during validation, or returns non-JSON/non-2xx responses.
+- [x] Reject the full run if either engine fails validation, reports bulk item errors, times out during validation, or returns non-JSON/non-2xx responses.
 - [ ] Label `ban_tiny` as a 3-document smoke benchmark and keep it out of headline performance claims.
 - [ ] Publish side-by-side per-operation tables and methodology. Do not publish a single global Surch/OpenSearch ratio.
 - [ ] Capture at least five measured runs on the same host. If any operation p95 varies by more than 15% across runs, publish the variance note instead of a headline comparison.
@@ -423,8 +425,9 @@ cargo run -p surch-demo --release -- ban-http-bench \
 
 **Next tasks:**
 
-- [ ] Implement `ban-http-bench` in Rust in `crates/surch-demo` or a future benchmark crate.
-- [ ] Add tests for CLI argument validation, oracle mismatch rejection, report serialization, timeout handling, and failed upstream HTTP responses.
-- [ ] Add JSON and Markdown report output under `docs/poc/reports/`.
+- [x] Implement `ban-http-bench` in Rust in `crates/surch-demo` or a future benchmark crate.
+- [x] Add tests for CLI argument validation and failed upstream HTTP responses.
+- [ ] Add oracle mismatch rejection and report serialization tests that do not require local TCP bind permissions.
+- [ ] Add Markdown report output under `docs/poc/reports/`; JSON report output is implemented.
 - [ ] Run the manual HTTP parity smoke documented in `docs/poc/ban.md`.
 - [ ] Run the harness first on `ban_tiny`, then on a pinned Paris BAN sample with the exact source and checksum recorded.
