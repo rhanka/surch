@@ -10,7 +10,11 @@ Base Adresse Nationale fixture:
 - run `match`, `bool.must`, and fuzzy search queries.
 
 The fixture is stored in `tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson`.
-The replay oracle is stored in `tests/opensearch_compat/oracle/replays/ban_tiny_search.json`.
+The full replay oracle is stored in
+`tests/opensearch_compat/oracle/replays/ban_tiny_search.json`. The symmetric
+HTTP benchmark uses
+`tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json`, which
+excludes the known OpenSearch 2.17 fuzzy typo gap documented below.
 
 ## Run the PoC
 
@@ -29,6 +33,7 @@ match label: 75101_0001_00001
 bool address: 33063_0002_00010B
 fuzzy label: 67482_0003_00007
 oracle: tests/opensearch_compat/oracle/replays/ban_tiny_search.json
+http_bench_oracle: tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json
 ```
 
 ## Run the Local Bench
@@ -168,7 +173,7 @@ numbers.
 
   ```bash
   DATASET=tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson
-  ORACLE=tests/opensearch_compat/oracle/replays/ban_tiny_search.json
+  ORACLE=tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json
   SURCH_URL=http://127.0.0.1:7700
   OPENSEARCH_URL=http://127.0.0.1:9200
   ```
@@ -242,6 +247,12 @@ The expected top-hit identifiers are:
 - bool address: `33063_0002_00010B`;
 - fuzzy label: `67482_0003_00007`.
 
+The fuzzy typo request is intentionally kept in the full replay as a
+compatibility probe. In a real HTTP run against OpenSearch 2.17.1, the request
+`Ale des Erables` currently returns zero OpenSearch hits while Surch returns the
+expected `67482_0003_00007` hit. The measured HTTP benchmark excludes that
+request until the gap is classified against real MatchID usage.
+
 ### Symmetric HTTP Benchmark Command
 
 The Rust-only HTTP harness is implemented as `ban-http-bench`. It loads both
@@ -254,7 +265,7 @@ cargo run -p surch-demo --release -- ban-http-bench \
   --surch-url "$SURCH_URL" \
   --opensearch-url "$OPENSEARCH_URL" \
   --dataset "$DATASET" \
-  --oracle "$ORACLE" \
+  --oracle tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json \
   --warmup 100 \
   --timeout-seconds 30 \
   --iterations 1000 \

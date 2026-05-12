@@ -337,7 +337,7 @@ uses the complete indexing, storage, scoring, and HTTP server path. It must not
 be published as an engine-performance comparison while Surch is still measured
 as an in-process in-memory API router.
 
-- [ ] Reuse `tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson` and `tests/opensearch_compat/oracle/replays/ban_tiny_search.json`.
+- [x] Reuse `tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson` and `tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json` for the measured HTTP overlap. Keep `ban_tiny_search.json` as the fuller compatibility probe.
 - [x] Provide a shell-only HTTP smoke path for both engines with `scripts/bench/ban-http-smoke.sh`: reset `ban_tiny`, load through `_bulk`, refresh, and verify `_count == 3`.
 - [ ] Measure the same operation sequence:
   - `PUT /ban_tiny`
@@ -390,7 +390,7 @@ of this benchmark path.
 
 ```bash
 DATASET=tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson
-ORACLE=tests/opensearch_compat/oracle/replays/ban_tiny_search.json
+ORACLE=tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json
 SURCH_URL=http://127.0.0.1:7700
 OPENSEARCH_URL=http://127.0.0.1:9200
 
@@ -407,7 +407,8 @@ cargo run -p surch-demo --release -- ban-http-bench \
 
 **Required benchmark stages:**
 
-- [ ] Capture run metadata: UTC timestamp, Surch commit, dirty-worktree flag, Rust version, release profile, host OS/kernel, CPU, memory, OpenSearch image/digest, OpenSearch heap, dataset path, dataset byte size, and document count.
+- [ ] Capture full run metadata: UTC timestamp, dirty-worktree flag, Rust version, release profile, host OS/kernel, CPU, memory, OpenSearch image/digest, and OpenSearch heap.
+- [x] Capture benchmark metadata in the report: Surch commit in the filename, dataset path, dataset byte size, document count, oracle path, warmup, iterations, timeout, and client mode.
 - [x] Reset both indexes before each measured run. Use `ban_tiny` for the oracle smoke and a separate pinned official BAN sample for public claims.
 - [x] Load both engines through the same HTTP sequence: `PUT /ban_tiny`, `POST /_bulk`, `POST /ban_tiny/_refresh`.
 - [x] Validate both engines against the replay oracle before timing: response status, count, total hits, and top-hit IDs.
@@ -418,7 +419,7 @@ cargo run -p surch-demo --release -- ban-http-bench \
 **Publication gates:**
 
 - [x] Reject the full run if either engine fails validation, reports bulk item errors, times out during validation, or returns non-JSON/non-2xx responses.
-- [ ] Label `ban_tiny` as a 3-document smoke benchmark and keep it out of headline performance claims.
+- [x] Label `ban_tiny` as a 3-document smoke benchmark and keep it out of headline performance claims.
 - [ ] Publish side-by-side per-operation tables and methodology. Do not publish a single global Surch/OpenSearch ratio.
 - [ ] Capture at least five measured runs on the same host. If any operation p95 varies by more than 15% across runs, publish the variance note instead of a headline comparison.
 - [ ] Keep compatibility findings separate from performance findings while scoring parity and full storage/indexing parity are still evolving.
@@ -428,6 +429,6 @@ cargo run -p surch-demo --release -- ban-http-bench \
 - [x] Implement `ban-http-bench` in Rust in `crates/surch-demo` or a future benchmark crate.
 - [x] Add tests for CLI argument validation and failed upstream HTTP responses.
 - [ ] Add oracle mismatch rejection and report serialization tests that do not require local TCP bind permissions.
-- [ ] Add Markdown report output under `docs/poc/reports/`; JSON report output is implemented.
-- [ ] Run the manual HTTP parity smoke documented in `docs/poc/ban.md`.
-- [ ] Run the harness first on `ban_tiny`, then on a pinned Paris BAN sample with the exact source and checksum recorded.
+- [x] Add a Markdown summary under `docs/poc/reports/`; JSON report output is implemented.
+- [x] Run the harness first on `ban_tiny`.
+- [ ] Run the harness on a pinned Paris BAN sample with the exact source and checksum recorded.

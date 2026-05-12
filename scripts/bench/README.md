@@ -90,7 +90,7 @@ Prerequisites:
 
   ```sh
   DATASET=tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson
-  ORACLE=tests/opensearch_compat/oracle/replays/ban_tiny_search.json
+  ORACLE=tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json
   SURCH_URL=http://127.0.0.1:7700
   OPENSEARCH_URL=http://127.0.0.1:9200
   ```

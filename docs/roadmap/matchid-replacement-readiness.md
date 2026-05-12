@@ -104,7 +104,8 @@ Exit criteria:
 
 ### Milestone 2: Symmetric HTTP Benchmark
 
-Estimate: 1-2 days for the BAN benchmark harness, plus time for real runs.
+Estimate: harness implemented; next 1-2 days should produce Paris BAN or
+MatchID-sized repeated runs.
 
 Deliverables:
 
@@ -115,7 +116,8 @@ Deliverables:
 
 Exit criteria:
 
-- `ban_tiny` smoke passes for both engines.
+- `ban_tiny` smoke passes for both engines
+  (`docs/poc/reports/ban-http-4c35045.{json,md}`).
 - Paris BAN or MatchID-sized sample produces 5 successful repeated runs.
 - p95 variance is <= 15% or the variance is explicitly reported.
 - No global ratio is published; report per-operation latency and throughput.

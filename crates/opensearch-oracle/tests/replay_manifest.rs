@@ -154,6 +154,29 @@ fn replay_fixture_ban_tiny_search_manifest_is_valid_for_oracle_replay() {
 }
 
 #[test]
+fn replay_fixture_ban_tiny_http_bench_manifest_excludes_known_fuzzy_gap() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/opensearch_compat/oracle/replays/ban_tiny_http_bench.json");
+    let manifest_json =
+        std::fs::read_to_string(manifest_path).expect("BAN tiny HTTP bench replay should exist");
+    let manifest = parse_manifest(&manifest_json);
+
+    assert_eq!(manifest.name, "ban_tiny_http_bench");
+    assert_eq!(manifest.dataset, "ban_tiny");
+    assert_eq!(manifest.requests.len(), 3);
+    assert!(manifest
+        .requests
+        .iter()
+        .all(|request| request.name != "future_fuzzy_label_typo"));
+    assert_eq!(manifest.requests[0].name, "count_ban_tiny_addresses");
+    assert_eq!(manifest.requests[1].name, "search_ban_tiny_by_label");
+    assert_eq!(
+        manifest.requests[2].name,
+        "search_ban_tiny_by_address_fields"
+    );
+}
+
+#[test]
 fn replay_manifest_defaults_to_exact_response_comparison() {
     let manifest = parse_manifest(
         r#"{

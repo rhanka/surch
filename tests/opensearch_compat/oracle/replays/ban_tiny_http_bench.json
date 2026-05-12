@@ -1,0 +1,116 @@
+{
+  "name": "ban_tiny_http_bench",
+  "dataset": "ban_tiny",
+  "comparison": {
+    "ignored_paths": [
+      "took",
+      "_shards.total",
+      "hits.max_score",
+      "hits.hits.*._score"
+    ],
+    "score_tolerance": 0.001
+  },
+  "requests": [
+    {
+      "name": "count_ban_tiny_addresses",
+      "method": "GET",
+      "path": "/ban_tiny/_count",
+      "expected_status": 200,
+      "expected_response": {
+        "count": 3,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        }
+      }
+    },
+    {
+      "name": "search_ban_tiny_by_label",
+      "method": "POST",
+      "path": "/ban_tiny/_search",
+      "body": {
+        "query": {
+          "match": {
+            "label": {
+              "query": "Rue de Rivoli",
+              "operator": "AND"
+            }
+          }
+        },
+        "_source": false
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "timed_out": false,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "eq"
+          },
+          "max_score": null,
+          "hits": [
+            {
+              "_index": "ban_tiny",
+              "_id": "75101_0001_00001"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "search_ban_tiny_by_address_fields",
+      "method": "POST",
+      "path": "/ban_tiny/_search",
+      "body": {
+        "query": {
+          "bool": {
+            "must": [
+              {
+                "match": {
+                  "street_name": {
+                    "query": "Cours de l'Intendance",
+                    "operator": "AND"
+                  }
+                }
+              },
+              {
+                "match": {
+                  "postcode": "33000"
+                }
+              }
+            ]
+          }
+        },
+        "_source": false
+      },
+      "expected_status": 200,
+      "expected_response": {
+        "timed_out": false,
+        "_shards": {
+          "successful": 1,
+          "skipped": 0,
+          "failed": 0
+        },
+        "hits": {
+          "total": {
+            "value": 1,
+            "relation": "eq"
+          },
+          "max_score": null,
+          "hits": [
+            {
+              "_index": "ban_tiny",
+              "_id": "33063_0002_00010B"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
