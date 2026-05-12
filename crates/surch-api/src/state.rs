@@ -19,6 +19,7 @@ pub struct AppState {
 struct MemoryStore {
     indices: BTreeMap<String, InMemoryIndex>,
     aliases: BTreeMap<String, std::collections::BTreeSet<String>>,
+    index_templates: BTreeMap<String, StoredIndexTemplate>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -36,6 +37,14 @@ pub struct StoredDocument {
     pub index: String,
     pub id: String,
     pub source: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredIndexTemplate {
+    pub index_template: Value,
+    pub index_patterns: Vec<String>,
+    pub mapping: IndexMapping,
+    pub priority: i64,
 }
 
 impl InMemoryIndex {
@@ -162,10 +171,45 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        store
-            .indices
-            .entry(index.to_owned())
-            .or_insert_with(|| InMemoryIndex::new(mapping.unwrap_or_default()));
+        if !store.indices.contains_key(index) {
+            let mapping =
+                mapping_for_new_index(index, &store.index_templates, mapping.unwrap_or_default());
+            store
+                .indices
+                .insert(index.to_owned(), InMemoryIndex::new(mapping));
+        }
+    }
+
+    pub fn put_index_template(&self, name: &str, template: StoredIndexTemplate) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        store.index_templates.insert(name.to_owned(), template);
+    }
+
+    pub fn index_template(&self, name: &str) -> Option<StoredIndexTemplate> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.index_templates.get(name).cloned()
+    }
+
+    pub fn all_index_templates(&self) -> BTreeMap<String, StoredIndexTemplate> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.index_templates.clone()
+    }
+
+    pub fn delete_index_template(&self, name: &str) -> bool {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        store.index_templates.remove(name).is_some()
     }
 
     pub fn delete_index(&self, index: &str) {
@@ -203,10 +247,17 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
+        if !store.indices.contains_key(index) {
+            let mapping =
+                mapping_for_new_index(index, &store.index_templates, IndexMapping::default());
+            store
+                .indices
+                .insert(index.to_owned(), InMemoryIndex::new(mapping));
+        }
         let data = store
             .indices
-            .entry(index.to_owned())
-            .or_insert_with(|| InMemoryIndex::new(IndexMapping::default()));
+            .get_mut(index)
+            .expect("index must exist after implicit creation");
         data.upsert_document(id, source);
     }
 
@@ -216,10 +267,17 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
+        if !store.indices.contains_key(index) {
+            let mapping =
+                mapping_for_new_index(index, &store.index_templates, IndexMapping::default());
+            store
+                .indices
+                .insert(index.to_owned(), InMemoryIndex::new(mapping));
+        }
         let data = store
             .indices
-            .entry(index.to_owned())
-            .or_insert_with(|| InMemoryIndex::new(IndexMapping::default()));
+            .get_mut(index)
+            .expect("index must exist after implicit creation");
         if data.has_document(id) {
             return false;
         }
@@ -495,4 +553,70 @@ impl AppState {
             .get(index)
             .map_or(0, |data| data.count_term_hits(field, value))
     }
+}
+
+fn mapping_for_new_index(
+    index: &str,
+    index_templates: &BTreeMap<String, StoredIndexTemplate>,
+    explicit_mapping: IndexMapping,
+) -> IndexMapping {
+    let mut mapping = IndexMapping::default();
+    let mut matching_templates = index_templates
+        .iter()
+        .filter(|(_, template)| {
+            template
+                .index_patterns
+                .iter()
+                .any(|pattern| index_pattern_matches(pattern, index))
+        })
+        .collect::<Vec<_>>();
+
+    matching_templates.sort_by(|(left_name, left), (right_name, right)| {
+        left.priority
+            .cmp(&right.priority)
+            .then_with(|| left_name.cmp(right_name))
+    });
+
+    for (_, template) in matching_templates {
+        merge_mapping_fields(&mut mapping, &template.mapping);
+    }
+    merge_mapping_fields(&mut mapping, &explicit_mapping);
+    mapping
+}
+
+fn merge_mapping_fields(target: &mut IndexMapping, source: &IndexMapping) {
+    for (field, mapping) in source.fields() {
+        target.set_field_mapping(field.to_owned(), *mapping);
+    }
+}
+
+fn index_pattern_matches(pattern: &str, index: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let index = index.chars().collect::<Vec<_>>();
+    let mut matches = vec![vec![false; index.len() + 1]; pattern.len() + 1];
+    matches[0][0] = true;
+
+    for pattern_index in 1..=pattern.len() {
+        if pattern[pattern_index - 1] == '*' {
+            matches[pattern_index][0] = matches[pattern_index - 1][0];
+        }
+    }
+
+    for pattern_index in 1..=pattern.len() {
+        for index_index in 1..=index.len() {
+            matches[pattern_index][index_index] = match pattern[pattern_index - 1] {
+                '*' => {
+                    matches[pattern_index - 1][index_index]
+                        || matches[pattern_index][index_index - 1]
+                }
+                '?' => matches[pattern_index - 1][index_index - 1],
+                character => {
+                    character == index[index_index - 1]
+                        && matches[pattern_index - 1][index_index - 1]
+                }
+            };
+        }
+    }
+
+    matches[pattern.len()][index.len()]
 }

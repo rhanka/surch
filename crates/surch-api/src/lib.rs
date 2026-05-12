@@ -17,6 +17,7 @@ pub mod document;
 pub mod error;
 pub mod field_caps;
 pub mod index;
+pub mod index_template;
 pub mod mget;
 pub mod msearch;
 pub mod root;
@@ -39,6 +40,16 @@ pub fn app_router() -> Router {
                 .layer(DefaultBodyLimit::max(BULK_BODY_LIMIT_BYTES)),
         )
         .route("/_mapping", get(index::mappings_handler))
+        .route(
+            "/_index_template",
+            get(index_template::list_index_templates_handler),
+        )
+        .route(
+            "/_index_template/:name",
+            get(index_template::get_index_template_handler)
+                .put(index_template::put_index_template_handler)
+                .delete(index_template::delete_index_template_handler),
+        )
         .route(
             "/:index/_mapping",
             get(index::mapping_handler)
