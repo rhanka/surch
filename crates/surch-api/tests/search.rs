@@ -803,6 +803,172 @@ async fn search_router_highlight_with_custom_pre_and_post_tags() {
 }
 
 #[tokio::test]
+async fn search_router_highlight_returns_multiple_fragments_when_fragment_options_are_set() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-1",
+        r#"{"description":"Rust search in practice, rust search is everywhere and reliable"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":"rust search"}},"highlight":{"fields":{"description":{}}, "fragment_size":24, "number_of_fragments":2},"_source":false}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 1);
+    let fragments = hits[0]["highlight"]["description"]
+        .as_array()
+        .expect("highlight array");
+    assert_eq!(fragments.len(), 2);
+    for fragment in fragments {
+        let fragment = fragment.as_str().expect("fragment");
+        assert!(fragment.contains("<em>rust</em>") || fragment.contains("<em>Rust</em>"));
+        assert!(fragment.contains("<em>search</em>"));
+    }
+}
+
+#[tokio::test]
+async fn search_router_highlight_limits_fragments_to_number_of_fragments() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-1",
+        r#"{"description":"Rust search engine is fast. Rust search engine is safe. Rust search engine is simple."}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":"rust search"}},"highlight":{"fields":{"description":{}}, "fragment_size":20, "number_of_fragments":1},"_source":false}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    let fragments = hits[0]["highlight"]["description"]
+        .as_array()
+        .expect("highlight array");
+    assert_eq!(fragments.len(), 1);
+    let fragment = fragments[0].as_str().expect("fragment");
+    assert!(fragment.contains("<em>Rust</em>"));
+    assert!(fragment.contains("<em>search</em>"));
+}
+
+#[tokio::test]
+async fn search_router_highlight_fragment_options_preserve_utf8_boundaries() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-1",
+        r#"{"description":"caf\u00e9 rust search keeps accents intact"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":"rust search"}},"highlight":{"fields":{"description":{}}, "fragment_size":14, "number_of_fragments":1},"_source":false}"#,
+    )
+    .await;
+
+    let fragments = body["hits"]["hits"][0]["highlight"]["description"]
+        .as_array()
+        .expect("highlight array");
+    assert_eq!(fragments.len(), 1);
+    let fragment = fragments[0].as_str().expect("fragment");
+    assert!(fragment.contains("<em>rust</em>"));
+    assert!(fragment.contains("<em>search</em>"));
+}
+
+#[tokio::test]
+async fn search_router_rejects_highlight_fragment_size_type_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"highlight":{"fields":{"description":{}},"fragment_size":"20"},"_source":false}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "`highlight.fragment_size` must be a positive integer",
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn search_router_rejects_highlight_number_of_fragments_as_negative_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"highlight":{"fields":{"description":{}},"number_of_fragments":0},"_source":false}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "`highlight.number_of_fragments` must be greater than zero",
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
 async fn search_router_rejects_highlight_pre_tags_with_non_string_elements() {
     let router = app_router();
     let create_index = router

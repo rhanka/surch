@@ -107,6 +107,35 @@ async fn msearch_reports_missing_index_per_pair_without_failing_the_batch() {
 }
 
 #[tokio::test]
+async fn msearch_returns_highlight_fragments_in_search_response() {
+    let router = app_router();
+    index_doc(
+        &router,
+        "products",
+        "sku-1",
+        r#"{"description":"Rust search engine with safe indexing"}"#,
+    )
+    .await;
+
+    let body = "{\"index\":\"products\"}\n\
+                {\"query\":{\"match\":{\"description\":\"rust search\"}},\"highlight\":{\"fields\":{\"description\":{}}},\"_source\":false}\n"
+        .to_owned();
+
+    let response = post_msearch(&router, "/_msearch", body).await;
+    let responses = response["responses"].as_array().expect("responses array");
+
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["status"], 200);
+
+    let hits = responses[0]["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0]["highlight"]["description"],
+        serde_json::json!(["<em>Rust</em> <em>search</em> engine with safe indexing"])
+    );
+}
+
+#[tokio::test]
 async fn msearch_reports_invalid_query_body_per_pair() {
     let router = app_router();
     index_doc(&router, "products", "sku-1", r#"{"name":"desk"}"#).await;

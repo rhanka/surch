@@ -78,6 +78,8 @@ pub struct HighlightRequest {
     pub fields: Vec<String>,
     pub pre_tag: String,
     pub post_tag: String,
+    pub fragment_size: Option<usize>,
+    pub number_of_fragments: Option<usize>,
 }
 
 /// Supported P0 `_search` queries.
@@ -179,6 +181,11 @@ pub struct SearchHitsTotal {
     pub value: u64,
     pub relation: &'static str,
 }
+
+const DEFAULT_HIGHLIGHT_FRAGMENT_SIZE: usize = 100;
+const DEFAULT_HIGHLIGHT_FRAGMENT_COUNT: usize = 5;
+const MAX_HIGHLIGHT_FRAGMENT_SIZE: usize = 50_000;
+const MAX_HIGHLIGHT_FRAGMENT_COUNT: usize = 1_000;
 
 pub fn build_search_response(hits: Vec<Value>, total: u64, took: u64) -> SearchResponse {
     build_search_response_with_total(
@@ -603,7 +610,10 @@ fn parse_highlight(value: &Value) -> Result<HighlightRequest, OpenSearchError> {
     })?;
 
     for key in object.keys() {
-        if !matches!(key.as_str(), "fields" | "pre_tags" | "post_tags") {
+        if !matches!(
+            key.as_str(),
+            "fields" | "pre_tags" | "post_tags" | "fragment_size" | "number_of_fragments"
+        ) {
             return Err(OpenSearchError::new(
                 StatusCode::BAD_REQUEST,
                 "parsing_exception",
@@ -663,11 +673,29 @@ fn parse_highlight(value: &Value) -> Result<HighlightRequest, OpenSearchError> {
         .map(|value| parse_highlight_tag(value, "post_tags"))
         .transpose()?
         .unwrap_or_else(|| "</em>".to_owned());
+    let fragment_size = object
+        .get("fragment_size")
+        .map(|value| {
+            parse_highlight_positive_integer(value, "fragment_size", MAX_HIGHLIGHT_FRAGMENT_SIZE)
+        })
+        .transpose()?;
+    let number_of_fragments = object
+        .get("number_of_fragments")
+        .map(|value| {
+            parse_highlight_positive_integer(
+                value,
+                "number_of_fragments",
+                MAX_HIGHLIGHT_FRAGMENT_COUNT,
+            )
+        })
+        .transpose()?;
 
     Ok(HighlightRequest {
         fields,
         pre_tag,
         post_tag,
+        fragment_size,
+        number_of_fragments,
     })
 }
 
@@ -701,6 +729,41 @@ fn parse_highlight_tag(value: &Value, field: &str) -> Result<String, OpenSearchE
             format!("`highlight.{field}` must be a string or array of strings"),
         )),
     }
+}
+
+fn parse_highlight_positive_integer(
+    value: &Value,
+    field: &str,
+    max_value: usize,
+) -> Result<usize, OpenSearchError> {
+    let value = value.as_u64().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`highlight.{field}` must be a positive integer"),
+        )
+    })?;
+    if value == 0 {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`highlight.{field}` must be greater than zero"),
+        ));
+    }
+    if value > max_value as u64 {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`highlight.{field}` must not exceed {max_value}"),
+        ));
+    }
+    usize::try_from(value).map_err(|_| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`highlight.{field}` must be a positive integer"),
+        )
+    })
 }
 
 fn parse_sort(value: &Value) -> Result<Vec<SortClause>, OpenSearchError> {
@@ -1817,10 +1880,10 @@ fn build_highlight(
         let Some(text) = field_text(source, field) else {
             continue;
         };
-        let Some(fragment) = highlight_field_fragment(&text, query, field, request) else {
+        let Some(fragment) = highlight_field_fragments(&text, query, field, request) else {
             continue;
         };
-        highlighted_fields.insert(field.clone(), json!([fragment]));
+        highlighted_fields.insert(field.clone(), json!(fragment));
     }
 
     if highlighted_fields.is_empty() {
@@ -1830,23 +1893,205 @@ fn build_highlight(
     }
 }
 
-fn highlight_field_fragment(
+fn highlight_field_fragments(
     text: &str,
     query: &SearchQuery,
     field: &str,
     request: &HighlightRequest,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     let spans = highlight_spans_for_query(text, query, field);
     if spans.is_empty() {
         return None;
     }
 
-    Some(render_highlight_fragment(
+    if request.fragment_size.is_none() && request.number_of_fragments.is_none() {
+        return Some(vec![render_highlight_fragment(
+            text,
+            &spans,
+            &request.pre_tag,
+            &request.post_tag,
+        )]);
+    }
+
+    let fragment_size = request
+        .fragment_size
+        .unwrap_or(DEFAULT_HIGHLIGHT_FRAGMENT_SIZE);
+    let number_of_fragments = request
+        .number_of_fragments
+        .unwrap_or(DEFAULT_HIGHLIGHT_FRAGMENT_COUNT);
+
+    Some(build_highlight_fragments(
         text,
         &spans,
+        fragment_size,
+        number_of_fragments,
         &request.pre_tag,
         &request.post_tag,
     ))
+}
+
+fn build_highlight_fragments(
+    text: &str,
+    spans: &[(usize, usize)],
+    fragment_size: usize,
+    max_fragments: usize,
+    pre_tag: &str,
+    post_tag: &str,
+) -> Vec<String> {
+    let mut fragments = Vec::new();
+    if text.is_empty() || spans.is_empty() || max_fragments == 0 {
+        return fragments;
+    }
+
+    let mut current_cluster: Vec<(usize, usize)> = Vec::new();
+    let mut cluster_start = 0usize;
+    let mut cluster_end = 0usize;
+
+    let flush_cluster = |cluster: &mut Vec<(usize, usize)>,
+                         start: &mut usize,
+                         end: &mut usize,
+                         out: &mut Vec<String>| {
+        if cluster.is_empty() {
+            return;
+        }
+        let fragment = render_cluster_fragment(
+            text,
+            cluster,
+            *start,
+            *end,
+            fragment_size,
+            pre_tag,
+            post_tag,
+        );
+        out.push(fragment);
+        cluster.clear();
+        *start = 0;
+        *end = 0;
+    };
+
+    for &(span_start, span_end) in spans {
+        if current_cluster.is_empty() {
+            current_cluster.push((span_start, span_end));
+            cluster_start = span_start;
+            cluster_end = span_end;
+            continue;
+        }
+
+        if span_start <= cluster_end || span_end.saturating_sub(cluster_start) <= fragment_size {
+            current_cluster.push((span_start, span_end));
+            cluster_end = cluster_end.max(span_end);
+            continue;
+        }
+
+        flush_cluster(
+            &mut current_cluster,
+            &mut cluster_start,
+            &mut cluster_end,
+            &mut fragments,
+        );
+        if fragments.len() >= max_fragments {
+            return fragments;
+        }
+
+        current_cluster.push((span_start, span_end));
+        cluster_start = span_start;
+        cluster_end = span_end;
+    }
+
+    if !current_cluster.is_empty() && fragments.len() < max_fragments {
+        flush_cluster(
+            &mut current_cluster,
+            &mut cluster_start,
+            &mut cluster_end,
+            &mut fragments,
+        );
+    }
+
+    fragments.into_iter().take(max_fragments).collect()
+}
+
+fn render_cluster_fragment(
+    text: &str,
+    spans: &[(usize, usize)],
+    cluster_start: usize,
+    cluster_end: usize,
+    fragment_size: usize,
+    pre_tag: &str,
+    post_tag: &str,
+) -> String {
+    let span_center = (cluster_start + cluster_end) / 2;
+    let half_window = fragment_size / 2;
+    let mut fragment_start = span_center.saturating_sub(half_window);
+    let fragment_end = (fragment_start + fragment_size).min(text.len());
+    if fragment_end == text.len() {
+        fragment_start = text.len().saturating_sub(fragment_size);
+    }
+    let fragment_start = previous_char_boundary(text, fragment_start);
+    let fragment_end = next_char_boundary(text, fragment_end);
+
+    let mut fragment_spans = Vec::with_capacity(spans.len());
+    for &(span_start, span_end) in spans {
+        let clipped_start = span_start.max(fragment_start);
+        let clipped_end = span_end.min(fragment_end);
+        if clipped_start < clipped_end {
+            fragment_spans.push((clipped_start, clipped_end));
+        }
+    }
+    if fragment_spans.is_empty() {
+        fragment_spans.push((fragment_start, fragment_start));
+    }
+
+    render_highlight_region(
+        text,
+        fragment_start,
+        fragment_end,
+        &fragment_spans,
+        pre_tag,
+        post_tag,
+    )
+}
+
+fn previous_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn next_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn render_highlight_region(
+    text: &str,
+    fragment_start: usize,
+    fragment_end: usize,
+    spans: &[(usize, usize)],
+    pre_tag: &str,
+    post_tag: &str,
+) -> String {
+    if fragment_end < fragment_start {
+        return String::new();
+    }
+    let mut fragment = String::new();
+    let mut cursor = fragment_start;
+    for (start, end) in spans {
+        if *start < cursor {
+            continue;
+        }
+        fragment.push_str(&text[cursor..*start]);
+        fragment.push_str(pre_tag);
+        fragment.push_str(&text[*start..*end]);
+        fragment.push_str(post_tag);
+        cursor = *end;
+    }
+    fragment.push_str(&text[cursor..fragment_end]);
+    fragment
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
