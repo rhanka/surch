@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
@@ -422,59 +422,145 @@ fn score_documents(
             .collect();
     };
 
-    let doc_count = state.count(index);
+    let scoring_context = SearchScoringContext::new(state, index, query);
     documents
         .into_iter()
         .map(|doc| {
-            let score = score_for_query(state, index, query, &doc, doc_count);
+            let score = score_for_query(query, &doc, &scoring_context);
             ScoredDocument { doc, score }
         })
         .collect()
 }
 
 fn score_for_query(
-    state: &AppState,
-    index: &str,
     query: &SearchQuery,
     document: &StoredDocument,
-    doc_count: u64,
+    scoring_context: &SearchScoringContext,
 ) -> f64 {
     match query {
         SearchQuery::Match { field, value, .. } => {
-            bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
+            bm25_field_score(scoring_context, field, value, &document.source).unwrap_or(1.0)
         }
         SearchQuery::MultiMatch { query, fields, .. } => fields
             .iter()
             .map(|field| {
-                bm25_field_score(state, index, field, query, &document.source, doc_count)
-                    .unwrap_or(0.0)
+                bm25_field_score(scoring_context, field, query, &document.source).unwrap_or(0.0)
             })
             .fold(0.0_f64, f64::max)
             .max(1.0 / 1e9_f64.max(1.0)),
         SearchQuery::MatchPhrase { field, value } => {
-            bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
+            bm25_field_score(scoring_context, field, value, &document.source).unwrap_or(1.0)
         }
         SearchQuery::Fuzzy { field, value, .. } => {
-            bm25_field_score(state, index, field, value, &document.source, doc_count).unwrap_or(1.0)
+            bm25_field_score(scoring_context, field, value, &document.source).unwrap_or(1.0)
         }
         SearchQuery::BoolMust(clauses) => clauses
             .iter()
-            .map(|clause| score_for_query(state, index, clause, document, doc_count))
+            .map(|clause| score_for_query(clause, document, scoring_context))
             .sum(),
         _ => 1.0,
     }
 }
 
+#[derive(Debug, Default)]
+struct SearchScoringContext {
+    doc_count: u64,
+    avg_doc_len_by_field: BTreeMap<String, f64>,
+    doc_freq_by_field_token: BTreeMap<(String, String), u64>,
+}
+
+impl SearchScoringContext {
+    fn new(state: &AppState, index: &str, query: &SearchQuery) -> Self {
+        let doc_count = state.count(index);
+        if doc_count == 0 {
+            return Self::default();
+        }
+
+        let mut field_tokens = BTreeMap::<String, BTreeSet<String>>::new();
+        collect_scoring_field_tokens(query, &mut field_tokens);
+        if field_tokens.is_empty() {
+            return Self {
+                doc_count,
+                ..Self::default()
+            };
+        }
+
+        let fields = field_tokens.keys().cloned().collect::<BTreeSet<_>>();
+        let avg_doc_len_by_field = compute_avg_doc_lens(state, index, &fields);
+        let mut doc_freq_by_field_token = BTreeMap::new();
+        for (field, tokens) in field_tokens {
+            for token in tokens {
+                let doc_freq = state.documents_for_term(index, &field, &token).len() as u64;
+                doc_freq_by_field_token.insert((field.clone(), token), doc_freq);
+            }
+        }
+
+        Self {
+            doc_count,
+            avg_doc_len_by_field,
+            doc_freq_by_field_token,
+        }
+    }
+
+    fn avg_doc_len(&self, field: &str) -> Option<f64> {
+        self.avg_doc_len_by_field.get(field).copied()
+    }
+
+    fn doc_freq(&self, field: &str, token: &str) -> u64 {
+        self.doc_freq_by_field_token
+            .get(&(field.to_owned(), token.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+fn collect_scoring_field_tokens(
+    query: &SearchQuery,
+    field_tokens: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    match query {
+        SearchQuery::Match { field, value, .. }
+        | SearchQuery::MatchPhrase { field, value }
+        | SearchQuery::Fuzzy { field, value, .. } => {
+            insert_scoring_tokens(field_tokens, field, value);
+        }
+        SearchQuery::MultiMatch { query, fields, .. } => {
+            for field in fields {
+                insert_scoring_tokens(field_tokens, field, query);
+            }
+        }
+        SearchQuery::BoolMust(clauses) => {
+            for clause in clauses {
+                collect_scoring_field_tokens(clause, field_tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn insert_scoring_tokens(
+    field_tokens: &mut BTreeMap<String, BTreeSet<String>>,
+    field: &str,
+    query: &str,
+) {
+    let tokens = tokenize_for_search(query);
+    if tokens.is_empty() {
+        return;
+    }
+    field_tokens
+        .entry(field.to_owned())
+        .or_default()
+        .extend(tokens);
+}
+
 fn bm25_field_score(
-    state: &AppState,
-    index: &str,
+    scoring_context: &SearchScoringContext,
     field: &str,
     query: &str,
     source: &Value,
-    doc_count: u64,
 ) -> Option<f64> {
     let query_tokens = tokenize_for_search(query);
-    if query_tokens.is_empty() || doc_count == 0 {
+    if query_tokens.is_empty() || scoring_context.doc_count == 0 {
         return None;
     }
     let field_tokens = field_tokens_for_source(source, field);
@@ -482,7 +568,7 @@ fn bm25_field_score(
         return None;
     }
     let doc_len = field_tokens.len() as u64;
-    let avg_doc_len = compute_avg_doc_len(state, index, field)?;
+    let avg_doc_len = scoring_context.avg_doc_len(field)?;
     if avg_doc_len <= 0.0 {
         return None;
     }
@@ -496,12 +582,18 @@ fn bm25_field_score(
         if term_freq == 0 {
             continue;
         }
-        let doc_freq = state.documents_for_term(index, field, query_token).len() as u64;
-        if doc_freq == 0 || doc_freq > doc_count {
+        let doc_freq = scoring_context.doc_freq(field, query_token);
+        if doc_freq == 0 || doc_freq > scoring_context.doc_count {
             continue;
         }
-        if let Ok(score) = bm25_score(config, doc_count, doc_freq, term_freq, doc_len, avg_doc_len)
-        {
+        if let Ok(score) = bm25_score(
+            config,
+            scoring_context.doc_count,
+            doc_freq,
+            term_freq,
+            doc_len,
+            avg_doc_len,
+        ) {
             total += score;
         }
     }
@@ -518,25 +610,36 @@ fn field_tokens_for_source(source: &Value, field: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn compute_avg_doc_len(state: &AppState, index: &str, field: &str) -> Option<f64> {
+fn compute_avg_doc_lens(
+    state: &AppState,
+    index: &str,
+    fields: &BTreeSet<String>,
+) -> BTreeMap<String, f64> {
     let documents = state.documents(index);
-    if documents.is_empty() {
-        return None;
-    }
-    let mut total: u64 = 0;
-    let mut docs_with_field: u64 = 0;
+    let mut totals = fields
+        .iter()
+        .map(|field| (field.clone(), (0_u64, 0_u64)))
+        .collect::<BTreeMap<_, _>>();
+
     for doc in &documents {
-        let tokens = field_tokens_for_source(&doc.source, field);
-        if !tokens.is_empty() {
-            total += tokens.len() as u64;
-            docs_with_field += 1;
+        for field in fields {
+            let tokens = field_tokens_for_source(&doc.source, field);
+            if !tokens.is_empty() {
+                let (total_len, docs_with_field) = totals
+                    .get_mut(field)
+                    .expect("field stats should be initialized");
+                *total_len += tokens.len() as u64;
+                *docs_with_field += 1;
+            }
         }
     }
-    if docs_with_field == 0 {
-        None
-    } else {
-        Some(total as f64 / docs_with_field as f64)
-    }
+
+    totals
+        .into_iter()
+        .filter_map(|(field, (total_len, docs_with_field))| {
+            (docs_with_field > 0).then(|| (field, total_len as f64 / docs_with_field as f64))
+        })
+        .collect()
 }
 
 pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
