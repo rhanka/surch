@@ -14,7 +14,7 @@ use crate::{
         exists_field_matches, multi_match_matches, parse_exists_clause, parse_multi_match_clause,
         parse_prefix_clause, parse_range_bounds, parse_terms_clause, parse_wildcard_clause,
         prefix_field_matches, range_field_matches, wildcard_field_matches, MatchOperator,
-        RangeBounds,
+        RangeBounds, TrackTotalHits,
     },
     state::AppState,
     OpenSearchError,
@@ -24,6 +24,7 @@ use crate::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct CountRequest {
     pub query: Option<CountQuery>,
+    pub track_total_hits: Option<TrackTotalHits>,
 }
 
 /// Supported P0 `_count` queries.
@@ -116,6 +117,10 @@ pub async fn count_handler(
                 .iter()
                 .map(|index| count_matches(&state, index, &request))
                 .sum();
+            let count = match request.track_total_hits {
+                Some(TrackTotalHits::UpTo(limit)) => count.min(limit),
+                Some(TrackTotalHits::Disabled) | Some(TrackTotalHits::Exact) | None => count,
+            };
 
             (StatusCode::OK, Json(build_count_response(count))).into_response()
         }
@@ -183,7 +188,10 @@ fn intersect_term_clauses(
 
 fn parse_count_request(body: &str) -> Result<CountRequest, OpenSearchError> {
     if body.trim().is_empty() {
-        return Ok(CountRequest { query: None });
+        return Ok(CountRequest {
+            query: None,
+            track_total_hits: None,
+        });
     }
 
     let value: Value = serde_json::from_str(body).map_err(|error| {
@@ -203,8 +211,37 @@ fn parse_count_request(body: &str) -> Result<CountRequest, OpenSearchError> {
     })?;
 
     let query = object.get("query").map(parse_count_query).transpose()?;
+    let track_total_hits = object
+        .get("track_total_hits")
+        .map(parse_track_total_hits)
+        .transpose()?;
 
-    Ok(CountRequest { query })
+    Ok(CountRequest {
+        query,
+        track_total_hits,
+    })
+}
+
+fn parse_track_total_hits(value: &Value) -> Result<TrackTotalHits, OpenSearchError> {
+    match value {
+        Value::Bool(true) => Ok(TrackTotalHits::Exact),
+        Value::Bool(false) => Ok(TrackTotalHits::Disabled),
+        Value::Number(number) => {
+            let limit = number.as_u64().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "`track_total_hits` must be a non-negative integer or boolean",
+                )
+            })?;
+            Ok(TrackTotalHits::UpTo(limit))
+        }
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`track_total_hits` must be a boolean or non-negative integer",
+        )),
+    }
 }
 
 fn parse_count_query(value: &Value) -> Result<CountQuery, OpenSearchError> {

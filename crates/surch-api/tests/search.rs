@@ -778,6 +778,117 @@ async fn search_router_returns_highlight_fragments_for_requested_match_field() {
 }
 
 #[tokio::test]
+async fn search_router_highlight_with_custom_pre_and_post_tags() {
+    let router = app_router();
+    index_product(
+        &router,
+        "sku-1",
+        r#"{"description":"Rust search engine with safe indexing"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"description":"rust search"}},"highlight":{"pre_tags":["<mark>"],"post_tags":["</mark>"],"fields":{"description":{}}},"_source":false}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["_id"], "sku-1");
+    assert_eq!(
+        hits[0]["highlight"]["description"],
+        serde_json::json!(["<mark>Rust</mark> <mark>search</mark> engine with safe indexing"])
+    );
+}
+
+#[tokio::test]
+async fn search_router_rejects_highlight_pre_tags_with_non_string_elements() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"highlight":{"pre_tags":[42],"post_tags":["</mark>"],"fields":{"description":{}}},"_source":false}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "`highlight.pre_tags` entries must be strings"
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
+async fn search_router_rejects_highlight_fields_array_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"highlight":{"pre_tags":["<mark>"],"post_tags":["</mark>"],"fields":[]}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "`highlight.fields` must be an object"
+            },
+            "status": 400
+        })
+    );
+}
+
+#[tokio::test]
 async fn search_router_sorts_documents_by_field_ascending_by_default() {
     let router = app_router();
     index_product(&router, "sku-3", r#"{"name":"Cap","price":15}"#).await;

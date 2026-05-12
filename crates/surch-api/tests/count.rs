@@ -482,3 +482,202 @@ async fn count_router_multi_match_and_operator_requires_all_tokens_in_one_field(
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await["count"], 1);
 }
+
+#[tokio::test]
+async fn count_router_track_total_hits_int_caps_count() {
+    let router = app_router();
+
+    for (id, body) in [
+        ("sku-1", r#"{"name":"item-1"}"#),
+        ("sku-2", r#"{"name":"item-2"}"#),
+        ("sku-3", r#"{"name":"item-3"}"#),
+        ("sku-4", r#"{"name":"item-4"}"#),
+        ("sku-5", r#"{"name":"item-5"}"#),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/products/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"track_total_hits":2}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["count"], 2);
+}
+
+#[tokio::test]
+async fn count_router_track_total_hits_int_returns_eq_when_within_limit() {
+    let router = app_router();
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_doc/sku-1")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name":"desk"}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"track_total_hits":10}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["count"], 1);
+}
+
+#[tokio::test]
+async fn count_router_track_total_hits_true_keeps_exact_count() {
+    let router = app_router();
+    for (id, body) in [
+        ("sku-1", r#"{"name":"item-1"}"#),
+        ("sku-2", r#"{"name":"item-2"}"#),
+        ("sku-3", r#"{"name":"item-3"}"#),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/products/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"track_total_hits":true}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["count"], 3);
+}
+
+#[tokio::test]
+async fn count_router_track_total_hits_false_keeps_exact_count() {
+    let router = app_router();
+    for (id, body) in [
+        ("sku-1", r#"{"name":"item-1"}"#),
+        ("sku-2", r#"{"name":"item-2"}"#),
+        ("sku-3", r#"{"name":"item-3"}"#),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/products/_doc/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"track_total_hits":false}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["count"], 3);
+}
+
+#[tokio::test]
+async fn count_router_rejects_invalid_track_total_hits_with_opensearch_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_count")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"track_total_hits":"yes"}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": {
+                "type": "parsing_exception",
+                "reason": "`track_total_hits` must be a boolean or non-negative integer"
+            },
+            "status": 400
+        })
+    );
+}
