@@ -134,12 +134,14 @@ fn parse_index_template_request(body: &str) -> Result<StoredIndexTemplate, OpenS
     let priority = parse_priority(object.get("priority"))?;
     let template = parse_template_object(object.get("template"))?;
     let mapping = parse_template_mapping(template)?;
+    let settings = parse_template_settings(template)?;
     let aliases = parse_template_aliases(template)?;
 
     Ok(StoredIndexTemplate {
         index_template: value,
         index_patterns,
         mapping,
+        settings,
         aliases,
         priority,
     })
@@ -258,6 +260,25 @@ fn parse_template_mapping(
         return Ok(IndexMapping::default());
     };
     parse_template_mappings_value(mappings)
+}
+
+fn parse_template_settings(
+    template: Option<&serde_json::Map<String, Value>>,
+) -> Result<Value, OpenSearchError> {
+    let Some(template) = template else {
+        return Ok(json!({}));
+    };
+    let Some(settings) = template.get("settings") else {
+        return Ok(json!({}));
+    };
+    if !settings.is_object() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "_index_template `template.settings` must be an object",
+        ));
+    }
+    Ok(settings.clone())
 }
 
 fn parse_template_aliases(

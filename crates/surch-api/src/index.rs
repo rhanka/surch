@@ -5,7 +5,7 @@ use axum::{
     Json,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
 use surch_index::mapping::IndexMapping;
@@ -56,6 +56,8 @@ struct IndexMappingsResponse {
 #[derive(Clone, Debug)]
 struct CreateIndexRequest {
     pub mapping: IndexMapping,
+    pub settings: Value,
+    pub aliases: Vec<String>,
 }
 
 pub async fn create_index_handler(
@@ -81,7 +83,12 @@ pub async fn create_index_handler(
         .into_response();
     }
 
-    state.create_index(&index, Some(request.mapping));
+    state.create_index(
+        &index,
+        Some(request.mapping),
+        request.settings,
+        request.aliases,
+    );
 
     (
         StatusCode::OK,
@@ -92,6 +99,47 @@ pub async fn create_index_handler(
         }),
     )
         .into_response()
+}
+
+pub async fn index_metadata_handler(
+    State(state): State<AppState>,
+    Path(target): Path<String>,
+) -> impl IntoResponse {
+    if let Err(error) = validate_index_name(&target) {
+        return error.into_response();
+    }
+
+    let indices = state.resolve_index(&target);
+    if indices.is_empty() {
+        return OpenSearchError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("index [{target}] missing"),
+        )
+        .into_response();
+    };
+
+    let mut entries = Map::new();
+    for index in indices {
+        if let Some(metadata) = state.index_metadata(&index) {
+            let mut aliases = Map::new();
+            for alias in metadata.aliases {
+                aliases.insert(alias, json!({}));
+            }
+            entries.insert(
+                index,
+                json!({
+                    "aliases": aliases,
+                    "mappings": metadata.mapping,
+                    "settings": {
+                        "index": metadata.settings
+                    }
+                }),
+            );
+        }
+    }
+
+    (StatusCode::OK, Json(Value::Object(entries))).into_response()
 }
 
 pub async fn delete_index_handler(
@@ -278,6 +326,8 @@ fn parse_create_index_request(body: &str) -> Result<CreateIndexRequest, OpenSear
     if body.trim().is_empty() {
         return Ok(CreateIndexRequest {
             mapping: IndexMapping::default(),
+            settings: json!({}),
+            aliases: Vec::new(),
         });
     }
 
@@ -306,25 +356,8 @@ fn parse_create_index_request(body: &str) -> Result<CreateIndexRequest, OpenSear
         }
     }
 
-    if let Some(settings) = object.get("settings") {
-        if !settings.is_object() {
-            return Err(OpenSearchError::new(
-                StatusCode::BAD_REQUEST,
-                "parsing_exception",
-                "index request `settings` must be an object",
-            ));
-        }
-    }
-
-    if let Some(aliases) = object.get("aliases") {
-        if !aliases.is_object() {
-            return Err(OpenSearchError::new(
-                StatusCode::BAD_REQUEST,
-                "parsing_exception",
-                "index request `aliases` must be an object",
-            ));
-        }
-    }
+    let settings = parse_create_index_settings(object.get("settings"))?;
+    let aliases = parse_create_index_aliases(object.get("aliases"))?;
 
     let mapping = match object.get("mappings") {
         Some(Value::Object(mappings)) => {
@@ -364,7 +397,58 @@ fn parse_create_index_request(body: &str) -> Result<CreateIndexRequest, OpenSear
         )
     })?;
 
-    Ok(CreateIndexRequest { mapping })
+    Ok(CreateIndexRequest {
+        mapping,
+        settings,
+        aliases,
+    })
+}
+
+fn parse_create_index_settings(settings: Option<&Value>) -> Result<Value, OpenSearchError> {
+    let Some(settings) = settings else {
+        return Ok(json!({}));
+    };
+    if !settings.is_object() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "index request `settings` must be an object",
+        ));
+    }
+    Ok(settings.clone())
+}
+
+fn parse_create_index_aliases(aliases: Option<&Value>) -> Result<Vec<String>, OpenSearchError> {
+    let Some(aliases) = aliases else {
+        return Ok(Vec::new());
+    };
+    let aliases = aliases.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "index request `aliases` must be an object",
+        )
+    })?;
+
+    let mut names = Vec::new();
+    for (alias, body) in aliases {
+        if alias.trim().is_empty() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "index request `aliases` names must not be empty",
+            ));
+        }
+        if !body.is_object() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("index request `aliases.{alias}` must be an object"),
+            ));
+        }
+        names.push(alias.clone());
+    }
+    Ok(names)
 }
 
 fn parse_properties_object(

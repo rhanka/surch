@@ -58,7 +58,9 @@ pub fn app_router() -> Router {
         )
         .route(
             "/:index",
-            put(index::create_index_handler).delete(index::delete_index_handler),
+            get(index::index_metadata_handler)
+                .put(index::create_index_handler)
+                .delete(index::delete_index_handler),
         )
         .route(
             "/:index/_bulk",

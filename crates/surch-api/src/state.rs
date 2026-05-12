@@ -29,6 +29,7 @@ struct InMemoryIndex {
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
     mapping: IndexMapping,
+    settings: Value,
     index: DocumentIndex,
 }
 
@@ -40,18 +41,27 @@ pub struct StoredDocument {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct IndexMetadata {
+    pub aliases: Vec<String>,
+    pub mapping: Value,
+    pub settings: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct StoredIndexTemplate {
     pub index_template: Value,
     pub index_patterns: Vec<String>,
     pub mapping: IndexMapping,
+    pub settings: Value,
     pub aliases: Vec<String>,
     pub priority: i64,
 }
 
 impl InMemoryIndex {
-    fn new(mapping: IndexMapping) -> Self {
+    fn new(mapping: IndexMapping, settings: Value) -> Self {
         Self {
             mapping,
+            settings,
             next_doc_id: 0,
             ..Self::default()
         }
@@ -84,6 +94,10 @@ impl InMemoryIndex {
 
     fn mapping_value(&self) -> Value {
         self.mapping.as_value()
+    }
+
+    fn settings_value(&self) -> Value {
+        self.settings.clone()
     }
 
     fn has_document(&self, id: &str) -> bool {
@@ -166,13 +180,25 @@ fn scalar_values(document: &Value, mapping: &IndexMapping, field: &str) -> Vec<S
 }
 
 impl AppState {
-    pub fn create_index(&self, index: &str, mapping: Option<IndexMapping>) {
+    pub fn create_index(
+        &self,
+        index: &str,
+        mapping: Option<IndexMapping>,
+        settings: Value,
+        aliases: Vec<String>,
+    ) {
         let mut store = self
             .store
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        create_index_if_missing(&mut store, index, mapping.unwrap_or_default());
+        create_index_if_missing(
+            &mut store,
+            index,
+            mapping.unwrap_or_default(),
+            settings,
+            aliases,
+        );
     }
 
     pub fn put_index_template(&self, name: &str, template: StoredIndexTemplate) {
@@ -242,7 +268,13 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        create_index_if_missing(&mut store, index, IndexMapping::default());
+        create_index_if_missing(
+            &mut store,
+            index,
+            IndexMapping::default(),
+            Value::Object(Default::default()),
+            Vec::new(),
+        );
         let data = store
             .indices
             .get_mut(index)
@@ -256,7 +288,13 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
 
-        create_index_if_missing(&mut store, index, IndexMapping::default());
+        create_index_if_missing(
+            &mut store,
+            index,
+            IndexMapping::default(),
+            Value::Object(Default::default()),
+            Vec::new(),
+        );
         let data = store
             .indices
             .get_mut(index)
@@ -277,7 +315,9 @@ impl AppState {
         store
             .indices
             .entry(index.to_owned())
-            .or_insert_with(|| InMemoryIndex::new(IndexMapping::default()))
+            .or_insert_with(|| {
+                InMemoryIndex::new(IndexMapping::default(), Value::Object(Default::default()))
+            })
             .set_mapping(mapping);
     }
 
@@ -342,6 +382,25 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         store.indices.get(index).map(|data| data.mapping_value())
+    }
+
+    pub fn index_metadata(&self, index: &str) -> Option<IndexMetadata> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let data = store.indices.get(index)?;
+        let aliases = store
+            .aliases
+            .iter()
+            .filter(|(_, indices)| indices.contains(index))
+            .map(|(alias, _)| alias.clone())
+            .collect();
+        Some(IndexMetadata {
+            aliases,
+            mapping: data.mapping_value(),
+            settings: data.settings_value(),
+        })
     }
 
     pub fn index_names(&self) -> Vec<String> {
@@ -538,16 +597,23 @@ impl AppState {
     }
 }
 
-fn create_index_if_missing(store: &mut MemoryStore, index: &str, explicit_mapping: IndexMapping) {
+fn create_index_if_missing(
+    store: &mut MemoryStore,
+    index: &str,
+    explicit_mapping: IndexMapping,
+    explicit_settings: Value,
+    explicit_aliases: Vec<String>,
+) {
     if store.indices.contains_key(index) {
         return;
     }
 
     let templates = matching_index_templates(index, &store.index_templates);
     let mapping = mapping_for_new_index(&templates, explicit_mapping);
+    let settings = settings_for_new_index(&templates, explicit_settings);
     store
         .indices
-        .insert(index.to_owned(), InMemoryIndex::new(mapping));
+        .insert(index.to_owned(), InMemoryIndex::new(mapping, settings));
 
     for (_, template) in templates {
         for alias in &template.aliases {
@@ -557,6 +623,13 @@ fn create_index_if_missing(store: &mut MemoryStore, index: &str, explicit_mappin
                 .or_default()
                 .insert(index.to_owned());
         }
+    }
+    for alias in explicit_aliases {
+        store
+            .aliases
+            .entry(alias)
+            .or_default()
+            .insert(index.to_owned());
     }
 }
 
@@ -594,9 +667,38 @@ fn mapping_for_new_index(
     mapping
 }
 
+fn settings_for_new_index(
+    matching_templates: &[(&String, &StoredIndexTemplate)],
+    explicit_settings: Value,
+) -> Value {
+    let mut settings = Value::Object(Default::default());
+    for (_, template) in matching_templates {
+        merge_settings(&mut settings, &template.settings);
+    }
+    merge_settings(&mut settings, &explicit_settings);
+    settings
+}
+
 fn merge_mapping_fields(target: &mut IndexMapping, source: &IndexMapping) {
     for (field, mapping) in source.fields() {
         target.set_field_mapping(field.to_owned(), *mapping);
+    }
+}
+
+fn merge_settings(target: &mut Value, source: &Value) {
+    let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) else {
+        return;
+    };
+
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(target_value), Value::Object(_)) if target_value.is_object() => {
+                merge_settings(target_value, value);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
     }
 }
 
