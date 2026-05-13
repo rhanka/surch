@@ -37,6 +37,24 @@ fn index_mapping_infer_from_document_indexes_scalar_and_array_types() {
 }
 
 #[test]
+fn index_mapping_infers_numeric_strings_as_keyword_fields() {
+    let document = serde_json::json!({
+        "postcode": "33000",
+        "city_code": "75103",
+        "label": "1 Rue Payenne 75003 Paris"
+    });
+
+    let mapping = IndexMapping::infer_from_document(&document);
+    let postcode = mapping.field("postcode").expect("postcode exists");
+    let city_code = mapping.field("city_code").expect("city_code exists");
+    let label = mapping.field("label").expect("label exists");
+
+    assert_eq!(postcode.field_type, FieldType::Keyword);
+    assert_eq!(city_code.field_type, FieldType::Keyword);
+    assert_eq!(label.field_type, FieldType::Text);
+}
+
+#[test]
 fn index_mapping_rejects_unsupported_field_types() {
     let properties = serde_json::json!({
         "title": { "type": "text", "analyzer": "magic" }

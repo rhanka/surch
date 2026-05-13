@@ -1790,6 +1790,99 @@ async fn match_query_orders_results_by_bm25_score_descending() {
 }
 
 #[tokio::test]
+async fn match_query_uses_index_analyzer_for_keyword_fields() {
+    let router = app_router();
+    let create_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"sku":{"type":"keyword"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    index_product(&router, "sku-1", r#"{"sku":"alpha road"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"sku":"alpha"}},"_source":false}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 0);
+    assert_eq!(body["hits"]["hits"].as_array().expect("hits").len(), 0);
+}
+
+#[tokio::test]
+async fn bool_must_mixed_match_and_range_uses_index_analyzer_for_keyword_fields() {
+    let router = app_router();
+    let create_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"sku":{"type":"keyword"},"price":{"type":"integer"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    index_product(&router, "sku-1", r#"{"sku":"alpha road","price":10}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"sku":"alpha"}},{"range":{"price":{"gte":1}}}]}},"_source":false}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 0);
+    assert_eq!(body["hits"]["hits"].as_array().expect("hits").len(), 0);
+}
+
+#[tokio::test]
+async fn bool_must_mixed_term_and_range_uses_index_analyzer_for_keyword_fields() {
+    let router = app_router();
+    let create_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"sku":{"type":"keyword"},"price":{"type":"integer"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    index_product(&router, "sku-1", r#"{"sku":"alpha road","price":10}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"term":{"sku":"alpha"}},{"range":{"price":{"gte":1}}}]}},"_source":false}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 0);
+    assert_eq!(body["hits"]["hits"].as_array().expect("hits").len(), 0);
+}
+
+#[tokio::test]
 async fn match_all_query_keeps_max_score_null_and_omits_score_field() {
     let router = app_router();
     index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
@@ -1813,6 +1906,27 @@ async fn sort_clause_overrides_default_score_order() {
     let body = search_with_body(
         &router,
         r#"{"query":{"match":{"name":"rust"}},"sort":[{"name":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-weak", "sku-strong"]);
+}
+
+#[tokio::test]
+async fn score_sort_clause_orders_by_score() {
+    let router = app_router();
+    index_product(&router, "sku-strong", r#"{"name":"rust rust rust"}"#).await;
+    index_product(&router, "sku-weak", r#"{"name":"rust"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":"rust"}},"sort":[{"_score":"asc"}],"_source":false}"#,
     )
     .await;
 

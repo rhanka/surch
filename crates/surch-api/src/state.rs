@@ -167,6 +167,49 @@ impl InMemoryIndex {
     fn count_term_hits(&self, field: &str, value: &str) -> usize {
         self.term_hits(field, value).len()
     }
+
+    fn match_hits(&self, field: &str, value: &str, require_all_terms: bool) -> Vec<String> {
+        if field.trim().is_empty() || value.is_empty() {
+            return Vec::new();
+        }
+
+        let terms = normalized_terms_for_field(value, field, &self.mapping);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches: Option<BTreeSet<u32>> = None;
+        for term in terms {
+            let current = self
+                .index
+                .postings(field, &term)
+                .into_iter()
+                .flat_map(|postings| postings.map(|posting| posting.doc_id))
+                .collect::<BTreeSet<_>>();
+
+            matches = Some(match matches {
+                None => current,
+                Some(mut previous) if require_all_terms => {
+                    previous.retain(|doc_id| current.contains(doc_id));
+                    previous
+                }
+                Some(mut previous) => {
+                    previous.extend(current);
+                    previous
+                }
+            });
+
+            if require_all_terms && matches.as_ref().is_some_and(BTreeSet::is_empty) {
+                break;
+            }
+        }
+
+        matches
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|doc_id| self.reverse_document_ids.get(&doc_id).cloned())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -203,6 +246,10 @@ pub enum DocumentWriteResult {
 
 fn normalized_term_for_field(value: &str, field: &str, mapping: &IndexMapping) -> String {
     mapping.analyzer(field).first_term(value)
+}
+
+fn normalized_terms_for_field(value: &str, field: &str, mapping: &IndexMapping) -> Vec<String> {
+    mapping.analyzer(field).terms(value)
 }
 
 fn indexed_fields_for_document(document: &Value, mapping: &IndexMapping) -> Vec<(String, String)> {
@@ -561,6 +608,14 @@ impl AppState {
         store.indices.get(index).map(|data| data.mapping_value())
     }
 
+    pub fn index_mapping(&self, index: &str) -> Option<IndexMapping> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.get(index).map(|data| data.mapping.clone())
+    }
+
     pub fn index_metadata(&self, index: &str) -> Option<IndexMetadata> {
         let store = self
             .store
@@ -789,6 +844,26 @@ impl AppState {
             .collect()
     }
 
+    pub fn documents_by_ids(&self, index: &str, ids: &[String]) -> Vec<StoredDocument> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let Some(data) = store.indices.get(index) else {
+            return Vec::new();
+        };
+
+        ids.iter()
+            .filter_map(|id| {
+                data.documents.get(id).map(|source| StoredDocument {
+                    index: index.to_owned(),
+                    id: id.clone(),
+                    source: source.clone(),
+                })
+            })
+            .collect()
+    }
+
     pub fn documents_for_term(&self, index: &str, field: &str, value: &str) -> Vec<String> {
         let store = self
             .store
@@ -798,6 +873,22 @@ impl AppState {
             .indices
             .get(index)
             .map_or_else(Vec::new, |data| data.term_hits(field, value))
+    }
+
+    pub fn documents_for_match(
+        &self,
+        index: &str,
+        field: &str,
+        value: &str,
+        require_all_terms: bool,
+    ) -> Vec<String> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.get(index).map_or_else(Vec::new, |data| {
+            data.match_hits(field, value, require_all_terms)
+        })
     }
 
     pub fn term_matches_count(&self, index: &str, field: &str, value: &str) -> usize {

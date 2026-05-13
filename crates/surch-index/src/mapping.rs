@@ -84,6 +84,13 @@ impl AnalyzerName {
             .unwrap_or_default()
     }
 
+    pub fn terms(&self, text: &str) -> Vec<String> {
+        self.token_stream(text)
+            .into_iter()
+            .map(|token| token.term)
+            .collect()
+    }
+
     fn token_stream(&self, text: &str) -> Vec<surch_analysis::Token> {
         match self {
             Self::Standard => StandardAnalyzer.token_stream(text),
@@ -304,6 +311,7 @@ pub enum MappingError {
 
 pub fn infer_field_type(value: &Value) -> FieldType {
     match value {
+        Value::String(text) if is_numeric_string(text) => FieldType::Keyword,
         Value::String(_) => FieldType::Text,
         Value::Number(number) => {
             if number.is_f64() {
@@ -325,4 +333,8 @@ pub fn infer_field_type(value: &Value) -> FieldType {
         Value::Object(_) => FieldType::Object,
         Value::Null => FieldType::Unknown,
     }
+}
+
+fn is_numeric_string(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|character| character.is_ascii_digit())
 }

@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
+use surch_index::mapping::IndexMapping;
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
@@ -257,38 +258,71 @@ fn documents_for_ids(state: &AppState, index: &str, ids: &[String]) -> Vec<Store
     if ids.is_empty() {
         return Vec::new();
     }
-
-    let wanted = ids.iter().collect::<BTreeSet<_>>();
-    state
-        .documents(index)
-        .into_iter()
-        .filter(|document| wanted.contains(&document.id))
-        .collect()
+    state.documents_by_ids(index, ids)
 }
 
-fn intersect_term_clauses(
+fn posting_candidate_ids(
     state: &AppState,
     index: &str,
-    queries: &[SearchQuery],
-) -> Option<Vec<String>> {
-    let mut matches: Option<BTreeSet<String>> = None;
-    for query in queries {
-        match query {
-            SearchQuery::Term { field, value } => {
-                let current: BTreeSet<String> = state
-                    .documents_for_term(index, field, value)
-                    .into_iter()
-                    .collect();
+    query: &SearchQuery,
+) -> Option<BTreeSet<String>> {
+    match query {
+        SearchQuery::Term { field, value } => Some(
+            state
+                .documents_for_term(index, field, value)
+                .into_iter()
+                .collect(),
+        ),
+        SearchQuery::Match {
+            field,
+            value,
+            operator,
+        } => Some(
+            state
+                .documents_for_match(index, field, value, *operator == MatchOperator::And)
+                .into_iter()
+                .collect(),
+        ),
+        SearchQuery::MultiMatch {
+            query,
+            fields,
+            operator,
+        } => {
+            let mut matches = BTreeSet::new();
+            for field in fields {
+                matches.extend(state.documents_for_match(
+                    index,
+                    field,
+                    query,
+                    *operator == MatchOperator::And,
+                ));
+            }
+            Some(matches)
+        }
+        SearchQuery::BoolMust(queries) => {
+            let mut matches: Option<BTreeSet<String>> = None;
+            let mut used_postings = false;
+            for query in queries {
+                let Some(current) = posting_candidate_ids(state, index, query) else {
+                    continue;
+                };
+                used_postings = true;
                 matches = Some(match matches {
                     Some(previous) => previous.intersection(&current).cloned().collect(),
                     None => current,
                 });
+                if matches.as_ref().is_some_and(BTreeSet::is_empty) {
+                    break;
+                }
             }
-            _ => return None,
+            if used_postings {
+                matches
+            } else {
+                None
+            }
         }
+        _ => None,
     }
-
-    matches.map(|ids: BTreeSet<String>| ids.into_iter().collect())
 }
 
 /// Axum handler for the OpenSearch-compatible `/{index}/_search` endpoint.
@@ -383,18 +417,35 @@ fn match_documents_for_index(
     index: &str,
     query: Option<&SearchQuery>,
 ) -> Vec<ScoredDocument> {
+    let mapping = state.index_mapping(index).unwrap_or_default();
     let plain = match query {
         None => state.documents(index),
         Some(query) => match query {
             SearchQuery::Term { field, value } => documents_by_term(state, index, field, value),
-            SearchQuery::BoolMust(queries) => {
-                if let Some(ids) = intersect_term_clauses(state, index, queries) {
+            SearchQuery::BoolMust(_) => {
+                if let Some(ids) = posting_candidate_ids(state, index, query) {
+                    let ids = ids.into_iter().collect::<Vec<_>>();
+                    documents_for_ids(state, index, &ids)
+                        .into_iter()
+                        .filter(|document| query_matches(query, &document.source, &mapping))
+                        .collect()
+                } else {
+                    state
+                        .documents(index)
+                        .into_iter()
+                        .filter(|document| query_matches(query, &document.source, &mapping))
+                        .collect()
+                }
+            }
+            SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. } => {
+                if let Some(ids) = posting_candidate_ids(state, index, query) {
+                    let ids = ids.into_iter().collect::<Vec<_>>();
                     documents_for_ids(state, index, &ids)
                 } else {
                     state
                         .documents(index)
                         .into_iter()
-                        .filter(|document| query_matches(query, &document.source))
+                        .filter(|document| query_matches(query, &document.source, &mapping))
                         .collect()
                 }
             }
@@ -402,7 +453,7 @@ fn match_documents_for_index(
             _ => state
                 .documents(index)
                 .into_iter()
-                .filter(|document| query_matches(query, &document.source))
+                .filter(|document| query_matches(query, &document.source, &mapping))
                 .collect(),
         },
     };
@@ -465,28 +516,34 @@ fn score_for_query(
 #[derive(Debug, Default)]
 struct SearchScoringContext {
     doc_count: u64,
+    mapping: IndexMapping,
     avg_doc_len_by_field: BTreeMap<String, f64>,
     doc_freq_by_field_token: BTreeMap<(String, String), u64>,
 }
 
 impl SearchScoringContext {
     fn new(state: &AppState, index: &str, query: &SearchQuery) -> Self {
+        let mapping = state.index_mapping(index).unwrap_or_default();
         let doc_count = state.count(index);
         if doc_count == 0 {
-            return Self::default();
+            return Self {
+                mapping,
+                ..Self::default()
+            };
         }
 
         let mut field_tokens = BTreeMap::<String, BTreeSet<String>>::new();
-        collect_scoring_field_tokens(query, &mut field_tokens);
+        collect_scoring_field_tokens(query, &mapping, &mut field_tokens);
         if field_tokens.is_empty() {
             return Self {
                 doc_count,
+                mapping,
                 ..Self::default()
             };
         }
 
         let fields = field_tokens.keys().cloned().collect::<BTreeSet<_>>();
-        let avg_doc_len_by_field = compute_avg_doc_lens(state, index, &fields);
+        let avg_doc_len_by_field = compute_avg_doc_lens(state, index, &fields, &mapping);
         let mut doc_freq_by_field_token = BTreeMap::new();
         for (field, tokens) in field_tokens {
             for token in tokens {
@@ -497,6 +554,7 @@ impl SearchScoringContext {
 
         Self {
             doc_count,
+            mapping,
             avg_doc_len_by_field,
             doc_freq_by_field_token,
         }
@@ -516,22 +574,23 @@ impl SearchScoringContext {
 
 fn collect_scoring_field_tokens(
     query: &SearchQuery,
+    mapping: &IndexMapping,
     field_tokens: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     match query {
         SearchQuery::Match { field, value, .. }
         | SearchQuery::MatchPhrase { field, value }
         | SearchQuery::Fuzzy { field, value, .. } => {
-            insert_scoring_tokens(field_tokens, field, value);
+            insert_scoring_tokens(field_tokens, mapping, field, value);
         }
         SearchQuery::MultiMatch { query, fields, .. } => {
             for field in fields {
-                insert_scoring_tokens(field_tokens, field, query);
+                insert_scoring_tokens(field_tokens, mapping, field, query);
             }
         }
         SearchQuery::BoolMust(clauses) => {
             for clause in clauses {
-                collect_scoring_field_tokens(clause, field_tokens);
+                collect_scoring_field_tokens(clause, mapping, field_tokens);
             }
         }
         _ => {}
@@ -540,10 +599,11 @@ fn collect_scoring_field_tokens(
 
 fn insert_scoring_tokens(
     field_tokens: &mut BTreeMap<String, BTreeSet<String>>,
+    mapping: &IndexMapping,
     field: &str,
     query: &str,
 ) {
-    let tokens = tokenize_for_search(query);
+    let tokens = mapping.analyzer(field).terms(query);
     if tokens.is_empty() {
         return;
     }
@@ -559,11 +619,11 @@ fn bm25_field_score(
     query: &str,
     source: &Value,
 ) -> Option<f64> {
-    let query_tokens = tokenize_for_search(query);
+    let query_tokens = scoring_context.mapping.analyzer(field).terms(query);
     if query_tokens.is_empty() || scoring_context.doc_count == 0 {
         return None;
     }
-    let field_tokens = field_tokens_for_source(source, field);
+    let field_tokens = field_tokens_for_source(source, field, &scoring_context.mapping);
     if field_tokens.is_empty() {
         return None;
     }
@@ -604,9 +664,9 @@ fn bm25_field_score(
     }
 }
 
-fn field_tokens_for_source(source: &Value, field: &str) -> Vec<String> {
+fn field_tokens_for_source(source: &Value, field: &str, mapping: &IndexMapping) -> Vec<String> {
     field_text(source, field)
-        .map(|text| tokenize_for_search(&text))
+        .map(|text| mapping.analyzer(field).terms(&text))
         .unwrap_or_default()
 }
 
@@ -614,6 +674,7 @@ fn compute_avg_doc_lens(
     state: &AppState,
     index: &str,
     fields: &BTreeSet<String>,
+    mapping: &IndexMapping,
 ) -> BTreeMap<String, f64> {
     let documents = state.documents(index);
     let mut totals = fields
@@ -623,7 +684,7 @@ fn compute_avg_doc_lens(
 
     for doc in &documents {
         for field in fields {
-            let tokens = field_tokens_for_source(&doc.source, field);
+            let tokens = field_tokens_for_source(&doc.source, field, mapping);
             if !tokens.is_empty() {
                 let (total_len, docs_with_field) = totals
                     .get_mut(field)
@@ -1587,19 +1648,23 @@ fn parse_non_negative_integer(field: &str, value: &Value) -> Result<u64, OpenSea
     })
 }
 
-fn query_matches(query: &SearchQuery, source: &Value) -> bool {
+fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) -> bool {
     match query {
         SearchQuery::MatchAll => true,
         SearchQuery::Match {
             field,
             value,
             operator,
-        } => field_matches(source, field, value, *operator),
+        } => field_matches_with_mapping(source, field, value, *operator, mapping),
         SearchQuery::MatchPhrase { field, value } => {
-            match_phrase_field_matches(source, field, value)
+            match_phrase_field_matches_with_mapping(source, field, value, mapping)
         }
-        SearchQuery::Term { field, value } => term_field_matches(source, field, value),
-        SearchQuery::BoolMust(queries) => queries.iter().all(|query| query_matches(query, source)),
+        SearchQuery::Term { field, value } => {
+            term_field_matches_with_mapping(source, field, value, mapping)
+        }
+        SearchQuery::BoolMust(queries) => queries
+            .iter()
+            .all(|query| query_matches(query, source, mapping)),
         SearchQuery::Fuzzy {
             field,
             value,
@@ -1609,15 +1674,33 @@ fn query_matches(query: &SearchQuery, source: &Value) -> bool {
         SearchQuery::Exists { field } => exists_field_matches(source, field),
         SearchQuery::Terms { field, values } => values
             .iter()
-            .any(|value| term_field_matches(source, field, value)),
+            .any(|value| term_field_matches_with_mapping(source, field, value, mapping)),
         SearchQuery::Prefix { field, value } => prefix_field_matches(source, field, value),
         SearchQuery::Wildcard { field, pattern } => wildcard_field_matches(source, field, pattern),
         SearchQuery::MultiMatch {
             query,
             fields,
             operator,
-        } => multi_match_matches(source, fields, query, *operator),
+        } => multi_match_matches_with_mapping(source, fields, query, *operator, mapping),
     }
+}
+
+fn field_matches_with_mapping(
+    source: &Value,
+    field: &str,
+    query: &str,
+    operator: MatchOperator,
+    mapping: &IndexMapping,
+) -> bool {
+    let query_tokens = mapping.analyzer(field).terms(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    let field_tokens = field_tokens_for_source(source, field, mapping);
+    if field_tokens.is_empty() {
+        return false;
+    }
+    tokens_match(&query_tokens, &field_tokens, operator)
 }
 
 fn field_matches(source: &Value, field: &str, query: &str, operator: MatchOperator) -> bool {
@@ -1632,6 +1715,10 @@ fn field_matches(source: &Value, field: &str, query: &str, operator: MatchOperat
     if field_tokens.is_empty() {
         return false;
     }
+    tokens_match(&query_tokens, &field_tokens, operator)
+}
+
+fn tokens_match(query_tokens: &[String], field_tokens: &[String], operator: MatchOperator) -> bool {
     match operator {
         MatchOperator::Or => query_tokens
             .iter()
@@ -1642,34 +1729,37 @@ fn field_matches(source: &Value, field: &str, query: &str, operator: MatchOperat
     }
 }
 
-fn match_phrase_field_matches(source: &Value, field: &str, query: &str) -> bool {
-    let query_tokens = tokenize_for_search(query);
+fn match_phrase_field_matches_with_mapping(
+    source: &Value,
+    field: &str,
+    query: &str,
+    mapping: &IndexMapping,
+) -> bool {
+    let query_tokens = mapping.analyzer(field).terms(query);
     if query_tokens.is_empty() {
         return false;
     }
 
-    field_text(source, field)
-        .map(|value| {
-            tokenize_for_search(&value)
-                .windows(query_tokens.len())
-                .any(|field_window| field_window == query_tokens.as_slice())
-        })
-        .unwrap_or(false)
+    let field_tokens = field_tokens_for_source(source, field, mapping);
+    field_tokens
+        .windows(query_tokens.len())
+        .any(|field_window| field_window == query_tokens.as_slice())
 }
 
-fn term_field_matches(source: &Value, field: &str, query: &str) -> bool {
-    let query = normalize_text(query);
+fn term_field_matches_with_mapping(
+    source: &Value,
+    field: &str,
+    query: &str,
+    mapping: &IndexMapping,
+) -> bool {
+    let query = mapping.analyzer(field).first_term(query);
     if query.is_empty() {
         return false;
     }
 
-    field_text(source, field)
-        .map(|value| {
-            tokenize_for_search(&value)
-                .iter()
-                .any(|field_token| field_token == &query)
-        })
-        .unwrap_or(false)
+    field_tokens_for_source(source, field, mapping)
+        .iter()
+        .any(|field_token| field_token == &query)
 }
 
 pub fn multi_match_matches(
@@ -1681,6 +1771,18 @@ pub fn multi_match_matches(
     fields
         .iter()
         .any(|field| field_matches(source, field, query, operator))
+}
+
+fn multi_match_matches_with_mapping(
+    source: &Value,
+    fields: &[String],
+    query: &str,
+    operator: MatchOperator,
+    mapping: &IndexMapping,
+) -> bool {
+    fields
+        .iter()
+        .any(|field| field_matches_with_mapping(source, field, query, operator, mapping))
 }
 
 pub fn prefix_field_matches(source: &Value, field: &str, prefix: &str) -> bool {
@@ -1877,17 +1979,38 @@ fn sort_scored_documents(
     }
     documents.sort_by(|left, right| {
         for clause in clauses {
-            let ordering = compare_field(
-                left.doc.source.get(&clause.field),
-                right.doc.source.get(&clause.field),
-                clause.order,
-            );
+            let ordering = compare_sort_clause(left, right, clause);
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
             }
         }
         std::cmp::Ordering::Equal
     });
+}
+
+fn compare_sort_clause(
+    left: &ScoredDocument,
+    right: &ScoredDocument,
+    clause: &SortClause,
+) -> std::cmp::Ordering {
+    if clause.field == "_score" {
+        return compare_score(left.score, right.score, clause.order);
+    }
+    compare_field(
+        left.doc.source.get(&clause.field),
+        right.doc.source.get(&clause.field),
+        clause.order,
+    )
+}
+
+fn compare_score(left: f64, right: f64, order: SortOrder) -> std::cmp::Ordering {
+    let base = left
+        .partial_cmp(&right)
+        .unwrap_or(std::cmp::Ordering::Equal);
+    match order {
+        SortOrder::Asc => base,
+        SortOrder::Desc => base.reverse(),
+    }
 }
 
 fn compare_field(
