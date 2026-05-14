@@ -90,10 +90,48 @@ This is a net win for the BAN search workload. The +60% bulk cost is
 the indexing-time cost we deliberately accepted to remove per-request
 source tokenization. The change is safe to merge.
 
+## Reference: Surch v2.1 vs OpenSearch 2.17.1 on the same machine
+
+Same Paris 25k dataset, same machine, same bench script, each engine
+run solo (the other stopped). OpenSearch was started via
+`scripts/bench/opensearch-start.sh` with the default 512 MB heap and
+2.17.1 image. Cleanest paired run captured at the end of the session
+(system relatively quiet):
+
+| Operation | Surch v2.1 took | OpenSearch 2.17.1 took | Surch vs OS |
+| --- | ---: | ---: | --- |
+| `_bulk` Paris 25k | 1048 ms | 7442 ms | Surch ~7x faster |
+| `_search` `Rue Payenne` | 96 ms | 9 ms | Surch ~10x slower |
+| `_search` `Place Patrice Chereau` | 4 ms | 8 ms | Surch ~2x faster |
+
+Important caveats on this comparison:
+
+- OpenSearch returns `hits.total.value = 10000` (default
+  `track_total_hits` cap), Surch returns the exact `18194`. OpenSearch
+  is doing less collection work on the high-cardinality query.
+- OpenSearch's Lucene scoring uses block-max WAND skipping; Surch
+  currently scores every matching document. This is the main reason
+  OS is faster on `Rue Payenne`. The two low-cardinality runs are
+  comparable because skipping does not buy much when there are only
+  559 matches to score.
+- Three solo runs of each engine showed bulk between 1.0 s and 9.0 s
+  for Surch and between 3.4 s and 25.3 s for OpenSearch on this host.
+  System load (`vite dev`, `svelte-check`, `tsup`, browsers) drifted
+  during the session. The numbers in the table are from the cleanest
+  paired window; medians across all runs preserve the same ordering.
+- Bulk numbers should not be read as a publishable Surch/OpenSearch
+  ratio: OpenSearch is doing real segment writes, refreshes and
+  durability while Surch is an in-memory router, so this is an
+  apples-to-oranges difference on ingestion. The search side is the
+  closer comparison.
+
 Follow-ups that remain open from
 `docs/poc/reports/ban-api-performance-debug-0dced7d.md`:
 
 - step 1 (postings-backed candidates) is still partial — TopDocs-style
   collection before source hydration is not implemented;
+- the next obvious search-side win is Lucene-style block-max WAND or
+  doc-id skipping during scoring, which would close most of the
+  `Rue Payenne` gap;
 - steps 3 and 4 (MatchID fixtures alignment and go/no-go thresholds)
   have not started.
