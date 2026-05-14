@@ -42,6 +42,20 @@ pub struct StoredDocument {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct FieldScoringStats {
+    pub doc_count: u64,
+    pub avg_doc_len: f64,
+    pub norms_enabled: bool,
+    pub doc_len_by_doc_id: BTreeMap<u32, u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TermScoringStats {
+    pub doc_freq: u64,
+    pub term_freq_by_doc_id: BTreeMap<u32, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct IndexMetadata {
     pub aliases: BTreeMap<String, Value>,
     pub mapping: Value,
@@ -166,6 +180,36 @@ impl InMemoryIndex {
 
     fn count_term_hits(&self, field: &str, value: &str) -> usize {
         self.term_hits(field, value).len()
+    }
+
+    fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats> {
+        let stats = self.index.field_stats(field)?;
+        let norms_enabled = self.mapping.norms_enabled(field);
+        let avg_doc_len = if norms_enabled { stats.avg_doc_len()? } else { 1.0 };
+        let doc_len_by_doc_id = if norms_enabled {
+            stats.doc_len_by_doc_id.clone()
+        } else {
+            BTreeMap::new()
+        };
+
+        Some(FieldScoringStats {
+            doc_count: stats.doc_count,
+            avg_doc_len,
+            norms_enabled,
+            doc_len_by_doc_id,
+        })
+    }
+
+    fn term_scoring_stats(&self, field: &str, term: &str) -> TermScoringStats {
+        let mut term_freq_by_doc_id = BTreeMap::<u32, u64>::new();
+        for posting in self.index.postings(field, term).into_iter().flatten() {
+            *term_freq_by_doc_id.entry(posting.doc_id).or_default() += u64::from(posting.freq);
+        }
+
+        TermScoringStats {
+            doc_freq: term_freq_by_doc_id.len() as u64,
+            term_freq_by_doc_id,
+        }
     }
 
     fn match_hits(&self, field: &str, value: &str, require_all_terms: bool) -> Vec<String> {
@@ -889,6 +933,44 @@ impl AppState {
         store.indices.get(index).map_or_else(Vec::new, |data| {
             data.match_hits(field, value, require_all_terms)
         })
+    }
+
+    pub fn internal_doc_ids(&self, index: &str, public_ids: &[&str]) -> Vec<Option<u32>> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let Some(data) = store.indices.get(index) else {
+            return vec![None; public_ids.len()];
+        };
+        public_ids
+            .iter()
+            .map(|id| data.document_ids.get(*id).copied())
+            .collect()
+    }
+
+    pub fn field_scoring_stats(&self, index: &str, field: &str) -> Option<FieldScoringStats> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .and_then(|data| data.field_scoring_stats(field))
+    }
+
+    pub fn term_scoring_stats(&self, index: &str, field: &str, term: &str) -> TermScoringStats {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map_or_else(TermScoringStats::default, |data| {
+                data.term_scoring_stats(field, term)
+            })
     }
 
     pub fn term_matches_count(&self, index: &str, field: &str, value: &str) -> usize {

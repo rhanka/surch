@@ -1,4 +1,5 @@
 use surch_index::document_index::{DocumentIndex, DocumentIndexError};
+use surch_index::mapping::{FieldMapping, FieldType, IndexMapping};
 use surch_index::stored_fields::StoredValue;
 
 const DOCUMENT_INDEX_CLASSIC: &str =
@@ -85,6 +86,57 @@ fn document_index_batch_adds_documents_and_builds_terms_once() {
     assert_eq!(fast.len(), 2);
     assert_eq!(fast[0].doc_id, 0);
     assert_eq!(fast[1].doc_id, 1);
+}
+
+#[test]
+fn document_index_records_field_lengths_during_analysis() {
+    let mut index = DocumentIndex::new();
+
+    index
+        .add_documents_with_mapping(
+            [(0, [("body", "rust rust search")]), (1, [("body", "rust")])],
+            &Default::default(),
+        )
+        .expect("batch add documents");
+
+    let stats = index.field_stats("body").expect("body stats");
+    assert_eq!(stats.doc_count, 2);
+    assert_eq!(stats.total_terms, 4);
+    assert_eq!(stats.doc_len(0), Some(3));
+    assert_eq!(stats.doc_len(1), Some(1));
+    assert_eq!(stats.avg_doc_len(), Some(2.0));
+}
+
+#[test]
+fn document_index_omits_field_lengths_when_norms_are_disabled() {
+    let mut mapping = IndexMapping::new();
+    mapping.set_field_mapping(
+        "body",
+        FieldMapping::with_norms(FieldType::Text, None, Some(false)),
+    );
+    let mut index = DocumentIndex::new();
+
+    index
+        .add_documents_with_mapping(
+            [(0, [("body", "rust rust search")]), (1, [("body", "rust")])],
+            &mapping,
+        )
+        .expect("batch add documents");
+
+    let stats = index.field_stats("body").expect("body stats");
+    assert_eq!(stats.doc_count, 2);
+    assert_eq!(stats.total_terms, 0);
+    assert_eq!(stats.doc_len(0), None);
+    assert_eq!(stats.doc_len(1), None);
+    assert_eq!(stats.avg_doc_len(), None);
+
+    let rust = index
+        .postings("body", "rust")
+        .expect("body/rust postings")
+        .collect::<Vec<_>>();
+    assert_eq!(rust.len(), 2);
+    assert_eq!(rust[0].freq, 2);
+    assert_eq!(rust[1].freq, 1);
 }
 
 #[test]

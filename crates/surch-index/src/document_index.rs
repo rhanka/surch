@@ -28,6 +28,42 @@ pub struct DocumentIndex {
     documents: BTreeMap<u32, StoredDocument>,
     postings_builder: PostingsBuilder,
     terms: TermDictionary,
+    field_stats: BTreeMap<String, FieldLengthStats>,
+}
+
+/// Per-field length statistics recorded during analysis for BM25 norms.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FieldLengthStats {
+    pub doc_count: u64,
+    pub total_terms: u64,
+    pub doc_len_by_doc_id: BTreeMap<u32, u64>,
+}
+
+impl FieldLengthStats {
+    fn record_doc_len(&mut self, doc_id: u32, doc_len: u64, norms_enabled: bool) {
+        if doc_len == 0 {
+            return;
+        }
+        if !norms_enabled {
+            self.doc_count += 1;
+            return;
+        }
+        if let Some(previous) = self.doc_len_by_doc_id.insert(doc_id, doc_len) {
+            self.total_terms -= previous;
+        } else {
+            self.doc_count += 1;
+        }
+        self.total_terms += doc_len;
+    }
+
+    pub fn avg_doc_len(&self) -> Option<f64> {
+        (self.doc_count > 0 && self.total_terms > 0)
+            .then(|| self.total_terms as f64 / self.doc_count as f64)
+    }
+
+    pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
+        self.doc_len_by_doc_id.get(&doc_id).copied()
+    }
 }
 
 impl DocumentIndex {
@@ -105,6 +141,7 @@ impl DocumentIndex {
         self.documents.clear();
         self.postings_builder = PostingsBuilder::new();
         self.terms = TermDictionary::default();
+        self.field_stats.clear();
     }
 
     pub fn doc_ids(&self) -> Vec<u32> {
@@ -121,6 +158,10 @@ impl DocumentIndex {
 
     pub fn postings(&self, field: &str, term: &str) -> Option<PostingsEnum<'_>> {
         self.terms.postings(field, term)
+    }
+
+    pub fn field_stats(&self, field: &str) -> Option<&FieldLengthStats> {
+        self.field_stats.get(field)
     }
 
     pub fn live_doc_count(&self) -> usize {
@@ -142,16 +183,39 @@ impl DocumentIndex {
             document.insert(name.clone(), StoredValue::String(value.clone()))?;
         }
 
+        let mut field_lengths = BTreeMap::<String, (u64, bool)>::new();
         for (field, value) in &fields {
             let field_mapping = mapping.field(field);
             let analyzer = field_mapping
                 .map_or(AnalyzerName::default_for(FieldType::Text), |field| {
                     field.analyzer()
                 });
+            let norms_enabled = field_mapping.is_none_or(|field| field.norms_enabled());
 
-            for ((field, term), positions) in analyzed_terms(analyzer, field, value) {
+            let analyzed_terms = analyzed_terms(analyzer, field, value);
+            let token_count = analyzed_terms
+                .values()
+                .map(|positions| positions.len() as u64)
+                .sum::<u64>();
+            if token_count > 0 {
+                let (doc_len, field_norms_enabled) = field_lengths
+                    .entry(field.clone())
+                    .or_insert((0, norms_enabled));
+                *doc_len += token_count;
+                *field_norms_enabled = *field_norms_enabled || norms_enabled;
+            }
+
+            for ((field, term), positions) in analyzed_terms {
                 self.postings_builder.add(field, term, doc_id, positions)?;
             }
+        }
+
+        for (field, (doc_len, norms_enabled)) in field_lengths {
+            self.field_stats.entry(field).or_default().record_doc_len(
+                doc_id,
+                doc_len,
+                norms_enabled,
+            );
         }
 
         self.documents.insert(doc_id, document);

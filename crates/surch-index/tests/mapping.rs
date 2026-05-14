@@ -18,6 +18,19 @@ fn index_mapping_from_properties_value_builds_fields_with_text_default_and_analy
 }
 
 #[test]
+fn index_mapping_preserves_explicit_norms_option() {
+    let properties = serde_json::json!({
+        "body": { "type": "text", "norms": false }
+    });
+
+    let mapping = IndexMapping::from_properties_value(&properties).expect("mapping should parse");
+    assert_eq!(
+        mapping.as_value()["properties"]["body"]["norms"],
+        serde_json::json!(false)
+    );
+}
+
+#[test]
 fn index_mapping_infer_from_document_indexes_scalar_and_array_types() {
     let document = serde_json::json!({
         "title": "Rust Search",

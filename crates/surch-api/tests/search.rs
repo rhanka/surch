@@ -1940,6 +1940,51 @@ async fn score_sort_clause_orders_by_score() {
 }
 
 #[tokio::test]
+async fn match_query_respects_norms_disabled_for_text_fields() {
+    let router = app_router();
+    let create_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"body":{"type":"text","norms":false}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    index_product(&router, "short", r#"{"body":"rust"}"#).await;
+    index_product(
+        &router,
+        "long",
+        r#"{"body":"rust storage engine search parser"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"body":"rust"}},"sort":[{"_id":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2);
+    let scores = hits
+        .iter()
+        .map(|hit| hit["_score"].as_f64().expect("score"))
+        .collect::<Vec<_>>();
+    assert!(
+        (scores[0] - scores[1]).abs() < f64::EPSILON,
+        "norms disabled should make equal term frequency scores equal: {scores:?}"
+    );
+}
+
+#[tokio::test]
 async fn match_query_defaults_to_or_operator_across_query_tokens() {
     let router = app_router();
     index_product(&router, "sku-rust", r#"{"description":"rust internals"}"#).await;

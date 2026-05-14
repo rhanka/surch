@@ -124,19 +124,34 @@ impl AnalyzerName {
 pub struct FieldMapping {
     pub field_type: FieldType,
     pub analyzer: Option<AnalyzerName>,
+    pub norms: Option<bool>,
 }
 
 impl FieldMapping {
     pub fn new(field_type: FieldType, analyzer: Option<AnalyzerName>) -> Self {
+        Self::with_norms(field_type, analyzer, None)
+    }
+
+    pub fn with_norms(
+        field_type: FieldType,
+        analyzer: Option<AnalyzerName>,
+        norms: Option<bool>,
+    ) -> Self {
         Self {
             field_type,
             analyzer,
+            norms,
         }
     }
 
     pub fn analyzer(&self) -> AnalyzerName {
         self.analyzer
             .unwrap_or_else(|| AnalyzerName::default_for(self.field_type))
+    }
+
+    pub fn norms_enabled(&self) -> bool {
+        self.norms
+            .unwrap_or_else(|| default_norms_for(self.field_type))
     }
 
     fn as_value(&self) -> Value {
@@ -153,8 +168,16 @@ impl FieldMapping {
             );
         }
 
+        if let Some(norms) = self.norms {
+            object.insert("norms".to_owned(), Value::Bool(norms));
+        }
+
         Value::Object(object)
     }
+}
+
+fn default_norms_for(field_type: FieldType) -> bool {
+    matches!(field_type, FieldType::Text)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -176,6 +199,13 @@ impl IndexMapping {
             .get(field)
             .map(|mapping| mapping.analyzer())
             .unwrap_or_else(|| AnalyzerName::default_for(FieldType::Text))
+    }
+
+    pub fn norms_enabled(&self, field: &str) -> bool {
+        self.fields
+            .get(field)
+            .map(FieldMapping::norms_enabled)
+            .unwrap_or_else(|| default_norms_for(FieldType::Text))
     }
 
     pub fn has_field(&self, field: &str) -> bool {
@@ -277,6 +307,19 @@ impl IndexMapping {
                 None => None,
             };
 
+            let norms = match field_definition.get("norms") {
+                Some(value) => {
+                    Some(
+                        value
+                            .as_bool()
+                            .ok_or_else(|| MappingError::NormsNotBoolean {
+                                field: field.clone(),
+                            })?,
+                    )
+                }
+                None => None,
+            };
+
             if field_type != FieldType::Text && analyzer.is_some() {
                 return Err(MappingError::AnalyzerNotSupported {
                     field: field.clone(),
@@ -284,7 +327,10 @@ impl IndexMapping {
                 });
             }
 
-            mapping.set_field_mapping(field.to_owned(), FieldMapping::new(field_type, analyzer));
+            mapping.set_field_mapping(
+                field.to_owned(),
+                FieldMapping::with_norms(field_type, analyzer, norms),
+            );
         }
 
         Ok(mapping)
@@ -307,6 +353,8 @@ pub enum MappingError {
     UnsupportedAnalyzer { field: String, analyzer: String },
     #[error("field `{field}` analyzer is only supported on text fields")]
     AnalyzerNotSupported { field: String, field_type: String },
+    #[error("field `{field}` norms must be a boolean")]
+    NormsNotBoolean { field: String },
 }
 
 pub fn infer_field_type(value: &Value) -> FieldType {
