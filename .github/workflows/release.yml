@@ -93,12 +93,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Download all binary artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: bin-*
           merge-multiple: true
+
+      - name: Install cargo-cyclonedx
+        run: cargo install --locked cargo-cyclonedx
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # cargo-cyclonedx writes one bom.json per crate at the workspace
+          # root; we merge by taking the workspace-level bom and renaming
+          # it to surch-sbom-<tag>.cdx.json for the release asset.
+          cargo cyclonedx --format json --all --target-in-filename
+          # The workspace bom lives at ./bom.json; per-crate boms sit at
+          # crates/<name>/bom.json. We ship the workspace one as the SBOM.
+          if [ -f bom.json ]; then
+            cp bom.json "dist/surch-sbom-${GITHUB_REF_NAME}.cdx.json"
+          else
+            # Fallback: prefer the surch-api crate bom, otherwise the first
+            # bom.json we find under crates/.
+            SBOM_SRC="$(find crates -maxdepth 3 -name 'bom.json' | head -n 1)"
+            if [ -z "${SBOM_SRC}" ]; then
+              echo "cargo-cyclonedx produced no bom.json" >&2
+              exit 1
+            fi
+            cp "${SBOM_SRC}" "dist/surch-sbom-${GITHUB_REF_NAME}.cdx.json"
+          fi
+          ls -la "dist/surch-sbom-${GITHUB_REF_NAME}.cdx.json"
+
+      - name: Upload SBOM artifact for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: dist/surch-sbom-*.cdx.json
+          retention-days: 7
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -108,13 +145,20 @@ jobs:
           files: |
             dist/surch-api-*
             dist/surch-api-*.sha256
+            dist/surch-sbom-*.cdx.json
 
   publish-image:
     name: publish-docker-image
     runs-on: ubuntu-22.04
-    needs: build-binaries
+    needs: [build-binaries, publish-release]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: dist
 
       - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
@@ -165,3 +209,20 @@ jobs:
           # Signing the immutable digest covers every tag pushed by
           # docker/metadata-action: they all resolve to the same manifest.
           cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attest CycloneDX SBOM against image digest
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+          IMAGE: ghcr.io/${{ github.repository_owner }}/surch
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SBOM="dist/surch-sbom-${GITHUB_REF_NAME}.cdx.json"
+          if [ ! -f "${SBOM}" ]; then
+            echo "SBOM ${SBOM} missing — publish-release must have produced it" >&2
+            exit 1
+          fi
+          cosign attest --yes \
+            --predicate "${SBOM}" \
+            --type cyclonedx \
+            "${IMAGE}@${DIGEST}"

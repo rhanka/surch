@@ -25,6 +25,7 @@ SCW_TAG               := surch-bench-$(SHA)-$(shell date +%s)
         bench-smoke bench-local bench-recall bench-trec-covid \
         bench-stress bench-perf \
         bench-remote-scw bench-all report \
+        sbom \
         clean
 
 help:
@@ -46,6 +47,7 @@ help:
 	@echo "  release           cargo build --release --workspace"
 	@echo "  docker-build      build the multi-stage Docker image locally"
 	@echo "  docker-smoke      build the image, start it on port 7711, hit /"
+	@echo "  sbom              generate CycloneDX SBOM (bom.json) via cargo-cyclonedx"
 	@echo "  report            aggregate target/bench-reports/<sha>/*.json -> summary.md"
 
 # ---------------------------------------------------------------------------
@@ -162,6 +164,16 @@ docker-smoke: docker-build
 	@until curl -fsS --max-time 1 http://127.0.0.1:7711/ >/dev/null 2>&1; do sleep 0.3; done
 	@echo "container reports:" && curl -s http://127.0.0.1:7711/ | head -c 400 && echo
 	-@docker rm -f $(DOCKER_CONTAINER) >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
+# SBOM (CycloneDX)
+# ---------------------------------------------------------------------------
+# Generates one bom.json per crate at the workspace root + per crate dir.
+# CI re-runs this in publish-release and renames the workspace bom.json to
+# dist/surch-sbom-<tag>.cdx.json before attaching it to the release.
+sbom:
+	cargo install --locked cargo-cyclonedx
+	cargo cyclonedx --format json --output-pattern bom
 
 # ---------------------------------------------------------------------------
 # Clean

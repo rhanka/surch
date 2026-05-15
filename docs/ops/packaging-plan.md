@@ -80,6 +80,39 @@ release CI yet. The release profile in `Cargo.toml` already has
 - **Size target**: < 30 MB compressed. Reference: `opensearchproject/opensearch:2.11.0` ≈ 1.2 GB (anti-example), `getmeili/meilisearch` ≈ 150 MB, `quickwit/quickwit` ≈ 80 MB.
 - **Effort**: 1 day.
 
+#### SBOM (CycloneDX)
+
+The `release.yml` workflow ships a CycloneDX 1.5 SBOM alongside every
+tag and bound to the OCI image:
+
+1. `publish-release` installs `cargo-cyclonedx` and runs
+   `cargo cyclonedx --format json --all --target-in-filename`. The
+   workspace-level `bom.json` is renamed to
+   `dist/surch-sbom-<tag>.cdx.json` and:
+   - uploaded as an artifact (`sbom-cyclonedx`) for the next job,
+   - attached to the GitHub release as a public asset.
+2. `publish-image` downloads that artifact, then runs
+
+   ```
+   cosign attest --yes \
+     --predicate dist/surch-sbom-<tag>.cdx.json \
+     --type cyclonedx \
+     ghcr.io/rhanka/surch@<digest>
+   ```
+
+   so the SBOM is anchored on the same image digest as the `cosign
+   sign` signature. End users verify both with `cosign verify` +
+   `cosign verify-attestation --type cyclonedx`.
+
+A helper script `scripts/verify-release.sh <image-ref>` runs both
+checks for downstream consumers and prints the top 5 dependencies
+extracted from the verified SBOM payload. Locally, contributors can
+generate the same SBOM offline via `make sbom`.
+
+SPDX support is on the Phase D backlog; CycloneDX is the format
+required by most enterprise procurement flows today, so it is the
+one shipped first.
+
 ### 4. Snapshots compatible with the Elasticsearch SLM surface
 
 Implement the REST subset that real clients use:
