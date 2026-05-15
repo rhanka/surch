@@ -125,6 +125,18 @@ pub enum SearchQuery {
         minimum_should_match: u32,
         boost: f64,
     },
+    /// `function_score` wrapper around an inner query. matchID's
+    /// deces-backend uses this shape today as a no-op (empty
+    /// `functions`) to keep its codebase ready for future custom
+    /// scoring. Surch supports the wrapper, the top-level `boost`
+    /// multiplier, and an empty `functions` array. Non-empty
+    /// `functions`, `score_mode`, `boost_mode` and friends are parsed
+    /// for forward-compat but produce an error today — tracked as
+    /// "function_score scoring phase 2" in `docs/wp-d-matchid/`.
+    FunctionScore {
+        inner: Box<SearchQuery>,
+        boost: f64,
+    },
     Fuzzy {
         field: String,
         value: String,
@@ -1018,14 +1030,15 @@ fn maxscore_match(
 }
 
 fn is_scoring_query(query: &SearchQuery) -> bool {
-    matches!(
-        query,
+    match query {
         SearchQuery::Match { .. }
-            | SearchQuery::MatchPhrase { .. }
-            | SearchQuery::MultiMatch { .. }
-            | SearchQuery::Fuzzy { .. }
-            | SearchQuery::Bool { .. }
-    )
+        | SearchQuery::MatchPhrase { .. }
+        | SearchQuery::MultiMatch { .. }
+        | SearchQuery::Fuzzy { .. }
+        | SearchQuery::Bool { .. } => true,
+        SearchQuery::FunctionScore { inner, .. } => is_scoring_query(inner),
+        _ => false,
+    }
 }
 
 fn compute_max_score(documents: &[ScoredDocument], scoring_enabled: bool) -> Option<f64> {
@@ -1174,6 +1187,9 @@ fn score_for_query(
             base * *boost
         }
         SearchQuery::MatchAll { boost } => *boost,
+        SearchQuery::FunctionScore { inner, boost } => {
+            score_for_query(inner, internal_doc_id, scoring_context) * *boost
+        }
         _ => 1.0,
     }
 }
@@ -1259,6 +1275,9 @@ fn collect_scoring_field_tokens(
             for clause in must.iter().chain(filter.iter()).chain(should.iter()) {
                 collect_scoring_field_tokens(clause, mapping, field_tokens);
             }
+        }
+        SearchQuery::FunctionScore { inner, .. } => {
+            collect_scoring_field_tokens(inner, mapping, field_tokens);
         }
         _ => {}
     }
@@ -1821,6 +1840,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "prefix" => parse_prefix_query(query_body),
         "wildcard" => parse_wildcard_query(query_body),
         "multi_match" => parse_multi_match_query(query_body),
+        "function_score" => parse_function_score_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -2274,6 +2294,84 @@ fn parse_exists_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     Ok(SearchQuery::Exists { field })
 }
 
+/// Parse a `function_score` query body.
+///
+/// matchID's deces-backend uses `function_score` today as a pure
+/// wrapper (no `functions` declared) to keep the codebase ready for
+/// future custom scoring. This implementation accepts:
+///
+/// - `query` (required) — the inner query to wrap;
+/// - `boost` (optional, non-negative finite) — multiplicative scaling
+///   applied to the inner `_score`;
+/// - `functions: []` (optional empty array) — accepted for
+///   forward-compat, no scoring effect today;
+/// - `score_mode` / `boost_mode` (optional strings) — accepted only
+///   when there are no functions, since they would otherwise have
+///   no semantics to drive;
+/// - any unknown top-level key returns HTTP 400 so wire-shape drift
+///   is caught early.
+fn parse_function_score_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`function_score` must be an object",
+        )
+    })?;
+
+    let mut inner: Option<SearchQuery> = None;
+    let mut boost: f64 = 1.0;
+
+    for (key, body) in object {
+        match key.as_str() {
+            "query" => {
+                inner = Some(parse_search_query(body)?);
+            }
+            "boost" => boost = parse_boost(body)?,
+            "functions" => {
+                let arr = body.as_array().ok_or_else(|| {
+                    OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`function_score.functions` must be an array",
+                    )
+                })?;
+                if !arr.is_empty() {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`function_score.functions` is parsed but scoring functions are not implemented yet (tracked under matchID gap A5 phase 2)",
+                    ));
+                }
+            }
+            "score_mode" | "boost_mode" | "max_boost" | "min_score" => {
+                // Accepted for forward-compat; ignored when `functions` is
+                // empty since none of these have semantics without it.
+            }
+            unknown => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("unsupported `function_score` field `{unknown}`"),
+                ));
+            }
+        }
+    }
+
+    let inner = inner.ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`function_score` must contain a `query`",
+        )
+    })?;
+
+    Ok(SearchQuery::FunctionScore {
+        inner: Box::new(inner),
+        boost,
+    })
+}
+
 /// Parse a `prefix` query body and return `(field, value)`.
 pub fn parse_prefix_clause(value: &Value) -> Result<(String, String), OpenSearchError> {
     let (field, body) = parse_single_field_query("prefix", value)?;
@@ -2574,6 +2672,7 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
             fields,
             operator,
         } => multi_match_matches_with_mapping(source, fields, query, *operator, mapping),
+        SearchQuery::FunctionScore { inner, .. } => query_matches(inner, source, mapping),
     }
 }
 
