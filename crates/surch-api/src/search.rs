@@ -646,20 +646,32 @@ fn maxscore_match(
         1
     };
 
+    // Deduplicate repeated tokens (e.g. analyzer-emitted duplicates from
+    // queries like "Paris Paris Paris") and turn the count into a boost.
+    // Equivalent to Lucene's "to be or not to be" -> "to^2 be^2 or not"
+    // rewrite, but applied at scoring time so each posting list is walked
+    // once per distinct token.
+    let mut token_boosts: BTreeMap<String, u32> = BTreeMap::new();
+    for token in tokens {
+        *token_boosts.entry(token).or_insert(0) += 1;
+    }
+
     struct TokenInfo<'a> {
         stats: &'a TermScoringStats,
         max_contrib: f64,
+        boost: f64,
     }
 
-    let mut token_infos: Vec<TokenInfo<'_>> = tokens
+    let mut token_infos: Vec<TokenInfo<'_>> = token_boosts
         .iter()
-        .filter_map(|token| {
+        .filter_map(|(token, count)| {
             let stats = ctx.term_stats(field, token)?;
             if stats.doc_freq == 0 || stats.doc_freq > field_stats.doc_count {
                 return None;
             }
             let max_tf = stats.max_term_freq().max(1);
-            let max_contrib = bm25_score(
+            let boost = *count as f64;
+            let single = bm25_score(
                 config,
                 field_stats.doc_count,
                 stats.doc_freq,
@@ -668,7 +680,11 @@ fn maxscore_match(
                 avg_doc_len,
             )
             .ok()?;
-            Some(TokenInfo { stats, max_contrib })
+            Some(TokenInfo {
+                stats,
+                max_contrib: single * boost,
+                boost,
+            })
         })
         .collect();
 
@@ -712,7 +728,7 @@ fn maxscore_match(
                 doc_len,
                 avg_doc_len,
             ) {
-                Ok(score) => score,
+                Ok(score) => score * token.boost,
                 Err(_) => continue,
             };
 
@@ -979,9 +995,16 @@ fn bm25_field_score(
     };
     let avg_doc_len = field_stats.avg_doc_len;
 
+    // Deduplicate repeated tokens; each repeat boosts the same posting
+    // lookup instead of walking the same term_freq twice.
+    let mut token_boosts: BTreeMap<&str, u32> = BTreeMap::new();
+    for token in &query_tokens {
+        *token_boosts.entry(token.as_str()).or_insert(0) += 1;
+    }
+
     let config = Bm25Config::default();
     let mut total = 0.0_f64;
-    for query_token in &query_tokens {
+    for (query_token, boost) in &token_boosts {
         let term_stats = scoring_context.term_stats(field, query_token)?;
         let term_freq = term_stats.term_freq(internal_doc_id);
         if term_freq == 0 {
@@ -999,7 +1022,7 @@ fn bm25_field_score(
             doc_len,
             avg_doc_len,
         ) {
-            total += score;
+            total += score * (*boost as f64);
         }
     }
     if total > 0.0 {
