@@ -17,6 +17,7 @@ use surch_search::scoring::{bm25_score, Bm25Config};
 use crate::{
     index::validate_index_name,
     state::{AppState, FieldScoringStats, StoredDocument, TermScoringStats},
+    topn::TopN,
     OpenSearchError,
 };
 
@@ -603,7 +604,7 @@ fn topk_scored_documents(
 fn finalize_topk(
     state: &AppState,
     index: &str,
-    mut scored: Vec<(f64, u32)>,
+    scored: Vec<(f64, u32)>,
     total: u64,
     limit: usize,
 ) -> Option<(Vec<ScoredDocument>, u64)> {
@@ -613,12 +614,14 @@ fn finalize_topk(
             .then_with(|| a.1.cmp(&b.1))
     };
 
-    let k = limit.min(scored.len());
-    if k < scored.len() {
-        scored.select_nth_unstable_by(k - 1, cmp);
-        scored.truncate(k);
+    // Scalar top-K: K-sized sorted array, O(1) compare against the
+    // current worst on the hot path. Replaces the prior
+    // select_nth_unstable_by + sort_by pair (Tantivy 0.22 optim #2).
+    let mut topn = TopN::new(limit, cmp);
+    for entry in scored {
+        topn.push(entry);
     }
-    scored.sort_by(cmp);
+    let scored = topn.into_sorted_vec();
 
     let winner_ids: Vec<u32> = scored.iter().map(|(_, id)| *id).collect();
     let hydrated = state.documents_by_internal_ids(index, &winner_ids);

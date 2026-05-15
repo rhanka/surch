@@ -24,6 +24,7 @@ pub mod msearch;
 pub mod root;
 pub mod search;
 pub mod state;
+mod topn;
 
 pub use bulk::{parse_bulk_ndjson, BulkOperation, BulkParseError};
 pub use error::OpenSearchError;
