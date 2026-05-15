@@ -137,12 +137,12 @@ Ordered by priority gain/effort on the BAN + INSEE + SciFact workloads:
 | `04d601c` | build(make): root Makefile entry point | covers tests + benches lifecycle |
 | `852f9db` | ci(check): fmt + clippy + test workflow | runs on every push + PR |
 | `bdcd91c` | docs(ops): test automation plan | SLO targets table + scw plan |
+| _pending_ | bench(rust): artillery_bench keep-alive Rust harness | **B-RUST-HARNESS** — `crates/surch-demo/src/bin/artillery_bench.rs`, hyper-util keep-alive pool, `make bench-artillery-rs`, JSON schema `surch.bench.artillery.v1`; bash `artillery-replay.sh` kept as no-build fallback |
 
 #### Reste
 
 | ID | Title | Effort | Output |
 |---|---|---|---|
-| **B-RUST-HARNESS** | Rust keep-alive artillery client (replace bash+curl) | 1 j | clean SLO p95 measurement vs matchID 200 ms target |
 | **B-RUN-PAIR** | `scripts/bench/run-pair.sh` Surch + OS sequencer | 0.5 j | one JSON per engine per workload |
 | **B-RSS-SAMPLE** | `scripts/bench/rss-sample.sh` (`pidstat → JSON`) | 0.5 j | RSS peak + steady metrics in the report schema |
 | **B-TREC-COVID** | TREC-COVID NDCG@10 gate (171 k corpus, 50 queries) | 1 j | second BEIR baseline, denser qrels (~500/query) |
