@@ -1,0 +1,16 @@
+target
+.git
+.github
+.claude
+.codex
+.agents
+.playwright-mcp
+.worktrees
+archive
+demo/data
+demo/node_modules
+docs/poc/reports
+plan
+scripts
+*.png
+.DS_Store
