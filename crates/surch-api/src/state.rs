@@ -10,11 +10,16 @@ use surch_index::{
     postings::BlockMeta,
 };
 
+use crate::scroll::ScrollTable;
+
 /// Shared in-memory API state used by API handlers.
 #[derive(Clone, Default)]
 pub struct AppState {
     store: Arc<RwLock<MemoryStore>>,
     search_cache: Arc<RwLock<BTreeMap<String, IndexSearchCache>>>,
+    /// Server-side state backing `_search?scroll=…` and
+    /// `POST /_search/scroll`. Shared across handlers; lazy GC.
+    pub scroll_table: Arc<ScrollTable>,
 }
 
 const SEARCH_CACHE_CAPACITY: usize = 256;

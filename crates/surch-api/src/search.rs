@@ -1,12 +1,12 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 use surch_index::mapping::IndexMapping;
 use surch_search::fuzzy::{
@@ -16,6 +16,7 @@ use surch_search::scoring::{bm25_score, Bm25Config};
 
 use crate::{
     index::validate_index_name,
+    scroll::{parse_scroll_ttl, ScrollContext},
     state::{AppState, FieldScoringStats, StoredDocument, TermScoringStats},
     topn::TopN,
     OpenSearchError,
@@ -192,6 +193,11 @@ pub struct SearchResponse {
     #[serde(rename = "_shards")]
     pub shards: SearchShards,
     pub hits: SearchHits,
+    /// Opaque cursor for `POST /_search/scroll`. Only present when the
+    /// caller passed `?scroll=…` on the initial `_search` request and on
+    /// each non-empty page returned by `scroll_handler`.
+    #[serde(rename = "_scroll_id", skip_serializing_if = "Option::is_none")]
+    pub scroll_id: Option<String>,
 }
 
 /// OpenSearch-compatible shard summary for `_search`.
@@ -254,6 +260,7 @@ pub fn build_search_response_with_total(
             max_score: None,
             hits,
         },
+        scroll_id: None,
     }
 }
 
@@ -428,6 +435,7 @@ fn posting_candidate_ids(
 pub async fn search_handler(
     State(state): State<AppState>,
     Path(target): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     body: String,
 ) -> impl IntoResponse {
     let started_at = Instant::now();
@@ -444,7 +452,11 @@ pub async fn search_handler(
         .into_response();
     }
 
-    let cache_eligible = indices.len() == 1;
+    // `?scroll=1m` triggers the stateful scan path: skip the search
+    // cache (each scroll session is logically unique), install a
+    // ScrollContext, and decorate the response with `_scroll_id`.
+    let scroll_keepalive = params.get("scroll").map(String::as_str);
+    let cache_eligible = indices.len() == 1 && scroll_keepalive.is_none();
     let cache_key = if cache_eligible {
         Some(hash_search_body(&body))
     } else {
@@ -475,7 +487,28 @@ pub async fn search_handler(
     match parse_search_request(&body) {
         Ok(request) => {
             let query_type = classify_query(request.query.as_ref());
-            let response = run_search(&state, &indices, &request);
+            let mut response = run_search(&state, &indices, &request);
+            if let Some(keepalive) = scroll_keepalive {
+                // Attach a `_scroll_id` so the client can paginate via
+                // `POST /_search/scroll`. The cursor starts where the
+                // initial page ended; total is reported back by
+                // `hits.total.value` so we can stop when the cursor
+                // catches up. Single-index only — matches ES behaviour.
+                if let Some(index) = indices.first() {
+                    let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
+                    let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
+                    let ttl = parse_scroll_ttl(keepalive);
+                    let ctx = ScrollContext {
+                        index: index.clone(),
+                        request: request.clone(),
+                        cursor: from.saturating_add(size),
+                        size,
+                        expires_at: Instant::now() + ttl,
+                    };
+                    let id = state.scroll_table.insert(ctx);
+                    response.scroll_id = Some(id);
+                }
+            }
             let bytes = match serde_json::to_vec(&response) {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -516,6 +549,103 @@ pub async fn search_handler(
         }
         Err(error) => error.into_response(),
     }
+}
+
+/// Axum handler for `POST /_search/scroll`. Looks up a scroll context
+/// by id, returns the next page (offset `cursor`, length `size`),
+/// advances the cursor, and reinstalls the context unless the cursor
+/// has caught up to the total. Unknown scroll ids return HTTP 404
+/// with an OpenSearch-shaped error envelope.
+pub async fn scroll_handler(
+    State(state): State<AppState>,
+    body: String,
+) -> axum::response::Response {
+    let started_at = Instant::now();
+    let request = match parse_scroll_request(&body) {
+        Ok(req) => req,
+        Err(error) => return error.into_response(),
+    };
+
+    let Some(mut ctx) = state.scroll_table.take(&request.scroll_id) else {
+        return OpenSearchError::new(
+            StatusCode::NOT_FOUND,
+            "search_context_missing_exception",
+            format!("No search context found for id [{}]", request.scroll_id),
+        )
+        .into_response();
+    };
+
+    // Build a one-shot SearchRequest at offset `cursor` and size
+    // `ctx.size`. We deliberately keep every other knob from the
+    // original request (query, source, sort, …) so the scrolled
+    // pages stay consistent with the initial `_search`.
+    let mut paged = ctx.request.clone();
+    paged.from = Some(ctx.cursor as u64);
+    paged.size = Some(ctx.size as u64);
+    let indices = vec![ctx.index.clone()];
+    let mut response = run_search(&state, &indices, &paged);
+
+    // Advance the cursor by the number of hits actually returned (the
+    // scoring path may filter via `min_score`, so `size` is an upper
+    // bound, not an exact count).
+    let returned = response.hits.hits.len();
+    ctx.cursor = ctx.cursor.saturating_add(returned);
+
+    // Re-install the context when we still have something to serve;
+    // an empty page or one where `from + size` overshoots the total
+    // ends the scroll without a re-install (matches ES — the next
+    // `_search/scroll` then 404s like an unknown id).
+    if returned > 0 {
+        let ttl = parse_scroll_ttl(&request.scroll);
+        ctx.expires_at = Instant::now() + ttl;
+        let new_id = state.scroll_table.insert(ctx);
+        response.scroll_id = Some(new_id);
+    }
+    // Always overwrite `took` so the scroll response measures the
+    // scroll fetch, not the upstream `_search` walk.
+    response.took = started_at.elapsed().as_millis() as u64;
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Body of a `POST /_search/scroll` request.
+#[derive(Clone, Debug)]
+struct ScrollRequestBody {
+    scroll: String,
+    scroll_id: String,
+}
+
+fn parse_scroll_request(body: &str) -> Result<ScrollRequestBody, OpenSearchError> {
+    let value: Value = serde_json::from_str(body).map_err(|error| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            error.to_string(),
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "scroll request body must be an object",
+        )
+    })?;
+    let scroll_id = object
+        .get("scroll_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "scroll request requires `scroll_id`",
+            )
+        })?
+        .to_string();
+    let scroll = object
+        .get("scroll")
+        .and_then(Value::as_str)
+        .unwrap_or("1m")
+        .to_string();
+    Ok(ScrollRequestBody { scroll, scroll_id })
 }
 
 /// Stable label value for the `query_type` dimension of
