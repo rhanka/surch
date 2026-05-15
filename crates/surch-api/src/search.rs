@@ -250,6 +250,10 @@ pub fn build_search_response_with_total(
 /// hits, otherwise it returns `relation = "gte"`.
 const DEFAULT_TRACK_TOTAL_HITS_CAP: u64 = 10_000;
 
+/// Mirrors ES 7.x `index.max_result_window` default: `from + size` must not
+/// exceed this value or the search fails fast with HTTP 400.
+const MAX_RESULT_WINDOW: u64 = 10_000;
+
 /// Resolve the OpenSearch `hits.total` field shape from a `track_total_hits` mode.
 pub fn resolve_total_hits(total: u64, mode: Option<&TrackTotalHits>) -> Option<SearchHitsTotal> {
     match mode {
@@ -1389,6 +1393,20 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
         .unwrap_or_default();
     let highlight = object.get("highlight").map(parse_highlight).transpose()?;
     let min_score = object.get("min_score").map(parse_min_score).transpose()?;
+
+    // ES 7.x `index.max_result_window` defaults to 10 000. Surch refuses
+    // pagination requests that would force scoring beyond that window —
+    // matches what deces-backend sees today.
+    let window = from.unwrap_or(0).saturating_add(size.unwrap_or(0));
+    if window > MAX_RESULT_WINDOW {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "search_phase_execution_exception",
+            format!(
+                "Result window is too large, from + size must be less than or equal to: [{MAX_RESULT_WINDOW}] but was [{window}]"
+            ),
+        ));
+    }
 
     Ok(SearchRequest {
         query,

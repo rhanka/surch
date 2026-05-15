@@ -2777,3 +2777,99 @@ async fn search_router_a11_min_score_rejects_negative_value() {
     let body = response_json(response).await;
     assert_eq!(body["error"]["type"], "parsing_exception");
 }
+
+// --- A9: `from` + `size` pagination ---
+//
+// deces-backend paginates result tables with `from` + `size` (intake
+// §2.8). Surch already wires from/size in `paginate_hits` /
+// `run_topk_search`; A9 pins the contract and the ES-7.x
+// `index.max_result_window = 10 000` cap on `from + size`.
+
+#[tokio::test]
+async fn search_router_a9_from_size_returns_requested_slice() {
+    let router = app_router();
+    for i in 0..5 {
+        index_product(&router, &format!("sku-{i}"), r#"{"name":"desk"}"#).await;
+    }
+
+    let body =
+        search_with_body(&router, r#"{"query":{"match":{"name":"desk"}},"from":0,"size":2}"#)
+            .await;
+    assert_eq!(body["hits"]["total"]["value"], 5);
+    assert_eq!(body["hits"]["hits"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn search_router_a9_from_size_paginates_to_next_page() {
+    let router = app_router();
+    for i in 0..5 {
+        index_product(&router, &format!("sku-{i}"), r#"{"name":"desk"}"#).await;
+    }
+
+    let page1 =
+        search_with_body(&router, r#"{"query":{"match":{"name":"desk"}},"from":0,"size":2}"#)
+            .await;
+    let page2 =
+        search_with_body(&router, r#"{"query":{"match":{"name":"desk"}},"from":2,"size":2}"#)
+            .await;
+
+    let ids = |b: &serde_json::Value| -> Vec<String> {
+        b["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let p1 = ids(&page1);
+    let p2 = ids(&page2);
+    assert_eq!(p1.len(), 2);
+    assert_eq!(p2.len(), 2);
+    assert!(
+        p1.iter().all(|id| !p2.contains(id)),
+        "pages must not overlap: {p1:?} vs {p2:?}"
+    );
+}
+
+#[tokio::test]
+async fn search_router_a9_from_plus_size_above_window_returns_400() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"from":9990,"size":20}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "search_phase_execution_exception");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Result window is too large"),
+        "got: {}",
+        body["error"]["reason"]
+    );
+}
