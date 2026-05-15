@@ -33,18 +33,22 @@ records scope and acceptance.
 
 ### WP-D deliverables (matchID-facing artefacts)
 
-These two documents are the matchID-side outputs of WP-D. They are
-not new requirements — they translate the gaps above into shapes
-matchID integrators can act on.
-
-- `dsl-translation-matrix.md` — gap-by-gap mapping (A1..A15, B1, B2)
-  of ES wire shape ↔ Surch equivalent ↔ status ↔ test gate file.
-  Cross-referenced by every implementation PR landing on `wp/d-matchid`
-  and `wp/b-test-auto`.
+- `gap-analysis.md` — single source of truth for matchID compat
+  status. Tracks every gap (A1..A15, B1, B2) with
+  `gap | partial | implemented | declined` + the Surch artifacts
+  that close it. Retired (or archived as "compat achieved on
+  YYYY-MM-DD") once every row is `implemented`.
 - `swap-guide.md` — operational playbook for the matchID team:
-  pre-requisites, three swap strategies (env-var flip, shadow mode,
-  incremental by workload), rollback paths, and minimum
-  observability via `GET /_prometheus_metrics`.
+  pre-requisites, the env-var-flip cutover (only valid once
+  `gap-analysis.md` is 100% green), rollback path, and minimum
+  observability via `GET /_prometheus_metrics`. Shadow mode and
+  incremental-by-workload strategies are explicitly **out of scope**
+  until full compat — matchID does not bascule until Surch is a
+  drop-in replacement.
+
+Note: an earlier `dsl-translation-matrix.md` was retired because the
+Surch wire shape is identical to ES 7.x by design; the matrix was a
+copy of `gap-analysis.md` columns under a misleading name.
 
 ## Active gaps
 
