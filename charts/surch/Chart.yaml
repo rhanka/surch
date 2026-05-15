@@ -1,0 +1,18 @@
+apiVersion: v2
+name: surch
+description: OpenSearch-compatible Rust search engine — minimal Helm chart
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/rhanka/surch
+sources:
+  - https://github.com/rhanka/surch
+icon: https://raw.githubusercontent.com/rhanka/surch/main/docs/favicon.svg
+keywords:
+  - search
+  - opensearch
+  - rust
+  - bm25
+maintainers:
+  - name: Surch Team
+    url: https://github.com/rhanka/surch

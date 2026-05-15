@@ -1,0 +1,69 @@
+# Default values for the surch chart.
+# Keep this file SHORT. Meilisearch's community chart sits around 80 lines;
+# Elastic's ECK Helm chart is 700 lines of options nobody reads. Stay
+# closer to Meilisearch.
+
+image:
+  repository: ghcr.io/rhanka/surch
+  # tag defaults to .Chart.appVersion when empty
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Surch is in-memory only today, so a single replica is the correct default.
+# The Deployment kind will move to StatefulSet once durable persistence ships.
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 7700
+
+# Surch listens on this port inside the container (DEFAULT_PORT in main.rs).
+containerPort: 7700
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 200m
+    memory: 256Mi
+
+env:
+  - name: SURCH_HOST
+    value: "0.0.0.0"
+  - name: SURCH_PORT
+    value: "7700"
+  - name: RUST_LOG
+    value: "warn"
+
+# Probe `GET /` — root_handler always returns 200 with the bootstrap JSON.
+probes:
+  liveness:
+    httpGet:
+      path: /
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readiness:
+    httpGet:
+      path: /
+      port: http
+    initialDelaySeconds: 2
+    periodSeconds: 5
+
+# Override the security context if your cluster requires it; the distroless
+# image already runs as uid 65532.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
