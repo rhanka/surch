@@ -1795,6 +1795,20 @@ fn parse_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     let query_text = parse_query_text(body, "match query")?;
     let operator = parse_match_operator(body, "match")?;
 
+    // Object form: `{ "match": { "F": { "query": "…", "fuzziness": "AUTO|N" } } }`.
+    // When `fuzziness` is present, route to the fuzzy executor so that
+    // bounded Damerau-Levenshtein is applied per analyzed token.
+    if let Some(object) = body.as_object() {
+        if let Some(raw) = object.get("fuzziness") {
+            let fuzziness = parse_fuzzy_query_fuzziness(raw)?;
+            return Ok(SearchQuery::Fuzzy {
+                field,
+                value: query_text,
+                fuzziness,
+            });
+        }
+    }
+
     Ok(SearchQuery::Match {
         field,
         value: query_text,

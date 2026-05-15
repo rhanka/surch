@@ -2383,3 +2383,117 @@ async fn match_query_rejects_unknown_operator_with_opensearch_error() {
         .expect("reason string")
         .contains("operator"));
 }
+
+// ---------------------------------------------------------------------------
+// A1 — `match` object form with `fuzziness` sub-field.
+//
+// deces-backend emits `{ "match": { "F": { "query": "JEAN",
+// "fuzziness": "AUTO" } } }`. Surch must accept the shape and apply
+// bounded Damerau-Levenshtein per analyzed query token, with AUTO →
+// edits=1 for terms shorter than 6 characters and edits=2 otherwise.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn match_object_form_with_fuzziness_auto_matches_one_edit_term() {
+    let router = app_router();
+    // "JEAN" indexed → "JEAS" (single substitution) should still match
+    // under AUTO (≤5 chars → edits=1).
+    index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
+    index_product(&router, "sku-other", r#"{"name":"PAUL"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"JEAS","fuzziness":"AUTO"}}}}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits should be an array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-jean".to_string()]);
+}
+
+#[tokio::test]
+async fn match_object_form_with_numeric_fuzziness_one_matches_one_edit() {
+    let router = app_router();
+    // Numeric fuzziness=1 → one substitution permitted.
+    index_product(&router, "sku-dupont", r#"{"name":"DUPONT"}"#).await;
+    index_product(&router, "sku-martin", r#"{"name":"MARTIN"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"DUPONX","fuzziness":1}}}}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits should be an array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-dupont".to_string()]);
+}
+
+#[tokio::test]
+async fn match_object_form_with_fuzziness_zero_requires_exact_term() {
+    let router = app_router();
+    index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
+
+    // fuzziness="0" → no edits allowed; "JEAS" must not match "JEAN".
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"JEAS","fuzziness":"0"}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 0);
+}
+
+#[tokio::test]
+async fn match_object_form_without_fuzziness_keeps_default_semantics() {
+    let router = app_router();
+    index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
+    index_product(&router, "sku-paul", r#"{"name":"PAUL"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"JEAN"}}}}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-jean".to_string()]);
+}
+
+#[tokio::test]
+async fn match_object_form_rejects_invalid_fuzziness_string() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"JEAN"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match":{"name":{"query":"JEAN","fuzziness":"NOPE"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+}
