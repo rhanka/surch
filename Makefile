@@ -23,7 +23,7 @@ SCW_TAG               := surch-bench-$(SHA)-$(shell date +%s)
         surch-build surch-up surch-down \
         opensearch-up opensearch-down \
         bench-smoke bench-local bench-recall bench-trec-covid \
-        bench-stress bench-perf \
+        bench-stress bench-artillery-rs bench-perf \
         bench-remote-scw bench-all report \
         sbom \
         clean
@@ -36,7 +36,8 @@ help:
 	@echo "  bench-recall      SciFact + TREC-COVID NDCG@10 vs Surch & OS (~10 min)"
 	@echo "  bench-trec-covid  TREC-COVID NDCG@10 + Recall@10 vs Surch & OS (~7 min)"
 	@echo "  bench-pair-<wl>   run a single workload vs Surch then OS (wl: ban25k|insee25k|insee25k-multi|scifact|trec-covid)"
-	@echo "  bench-stress      artillery-replay vs Surch & OS (~10 min)"
+	@echo "  bench-stress      artillery-replay (bash fallback) vs Surch & OS (~10 min)"
+	@echo "  bench-artillery-rs Rust keep-alive artillery_bench vs Surch & OS (~6 min)"
 	@echo "  bench-perf        bench-local + bench-stress + RSS sampling"
 	@echo "  bench-remote-scw  bench-perf on a Scaleway DEV1-M (hard 30 min cap)"
 	@echo "  bench-all         full local suite, sequenced"
@@ -133,6 +134,29 @@ bench-stress: opensearch-up surch-up | $(REPORTS_DIR)
 	$(MAKE) surch-down
 	bash scripts/bench/artillery-replay.sh "art-os-$(SHA)"    $(REPORTS_DIR)/art-os.out    $(OS_URL)
 	$(MAKE) opensearch-down
+
+# B-RUST-HARNESS: keep-alive Rust harness replacement for the bash
+# artillery-replay.sh. Each engine is benched with the matchID phase
+# scenario (2,2,5,10,20,50 rps), a shared hyper-util HTTP/1.1 pool of
+# $(ART_WORKERS) workers, and emits surch.bench.artillery.v1 JSON.
+ART_WORKERS ?= 8
+ART_PHASES  ?= 2:30,2:30,5:30,10:30,20:30,50:60
+ART_NAMES   ?= /home/antoinefa/src/surch/target/insee/artillery_names.txt
+ART_INDEX   ?= deces_25k
+
+bench-artillery-rs: opensearch-up surch-up | $(REPORTS_DIR)
+	cargo build --release -p surch-demo --bin artillery_bench --locked
+	./target/release/artillery_bench \
+	    --url $(SURCH_URL) --index $(ART_INDEX) --names $(ART_NAMES) \
+	    --workers $(ART_WORKERS) --phases '$(ART_PHASES)' \
+	    --report $(REPORTS_DIR)/art-surch.json
+	$(MAKE) surch-down
+	./target/release/artillery_bench \
+	    --url $(OS_URL) --index $(ART_INDEX) --names $(ART_NAMES) \
+	    --workers $(ART_WORKERS) --phases '$(ART_PHASES)' \
+	    --report $(REPORTS_DIR)/art-os.json
+	$(MAKE) opensearch-down
+	@echo "bench-artillery-rs reports under $(REPORTS_DIR)"
 
 bench-perf: bench-local bench-stress
 	@echo "bench-perf reports under $(REPORTS_DIR)"

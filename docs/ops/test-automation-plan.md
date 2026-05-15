@@ -99,13 +99,23 @@ Persisted under `target/bench-reports/<sha>/<workload>-<engine>.json`. A `surch-
 
 Implemented:
 - `/Makefile` root with the target hierarchy above (also exposes
-  `bench-pair-<workload>` as a pattern target dispatching to `run-pair.sh`)
+  `bench-pair-<workload>` as a pattern target dispatching to `run-pair.sh`
+  and `bench-artillery-rs` for the Rust keep-alive harness)
 - `/scripts/bench/run-pair.sh` — wraps Surch + OS bench in a single workload
   run, emits one `.out` per engine plus a `pair.json` envelope
   (schema `surch.bench.pair.v1`); trap-cleans both engines on EXIT/INT/TERM
 - `/scripts/bench/rss-sample.sh` — 1 Hz sampling of `/proc/<pid>/status`
   `VmRSS` (with `ps` fallback) → JSON (schema `surch.bench.rss.v1`)
 - `/scripts/bench/trec-covid-ndcg.sh` — clone of `scifact-ndcg.sh`, larger corpus
+- `/crates/surch-demo/src/bin/artillery_bench.rs` — **B-RUST-HARNESS**.
+  Rust binary that replaces the bash + curl `artillery-replay.sh` for the
+  matchID SLO measurement story. hyper-util keep-alive connection pool,
+  configurable workers, phased rate-limiting via `tokio::time::sleep_until`,
+  percentiles per phase + global. JSON report schema
+  `surch.bench.artillery.v1`. CLI: `artillery_bench --url --index --names
+  --workers --phases --report`. Wired into the Makefile as
+  `make bench-artillery-rs`. The bash `artillery-replay.sh` is kept as a
+  no-build fallback.
 
 To create:
 1. `/scripts/bench/mmarco-fr-ndcg.sh` — remote-only, French baseline
