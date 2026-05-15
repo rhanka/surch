@@ -2474,6 +2474,119 @@ async fn match_object_form_without_fuzziness_keeps_default_semantics() {
     assert_eq!(ids, vec!["sku-jean".to_string()]);
 }
 
+// ---------------------------------------------------------------------------
+// A8 — `match_all` with optional `boost`.
+//
+// deces-backend uses `{ "match_all": {} }` as the default query and as
+// the must-clause of a geo-filter bool. The empty form keeps the
+// existing `_score = null` semantics; the explicit `{ "boost": N }`
+// form contributes `N` to the bool-sum so that filter-context callers
+// can adjust ranking without writing a `function_score` wrapper.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn match_all_with_boost_object_returns_every_document() {
+    let router = app_router();
+    index_product(&router, "sku-a", r#"{"name":"alpha"}"#).await;
+    index_product(&router, "sku-b", r#"{"name":"beta"}"#).await;
+
+    let body = search_with_body(&router, r#"{"query":{"match_all":{"boost":2.5}}}"#).await;
+
+    assert_eq!(body["hits"]["total"]["value"], 2);
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert!(ids.contains(&"sku-a".to_string()));
+    assert!(ids.contains(&"sku-b".to_string()));
+}
+
+#[tokio::test]
+async fn match_all_with_boost_in_bool_must_scales_score() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"rust"}"#).await;
+
+    let body_default = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"name":"rust"}},{"match_all":{}}]}}}"#,
+    )
+    .await;
+    let body_boosted = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"name":"rust"}},{"match_all":{"boost":5}}]}}}"#,
+    )
+    .await;
+
+    // BoolMust sums clause scores → boost=5 adds +5 (vs default +1) to
+    // the match clause's BM25 score.
+    let s_default = body_default["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("default score");
+    let s_boosted = body_boosted["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("boosted score");
+    let diff = s_boosted - s_default;
+    assert!(
+        (diff - 4.0).abs() < 1e-6,
+        "boost=5 vs default=1 must add 4.0, got diff={diff}"
+    );
+}
+
+#[tokio::test]
+async fn match_all_rejects_unknown_field() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"x"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{"weird":1}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+}
+
+#[tokio::test]
+async fn match_all_rejects_negative_boost() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"x"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{"boost":-1}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+}
+
+#[tokio::test]
+async fn match_all_rejects_invalid_fuzziness_via_unknown_field_check() {
+    // Sanity: the empty body still works after the parser refactor.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"x"}"#).await;
+    let body = search_with_body(&router, r#"{"query":{"match_all":{}}}"#).await;
+    assert_eq!(body["hits"]["total"]["value"], 1);
+}
+
 #[tokio::test]
 async fn match_object_form_rejects_invalid_fuzziness_string() {
     let router = app_router();

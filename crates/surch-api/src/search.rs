@@ -87,7 +87,12 @@ pub struct HighlightRequest {
 /// Supported P0 `_search` queries.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SearchQuery {
-    MatchAll,
+    /// Matches every document. `boost` multiplies the constant
+    /// `_score = 1.0`; OpenSearch defaults `boost` to `1.0` when the
+    /// query body is `{}` and accepts `{ "boost": <number> }` to scale.
+    MatchAll {
+        boost: f64,
+    },
     Match {
         field: String,
         value: String,
@@ -1058,7 +1063,7 @@ fn match_documents_for_index(
                         .collect()
                 }
             }
-            SearchQuery::MatchAll => state.documents(index),
+            SearchQuery::MatchAll { .. } => state.documents(index),
             _ => state
                 .documents(index)
                 .into_iter()
@@ -1130,39 +1135,29 @@ fn score_for_query(
             boost,
             ..
         } => {
-            // `filter` clauses are intentionally excluded from scoring —
-            // they only restrict the candidate set.
+            // `filter` clauses are excluded — they restrict candidacy, not score.
             let must_score: f64 = must
                 .iter()
                 .map(|clause| score_for_query(clause, internal_doc_id, scoring_context))
                 .sum();
 
-            // `should` clauses contribute to `_score` whenever they match
-            // (independent of `minimum_should_match`, which is enforced
-            // earlier in `query_matches`).
+            // The wildcard arm at the bottom returns 1.0 for non-scoring
+            // sub-queries; filter that placeholder out so it doesn't inflate
+            // the sum. BM25 always emits > 1.0 for real matches.
             let should_score: f64 = should
                 .iter()
                 .map(|clause| score_for_query(clause, internal_doc_id, scoring_context))
-                // A non-matching `should` clause returns the neutral 1.0
-                // placeholder from the wildcard arm; filter it out so it
-                // does not inflate the running sum. We approximate
-                // "non-matching" as "scoring sub-query but score == 1.0
-                // (the placeholder)"; matching scoring sub-queries always
-                // return > 1.0 in practice because BM25 only emits
-                // strictly positive scores.
                 .filter(|score| *score != 1.0)
                 .sum();
 
-            let combined = must_score + should_score;
-            // When the whole bool is filter-only the inner sum is 0; keep
-            // the neutral 1.0 (so subsequent sorts stay well-defined) and
-            // still apply the clause boost.
-            let base = if combined > 0.0 { combined } else { 1.0 };
-            // `minimum_should_match` does not affect scoring (it gates
-            // candidacy); skip the `_` warning by binding it.
+            // `minimum_should_match` gates candidacy in query_matches; it
+            // does not affect scoring once we are in this arm.
             let _ = minimum_should_match;
+            let combined = must_score + should_score;
+            let base = if combined > 0.0 { combined } else { 1.0 };
             base * *boost
         }
+        SearchQuery::MatchAll { boost } => *boost,
         _ => 1.0,
     }
 }
@@ -1763,14 +1758,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
 
     let (query_type, query_body) = object.iter().next().expect("object has one query type");
     match query_type.as_str() {
-        "match_all" if query_body.as_object().is_some_and(|body| body.is_empty()) => {
-            Ok(SearchQuery::MatchAll)
-        }
-        "match_all" => Err(OpenSearchError::new(
-            StatusCode::BAD_REQUEST,
-            "parsing_exception",
-            "match_all query body must be an empty object",
-        )),
+        "match_all" => parse_match_all_query(query_body),
         "match" => parse_match_query(query_body),
         "match_phrase" => parse_match_phrase_query(query_body),
         "term" => parse_term_query(query_body),
@@ -1788,6 +1776,55 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
             format!("unsupported search query `{unknown}`"),
         )),
     }
+}
+
+/// Parse `match_all` query body. Accepts `{}` (boost=1.0) and
+/// `{ "boost": <number> }`. Boost must be a finite non-negative
+/// number — OpenSearch rejects negative boosts at parse time.
+fn parse_match_all_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "match_all query body must be an object",
+        )
+    })?;
+
+    let mut boost: f64 = 1.0;
+    for (key, raw) in object {
+        match key.as_str() {
+            "boost" => {
+                boost = parse_boost_value("match_all", raw)?;
+            }
+            unknown => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("match_all query does not support `{unknown}`"),
+                ));
+            }
+        }
+    }
+
+    Ok(SearchQuery::MatchAll { boost })
+}
+
+fn parse_boost_value(context: &str, value: &Value) -> Result<f64, OpenSearchError> {
+    let number = value.as_f64().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{context} `boost` must be a number"),
+        )
+    })?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{context} `boost` must be a finite, non-negative number"),
+        ));
+    }
+    Ok(number)
 }
 
 fn parse_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
@@ -2427,7 +2464,7 @@ fn parse_non_negative_integer(field: &str, value: &Value) -> Result<u64, OpenSea
 
 fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) -> bool {
     match query {
-        SearchQuery::MatchAll => true,
+        SearchQuery::MatchAll { .. } => true,
         SearchQuery::Match {
             field,
             value,
