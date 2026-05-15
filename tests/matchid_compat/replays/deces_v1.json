@@ -1,0 +1,211 @@
+{
+  "name": "deces_v1",
+  "dataset": "deces",
+  "description": "matchID replay v1 — 10 representative requests against the INSEE-shaped slice. v0 acceptance: at least 3 entries must execute against Surch today; the remaining 3 prefix/scroll entries are skipped on gaps A4/A6 until those gaps land. Expected hit counts and top-hit ids were captured against Surch HEAD on 2026-05-15; once an ES-7.x oracle replays the same slice, these expectations must be cross-checked.",
+  "requests": [
+    {
+      "name": "adv_nom_prenoms_date",
+      "category": "advanced_ui",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM": "DUPONT" } },
+                { "match": { "PRENOMS": "JEANNE" } },
+                { "term": { "DATE_NAISSANCE": "19410813" } }
+              ]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 1,
+        "hits.hits[0]._id": "deces_00001"
+      }
+    },
+    {
+      "name": "adv_nom_commune_sexe",
+      "category": "advanced_ui",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM": "BONNET" } },
+                { "term": { "COMMUNE_NAISSANCE": "ANGERS" } },
+                { "term": { "SEXE": "F" } }
+              ]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 1,
+        "hits.hits[0]._id": "deces_00002"
+      }
+    },
+    {
+      "name": "adv_nom_prenoms_commune",
+      "category": "advanced_ui",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM": "DUPONT" } },
+                { "match": { "PRENOMS": "GEORGES" } },
+                { "term": { "COMMUNE_DECES": "LEHAVRE" } }
+              ]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 1,
+        "hits.hits[0]._id": "deces_00001"
+      }
+    },
+    {
+      "name": "block_msearch_a",
+      "category": "block_match",
+      "request": {
+        "method": "POST",
+        "path": "/_msearch",
+        "body_ndjson": [
+          { "index": "deces" },
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  { "match": { "NOM": "MARTIN" } },
+                  { "term": { "SEXE": "M" } }
+                ]
+              }
+            },
+            "size": 3
+          },
+          { "index": "deces" },
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  { "match": { "NOM": "DUPONT" } },
+                  { "term": { "SEXE": "F" } }
+                ]
+              }
+            },
+            "size": 3
+          }
+        ]
+      },
+      "expected": {
+        "hits.total.value": 31,
+        "hits.hits[0]._id": "deces_00059"
+      }
+    },
+    {
+      "name": "block_msearch_b",
+      "category": "block_match",
+      "request": {
+        "method": "POST",
+        "path": "/_msearch",
+        "body_ndjson": [
+          { "index": "deces" },
+          { "query": { "match": { "NOM": "RICHARD" } }, "size": 3 },
+          { "index": "deces" },
+          { "query": { "match": { "PRENOMS": "MARIE" } }, "size": 3 }
+        ]
+      },
+      "expected": {
+        "hits.total.value": 110,
+        "hits.hits[0]._id": "deces_00025"
+      }
+    },
+    {
+      "name": "ft_multi_match_nom_prenoms",
+      "category": "full_text",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "multi_match": {
+              "query": "DUPONT",
+              "fields": ["NOM", "PRENOMS"]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 30,
+        "hits.hits[0]._id": "deces_00001"
+      }
+    },
+    {
+      "name": "ft_match_simple_nom",
+      "category": "full_text",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM": "BONNET" } },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 42,
+        "hits.hits[0]._id": "deces_00002"
+      }
+    },
+    {
+      "name": "prefix_nom",
+      "category": "autocomplete",
+      "skip": "gap-A6",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "prefix": { "NOM": "DUP" } },
+          "size": 5
+        }
+      }
+    },
+    {
+      "name": "prefix_prenoms",
+      "category": "autocomplete",
+      "skip": "gap-A6",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "prefix": { "PRENOMS": "JEA" } },
+          "size": 5
+        }
+      }
+    },
+    {
+      "name": "scroll_full",
+      "category": "scroll",
+      "skip": "gap-A4",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search?scroll=1m",
+        "body": {
+          "query": { "match_all": {} },
+          "size": 100
+        }
+      }
+    }
+  ]
+}
