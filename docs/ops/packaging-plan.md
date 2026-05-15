@@ -50,6 +50,58 @@ release CI yet. The release profile in `Cargo.toml` already has
 - References: `astral-sh/ruff`, `astral-sh/uv` use exactly this `cargo-dist` setup.
 - **Effort**: 1–2 days.
 
+#### cargo-dist wiring
+
+`[workspace.metadata.dist]` in `Cargo.toml` pins
+`cargo-dist-version = "0.25.1"` and lists the five release targets. The
+`release.yml` workflow runs three layered jobs:
+
+1. `dist-plan` runs `cargo dist plan --output-format=json` and emits the
+   target matrix as a GitHub Actions output.
+2. `dist-build` fans out across that matrix; each runner installs
+   `cargo-dist`, the matching Rust target, and the linux cross
+   toolchain when needed (`gcc-aarch64-linux-gnu`, `musl-tools`).
+   Apple targets run on `macos-13`. `cargo dist build --artifacts=local`
+   produces `target/distrib/*.tar.xz` + `.sha256`.
+3. `publish-release` collects every archive, signs it with minisign,
+   builds the CycloneDX SBOM, and hands the lot to
+   `softprops/action-gh-release`.
+
+The previous hand-rolled `build-binaries` matrix (only linux gnu) is
+gone; macOS + musl are now part of every tag.
+
+#### minisign key lifecycle
+
+Key generation is out-of-band — running `minisign -G` inside CI would
+leak the seedphrase into the runner. The release maintainer runs once,
+on a trusted workstation:
+
+```bash
+minisign -G -p surch.pub -s surch.key
+```
+
+Then:
+
+- commit `surch.pub` at the repository root (already done);
+- store `surch.key` base64-encoded in the GitHub Actions secret
+  `MINISIGN_PRIVATE_KEY` (`base64 -w0 < surch.key | gh secret set
+  MINISIGN_PRIVATE_KEY`);
+- store the passphrase in `MINISIGN_PASSWORD`;
+- keep the on-disk `surch.key` in an offline password manager; never
+  push it to git.
+
+`publish-release` decodes the key into a private tmpfs path
+(`/tmp/minisign.key`, `umask 077`), signs every archive
+(`minisign -Sm <archive> -s /tmp/minisign.key`), uploads the
+resulting `.minisig` files alongside the archives on the GitHub
+release, and shreds the key on job exit (`shred -u`).
+
+Downstream verification command (also in `README.md`):
+
+```bash
+minisign -Vm surch-api-<ver>-<triple>.tar.xz -p surch.pub
+```
+
 ### 2. Versioning
 
 - **SemVer strict** on the Surch binary and on the REST surface that is **not** OS-compatible.

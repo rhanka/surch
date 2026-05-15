@@ -64,6 +64,26 @@ cosign verify ghcr.io/rhanka/surch:<tag> \
 `X.Y.Z`, short `X.Y`, major `X`, or `sha-<short>`). All tags resolve to
 the same signed manifest digest.
 
+### Static binaries (minisign)
+
+The static binaries produced by `cargo-dist` (linux gnu/musl x86_64 +
+aarch64, darwin x86_64 + aarch64) are signed with
+[minisign](https://jedisct1.github.io/minisign/). Each archive is
+published next to its `.minisig` signature on the GitHub release page.
+The public verification key lives at the repo root in `surch.pub` and
+is also attached to every release as an asset.
+
+Verify a downloaded archive:
+
+```bash
+# Extract the archive you want to verify, then:
+minisign -Vm surch-api-<ver>-<triple>.tar.xz -p surch.pub
+```
+
+`minisign -Vm` exits 0 only if the signature is valid for the file
+content and was produced by the holder of the matching private key
+(stored as a GitHub Actions secret, never present in this repository).
+
 ## License
 
 Apache-2.0

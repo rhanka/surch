@@ -1,15 +1,26 @@
 # Surch release pipeline.
 #
-# Triggers on `v*.*.*` tag pushes. Builds the linux x86_64 + aarch64 binaries,
-# attaches them to a GitHub release with SHA-256 checksums, then builds and
-# publishes a multi-arch Docker image to ghcr.io.
+# Triggers on `v*.*.*` tag pushes. cargo-dist plans + builds the five
+# release targets (linux gnu/musl x86_64 + aarch64, darwin x86_64 +
+# aarch64); each archive is then signed with minisign, attached to a
+# GitHub release alongside a CycloneDX SBOM, and the multi-arch OCI
+# image is built, pushed to ghcr.io, cosign-signed (keyless OIDC) and
+# SBOM-attested.
 #
-# The OCI image pushed to ghcr.io is signed via cosign keyless OIDC at the
-# end of the publish-image job (signature anchored on the immutable digest
-# returned by docker/build-push-action).
+# Layering:
+#   dist-plan       → emits the build matrix from cargo-dist metadata
+#   dist-build      → builds + archives per-target (matrix fanned out)
+#   publish-release → minisign each archive, build CycloneDX SBOM,
+#                     softprops/action-gh-release uploads everything
+#   publish-image   → multi-arch image + cosign sign by digest +
+#                     CycloneDX SBOM attestation against that digest
 #
-# Multi-platform binaries (macOS, musl) and minisign signatures of the
-# static binaries come in a follow-up that wires cargo-dist.
+# Static binary signing uses minisign (passphrase-protected Ed25519
+# key, secret `MINISIGN_PRIVATE_KEY` base64-encoded + passphrase in
+# `MINISIGN_PASSWORD`); the public verification key `surch.pub` is
+# committed at the repo root and documented in README.md so downstream
+# consumers can run `minisign -Vm <artifact> -p surch.pub`. Cosign is
+# reserved for the OCI image (keyless OIDC via Sigstore).
 
 name: release
 
@@ -28,20 +39,54 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
+  CARGO_DIST_VERSION: "0.25.1"
 
 jobs:
-  build-binaries:
-    name: build-${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+  # Read [workspace.metadata.dist] from Cargo.toml and emit the per-target
+  # build matrix. Doing this in one place keeps the matrix in sync with
+  # what `cargo dist plan` would generate locally.
+  dist-plan:
+    name: dist-plan
+    runs-on: ubuntu-22.04
+    outputs:
+      targets: ${{ steps.plan.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-dist
+        run: cargo install --locked cargo-dist@${CARGO_DIST_VERSION}
+
+      - name: Plan release
+        id: plan
+        run: |
+          set -euo pipefail
+          cargo dist plan --output-format=json > dist-plan.json
+          # Extract the list of target triples for the build matrix; the
+          # exact JSON path is stable across cargo-dist 0.25.x.
+          TARGETS=$(jq -c '[.releases[].artifacts[] | select(.kind=="executable-zip") | .target_triples[0]] | unique' dist-plan.json)
+          echo "targets=${TARGETS}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-plan
+          path: dist-plan.json
+          retention-days: 7
+
+  # Build + archive each target with cargo-dist. cargo-dist handles
+  # cross-compilation toolchain selection (linker, sysroot, etc.) and
+  # produces .tar.xz archives + sha256 checksums under target/distrib/.
+  dist-build:
+    name: dist-build-${{ matrix.target }}
+    needs: dist-plan
+    runs-on: ${{ contains(matrix.target, 'apple') && 'macos-13' || 'ubuntu-22.04' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04
-            cross: true
+        target: ${{ fromJson(needs.dist-plan.outputs.targets) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,9 +95,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross (aarch64 only)
-        if: matrix.cross == true
-        run: cargo install --locked cross
+      - name: Install musl tools (linux musl only)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install aarch64 cross toolchain (linux gnu only)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install cargo-dist
+        run: cargo install --locked cargo-dist@${CARGO_DIST_VERSION}
 
       - name: Cargo cache
         uses: actions/cache@v4
@@ -63,45 +115,74 @@ jobs:
             target
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary (native)
-        if: matrix.cross != true
-        run: cargo build --release --locked --target ${{ matrix.target }} -p surch-api
-
-      - name: Build release binary (cross)
-        if: matrix.cross == true
-        run: cross build --release --locked --target ${{ matrix.target }} -p surch-api
-
-      - name: Stage and checksum the binary
+      - name: Build release artefacts
         run: |
           set -euo pipefail
-          mkdir -p dist
-          NAME="surch-api-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          cp "target/${{ matrix.target }}/release/surch-api" "dist/${NAME}"
-          (cd dist && sha256sum "${NAME}" > "${NAME}.sha256")
+          cargo dist build --target ${{ matrix.target }} --artifacts=local
+          ls -la target/distrib/
 
-      - name: Upload binary artifact
+      - name: Upload archives
         uses: actions/upload-artifact@v4
         with:
-          name: bin-${{ matrix.target }}
-          path: dist/
+          name: dist-${{ matrix.target }}
+          path: |
+            target/distrib/*.tar.xz
+            target/distrib/*.zip
+            target/distrib/*.sha256
           retention-days: 7
+          if-no-files-found: error
 
   publish-release:
     name: publish-github-release
     runs-on: ubuntu-22.04
-    needs: build-binaries
+    needs: dist-build
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Download all binary artifacts
+      - name: Download all archive artefacts
         uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: bin-*
+          pattern: dist-*
           merge-multiple: true
+
+      - name: Install minisign
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Decode minisign secret key
+        env:
+          MINISIGN_PRIVATE_KEY: ${{ secrets.MINISIGN_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # Secret stored base64-encoded; never echo the decoded bytes.
+          umask 077
+          printf '%s' "${MINISIGN_PRIVATE_KEY}" | base64 -d > /tmp/minisign.key
+
+      - name: Sign each archive with minisign
+        env:
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in dist/*.tar.xz dist/*.zip; do
+            echo "Signing ${f}"
+            # -W trusts the passphrase from MINISIGN_PASSWORD env var;
+            # minisign 0.11+ honours it via the prompt fallback path.
+            printf '%s\n' "${MINISIGN_PASSWORD}" | minisign -Sm "${f}" -s /tmp/minisign.key
+          done
+          # Re-issue checksums covering the signatures too.
+          (cd dist && sha256sum *.tar.xz *.zip *.minisig 2>/dev/null > SHA256SUMS || true)
+          ls -la dist/
+
+      - name: Wipe minisign key
+        if: always()
+        run: shred -u /tmp/minisign.key 2>/dev/null || rm -f /tmp/minisign.key
 
       - name: Install cargo-cyclonedx
         run: cargo install --locked cargo-cyclonedx
@@ -114,13 +195,9 @@ jobs:
           # root; we merge by taking the workspace-level bom and renaming
           # it to surch-sbom-<tag>.cdx.json for the release asset.
           cargo cyclonedx --format json --all --target-in-filename
-          # The workspace bom lives at ./bom.json; per-crate boms sit at
-          # crates/<name>/bom.json. We ship the workspace one as the SBOM.
           if [ -f bom.json ]; then
             cp bom.json "dist/surch-sbom-${GITHUB_REF_NAME}.cdx.json"
           else
-            # Fallback: prefer the surch-api crate bom, otherwise the first
-            # bom.json we find under crates/.
             SBOM_SRC="$(find crates -maxdepth 3 -name 'bom.json' | head -n 1)"
             if [ -z "${SBOM_SRC}" ]; then
               echo "cargo-cyclonedx produced no bom.json" >&2
@@ -143,14 +220,18 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           files: |
-            dist/surch-api-*
-            dist/surch-api-*.sha256
+            dist/*.tar.xz
+            dist/*.zip
+            dist/*.minisig
+            dist/*.sha256
+            dist/SHA256SUMS
             dist/surch-sbom-*.cdx.json
+            surch.pub
 
   publish-image:
     name: publish-docker-image
     runs-on: ubuntu-22.04
-    needs: [build-binaries, publish-release]
+    needs: [dist-build, publish-release]
     steps:
       - uses: actions/checkout@v4
 

@@ -52,3 +52,27 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# cargo-dist drives the release pipeline (multi-target build + archive +
+# checksums). Targets cover linux gnu/musl on x86_64 and aarch64, plus the
+# two Apple Darwin triples. Installers are deferred; we ship raw archives
+# and let downstream consumers verify via sha256 + minisign.
+#
+# `pr-run-mode = "skip"` keeps cargo-dist's own CI off PRs — the release
+# workflow runs only on tag pushes, matching the existing trigger.
+# `publish-jobs` points at the in-repo publish-image job so cargo-dist
+# does not try to publish anything itself; the OCI image + cosign + SBOM
+# attestation path remains under our control.
+[workspace.metadata.dist]
+cargo-dist-version = "0.25.1"
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+ci = ["github"]
+installers = ["shell", "powershell"]
+pr-run-mode = "skip"
+publish-jobs = ["./publish-image"]

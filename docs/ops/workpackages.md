@@ -177,12 +177,12 @@ Ordered by priority gain/effort on the BAN + INSEE + SciFact workloads:
 | `e7f7b91` | ci(release): cosign keyless OIDC signing on OCI image | C-COSIGN — image signed by digest, verify command documented in README + packaging-plan |
 | _pending_ | feat(api): `/_prometheus_metrics` endpoint | C-METRICS — text exposition format, 3 minimum-viable metrics (`surch_search_total`, `surch_search_cache_hit_total`, `surch_search_duration_seconds`), recorder installed at `app_router` build time |
 | _pending_ | feat(release): CycloneDX SBOM + cosign attestation | C-SBOM — `cargo-cyclonedx` in `publish-release`, SBOM uploaded as release asset and attested against image digest via `cosign attest --type cyclonedx`; `scripts/verify-release.sh` runs `cosign verify` + `verify-attestation` and prints top 5 deps; `make sbom` for offline generation |
+| _pending_ | ci(release): cargo-dist multi-target + minisign signatures | C-CARGO-DIST + C-MINISIGN — `[workspace.metadata.dist]` (cargo-dist 0.25.1, 5 targets); `release.yml` rewritten around `dist-plan` + matrix `dist-build` (linux gnu/musl x86_64 + aarch64, darwin x86_64 + aarch64), `publish-release` minisigns each archive via `MINISIGN_PRIVATE_KEY` + `MINISIGN_PASSWORD` secrets and uploads `.minisig` next to every artefact; `surch.pub` at the repo root for downstream `minisign -Vm` verification |
 
 #### Reste
 
 | ID | Title | Effort | Output |
 |---|---|---|---|
-| **C-CARGO-DIST** | replace ad-hoc release workflow with `cargo-dist` | 1 j | macOS + musl targets, minisign signatures |
 | **C-OTEL** | OpenTelemetry traces export via `opentelemetry-otlp` | 1 j | trace each search through scoring + hydration |
 | **C-SNAPSHOT-API** | ES SLM-compatible REST surface, register / take / status / delete | 4-5 j | first end-to-end snapshot path |
 | **C-SNAPSHOT-S3** | S3 backend (`aws-sdk-s3`), per-prefix layout, `format_version` | 3-4 j | snapshots actually leaving the box |
