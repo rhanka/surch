@@ -49,7 +49,7 @@ help:
 	@echo "  docker-build      build the multi-stage Docker image locally"
 	@echo "  docker-smoke      build the image, start it on port 7711, hit /"
 	@echo "  sbom              generate CycloneDX SBOM (bom.json) via cargo-cyclonedx"
-	@echo "  report            aggregate target/bench-reports/<sha>/*.json -> summary.md"
+	@echo "  report            aggregate target/bench-reports/<sha>/*.json -> summary.md + SLO gate"
 
 # ---------------------------------------------------------------------------
 # Build + tests
@@ -167,9 +167,19 @@ bench-remote-scw:
 
 bench-all: bench-local bench-recall bench-stress
 
+# bench_report aggregates target/bench-reports/<sha>/*.json envelopes into
+# a Markdown summary and gates the run on the matchID v1 SLOs. Set
+# REPORT_BASELINE=target/bench-reports/<other_sha> to also enforce the
+# regression budget (p95 +15 %, RSS +25 %). Exit code is 0 iff every SLO
+# passes and no regression breaches its threshold.
+REPORT_BASELINE ?=
 report:
-	@ls -1 $(REPORTS_DIR)/*.out 2>/dev/null || (echo "no reports for $(SHA)"; exit 1)
-	@echo "summary aggregation tool (bench_report) not implemented yet"
+	cargo build --release -p surch-demo --bin bench_report --locked
+	@if [ -n "$(REPORT_BASELINE)" ]; then \
+	  ./target/release/bench_report --dir $(REPORTS_DIR) --baseline $(REPORT_BASELINE); \
+	else \
+	  ./target/release/bench_report --dir $(REPORTS_DIR); \
+	fi
 
 # ---------------------------------------------------------------------------
 # Docker

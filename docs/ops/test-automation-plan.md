@@ -116,12 +116,24 @@ Implemented:
   --workers --phases --report`. Wired into the Makefile as
   `make bench-artillery-rs`. The bash `artillery-replay.sh` is kept as a
   no-build fallback.
+- `/crates/surch-demo/src/bin/bench_report.rs` — **B-BENCH-REPORT**.
+  Rust binary that scans `target/bench-reports/<sha>/*.json`, recognises
+  the three envelope schemas (`surch.bench.artillery.v1`,
+  `surch.bench.rss.v1`, `surch.bench.pair.v1`) and renders a
+  `summary.md` with artillery latency tables (p50/p95/p99/max,
+  issued/errors), RSS peak/final per workload, and a "## SLO checks"
+  section gated on the matchID v1 thresholds (p95 ≤ 200 ms,
+  max ≤ 500 ms, error rate ≤ 1 %, RSS peak ≤ 1024 MB on the artillery
+  INSEE 25k workload). When `--baseline <other_sha_dir>` is provided,
+  also emits "## Regression vs baseline" with p95 and RSS deltas, and
+  fails (exit code 1) on a regression > 15 % p95 or > 25 % RSS. Wired
+  into the Makefile as `make report` (with optional
+  `REPORT_BASELINE=...`). This is the gate CI can hook into.
 
 To create:
 1. `/scripts/bench/mmarco-fr-ndcg.sh` — remote-only, French baseline
 2. `/scripts/scw/{wait-ssh,rsync-repo,remote-build,cost-guard}.sh` — Scaleway orchestration
-3. `/crates/surch-demo/src/bin/bench_report.rs` — JSON → Markdown aggregation + regression comparison
-4. `/crates/surch-demo/src/bin/bench_aggregate.rs` — pidstat `.log` → JSON
+3. `/crates/surch-demo/src/bin/bench_aggregate.rs` — pidstat `.log` → JSON
 
 ## References used
 
