@@ -23,6 +23,27 @@ For each optimization, the 3 axes are tracked separately:
 | v2.10 — C1 | `644f62b` | Per-index LRU search-response cache (256 entries, byte-cached, generation-invalidated on every mutation) | **dramatic on repeated queries** (cache hit ≈ 0 work, see matchID auto-suggest / dedupe-review-list workflows); neutral on unique-query benches | small (+capacity × avg response bytes; ~256 × ~3 KB ≈ 1 MB per index ceiling) | neutral |
 | O3 — artillery harness | _scripted_ | `scripts/bench/artillery-replay.sh` reproduces `test-backend-v1.yml` shape (50/50 `multi_match` vs `bool.must`, phases 2→50 RPS over 4 min scaled by `ARTILLERY_SCALE`) | bench infrastructure only | neutral | neutral |
 
+### SciFact BEIR NDCG@10 parity (BM25 correctness gate)
+
+`scripts/bench/scifact-ndcg.sh` indexes the SciFact corpus (5 183
+docs), runs all 300 test queries through `multi_match` over
+`title`+`text`, and computes NDCG@10 against the BEIR `qrels/test.tsv`
+binary judgments.
+
+| Engine | NDCG@10 | Recall@10 |
+| --- | ---: | ---: |
+| **Surch v2.11** (after O2 + T2) | **0.6576** | 0.8100 |
+| OpenSearch 2.17.1 (default BM25) | 0.6537 | 0.8033 |
+| Anserini / Lucene BM25 tuned baseline (BEIR paper) | 0.688 | — |
+
+Surch and OS both sit ~5 % below the Anserini-tuned baseline; the
+gap is fully explained by the tuned BM25 parameters (Anserini uses
+k1=0.9 / b=0.4 against our default 1.2 / 0.75) and the Porter
+English stemmer that neither Surch nor a plain OS BM25 with the
+`standard` analyzer applies. Surch is **slightly above** OS on this
+fixture, which gives the BM25 implementation a written third-party
+correctness gate before we keep optimising.
+
 ### Artillery scaled run on INSEE 25k (ARTILLERY_SCALE=0.2, ~50 s/engine)
 
 `p50` client-side latency from the bash+curl harness, paired runs:
