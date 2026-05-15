@@ -2975,3 +2975,79 @@ async fn search_router_a10_sort_missing_field_goes_last() {
         .to_string();
     assert_eq!(last_id, "sku-3", "missing values must sort last regardless of order");
 }
+
+// --- A5: `function_score` no-op wrapper ---
+//
+// matchID's deces-backend wraps every advanced + block-match in
+// `function_score` (intake §2.2) even though no scoring functions
+// are declared yet. Surch must accept the wrapper, forward to the
+// inner query, and apply the optional top-level `boost`.
+
+#[tokio::test]
+async fn search_router_a5_function_score_forwards_inner_query() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk lamp"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"office desk"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"chair"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"name":"desk"}}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 2);
+}
+
+#[tokio::test]
+async fn search_router_a5_function_score_accepts_empty_functions_array() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match_all":{}},"functions":[],"score_mode":"sum","boost_mode":"multiply"}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 1);
+}
+
+#[tokio::test]
+async fn search_router_a5_function_score_rejects_non_empty_functions() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"function_score":{"query":{"match_all":{}},"functions":[{"weight":2}]}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert!(body["error"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("not implemented yet"));
+}
