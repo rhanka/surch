@@ -26,6 +26,7 @@ pub mod root;
 pub mod search;
 pub mod snapshot;
 pub mod state;
+pub mod telemetry;
 mod topn;
 
 pub use bulk::{parse_bulk_ndjson, BulkOperation, BulkParseError};

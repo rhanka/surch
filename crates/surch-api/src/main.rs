@@ -75,6 +75,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    surch_api::telemetry::init_telemetry();
+
     let config = server_config_from_env(env::vars())?;
     let bind_addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
