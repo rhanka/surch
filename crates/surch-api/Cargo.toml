@@ -20,7 +20,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 opensearch-oracle = { path = "../opensearch-oracle" }
 tower = { workspace = true, features = ["util"] }
+tar = { workspace = true }
+flate2 = { workspace = true }
