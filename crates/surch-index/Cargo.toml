@@ -14,3 +14,4 @@ surch-store = { path = "../surch-store" }
 surch-types = { path = "../surch-types" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+fst = { workspace = true }

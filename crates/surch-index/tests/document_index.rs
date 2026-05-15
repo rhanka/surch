@@ -19,11 +19,20 @@ fn document_index_stores_documents_and_indexes_terms_with_positions_by_field() {
 
     assert_eq!(
         index.terms("body").collect::<Vec<_>>(),
-        ["engine", "fast", "rust", "search"]
+        vec![
+            "engine".to_string(),
+            "fast".to_string(),
+            "rust".to_string(),
+            "search".to_string()
+        ]
     );
     assert_eq!(
         index.terms("title").collect::<Vec<_>>(),
-        ["index", "search", "surch"]
+        vec![
+            "index".to_string(),
+            "search".to_string(),
+            "surch".to_string()
+        ]
     );
 
     let body_search = index
@@ -64,7 +73,11 @@ fn document_index_batch_adds_documents_and_builds_terms_once() {
     assert_eq!(index.doc_ids(), vec![0, 1]);
     assert_eq!(
         index.terms("body").collect::<Vec<_>>(),
-        ["fast", "index", "search"]
+        vec![
+            "fast".to_string(),
+            "index".to_string(),
+            "search".to_string()
+        ]
     );
     let fast = index
         .postings("body", "fast")
@@ -164,8 +177,14 @@ fn document_index_stores_empty_text_without_postings() {
         .expect("empty text is storable");
 
     assert_eq!(index.doc_ids(), vec![1]);
-    assert_eq!(index.terms("title").collect::<Vec<_>>(), Vec::<&str>::new());
-    assert_eq!(index.terms("body").collect::<Vec<_>>(), ["rust"]);
+    assert_eq!(
+        index.terms("title").collect::<Vec<_>>(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        index.terms("body").collect::<Vec<_>>(),
+        vec!["rust".to_string()]
+    );
     assert!(index.postings("title", "").is_none());
 }
 

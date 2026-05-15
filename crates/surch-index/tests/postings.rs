@@ -24,12 +24,15 @@ fn postings_builder_indexes_terms_and_postings_in_deterministic_order() {
 
     assert_eq!(
         dictionary.terms("body").collect::<Vec<_>>(),
-        ["rust", "search"]
+        vec!["rust".to_string(), "search".to_string()]
     );
-    assert_eq!(dictionary.terms("title").collect::<Vec<_>>(), ["surch"]);
+    assert_eq!(
+        dictionary.terms("title").collect::<Vec<_>>(),
+        vec!["surch".to_string()]
+    );
     assert_eq!(
         dictionary.terms("missing").collect::<Vec<_>>(),
-        Vec::<&str>::new()
+        Vec::<String>::new()
     );
 
     let search_postings = dictionary
@@ -113,7 +116,11 @@ fn postings_lucene_parity_fixture_matches_classic_shape() {
 
     assert_eq!(
         dictionary.terms("body").collect::<Vec<_>>(),
-        ["engine", "rust", "search"]
+        vec![
+            "engine".to_string(),
+            "rust".to_string(),
+            "search".to_string()
+        ]
     );
 
     let search_postings = dictionary
@@ -127,4 +134,87 @@ fn postings_lucene_parity_fixture_matches_classic_shape() {
     assert_eq!(search_postings[1].doc_id, 3);
     assert_eq!(search_postings[1].freq, 1);
     assert_eq!(search_postings[1].positions, [5]);
+}
+
+#[test]
+fn term_dictionary_fst_lookup_returns_postings_by_term() {
+    // Exercise the FST lookup path: insert several terms with prefix
+    // overlap (the FST shares the "rue " prefix), then fetch each
+    // posting list and check the FST round-trip is lossless. Also
+    // assert that a missing term yields `None` — this is the contract
+    // every BM25/BoolMust caller depends on.
+    let mut builder = PostingsBuilder::new();
+    builder
+        .add("address", "rue de la paix", 1, vec![0, 1, 2, 3])
+        .expect("address/rue de la paix");
+    builder
+        .add("address", "rue de la liberte", 2, vec![0, 1, 2, 3])
+        .expect("address/rue de la liberte");
+    builder
+        .add("address", "rue mozart", 3, vec![0, 1])
+        .expect("address/rue mozart");
+    builder
+        .add("address", "avenue victor hugo", 4, vec![0, 1, 2])
+        .expect("address/avenue victor hugo");
+
+    let dictionary = builder.build();
+
+    let paix = dictionary
+        .postings("address", "rue de la paix")
+        .expect("rue de la paix postings")
+        .collect::<Vec<_>>();
+    assert_eq!(paix.len(), 1);
+    assert_eq!(paix[0].doc_id, 1);
+    assert_eq!(paix[0].positions, [0, 1, 2, 3]);
+
+    let mozart = dictionary
+        .postings("address", "rue mozart")
+        .expect("rue mozart postings")
+        .collect::<Vec<_>>();
+    assert_eq!(mozart.len(), 1);
+    assert_eq!(mozart[0].doc_id, 3);
+
+    let avenue = dictionary
+        .postings("address", "avenue victor hugo")
+        .expect("avenue victor hugo postings")
+        .collect::<Vec<_>>();
+    assert_eq!(avenue.len(), 1);
+    assert_eq!(avenue[0].doc_id, 4);
+
+    assert!(dictionary
+        .postings("address", "rue de la republique")
+        .is_none());
+    assert!(dictionary.postings("missing_field", "rue mozart").is_none());
+}
+
+#[test]
+fn term_dictionary_fst_terms_returns_lex_sorted() {
+    // Insert terms in non-lexicographic order; the FST builder
+    // contract requires lex order on the way in, so this test
+    // exercises the `PostingsBuilder::build()` sort.
+    let mut builder = PostingsBuilder::new();
+    builder.add("body", "zebra", 1, vec![0]).expect("zebra");
+    builder.add("body", "alpha", 2, vec![0]).expect("alpha");
+    builder.add("body", "mango", 3, vec![0]).expect("mango");
+    builder.add("body", "alfa", 4, vec![0]).expect("alfa");
+    builder.add("body", "beta", 5, vec![0]).expect("beta");
+
+    let dictionary = builder.build();
+
+    let terms = dictionary.terms("body").collect::<Vec<_>>();
+    assert_eq!(
+        terms,
+        vec![
+            "alfa".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "mango".to_string(),
+            "zebra".to_string(),
+        ]
+    );
+
+    // The empty-field case must yield an empty iterator (not panic
+    // and not return a single empty string).
+    let missing = dictionary.terms("nope").collect::<Vec<_>>();
+    assert!(missing.is_empty());
 }

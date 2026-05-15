@@ -32,7 +32,7 @@ struct MemoryStore {
     index_templates: BTreeMap<String, StoredIndexTemplate>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone)]
 struct InMemoryIndex {
     documents: BTreeMap<String, Value>,
     document_ids: BTreeMap<String, u32>,
