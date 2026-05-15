@@ -18,7 +18,7 @@ per-workload prerequisite matrix).
 ### Surch version
 
 - **Minimum Surch version for the first bulk-match swap**: 0.2.x
-  (round 5 of `wp/a-optim` + `wp/b-test-auto` shipped, i.e. **A1, A3,
+  (round 5 of `wp/d-matchid` + `wp/b-test-auto` shipped, i.e. **A1, A3,
   A8 implemented + B1 replay fixture green**).
 - **Minimum Surch version for the interactive-search swap**: 0.3.x
   (adds A9, A10, A11, A14).
