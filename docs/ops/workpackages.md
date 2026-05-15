@@ -174,7 +174,7 @@ Ordered by priority gain/effort on the BAN + INSEE + SciFact workloads:
 | `e7494e3` | ci(release): tag-triggered binary + docker release workflow | x86_64-gnu + aarch64-gnu via `cross`, multi-arch buildx push to ghcr.io |
 | `2c4554a` | chart(helm): minimal Surch Helm chart | Deployment, Service, probes on `/`, distroless-friendly securityContext |
 | `9233d8f` | build(make): docker-build + docker-smoke targets | smoke runs the image on host port 7711 |
-| `79ed7b9` | ci(release): cosign keyless OIDC signing on OCI image | C-COSIGN — image signed by digest, verify command documented in README + packaging-plan |
+| `e7f7b91` | ci(release): cosign keyless OIDC signing on OCI image | C-COSIGN — image signed by digest, verify command documented in README + packaging-plan |
 
 #### Reste
 
