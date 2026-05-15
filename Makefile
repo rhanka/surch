@@ -24,7 +24,7 @@ SCW_TAG               := surch-bench-$(SHA)-$(shell date +%s)
         opensearch-up opensearch-down \
         bench-smoke bench-local bench-recall bench-trec-covid \
         bench-stress bench-artillery-rs bench-perf \
-        bench-remote-scw bench-all report \
+        bench-remote-scw bench-k8s bench-all report \
         sbom \
         clean
 
@@ -40,6 +40,7 @@ help:
 	@echo "  bench-artillery-rs Rust keep-alive artillery_bench vs Surch & OS (~6 min)"
 	@echo "  bench-perf        bench-local + bench-stress + RSS sampling"
 	@echo "  bench-remote-scw  bench-perf on a Scaleway DEV1-M (hard 30 min cap)"
+	@echo "  bench-k8s         dispatch the .github/workflows/ci-k8s.yml burst-pool bench (gh CLI)"
 	@echo "  bench-all         full local suite, sequenced"
 	@echo "  surch-up          launch surch-api release in the background"
 	@echo "  surch-down        stop a backgrounded surch-api"
@@ -163,6 +164,25 @@ bench-perf: bench-local bench-stress
 
 bench-remote-scw:
 	@echo "scw harness not implemented yet — see docs/ops/test-automation-plan.md"
+	@exit 1
+
+# ---------------------------------------------------------------------------
+# K8s burst-pool dispatch (poc-k8s)
+# ---------------------------------------------------------------------------
+# Dispatches the .github/workflows/ci-k8s.yml workflow that runs a Surch Job
+# (ndcg-gate | insee-bench | 00-init-corpora) on the Scaleway Kapsule burst
+# pool. The workflow is dormant (`if: false`) for the MVP — enable after:
+#   1. poc-k8s PR #2 merged (surch namespace + burst pool live)
+#   2. `ghcr-pull` Secret provisioned in the surch namespace
+#   3. SCW_OIDC_ROLE GitHub secret set
+# Until then, this target only emits a TODO message and exits non-zero.
+K8S_JOB ?= ndcg-gate
+bench-k8s:
+	@echo "bench-k8s: dispatching ci-k8s.yml (job=$(K8S_JOB))"
+	@echo "TODO: enable after poc-k8s PR #2 merged + ghcr-pull Secret provisioned + SCW_OIDC_ROLE set"
+	@echo "Then drop the leading '#' from the gh invocation below."
+	@# gh workflow run ci-k8s.yml -f job=$(K8S_JOB)
+	@# gh run watch --exit-status $$(gh run list --workflow=ci-k8s.yml --limit=1 --json databaseId --jq '.[0].databaseId')
 	@exit 1
 
 bench-all: bench-local bench-recall bench-stress
