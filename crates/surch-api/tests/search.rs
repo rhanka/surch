@@ -2039,6 +2039,312 @@ async fn match_query_with_and_operator_requires_all_query_tokens() {
     assert_eq!(ids, vec!["sku-both"]);
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// A3 — bool.filter / bool.should / minimum_should_match / clause boost.
+// Mirrors the matchID deces-backend wire shapes from
+// `docs/wp-d-matchid/incoming/2026-05-15-deces-backend-dsl-inventory.md`
+// (§2.1 and §2.6).
+// ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn bool_filter_restricts_without_changing_score_ordering() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"alpha","category":"a"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"alpha","category":"b"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"name":"alpha"}}],"filter":[{"term":{"category":"a"}}]}}}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    let ids: Vec<&str> = hits
+        .iter()
+        .map(|h| h["_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn bool_should_with_minimum_should_match_two_requires_two_matches() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"first":"jean","last":"dupont"}"#).await;
+    index_product(&router, "sku-2", r#"{"first":"jean","last":"martin"}"#).await;
+    index_product(&router, "sku-3", r#"{"first":"paul","last":"dupont"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"should":[{"match":{"first":"jean"}},{"match":{"last":"dupont"}}],"minimum_should_match":2}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<&str> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn bool_should_default_minimum_when_only_should_present_is_one() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"first":"jean","last":"dupont"}"#).await;
+    index_product(&router, "sku-2", r#"{"first":"paul","last":"martin"}"#).await;
+
+    // No `minimum_should_match` and no `must`/`filter` → MSM defaults to 1.
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"should":[{"match":{"first":"jean"}},{"match":{"last":"dupont"}}]}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<&str> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn bool_minimum_should_match_percentage_resolves_to_ceiled_integer() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"a":"x","b":"x","c":"y","d":"y"}"#).await;
+    index_product(&router, "sku-2", r#"{"a":"x","b":"y","c":"y","d":"y"}"#).await;
+
+    // 4 should-clauses, "50%" → MSM = 2. sku-1 has two matching (a, b),
+    // sku-2 has one matching (a).
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"should":[{"term":{"a":"x"}},{"term":{"b":"x"}},{"term":{"c":"x"}},{"term":{"d":"x"}}],"minimum_should_match":"50%"}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<&str> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn bool_clause_boost_scales_inner_score_proportionally() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"alpha"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"alpha beta"}"#).await;
+
+    let baseline = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"name":"alpha"}}]}}}"#,
+    )
+    .await;
+    let boosted = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"name":"alpha"}}],"boost":3}}}"#,
+    )
+    .await;
+
+    let base_top = baseline["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("baseline _score");
+    let boost_top = boosted["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("boosted _score");
+
+    // 3x boost ≈ 3x score; allow 1 % slack for f64 accumulation.
+    let ratio = boost_top / base_top;
+    assert!(
+        (ratio - 3.0).abs() < 0.03,
+        "expected ~3.0 boost ratio, got {ratio}"
+    );
+}
+
+#[tokio::test]
+async fn bool_matchid_nested_should_with_boost_disambiguates_name_order() {
+    // Mirrors the canonical matchID `nameQuery(fuzzy=auto)` shape from
+    // §2.1 of the DSL inventory: two nested `bool.should` blocks differ
+    // only by `boost`, used to prefer the natural "first last" order.
+    let router = app_router();
+    index_product(&router, "doc-direct", r#"{"first":"jean","last":"dupont"}"#).await;
+    index_product(
+        &router,
+        "doc-swapped",
+        r#"{"first":"dupont","last":"jean"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{
+            "query": {
+                "bool": {
+                    "minimum_should_match": 1,
+                    "should": [
+                        {
+                            "bool": {
+                                "should": [
+                                    { "match": { "first": "jean" } },
+                                    { "match": { "last": "dupont" } }
+                                ],
+                                "minimum_should_match": 2,
+                                "boost": 2
+                            }
+                        },
+                        {
+                            "bool": {
+                                "should": [
+                                    { "match": { "first": "dupont" } },
+                                    { "match": { "last": "jean" } }
+                                ],
+                                "minimum_should_match": 2,
+                                "boost": 0.5
+                            }
+                        }
+                    ]
+                }
+            }
+        }"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["_id"].as_str().expect("id"), "doc-direct");
+    let top_score = hits[0]["_score"].as_f64().expect("top score");
+    let next_score = hits[1]["_score"].as_f64().expect("next score");
+    // The 2x vs 0.5x boost should keep doc-direct ranked first.
+    assert!(top_score > next_score);
+}
+
+#[tokio::test]
+async fn bool_rejects_empty_body() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"bool":{}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert!(body["error"]["reason"]
+        .as_str()
+        .expect("reason")
+        .contains("at least one of"));
+}
+
+#[tokio::test]
+async fn bool_rejects_negative_boost() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"bool":{"must":[{"match":{"name":"x"}}],"boost":-1}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert!(body["error"]["reason"]
+        .as_str()
+        .expect("reason")
+        .contains("boost"));
+}
+
+#[tokio::test]
+async fn bool_filter_alone_is_valid_and_matches_all_filtered() {
+    // Mirrors the `geo_distance`-as-filter pattern from §2.6 minus the
+    // geo op itself: a `bool.filter` clause restricts the candidate set
+    // without contributing to `_score`.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"category":"a"}"#).await;
+    index_product(&router, "sku-2", r#"{"category":"b"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"filter":[{"term":{"category":"a"}}]}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<&str> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn bool_filter_accepts_object_shorthand() {
+    // §2.6 wire shape uses `"filter": { … }` (single object), not the
+    // array form. Both must parse.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"category":"a"}"#).await;
+    index_product(&router, "sku-2", r#"{"category":"b"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match_all":{}}],"filter":{"term":{"category":"a"}}}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<&str> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
 #[tokio::test]
 async fn match_query_rejects_unknown_operator_with_opensearch_error() {
     let router = app_router();
@@ -2076,4 +2382,231 @@ async fn match_query_rejects_unknown_operator_with_opensearch_error() {
         .as_str()
         .expect("reason string")
         .contains("operator"));
+}
+
+// ---------------------------------------------------------------------------
+// A1 — `match` object form with `fuzziness` sub-field.
+//
+// deces-backend emits `{ "match": { "F": { "query": "JEAN",
+// "fuzziness": "AUTO" } } }`. Surch must accept the shape and apply
+// bounded Damerau-Levenshtein per analyzed query token, with AUTO →
+// edits=1 for terms shorter than 6 characters and edits=2 otherwise.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn match_object_form_with_fuzziness_auto_matches_one_edit_term() {
+    let router = app_router();
+    // "JEAN" indexed → "JEAS" (single substitution) should still match
+    // under AUTO (≤5 chars → edits=1).
+    index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
+    index_product(&router, "sku-other", r#"{"name":"PAUL"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"JEAS","fuzziness":"AUTO"}}}}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits should be an array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-jean".to_string()]);
+}
+
+#[tokio::test]
+async fn match_object_form_with_numeric_fuzziness_one_matches_one_edit() {
+    let router = app_router();
+    // Numeric fuzziness=1 → one substitution permitted.
+    index_product(&router, "sku-dupont", r#"{"name":"DUPONT"}"#).await;
+    index_product(&router, "sku-martin", r#"{"name":"MARTIN"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"DUPONX","fuzziness":1}}}}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits should be an array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-dupont".to_string()]);
+}
+
+#[tokio::test]
+async fn match_object_form_with_fuzziness_zero_requires_exact_term() {
+    let router = app_router();
+    index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
+
+    // fuzziness="0" → no edits allowed; "JEAS" must not match "JEAN".
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"JEAS","fuzziness":"0"}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 0);
+}
+
+#[tokio::test]
+async fn match_object_form_without_fuzziness_keeps_default_semantics() {
+    let router = app_router();
+    index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
+    index_product(&router, "sku-paul", r#"{"name":"PAUL"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"JEAN"}}}}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-jean".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// A8 — `match_all` with optional `boost`.
+//
+// deces-backend uses `{ "match_all": {} }` as the default query and as
+// the must-clause of a geo-filter bool. The empty form keeps the
+// existing `_score = null` semantics; the explicit `{ "boost": N }`
+// form contributes `N` to the bool-sum so that filter-context callers
+// can adjust ranking without writing a `function_score` wrapper.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn match_all_with_boost_object_returns_every_document() {
+    let router = app_router();
+    index_product(&router, "sku-a", r#"{"name":"alpha"}"#).await;
+    index_product(&router, "sku-b", r#"{"name":"beta"}"#).await;
+
+    let body = search_with_body(&router, r#"{"query":{"match_all":{"boost":2.5}}}"#).await;
+
+    assert_eq!(body["hits"]["total"]["value"], 2);
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert!(ids.contains(&"sku-a".to_string()));
+    assert!(ids.contains(&"sku-b".to_string()));
+}
+
+#[tokio::test]
+async fn match_all_with_boost_in_bool_must_scales_score() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"rust"}"#).await;
+
+    let body_default = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"name":"rust"}},{"match_all":{}}]}}}"#,
+    )
+    .await;
+    let body_boosted = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"name":"rust"}},{"match_all":{"boost":5}}]}}}"#,
+    )
+    .await;
+
+    // BoolMust sums clause scores → boost=5 adds +5 (vs default +1) to
+    // the match clause's BM25 score.
+    let s_default = body_default["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("default score");
+    let s_boosted = body_boosted["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("boosted score");
+    let diff = s_boosted - s_default;
+    assert!(
+        (diff - 4.0).abs() < 1e-6,
+        "boost=5 vs default=1 must add 4.0, got diff={diff}"
+    );
+}
+
+#[tokio::test]
+async fn match_all_rejects_unknown_field() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"x"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{"weird":1}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+}
+
+#[tokio::test]
+async fn match_all_rejects_negative_boost() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"x"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{"boost":-1}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+}
+
+#[tokio::test]
+async fn match_all_rejects_invalid_fuzziness_via_unknown_field_check() {
+    // Sanity: the empty body still works after the parser refactor.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"x"}"#).await;
+    let body = search_with_body(&router, r#"{"query":{"match_all":{}}}"#).await;
+    assert_eq!(body["hits"]["total"]["value"], 1);
+}
+
+#[tokio::test]
+async fn match_object_form_rejects_invalid_fuzziness_string() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"JEAN"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match":{"name":{"query":"JEAN","fuzziness":"NOPE"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
 }

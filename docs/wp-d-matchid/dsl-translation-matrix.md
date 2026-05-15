@@ -13,7 +13,7 @@ implements it.
 Status legend (mirrors `gap-analysis.md`):
 
 - **gap** — Surch does not implement this primitive yet
-- **in flight (round 5)** — landing on `wp/a-optim` or `wp/b-test-auto`
+- **in flight (round 5)** — landing on `wp/d-matchid` or `wp/b-test-auto`
   during round 5 (A1, A3, A8, B1, B2, C-SNAPSHOT-RAW)
 - **partial** — Surch implements a subset; remaining mismatch noted
 - **implemented** — on `main` and gated by at least one cargo test or
