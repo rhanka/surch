@@ -24,6 +24,7 @@ pub mod mget;
 pub mod msearch;
 pub mod root;
 pub mod search;
+pub mod snapshot;
 pub mod state;
 mod topn;
 
@@ -31,6 +32,11 @@ pub use bulk::{parse_bulk_ndjson, BulkOperation, BulkParseError};
 pub use error::OpenSearchError;
 
 const BULK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+/// Hard cap on `POST /_surch/snapshot/import` body. Matches the
+/// internal cap in `snapshot::IMPORT_BODY_CAP_BYTES`; `axum`'s
+/// `DefaultBodyLimit` enforces it before the handler sees the bytes,
+/// so a hostile uploader cannot exhaust memory.
+const SNAPSHOT_IMPORT_BODY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Build the P0 OpenSearch-compatible API router.
 pub fn app_router() -> Router {
@@ -148,6 +154,15 @@ pub fn app_router() -> Router {
         .route("/_cat/aliases/:name", get(cat::cat_aliases_by_name_handler))
         .route("/_cat/count", get(cat::cat_count_handler))
         .route("/_cat/count/:index", get(cat::cat_count_index_handler))
+        .route(
+            "/_surch/snapshot/export",
+            post(snapshot::export_handler).get(snapshot::export_handler),
+        )
+        .route(
+            "/_surch/snapshot/import",
+            post(snapshot::import_handler)
+                .layer(DefaultBodyLimit::max(SNAPSHOT_IMPORT_BODY_LIMIT_BYTES)),
+        )
         .route(
             "/_aliases",
             post(aliases::aliases_state_handler).put(aliases::aliases_state_handler),
