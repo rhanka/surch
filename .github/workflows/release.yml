@@ -4,8 +4,12 @@
 # attaches them to a GitHub release with SHA-256 checksums, then builds and
 # publishes a multi-arch Docker image to ghcr.io.
 #
-# Multi-platform binaries (macOS, musl) and minisign/cosign signatures come
-# in a follow-up that wires cargo-dist + cosign keyless OIDC.
+# The OCI image pushed to ghcr.io is signed via cosign keyless OIDC at the
+# end of the publish-image job (signature anchored on the immutable digest
+# returned by docker/build-push-action).
+#
+# Multi-platform binaries (macOS, musl) and minisign signatures of the
+# static binaries come in a follow-up that wires cargo-dist.
 
 name: release
 
@@ -18,7 +22,7 @@ on:
 permissions:
   contents: write       # create release + upload assets
   packages: write       # push image to ghcr.io
-  id-token: write       # OIDC for cosign keyless (future)
+  id-token: write       # OIDC token for cosign keyless signing
 
 env:
   CARGO_TERM_COLOR: always
@@ -134,6 +138,7 @@ jobs:
             type=sha,prefix=sha-
 
       - name: Build + push multi-arch image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -144,3 +149,19 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign image by digest (keyless OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+          IMAGE: ghcr.io/${{ github.repository_owner }}/surch
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Signing the immutable digest covers every tag pushed by
+          # docker/metadata-action: they all resolve to the same manifest.
+          cosign sign --yes "${IMAGE}@${DIGEST}"

@@ -174,13 +174,13 @@ Ordered by priority gain/effort on the BAN + INSEE + SciFact workloads:
 | `e7494e3` | ci(release): tag-triggered binary + docker release workflow | x86_64-gnu + aarch64-gnu via `cross`, multi-arch buildx push to ghcr.io |
 | `2c4554a` | chart(helm): minimal Surch Helm chart | Deployment, Service, probes on `/`, distroless-friendly securityContext |
 | `9233d8f` | build(make): docker-build + docker-smoke targets | smoke runs the image on host port 7711 |
+| `e7f7b91` | ci(release): cosign keyless OIDC signing on OCI image | C-COSIGN — image signed by digest, verify command documented in README + packaging-plan |
 
 #### Reste
 
 | ID | Title | Effort | Output |
 |---|---|---|---|
 | **C-CARGO-DIST** | replace ad-hoc release workflow with `cargo-dist` | 1 j | macOS + musl targets, minisign signatures |
-| **C-COSIGN** | cosign keyless OIDC on the OCI image + attestations | 0.5 j | provenance + signature published with each tag |
 | **C-SBOM** | CycloneDX SBOM attached to each release | 0.5 j | supply-chain transparency |
 | **C-METRICS** | `/_prometheus_metrics` endpoint | 1 j | scrapable counters + histograms (search latency, postings size, cache hit ratio) |
 | **C-OTEL** | OpenTelemetry traces export via `opentelemetry-otlp` | 1 j | trace each search through scoring + hydration |

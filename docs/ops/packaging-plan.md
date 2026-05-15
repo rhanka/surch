@@ -66,6 +66,17 @@ release CI yet. The release profile in `Cargo.toml` already has
 - **Publication**: primary `ghcr.io/rhanka/surch` (OIDC auth, free, scoped to the repo); mirror to Docker Hub `surch/surch` for visibility.
 - **Tags**: `latest`, `0.2`, `0.2.3`, `sha-<short>`, `edge` (main).
 - **Signing**: cosign keyless (OIDC GitHub Actions). SBOM via `cargo-cyclonedx` (CycloneDX format) attached to each tag.
+- **Verification command** (downstream consumers):
+
+  ```bash
+  cosign verify ghcr.io/rhanka/surch:<tag> \
+    --certificate-identity-regexp 'https://github.com/rhanka/surch/.github/workflows/release\.yml@.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+  The signature is anchored on the immutable image digest emitted by
+  `docker/build-push-action`; every tag pushed by `docker/metadata-action`
+  resolves to the same manifest, so a single `cosign sign` covers them all.
 - **Size target**: < 30 MB compressed. Reference: `opensearchproject/opensearch:2.11.0` ≈ 1.2 GB (anti-example), `getmeili/meilisearch` ≈ 150 MB, `quickwit/quickwit` ≈ 80 MB.
 - **Effort**: 1 day.
 
