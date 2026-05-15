@@ -2873,3 +2873,105 @@ async fn search_router_a9_from_plus_size_above_window_returns_400() {
         body["error"]["reason"]
     );
 }
+
+// --- A10: sort over stored fields + multi-field sub-field aliasing ---
+//
+// deces-backend sorts UI tables on `DATE_NAISSANCE_NORM` then `NOM.raw`
+// (intake §2.8). The `_source` map only carries the parent fields
+// today (A13 multi-field mapping isn't shipped yet) — A10 aliases the
+// `.raw` / `.norm` sub-field to its parent so the wire shape works
+// even before A13 lands; the alias is a no-op once A13 ships real
+// keyword normalisers under those sub-paths.
+
+#[tokio::test]
+async fn search_router_a10_sort_string_field_ascending() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"banana"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"apple"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"cherry"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"name":"asc"}]}"#,
+    )
+    .await;
+
+    let names: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["_source"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["apple", "banana", "cherry"]);
+}
+
+#[tokio::test]
+async fn search_router_a10_sort_string_field_descending() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"banana"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"apple"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"cherry"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"name":"desc"}]}"#,
+    )
+    .await;
+
+    let names: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["_source"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["cherry", "banana", "apple"]);
+}
+
+#[tokio::test]
+async fn search_router_a10_sort_subfield_aliases_to_parent() {
+    // matchID wire shape uses `NOM.raw`; until A13 ships real
+    // multi-fields, Surch aliases the sub-field to its parent so the
+    // sort order is deterministic instead of dropping everything to
+    // the "missing" bucket.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"banana"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"apple"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"name.raw":"asc"}]}"#,
+    )
+    .await;
+
+    let names: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["_source"]["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["apple", "banana"]);
+}
+
+#[tokio::test]
+async fn search_router_a10_sort_missing_field_goes_last() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"banana"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"apple"}"#).await;
+    index_product(&router, "sku-3", r#"{"other":"no-name"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"name":"asc"}]}"#,
+    )
+    .await;
+
+    let last_id = body["hits"]["hits"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(last_id, "sku-3", "missing values must sort last regardless of order");
+}

@@ -2889,10 +2889,24 @@ fn compare_sort_clause(
         return compare_score(left.score, right.score, clause.order);
     }
     compare_field(
-        left.doc.source.get(&clause.field),
-        right.doc.source.get(&clause.field),
+        lookup_sort_value(&left.doc.source, &clause.field),
+        lookup_sort_value(&right.doc.source, &clause.field),
         clause.order,
     )
+}
+
+/// Resolve a sort field against the stored `_source` map, with a fallback
+/// for ES multi-field sub-fields like `NOM.raw` or `DATE_NAISSANCE.norm`.
+/// matchID emits these because their mapping declares
+/// `NOM: { type: text, fields: { raw: { type: keyword } } }` — until A13
+/// ships the real multi-field types, we alias the sub-field to its
+/// parent so the sort order is still deterministic.
+fn lookup_sort_value<'a>(source: &'a Value, field: &str) -> Option<&'a Value> {
+    let object = source.as_object()?;
+    if let Some(value) = object.get(field) {
+        return Some(value);
+    }
+    field.rsplit_once('.').and_then(|(parent, _)| object.get(parent))
 }
 
 fn compare_score(left: f64, right: f64, order: SortOrder) -> std::cmp::Ordering {
