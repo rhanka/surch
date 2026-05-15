@@ -45,6 +45,25 @@ Every feature starts from an upstream reference and a golden parity test:
 - passing oracle against upstream or recorded fixture
 - verification gates
 
+## Verifying releases
+
+The Surch OCI image published to `ghcr.io/rhanka/surch` is signed via
+[cosign](https://github.com/sigstore/cosign) keyless OIDC from the
+`release.yml` GitHub Actions workflow. No static keys are involved; the
+signature is anchored to the image digest in the Sigstore transparency log.
+
+Verify a published tag with cosign 2.x:
+
+```bash
+cosign verify ghcr.io/rhanka/surch:<tag> \
+  --certificate-identity-regexp 'https://github.com/rhanka/surch/.github/workflows/release\.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+`<tag>` can be any tag produced by the release workflow (semver
+`X.Y.Z`, short `X.Y`, major `X`, or `sha-<short>`). All tags resolve to
+the same signed manifest digest.
+
 ## License
 
 Apache-2.0
