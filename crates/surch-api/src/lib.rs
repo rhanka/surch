@@ -19,6 +19,7 @@ pub mod error;
 pub mod field_caps;
 pub mod index;
 pub mod index_template;
+pub mod metrics;
 pub mod mget;
 pub mod msearch;
 pub mod root;
@@ -33,8 +34,14 @@ const BULK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Build the P0 OpenSearch-compatible API router.
 pub fn app_router() -> Router {
+    // Install the global Prometheus recorder before the router starts
+    // emitting metrics. Idempotent: safe to call from every test and
+    // from `main` at startup.
+    let _ = metrics::install_global();
+
     Router::new()
         .route("/", get(root::root_handler))
+        .route("/_prometheus_metrics", get(metrics::prometheus_handler))
         .route(
             "/_bulk",
             post(bulk::bulk_state_handler)

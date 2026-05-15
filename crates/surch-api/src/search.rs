@@ -356,6 +356,7 @@ pub async fn search_handler(
     Path(target): Path<String>,
     body: String,
 ) -> impl IntoResponse {
+    let started_at = Instant::now();
     if let Err(error) = validate_index_name(&target) {
         return error.into_response();
     }
@@ -378,6 +379,16 @@ pub async fn search_handler(
 
     if let (Some(key), Some(index)) = (cache_key, indices.first()) {
         if let Some(bytes) = state.search_cache_get(index, key) {
+            metrics::counter!("surch_search_cache_hit_total").increment(1);
+            let query_type = classify_search_body(&body);
+            metrics::counter!(
+                "surch_search_total",
+                "index" => target.clone(),
+                "query_type" => query_type,
+            )
+            .increment(1);
+            metrics::histogram!("surch_search_duration_seconds")
+                .record(started_at.elapsed().as_secs_f64());
             return axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -389,10 +400,21 @@ pub async fn search_handler(
 
     match parse_search_request(&body) {
         Ok(request) => {
+            let query_type = classify_query(request.query.as_ref());
             let response = run_search(&state, &indices, &request);
             let bytes = match serde_json::to_vec(&response) {
                 Ok(bytes) => bytes,
-                Err(_) => return (StatusCode::OK, Json(response)).into_response(),
+                Err(_) => {
+                    metrics::counter!(
+                        "surch_search_total",
+                        "index" => target.clone(),
+                        "query_type" => query_type,
+                    )
+                    .increment(1);
+                    metrics::histogram!("surch_search_duration_seconds")
+                        .record(started_at.elapsed().as_secs_f64());
+                    return (StatusCode::OK, Json(response)).into_response();
+                }
             };
             if let (Some(key), Some(index)) = (cache_key, indices.first()) {
                 // Cache the response with took=0 so cache hits report ~zero
@@ -403,6 +425,14 @@ pub async fn search_handler(
                     state.search_cache_put(index, key, cache_bytes);
                 }
             }
+            metrics::counter!(
+                "surch_search_total",
+                "index" => target.clone(),
+                "query_type" => query_type,
+            )
+            .increment(1);
+            metrics::histogram!("surch_search_duration_seconds")
+                .record(started_at.elapsed().as_secs_f64());
             axum::http::Response::builder()
                 .status(StatusCode::OK)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -411,6 +441,42 @@ pub async fn search_handler(
                 .into_response()
         }
         Err(error) => error.into_response(),
+    }
+}
+
+/// Stable label value for the `query_type` dimension of
+/// `surch_search_total`. Anything outside the explicit set folds into
+/// `"other"` so the cardinality of the metric stays bounded.
+fn classify_query(query: Option<&SearchQuery>) -> &'static str {
+    match query {
+        Some(SearchQuery::Match { .. }) => "match",
+        Some(SearchQuery::MultiMatch { .. }) => "multi_match",
+        Some(SearchQuery::Term { .. }) => "term",
+        Some(SearchQuery::BoolMust(_)) => "bool_must",
+        _ => "other",
+    }
+}
+
+/// Best-effort classification of a raw search body for the cache-hit
+/// path, where the body has not been parsed yet. Falls back to
+/// `"other"` whenever the JSON is missing or malformed.
+fn classify_search_body(body: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return "other";
+    };
+    let Some(query) = value.get("query").and_then(Value::as_object) else {
+        return "other";
+    };
+    if query.contains_key("match") {
+        "match"
+    } else if query.contains_key("multi_match") {
+        "multi_match"
+    } else if query.contains_key("term") {
+        "term"
+    } else if query.contains_key("bool") {
+        "bool_must"
+    } else {
+        "other"
     }
 }
 
