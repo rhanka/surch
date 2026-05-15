@@ -22,7 +22,8 @@ SCW_TAG               := surch-bench-$(SHA)-$(shell date +%s)
 .PHONY: help test build release \
         surch-build surch-up surch-down \
         opensearch-up opensearch-down \
-        bench-smoke bench-local bench-recall bench-stress bench-perf \
+        bench-smoke bench-local bench-recall bench-trec-covid \
+        bench-stress bench-perf \
         bench-remote-scw bench-all report \
         clean
 
@@ -31,7 +32,8 @@ help:
 	@echo "  test              cargo test --workspace --locked (~30 s)"
 	@echo "  bench-smoke       BAN tiny smoke against a local engine"
 	@echo "  bench-local       BAN 25k + INSEE 25k vs Surch & OS (~5 min)"
-	@echo "  bench-recall      SciFact NDCG@10 vs Surch & OS (~3 min)"
+	@echo "  bench-recall      SciFact + TREC-COVID NDCG@10 vs Surch & OS (~10 min)"
+	@echo "  bench-trec-covid  TREC-COVID NDCG@10 + Recall@10 vs Surch & OS (~7 min)"
 	@echo "  bench-stress      artillery-replay vs Surch & OS (~10 min)"
 	@echo "  bench-perf        bench-local + bench-stress + RSS sampling"
 	@echo "  bench-remote-scw  bench-perf on a Scaleway DEV1-M (hard 30 min cap)"
@@ -106,8 +108,15 @@ bench-local: opensearch-up surch-up | $(REPORTS_DIR)
 	@echo "bench-local reports under $(REPORTS_DIR)"
 
 bench-recall: opensearch-up surch-up | $(REPORTS_DIR)
-	bash scripts/bench/scifact-ndcg.sh "scifact-surch-$(SHA)" $(REPORTS_DIR)/scifact-surch.out $(SURCH_URL)
-	bash scripts/bench/scifact-ndcg.sh "scifact-os-$(SHA)"    $(REPORTS_DIR)/scifact-os.out    $(OS_URL)
+	bash scripts/bench/scifact-ndcg.sh    "scifact-surch-$(SHA)"    $(REPORTS_DIR)/scifact-surch.out    $(SURCH_URL)
+	bash scripts/bench/scifact-ndcg.sh    "scifact-os-$(SHA)"       $(REPORTS_DIR)/scifact-os.out       $(OS_URL)
+	bash scripts/bench/trec-covid-ndcg.sh "trec-covid-surch-$(SHA)" $(REPORTS_DIR)/trec-covid-surch.out $(SURCH_URL)
+	bash scripts/bench/trec-covid-ndcg.sh "trec-covid-os-$(SHA)"    $(REPORTS_DIR)/trec-covid-os.out    $(OS_URL)
+	$(MAKE) surch-down opensearch-down
+
+bench-trec-covid: opensearch-up surch-up | $(REPORTS_DIR)
+	bash scripts/bench/trec-covid-ndcg.sh "trec-covid-surch-$(SHA)" $(REPORTS_DIR)/trec-covid-surch.out $(SURCH_URL)
+	bash scripts/bench/trec-covid-ndcg.sh "trec-covid-os-$(SHA)"    $(REPORTS_DIR)/trec-covid-os.out    $(OS_URL)
 	$(MAKE) surch-down opensearch-down
 
 bench-stress: opensearch-up surch-up | $(REPORTS_DIR)

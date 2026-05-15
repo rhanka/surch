@@ -36,6 +36,8 @@ Exit code reflects SLO pass/fail.
 
 Calibration rule: "no worse than OS in latency at equal load" + "≥ Lucene −5 points absolute on NDCG@10". Tighten after the first reproduced baselines land.
 
+TREC-COVID is now wired in as the second BEIR correctness gate (after SciFact). It runs as part of `make bench-recall` and on its own via `make bench-trec-covid`. Unlike SciFact's binary qrels (~1 judged doc per query), TREC-COVID ships graded judgments 0/1/2 averaging ~500 per query, so the NDCG@10 implementation uses `gain = 2^rel - 1` and the IDCG sorts all judged docs by grade desc before taking the top 10. This denser, graded signal makes any BM25 regression jump out of the noise floor.
+
 | Workload | Metric | Target Surch | Observed OS baseline | Bench file |
 | --- | --- | ---: | ---: | --- |
 | BAN Paris 25k | bulk ingestion | ≥ 10 000 docs/s | ~10 000 (TBD) | `scripts/bench/bench.sh` |
@@ -48,7 +50,8 @@ Calibration rule: "no worse than OS in latency at equal load" + "≥ Lucene −5
 | INSEE 25k artillery 50 RPS | RSS peak | ≤ 1024 MB | OS ~512 MB heap | idem + `pidstat` |
 | SciFact 5k BEIR | NDCG@10 | ≥ 0.65 (Lucene 0.688) | 0.688 Anserini | `scripts/bench/scifact-ndcg.sh` |
 | SciFact 5k BEIR | Recall@10 | ≥ 0.90 | TBD | idem |
-| TREC-COVID 171k | NDCG@10 | ≥ 0.55 (Anserini 0.595) | 0.595 | upcoming `scripts/bench/trec-covid-ndcg.sh` |
+| TREC-COVID 171k | NDCG@10 | ≥ 0.55 (Anserini 0.595) | 0.595 | `scripts/bench/trec-covid-ndcg.sh` |
+| TREC-COVID 171k | Recall@10 | ≥ 0.05 (Anserini ~0.057) | TBD | idem |
 | TREC-COVID 171k | RSS peak | ≤ 4 GB | TBD | idem |
 | mMARCO-fr 8.8M | indexation | ≥ 5 000 docs/s sustained | TBD | upcoming `scripts/bench/mmarco-fr-ndcg.sh` (remote only) |
 | mMARCO-fr 8.8M | NDCG@10 | ≥ 0.30 (BM25 baseline) | 0.30 | idem |
