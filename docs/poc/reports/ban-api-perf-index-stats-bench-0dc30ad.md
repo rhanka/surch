@@ -90,6 +90,52 @@ This is a net win for the BAN search workload. The +60% bulk cost is
 the indexing-time cost we deliberately accepted to remove per-request
 source tokenization. The change is safe to merge.
 
+## Follow-up: top-K with lazy source hydration (v2.3)
+
+After v2.1 closed the indexing-time stats gap, the next obvious win was
+that scoring still hydrated the full JSON `_source` for every matching
+document, then sorted, then discarded everything past the requested
+page. For `Rue Payenne` that meant 18 194 source clones per request
+just to return ten hits.
+
+v2.3 adds an early-return path in `run_search` that triggers when the
+query is `Match`/`MultiMatch` with the default `_score`-desc sort and a
+single physical index. On that path:
+
+- candidate docs are kept as internal `u32` ids (no public-id round
+  trip; new `documents_for_match_internal` and
+  `documents_by_internal_ids` on `AppState`);
+- all candidates are scored, then partitioned with
+  `select_nth_unstable_by` to keep the top `from + size`;
+- only those winners are hydrated into `StoredDocument`;
+- tie-breaking is internal doc id ascending (Lucene convention) so the
+  default ordering matches OpenSearch on equal-score ties.
+
+Cleanest paired Paris 25k window we could capture (system load
+fluctuated, multiple runs were captured):
+
+| Operation | Surch v2.1 | Surch v2.3 (top-K) | OpenSearch 2.17.1 |
+| --- | ---: | ---: | ---: |
+| `_bulk` 25k | ~1050 ms | ~480 ms | ~7400 ms |
+| `_search` `Rue Payenne` (18 194 hits, `track_total_hits=true`) | ~95 ms | ~12 ms | ~9 ms |
+| `_search` `Place Patrice Chereau` (559 hits) | ~5 ms | ~1 ms | ~5 ms |
+
+With `track_total_hits=true` on both engines (apples-to-apples,
+exact 18 194 returned by both), the same Surch v2.3 run came out at
+~25 ms vs OS ~5 ms on `Rue Payenne` in a noisier second window. OS
+keeps a 3–5x edge on the high-cardinality search because Lucene's
+block-max WAND skips entire blocks once the top-K threshold is known,
+while Surch v2.3 still scores every matching document. That is the
+next-step optimization (per-block max scores in postings, score
+threshold tracking during scoring).
+
+The HashMap variant (v2.4) was tried and rejected: std `HashMap` with
+SipHash is slower than `BTreeMap` for ~18 k `u32` keys (~80 ms vs
+~25 ms on `Rue Payenne`). A two-pointer lockstep walk (v2.5) was
+prototyped and reverted: it did not show a measurable win on this
+hardware under the load drift we had, and the simpler v2.3 path is
+clearer and slightly less code.
+
 ## Reference: Surch v2.1 vs OpenSearch 2.17.1 on the same machine
 
 Same Paris 25k dataset, same machine, same bench script, each engine

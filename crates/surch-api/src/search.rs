@@ -363,6 +363,12 @@ struct ScoredDocument {
 /// Execute a parsed search request against a set of physical indices and build the response.
 pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest) -> SearchResponse {
     let started_at = Instant::now();
+    let scoring_enabled = request.query.as_ref().is_some_and(is_scoring_query);
+
+    if let Some(response) = run_topk_search(state, indices, request, scoring_enabled, started_at) {
+        return response;
+    }
+
     let mut matched_documents: Vec<ScoredDocument> = Vec::new();
     for index in indices {
         matched_documents.extend(match_documents_for_index(
@@ -371,7 +377,6 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
             request.query.as_ref(),
         ));
     }
-    let scoring_enabled = request.query.as_ref().is_some_and(is_scoring_query);
     sort_scored_documents(&mut matched_documents, &request.sort, scoring_enabled);
     let max_score = compute_max_score(&matched_documents, scoring_enabled);
     let total = matched_documents.len() as u64;
@@ -385,6 +390,140 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     );
     response.hits.max_score = max_score;
     response
+}
+
+fn run_topk_search(
+    state: &AppState,
+    indices: &[String],
+    request: &SearchRequest,
+    scoring_enabled: bool,
+    started_at: Instant,
+) -> Option<SearchResponse> {
+    if !scoring_enabled || indices.len() != 1 || !is_default_score_sort(&request.sort) {
+        return None;
+    }
+    if request.highlight.is_some() {
+        return None;
+    }
+    let query = request.query.as_ref()?;
+    if !matches!(
+        query,
+        SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. }
+    ) {
+        return None;
+    }
+
+    let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
+    let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
+    let limit = from.saturating_add(size);
+
+    let (scored, total) = topk_scored_documents(state, &indices[0], query, limit)?;
+
+    let max_score = compute_max_score(&scored, scoring_enabled);
+    let hits = scored
+        .iter()
+        .skip(from)
+        .take(size)
+        .map(|doc| {
+            build_hit(
+                &doc.doc,
+                request.source.as_ref(),
+                scoring_enabled.then_some(doc.score),
+                request.highlight.as_ref(),
+                request.query.as_ref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
+
+    let mut response = build_search_response_with_total(
+        hits,
+        total_summary,
+        started_at.elapsed().as_millis() as u64,
+    );
+    response.hits.max_score = max_score;
+    Some(response)
+}
+
+fn is_default_score_sort(sort: &[SortClause]) -> bool {
+    sort.is_empty()
+        || (sort.len() == 1 && sort[0].field == "_score" && sort[0].order == SortOrder::Desc)
+}
+
+fn topk_scored_documents(
+    state: &AppState,
+    index: &str,
+    query: &SearchQuery,
+    limit: usize,
+) -> Option<(Vec<ScoredDocument>, u64)> {
+    let candidates: Vec<u32> = match query {
+        SearchQuery::Match {
+            field,
+            value,
+            operator,
+        } => state.documents_for_match_internal(
+            index,
+            field,
+            value,
+            *operator == MatchOperator::And,
+        ),
+        SearchQuery::MultiMatch {
+            query,
+            fields,
+            operator,
+        } => {
+            let mut matches = BTreeSet::new();
+            for field in fields {
+                matches.extend(state.documents_for_match_internal(
+                    index,
+                    field,
+                    query,
+                    *operator == MatchOperator::And,
+                ));
+            }
+            matches.into_iter().collect()
+        }
+        _ => return None,
+    };
+
+    let total = candidates.len() as u64;
+    if limit == 0 || candidates.is_empty() {
+        return Some((Vec::new(), total));
+    }
+
+    let scoring_context = SearchScoringContext::new(state, index, query);
+
+    let mut scored: Vec<(f64, u32)> = candidates
+        .iter()
+        .map(|internal_id| {
+            let score = score_for_query(query, *internal_id, &scoring_context);
+            (score, *internal_id)
+        })
+        .collect();
+
+    let cmp = |a: &(f64, u32), b: &(f64, u32)| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    };
+
+    let k = limit.min(scored.len());
+    if k < scored.len() {
+        scored.select_nth_unstable_by(k - 1, cmp);
+        scored.truncate(k);
+    }
+    scored.sort_by(cmp);
+
+    let winner_ids: Vec<u32> = scored.iter().map(|(_, id)| *id).collect();
+    let hydrated = state.documents_by_internal_ids(index, &winner_ids);
+
+    let result = scored
+        .into_iter()
+        .zip(hydrated)
+        .map(|((score, _), doc)| ScoredDocument { doc, score })
+        .collect();
+
+    Some((result, total))
 }
 
 fn is_scoring_query(query: &SearchQuery) -> bool {

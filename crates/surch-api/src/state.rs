@@ -213,6 +213,13 @@ impl InMemoryIndex {
     }
 
     fn match_hits(&self, field: &str, value: &str, require_all_terms: bool) -> Vec<String> {
+        self.match_hits_internal(field, value, require_all_terms)
+            .into_iter()
+            .filter_map(|doc_id| self.reverse_document_ids.get(&doc_id).cloned())
+            .collect()
+    }
+
+    fn match_hits_internal(&self, field: &str, value: &str, require_all_terms: bool) -> Vec<u32> {
         if field.trim().is_empty() || value.is_empty() {
             return Vec::new();
         }
@@ -248,10 +255,20 @@ impl InMemoryIndex {
             }
         }
 
-        matches
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|doc_id| self.reverse_document_ids.get(&doc_id).cloned())
+        matches.unwrap_or_default().into_iter().collect()
+    }
+
+    fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
+        internal_ids
+            .iter()
+            .filter_map(|doc_id| {
+                let id = self.reverse_document_ids.get(doc_id)?;
+                self.documents.get(id).map(|source| StoredDocument {
+                    index: index.to_owned(),
+                    id: id.clone(),
+                    source: source.clone(),
+                })
+            })
             .collect()
     }
 }
@@ -933,6 +950,39 @@ impl AppState {
         store.indices.get(index).map_or_else(Vec::new, |data| {
             data.match_hits(field, value, require_all_terms)
         })
+    }
+
+    pub fn documents_for_match_internal(
+        &self,
+        index: &str,
+        field: &str,
+        value: &str,
+        require_all_terms: bool,
+    ) -> Vec<u32> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.get(index).map_or_else(Vec::new, |data| {
+            data.match_hits_internal(field, value, require_all_terms)
+        })
+    }
+
+    pub fn documents_by_internal_ids(
+        &self,
+        index: &str,
+        internal_ids: &[u32],
+    ) -> Vec<StoredDocument> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map_or_else(Vec::new, |data| {
+                data.documents_by_internal_ids(index, internal_ids)
+            })
     }
 
     pub fn internal_doc_ids(&self, index: &str, public_ids: &[&str]) -> Vec<Option<u32>> {
