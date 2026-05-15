@@ -1,0 +1,129 @@
+# Surch — SciFact NDCG@10 parity gate.
+#
+# Spins up a single Pod with two sidecars (surch + opensearch) and a
+# driver container that runs `scripts/bench/scifact-ndcg.sh` against both
+# engines, then emits a `surch.bench.report.v1` JSON to /reports.
+#
+# The Pod-anti-affinity story stays simple here: both engines are local
+# to the Pod, talking over localhost. Resource envelope is tuned to fit
+# the tenant ResourceQuota (requests.cpu=500m, limits.cpu=2500m,
+# requests.memory=512Mi, limits.memory=3Gi) declared in poc-k8s:
+#   surch       cpu  150m req /  800m lim ; mem 128Mi req /  512Mi lim
+#   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 1536Mi lim  (JVM Xmx=1g)
+#   driver      cpu  100m req /  500m lim ; mem 128Mi req /  512Mi lim
+#   ---------------------------------------------------------------
+#   total       cpu  500m req / 2500m lim ; mem 512Mi req / 2560Mi lim
+# Fits a DEV1-L (2 vCPU / 4 GiB) burst node with Kapsule overhead.
+#
+# `${SURCH_SHA}` is substituted by the GHA workflow via envsubst.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ndcg-gate
+  namespace: surch
+  labels:
+    app.kubernetes.io/name: surch
+    app.kubernetes.io/component: ndcg-gate
+    app.kubernetes.io/part-of: surch-ci
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: surch
+        app.kubernetes.io/component: ndcg-gate
+        app.kubernetes.io/part-of: surch-ci
+    spec:
+      restartPolicy: Never
+      serviceAccountName: surch
+      imagePullSecrets:
+        - name: ghcr-pull
+      nodeSelector:
+        pool: burst
+      tolerations:
+        - key: pool
+          operator: Equal
+          value: burst
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      volumes:
+        - name: beir
+          persistentVolumeClaim:
+            claimName: surch-corpus-beir
+            readOnly: true
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: surch-scratch
+        - name: reports
+          emptyDir: { sizeLimit: 64Mi }
+      containers:
+        # --- Engine sidecar #1: Surch ---------------------------------
+        - name: surch
+          image: ghcr.io/rhanka/surch:${SURCH_SHA}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 7700, name: surch-http }
+          env:
+            - { name: SURCH_HOST, value: "127.0.0.1" }
+            - { name: SURCH_PORT, value: "7700" }
+            - { name: RUST_LOG,   value: "warn" }
+          resources:
+            requests: { cpu: 150m, memory: 128Mi }
+            limits:   { cpu: 800m, memory: 512Mi }
+          volumeMounts:
+            - { name: scratch, mountPath: /var/surch }
+        # --- Engine sidecar #2: OpenSearch baseline -------------------
+        - name: opensearch
+          image: opensearchproject/opensearch:2.17.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 9200, name: os-http }
+          env:
+            - { name: discovery.type,                     value: "single-node" }
+            - { name: DISABLE_SECURITY_PLUGIN,            value: "true" }
+            - { name: DISABLE_INSTALL_DEMO_CONFIG,        value: "true" }
+            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms1g -Xmx1g" }
+            - { name: bootstrap.memory_lock,              value: "false" }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: 1200m, memory: 1536Mi }
+          # OpenSearch 2.x requires a writable scratch dir for its data path.
+          volumeMounts:
+            - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data }
+        # --- Driver: scifact-ndcg.sh against both engines -------------
+        - name: ndcg-driver
+          image: ghcr.io/rhanka/surch:${SURCH_SHA}
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: SURCH_URL,      value: "http://127.0.0.1:7700" }
+            - { name: OPENSEARCH_URL, value: "http://127.0.0.1:9200" }
+            - { name: BEIR_DIR,       value: "/data/beir" }
+            - { name: REPORTS_DIR,    value: "/reports" }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          command: ["/bin/sh", "-c"]
+          # The Surch image bundles scripts/bench/scifact-ndcg.sh; this
+          # driver waits for both engines, runs the gate, and exits with
+          # the script's own status. CI reads /reports/ndcg-gate.json.
+          args:
+            - |
+              set -eu
+              echo "Waiting for Surch + OpenSearch..."
+              until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+              until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=30s" >/dev/null 2>&1; do sleep 1; done
+              echo "Both engines healthy."
+              mkdir -p "$REPORTS_DIR"
+              /usr/local/bin/scifact-ndcg.sh "ndcg-surch-k8s" "$REPORTS_DIR/scifact-surch.out" "$SURCH_URL"
+              /usr/local/bin/scifact-ndcg.sh "ndcg-os-k8s"    "$REPORTS_DIR/scifact-os.out"    "$OPENSEARCH_URL"
+              cp "$REPORTS_DIR/scifact-surch.out" "$REPORTS_DIR/bench.json"
+              echo "ndcg-gate complete."
+          volumeMounts:
+            - { name: beir,    mountPath: /data/beir, readOnly: true }
+            - { name: reports, mountPath: /reports }

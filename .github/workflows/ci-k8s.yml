@@ -1,0 +1,183 @@
+# Surch — K8s burst-bench CI/CD.
+#
+# Runs heavy CI gates (BEIR NDCG@10, INSEE paired bench) on the Scaleway
+# Kapsule "burst" pool described in poc-k8s (rhanka/poc-k8s#2). Every Job
+# is short-lived: pool scales 0 -> 1 -> 0, hard 30 min cap. Everything in
+# this file is dormant until poc-k8s PR #2 ships the surch namespace + the
+# OIDC IAM role; the top-level `if: false` keeps the workflow non-blocking.
+#
+# Cost guardrails (documentation-only here, enforced inside the Job
+# manifests via `activeDeadlineSeconds` and the trap in the burst pool
+# tear-down step):
+#   SCW_MAX_COST_EUR=2  — DEV1-L node-hour ~0.08€, 30 min run ~0.04€,
+#                         leaves a 50x safety margin.
+#   SCW_MAX_DURATION_MIN=30 — Jobs carry activeDeadlineSeconds=1800.
+
+name: ci-k8s
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Job manifest to run (ndcg-gate | insee-bench | 00-init-corpora)"
+        required: true
+        default: "ndcg-gate"
+        type: choice
+        options:
+          - ndcg-gate
+          - insee-bench
+          - 00-init-corpora
+  # TODO: enable PR trigger once the burst pool + ghcr-pull Secret are live.
+  # pull_request:
+  #   types: [opened, synchronize]
+  #   paths:
+  #     - "crates/**"
+  #     - "deploy/k8s/**"
+  #     - ".github/workflows/ci-k8s.yml"
+
+env:
+  # Cost guardrails — informational at the workflow level; enforced for
+  # real by the burst-pool tear-down step + the Job activeDeadlineSeconds.
+  SCW_MAX_COST_EUR: "2"
+  SCW_MAX_DURATION_MIN: "30"
+  SCW_REGION: fr-par
+  SCW_ZONE: fr-par-2
+  SCW_CLUSTER: poc
+  SCW_NAMESPACE: surch
+  SCW_BURST_POOL: burst
+  GHCR_IMAGE: ghcr.io/rhanka/surch
+
+# MVP: workflow is dormant until poc-k8s PR #2 merges and the OIDC role is
+# provisioned. Two jobs:
+#   - placeholder: always runs, echoes the inputs (visible feedback in GHA UI)
+#   - bench-k8s:   the real worker, gated `if: false` until the cluster is live
+# GitHub Actions does not support a workflow-level `if`; gating each
+# real job with `if: false` is the canonical way to keep the file
+# committed but inert. Flip both `if: false` to `if: ${{ true }}` (or
+# remove the line) when activating.
+jobs:
+  placeholder:
+    name: ci-k8s dormant (poc-k8s PR #2 pending)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 1
+    steps:
+      - name: Announce dormant state
+        run: |
+          echo "ci-k8s workflow is dormant: the real bench job is gated 'if: false'."
+          echo "Activate after poc-k8s PR #2 merges + ghcr-pull Secret is provisioned."
+          echo "Requested job manifest : ${{ inputs.job }}"
+          echo "Cost cap : ${SCW_MAX_COST_EUR}€"
+          echo "Duration cap : ${SCW_MAX_DURATION_MIN}m"
+
+  bench-k8s:
+    if: false  # FLIP THIS once the burst pool + OIDC role + ghcr-pull Secret exist.
+    name: surch burst bench (${{ inputs.job }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35  # hard cap = SCW_MAX_DURATION_MIN + 5 min slack
+    permissions:
+      contents: read
+      id-token: write    # required for GitHub -> Scaleway OIDC federation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image SHA
+        id: image
+        run: |
+          echo "sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "image=${GHCR_IMAGE}:sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # Step 1 — Auth: GitHub OIDC -> Scaleway IAM short-lived token.
+      # ----------------------------------------------------------------
+      # TODO: configure SCW_OIDC_ROLE once tenant is live. The IAM role
+      # must grant: k8s:read-cluster-kubeconfig on cluster `poc`, plus
+      # k8s:pool-update on pool `burst` for scale-up/scale-down.
+      # - name: Configure Scaleway OIDC
+      #   uses: scaleway/action-oidc-auth@v1  # placeholder name
+      #   with:
+      #     role-arn: ${{ secrets.SCW_OIDC_ROLE }}
+      #     region: ${{ env.SCW_REGION }}
+      #     audience: scaleway
+
+      # ----------------------------------------------------------------
+      # Step 2 — Kubeconfig.
+      # ----------------------------------------------------------------
+      # - name: Fetch kubeconfig
+      #   run: |
+      #     mkdir -p "$HOME/.kube"
+      #     scw k8s kubeconfig get "${SCW_CLUSTER}" > "$HOME/.kube/config"
+      #     chmod 600 "$HOME/.kube/config"
+      #     kubectl config use-context "${SCW_CLUSTER}"
+
+      # ----------------------------------------------------------------
+      # Step 3 — Scale burst pool 0 -> 1 (paid by the minute, 30 min cap).
+      # ----------------------------------------------------------------
+      # - name: Burst pool up
+      #   run: |
+      #     CLUSTER_ID=$(scw k8s cluster list name=${SCW_CLUSTER} -o json | jq -r '.[0].id')
+      #     POOL_ID=$(scw k8s pool list cluster-id="$CLUSTER_ID" -o json \
+      #       | jq -r --arg n "$SCW_BURST_POOL" '.[] | select(.name==$n) | .id')
+      #     scw k8s pool update "$POOL_ID" min-size=0 max-size=1
+
+      # ----------------------------------------------------------------
+      # Step 4 — Apply Job manifest with the current SHA patched in.
+      # ----------------------------------------------------------------
+      # - name: Apply Job manifest (kustomize patch on image tag)
+      #   run: |
+      #     # The Job manifest references `ghcr.io/rhanka/surch:${SURCH_SHA}`;
+      #     # `envsubst` is enough until we adopt a Kustomize overlay.
+      #     export SURCH_SHA="${{ steps.image.outputs.sha }}"
+      #     envsubst < "deploy/k8s/jobs/${{ inputs.job }}.yaml" \
+      #       | kubectl -n "$SCW_NAMESPACE" apply -f -
+
+      # ----------------------------------------------------------------
+      # Step 5 — Wait for completion (30 min hard cap).
+      # ----------------------------------------------------------------
+      # - name: Wait for Job
+      #   run: |
+      #     kubectl -n "$SCW_NAMESPACE" wait \
+      #       --for=condition=Complete \
+      #       --timeout=1800s \
+      #       "job/${{ inputs.job }}"
+
+      # ----------------------------------------------------------------
+      # Step 6 — Pull the bench JSON report out and attach it to the run.
+      # ----------------------------------------------------------------
+      # - name: Collect report
+      #   run: |
+      #     mkdir -p target/bench-reports/k8s
+      #     POD=$(kubectl -n "$SCW_NAMESPACE" get pod \
+      #       -l "app.kubernetes.io/component=${{ inputs.job }}" \
+      #       -o jsonpath='{.items[0].metadata.name}')
+      #     kubectl -n "$SCW_NAMESPACE" cp \
+      #       "${POD}:/reports/bench.json" \
+      #       "target/bench-reports/k8s/${{ inputs.job }}.json" || true
+      # - name: Upload report
+      #   if: always()
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: k8s-bench-${{ inputs.job }}-${{ steps.image.outputs.sha }}
+      #     path: target/bench-reports/k8s/
+
+      # ----------------------------------------------------------------
+      # Step 7 — Tear-down (always-run; idempotent).
+      # ----------------------------------------------------------------
+      # - name: Delete Job
+      #   if: always()
+      #   run: |
+      #     kubectl -n "$SCW_NAMESPACE" delete \
+      #       "job/${{ inputs.job }}" --ignore-not-found=true
+      # - name: Burst pool down
+      #   if: always()
+      #   run: |
+      #     CLUSTER_ID=$(scw k8s cluster list name=${SCW_CLUSTER} -o json | jq -r '.[0].id')
+      #     POOL_ID=$(scw k8s pool list cluster-id="$CLUSTER_ID" -o json \
+      #       | jq -r --arg n "$SCW_BURST_POOL" '.[] | select(.name==$n) | .id')
+      #     scw k8s pool update "$POOL_ID" min-size=0 max-size=0
+
+      - name: Dormant placeholder
+        run: |
+          echo "bench-k8s is gated 'if: false' — this step never runs."
+          echo "Selected job manifest : ${{ inputs.job }}"
+          echo "Image : ${{ steps.image.outputs.image }}"
+          echo "Cost cap : ${SCW_MAX_COST_EUR}€   Duration cap : ${SCW_MAX_DURATION_MIN}m"
