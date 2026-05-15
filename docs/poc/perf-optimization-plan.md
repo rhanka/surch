@@ -20,7 +20,23 @@ For each optimization, the 3 axes are tracked separately:
 | v2.8 — W | `65ccfbe` | MaxScore for `MultiMatch` via per-field max | matchID `multi_match NOM+PRENOMS` now goes through WAND (p50 4 ms vs OS 15 ms on INSEE 25k) | neutral | neutral |
 | v2.8 — P6 | `8757288` | Deduplicate repeated query tokens with boost | half the posting walks for queries with duplicate analyzed tokens | neutral | neutral |
 | v2.9 — B | `651e22a` | `DocumentIndex` keeps `BTreeSet<u32>` `live_docs` (no `StoredDocument` duplicate) | neutral | **~30 MB** observed (RSS 260 → 231 MB on Paris 25k) | unblocks a cleaner future codec (sources are owned only by `InMemoryIndex`) |
-| v2.10 — C1 | _pending_ | Per-index LRU search-response cache (256 entries, byte-cached, generation-invalidated on every mutation) | **dramatic on repeated queries** (cache hit ≈ 0 work, see matchID auto-suggest / dedupe-review-list workflows); neutral on unique-query benches | small (+capacity × avg response bytes; ~256 × ~3 KB ≈ 1 MB per index ceiling) | neutral |
+| v2.10 — C1 | `644f62b` | Per-index LRU search-response cache (256 entries, byte-cached, generation-invalidated on every mutation) | **dramatic on repeated queries** (cache hit ≈ 0 work, see matchID auto-suggest / dedupe-review-list workflows); neutral on unique-query benches | small (+capacity × avg response bytes; ~256 × ~3 KB ≈ 1 MB per index ceiling) | neutral |
+| O3 — artillery harness | _scripted_ | `scripts/bench/artillery-replay.sh` reproduces `test-backend-v1.yml` shape (50/50 `multi_match` vs `bool.must`, phases 2→50 RPS over 4 min scaled by `ARTILLERY_SCALE`) | bench infrastructure only | neutral | neutral |
+
+### Artillery scaled run on INSEE 25k (ARTILLERY_SCALE=0.2, ~50 s/engine)
+
+`p50` client-side latency from the bash+curl harness, paired runs:
+
+| Phase (RPS) | Surch v2.10 p50 | OpenSearch 2.17.1 p50 | Surch p95 | OS p95 |
+|---|---:|---:|---:|---:|
+| 1 (2) | **174** | 361 | 324 | 796 |
+| 2 (2) | **164** | 472 | 247 | 809 |
+| 3 (5) | **192** | 357 | 300 | 659 |
+| 4 (10) | **227** | 377 | 440 | 788 |
+| 5 (20) | **275** | 392 | 709 | 777 |
+| 6 (50) | **157** | 175 | 465 | 515 |
+
+Surch wins p50 by 1.4–2.9× on low/mid-RPS phases, comparable at 50 RPS sustained. Both engines have high tails because the harness opens a fresh TCP/HTTP connection per request and runs each backgrounded bash fork at the artillery cadence — the bottleneck is the harness, not the engines. The matchID SLO of `p95 < 200 ms` will need a real keep-alive HTTP client (Rust binary) to be measurable end-to-end; the comparative win is already visible.
 
 ## Plan ahead (ordered)
 
