@@ -14,6 +14,10 @@ commits on `main`.
 | v2.3 | `3157afb` | Top-K with lazy `_source` hydration | 18 k JSON clones removed per `Rue Payenne` |
 | v2.6 | `ed76014` | MaxScore-style WAND skipping for OR-Match | `Rue Payenne` ~120 ms → ~30 ms |
 | v2.7 | `d778ee1` | Sorted `Vec<(u32, u64)>` for scoring stats | `Rue Payenne` ~30 ms → ~16 ms |
+| v2.8 — A | `65ccfbe` | `finalize_postings()` drops PostingsBuilder snapshot after rebuild | ~150 MB of duplicate postings reclaimed inside the heap on BAN Paris 25k |
+| v2.8 — W | `65ccfbe` | MaxScore for `MultiMatch` via per-field max | matchID-style `multi_match NOM + PRENOMS` now goes through the WAND path |
+| v2.8 — P6 | `8757288` | Deduplicate repeated query tokens with boost | half the posting walks for queries with duplicate analyzed tokens |
+| v2.9 — B | _pending_ | `DocumentIndex` keeps `BTreeSet<u32>` `live_docs` instead of `BTreeMap<u32, StoredDocument>` | StoredDocument source duplicate (~24 MB on BAN Paris 25k) removed |
 
 ## Plan (ordered)
 

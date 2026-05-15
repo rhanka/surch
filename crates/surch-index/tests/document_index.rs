@@ -1,6 +1,5 @@
 use surch_index::document_index::{DocumentIndex, DocumentIndexError};
 use surch_index::mapping::{FieldMapping, FieldType, IndexMapping};
-use surch_index::stored_fields::StoredValue;
 
 const DOCUMENT_INDEX_CLASSIC: &str =
     include_str!("../../../tests/lucene_parity/index/document_index_classic.tsv");
@@ -17,18 +16,6 @@ fn document_index_stores_documents_and_indexes_terms_with_positions_by_field() {
 
     assert_eq!(index.doc_ids(), vec![0, 2]);
     assert_eq!(index.live_doc_count(), 2);
-    assert_eq!(
-        index
-            .stored_document(0)
-            .and_then(|document| document.get("title")),
-        Some(&StoredValue::String("Surch Search".to_owned()))
-    );
-    assert_eq!(
-        index
-            .stored_document(2)
-            .map(|document| document.field_names()),
-        Some(vec!["body", "title"])
-    );
 
     assert_eq!(
         index.terms("body").collect::<Vec<_>>(),
@@ -176,12 +163,7 @@ fn document_index_stores_empty_text_without_postings() {
         .add_document(1, [("title", ""), ("body", "Rust")])
         .expect("empty text is storable");
 
-    assert_eq!(
-        index
-            .stored_document(1)
-            .and_then(|document| document.get("title")),
-        Some(&StoredValue::String(String::new()))
-    );
+    assert_eq!(index.doc_ids(), vec![1]);
     assert_eq!(index.terms("title").collect::<Vec<_>>(), Vec::<&str>::new());
     assert_eq!(index.terms("body").collect::<Vec<_>>(), ["rust"]);
     assert!(index.postings("title", "").is_none());

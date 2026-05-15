@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::mapping::{AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum};
-use crate::stored_fields::{StoredDocument, StoredFieldsError, StoredValue};
+use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
 pub type Result<T> = std::result::Result<T, DocumentIndexError>;
 
@@ -25,7 +25,10 @@ pub enum DocumentIndexError {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DocumentIndex {
-    documents: BTreeMap<u32, StoredDocument>,
+    /// Live document ids in this generation. The full source is held by
+    /// the caller (surch-api `InMemoryIndex`) so this is just a presence
+    /// set, not a copy of `StoredDocument`.
+    live_docs: BTreeSet<u32>,
     postings_builder: PostingsBuilder,
     terms: TermDictionary,
     field_stats: BTreeMap<String, FieldLengthStats>,
@@ -109,7 +112,7 @@ impl DocumentIndex {
         let mut documents = documents
             .into_iter()
             .map(|(doc_id, fields)| {
-                if self.documents.contains_key(&doc_id) || !seen.insert(doc_id) {
+                if self.live_docs.contains(&doc_id) || !seen.insert(doc_id) {
                     return Err(DocumentIndexError::DuplicateDocId { doc_id });
                 }
 
@@ -153,18 +156,23 @@ impl DocumentIndex {
     }
 
     pub fn clear(&mut self) {
-        self.documents.clear();
+        self.live_docs.clear();
         self.postings_builder = PostingsBuilder::new();
         self.terms = TermDictionary::default();
         self.field_stats.clear();
     }
 
     pub fn doc_ids(&self) -> Vec<u32> {
-        self.documents.keys().copied().collect()
+        self.live_docs.iter().copied().collect()
     }
 
-    pub fn stored_document(&self, doc_id: u32) -> Option<&StoredDocument> {
-        self.documents.get(&doc_id)
+    /// Stored field retrieval is the caller's responsibility (sources live
+    /// in `surch-api::AppState`); this method only returns the previously
+    /// indexed analyzed fields when a stored-fields writer has been wired
+    /// in, which is not the in-memory path. Always returns `None` for the
+    /// current `DocumentIndex` layout.
+    pub fn stored_document(&self, _doc_id: u32) -> Option<&StoredDocument> {
+        None
     }
 
     pub fn terms(&self, field: &str) -> TermsEnum<'_> {
@@ -180,7 +188,7 @@ impl DocumentIndex {
     }
 
     pub fn live_doc_count(&self) -> usize {
-        self.documents.len()
+        self.live_docs.len()
     }
 
     pub fn live_docs(&self) -> Vec<u32> {
@@ -193,11 +201,6 @@ impl DocumentIndex {
         fields: Vec<(String, String)>,
         mapping: &IndexMapping,
     ) -> Result<()> {
-        let mut document = StoredDocument::new();
-        for (name, value) in &fields {
-            document.insert(name.clone(), StoredValue::String(value.clone()))?;
-        }
-
         let mut field_lengths = BTreeMap::<String, (u64, bool)>::new();
         for (field, value) in &fields {
             let field_mapping = mapping.field(field);
@@ -233,7 +236,7 @@ impl DocumentIndex {
             );
         }
 
-        self.documents.insert(doc_id, document);
+        self.live_docs.insert(doc_id);
         Ok(())
     }
 }
