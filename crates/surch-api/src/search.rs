@@ -101,7 +101,24 @@ pub enum SearchQuery {
         field: String,
         value: String,
     },
-    BoolMust(Vec<SearchQuery>),
+    /// Compound `bool` query carrying every clause-bucket used by
+    /// matchID's deces-backend (`must` + `filter` + `should`) plus
+    /// `minimum_should_match` and a clause-level multiplicative `boost`.
+    ///
+    /// Semantics (mirroring ES 7.x):
+    /// - a document matches when **all** `must` and `filter` clauses match,
+    ///   **and** at least `minimum_should_match` of the `should` clauses
+    ///   match (if `should` is non-empty and `minimum_should_match > 0`),
+    /// - `filter` clauses do **not** contribute to `_score`,
+    /// - `must` and matching `should` clauses sum into `_score`,
+    /// - the result `_score` is multiplied by `boost`.
+    Bool {
+        must: Vec<SearchQuery>,
+        filter: Vec<SearchQuery>,
+        should: Vec<SearchQuery>,
+        minimum_should_match: u32,
+        boost: f64,
+    },
     Fuzzy {
         field: String,
         value: String,
@@ -318,17 +335,52 @@ fn posting_candidate_ids(
             }
             Some(matches)
         }
-        SearchQuery::BoolMust(queries) => {
+        SearchQuery::Bool {
+            must,
+            filter,
+            should,
+            minimum_should_match,
+            ..
+        } => {
             // Pre-compute candidate sets for every postings-backed clause and
             // intersect in ascending-size order. Starting with the smallest
             // set keeps the running intersection small and turns
             // `BTreeSet::intersection` (O(N + M)) into roughly O(K * size_min)
             // instead of O(K * size_first_seen).
-            let mut sets: Vec<BTreeSet<String>> = queries
+            //
+            // `must` and `filter` both restrict the candidate space via
+            // intersection (only their scoring contribution differs, which
+            // is handled in `score_for_query`). `should` only restricts the
+            // candidate space when `minimum_should_match >= 1`, in which
+            // case the union of postings-backed `should` clauses limits the
+            // candidate space.
+            let mut sets: Vec<BTreeSet<String>> = must
                 .iter()
+                .chain(filter.iter())
                 .filter_map(|q| posting_candidate_ids(state, index, q))
                 .collect();
-            let used_postings = !sets.is_empty();
+            let mut used_postings = !sets.is_empty();
+
+            // `should` with MSM >= 1: union of postings-backed clauses
+            // restricts the candidate pool. If any `should` clause cannot
+            // be answered from postings we conservatively skip the union
+            // contribution (must/filter still restricts; the final
+            // `query_matches` pass enforces MSM).
+            if !should.is_empty() && *minimum_should_match >= 1 {
+                let union_sets: Vec<BTreeSet<String>> = should
+                    .iter()
+                    .filter_map(|q| posting_candidate_ids(state, index, q))
+                    .collect();
+                if union_sets.len() == should.len() {
+                    let mut union = BTreeSet::new();
+                    for s in union_sets {
+                        union.extend(s);
+                    }
+                    sets.push(union);
+                    used_postings = true;
+                }
+            }
+
             sets.sort_by_key(|s| s.len());
             let mut matches: Option<BTreeSet<String>> = None;
             for current in sets {
@@ -452,7 +504,7 @@ fn classify_query(query: Option<&SearchQuery>) -> &'static str {
         Some(SearchQuery::Match { .. }) => "match",
         Some(SearchQuery::MultiMatch { .. }) => "multi_match",
         Some(SearchQuery::Term { .. }) => "term",
-        Some(SearchQuery::BoolMust(_)) => "bool_must",
+        Some(SearchQuery::Bool { .. }) => "bool",
         _ => "other",
     }
 }
@@ -474,7 +526,7 @@ fn classify_search_body(body: &str) -> &'static str {
     } else if query.contains_key("term") {
         "term"
     } else if query.contains_key("bool") {
-        "bool_must"
+        "bool"
     } else {
         "other"
     }
@@ -951,7 +1003,7 @@ fn is_scoring_query(query: &SearchQuery) -> bool {
             | SearchQuery::MatchPhrase { .. }
             | SearchQuery::MultiMatch { .. }
             | SearchQuery::Fuzzy { .. }
-            | SearchQuery::BoolMust(_)
+            | SearchQuery::Bool { .. }
     )
 }
 
@@ -979,7 +1031,7 @@ fn match_documents_for_index(
         None => state.documents(index),
         Some(query) => match query {
             SearchQuery::Term { field, value } => documents_by_term(state, index, field, value),
-            SearchQuery::BoolMust(_) => {
+            SearchQuery::Bool { .. } => {
                 if let Some(ids) = posting_candidate_ids(state, index, query) {
                     let ids = ids.into_iter().collect::<Vec<_>>();
                     documents_for_ids(state, index, &ids)
@@ -1071,10 +1123,46 @@ fn score_for_query(
         SearchQuery::Fuzzy { field, value, .. } => {
             bm25_field_score(scoring_context, field, value, internal_doc_id).unwrap_or(1.0)
         }
-        SearchQuery::BoolMust(clauses) => clauses
-            .iter()
-            .map(|clause| score_for_query(clause, internal_doc_id, scoring_context))
-            .sum(),
+        SearchQuery::Bool {
+            must,
+            should,
+            minimum_should_match,
+            boost,
+            ..
+        } => {
+            // `filter` clauses are intentionally excluded from scoring —
+            // they only restrict the candidate set.
+            let must_score: f64 = must
+                .iter()
+                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context))
+                .sum();
+
+            // `should` clauses contribute to `_score` whenever they match
+            // (independent of `minimum_should_match`, which is enforced
+            // earlier in `query_matches`).
+            let should_score: f64 = should
+                .iter()
+                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context))
+                // A non-matching `should` clause returns the neutral 1.0
+                // placeholder from the wildcard arm; filter it out so it
+                // does not inflate the running sum. We approximate
+                // "non-matching" as "scoring sub-query but score == 1.0
+                // (the placeholder)"; matching scoring sub-queries always
+                // return > 1.0 in practice because BM25 only emits
+                // strictly positive scores.
+                .filter(|score| *score != 1.0)
+                .sum();
+
+            let combined = must_score + should_score;
+            // When the whole bool is filter-only the inner sum is 0; keep
+            // the neutral 1.0 (so subsequent sorts stay well-defined) and
+            // still apply the clause boost.
+            let base = if combined > 0.0 { combined } else { 1.0 };
+            // `minimum_should_match` does not affect scoring (it gates
+            // candidacy); skip the `_` warning by binding it.
+            let _ = minimum_should_match;
+            base * *boost
+        }
         _ => 1.0,
     }
 }
@@ -1148,8 +1236,16 @@ fn collect_scoring_field_tokens(
                 insert_scoring_tokens(field_tokens, mapping, field, query);
             }
         }
-        SearchQuery::BoolMust(clauses) => {
-            for clause in clauses {
+        SearchQuery::Bool {
+            must,
+            filter,
+            should,
+            ..
+        } => {
+            // `filter` clauses do not score but we still need their term
+            // statistics for correct posting candidate evaluation when
+            // they wrap scoring sub-queries indirectly (cheap, idempotent).
+            for clause in must.iter().chain(filter.iter()).chain(should.iter()) {
                 collect_scoring_field_tokens(clause, mapping, field_tokens);
             }
         }
@@ -1771,27 +1867,162 @@ fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         )
     })?;
 
-    let must = object.get("must").ok_or_else(|| {
-        OpenSearchError::new(
-            StatusCode::BAD_REQUEST,
-            "parsing_exception",
-            "bool query must contain `must`",
-        )
-    })?;
-    let must = must.as_array().ok_or_else(|| {
-        OpenSearchError::new(
-            StatusCode::BAD_REQUEST,
-            "parsing_exception",
-            "bool query `must` must be an array",
-        )
-    })?;
+    let must = parse_bool_clause_bucket(object, "must")?;
+    let filter = parse_bool_clause_bucket(object, "filter")?;
+    let should = parse_bool_clause_bucket(object, "should")?;
 
-    let mut queries = Vec::with_capacity(must.len());
-    for query in must {
-        queries.push(parse_search_query(query)?);
+    // Each bucket-key is optional individually but at least one must be
+    // present, otherwise the body is empty and the request is malformed.
+    if must.is_empty() && filter.is_empty() && should.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "bool query must contain at least one of `must`, `filter`, or `should`",
+        ));
     }
 
-    Ok(SearchQuery::BoolMust(queries))
+    let minimum_should_match = match object.get("minimum_should_match") {
+        Some(raw) => parse_minimum_should_match(raw, should.len())?,
+        None => {
+            // ES 7.x rule: when the only non-empty bucket is `should`,
+            // MSM defaults to 1; otherwise it defaults to 0.
+            if must.is_empty() && filter.is_empty() && !should.is_empty() {
+                1
+            } else {
+                0
+            }
+        }
+    };
+
+    let boost = match object.get("boost") {
+        Some(raw) => parse_boost(raw)?,
+        None => 1.0,
+    };
+
+    Ok(SearchQuery::Bool {
+        must,
+        filter,
+        should,
+        minimum_should_match,
+        boost,
+    })
+}
+
+/// Parse one of `must` / `filter` / `should` from a `bool` body. Each
+/// bucket accepts a single object **or** an array of objects per ES 7.x
+/// conventions; missing keys yield an empty `Vec`.
+fn parse_bool_clause_bucket(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<SearchQuery>, OpenSearchError> {
+    let Some(raw) = object.get(key) else {
+        return Ok(Vec::new());
+    };
+    match raw {
+        Value::Array(items) => {
+            let mut clauses = Vec::with_capacity(items.len());
+            for item in items {
+                clauses.push(parse_search_query(item)?);
+            }
+            Ok(clauses)
+        }
+        Value::Object(_) => Ok(vec![parse_search_query(raw)?]),
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("bool query `{key}` must be an object or an array of objects"),
+        )),
+    }
+}
+
+/// Parse a `minimum_should_match` token. Supports the integer form
+/// (positive or negative; negative means `should.len() - |n|`) and the
+/// simple percentage form `"N%"` (`"50%"` → `ceil(0.5 * should.len())`).
+/// `should_len == 0` clamps the result to 0.
+fn parse_minimum_should_match(value: &Value, should_len: usize) -> Result<u32, OpenSearchError> {
+    match value {
+        Value::Number(num) => {
+            let signed = num.as_i64().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "`minimum_should_match` must be an integer",
+                )
+            })?;
+            Ok(resolve_msm_integer(signed, should_len))
+        }
+        Value::String(text) => parse_msm_string(text, should_len),
+        _ => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`minimum_should_match` must be an integer or a percentage string",
+        )),
+    }
+}
+
+fn resolve_msm_integer(signed: i64, should_len: usize) -> u32 {
+    if should_len == 0 {
+        return 0;
+    }
+    let len_i = should_len as i64;
+    let resolved = if signed < 0 {
+        (len_i + signed).max(0)
+    } else {
+        signed.min(len_i)
+    };
+    resolved.max(0) as u32
+}
+
+fn parse_msm_string(text: &str, should_len: usize) -> Result<u32, OpenSearchError> {
+    let trimmed = text.trim();
+    if let Some(percent_str) = trimmed.strip_suffix('%') {
+        let percent: f64 = percent_str.trim().parse().map_err(|_| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`minimum_should_match` percentage `{text}` must be numeric"),
+            )
+        })?;
+        if should_len == 0 {
+            return Ok(0);
+        }
+        let raw = (percent / 100.0) * should_len as f64;
+        // ES rounds toward zero on negative percentages (`-25%` means
+        // "drop 25 % of clauses"); we follow that convention.
+        let resolved = if percent < 0.0 {
+            should_len as f64 + raw
+        } else {
+            raw
+        };
+        let clamped = resolved.floor().clamp(0.0, should_len as f64) as i64;
+        return Ok(clamped.max(0) as u32);
+    }
+    let signed: i64 = trimmed.parse().map_err(|_| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`minimum_should_match` value `{text}` is not a supported form"),
+        )
+    })?;
+    Ok(resolve_msm_integer(signed, should_len))
+}
+
+fn parse_boost(value: &Value) -> Result<f64, OpenSearchError> {
+    let raw = value.as_f64().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`boost` must be a number",
+        )
+    })?;
+    if !raw.is_finite() || raw < 0.0 {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`boost` must be a finite non-negative number",
+        ));
+    }
+    Ok(raw)
 }
 
 fn parse_fuzzy_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
@@ -2194,9 +2425,36 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
         SearchQuery::Term { field, value } => {
             term_field_matches_with_mapping(source, field, value, mapping)
         }
-        SearchQuery::BoolMust(queries) => queries
-            .iter()
-            .all(|query| query_matches(query, source, mapping)),
+        SearchQuery::Bool {
+            must,
+            filter,
+            should,
+            minimum_should_match,
+            ..
+        } => {
+            // `must` and `filter` clauses must all match.
+            if !must.iter().all(|q| query_matches(q, source, mapping)) {
+                return false;
+            }
+            if !filter.iter().all(|q| query_matches(q, source, mapping)) {
+                return false;
+            }
+            // `should` clauses: count matches and compare against MSM.
+            // If `should` is empty, MSM is effectively zero and the
+            // bucket is satisfied.
+            if should.is_empty() {
+                return true;
+            }
+            // ES 7.x default: when only `should` is present, MSM is 1.
+            // When `must`/`filter` are present and MSM was not set, MSM
+            // is 0 and `should` only contributes scoring. Both behaviours
+            // are encoded in `parse_bool_query` so we trust the field.
+            let matched = should
+                .iter()
+                .filter(|q| query_matches(q, source, mapping))
+                .count() as u32;
+            matched >= *minimum_should_match
+        }
         SearchQuery::Fuzzy {
             field,
             value,
@@ -2909,8 +3167,15 @@ fn highlight_spans_for_query(text: &str, query: &SearchQuery, field: &str) -> Ve
         {
             exact_token_spans(&tokens, &tokenize_for_search(query))
         }
-        SearchQuery::BoolMust(clauses) => clauses
+        SearchQuery::Bool {
+            must,
+            filter,
+            should,
+            ..
+        } => must
             .iter()
+            .chain(filter.iter())
+            .chain(should.iter())
             .flat_map(|clause| highlight_spans_for_query(text, clause, field))
             .collect(),
         _ => Vec::new(),

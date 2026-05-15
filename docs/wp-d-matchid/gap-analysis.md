@@ -19,7 +19,7 @@ Status legend:
 |---|---|---|---|---|---|
 | **A1** | `match` object form with `fuzziness` sub-field | name lookup | gap | _pending_ | extend `parse_match_query` in `crates/surch-api/src/search.rs` |
 | **A2** | `geo_point` + `geo_distance` | UI "near X" filter | gap | _pending_ | new field type + new query + scoring rule |
-| **A3** | `bool.filter` / `bool.should` / `minimum_should_match` / clause `boost` | every advanced search | gap | _pending_ | extend `parse_bool_query`; filter does not score |
+| **A3** | `bool.filter` / `bool.should` / `minimum_should_match` / clause `boost` | every advanced search | implemented | `crates/surch-api/src/search.rs` (`SearchQuery::Bool`, `parse_bool_query`, `parse_minimum_should_match`, `parse_boost`); `crates/surch-api/tests/search.rs` (10 `bool_*` cases incl. the matchID nested-should/boost shape) | filter intersects without scoring; should supports integer + `"N%"` MSM (default 1 when only `should` is present); clause `boost` multiplies the `Bool` `_score`; `must_not` and per-leaf clause boost left for a follow-up |
 | **A4** | Scroll API | bulk-match | gap | _pending_ | new `surch-api/src/scroll.rs` with TTL'd `scroll_id` table |
 | **A5** | `function_score` wrapper | advanced + block match | gap | _pending_ | declarative-only: `field_value_factor`, decay functions, `score_mode`, `boost_mode`; no scripts |
 | **A6** | `prefix` query + `index_prefixes` mapping option | autocomplete | gap | _pending_ | postings-side prefix iterator; mapping option drives a min/max ngram-on-write fan-out |
