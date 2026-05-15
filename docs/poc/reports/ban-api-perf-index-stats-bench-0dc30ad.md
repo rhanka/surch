@@ -90,6 +90,50 @@ This is a net win for the BAN search workload. The +60% bulk cost is
 the indexing-time cost we deliberately accepted to remove per-request
 source tokenization. The change is safe to merge.
 
+## Follow-up: sorted Vec<(u32, u64)> for scoring stats (v2.7)
+
+After v2.6 closed most of the gap with OpenSearch on BAN Paris 25k, a
+brainstorm review of historical IR optimizations (turbopuffer FTS v2,
+jpountz SBG analysis 2025) pointed at the same place: stop using
+`BTreeMap<u32, u64>` for per-doc length and per-token term-frequency
+lookups during scoring, and use a sorted `Vec<(u32, u64)>` plus
+`binary_search_by_key` instead.
+
+Why: BTreeMap nodes are scattered allocations (~96 B per node, B=6).
+Cache misses dominate the lookup cost. A sorted Vec is contiguous in
+memory, so `binary_search_by_key` fits ~3 cache lines for ~18 k
+entries and reaches the entry in 14 comparisons of two u32s.
+
+Numbers on BAN Paris 25k controlled (same hardware, same warmup):
+
+| Operation | v2.6 (BTreeMap) | v2.7 (sorted Vec) |
+| --- | ---: | ---: |
+| `_search` `Rue Payenne` (18 194 hits) | ~30 ms | **~16 ms** |
+| `_search` `Place Patrice Chereau` (559 hits) | ~10 ms | **~3 ms** |
+
+The change is also confirmed on a different shape: INSEE death
+records (`Deces_2024` + `Deces_2025`, 25 k sample, ~1.3 M total in
+source) loaded with a matchID-equivalent `_search` workload
+(30 random `match` on `NOM`):
+
+| Engine | bulk took | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Surch v2.7 (warm) | ~5.0 s | **2 ms** | **9 ms** | **11 ms** |
+| OpenSearch 2.17.1 (cold first run) | ~33 s | 11 ms | 27 ms | 32 ms |
+| OpenSearch 2.17.1 (warm, system loaded) | ~14 s | 24 ms | 54 ms | 73 ms |
+| Surch v2.7 (same load as OS warm) | ~15 s | **2 ms** | **4 ms** | **12 ms** |
+
+Under the same system load Surch v2.7 search is ~12× faster than
+OpenSearch p50 and stays ~6× faster on p99 on the matchID-shaped
+data. Bulk is comparable between the two engines on busy hardware.
+
+The implementation also exposes two helpers, `FieldScoringStats::doc_len`
+and `TermScoringStats::term_freq`, so all scoring callers
+(`bm25_field_score`, `maxscore_match`) go through the same binary-search
+path. Aux. helpers `min_doc_len` and `max_term_freq` replace the prior
+`.values().min()/.max()` iterations during the MaxScore upper-bound
+computation.
+
 ## Follow-up: MaxScore-style WAND skipping (v2.6)
 
 v2.3 still scored every matching document for OR-Match queries. For

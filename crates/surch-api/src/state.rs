@@ -46,13 +46,50 @@ pub struct FieldScoringStats {
     pub doc_count: u64,
     pub avg_doc_len: f64,
     pub norms_enabled: bool,
-    pub doc_len_by_doc_id: BTreeMap<u32, u64>,
+    /// Sorted ascending by `doc_id`. Empty when `norms_enabled` is false.
+    pub doc_len_by_doc_id: Vec<(u32, u64)>,
+}
+
+impl FieldScoringStats {
+    pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
+        self.doc_len_by_doc_id
+            .binary_search_by_key(&doc_id, |(id, _)| *id)
+            .ok()
+            .map(|idx| self.doc_len_by_doc_id[idx].1)
+    }
+
+    pub fn min_doc_len(&self) -> Option<u64> {
+        self.doc_len_by_doc_id
+            .iter()
+            .map(|(_, len)| *len)
+            .filter(|len| *len > 0)
+            .min()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TermScoringStats {
     pub doc_freq: u64,
-    pub term_freq_by_doc_id: BTreeMap<u32, u64>,
+    /// Sorted ascending by `doc_id`.
+    pub term_freq_by_doc_id: Vec<(u32, u64)>,
+}
+
+impl TermScoringStats {
+    pub fn term_freq(&self, doc_id: u32) -> u64 {
+        self.term_freq_by_doc_id
+            .binary_search_by_key(&doc_id, |(id, _)| *id)
+            .ok()
+            .map(|idx| self.term_freq_by_doc_id[idx].1)
+            .unwrap_or(0)
+    }
+
+    pub fn max_term_freq(&self) -> u64 {
+        self.term_freq_by_doc_id
+            .iter()
+            .map(|(_, tf)| *tf)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,9 +224,14 @@ impl InMemoryIndex {
         let norms_enabled = self.mapping.norms_enabled(field);
         let avg_doc_len = if norms_enabled { stats.avg_doc_len()? } else { 1.0 };
         let doc_len_by_doc_id = if norms_enabled {
-            stats.doc_len_by_doc_id.clone()
+            // BTreeMap iteration yields ascending order, so the Vec is sorted.
+            stats
+                .doc_len_by_doc_id
+                .iter()
+                .map(|(id, len)| (*id, *len))
+                .collect()
         } else {
-            BTreeMap::new()
+            Vec::new()
         };
 
         Some(FieldScoringStats {
@@ -201,9 +243,20 @@ impl InMemoryIndex {
     }
 
     fn term_scoring_stats(&self, field: &str, term: &str) -> TermScoringStats {
-        let mut term_freq_by_doc_id = BTreeMap::<u32, u64>::new();
+        // Postings come from `TermDictionary` in ascending `doc_id` order
+        // (see `PostingsBuilder::build`), so a single pass produces a sorted
+        // accumulator without re-sorting. We merge same-doc postings (rare
+        // unless multiple positions push the same doc id repeatedly) by
+        // checking the tail.
+        let mut term_freq_by_doc_id: Vec<(u32, u64)> = Vec::new();
         for posting in self.index.postings(field, term).into_iter().flatten() {
-            *term_freq_by_doc_id.entry(posting.doc_id).or_default() += u64::from(posting.freq);
+            let freq = u64::from(posting.freq);
+            match term_freq_by_doc_id.last_mut() {
+                Some((id, current)) if *id == posting.doc_id => {
+                    *current += freq;
+                }
+                _ => term_freq_by_doc_id.push((posting.doc_id, freq)),
+            }
         }
 
         TermScoringStats {

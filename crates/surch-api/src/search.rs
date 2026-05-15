@@ -585,13 +585,7 @@ fn maxscore_match(
     let norms_enabled = field_stats.norms_enabled;
 
     let min_doc_len: u64 = if norms_enabled {
-        field_stats
-            .doc_len_by_doc_id
-            .values()
-            .copied()
-            .filter(|len| *len > 0)
-            .min()
-            .unwrap_or(1)
+        field_stats.min_doc_len().unwrap_or(1)
     } else {
         1
     };
@@ -608,7 +602,7 @@ fn maxscore_match(
             if stats.doc_freq == 0 || stats.doc_freq > field_stats.doc_count {
                 return None;
             }
-            let max_tf = stats.term_freq_by_doc_id.values().copied().max().unwrap_or(1);
+            let max_tf = stats.max_term_freq().max(1);
             let max_contrib = bm25_score(
                 config,
                 field_stats.doc_count,
@@ -646,7 +640,7 @@ fn maxscore_match(
             }
 
             let doc_len = if norms_enabled {
-                match field_stats.doc_len_by_doc_id.get(doc_id).copied() {
+                match field_stats.doc_len(*doc_id) {
                     Some(len) if len > 0 => len,
                     _ => continue,
                 }
@@ -923,7 +917,7 @@ fn bm25_field_score(
     }
 
     let doc_len = if field_stats.norms_enabled {
-        field_stats.doc_len_by_doc_id.get(&internal_doc_id).copied()?
+        field_stats.doc_len(internal_doc_id)?
     } else {
         1
     };
@@ -933,11 +927,7 @@ fn bm25_field_score(
     let mut total = 0.0_f64;
     for query_token in &query_tokens {
         let term_stats = scoring_context.term_stats(field, query_token)?;
-        let term_freq = term_stats
-            .term_freq_by_doc_id
-            .get(&internal_doc_id)
-            .copied()
-            .unwrap_or(0);
+        let term_freq = term_stats.term_freq(internal_doc_id);
         if term_freq == 0 {
             continue;
         }
