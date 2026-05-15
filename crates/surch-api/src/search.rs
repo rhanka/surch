@@ -318,13 +318,19 @@ fn posting_candidate_ids(
             Some(matches)
         }
         SearchQuery::BoolMust(queries) => {
+            // Pre-compute candidate sets for every postings-backed clause and
+            // intersect in ascending-size order. Starting with the smallest
+            // set keeps the running intersection small and turns
+            // `BTreeSet::intersection` (O(N + M)) into roughly O(K * size_min)
+            // instead of O(K * size_first_seen).
+            let mut sets: Vec<BTreeSet<String>> = queries
+                .iter()
+                .filter_map(|q| posting_candidate_ids(state, index, q))
+                .collect();
+            let used_postings = !sets.is_empty();
+            sets.sort_by_key(|s| s.len());
             let mut matches: Option<BTreeSet<String>> = None;
-            let mut used_postings = false;
-            for query in queries {
-                let Some(current) = posting_candidate_ids(state, index, query) else {
-                    continue;
-                };
-                used_postings = true;
+            for current in sets {
                 matches = Some(match matches {
                     Some(previous) => previous.intersection(&current).cloned().collect(),
                     None => current,
