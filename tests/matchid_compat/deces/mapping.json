@@ -1,0 +1,36 @@
+{
+  "mappings": {
+    "properties": {
+      "NOM": {
+        "type": "text"
+      },
+      "PRENOMS": {
+        "type": "text"
+      },
+      "SEXE": {
+        "type": "keyword"
+      },
+      "DATE_NAISSANCE": {
+        "type": "keyword"
+      },
+      "COMMUNE_NAISSANCE": {
+        "type": "keyword"
+      },
+      "CODE_INSEE_NAISSANCE": {
+        "type": "keyword"
+      },
+      "DATE_DECES": {
+        "type": "keyword"
+      },
+      "COMMUNE_DECES": {
+        "type": "keyword"
+      },
+      "SOURCE": {
+        "type": "keyword"
+      },
+      "SOURCE_LINE": {
+        "type": "integer"
+      }
+    }
+  }
+}
