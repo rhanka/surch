@@ -61,19 +61,43 @@ Scope:
 Out of scope: code generation in the engine path (→ WP-A) and the
 bench harness (→ WP-B).
 
+### WP-D — Évolutions queries pour le portage matchID
+
+Branch: **`wp/d-matchid`**
+
+Scope:
+
+- Implementing the search / index features that matchID's
+  `deces-backend` needs from Surch to route its reads without
+  modifying its own code.
+- Intake of matchID-side requirements under
+  `docs/wp-d-matchid/incoming/`, consolidated decisions under
+  `docs/wp-d-matchid/decisions/`, rolling gap analysis under
+  `docs/wp-d-matchid/gap-analysis.md`.
+- Test fixtures under `tests/matchid_compat/` that replay matchID
+  traffic against Surch and OpenSearch side by side.
+
+Out of scope: every perf optim that does not unblock a matchID
+requirement (→ WP-A), bench harness changes (→ WP-B), packaging and
+deployment artefacts (→ WP-C). matchID intake files live in
+`docs/wp-d-matchid/incoming/` only — see that directory's README for
+the exact authoring contract.
+
 ## Branch + merge policy
 
-- Three long-lived branches: `wp/a-optim`, `wp/b-test-auto`, `wp/c-ops`.
+- Four long-lived branches: `wp/a-optim`, `wp/b-test-auto`,
+  `wp/c-ops`, `wp/d-matchid`.
 - Direct commits stay possible on `main` for tiny cross-cutting
   changes (typos, README), but anything implementation-bearing lands
   on its WP branch first.
-- Each commit carries a `[wp-a]`, `[wp-b]`, `[wp-c]` prefix in the
-  subject so retrospective reading stays simple.
+- Each commit carries a `[wp-a]`, `[wp-b]`, `[wp-c]` or `[wp-d]`
+  prefix in the subject so retrospective reading stays simple.
 - Merges from a WP branch to `main` should happen as soon as the
   commit is green (cargo test + the WP-relevant bench / chart lint).
   No PR ceremony until the first production release.
 - Worktrees live under `.worktrees/` (already in `.gitignore`):
-  `.worktrees/wp-a`, `.worktrees/wp-b`, `.worktrees/wp-c`.
+  `.worktrees/wp-a`, `.worktrees/wp-b`, `.worktrees/wp-c`,
+  `.worktrees/wp-d`.
 
 ## Reporting
 
@@ -213,3 +237,34 @@ Ordered by priority gain/effort on the BAN + INSEE + SciFact workloads:
   there.
 - WP-A unblocks WP-C snapshots by stabilising the on-disk codec
   (block-128 FoR + skip list).
+- WP-D drives WP-A priorities once matchID drops its first intake:
+  any missing query type in `incoming/` becomes the new top of the
+  WP-A backlog.
+
+### WP-D — Évolutions queries pour le portage matchID
+
+#### Fait
+
+| Commit | Title | Notes |
+|---|---|---|
+| `bd31bb1` | docs(wp-d): matchID intake workpackage skeleton | branch, worktree, intake README, SPEC.md, gap-analysis.md, incoming/, decisions/ |
+
+#### Reste
+
+| ID | Title | Effort | Output |
+|---|---|---|---|
+| **D-INTAKE** | First requirement from matchID lands under `docs/wp-d-matchid/incoming/` | matchID-driven | a numbered requirement to triage |
+| **D-GAP-ANALYSIS** | Roll the gap-analysis.md once a requirement lands | 0.5 j per batch | mapped status table |
+| **D-IMPL** | Per-requirement Surch implementation + tests | varies | implementation commits, test fixtures, bench report |
+
+#### Attendu
+
+- `wp/d-matchid` stays empty of code until the first matchID intake
+  file lands.
+- Each requirement is decided (accept / partial / decline) before any
+  WP-A or WP-C code moves to satisfy it. The decision file under
+  `docs/wp-d-matchid/decisions/` is the contract.
+- Implementation cuts across WP-A (query DSL, scoring), WP-B
+  (fixture, bench gate) and occasionally WP-C (config knobs).
+  Cross-WP commits stay per-WP but each commit's subject cites the
+  requirement file id.
