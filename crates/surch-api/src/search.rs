@@ -500,19 +500,30 @@ fn topk_scored_documents(
     // skipped. For BAN-style queries where one query token is rare and
     // the other is common, this collapses scoring work from "all
     // candidates" to "candidates of the rare token(s)".
-    if let SearchQuery::Match {
-        field,
-        value,
-        operator,
-    } = query
-    {
-        if *operator != MatchOperator::And {
+    match query {
+        SearchQuery::Match {
+            field,
+            value,
+            operator,
+        } if *operator != MatchOperator::And => {
             if let Some(scored_pairs) =
                 maxscore_match(field, value, limit, &scoring_context, total)
             {
                 return finalize_topk(state, index, scored_pairs, total, limit);
             }
         }
+        SearchQuery::MultiMatch {
+            query: value,
+            fields,
+            operator,
+        } if *operator != MatchOperator::And => {
+            if let Some(scored_pairs) =
+                maxscore_multi_match(fields, value, limit, &scoring_context)
+            {
+                return finalize_topk(state, index, scored_pairs, total, limit);
+            }
+        }
+        _ => {}
     }
 
     let scored: Vec<(f64, u32)> = candidates
@@ -556,6 +567,51 @@ fn finalize_topk(
         .collect();
 
     Some((result, total))
+}
+
+/// MaxScore-style top-K scoring for a `MultiMatch` over several fields
+/// (OR semantics across fields and across tokens within each field). The
+/// per-doc score follows the existing fallback semantics: take the max
+/// across fields, then floor at `1e-9`. Each field runs the same
+/// `maxscore_match` path independently — a doc that ends up in overall
+/// top-K is necessarily in at least one field's scored set, because the
+/// field giving it its final score must have scored it.
+fn maxscore_multi_match(
+    fields: &[String],
+    value: &str,
+    limit: usize,
+    ctx: &SearchScoringContext,
+) -> Option<Vec<(f64, u32)>> {
+    if fields.is_empty() {
+        return None;
+    }
+
+    let mut combined: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut any_field = false;
+    for field in fields {
+        let Some(field_scores) = maxscore_match(field, value, limit, ctx, 0) else {
+            continue;
+        };
+        any_field = true;
+        for (score, doc_id) in field_scores {
+            let entry = combined.entry(doc_id).or_insert(0.0);
+            if score > *entry {
+                *entry = score;
+            }
+        }
+    }
+
+    if !any_field {
+        return None;
+    }
+
+    let floor = 1.0 / 1e9_f64.max(1.0);
+    Some(
+        combined
+            .into_iter()
+            .map(|(id, score)| (score.max(floor), id))
+            .collect(),
+    )
 }
 
 /// MaxScore-style top-K scoring for a single-field `Match` (OR semantics):

@@ -137,6 +137,21 @@ impl DocumentIndex {
         Ok(())
     }
 
+    /// Drop the internal `PostingsBuilder` state once the caller is done
+    /// adding documents in the current generation. The builder holds a
+    /// duplicate of every indexed posting (~half of the index RAM on BAN
+    /// Paris 25k), so freeing it after a batch is a big memory win.
+    ///
+    /// After this call any further `add_document*` call starts a fresh
+    /// builder, and the previously indexed postings remain accessible via
+    /// `terms()` / `postings()`. Mixing `finalize_postings` with
+    /// incremental adds therefore breaks the snapshot semantics — only
+    /// callers that follow a `clear()` + batch + finalize lifecycle
+    /// should use it.
+    pub fn finalize_postings(&mut self) {
+        self.postings_builder = PostingsBuilder::new();
+    }
+
     pub fn clear(&mut self) {
         self.documents.clear();
         self.postings_builder = PostingsBuilder::new();

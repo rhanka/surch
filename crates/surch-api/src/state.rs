@@ -190,6 +190,10 @@ impl InMemoryIndex {
         let _ = self
             .index
             .add_documents_with_mapping(documents, &self.mapping);
+        // Surch always rebuilds from `documents` after a `clear()`, so the
+        // postings builder snapshot inside `DocumentIndex` is now dead
+        // weight (~150 MB on BAN Paris 25k). Drop it.
+        self.index.finalize_postings();
     }
 
     fn set_mapping(&mut self, mapping: IndexMapping) {
