@@ -2610,3 +2610,78 @@ async fn match_object_form_rejects_invalid_fuzziness_string() {
     let body = response_json(response).await;
     assert_eq!(body["error"]["type"], "parsing_exception");
 }
+
+// --- A14: ES-7.x hits.total.{value,relation} wire-shape parity ---
+//
+// deces-backend reads `hits.total.value` and `hits.total.relation`
+// (intake §3). ES 7.x emits `relation = "gte"` when the running total is
+// capped by `track_total_hits` and `"eq"` otherwise. Surch already
+// implements the shape through `resolve_total_hits`; these tests pin
+// down the contract over the public HTTP surface.
+
+#[tokio::test]
+async fn search_router_a14_default_track_total_hits_returns_eq_below_cap() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
+
+    let body = search_with_body(&router, r#"{"query":{"match_all":{}}}"#).await;
+
+    assert_eq!(body["hits"]["total"]["value"], 2);
+    assert_eq!(body["hits"]["total"]["relation"], "eq");
+}
+
+#[tokio::test]
+async fn search_router_a14_track_total_hits_true_returns_eq_relation() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"lamp"}"#).await;
+
+    let body =
+        search_with_body(&router, r#"{"query":{"match_all":{}},"track_total_hits":true}"#).await;
+
+    assert_eq!(body["hits"]["total"]["value"], 3);
+    assert_eq!(body["hits"]["total"]["relation"], "eq");
+}
+
+#[tokio::test]
+async fn search_router_a14_track_total_hits_caps_value_with_gte_relation() {
+    // matchID's wire contract: a numeric `track_total_hits` caps the
+    // count and forces `relation = "gte"` once the true total exceeds
+    // the limit. Three indexed docs against a limit of 1 forces the cap.
+    let router = app_router();
+    for index in 0..3 {
+        index_product(
+            &router,
+            &format!("sku-{index}"),
+            &format!(r#"{{"name":"item-{index}"}}"#),
+        )
+        .await;
+    }
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"track_total_hits":1,"size":0}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 1);
+    assert_eq!(body["hits"]["total"]["relation"], "gte");
+}
+
+#[tokio::test]
+async fn search_router_a14_total_relation_field_serializes_as_string() {
+    // Wire-shape pin: `relation` must serialize as a JSON string, not a
+    // number or boolean, so ES-7.x clients (deces-backend) can read it
+    // with their existing string parser.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+
+    let body = search_with_body(&router, r#"{"query":{"match_all":{}}}"#).await;
+
+    let relation = body["hits"]["total"]["relation"]
+        .as_str()
+        .expect("relation must be a string");
+    assert!(matches!(relation, "eq" | "gte"));
+}
