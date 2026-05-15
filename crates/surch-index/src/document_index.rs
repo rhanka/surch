@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use surch_analysis::{
-    Analyzer, KeywordAnalyzer, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer, WhitespaceAnalyzer,
+    Analyzer, KeywordAnalyzer, NormAnalyzer, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer,
+    WhitespaceAnalyzer,
 };
 use thiserror::Error;
 
@@ -261,6 +262,7 @@ fn analyzed_terms(
         AnalyzerName::Stop => StopAnalyzer.token_stream(value),
         AnalyzerName::Keyword => KeywordAnalyzer.token_stream(value),
         AnalyzerName::Whitespace => WhitespaceAnalyzer.token_stream(value),
+        AnalyzerName::Norm => NormAnalyzer.token_stream(value),
     };
 
     let mut terms = BTreeMap::<(String, String), Vec<u32>>::new();
