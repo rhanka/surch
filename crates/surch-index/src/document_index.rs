@@ -23,7 +23,7 @@ pub enum DocumentIndexError {
     Postings(#[from] PostingsError),
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone)]
 pub struct DocumentIndex {
     /// Live document ids in this generation. The full source is held by
     /// the caller (surch-api `InMemoryIndex`) so this is just a presence
@@ -175,7 +175,7 @@ impl DocumentIndex {
         None
     }
 
-    pub fn terms(&self, field: &str) -> TermsEnum<'_> {
+    pub fn terms(&self, field: &str) -> TermsEnum {
         self.terms.terms(field)
     }
 
