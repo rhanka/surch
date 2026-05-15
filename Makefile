@@ -41,7 +41,9 @@ help:
 	@echo "  opensearch-up     start the dedicated OpenSearch docker"
 	@echo "  opensearch-down   stop and remove the OpenSearch docker"
 	@echo "  release           cargo build --release --workspace"
-	@echo "  report            aggregate target/bench-reports/$$SHA/*.json -> summary.md"
+	@echo "  docker-build      build the multi-stage Docker image locally"
+	@echo "  docker-smoke      build the image, start it on port 7711, hit /"
+	@echo "  report            aggregate target/bench-reports/<sha>/*.json -> summary.md"
 
 # ---------------------------------------------------------------------------
 # Build + tests
@@ -126,6 +128,24 @@ bench-all: bench-local bench-recall bench-stress
 report:
 	@ls -1 $(REPORTS_DIR)/*.out 2>/dev/null || (echo "no reports for $(SHA)"; exit 1)
 	@echo "summary aggregation tool (bench_report) not implemented yet"
+
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
+DOCKER_IMAGE ?= ghcr.io/rhanka/surch
+DOCKER_TAG   ?= dev-$(SHA)
+DOCKER_CONTAINER ?= surch-bench-image-smoke
+
+.PHONY: docker-build docker-smoke
+docker-build:
+	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
+
+docker-smoke: docker-build
+	-@docker rm -f $(DOCKER_CONTAINER) >/dev/null 2>&1
+	docker run -d --name $(DOCKER_CONTAINER) -p 7711:7700 $(DOCKER_IMAGE):$(DOCKER_TAG)
+	@until curl -fsS --max-time 1 http://127.0.0.1:7711/ >/dev/null 2>&1; do sleep 0.3; done
+	@echo "container reports:" && curl -s http://127.0.0.1:7711/ | head -c 400 && echo
+	-@docker rm -f $(DOCKER_CONTAINER) >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # Clean
