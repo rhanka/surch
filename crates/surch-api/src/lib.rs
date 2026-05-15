@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod mget;
 pub mod msearch;
 pub mod root;
+pub mod scroll;
 pub mod search;
 pub mod snapshot;
 pub mod state;
@@ -106,6 +107,10 @@ pub fn app_router() -> Router {
         .route(
             "/:index/_search",
             post(search::search_handler).get(search::search_handler),
+        )
+        .route(
+            "/_search/scroll",
+            post(search::scroll_handler).get(search::scroll_handler),
         )
         .route(
             "/_mget",
