@@ -31,6 +31,21 @@ records scope and acceptance.
   `/deces/api/v1/search`, `/search/csv`, `/id/{id}`, and the artillery
   scenario acceptance budget (p95 < 200 ms, max < 500 ms at 50 RPS).
 
+### WP-D deliverables (matchID-facing artefacts)
+
+These two documents are the matchID-side outputs of WP-D. They are
+not new requirements — they translate the gaps above into shapes
+matchID integrators can act on.
+
+- `dsl-translation-matrix.md` — gap-by-gap mapping (A1..A15, B1, B2)
+  of ES wire shape ↔ Surch equivalent ↔ status ↔ test gate file.
+  Cross-referenced by every implementation PR landing on `wp/a-optim`
+  and `wp/b-test-auto`.
+- `swap-guide.md` — operational playbook for the matchID team:
+  pre-requisites, three swap strategies (env-var flip, shadow mode,
+  incremental by workload), rollback paths, and minimum
+  observability via `GET /_prometheus_metrics`.
+
 ## Active gaps
 
 Numbered ids — stable, used in commit subjects and PR titles.
