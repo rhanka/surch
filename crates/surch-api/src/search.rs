@@ -765,43 +765,97 @@ fn maxscore_match(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    const BLOCK_SIZE: usize = 128;
+
+    // Precompute the per-block upper bound contribution for every token
+    // (Block-Max WAND, à la Tantivy `BlockWAND` and Lucene block-max
+    // postings). Blocks of `BLOCK_SIZE` entries in the (sorted by
+    // doc_id) `term_freq_by_doc_id` Vec: the block's tightest upper
+    // bound is `bm25(max_tf_in_block, min_doc_len, …)`, multiplied by
+    // the token's repeat boost.
+    let block_max_contribs: Vec<Vec<f64>> = token_infos
+        .iter()
+        .map(|token| {
+            token
+                .stats
+                .term_freq_by_doc_id
+                .chunks(BLOCK_SIZE)
+                .map(|block| {
+                    let block_max_tf = block.iter().map(|(_, tf)| *tf).max().unwrap_or(0).max(1);
+                    let block_score = bm25_score(
+                        config,
+                        field_stats.doc_count,
+                        token.stats.doc_freq,
+                        block_max_tf,
+                        min_doc_len,
+                        avg_doc_len,
+                    )
+                    .unwrap_or(0.0);
+                    block_score * token.boost
+                })
+                .collect()
+        })
+        .collect();
+
     let mut scored: BTreeMap<u32, f64> = BTreeMap::new();
     let mut threshold = f64::NEG_INFINITY;
 
-    for token in &token_infos {
+    for (token_idx, token) in token_infos.iter().enumerate() {
         let allow_new_docs = token.max_contrib >= threshold;
-        for (doc_id, tf) in &token.stats.term_freq_by_doc_id {
-            if *tf == 0 {
-                continue;
-            }
-            let in_scored = scored.contains_key(doc_id);
-            if !in_scored && !allow_new_docs {
-                continue;
-            }
+        let token_blocks = &block_max_contribs[token_idx];
 
-            let doc_len = if norms_enabled {
-                match field_stats.doc_len(*doc_id) {
-                    Some(len) if len > 0 => len,
-                    _ => continue,
+        for (block_idx, block) in token.stats.term_freq_by_doc_id.chunks(BLOCK_SIZE).enumerate() {
+            if block.is_empty() {
+                continue;
+            }
+            let block_max = token_blocks[block_idx];
+
+            // Block-level skip: if the block's tightest upper bound is
+            // below the running threshold AND no doc in this block is
+            // already scored from a rarer token (so we cannot increase
+            // its score either), the whole block contributes nothing
+            // to top-K and can be skipped without touching it.
+            if !allow_new_docs && block_max < threshold {
+                let block_first = block[0].0;
+                let block_last = block[block.len() - 1].0;
+                if scored.range(block_first..=block_last).next().is_none() {
+                    continue;
                 }
-            } else {
-                1
-            };
+            }
 
-            let contrib = match bm25_score(
-                config,
-                field_stats.doc_count,
-                token.stats.doc_freq,
-                *tf,
-                doc_len,
-                avg_doc_len,
-            ) {
-                Ok(score) => score * token.boost,
-                Err(_) => continue,
-            };
+            for (doc_id, tf) in block {
+                if *tf == 0 {
+                    continue;
+                }
+                let in_scored = scored.contains_key(doc_id);
+                if !in_scored && !allow_new_docs {
+                    continue;
+                }
 
-            let entry = scored.entry(*doc_id).or_insert(0.0);
-            *entry += contrib;
+                let doc_len = if norms_enabled {
+                    match field_stats.doc_len(*doc_id) {
+                        Some(len) if len > 0 => len,
+                        _ => continue,
+                    }
+                } else {
+                    1
+                };
+
+                let contrib = match bm25_score(
+                    config,
+                    field_stats.doc_count,
+                    token.stats.doc_freq,
+                    *tf,
+                    doc_len,
+                    avg_doc_len,
+                ) {
+                    Ok(score) => score * token.boost,
+                    Err(_) => continue,
+                };
+
+                let entry = scored.entry(*doc_id).or_insert(0.0);
+                *entry += contrib;
+            }
         }
 
         if scored.len() >= limit {

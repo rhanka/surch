@@ -3,8 +3,10 @@
   "cluster_name": "surch-cluster",
   "cluster_uuid": "00000000-0000-0000-0000-000000000000",
   "version": {
-    "number": "0.1.0",
+    "number": "2.17.1",
     "distribution": "opensearch"
   },
+  "surch_version": "0.1.0",
+  "opensearch_compat_version": "2.17.1",
   "tagline": "The OpenSearch Project: https://opensearch.org/"
 }
