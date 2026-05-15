@@ -493,7 +493,29 @@ fn topk_scored_documents(
 
     let scoring_context = SearchScoringContext::new(state, index, query);
 
-    let mut scored: Vec<(f64, u32)> = candidates
+    // MaxScore-style skipping for OR-Match queries: iterate tokens from
+    // highest to lowest max BM25 contribution. Once the top-K threshold
+    // exceeds a token's max contribution, only docs already scored from
+    // a rarer token can still make it; new docs from that token are
+    // skipped. For BAN-style queries where one query token is rare and
+    // the other is common, this collapses scoring work from "all
+    // candidates" to "candidates of the rare token(s)".
+    if let SearchQuery::Match {
+        field,
+        value,
+        operator,
+    } = query
+    {
+        if *operator != MatchOperator::And {
+            if let Some(scored_pairs) =
+                maxscore_match(field, value, limit, &scoring_context, total)
+            {
+                return finalize_topk(state, index, scored_pairs, total, limit);
+            }
+        }
+    }
+
+    let scored: Vec<(f64, u32)> = candidates
         .iter()
         .map(|internal_id| {
             let score = score_for_query(query, *internal_id, &scoring_context);
@@ -501,6 +523,16 @@ fn topk_scored_documents(
         })
         .collect();
 
+    finalize_topk(state, index, scored, total, limit)
+}
+
+fn finalize_topk(
+    state: &AppState,
+    index: &str,
+    mut scored: Vec<(f64, u32)>,
+    total: u64,
+    limit: usize,
+) -> Option<(Vec<ScoredDocument>, u64)> {
     let cmp = |a: &(f64, u32), b: &(f64, u32)| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -524,6 +556,132 @@ fn topk_scored_documents(
         .collect();
 
     Some((result, total))
+}
+
+/// MaxScore-style top-K scoring for a single-field `Match` (OR semantics):
+/// iterate query tokens from highest to lowest max BM25 contribution, and
+/// once the running top-K threshold exceeds a token's max contribution,
+/// only update docs already scored from a rarer token. Returns the full
+/// list of scored (score, internal doc id) pairs, or `None` if the path
+/// cannot be used (no field stats, no scorable tokens, etc.).
+fn maxscore_match(
+    field: &str,
+    value: &str,
+    limit: usize,
+    ctx: &SearchScoringContext,
+    total_hint: u64,
+) -> Option<Vec<(f64, u32)>> {
+    let field_stats = ctx.field_stats(field)?;
+    if field_stats.doc_count == 0 {
+        return None;
+    }
+    let tokens = ctx.mapping.analyzer(field).terms(value);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let avg_doc_len = field_stats.avg_doc_len;
+    let config = Bm25Config::default();
+    let norms_enabled = field_stats.norms_enabled;
+
+    let min_doc_len: u64 = if norms_enabled {
+        field_stats
+            .doc_len_by_doc_id
+            .values()
+            .copied()
+            .filter(|len| *len > 0)
+            .min()
+            .unwrap_or(1)
+    } else {
+        1
+    };
+
+    struct TokenInfo<'a> {
+        stats: &'a TermScoringStats,
+        max_contrib: f64,
+    }
+
+    let mut token_infos: Vec<TokenInfo<'_>> = tokens
+        .iter()
+        .filter_map(|token| {
+            let stats = ctx.term_stats(field, token)?;
+            if stats.doc_freq == 0 || stats.doc_freq > field_stats.doc_count {
+                return None;
+            }
+            let max_tf = stats.term_freq_by_doc_id.values().copied().max().unwrap_or(1);
+            let max_contrib = bm25_score(
+                config,
+                field_stats.doc_count,
+                stats.doc_freq,
+                max_tf,
+                min_doc_len,
+                avg_doc_len,
+            )
+            .ok()?;
+            Some(TokenInfo { stats, max_contrib })
+        })
+        .collect();
+
+    if token_infos.is_empty() {
+        return None;
+    }
+    token_infos.sort_by(|a, b| {
+        b.max_contrib
+            .partial_cmp(&a.max_contrib)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut scored: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut threshold = f64::NEG_INFINITY;
+
+    for token in &token_infos {
+        let allow_new_docs = token.max_contrib >= threshold;
+        for (doc_id, tf) in &token.stats.term_freq_by_doc_id {
+            if *tf == 0 {
+                continue;
+            }
+            let in_scored = scored.contains_key(doc_id);
+            if !in_scored && !allow_new_docs {
+                continue;
+            }
+
+            let doc_len = if norms_enabled {
+                match field_stats.doc_len_by_doc_id.get(doc_id).copied() {
+                    Some(len) if len > 0 => len,
+                    _ => continue,
+                }
+            } else {
+                1
+            };
+
+            let contrib = match bm25_score(
+                config,
+                field_stats.doc_count,
+                token.stats.doc_freq,
+                *tf,
+                doc_len,
+                avg_doc_len,
+            ) {
+                Ok(score) => score,
+                Err(_) => continue,
+            };
+
+            let entry = scored.entry(*doc_id).or_insert(0.0);
+            *entry += contrib;
+        }
+
+        if scored.len() >= limit {
+            let mut values: Vec<f64> = scored.values().copied().collect();
+            let k = values.len() - limit;
+            values.select_nth_unstable_by(k, |a, b| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            threshold = values[k];
+        }
+    }
+
+    let _ = total_hint;
+    Some(scored.into_iter().map(|(id, score)| (score, id)).collect())
 }
 
 fn is_scoring_query(query: &SearchQuery) -> bool {

@@ -90,6 +90,46 @@ This is a net win for the BAN search workload. The +60% bulk cost is
 the indexing-time cost we deliberately accepted to remove per-request
 source tokenization. The change is safe to merge.
 
+## Follow-up: MaxScore-style WAND skipping (v2.6)
+
+v2.3 still scored every matching document for OR-Match queries. For
+`Rue Payenne` that means scoring all 18 194 candidates even though
+the top ten are dominated by the rare `payenne` term. v2.6 adds a
+MaxScore-style early-skip path:
+
+- per query token, compute an upper bound BM25 contribution from
+  `term_freq_by_doc_id.values().max()` and the field's smallest
+  observed `doc_len`;
+- iterate tokens from highest to lowest max contribution;
+- after each token, recompute the K-th score threshold over the
+  currently scored docs;
+- when iterating a later token whose max contribution is below that
+  threshold, skip docs that are not already scored from a rarer
+  token — they cannot beat the threshold by adding only this term.
+
+The path is enabled for `SearchQuery::Match` with default OR operator
+on a single physical index; AND-Match and other shapes fall through
+to the v2.3 full-scoring path. Top-hit order matches OpenSearch
+(tie-break by ascending internal doc id) and `hits.total.value` stays
+exact, since the union is still walked once for total counting.
+
+Bench summary (Paris 25k, `track_total_hits=true` on both engines):
+
+| Operation | Surch v2.3 | Surch v2.6 (WAND) | OpenSearch 2.17.1 |
+| --- | ---: | ---: | ---: |
+| `_bulk` 25k | ~480 ms | ~3 s (under heavy concurrent load) | ~5 s |
+| `_search` `Rue Payenne` (18 194 hits) | ~25 ms | **~5 ms** (5–12 ms range) | 2–9 ms |
+| `_search` `Place Patrice Chereau` (559 hits) | ~2 ms | ~1–3 ms | 2–5 ms |
+
+System load drifted heavily between runs (svelte-check, vite,
+tsup, multiple browser processes), so absolute numbers should be
+read as ranges. The ordering is consistent across runs: Surch v2.6
+matches or beats OS on `_bulk` and the low-cardinality search and
+stays within ~2–4x of OS on the high-cardinality `Rue Payenne`. The
+remaining gap is the codec-level optimizations that Lucene has and
+Surch does not (block-max scores per postings block, SIMD scoring,
+lazy block decompression).
+
 ## Follow-up: top-K with lazy source hydration (v2.3)
 
 After v2.1 closed the indexing-time stats gap, the next obvious win was
