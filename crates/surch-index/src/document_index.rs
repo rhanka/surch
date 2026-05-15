@@ -6,7 +6,9 @@ use surch_analysis::{
 use thiserror::Error;
 
 use crate::mapping::{AnalyzerName, FieldType, IndexMapping};
-use crate::postings::{PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum};
+use crate::postings::{
+    BlockMeta, PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum,
+};
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
 pub type Result<T> = std::result::Result<T, DocumentIndexError>;
@@ -181,6 +183,13 @@ impl DocumentIndex {
 
     pub fn postings(&self, field: &str, term: &str) -> Option<PostingsEnum<'_>> {
         self.terms.postings(field, term)
+    }
+
+    /// Returns the pre-computed per-block stats for `(field, term)`,
+    /// aligned with [`postings`] chunks of 128 entries. See
+    /// [`crate::postings::BlockMeta`] for the schema.
+    pub fn block_metas(&self, field: &str, term: &str) -> Option<&[BlockMeta]> {
+        self.terms.block_metas(field, term)
     }
 
     pub fn field_stats(&self, field: &str) -> Option<&FieldLengthStats> {

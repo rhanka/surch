@@ -833,19 +833,22 @@ fn maxscore_match(
 
     // Precompute the per-block upper bound contribution for every token
     // (Block-Max WAND, à la Tantivy `BlockWAND` and Lucene block-max
-    // postings). Blocks of `BLOCK_SIZE` entries in the (sorted by
-    // doc_id) `term_freq_by_doc_id` Vec: the block's tightest upper
-    // bound is `bm25(max_tf_in_block, min_doc_len, …)`, multiplied by
-    // the token's repeat boost.
+    // postings). Per-block max term frequency is read directly from
+    // `BlockMeta::max_term_freq`, which was computed once at
+    // `PostingsBuilder::build()` time when the postings were folded
+    // into 128-entry chunks — so this loop is O(num_blocks) BM25 calls
+    // and no longer iterates the postings themselves. The block max
+    // contrib is `bm25(max_tf_in_block, min_doc_len, …)` times the
+    // token's repeat boost.
     let block_max_contribs: Vec<Vec<f64>> = token_infos
         .iter()
         .map(|token| {
             token
                 .stats
-                .term_freq_by_doc_id
-                .chunks(BLOCK_SIZE)
-                .map(|block| {
-                    let block_max_tf = block.iter().map(|(_, tf)| *tf).max().unwrap_or(0).max(1);
+                .block_metas
+                .iter()
+                .map(|meta| {
+                    let block_max_tf = u64::from(meta.max_term_freq).max(1);
                     let block_score = bm25_score(
                         config,
                         field_stats.doc_count,

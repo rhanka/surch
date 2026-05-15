@@ -7,6 +7,7 @@ use serde_json::Value;
 use surch_index::{
     document_index::DocumentIndex,
     mapping::{FieldMapping, IndexMapping},
+    postings::BlockMeta,
 };
 
 /// Shared in-memory API state used by API handlers.
@@ -81,6 +82,12 @@ pub struct TermScoringStats {
     pub doc_freq: u64,
     /// Sorted ascending by `doc_id`.
     pub term_freq_by_doc_id: Vec<(u32, u64)>,
+    /// Per-block stats aligned with `term_freq_by_doc_id.chunks(128)` —
+    /// computed once at `PostingsBuilder::build()` time and copied here
+    /// when the scoring context is built, so `maxscore_match` does not
+    /// have to re-iterate the postings to recompute the per-block max
+    /// term frequency at every query.
+    pub block_metas: Vec<BlockMeta>,
 }
 
 impl TermScoringStats {
@@ -276,9 +283,39 @@ impl InMemoryIndex {
             }
         }
 
+        // Pre-built per-block stats live next to the postings in
+        // `DocumentIndex` (FST-indexed parallel `Vec<Vec<BlockMeta>>`).
+        // We copy the slice into the scoring stats so the scoring loop
+        // does not have to keep a reference into the index — and so
+        // the data path matches the on-disk codec we're building
+        // toward, where these metas live in their own block.
+        //
+        // The 128-block alignment between `block_metas` (built from raw
+        // postings) and `term_freq_by_doc_id.chunks(128)` (built here)
+        // relies on the `analyzed_terms` invariant in
+        // `DocumentIndex::add_validated_document`: a given
+        // `(doc_id, field, term)` triple produces exactly one posting,
+        // so the merge branch above is a defensive no-op and both Vecs
+        // have the same length. The `debug_assert_eq!` below catches a
+        // regression as soon as it happens.
+        let block_metas = self
+            .index
+            .block_metas(field, term)
+            .map(<[BlockMeta]>::to_vec)
+            .unwrap_or_default();
+        debug_assert_eq!(
+            block_metas.len(),
+            term_freq_by_doc_id.len().div_ceil(128),
+            "block_metas alignment with term_freq_by_doc_id chunks broken \
+             (field={field}, term={term}, postings={}, metas={})",
+            term_freq_by_doc_id.len(),
+            block_metas.len(),
+        );
+
         TermScoringStats {
             doc_freq: term_freq_by_doc_id.len() as u64,
             term_freq_by_doc_id,
+            block_metas,
         }
     }
 
