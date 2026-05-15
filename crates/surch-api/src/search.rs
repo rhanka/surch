@@ -221,10 +221,28 @@ pub fn build_search_response_with_total(
     }
 }
 
+/// OpenSearch 7+ default cap: a `_search` request that does not specify
+/// `track_total_hits` reports an exact total only up to this number of
+/// hits, otherwise it returns `relation = "gte"`.
+const DEFAULT_TRACK_TOTAL_HITS_CAP: u64 = 10_000;
+
 /// Resolve the OpenSearch `hits.total` field shape from a `track_total_hits` mode.
 pub fn resolve_total_hits(total: u64, mode: Option<&TrackTotalHits>) -> Option<SearchHitsTotal> {
     match mode {
-        None | Some(TrackTotalHits::Exact) => Some(SearchHitsTotal {
+        None => {
+            if total <= DEFAULT_TRACK_TOTAL_HITS_CAP {
+                Some(SearchHitsTotal {
+                    value: total,
+                    relation: "eq",
+                })
+            } else {
+                Some(SearchHitsTotal {
+                    value: DEFAULT_TRACK_TOTAL_HITS_CAP,
+                    relation: "gte",
+                })
+            }
+        }
+        Some(TrackTotalHits::Exact) => Some(SearchHitsTotal {
             value: total,
             relation: "eq",
         }),
