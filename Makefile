@@ -34,6 +34,7 @@ help:
 	@echo "  bench-local       BAN 25k + INSEE 25k vs Surch & OS (~5 min)"
 	@echo "  bench-recall      SciFact + TREC-COVID NDCG@10 vs Surch & OS (~10 min)"
 	@echo "  bench-trec-covid  TREC-COVID NDCG@10 + Recall@10 vs Surch & OS (~7 min)"
+	@echo "  bench-pair-<wl>   run a single workload vs Surch then OS (wl: ban25k|insee25k|insee25k-multi|scifact|trec-covid)"
 	@echo "  bench-stress      artillery-replay vs Surch & OS (~10 min)"
 	@echo "  bench-perf        bench-local + bench-stress + RSS sampling"
 	@echo "  bench-remote-scw  bench-perf on a Scaleway DEV1-M (hard 30 min cap)"
@@ -118,6 +119,12 @@ bench-trec-covid: opensearch-up surch-up | $(REPORTS_DIR)
 	bash scripts/bench/trec-covid-ndcg.sh "trec-covid-surch-$(SHA)" $(REPORTS_DIR)/trec-covid-surch.out $(SURCH_URL)
 	bash scripts/bench/trec-covid-ndcg.sh "trec-covid-os-$(SHA)"    $(REPORTS_DIR)/trec-covid-os.out    $(OS_URL)
 	$(MAKE) surch-down opensearch-down
+
+# bench-pair-<workload> — orchestrate a single workload against Surch then
+# OpenSearch via scripts/bench/run-pair.sh. Both engines are trap-cleaned
+# even on crash. Workload is the wildcard portion (ban25k, insee25k, ...).
+bench-pair-%: | $(REPORTS_DIR)
+	bash scripts/bench/run-pair.sh $* $(REPORTS_DIR)
 
 bench-stress: opensearch-up surch-up | $(REPORTS_DIR)
 	bash scripts/bench/artillery-replay.sh "art-surch-$(SHA)" $(REPORTS_DIR)/art-surch.out $(SURCH_URL)

@@ -97,15 +97,21 @@ Persisted under `target/bench-reports/<sha>/<workload>-<engine>.json`. A `surch-
 
 ## Implementation files
 
-To create in this order:
-1. `/Makefile` root with the target hierarchy above
-2. `/scripts/bench/run-pair.sh` — wraps Surch + OS bench in a single workload run, emits one JSON per engine
-3. `/scripts/bench/rss-sample.sh` — `pidstat -r 1 -p $PID` → JSON
-4. `/scripts/bench/trec-covid-ndcg.sh` — clone of `scifact-ndcg.sh`, larger corpus
-5. `/scripts/bench/mmarco-fr-ndcg.sh` — remote-only, French baseline
-6. `/scripts/scw/{wait-ssh,rsync-repo,remote-build,cost-guard}.sh` — Scaleway orchestration
-7. `/crates/surch-demo/src/bin/bench_report.rs` — JSON → Markdown aggregation + regression comparison
-8. `/crates/surch-demo/src/bin/bench_aggregate.rs` — pidstat `.log` → JSON
+Implemented:
+- `/Makefile` root with the target hierarchy above (also exposes
+  `bench-pair-<workload>` as a pattern target dispatching to `run-pair.sh`)
+- `/scripts/bench/run-pair.sh` — wraps Surch + OS bench in a single workload
+  run, emits one `.out` per engine plus a `pair.json` envelope
+  (schema `surch.bench.pair.v1`); trap-cleans both engines on EXIT/INT/TERM
+- `/scripts/bench/rss-sample.sh` — 1 Hz sampling of `/proc/<pid>/status`
+  `VmRSS` (with `ps` fallback) → JSON (schema `surch.bench.rss.v1`)
+- `/scripts/bench/trec-covid-ndcg.sh` — clone of `scifact-ndcg.sh`, larger corpus
+
+To create:
+1. `/scripts/bench/mmarco-fr-ndcg.sh` — remote-only, French baseline
+2. `/scripts/scw/{wait-ssh,rsync-repo,remote-build,cost-guard}.sh` — Scaleway orchestration
+3. `/crates/surch-demo/src/bin/bench_report.rs` — JSON → Markdown aggregation + regression comparison
+4. `/crates/surch-demo/src/bin/bench_aggregate.rs` — pidstat `.log` → JSON
 
 ## References used
 
