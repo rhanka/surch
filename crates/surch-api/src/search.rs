@@ -529,12 +529,9 @@ fn topk_scored_documents(
             field,
             value,
             operator,
-        } => state.documents_for_match_internal(
-            index,
-            field,
-            value,
-            *operator == MatchOperator::And,
-        ),
+        } => {
+            state.documents_for_match_internal(index, field, value, *operator == MatchOperator::And)
+        }
         SearchQuery::MultiMatch {
             query,
             fields,
@@ -574,8 +571,7 @@ fn topk_scored_documents(
             value,
             operator,
         } if *operator != MatchOperator::And => {
-            if let Some(scored_pairs) =
-                maxscore_match(field, value, limit, &scoring_context, total)
+            if let Some(scored_pairs) = maxscore_match(field, value, limit, &scoring_context, total)
             {
                 return finalize_topk(state, index, scored_pairs, total, limit);
             }
@@ -585,8 +581,7 @@ fn topk_scored_documents(
             fields,
             operator,
         } if *operator != MatchOperator::And => {
-            if let Some(scored_pairs) =
-                maxscore_multi_match(fields, value, limit, &scoring_context)
+            if let Some(scored_pairs) = maxscore_multi_match(fields, value, limit, &scoring_context)
             {
                 return finalize_topk(state, index, scored_pairs, total, limit);
             }
@@ -804,7 +799,12 @@ fn maxscore_match(
         let allow_new_docs = token.max_contrib >= threshold;
         let token_blocks = &block_max_contribs[token_idx];
 
-        for (block_idx, block) in token.stats.term_freq_by_doc_id.chunks(BLOCK_SIZE).enumerate() {
+        for (block_idx, block) in token
+            .stats
+            .term_freq_by_doc_id
+            .chunks(BLOCK_SIZE)
+            .enumerate()
+        {
             if block.is_empty() {
                 continue;
             }
@@ -959,7 +959,10 @@ fn score_documents(
     };
 
     let scoring_context = SearchScoringContext::new(state, index, query);
-    let public_ids = documents.iter().map(|doc| doc.id.as_str()).collect::<Vec<_>>();
+    let public_ids = documents
+        .iter()
+        .map(|doc| doc.id.as_str())
+        .collect::<Vec<_>>();
     let internal_ids = state.internal_doc_ids(index, &public_ids);
 
     documents

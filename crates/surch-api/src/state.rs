@@ -235,7 +235,11 @@ impl InMemoryIndex {
     fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats> {
         let stats = self.index.field_stats(field)?;
         let norms_enabled = self.mapping.norms_enabled(field);
-        let avg_doc_len = if norms_enabled { stats.avg_doc_len()? } else { 1.0 };
+        let avg_doc_len = if norms_enabled {
+            stats.avg_doc_len()?
+        } else {
+            1.0
+        };
         let doc_len_by_doc_id = if norms_enabled {
             // BTreeMap iteration yields ascending order, so the Vec is sorted.
             stats
@@ -1095,12 +1099,9 @@ impl AppState {
             .store
             .read()
             .expect("in-memory API state lock should not be poisoned");
-        store
-            .indices
-            .get(index)
-            .map_or_else(Vec::new, |data| {
-                data.documents_by_internal_ids(index, internal_ids)
-            })
+        store.indices.get(index).map_or_else(Vec::new, |data| {
+            data.documents_by_internal_ids(index, internal_ids)
+        })
     }
 
     pub fn internal_doc_ids(&self, index: &str, public_ids: &[&str]) -> Vec<Option<u32>> {
