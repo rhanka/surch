@@ -31,6 +31,7 @@ pub struct SearchRequest {
     pub track_total_hits: Option<TrackTotalHits>,
     pub sort: Vec<SortClause>,
     pub highlight: Option<HighlightRequest>,
+    pub min_score: Option<f64>,
 }
 
 /// Single OpenSearch `sort` clause.
@@ -569,6 +570,11 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
             request.query.as_ref(),
         ));
     }
+    if scoring_enabled {
+        if let Some(min) = request.min_score {
+            matched_documents.retain(|doc| doc.score >= min);
+        }
+    }
     sort_scored_documents(&mut matched_documents, &request.sort, scoring_enabled);
     let max_score = compute_max_score(&matched_documents, scoring_enabled);
     let total = matched_documents.len() as u64;
@@ -595,6 +601,12 @@ fn run_topk_search(
         return None;
     }
     if request.highlight.is_some() {
+        return None;
+    }
+    // min_score requires scoring every candidate to know the post-filter
+    // total; the top-K shortcut can't deliver that cheaply, so we hand
+    // off to the full-scan path.
+    if request.min_score.is_some() {
         return None;
     }
     let query = request.query.as_ref()?;
@@ -1336,6 +1348,7 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
             track_total_hits: None,
             sort: Vec::new(),
             highlight: None,
+            min_score: None,
         });
     }
 
@@ -1375,6 +1388,7 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
         .transpose()?
         .unwrap_or_default();
     let highlight = object.get("highlight").map(parse_highlight).transpose()?;
+    let min_score = object.get("min_score").map(parse_min_score).transpose()?;
 
     Ok(SearchRequest {
         query,
@@ -1384,7 +1398,26 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
         track_total_hits,
         sort,
         highlight,
+        min_score,
     })
+}
+
+fn parse_min_score(value: &Value) -> Result<f64, OpenSearchError> {
+    let n = value.as_f64().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`min_score` must be a number",
+        )
+    })?;
+    if !n.is_finite() || n.is_sign_negative() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`min_score` must be a non-negative finite number",
+        ));
+    }
+    Ok(n)
 }
 
 fn parse_highlight(value: &Value) -> Result<HighlightRequest, OpenSearchError> {

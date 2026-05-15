@@ -2685,3 +2685,95 @@ async fn search_router_a14_total_relation_field_serializes_as_string() {
         .expect("relation must be a string");
     assert!(matches!(relation, "eq" | "gte"));
 }
+
+// --- A11: `min_score` top-level body filter ---
+//
+// matchID's deces-backend sets `min_score` on full-text searches (intake
+// §2.8) so weak BM25 hits don't pollute the UI. Surch must drop scored
+// hits with `_score < min_score` before pagination, and the response
+// `hits.total.value` must reflect the post-filter count.
+
+#[tokio::test]
+async fn search_router_a11_min_score_keeps_only_scoring_hits_above_threshold() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk lamp"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"office desk"}"#).await;
+    index_product(&router, "sku-3", r#"{"name":"kitchen chair"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":"desk"}},"min_score":1000.0}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 0);
+    assert_eq!(body["hits"]["hits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn search_router_a11_min_score_zero_keeps_every_scored_hit() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk lamp"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"office desk"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":"desk"}},"min_score":0.0001}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 2);
+}
+
+#[tokio::test]
+async fn search_router_a11_min_score_is_ignored_on_unscored_queries() {
+    // match_all returns _score = null (no BM25), so `min_score` must
+    // not silently drop everything — the filter only applies when
+    // scoring is enabled.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"min_score":1000.0}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 2);
+}
+
+#[tokio::test]
+async fn search_router_a11_min_score_rejects_negative_value() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"min_score":-1.0}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+}
