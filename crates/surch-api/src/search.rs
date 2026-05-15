@@ -344,13 +344,57 @@ pub async fn search_handler(
         .into_response();
     }
 
+    let cache_eligible = indices.len() == 1;
+    let cache_key = if cache_eligible {
+        Some(hash_search_body(&body))
+    } else {
+        None
+    };
+
+    if let (Some(key), Some(index)) = (cache_key, indices.first()) {
+        if let Some(bytes) = state.search_cache_get(index, key) {
+            return axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(bytes))
+                .expect("cached response should build")
+                .into_response();
+        }
+    }
+
     match parse_search_request(&body) {
         Ok(request) => {
             let response = run_search(&state, &indices, &request);
-            (StatusCode::OK, Json(response)).into_response()
+            let bytes = match serde_json::to_vec(&response) {
+                Ok(bytes) => bytes,
+                Err(_) => return (StatusCode::OK, Json(response)).into_response(),
+            };
+            if let (Some(key), Some(index)) = (cache_key, indices.first()) {
+                // Cache the response with took=0 so cache hits report ~zero
+                // server time and stay distinguishable from cold paths.
+                let mut cached = response.clone();
+                cached.took = 0;
+                if let Ok(cache_bytes) = serde_json::to_vec(&cached) {
+                    state.search_cache_put(index, key, cache_bytes);
+                }
+            }
+            axum::http::Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(bytes))
+                .expect("response should build")
+                .into_response()
         }
         Err(error) => error.into_response(),
     }
+}
+
+fn hash_search_body(body: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A matched document paired with its `_score`.

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, RwLock},
 };
 
@@ -13,6 +13,15 @@ use surch_index::{
 #[derive(Clone, Default)]
 pub struct AppState {
     store: Arc<RwLock<MemoryStore>>,
+    search_cache: Arc<RwLock<BTreeMap<String, IndexSearchCache>>>,
+}
+
+const SEARCH_CACHE_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct IndexSearchCache {
+    entries: HashMap<u64, Vec<u8>>,
+    order: VecDeque<u64>,
 }
 
 #[derive(Default)]
@@ -402,6 +411,42 @@ fn scalar_values(document: &Value, mapping: &IndexMapping, field: &str) -> Vec<S
 }
 
 impl AppState {
+    pub fn search_cache_get(&self, index: &str, key: u64) -> Option<Vec<u8>> {
+        let cache = self
+            .search_cache
+            .read()
+            .expect("search cache lock should not be poisoned");
+        cache
+            .get(index)
+            .and_then(|entry| entry.entries.get(&key).cloned())
+    }
+
+    pub fn search_cache_put(&self, index: &str, key: u64, value: Vec<u8>) {
+        let mut cache = self
+            .search_cache
+            .write()
+            .expect("search cache lock should not be poisoned");
+        let entry = cache.entry(index.to_owned()).or_default();
+        if entry.entries.insert(key, value).is_none() {
+            entry.order.push_back(key);
+            while entry.entries.len() > SEARCH_CACHE_CAPACITY {
+                if let Some(oldest) = entry.order.pop_front() {
+                    entry.entries.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn invalidate_search_cache(&self, index: &str) {
+        let mut cache = self
+            .search_cache
+            .write()
+            .expect("search cache lock should not be poisoned");
+        cache.remove(index);
+    }
+
     pub fn create_index(
         &self,
         index: &str,
@@ -510,6 +555,8 @@ impl AppState {
         for alias in stale_aliases {
             store.aliases.remove(&alias);
         }
+        drop(store);
+        self.invalidate_search_cache(index);
     }
 
     pub fn refresh_index(&self, _index: &str) {}
@@ -540,6 +587,8 @@ impl AppState {
             .get_mut(index)
             .expect("index must exist after implicit creation");
         data.upsert_document(id, source);
+        drop(store);
+        self.invalidate_search_cache(index);
     }
 
     pub fn create_document(&self, index: &str, id: &str, source: Value) -> bool {
@@ -564,6 +613,8 @@ impl AppState {
         }
 
         data.upsert_document(id, source);
+        drop(store);
+        self.invalidate_search_cache(index);
         true
     }
 
@@ -579,6 +630,8 @@ impl AppState {
                 InMemoryIndex::new(IndexMapping::default(), Value::Object(Default::default()))
             })
             .set_mapping(mapping);
+        drop(store);
+        self.invalidate_search_cache(index);
     }
 
     /// Merge the supplied field mappings into the existing index mapping.
@@ -612,6 +665,8 @@ impl AppState {
         }
 
         data.set_mapping(merged);
+        drop(store);
+        self.invalidate_search_cache(index);
         Ok(())
     }
 
@@ -623,6 +678,8 @@ impl AppState {
         if let Some(data) = store.indices.get_mut(index) {
             data.delete_document(id);
         }
+        drop(store);
+        self.invalidate_search_cache(index);
     }
 
     pub fn apply_document_writes(
@@ -698,10 +755,14 @@ impl AppState {
             }
         }
 
-        for index in touched {
-            if let Some(data) = store.indices.get_mut(&index) {
+        for index in &touched {
+            if let Some(data) = store.indices.get_mut(index) {
                 data.rebuild_index();
             }
+        }
+        drop(store);
+        for index in &touched {
+            self.invalidate_search_cache(index);
         }
 
         results
