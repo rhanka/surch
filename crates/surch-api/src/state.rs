@@ -244,6 +244,43 @@ impl InMemoryIndex {
         self.term_hits(field, value).len()
     }
 
+    /// A6 phase 2: postings-backed prefix lookup.
+    ///
+    /// Returns `Some(Vec<doc_public_id>)` when the field carries
+    /// `index_prefixes` AND the normalized prefix length falls inside
+    /// `[min_chars..=max_chars]` — in that case the result is the exact
+    /// set of docs containing a token starting with `prefix`. Returns
+    /// `None` when the postings-backed path is not applicable (no
+    /// `index_prefixes` on the field, or prefix length out of bounds);
+    /// callers fall back to source-scan via `prefix_field_matches`.
+    fn prefix_hits(&self, field: &str, prefix: &str) -> Option<Vec<String>> {
+        if field.trim().is_empty() || prefix.is_empty() {
+            return None;
+        }
+        let field_mapping = self.mapping.field(field)?;
+        let bounds = field_mapping.index_prefixes?;
+
+        let normalized = normalized_term_for_field(prefix, field, &self.mapping);
+        if normalized.is_empty() {
+            return None;
+        }
+        let prefix_len = normalized.chars().count();
+        if prefix_len < bounds.min_chars || prefix_len > bounds.max_chars {
+            return None;
+        }
+
+        let hits = self
+            .index
+            .prefix_postings(field, &normalized)
+            .map(|set| {
+                set.iter()
+                    .filter_map(|doc_id| self.reverse_document_ids.get(doc_id).cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Some(hits)
+    }
+
     fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats> {
         let stats = self.index.field_stats(field)?;
         let norms_enabled = self.mapping.norms_enabled(field);
@@ -1098,6 +1135,28 @@ impl AppState {
             .indices
             .get(index)
             .map_or_else(Vec::new, |data| data.term_hits(field, value))
+    }
+
+    /// A6 phase 2: postings-backed prefix lookup. Returns `Some(ids)` iff
+    /// `field` declares `index_prefixes` AND the prefix length falls in the
+    /// `[min_chars..=max_chars]` window — in that case the result is the
+    /// exact set of matching document ids. Returns `None` when the
+    /// accelerated path is not applicable, in which case the caller must
+    /// fall back to the source-scan path.
+    pub fn documents_for_prefix(
+        &self,
+        index: &str,
+        field: &str,
+        prefix: &str,
+    ) -> Option<Vec<String>> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .and_then(|data| data.prefix_hits(field, prefix))
     }
 
     pub fn documents_for_match(

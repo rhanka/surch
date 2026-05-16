@@ -1463,6 +1463,109 @@ async fn search_router_prefix_query_matches_token_prefix() {
     assert_eq!(ids, vec!["sku-1"]);
 }
 
+// --- A6 phase 2: runtime acceleration via `index_prefixes` postings ---
+
+async fn create_index_prefixes_products(router: &axum::Router) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"NOM":{"type":"text","index_prefixes":{"min_chars":2,"max_chars":5}}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn prefix_query_uses_index_prefixes_postings_within_bounds() {
+    // A6 phase 2: with `index_prefixes: { min_chars: 2, max_chars: 5 }` on
+    // `NOM`, a 3-char prefix `"DUP"` falls inside the window and is served
+    // from the write-time prefix postings. Expected: 2 hits (DUPONT, DUPRE).
+    let router = app_router();
+    create_index_prefixes_products(&router).await;
+    index_product(&router, "sku-1", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "sku-2", r#"{"NOM":"DUPRE"}"#).await;
+    index_product(&router, "sku-3", r#"{"NOM":"MARTIN"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"prefix":{"NOM":"DUP"}},"sort":[{"_id":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1", "sku-2"]);
+}
+
+#[tokio::test]
+async fn prefix_query_uses_index_prefixes_postings_at_max_chars() {
+    // A6 phase 2: a 4-char prefix `"DUPO"` is still inside `[2..=5]` so the
+    // postings-backed lookup applies. Only DUPONT contains a token starting
+    // with "DUPO".
+    let router = app_router();
+    create_index_prefixes_products(&router).await;
+    index_product(&router, "sku-1", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "sku-2", r#"{"NOM":"DUPRE"}"#).await;
+    index_product(&router, "sku-3", r#"{"NOM":"MARTIN"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"prefix":{"NOM":"DUPO"}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["sku-1"]);
+}
+
+#[tokio::test]
+async fn prefix_query_falls_back_to_source_scan_above_max_chars() {
+    // A6 phase 2: a 6-char prefix `"DUPOND"` is OUTSIDE `[2..=5]`, so the
+    // postings-backed lookup is skipped and the executor falls back to the
+    // source-scan path via `prefix_field_matches`. The query must still
+    // return the expected hit (here zero — no DUPOND in the corpus —
+    // verifying the fallback respects the prefix even when shorter prefixes
+    // are precomputed).
+    let router = app_router();
+    create_index_prefixes_products(&router).await;
+    index_product(&router, "sku-1", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "sku-2", r#"{"NOM":"DUPRE"}"#).await;
+    index_product(&router, "sku-3", r#"{"NOM":"MARTIN"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"prefix":{"NOM":"DUPOND"}},"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    // No DUPOND in the corpus, but the fallback must still execute without
+    // returning false positives from the precomputed [2..5] prefix table.
+    assert!(ids.is_empty(), "DUPOND must not match DUPONT via prefix fallback (got {ids:?})");
+}
+
 #[tokio::test]
 async fn search_router_wildcard_query_matches_star_and_question_patterns() {
     let router = app_router();

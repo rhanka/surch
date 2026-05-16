@@ -2,10 +2,12 @@
   "mappings": {
     "properties": {
       "NOM": {
-        "type": "text"
+        "type": "text",
+        "index_prefixes": { "min_chars": 2, "max_chars": 5 }
       },
       "PRENOMS": {
-        "type": "text"
+        "type": "text",
+        "index_prefixes": { "min_chars": 2, "max_chars": 5 }
       },
       "SEXE": {
         "type": "keyword"
