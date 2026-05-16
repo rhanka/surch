@@ -3096,6 +3096,167 @@ async fn search_router_a10_sort_missing_field_goes_last() {
     assert_eq!(last_id, "sku-3", "missing values must sort last regardless of order");
 }
 
+// --- A10 phase 2: multi-field sub-fields (matchID intake §2.12) ---
+//
+// matchID's `deces_index.yml` maps `NOM` as
+// `{ type: text, analyzer: norm, fields: { raw: { type: keyword,
+// normalizer: norm } } }`. Phase 2 parses the `fields:` block and, when
+// the sub-field declares a `normalizer`, applies it at sort time so
+// `sort: NOM.raw` orders by the lowercased/asciifolded keyword
+// regardless of the parent's `_source` casing. Write-time fan-out
+// (storing each parent value under `parent.subname`) remains pending —
+// see gap-analysis A10 "phase 3".
+
+async fn create_index_with_nom_multi_field(router: &axum::Router) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"NOM":{"type":"text","analyzer":"norm","fields":{"raw":{"type":"keyword","normalizer":"norm"}}}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn search_router_a10_phase2_mapping_round_trips_subfields() {
+    // `GET /:index/_mapping` must round-trip the multi-field shape
+    // matchID puts on the wire (intake §2.12).
+    let router = app_router();
+    create_index_with_nom_multi_field(&router).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/products/_mapping")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    let raw = body
+        .pointer("/products/mappings/properties/NOM/fields/raw")
+        .expect("NOM.raw rendered under fields.raw");
+    assert_eq!(raw["type"], serde_json::Value::String("keyword".to_owned()));
+    assert_eq!(
+        raw["normalizer"],
+        serde_json::Value::String("norm".to_owned()),
+    );
+}
+
+#[tokio::test]
+async fn search_router_a10_phase2_sort_subfield_applies_normalizer() {
+    // With `NOM.raw: { type: keyword, normalizer: norm }`, a `sort` on
+    // `NOM.raw` must order by the lowercased/asciifolded keyword even
+    // though the stored `_source` keeps the original casing.
+    // Input order (NOM): "Élise", "alice", "Bob".
+    // Normalized:        "elise", "alice", "bob".
+    // Expected ascending order of returned `_id`s: alice, bob, elise.
+    let router = app_router();
+    create_index_with_nom_multi_field(&router).await;
+    index_product(&router, "sku-elise", r#"{"NOM":"Élise"}"#).await;
+    index_product(&router, "sku-alice", r#"{"NOM":"alice"}"#).await;
+    index_product(&router, "sku-bob", r#"{"NOM":"Bob"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"NOM.raw":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec!["sku-alice", "sku-bob", "sku-elise"]);
+}
+
+#[tokio::test]
+async fn search_router_a10_phase2_sort_parent_text_uses_first_analyzed_term() {
+    // Sorting on the parent `NOM` (a text field with `analyzer: norm`)
+    // must keep its existing behaviour: comparison happens on the
+    // stored `_source` string verbatim, which is *not* the same as
+    // sorting on `NOM.raw`. We pin the contract so phase 3 (write-time
+    // fan-out) doesn't silently divert parent-field sorts.
+    let router = app_router();
+    create_index_with_nom_multi_field(&router).await;
+    index_product(&router, "sku-elise", r#"{"NOM":"Élise"}"#).await;
+    index_product(&router, "sku-alice", r#"{"NOM":"alice"}"#).await;
+    index_product(&router, "sku-bob", r#"{"NOM":"Bob"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"NOM":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    // Raw `_source` ordering: "Bob" < "alice" < "Élise" in Rust's
+    // string Ord (uppercase < lowercase < non-ASCII).
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec!["sku-bob", "sku-alice", "sku-elise"]);
+}
+
+#[tokio::test]
+async fn search_router_a10_phase2_sort_subfield_without_normalizer_falls_back_to_alias() {
+    // A sub-field declared *without* `normalizer` keeps the durable
+    // alias behaviour (sub-field path resolves to the parent's stored
+    // value, unmodified). Pin the contract so removing the alias in a
+    // future phase doesn't silently break matchID clients that point at
+    // a bare `keyword` sub-field.
+    let router = app_router();
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"NOM":{"type":"text","fields":{"keyword":{"type":"keyword"}}}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    index_product(&router, "sku-1", r#"{"NOM":"Élise"}"#).await;
+    index_product(&router, "sku-2", r#"{"NOM":"alice"}"#).await;
+    index_product(&router, "sku-3", r#"{"NOM":"Bob"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"NOM.keyword":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    // No normalizer => same ordering as raw `_source`.
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, vec!["sku-3", "sku-2", "sku-1"]);
+}
+
 // --- A5: `function_score` no-op wrapper ---
 //
 // matchID's deces-backend wraps every advanced + block-match in
