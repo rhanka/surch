@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
-use surch_index::mapping::IndexMapping;
+use surch_index::mapping::{AnalyzerName, IndexMapping};
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
@@ -973,7 +973,15 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
             matched_documents.retain(|doc| doc.score >= min);
         }
     }
-    sort_scored_documents(&mut matched_documents, &request.sort, scoring_enabled);
+    let sort_mapping = indices
+        .first()
+        .and_then(|index| state.index_mapping(index));
+    sort_scored_documents(
+        &mut matched_documents,
+        &request.sort,
+        scoring_enabled,
+        sort_mapping.as_ref(),
+    );
     let max_score = compute_max_score(&matched_documents, scoring_enabled);
     let total = matched_documents.len() as u64;
     let aggregations = compute_aggregations(&request.aggs, &matched_documents);
@@ -5094,6 +5102,7 @@ fn sort_scored_documents(
     documents: &mut [ScoredDocument],
     clauses: &[SortClause],
     scoring_enabled: bool,
+    mapping: Option<&IndexMapping>,
 ) {
     if clauses.is_empty() {
         if scoring_enabled {
@@ -5106,9 +5115,19 @@ fn sort_scored_documents(
         }
         return;
     }
+
+    // A10 phase 2: pre-resolve, for each sort clause, the sub-field
+    // normalizer (if any) so we apply it once per comparison instead of
+    // looking it up on every doc-pair. matchID's `NOM.raw` →
+    // `{ type: keyword, normalizer: norm }` shape lands here.
+    let normalizers: Vec<Option<AnalyzerName>> = clauses
+        .iter()
+        .map(|clause| mapping.and_then(|m| m.subfield_normalizer(&clause.field)))
+        .collect();
+
     documents.sort_by(|left, right| {
-        for clause in clauses {
-            let ordering = compare_sort_clause(left, right, clause);
+        for (clause, normalizer) in clauses.iter().zip(normalizers.iter()) {
+            let ordering = compare_sort_clause(left, right, clause, *normalizer);
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
             }
@@ -5121,23 +5140,53 @@ fn compare_sort_clause(
     left: &ScoredDocument,
     right: &ScoredDocument,
     clause: &SortClause,
+    normalizer: Option<AnalyzerName>,
 ) -> std::cmp::Ordering {
     if clause.field == "_score" {
         return compare_score(left.score, right.score, clause.order);
     }
+    let left_value = lookup_sort_value(&left.doc.source, &clause.field);
+    let right_value = lookup_sort_value(&right.doc.source, &clause.field);
+    // A10 phase 2: when the sub-field declares a `normalizer`, apply it
+    // to the parent's stored value at read time. Until write-time fan-out
+    // ships (gap-analysis A10 "phase 3"), this gives matchID the
+    // lowercase/asciifold ordering it expects on `NOM.raw`.
+    let (left_norm, right_norm) = match normalizer {
+        Some(name) => (
+            left_value.map(|v| normalize_sort_value(v, name)),
+            right_value.map(|v| normalize_sort_value(v, name)),
+        ),
+        None => (None, None),
+    };
     compare_field(
-        lookup_sort_value(&left.doc.source, &clause.field),
-        lookup_sort_value(&right.doc.source, &clause.field),
+        left_norm.as_ref().or(left_value),
+        right_norm.as_ref().or(right_value),
         clause.order,
     )
+}
+
+/// A10 phase 2: applies a normalizer (`norm` = lowercase + asciifolding)
+/// to a stored `_source` value for sort-time comparison only. Non-string
+/// values are returned verbatim so numeric/bool sub-fields keep their
+/// native ordering.
+fn normalize_sort_value(value: &Value, analyzer: AnalyzerName) -> Value {
+    match value {
+        Value::String(text) => {
+            let normalized = analyzer.first_term(text);
+            Value::String(normalized)
+        }
+        other => other.clone(),
+    }
 }
 
 /// Resolve a sort field against the stored `_source` map, with a fallback
 /// for ES multi-field sub-fields like `NOM.raw` or `DATE_NAISSANCE.norm`.
 /// matchID emits these because their mapping declares
-/// `NOM: { type: text, fields: { raw: { type: keyword } } }` — until A13
-/// ships the real multi-field types, we alias the sub-field to its
-/// parent so the sort order is still deterministic.
+/// `NOM: { type: text, fields: { raw: { type: keyword } } }`. A10 phase
+/// 2 parses the `fields` block and applies the sub-field's `normalizer`
+/// at sort time (see `compare_sort_clause`); write-time fan-out remains
+/// pending (gap-analysis A10 "phase 3"), so this alias stays the
+/// durable fallback for the stored `_source`.
 fn lookup_sort_value<'a>(source: &'a Value, field: &str) -> Option<&'a Value> {
     let object = source.as_object()?;
     if let Some(value) = object.get(field) {

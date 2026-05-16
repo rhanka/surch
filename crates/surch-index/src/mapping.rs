@@ -192,6 +192,22 @@ pub struct FieldMapping {
     /// MVP stores the value verbatim — any string is accepted but only the
     /// lex-sortable `yyyyMMdd` shape is exercised at search time.
     pub date_format: Option<String>,
+    /// A10 phase 2: parsed multi-field sub-fields declared under the
+    /// ES `fields: { <sub_name>: { type: …, normalizer: …, … } }` block.
+    ///
+    /// matchID's `deces_index.yml` (intake §2.12) maps
+    /// `NOM: { type: text, analyzer: norm, fields: { raw: { type: keyword,
+    /// normalizer: norm } } }`. Wire-shape consumers (`GET
+    /// /:index/_mapping`) need every sub-field round-tripped verbatim.
+    ///
+    /// Write-time fan-out (indexing each parent value under the
+    /// `parent.subname` path with the sub-field's analyzer/normalizer) is
+    /// **not** wired yet — see gap-analysis A10 "phase 3" note. At
+    /// query time `lookup_sort_value` still aliases `parent.subname` to
+    /// the parent's stored value; when the sub-field carries a
+    /// `normalizer` the alias is normalised on read so `sort: NOM.raw`
+    /// returns the lowercased / asciifolded value matchID expects.
+    pub fields: BTreeMap<String, FieldMapping>,
 }
 
 impl FieldMapping {
@@ -211,6 +227,7 @@ impl FieldMapping {
             normalizer: None,
             index_prefixes: None,
             date_format: None,
+            fields: BTreeMap::new(),
         }
     }
 
@@ -226,6 +243,13 @@ impl FieldMapping {
 
     pub fn with_date_format(mut self, date_format: Option<String>) -> Self {
         self.date_format = date_format;
+        self
+    }
+
+    /// A10 phase 2: overrides the parsed multi-field sub-fields block
+    /// (`fields: { <name>: { … } }`).
+    pub fn with_subfields(mut self, fields: BTreeMap<String, FieldMapping>) -> Self {
+        self.fields = fields;
         self
     }
 
@@ -298,6 +322,15 @@ impl FieldMapping {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_DATE_FORMAT.to_owned());
             object.insert("format".to_owned(), Value::String(format));
+        }
+
+        if !self.fields.is_empty() {
+            let inner = self
+                .fields
+                .iter()
+                .map(|(name, mapping)| (name.clone(), mapping.as_value()))
+                .collect::<Map<_, _>>();
+            object.insert("fields".to_owned(), Value::Object(inner));
         }
 
         Value::Object(object)
@@ -396,6 +429,30 @@ impl IndexMapping {
         self.fields.get(field)
     }
 
+    /// A10 phase 2: resolves a (possibly dotted) field path against the
+    /// declared multi-field mapping.
+    ///
+    /// For a top-level path (`"NOM"`) this returns the same value as
+    /// [`Self::field`]. For a multi-field path (`"NOM.raw"`) it walks the
+    /// parent's `fields` block and returns the sub-field mapping. Returns
+    /// `None` when neither the parent nor the sub-field is declared.
+    pub fn resolve_field(&self, path: &str) -> Option<&FieldMapping> {
+        if let Some(field) = self.fields.get(path) {
+            return Some(field);
+        }
+        let (parent, sub) = path.rsplit_once('.')?;
+        self.fields.get(parent)?.fields.get(sub)
+    }
+
+    /// A10 phase 2: when `path` is a multi-field sub-field (`parent.sub`)
+    /// declared with a `normalizer`, returns that normalizer so callers
+    /// (e.g. sort) can apply it to the parent's stored value at read
+    /// time, until write-time fan-out lands.
+    pub fn subfield_normalizer(&self, path: &str) -> Option<AnalyzerName> {
+        let (parent, sub) = path.rsplit_once('.')?;
+        self.fields.get(parent)?.fields.get(sub)?.normalizer
+    }
+
     pub fn as_value(&self) -> Value {
         let properties = self
             .fields
@@ -452,119 +509,8 @@ impl IndexMapping {
             if field.trim().is_empty() {
                 return Err(MappingError::EmptyFieldName);
             }
-
-            let field_definition = field_definition.as_object().ok_or_else(|| {
-                MappingError::FieldDefinitionNotObject {
-                    field: field.clone(),
-                }
-            })?;
-
-            let field_type_name = field_definition
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("text");
-            let field_type = FieldType::from_name(field_type_name).ok_or_else(|| {
-                MappingError::UnsupportedFieldType {
-                    field: field.clone(),
-                    field_type: field_type_name.to_owned(),
-                }
-            })?;
-
-            let analyzer = match field_definition.get("analyzer") {
-                Some(value) => {
-                    let value = value
-                        .as_str()
-                        .ok_or_else(|| MappingError::AnalyzerNotString {
-                            field: field.clone(),
-                        })?;
-                    Some(AnalyzerName::from_name(value).ok_or_else(|| {
-                        MappingError::UnsupportedAnalyzer {
-                            field: field.clone(),
-                            analyzer: value.to_owned(),
-                        }
-                    })?)
-                }
-                None => None,
-            };
-
-            let norms = match field_definition.get("norms") {
-                Some(value) => {
-                    Some(
-                        value
-                            .as_bool()
-                            .ok_or_else(|| MappingError::NormsNotBoolean {
-                                field: field.clone(),
-                            })?,
-                    )
-                }
-                None => None,
-            };
-
-            if field_type != FieldType::Text && analyzer.is_some() {
-                return Err(MappingError::AnalyzerNotSupported {
-                    field: field.clone(),
-                    field_type: field_type.as_str().to_owned(),
-                });
-            }
-
-            let normalizer = match field_definition.get("normalizer") {
-                Some(value) => {
-                    let value =
-                        value
-                            .as_str()
-                            .ok_or_else(|| MappingError::NormalizerNotString {
-                                field: field.clone(),
-                            })?;
-                    Some(AnalyzerName::from_name(value).ok_or_else(|| {
-                        MappingError::UnsupportedNormalizer {
-                            field: field.clone(),
-                            normalizer: value.to_owned(),
-                        }
-                    })?)
-                }
-                None => None,
-            };
-
-            let index_prefixes = match field_definition.get("index_prefixes") {
-                Some(value) => Some(parse_index_prefixes(field, value)?),
-                None => None,
-            };
-
-            if index_prefixes.is_some() && field_type != FieldType::Text {
-                return Err(MappingError::IndexPrefixesNotSupported {
-                    field: field.clone(),
-                    field_type: field_type.as_str().to_owned(),
-                });
-            }
-
-            // `format` is only meaningful on `type: date`. Captured verbatim
-            // — MVP keyword-backs `YYYYMMDD` strings, so any shape rounds-trips
-            // without runtime validation. See gap-analysis A7.
-            let date_format = match field_definition.get("format") {
-                Some(value) => {
-                    let value = value
-                        .as_str()
-                        .ok_or_else(|| MappingError::DateFormatNotString {
-                            field: field.clone(),
-                        })?;
-                    if field_type != FieldType::Date {
-                        return Err(MappingError::DateFormatNotSupported {
-                            field: field.clone(),
-                            field_type: field_type.as_str().to_owned(),
-                        });
-                    }
-                    Some(value.to_owned())
-                }
-                None => None,
-            };
-
-            mapping.set_field_mapping(
-                field.to_owned(),
-                FieldMapping::with_norms(field_type, analyzer, norms)
-                    .with_normalizer(normalizer)
-                    .with_index_prefixes(index_prefixes)
-                    .with_date_format(date_format),
-            );
+            let parsed = parse_field_definition(field, field_definition, true)?;
+            mapping.set_field_mapping(field.to_owned(), parsed);
         }
 
         Ok(mapping)
@@ -726,6 +672,153 @@ impl IndexMapping {
     }
 }
 
+/// Parses a single field definition. Used both by the top-level
+/// `properties: { <name>: { … } }` loop and recursively by the
+/// `fields: { <sub_name>: { … } }` multi-field sub-block (A10 phase 2).
+///
+/// `allow_subfields` is `true` at the top level and `false` for entries
+/// nested under `fields:` — ES rejects multi-field nesting more than one
+/// level deep.
+fn parse_field_definition(
+    field: &str,
+    definition: &Value,
+    allow_subfields: bool,
+) -> Result<FieldMapping, MappingError> {
+    let object = definition
+        .as_object()
+        .ok_or_else(|| MappingError::FieldDefinitionNotObject {
+            field: field.to_owned(),
+        })?;
+
+    let field_type_name = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("text");
+    let field_type = FieldType::from_name(field_type_name).ok_or_else(|| {
+        MappingError::UnsupportedFieldType {
+            field: field.to_owned(),
+            field_type: field_type_name.to_owned(),
+        }
+    })?;
+
+    let analyzer = match object.get("analyzer") {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| MappingError::AnalyzerNotString {
+                    field: field.to_owned(),
+                })?;
+            Some(AnalyzerName::from_name(value).ok_or_else(|| {
+                MappingError::UnsupportedAnalyzer {
+                    field: field.to_owned(),
+                    analyzer: value.to_owned(),
+                }
+            })?)
+        }
+        None => None,
+    };
+
+    let norms = match object.get("norms") {
+        Some(value) => Some(
+            value
+                .as_bool()
+                .ok_or_else(|| MappingError::NormsNotBoolean {
+                    field: field.to_owned(),
+                })?,
+        ),
+        None => None,
+    };
+
+    if field_type != FieldType::Text && analyzer.is_some() {
+        return Err(MappingError::AnalyzerNotSupported {
+            field: field.to_owned(),
+            field_type: field_type.as_str().to_owned(),
+        });
+    }
+
+    let normalizer = match object.get("normalizer") {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| MappingError::NormalizerNotString {
+                    field: field.to_owned(),
+                })?;
+            Some(AnalyzerName::from_name(value).ok_or_else(|| {
+                MappingError::UnsupportedNormalizer {
+                    field: field.to_owned(),
+                    normalizer: value.to_owned(),
+                }
+            })?)
+        }
+        None => None,
+    };
+
+    let index_prefixes = match object.get("index_prefixes") {
+        Some(value) => Some(parse_index_prefixes(field, value)?),
+        None => None,
+    };
+
+    if index_prefixes.is_some() && field_type != FieldType::Text {
+        return Err(MappingError::IndexPrefixesNotSupported {
+            field: field.to_owned(),
+            field_type: field_type.as_str().to_owned(),
+        });
+    }
+
+    // `format` is only meaningful on `type: date`. Captured verbatim
+    // — MVP keyword-backs `YYYYMMDD` strings, so any shape rounds-trips
+    // without runtime validation. See gap-analysis A7.
+    let date_format = match object.get("format") {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| MappingError::DateFormatNotString {
+                    field: field.to_owned(),
+                })?;
+            if field_type != FieldType::Date {
+                return Err(MappingError::DateFormatNotSupported {
+                    field: field.to_owned(),
+                    field_type: field_type.as_str().to_owned(),
+                });
+            }
+            Some(value.to_owned())
+        }
+        None => None,
+    };
+
+    // A10 phase 2: parse `fields: { <sub_name>: { … } }`. ES forbids
+    // nesting `fields` more than one level deep — we mirror that.
+    let mut subfields: BTreeMap<String, FieldMapping> = BTreeMap::new();
+    if let Some(fields_value) = object.get("fields") {
+        if !allow_subfields {
+            return Err(MappingError::NestedSubfieldsNotSupported {
+                field: field.to_owned(),
+            });
+        }
+        let entries = fields_value
+            .as_object()
+            .ok_or_else(|| MappingError::SubfieldsNotObject {
+                field: field.to_owned(),
+            })?;
+        for (sub_name, sub_definition) in entries {
+            if sub_name.trim().is_empty() {
+                return Err(MappingError::EmptySubfieldName {
+                    field: field.to_owned(),
+                });
+            }
+            let qualified = format!("{field}.{sub_name}");
+            let parsed = parse_field_definition(&qualified, sub_definition, false)?;
+            subfields.insert(sub_name.clone(), parsed);
+        }
+    }
+
+    Ok(FieldMapping::with_norms(field_type, analyzer, norms)
+        .with_normalizer(normalizer)
+        .with_index_prefixes(index_prefixes)
+        .with_date_format(date_format)
+        .with_subfields(subfields))
+}
+
 fn parse_index_prefixes(field: &str, value: &Value) -> Result<FieldPrefixes, MappingError> {
     let object = value
         .as_object()
@@ -853,6 +946,12 @@ pub enum MappingError {
     },
     #[error("field `{field}` index_prefixes is only supported on text fields (got `{field_type}`)")]
     IndexPrefixesNotSupported { field: String, field_type: String },
+    #[error("field `{field}` fields must be an object")]
+    SubfieldsNotObject { field: String },
+    #[error("field `{field}` declares an empty sub-field name")]
+    EmptySubfieldName { field: String },
+    #[error("field `{field}` nests `fields` more than one level deep, which is not allowed")]
+    NestedSubfieldsNotSupported { field: String },
 }
 
 pub fn infer_field_type(value: &Value) -> FieldType {
@@ -1173,6 +1272,139 @@ mod tests {
         assert!(
             matches!(error, MappingError::DateFormatNotSupported { .. }),
             "unexpected error: {error:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // A10 phase 2: multi-field sub-fields (matchID intake §2.12)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn from_properties_value_parses_multi_field_subfields() {
+        // matchID maps NOM with a `fields.raw` keyword sub-field carrying
+        // `normalizer: norm` (intake §2.12). The parser must record the
+        // sub-field on the parent's `FieldMapping.fields` map.
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "analyzer": "norm",
+                "fields": {
+                    "raw": { "type": "keyword", "normalizer": "norm" }
+                }
+            }
+        });
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("multi-field mapping should parse");
+        let nom = mapping.field("NOM").expect("NOM field exists");
+        assert_eq!(nom.field_type, FieldType::Text);
+        assert_eq!(nom.analyzer, Some(AnalyzerName::Norm));
+        let raw = nom.fields.get("raw").expect("NOM.raw sub-field recorded");
+        assert_eq!(raw.field_type, FieldType::Keyword);
+        assert_eq!(raw.normalizer, Some(AnalyzerName::Norm));
+    }
+
+    #[test]
+    fn multi_field_subfields_round_trip_through_as_value() {
+        // `IndexMapping::as_value` powers `GET /:index/_mapping`; matchID
+        // replays its mapping from this response, so the `fields` block
+        // must round-trip verbatim.
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "analyzer": "norm",
+                "fields": {
+                    "raw": { "type": "keyword", "normalizer": "norm" }
+                }
+            }
+        });
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("multi-field mapping should parse");
+        let value = mapping.as_value();
+        let raw = value
+            .pointer("/properties/NOM/fields/raw")
+            .expect("NOM.raw rendered under fields.raw");
+        assert_eq!(raw["type"], Value::String("keyword".to_owned()));
+        assert_eq!(raw["normalizer"], Value::String("norm".to_owned()));
+    }
+
+    #[test]
+    fn resolve_field_walks_into_multi_field_subfields() {
+        // `IndexMapping::resolve_field("NOM.raw")` must return the
+        // sub-field mapping so the sort path can pick up its normalizer.
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "fields": {
+                    "raw": { "type": "keyword", "normalizer": "norm" }
+                }
+            }
+        });
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("multi-field mapping should parse");
+        let raw = mapping
+            .resolve_field("NOM.raw")
+            .expect("NOM.raw resolvable via dotted path");
+        assert_eq!(raw.field_type, FieldType::Keyword);
+        assert_eq!(
+            mapping.subfield_normalizer("NOM.raw"),
+            Some(AnalyzerName::Norm),
+        );
+        // Top-level paths are unaffected.
+        assert!(mapping.resolve_field("NOM").is_some());
+        assert!(mapping.resolve_field("UNKNOWN.sub").is_none());
+        assert!(mapping.subfield_normalizer("NOM").is_none());
+    }
+
+    #[test]
+    fn from_properties_value_rejects_nested_multi_field_subfields() {
+        // ES forbids nesting `fields` more than one level deep. We mirror
+        // that so misuse is caught at `PUT /:index`.
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "fields": {
+                    "raw": {
+                        "type": "keyword",
+                        "fields": {
+                            "inner": { "type": "keyword" }
+                        }
+                    }
+                }
+            }
+        });
+        let error = IndexMapping::from_properties_value(&properties)
+            .expect_err("nested fields must be rejected");
+        assert!(
+            matches!(
+                &error,
+                MappingError::NestedSubfieldsNotSupported { field } if field == "NOM.raw"
+            ),
+            "unexpected error: {error:?}",
+        );
+    }
+
+    #[test]
+    fn from_properties_value_rejects_unsupported_multi_field_subfield_type() {
+        // Sub-field validation must reuse the same type checks: an
+        // unknown `type` under `fields:` is rejected with the
+        // qualified field path.
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "fields": {
+                    "raw": { "type": "bogus" }
+                }
+            }
+        });
+        let error = IndexMapping::from_properties_value(&properties)
+            .expect_err("unsupported sub-field type must error");
+        assert!(
+            matches!(
+                &error,
+                MappingError::UnsupportedFieldType { field, field_type }
+                    if field == "NOM.raw" && field_type == "bogus"
+            ),
+            "unexpected error: {error:?}",
         );
     }
 }
