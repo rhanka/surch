@@ -1483,6 +1483,7 @@ name = "surch-codec"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "criterion",
  "thiserror 1.0.69",
 ]
 
