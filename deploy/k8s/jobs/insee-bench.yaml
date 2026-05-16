@@ -41,8 +41,6 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: surch
-      imagePullSecrets:
-        - name: ghcr-pull
       nodeSelector:
         pool: burst
       tolerations:

@@ -32,8 +32,6 @@ spec:
     spec:
       restartPolicy: OnFailure
       serviceAccountName: surch
-      imagePullSecrets:
-        - name: ghcr-pull
       # Schedule on the dedicated burst pool. The pool taint is applied
       # by `make pool-burst` in poc-k8s; tolerate it explicitly.
       nodeSelector:
