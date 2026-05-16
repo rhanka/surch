@@ -35,3 +35,11 @@ opensearch-oracle = { path = "../opensearch-oracle" }
 tower = { workspace = true, features = ["util"] }
 tar = { workspace = true }
 flate2 = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Criterion bench harness: measures the in-process scoring hot path
+# (no axum, no HTTP) so iterative search-side optimisations can be
+# compared with sub-millisecond resolution. See docs/ops/perf-bench.md.
+[[bench]]
+name = "search_hot_path"
+harness = false
