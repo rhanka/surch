@@ -3175,6 +3175,9 @@ async fn search_router_a12_rejects_unsupported_agg_type_with_phase2_hint() {
         .expect("router should respond");
     assert!(create_index.status().is_success());
 
+    // `composite` is still pending under A12 phase 2 (after_key
+    // round-trip). `date_histogram` and `cardinality` graduated under
+    // A12.2 / A12.3 — see the dedicated tests below.
     let response = router
         .oneshot(
             Request::builder()
@@ -3182,7 +3185,7 @@ async fn search_router_a12_rejects_unsupported_agg_type_with_phase2_hint() {
                 .uri("/products/_search")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"query":{"match_all":{}},"aggs":{"by_month":{"date_histogram":{"field":"DATE","calendar_interval":"month"}}}}"#,
+                    r#"{"query":{"match_all":{}},"aggs":{"by_pair":{"composite":{"sources":[{"k":{"terms":{"field":"NOM.raw"}}}]}}}}"#,
                 ))
                 .expect("request should build"),
         )
@@ -3193,7 +3196,7 @@ async fn search_router_a12_rejects_unsupported_agg_type_with_phase2_hint() {
     let body = response_json(response).await;
     assert_eq!(body["error"]["type"], "parsing_exception");
     let reason = body["error"]["reason"].as_str().unwrap();
-    assert!(reason.contains("date_histogram"));
+    assert!(reason.contains("composite"));
     assert!(reason.contains("A12 phase 2"));
 }
 
@@ -3215,6 +3218,155 @@ async fn search_router_a12_accepts_aggregations_long_form_alias() {
         .as_array()
         .expect("buckets array");
     assert_eq!(buckets.len(), 2);
+}
+
+// --- A12.2: `date_histogram` aggregation ---
+//
+// matchID's analytics tab emits `date_histogram` against the
+// `YYYYMMDD` keyword-stored birth/death dates. Each test below pins
+// one calendar_interval against a small in-memory corpus and asserts
+// that bucket keys are emitted ascending with the expected
+// truncation. `key_as_string` is verified to round-trip when `format`
+// is provided.
+
+#[tokio::test]
+async fn search_router_a12_2_date_histogram_month_buckets_documents() {
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"DATE_NAISSANCE":"19620115"}"#).await;
+    index_product(&router, "doc-2", r#"{"DATE_NAISSANCE":"19620128"}"#).await;
+    index_product(&router, "doc-3", r#"{"DATE_NAISSANCE":"19620201"}"#).await;
+    index_product(&router, "doc-4", r#"{"DATE_NAISSANCE":"19620215"}"#).await;
+    index_product(&router, "doc-5", r#"{"DATE_NAISSANCE":"19620228"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_month":{"date_histogram":{"field":"DATE_NAISSANCE","calendar_interval":"month","format":"yyyyMMdd"}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_month"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 2, "two distinct months");
+    // Ascending key order, parity with ES.
+    assert_eq!(buckets[0]["key"], "19620101");
+    assert_eq!(buckets[0]["key_as_string"], "19620101");
+    assert_eq!(buckets[0]["doc_count"], 2);
+    assert_eq!(buckets[1]["key"], "19620201");
+    assert_eq!(buckets[1]["key_as_string"], "19620201");
+    assert_eq!(buckets[1]["doc_count"], 3);
+}
+
+#[tokio::test]
+async fn search_router_a12_2_date_histogram_day_emits_one_bucket_per_day() {
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"DATE_NAISSANCE":"19620115"}"#).await;
+    index_product(&router, "doc-2", r#"{"DATE_NAISSANCE":"19620115"}"#).await;
+    index_product(&router, "doc-3", r#"{"DATE_NAISSANCE":"19620116"}"#).await;
+    index_product(&router, "doc-4", r#"{"DATE_NAISSANCE":"19620117"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_day":{"date_histogram":{"field":"DATE_NAISSANCE","calendar_interval":"day"}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_day"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 3);
+    assert_eq!(buckets[0]["key"], "19620115");
+    assert_eq!(buckets[0]["doc_count"], 2);
+    // No `format` declared → no `key_as_string` field in the bucket.
+    assert!(buckets[0].get("key_as_string").is_none());
+    assert_eq!(buckets[1]["key"], "19620116");
+    assert_eq!(buckets[1]["doc_count"], 1);
+    assert_eq!(buckets[2]["key"], "19620117");
+    assert_eq!(buckets[2]["doc_count"], 1);
+}
+
+#[tokio::test]
+async fn search_router_a12_2_date_histogram_year_groups_across_months() {
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"DATE_NAISSANCE":"19620115"}"#).await;
+    index_product(&router, "doc-2", r#"{"DATE_NAISSANCE":"19620715"}"#).await;
+    index_product(&router, "doc-3", r#"{"DATE_NAISSANCE":"19631115"}"#).await;
+    index_product(&router, "doc-4", r#"{"DATE_NAISSANCE":"19640301"}"#).await;
+    index_product(&router, "doc-5", r#"{"DATE_NAISSANCE":"19640401"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_year":{"date_histogram":{"field":"DATE_NAISSANCE","calendar_interval":"year"}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_year"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 3);
+    assert_eq!(buckets[0]["key"], "19620101");
+    assert_eq!(buckets[0]["doc_count"], 2);
+    assert_eq!(buckets[1]["key"], "19630101");
+    assert_eq!(buckets[1]["doc_count"], 1);
+    assert_eq!(buckets[2]["key"], "19640101");
+    assert_eq!(buckets[2]["doc_count"], 2);
+}
+
+// --- A12.3: `cardinality` aggregation ---
+//
+// matchID's analytics tab emits a `cardinality` companion agg next
+// to each `terms` agg to surface the total distinct count. MVP:
+// exact count, no HyperLogLog estimation.
+
+#[tokio::test]
+async fn search_router_a12_3_cardinality_counts_distinct_values() {
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-3", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "doc-4", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "doc-5", r#"{"NOM":"BERNARD"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"lastName_count":{"cardinality":{"field":"NOM"}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["aggregations"]["lastName_count"]["value"], 3);
+}
+
+#[tokio::test]
+async fn search_router_a12_3_cardinality_zero_for_missing_field() {
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"DUPONT"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"absent":{"cardinality":{"field":"ABSENT_FIELD"}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["aggregations"]["absent"]["value"], 0);
+}
+
+#[tokio::test]
+async fn search_router_a12_3_cardinality_subfield_aliases_to_parent() {
+    // `NOM.raw` should resolve through `lookup_sort_value` to the
+    // parent `NOM` value (same alias as A10 sort + A12.1 terms).
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-3", r#"{"NOM":"DUPONT"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"lastName_count":{"cardinality":{"field":"NOM.raw"}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["aggregations"]["lastName_count"]["value"], 2);
 }
 
 
