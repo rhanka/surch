@@ -205,6 +205,27 @@ impl DocumentIndex {
         self.field_stats.get(field)
     }
 
+    /// Returns the in-memory `field -> FieldLengthStats` map. Used by the
+    /// memory accounting helper (`crate::memory`) to size the BM25 norms
+    /// payload without exposing the underlying `BTreeMap` everywhere.
+    pub fn field_stats_map(&self) -> &BTreeMap<String, FieldLengthStats> {
+        &self.field_stats
+    }
+
+    /// Returns the names of every field that currently has indexed
+    /// postings, in lexicographic order. Used by the memory accounting
+    /// helper to enumerate every `(field, term)` pair.
+    pub fn field_names(&self) -> Vec<String> {
+        self.terms.field_names()
+    }
+
+    /// Returns the in-memory prefix-postings side table. Empty for fields
+    /// that did not declare `index_prefixes`. Used by the memory
+    /// accounting helper.
+    pub fn prefix_postings_map(&self) -> &BTreeMap<String, BTreeMap<String, BTreeSet<u32>>> {
+        &self.prefix_postings
+    }
+
     /// A6 phase 2: lookup the write-time prefix postings for `(field, prefix)`.
     ///
     /// Returns `Some(&BTreeSet<u32>)` iff `field` was indexed with
