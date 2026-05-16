@@ -1,0 +1,5 @@
+## scifact-ndcg label=scifact-os  2026-05-16T09:20:55-04:00
+url=http://127.0.0.1:9200 bulk_ms=17612.3
+queries_processed=300 (out of 300 unique test qids)
+NDCG@10 = 0.6537 (Lucene/Anserini baseline: 0.688)
+Recall@10 = 0.8033

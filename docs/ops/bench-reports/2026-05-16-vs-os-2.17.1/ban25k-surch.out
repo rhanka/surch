@@ -1,0 +1,15 @@
+## bench label=ban25k-surch  2026-05-16T09:21:30-04:00
+binary_sha256=20106412592ad5f810418436dc0b05834e8a31ffb1416bc71d3fbd48831a50a4
+bulk	-	client_ms=17882.2	took=15530	errors=false
+refresh	-	client_ms=563.9
+count	-	count=25000
+search	Rue Payenne	client_ms=216.7	took=20	hits=18194	top=75103_7205_00001
+search	Rue Payenne	client_ms=58.2	took=0	hits=18194	top=75103_7205_00001
+search	Rue Payenne	client_ms=56.2	took=0	hits=18194	top=75103_7205_00001
+search	Rue Payenne	client_ms=50.4	took=0	hits=18194	top=75103_7205_00001
+search	Rue Payenne	client_ms=165.1	took=0	hits=18194	top=75103_7205_00001
+search	Place Patrice Chereau	client_ms=210.2	took=2	hits=559	top=75103_vaip3v_00001
+search	Place Patrice Chereau	client_ms=161.3	took=0	hits=559	top=75103_vaip3v_00001
+search	Place Patrice Chereau	client_ms=138.3	took=0	hits=559	top=75103_vaip3v_00001
+search	Place Patrice Chereau	client_ms=72.1	took=0	hits=559	top=75103_vaip3v_00001
+search	Place Patrice Chereau	client_ms=86.4	took=0	hits=559	top=75103_vaip3v_00001
