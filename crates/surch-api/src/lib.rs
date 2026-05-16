@@ -6,6 +6,8 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 pub mod aliases;
 pub mod analyze;
@@ -183,6 +185,16 @@ pub fn app_router() -> Router {
                 .delete(aliases::delete_index_alias_handler),
         )
         .with_state(state::AppState::default())
+        // HTTP middleware: one span per request with method/route/status
+        // attributes. Sits at the bottom of the router so every route
+        // inherits it. When the OTLP exporter is wired (see
+        // `telemetry::init_telemetry`), these spans are forwarded to
+        // the collector; otherwise they only land in the `fmt` log.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
 }
 
 /// Short crate purpose used by workspace smoke tests.
