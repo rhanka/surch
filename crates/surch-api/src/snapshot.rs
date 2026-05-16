@@ -1,5 +1,13 @@
 //! Raw-index snapshot export / import.
 //!
+//! **Deprecated since 0.2.0** — these `/_surch/snapshot/{export,import}`
+//! routes remain available for the matchID `deces-backend` boot path
+//! that already targets them, but the canonical ES-parity surface
+//! lives under `/_snapshot/{repository}/{snapshot}` (see
+//! `crate::snapshot_es` and `docs/ops/snapshot-es-api.md`). The
+//! `_surch/*` shape will be removed in `0.4.0` after one matchID
+//! release cycle.
+//!
 //! Surch is single-node and in-memory today, so the "raw index" is not
 //! a directory of FST + postings files but the logical content that
 //! lets a fresh node reproduce the same searches bit-for-bit: the
@@ -93,7 +101,67 @@ struct Manifest {
     doc_count: u64,
 }
 
+/// Build a single-index tarball for the ES-parity snapshot path.
+///
+/// Surch is in-memory: the on-repository "shard payload" promised by
+/// the Elasticsearch `BlobStoreRepository` layout is a logical
+/// equivalent — the same `build_tarball` output the legacy
+/// `_surch/snapshot/export` route returns, packaged inside the
+/// ES-style `__snap-{uuid}.dat` blob. This wrapper keeps the byte
+/// shape identical so an operator can `scp` a single payload out of
+/// the repository and feed it to the legacy `_surch/snapshot/import`
+/// route without translation.
+pub fn build_index_tarball_for_es_snapshot(
+    index: &str,
+    metadata: &crate::state::IndexMetadata,
+    documents: &[StoredDocument],
+) -> Result<Vec<u8>, String> {
+    build_tarball(
+        index,
+        &metadata.mapping,
+        &metadata.settings,
+        &metadata.aliases,
+        documents,
+    )
+}
+
+/// Restore a single index from the tarball produced by
+/// [`build_index_tarball_for_es_snapshot`].
+///
+/// Refuses to overwrite an existing index (same contract as the
+/// legacy `_surch/snapshot/import` route — the caller deletes first
+/// if they want to overwrite, matching ES `restore` defaults).
+pub fn restore_index_tarball_for_es_snapshot(
+    state: &AppState,
+    index: &str,
+    body: &[u8],
+) -> Result<u64, String> {
+    if state.index_exists(index) {
+        return Err(format!("index [{index}] already exists"));
+    }
+    let parsed = parse_tarball(body)?;
+    if parsed.manifest.format_version != SNAPSHOT_FORMAT_VERSION {
+        return Err(format!(
+            "unsupported snapshot format_version {} (expected {})",
+            parsed.manifest.format_version, SNAPSHOT_FORMAT_VERSION
+        ));
+    }
+    state.create_index(
+        index,
+        Some(parsed.mapping),
+        parsed.settings,
+        parsed.aliases,
+    );
+    for (id, source) in parsed.documents {
+        state.index_document(index, &id, source);
+    }
+    Ok(parsed.manifest.doc_count)
+}
+
 /// `POST /_surch/snapshot/export?index=<name>` → tar.gz body.
+///
+/// Deprecated: use `PUT /_snapshot/<repo>/<snap>` instead. Will be
+/// removed in 0.4.0.
 ///
 /// Returns 404 when the index is unknown, 400 when the name is
 /// invalid, 200 + `application/gzip` otherwise.
@@ -159,6 +227,9 @@ pub async fn export_handler(
 }
 
 /// `POST /_surch/snapshot/import?index=<name>` ← tar.gz body.
+///
+/// Deprecated: use `POST /_snapshot/<repo>/<snap>/_restore` instead.
+/// Will be removed in 0.4.0.
 ///
 /// `index` becomes the new physical index name (free choice, lets the
 /// caller restore the same snapshot under a different alias without
