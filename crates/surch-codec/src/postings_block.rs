@@ -146,6 +146,144 @@ fn read_varint_u32(input: &[u8], position: &mut usize) -> Result<u32, PostingsBl
     }
 }
 
+/// Encode a parallel pair of slices `(doc_ids, freqs)` as a compact
+/// `Vec<u8>` payload suitable for cold-tier posting list storage.
+///
+/// The layout is intentionally simple — it is the building block of
+/// the future block-128 FoR codec described in
+/// `docs/poc/for-integration-plan.md` (Phase 1):
+///
+/// 1. The number of postings `n` is written as a varint.
+/// 2. `n` delta-varint doc ids follow (same scheme as
+///    [`encode_doc_ids_delta_varint`]).
+/// 3. `n` raw varint frequencies follow (no delta — frequencies are
+///    not monotonic; varint already compresses the typical 1..16 range
+///    to a single byte).
+///
+/// `doc_ids` and `freqs` must have the same length, otherwise
+/// [`PostingsBlockError::NotMonotonic`] is returned (the variant name
+/// is reused to avoid a breaking enum change — see the integration
+/// plan for the dedicated `LengthMismatch` variant scheduled in Phase
+/// 2).
+pub fn encode_postings_doc_id_freq(
+    doc_ids: &[u32],
+    freqs: &[u32],
+) -> Result<Vec<u8>, PostingsBlockError> {
+    if doc_ids.len() != freqs.len() {
+        return Err(PostingsBlockError::NotMonotonic);
+    }
+    validate_strictly_increasing(doc_ids)?;
+
+    // Rough capacity heuristic: 1 byte length header + ~1.5 bytes per
+    // delta + ~1 byte per freq. Avoids the first 1–2 grow cycles of
+    // `Vec::push` on the BAN 25 k corpus (mean term length ≈ 8 postings).
+    let mut out = Vec::with_capacity(1 + doc_ids.len() * 3);
+    write_varint_u32(&mut out, doc_ids.len() as u32);
+
+    let mut previous: u32 = 0;
+    for &value in doc_ids {
+        let delta = value - previous;
+        write_varint_u32(&mut out, delta);
+        previous = value;
+    }
+    for &freq in freqs {
+        write_varint_u32(&mut out, freq);
+    }
+    Ok(out)
+}
+
+/// Decode the output of [`encode_postings_doc_id_freq`] back into the
+/// two parallel `Vec<u32>` slices.
+pub fn decode_postings_doc_id_freq(
+    bytes: &[u8],
+) -> Result<(Vec<u32>, Vec<u32>), PostingsBlockError> {
+    let mut position = 0;
+    let length = read_varint_u32(bytes, &mut position)? as usize;
+
+    let mut doc_ids = Vec::with_capacity(length);
+    let mut previous: u32 = 0;
+    for i in 0..length {
+        let delta = read_varint_u32(bytes, &mut position)?;
+        if i > 0 && delta == 0 {
+            return Err(PostingsBlockError::NotMonotonic);
+        }
+        let value = previous
+            .checked_add(delta)
+            .ok_or(PostingsBlockError::NotMonotonic)?;
+        doc_ids.push(value);
+        previous = value;
+    }
+
+    let mut freqs = Vec::with_capacity(length);
+    for _ in 0..length {
+        freqs.push(read_varint_u32(bytes, &mut position)?);
+    }
+
+    Ok((doc_ids, freqs))
+}
+
+/// Streaming decoder for the doc-id channel of a payload produced by
+/// [`encode_postings_doc_id_freq`]. Yields `(doc_id, position_in_bytes)`
+/// pairs, **without allocating** a `Vec<u32>`. Used by the future
+/// "decode-on-demand" wire-up where the scoring loop walks doc ids one
+/// by one and only materialises the matching slice into RAM.
+///
+/// Phase 1 wire-up plan: callers use `DocIdDeltaCursor::new(encoded)`,
+/// then `cursor.next()` returns `Ok(Some(doc_id))` until exhaustion;
+/// `Ok(None)` on the natural end, `Err(_)` on a malformed payload.
+#[derive(Debug)]
+pub struct DocIdDeltaCursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    remaining: u32,
+    previous: u32,
+    /// First delta seen? `0` is only legal for `index == 0`.
+    started: bool,
+}
+
+impl<'a> DocIdDeltaCursor<'a> {
+    /// Build a cursor over `encoded`, reading the length header
+    /// eagerly so the caller learns about a truncated payload before
+    /// the first `next()` call.
+    pub fn new(encoded: &'a [u8]) -> Result<Self, PostingsBlockError> {
+        let mut position = 0;
+        let remaining = read_varint_u32(encoded, &mut position)?;
+        Ok(Self {
+            bytes: encoded,
+            position,
+            remaining,
+            previous: 0,
+            started: false,
+        })
+    }
+
+    /// Number of doc ids that have not been yielded yet.
+    pub fn remaining(&self) -> u32 {
+        self.remaining
+    }
+
+    /// Advance one step. Returns `Ok(None)` once the payload is
+    /// exhausted, `Err(_)` if the next varint is malformed.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<u32>, PostingsBlockError> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let delta = read_varint_u32(self.bytes, &mut self.position)?;
+        if self.started && delta == 0 {
+            return Err(PostingsBlockError::NotMonotonic);
+        }
+        let value = self
+            .previous
+            .checked_add(delta)
+            .ok_or(PostingsBlockError::NotMonotonic)?;
+        self.previous = value;
+        self.started = true;
+        self.remaining -= 1;
+        Ok(Some(value))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +389,103 @@ mod tests {
         let bytes = [0x02_u8, 0x01, 0x00];
         let err = decode_doc_ids_delta_varint(&bytes).unwrap_err();
         assert_eq!(err, PostingsBlockError::NotMonotonic);
+    }
+
+    #[test]
+    fn postings_round_trip_empty() {
+        let doc_ids: [u32; 0] = [];
+        let freqs: [u32; 0] = [];
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+        let (out_ids, out_freqs) = decode_postings_doc_id_freq(&encoded).unwrap();
+        assert!(out_ids.is_empty() && out_freqs.is_empty());
+    }
+
+    #[test]
+    fn postings_round_trip_small() {
+        let doc_ids = [1_u32, 3, 7, 9, 42];
+        let freqs = [1_u32, 5, 2, 1, 17];
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+        let (out_ids, out_freqs) = decode_postings_doc_id_freq(&encoded).unwrap();
+        assert_eq!(out_ids, doc_ids);
+        assert_eq!(out_freqs, freqs);
+    }
+
+    #[test]
+    fn postings_round_trip_2k_seeded_matches_ground_truth() {
+        // Same xorshift32 seed as `round_trip_random_2k_seeded` so we
+        // share the doc-id corpus with the doc-id-only path.
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+
+        let mut doc_ids: Vec<u32> = (0..2000).map(|_| next() % 10_000_000).collect();
+        doc_ids.sort_unstable();
+        doc_ids.dedup();
+        // Synthetic freqs in [1..=16] — covers the BAN/INSEE token range.
+        let freqs: Vec<u32> = doc_ids.iter().map(|d| (d % 16) + 1).collect();
+
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+        let (out_ids, out_freqs) = decode_postings_doc_id_freq(&encoded).unwrap();
+        assert_eq!(out_ids, doc_ids, "decoded doc_ids must equal ground truth");
+        assert_eq!(out_freqs, freqs, "decoded freqs must equal ground truth");
+    }
+
+    #[test]
+    fn postings_rejects_length_mismatch() {
+        let err = encode_postings_doc_id_freq(&[1, 2], &[1]).unwrap_err();
+        // Reused variant — see doc comment on `encode_postings_doc_id_freq`.
+        assert_eq!(err, PostingsBlockError::NotMonotonic);
+    }
+
+    #[test]
+    fn cursor_yields_same_sequence_as_decode() {
+        let doc_ids = [1_u32, 3, 7, 9, 42, 100, 128, 5000];
+        let freqs = [1_u32; 8];
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+
+        let mut cursor = DocIdDeltaCursor::new(&encoded).unwrap();
+        assert_eq!(cursor.remaining(), doc_ids.len() as u32);
+        let mut collected = Vec::with_capacity(doc_ids.len());
+        while let Some(v) = cursor.next().unwrap() {
+            collected.push(v);
+        }
+        assert_eq!(collected, doc_ids);
+        // Subsequent calls keep returning None without erroring.
+        assert!(cursor.next().unwrap().is_none());
+        assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn cursor_rejects_truncated_payload() {
+        // Announce 3 deltas but only deliver 1.
+        let bytes = [0x03_u8, 0x01];
+        let mut cursor = DocIdDeltaCursor::new(&bytes).unwrap();
+        let _first = cursor.next().unwrap();
+        // Second delta read should fail — EOF before continuation.
+        let err = cursor.next().unwrap_err();
+        assert_eq!(err, PostingsBlockError::UnexpectedEof);
+    }
+
+    /// Sanity: the codec payload is meaningfully smaller than the
+    /// naive `Vec<u32>` layout for a realistic dense posting list.
+    /// This isn't a perf bench (see `benches/for_decode.rs`) — just a
+    /// guardrail so regressions in `encode_postings_doc_id_freq` fail
+    /// loudly.
+    #[test]
+    fn postings_compression_ratio_better_than_naive() {
+        let doc_ids: Vec<u32> = (0..1024).map(|i| i * 3 + 7).collect();
+        let freqs: Vec<u32> = vec![1; 1024];
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+        let naive_bytes = doc_ids.len() * 4 + freqs.len() * 4; // raw u32 + u32
+        assert!(
+            encoded.len() < naive_bytes / 2,
+            "codec={} naive={} — expected at least 2× compression",
+            encoded.len(),
+            naive_bytes
+        );
     }
 }

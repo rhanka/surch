@@ -1451,6 +1451,8 @@ name = "surch-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
+ "chrono",
  "criterion",
  "flate2",
  "metrics",
@@ -1481,6 +1483,7 @@ name = "surch-codec"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "criterion",
  "thiserror 1.0.69",
 ]
 

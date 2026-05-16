@@ -10,3 +10,15 @@ repository.workspace = true
 [dependencies]
 bytes = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Standalone bench for the FoR / delta-varint codec. Measures encode,
+# decode, and decode-on-demand cursor speed plus the compression ratio
+# against the naive `Vec<u32>` layout. Intentionally NOT wired into the
+# postings hot path — see `docs/poc/for-integration-plan.md` for the
+# 3-phase roadmap.
+[[bench]]
+name = "for_decode"
+harness = false
