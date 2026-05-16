@@ -70,12 +70,20 @@ impl FuzzyQueryConfig {
 }
 
 /// Parses the P0 fuzzy forms used by OpenSearch/Lucene.
+///
+/// `AUTO` and `AUTO:<low>,<high>` are case-insensitive — ES 7.x accepts
+/// both `"AUTO"` and `"auto"`; matchID's deces-backend uses lowercase
+/// in production. Numeric edits (`"0"`, `"1"`, `"2"`) are parsed as-is.
 pub fn parse_fuzziness(value: &str) -> Result<Fuzziness, FuzzyError> {
-    if value == "AUTO" {
+    if value.eq_ignore_ascii_case("AUTO") {
         return Ok(Fuzziness::Auto { low: 3, high: 6 });
     }
 
-    if let Some(bounds) = value.strip_prefix("AUTO:") {
+    let auto_prefixed = value
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AUTO:"));
+    if auto_prefixed {
+        let bounds = &value[5..];
         let (low, high) = bounds.split_once(',').ok_or(FuzzyError::InvalidFuzziness)?;
         let low = low
             .parse::<usize>()

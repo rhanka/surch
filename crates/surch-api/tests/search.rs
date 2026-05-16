@@ -2394,6 +2394,23 @@ async fn match_query_rejects_unknown_operator_with_opensearch_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn match_object_form_with_fuzziness_lowercase_auto_is_accepted() {
+    // matchID's deces-backend emits `"fuzziness": "auto"` (lowercase).
+    // ES 7.x accepts both casings; Surch must too.
+    let router = app_router();
+    index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
+    index_product(&router, "sku-other", r#"{"name":"PAUL"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":{"query":"JEAS","fuzziness":"auto"}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 1);
+}
+
+#[tokio::test]
 async fn match_object_form_with_fuzziness_auto_matches_one_edit_term() {
     let router = app_router();
     // "JEAN" indexed → "JEAS" (single substitution) should still match
