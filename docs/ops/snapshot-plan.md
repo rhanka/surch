@@ -320,34 +320,42 @@ lifting is the retention math + the bounded execution log.
 
 ---
 
-## 4. Decisions to validate
+## 4. Decisions — validated 2026-05-16
 
-Five open points the implementer needs answered before R16
-starts:
+User decision: **Surch ships the same snapshot API surface as
+Elasticsearch / OpenSearch — same routes, same wire shapes, same
+repository layout — because Surch will be offered as a PaaS where
+existing ES tooling (Curator, the `_snapshot` UI in Kibana, the
+client SDKs) must keep working without code changes**. Surch does
+not invent a "simpler native flavour" alongside the ES one.
 
-1. **S3 SDK choice.** `aws-sdk-s3` 1.x (official, supported by
-   Amazon, ~80 transitive deps but covers IAM / IMDS / SigV4 /
-   STS) versus a thin in-house `reqwest + aws-sigv4 + aws-config`
-   wrapper (~10 deps, no STS, hand-rolled retry). Recommendation:
-   `aws-sdk-s3`. The dep weight is paid once and we get
-   pre-signed URLs + S3-compatible providers (MinIO, R2, GCS
-   interop) for free.
-2. **`C-SNAPSHOT-RAW` lifecycle.** Keep it as `/_surch/snapshot/*`
-   (matchID-specific, no repository) once Phase S1 ships? Or
-   deprecate and redirect to `PUT /_snapshot/local/{snap}`?
-   Recommendation: **keep** for two minor versions, mark
-   deprecated in `docs/ops/snapshot-raw.md`, drop in 0.4.0. The
-   matchID `deces-backend` integration relies on the body-stream
-   shape, not on repository semantics.
-3. **Repository format flavour.** Bit-for-bit ES `BlobStoreRepository`
-   layout (chunked segment files, generation `index-N`) or a
-   Surch-native simplified layout (one JSON manifest, one tarball
-   per snap, no chunking)? Recommendation: **Surch-native** in
-   S1 and S2 (single-node single-tarball is the use case) with a
-   `surch_snapshot_format_version` field that leaves room for an
-   ES-bit-compatible v3 if a customer needs Curator
-   compatibility. Document the divergence explicitly in
-   `manifest.json`.
+The plan below replaces the earlier "Surch-native" wording.
+Recommendations are now binding decisions:
+
+1. **S3 SDK.** `aws-sdk-s3` 1.x — official, covers SigV4 / STS /
+   IMDS, gets MinIO / R2 / GCS interop for free.
+2. **`C-SNAPSHOT-RAW` lifecycle.** Keep `/_surch/snapshot/*` for
+   the two minor versions currently shipped because matchID's
+   `deces-backend` boot path already relies on the body-stream
+   shape (intake §2.12). Mark deprecated in
+   `docs/ops/snapshot-raw.md` as soon as the ES-compatible
+   `_snapshot` routes land, drop the `_surch/*` route in `0.4.0`
+   after one matchID release cycle. **The ES-compatible API is
+   the only long-term shape.**
+3. **Repository format = ES `BlobStoreRepository`, bit-compatible.**
+   Same `index-N` generation file, same `meta-{uuid}.dat` per
+   snapshot, same `snap-{uuid}.dat` per snapshot, same
+   `indices/{uuid}/meta-…` per snapshotted index, same chunked
+   segment-blob layout. The reason is non-negotiable: PaaS
+   customers must be able to point their existing ES Curator /
+   Kibana / `elasticsearch-py` `client.snapshot` calls at Surch
+   and have them work. Diverging from the on-disk format would
+   force every downstream tool to recompile. The Lucene-segment
+   abstraction is faked at the blob layer: Surch's in-memory
+   `DocumentIndex` is serialised into a tar-of-blobs that
+   matches what a Lucene shard would have produced, with a
+   single synthetic `_n.cfs` carrying the postings + doc store +
+   mapping. Restore reverses the same packing.
 4. **Test strategy.** Three layers:
    - unit tests with a `MockRepository` (in-memory `BTreeMap`)
      covering happy path + CAS conflicts + missing key + listing
