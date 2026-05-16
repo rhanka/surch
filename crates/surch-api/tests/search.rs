@@ -3134,7 +3134,12 @@ async fn search_router_a5_function_score_accepts_empty_functions_array() {
 }
 
 #[tokio::test]
-async fn search_router_a5_function_score_rejects_non_empty_functions() {
+async fn search_router_a5_function_score_rejects_phase3_functions() {
+    // A5 phase 2 ships `weight`, `field_value_factor` and `gauss`
+    // (intake §2.2 wire shape). `linear` / `exp` decay and
+    // `script_score` are explicitly deferred to phase 3 — assert the
+    // parser surfaces a diagnosable HTTP 400 instead of silently
+    // ignoring them.
     let router = app_router();
     let create_index = router
         .clone()
@@ -3156,7 +3161,7 @@ async fn search_router_a5_function_score_rejects_non_empty_functions() {
                 .uri("/products/_search")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"query":{"function_score":{"query":{"match_all":{}},"functions":[{"weight":2}]}}}"#,
+                    r#"{"query":{"function_score":{"query":{"match_all":{}},"functions":[{"script_score":{"script":"_score"}}]}}}"#,
                 ))
                 .expect("request should build"),
         )
@@ -3169,7 +3174,178 @@ async fn search_router_a5_function_score_rejects_non_empty_functions() {
     assert!(body["error"]["reason"]
         .as_str()
         .unwrap()
-        .contains("not implemented yet"));
+        .contains("phase 3"));
+}
+
+// --- A5 phase 2: declarative scoring functions
+// (`weight` + `field_value_factor` + `gauss`) ---
+//
+// matchID intake §2.2 flags these three as the next function_score
+// functions to wire (sample with `field_value_factor` on AGE_DECES,
+// `gauss` on a date field, and a filtered bare `weight`). Each test
+// asserts that the function output behaves like ES 7.x against a
+// deterministic fixture.
+
+#[tokio::test]
+async fn search_router_a5_phase2_function_score_weight_scales_inner_score() {
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+    index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
+
+    // weight=2 with default boost_mode=multiply -> inner _score * 2.
+    let baseline = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"name":"desk"}}}}}"#,
+    )
+    .await;
+    let baseline_score = baseline["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("baseline score must be numeric");
+
+    let weighted = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"name":"desk"}},"functions":[{"weight":2}]}}}"#,
+    )
+    .await;
+    let weighted_score = weighted["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("weighted score must be numeric");
+
+    assert!(
+        (weighted_score - baseline_score * 2.0).abs() < 1e-6,
+        "weight=2 must double the inner score (baseline={baseline_score}, weighted={weighted_score})"
+    );
+}
+
+#[tokio::test]
+async fn search_router_a5_phase2_field_value_factor_log1p_modifies_score() {
+    let router = app_router();
+    // Two docs match the same query but carry different AGE_DECES
+    // values; the field_value_factor reranks them by log1p(age * 0.1).
+    index_product(
+        &router,
+        "deces-1",
+        r#"{"NOM":"MARTIN","AGE_DECES":90}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "deces-2",
+        r#"{"NOM":"MARTIN","AGE_DECES":10}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"NOM":"MARTIN"}},"functions":[{"field_value_factor":{"field":"AGE_DECES","factor":0.1,"modifier":"log1p","missing":0}}],"boost_mode":"multiply"}}}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 2);
+    // log1p(90 * 0.1) = log(10) >> log1p(10 * 0.1) = log(2) so the
+    // older record must outrank the younger one regardless of any tie
+    // in the inner BM25 score.
+    assert_eq!(hits[0]["_id"], "deces-1");
+    assert_eq!(hits[1]["_id"], "deces-2");
+    let high = hits[0]["_score"].as_f64().expect("score");
+    let low = hits[1]["_score"].as_f64().expect("score");
+    assert!(high > low, "high-AGE_DECES score must beat low-AGE_DECES");
+}
+
+#[tokio::test]
+async fn search_router_a5_phase2_gauss_decay_ranks_closer_dates_higher() {
+    let router = app_router();
+    // Two docs with the same BM25 contribution but different
+    // DATE_NAISSANCE keyword fields. `gauss` decay over origin
+    // 20000101 with scale=365d must rank the closer date first.
+    index_product(
+        &router,
+        "doc-near",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"20000115"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-far",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19500101"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"NOM":"MARTIN"}},"functions":[{"gauss":{"DATE_NAISSANCE":{"origin":"20000101","scale":"365d","decay":0.5}}}],"boost_mode":"multiply"}}}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["_id"], "doc-near");
+    assert_eq!(hits[1]["_id"], "doc-far");
+    let near = hits[0]["_score"].as_f64().expect("score");
+    let far = hits[1]["_score"].as_f64().expect("score");
+    assert!(near > far);
+    // Decay must shrink the far doc heavily — distance >> scale.
+    assert!(far < near * 0.5);
+}
+
+#[tokio::test]
+async fn search_router_a5_phase2_score_mode_sum_then_boost_mode_multiply() {
+    // Combine two functions with score_mode=sum and verify the inner
+    // BM25 score gets multiplied by (f1 + f2): weight=3 + weight=4
+    // -> inner * 7.
+    let router = app_router();
+    index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
+
+    let baseline = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"name":"desk"}}}}}"#,
+    )
+    .await;
+    let baseline_score = baseline["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("baseline score must be numeric");
+
+    let combined = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"name":"desk"}},"functions":[{"weight":3},{"weight":4}],"score_mode":"sum","boost_mode":"multiply"}}}"#,
+    )
+    .await;
+    let combined_score = combined["hits"]["hits"][0]["_score"]
+        .as_f64()
+        .expect("combined score must be numeric");
+
+    assert!(
+        (combined_score - baseline_score * 7.0).abs() < 1e-6,
+        "score_mode=sum + boost_mode=multiply must yield inner * (3+4) (baseline={baseline_score}, combined={combined_score})"
+    );
+}
+
+#[tokio::test]
+async fn search_router_a5_phase2_filter_gates_per_function_contribution() {
+    // Two docs: only one matches the filter inside the function.
+    // weight=10, score_mode=multiply (default), boost_mode=multiply
+    // (default) -> matching doc gets inner * 10, the other gets
+    // inner * 1.0 (Multiply identity for filtered-out functions).
+    let router = app_router();
+    index_product(&router, "src-a", r#"{"NOM":"MARTIN","SOURCE":"insee"}"#).await;
+    index_product(&router, "src-b", r#"{"NOM":"MARTIN","SOURCE":"municipal"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"NOM":"MARTIN"}},"functions":[{"filter":{"term":{"SOURCE":"insee"}},"weight":10}]}}}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["_id"], "src-a");
+    let boosted = hits[0]["_score"].as_f64().expect("score");
+    let unboosted = hits[1]["_score"].as_f64().expect("score");
+    assert!(
+        (boosted - unboosted * 10.0).abs() < 1e-6,
+        "filter-matched doc must receive weight=10, others stay at identity (boosted={boosted}, unboosted={unboosted})"
+    );
 }
 
 // --- A12.1: `terms` aggregation MVP ---

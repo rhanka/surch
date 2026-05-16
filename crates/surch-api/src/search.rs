@@ -208,15 +208,32 @@ pub enum SearchQuery {
     },
     /// `function_score` wrapper around an inner query. matchID's
     /// deces-backend uses this shape today as a no-op (empty
-    /// `functions`) to keep its codebase ready for future custom
-    /// scoring. Surch supports the wrapper, the top-level `boost`
-    /// multiplier, and an empty `functions` array. Non-empty
-    /// `functions`, `score_mode`, `boost_mode` and friends are parsed
-    /// for forward-compat but produce an error today — tracked as
-    /// "function_score scoring phase 2" in `docs/wp-d-matchid/`.
+    /// `functions`) but the intake (§2.2 — future work note) flags
+    /// `weight`, `field_value_factor` and `gauss` decay as the next
+    /// scoring functions to wire. A5 phase 2 implements those three:
+    ///
+    /// - the inner `_score` (multiplied by the top-level `boost`) is
+    ///   the BM25 driver,
+    /// - each function in `functions` produces a per-document factor
+    ///   from the doc's `_source`; an optional clause-level `filter`
+    ///   restricts the function to docs that match it (non-matching
+    ///   docs contribute the score-mode identity for that function),
+    /// - the function factors are combined with `score_mode`
+    ///   (Multiply / Sum / Avg / First / Min / Max — default
+    ///   `Multiply`),
+    /// - the combined factor is composed with the inner `_score` via
+    ///   `boost_mode` (Multiply / Sum / Avg / Replace / Min / Max —
+    ///   default `Multiply`).
+    ///
+    /// Empty `functions` collapses to the phase-1 no-op shape: inner
+    /// score multiplied by `boost`, no scoring-function machinery
+    /// touched, so the SciFact NDCG@10 baseline is preserved.
     FunctionScore {
         inner: Box<SearchQuery>,
         boost: f64,
+        functions: Vec<ScoringFunctionClause>,
+        score_mode: ScoreMode,
+        boost_mode: BoostMode,
     },
     Fuzzy {
         field: String,
@@ -258,6 +275,89 @@ pub enum SearchQuery {
         lon: f64,
         distance_meters: f64,
     },
+}
+
+/// A5 phase 2: one `function_score.functions[]` entry. Bundles the
+/// scoring function itself with an optional clause-level `filter`
+/// (only the function applies when the doc matches the filter) and an
+/// optional `weight` multiplier (applied on top of the function's
+/// own output — same semantics as ES 7.x).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoringFunctionClause {
+    pub function: ScoringFunction,
+    pub filter: Option<Box<SearchQuery>>,
+    pub weight: Option<f64>,
+}
+
+/// A5 phase 2: declarative scoring function variants honoured today.
+/// MVP scope (from `docs/wp-d-matchid/incoming/...`) is `weight`,
+/// `field_value_factor` and `gauss` decay over keyword-encoded
+/// `YYYYMMDD` date fields. Other modifiers (`exp`/`linear` decay,
+/// geo decay, `script_score`) are tracked under "function_score
+/// phase 3" in gap-analysis.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScoringFunction {
+    /// Bare `{ "weight": <num> }` entry — emits a constant factor.
+    /// matchID uses it on the third entry of the §2.2 sample
+    /// (filter on `SOURCE`).
+    Weight { value: f64 },
+    /// `field_value_factor`: read a numeric field from `_source`,
+    /// scale by `factor`, optionally pipe through `modifier`. When
+    /// the field is absent or non-numeric, `missing` is substituted
+    /// (defaults to 0.0 to mirror ES 7.x).
+    FieldValueFactor {
+        field: String,
+        factor: f64,
+        modifier: FieldValueModifier,
+        missing: f64,
+    },
+    /// `gauss` decay over a keyword-encoded `YYYYMMDD` date field.
+    /// `origin` and `scale_days` are pre-parsed at request time so
+    /// scoring stays branch-light per doc. Score formula (ES 7.x):
+    /// `exp(- (max(0, distance_days - offset_days))^2 *
+    /// ln(1 / decay) / (scale_days^2))`. MVP keeps `offset_days = 0`.
+    GaussDecay {
+        field: String,
+        origin_days: i64,
+        scale_days: f64,
+        decay: f64,
+    },
+}
+
+/// A5 phase 2: numeric pipe for `field_value_factor.modifier`. MVP
+/// covers the four modifiers matchID is most likely to wire first
+/// (intake §2.2 names `log1p` explicitly); `ln`, `ln1p`, `log`,
+/// `log2p`, `square`, `none` and friends are deferred to phase 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldValueModifier {
+    None,
+    Log1p,
+    Sqrt,
+    Reciprocal,
+}
+
+/// A5 phase 2: how to combine the per-function factors of a
+/// `function_score`. Default in ES 7.x is `Multiply`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreMode {
+    Multiply,
+    Sum,
+    Avg,
+    First,
+    Min,
+    Max,
+}
+
+/// A5 phase 2: how to combine the combined function factor with the
+/// inner BM25 `_score`. Default in ES 7.x is `Multiply`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoostMode {
+    Multiply,
+    Sum,
+    Avg,
+    Replace,
+    Min,
+    Max,
 }
 
 /// Inclusive/exclusive numeric or lexicographic bounds for `range` queries.
@@ -1446,7 +1546,11 @@ fn topk_scored_documents(
     let scored: Vec<(f64, u32)> = candidates
         .iter()
         .map(|internal_id| {
-            let score = score_for_query(query, *internal_id, &scoring_context);
+            // `topk_scored_documents` only kicks in for Match / MultiMatch
+            // (candidate resolution returns `None` for FunctionScore), so
+            // we never need the doc source on this path — function-score
+            // scoring goes through `score_documents` which threads it in.
+            let score = score_for_query(query, *internal_id, &scoring_context, None);
             (score, *internal_id)
         })
         .collect();
@@ -1832,7 +1936,7 @@ fn score_documents(
         .zip(internal_ids)
         .map(|(doc, internal_id)| {
             let score = internal_id
-                .map(|id| score_for_query(query, id, &scoring_context))
+                .map(|id| score_for_query(query, id, &scoring_context, Some(&doc.source)))
                 .unwrap_or(1.0);
             ScoredDocument { doc, score }
         })
@@ -1843,6 +1947,7 @@ fn score_for_query(
     query: &SearchQuery,
     internal_doc_id: u32,
     scoring_context: &SearchScoringContext,
+    source: Option<&Value>,
 ) -> f64 {
     match query {
         SearchQuery::Match { field, value, .. } => {
@@ -1871,7 +1976,7 @@ fn score_for_query(
             // `filter` clauses are excluded — they restrict candidacy, not score.
             let must_score: f64 = must
                 .iter()
-                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context))
+                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context, source))
                 .sum();
 
             // The wildcard arm at the bottom returns 1.0 for non-scoring
@@ -1879,7 +1984,7 @@ fn score_for_query(
             // the sum. BM25 always emits > 1.0 for real matches.
             let should_score: f64 = should
                 .iter()
-                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context))
+                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context, source))
                 .filter(|score| *score != 1.0)
                 .sum();
 
@@ -1891,13 +1996,199 @@ fn score_for_query(
             base * *boost
         }
         SearchQuery::MatchAll { boost } => *boost,
-        SearchQuery::FunctionScore { inner, boost } => {
-            score_for_query(inner, internal_doc_id, scoring_context) * *boost
+        SearchQuery::FunctionScore {
+            inner,
+            boost,
+            functions,
+            score_mode,
+            boost_mode,
+        } => {
+            let inner_score =
+                score_for_query(inner, internal_doc_id, scoring_context, source) * *boost;
+
+            if functions.is_empty() {
+                // A5 phase 1 fast path: pure no-op wrapper, no
+                // scoring-function machinery, baseline preserved.
+                return inner_score;
+            }
+
+            let combined_factor = combine_scoring_functions(
+                functions,
+                *score_mode,
+                source,
+                &scoring_context.mapping,
+            );
+            combine_with_boost_mode(inner_score, combined_factor, *boost_mode)
         }
         // `geo_distance` is a filter — constant score so it does not
         // perturb BM25 ranking (matchID always wraps it in `bool.filter`).
         SearchQuery::GeoDistance { .. } => 1.0,
         _ => 1.0,
+    }
+}
+
+/// A5 phase 2: evaluate every `function_score.functions[]` entry
+/// against `source` and combine the resulting factors with `mode`.
+/// When a function carries a `filter` that the doc does not match,
+/// the function contributes the score-mode identity (1.0 for
+/// `Multiply`, 0.0 for `Sum`/`Avg`, and is dropped from `First`/
+/// `Min`/`Max`) — matches ES 7.x semantics.
+fn combine_scoring_functions(
+    functions: &[ScoringFunctionClause],
+    mode: ScoreMode,
+    source: Option<&Value>,
+    mapping: &IndexMapping,
+) -> f64 {
+    let mut factors: Vec<f64> = Vec::with_capacity(functions.len());
+    for clause in functions {
+        let applies = match (&clause.filter, source) {
+            (Some(filter), Some(src)) => query_matches(filter, src, mapping),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !applies {
+            // Function is filtered out for this doc — contribute the
+            // score-mode identity so it does not perturb the result.
+            match mode {
+                ScoreMode::Multiply => factors.push(1.0),
+                ScoreMode::Sum | ScoreMode::Avg => factors.push(0.0),
+                ScoreMode::First | ScoreMode::Min | ScoreMode::Max => {
+                    // Skip — these modes treat absence as "no contribution".
+                }
+            }
+            continue;
+        }
+        let raw = evaluate_scoring_function(&clause.function, source);
+        let weighted = match clause.weight {
+            Some(w) => raw * w,
+            None => raw,
+        };
+        factors.push(weighted);
+    }
+
+    if factors.is_empty() {
+        // Every function was filtered out under First/Min/Max — fall
+        // back to the score-mode identity so the inner score survives.
+        return match mode {
+            ScoreMode::Multiply => 1.0,
+            ScoreMode::Sum | ScoreMode::Avg => 0.0,
+            ScoreMode::First | ScoreMode::Min | ScoreMode::Max => 1.0,
+        };
+    }
+
+    match mode {
+        ScoreMode::Multiply => factors.iter().product(),
+        ScoreMode::Sum => factors.iter().sum(),
+        ScoreMode::Avg => factors.iter().sum::<f64>() / factors.len() as f64,
+        ScoreMode::First => factors[0],
+        ScoreMode::Min => factors
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min),
+        ScoreMode::Max => factors
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max),
+    }
+}
+
+/// A5 phase 2: combine the inner BM25 `_score` with the combined
+/// function factor using `mode`. Mirrors ES 7.x semantics.
+fn combine_with_boost_mode(inner: f64, factor: f64, mode: BoostMode) -> f64 {
+    match mode {
+        BoostMode::Multiply => inner * factor,
+        BoostMode::Sum => inner + factor,
+        BoostMode::Avg => (inner + factor) * 0.5,
+        BoostMode::Replace => factor,
+        BoostMode::Min => inner.min(factor),
+        BoostMode::Max => inner.max(factor),
+    }
+}
+
+/// A5 phase 2: evaluate one scoring function against a document's
+/// `_source`. Missing / non-numeric field values fall back to the
+/// `missing` value (for `field_value_factor`) or to a neutral factor
+/// (1.0 for `Weight`, the `decay` floor for `GaussDecay`).
+fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>) -> f64 {
+    match function {
+        ScoringFunction::Weight { value } => *value,
+        ScoringFunction::FieldValueFactor {
+            field,
+            factor,
+            modifier,
+            missing,
+        } => {
+            let raw = source
+                .and_then(|src| lookup_numeric_field(src, field))
+                .unwrap_or(*missing);
+            let scaled = raw * *factor;
+            apply_field_value_modifier(scaled, *modifier)
+        }
+        ScoringFunction::GaussDecay {
+            field,
+            origin_days,
+            scale_days,
+            decay,
+        } => {
+            let Some(doc_text) = source.and_then(|src| lookup_text_field(src, field)) else {
+                // Missing field — return the decay floor so the doc is
+                // still rankable but penalised the same way ES does.
+                return *decay;
+            };
+            let Some(doc_days) = parse_yyyymmdd_to_days(&doc_text) else {
+                return *decay;
+            };
+            let distance = (origin_days - doc_days).abs() as f64;
+            // ES 7.x gauss: exp( - distance^2 * ln(1/decay) / scale^2 ).
+            // No offset in MVP.
+            let sigma_sq = scale_days * scale_days;
+            let factor = (-distance * distance * (1.0_f64 / *decay).ln() / sigma_sq).exp();
+            factor
+        }
+    }
+}
+
+fn apply_field_value_modifier(value: f64, modifier: FieldValueModifier) -> f64 {
+    match modifier {
+        FieldValueModifier::None => value,
+        FieldValueModifier::Log1p => (1.0 + value).ln(),
+        FieldValueModifier::Sqrt => {
+            if value < 0.0 {
+                0.0
+            } else {
+                value.sqrt()
+            }
+        }
+        FieldValueModifier::Reciprocal => {
+            if value == 0.0 {
+                0.0
+            } else {
+                1.0 / value
+            }
+        }
+    }
+}
+
+/// Read a numeric field from `_source`. Honours integers, floats and
+/// numeric strings (matchID emits `AGE_DECES` as integer JSON, but
+/// keyword indexes serialise dates as strings; numeric strings are
+/// permissive here so the same helper handles both shapes).
+fn lookup_numeric_field(source: &Value, field: &str) -> Option<f64> {
+    let value = source.get(field)?;
+    match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Read a text field from `_source`. Used by `GaussDecay` to pick
+/// up `YYYYMMDD` keyword fields.
+fn lookup_text_field(source: &Value, field: &str) -> Option<String> {
+    match source.get(field)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
     }
 }
 
@@ -3412,17 +3703,28 @@ fn parse_exists_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
 /// Parse a `function_score` query body.
 ///
 /// matchID's deces-backend uses `function_score` today as a pure
-/// wrapper (no `functions` declared) to keep the codebase ready for
-/// future custom scoring. This implementation accepts:
+/// wrapper (no `functions` declared) — A5 phase 1 shipped that
+/// no-op shape. A5 phase 2 (this code) honours non-empty `functions`
+/// for the three function types matchID will wire next per intake
+/// §2.2: `weight`, `field_value_factor` and `gauss` decay.
+///
+/// Accepted fields:
 ///
 /// - `query` (required) — the inner query to wrap;
 /// - `boost` (optional, non-negative finite) — multiplicative scaling
-///   applied to the inner `_score`;
-/// - `functions: []` (optional empty array) — accepted for
-///   forward-compat, no scoring effect today;
-/// - `score_mode` / `boost_mode` (optional strings) — accepted only
-///   when there are no functions, since they would otherwise have
-///   no semantics to drive;
+///   applied to the inner `_score` before combination;
+/// - `functions: [...]` (optional) — declarative scoring functions,
+///   each entry exactly one of `{ weight }`, `{ field_value_factor }`,
+///   `{ gauss }` (optionally combined with `filter` and a top-level
+///   `weight` multiplier);
+/// - `score_mode` (optional) — how to combine per-function factors
+///   (`multiply` | `sum` | `avg` | `first` | `min` | `max`);
+/// - `boost_mode` (optional) — how to combine the combined factor
+///   with the inner `_score` (`multiply` | `sum` | `avg` | `replace`
+///   | `min` | `max`);
+/// - `max_boost` / `min_score` — currently accepted as no-ops for
+///   forward-compat (the intake never sets them today; tracked as
+///   phase 3);
 /// - any unknown top-level key returns HTTP 400 so wire-shape drift
 ///   is caught early.
 fn parse_function_score_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
@@ -3436,6 +3738,9 @@ fn parse_function_score_query(value: &Value) -> Result<SearchQuery, OpenSearchEr
 
     let mut inner: Option<SearchQuery> = None;
     let mut boost: f64 = 1.0;
+    let mut functions: Vec<ScoringFunctionClause> = Vec::new();
+    let mut score_mode = ScoreMode::Multiply;
+    let mut boost_mode = BoostMode::Multiply;
 
     for (key, body) in object {
         match key.as_str() {
@@ -3451,17 +3756,19 @@ fn parse_function_score_query(value: &Value) -> Result<SearchQuery, OpenSearchEr
                         "`function_score.functions` must be an array",
                     )
                 })?;
-                if !arr.is_empty() {
-                    return Err(OpenSearchError::new(
-                        StatusCode::BAD_REQUEST,
-                        "parsing_exception",
-                        "`function_score.functions` is parsed but scoring functions are not implemented yet (tracked under matchID gap A5 phase 2)",
-                    ));
+                for entry in arr {
+                    functions.push(parse_scoring_function_clause(entry)?);
                 }
             }
-            "score_mode" | "boost_mode" | "max_boost" | "min_score" => {
-                // Accepted for forward-compat; ignored when `functions` is
-                // empty since none of these have semantics without it.
+            "score_mode" => {
+                score_mode = parse_score_mode(body)?;
+            }
+            "boost_mode" => {
+                boost_mode = parse_boost_mode(body)?;
+            }
+            "max_boost" | "min_score" => {
+                // Accepted no-op for forward-compat — matchID does not
+                // emit these today; tracked under function_score phase 3.
             }
             unknown => {
                 return Err(OpenSearchError::new(
@@ -3484,7 +3791,455 @@ fn parse_function_score_query(value: &Value) -> Result<SearchQuery, OpenSearchEr
     Ok(SearchQuery::FunctionScore {
         inner: Box::new(inner),
         boost,
+        functions,
+        score_mode,
+        boost_mode,
     })
+}
+
+/// Parse `function_score.score_mode`. Default is `multiply`.
+fn parse_score_mode(value: &Value) -> Result<ScoreMode, OpenSearchError> {
+    let text = value.as_str().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`function_score.score_mode` must be a string",
+        )
+    })?;
+    match text {
+        "multiply" => Ok(ScoreMode::Multiply),
+        "sum" => Ok(ScoreMode::Sum),
+        "avg" => Ok(ScoreMode::Avg),
+        "first" => Ok(ScoreMode::First),
+        "min" => Ok(ScoreMode::Min),
+        "max" => Ok(ScoreMode::Max),
+        unknown => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("unsupported `function_score.score_mode` `{unknown}`"),
+        )),
+    }
+}
+
+/// Parse `function_score.boost_mode`. Default is `multiply`.
+fn parse_boost_mode(value: &Value) -> Result<BoostMode, OpenSearchError> {
+    let text = value.as_str().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`function_score.boost_mode` must be a string",
+        )
+    })?;
+    match text {
+        "multiply" => Ok(BoostMode::Multiply),
+        "sum" => Ok(BoostMode::Sum),
+        "avg" => Ok(BoostMode::Avg),
+        "replace" => Ok(BoostMode::Replace),
+        "min" => Ok(BoostMode::Min),
+        "max" => Ok(BoostMode::Max),
+        unknown => Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("unsupported `function_score.boost_mode` `{unknown}`"),
+        )),
+    }
+}
+
+/// Parse one entry of `function_score.functions`. Each entry must
+/// declare exactly one scoring function key (`weight`,
+/// `field_value_factor`, `gauss`), optionally paired with `filter`
+/// (a sub-query) and an outer `weight` multiplier. Bare
+/// `{ "weight": <num> }` is allowed (matchID intake §2.2 sample).
+fn parse_scoring_function_clause(
+    value: &Value,
+) -> Result<ScoringFunctionClause, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`function_score.functions[]` entry must be an object",
+        )
+    })?;
+
+    let mut function: Option<ScoringFunction> = None;
+    let mut outer_weight: Option<f64> = None;
+    let mut filter: Option<Box<SearchQuery>> = None;
+    let mut bare_weight: Option<f64> = None;
+
+    for (key, body) in object {
+        match key.as_str() {
+            "weight" => {
+                let number = parse_finite_number(body, "`function_score.functions[].weight`")?;
+                if number < 0.0 {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`function_score.functions[].weight` must be non-negative",
+                    ));
+                }
+                // The same key acts as the function body when no other
+                // function key is supplied (bare-weight shape); otherwise
+                // it is the outer multiplier. Resolve after the loop.
+                bare_weight = Some(number);
+                outer_weight = Some(number);
+            }
+            "filter" => {
+                filter = Some(Box::new(parse_search_query(body)?));
+            }
+            "field_value_factor" => {
+                function = Some(parse_field_value_factor_function(body)?);
+            }
+            "gauss" => {
+                function = Some(parse_gauss_decay_function(body)?);
+            }
+            "linear" | "exp" => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!(
+                        "`function_score.functions[].{key}` decay is parsed but not implemented yet (tracked under function_score phase 3)"
+                    ),
+                ));
+            }
+            "script_score" | "random_score" => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!(
+                        "`function_score.functions[].{key}` is parsed but not implemented yet (tracked under function_score phase 3)"
+                    ),
+                ));
+            }
+            unknown => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("unsupported `function_score.functions[]` field `{unknown}`"),
+                ));
+            }
+        }
+    }
+
+    let (function, outer_weight) = match function {
+        Some(fn_) => (fn_, outer_weight),
+        None => match bare_weight {
+            Some(value) => (ScoringFunction::Weight { value }, None),
+            None => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "`function_score.functions[]` entry must declare a scoring function (`weight`, `field_value_factor` or `gauss`)",
+                ));
+            }
+        },
+    };
+
+    Ok(ScoringFunctionClause {
+        function,
+        filter,
+        weight: outer_weight,
+    })
+}
+
+/// Parse a `field_value_factor` function body.
+fn parse_field_value_factor_function(
+    value: &Value,
+) -> Result<ScoringFunction, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`field_value_factor` body must be an object",
+        )
+    })?;
+
+    let mut field: Option<String> = None;
+    let mut factor: f64 = 1.0;
+    let mut modifier = FieldValueModifier::None;
+    let mut missing: f64 = 0.0;
+
+    for (key, body) in object {
+        match key.as_str() {
+            "field" => {
+                field = Some(
+                    body.as_str()
+                        .ok_or_else(|| {
+                            OpenSearchError::new(
+                                StatusCode::BAD_REQUEST,
+                                "parsing_exception",
+                                "`field_value_factor.field` must be a string",
+                            )
+                        })?
+                        .to_string(),
+                );
+            }
+            "factor" => {
+                factor = parse_finite_number(body, "`field_value_factor.factor`")?;
+            }
+            "modifier" => {
+                let text = body.as_str().ok_or_else(|| {
+                    OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`field_value_factor.modifier` must be a string",
+                    )
+                })?;
+                modifier = match text {
+                    "none" => FieldValueModifier::None,
+                    "log1p" => FieldValueModifier::Log1p,
+                    "sqrt" => FieldValueModifier::Sqrt,
+                    "reciprocal" => FieldValueModifier::Reciprocal,
+                    unknown => {
+                        return Err(OpenSearchError::new(
+                            StatusCode::BAD_REQUEST,
+                            "parsing_exception",
+                            format!(
+                                "`field_value_factor.modifier` `{unknown}` is parsed but not implemented yet (tracked under function_score phase 3)"
+                            ),
+                        ));
+                    }
+                };
+            }
+            "missing" => {
+                missing = parse_finite_number(body, "`field_value_factor.missing`")?;
+            }
+            unknown => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("unsupported `field_value_factor` field `{unknown}`"),
+                ));
+            }
+        }
+    }
+
+    let field = field.ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`field_value_factor` must declare `field`",
+        )
+    })?;
+
+    Ok(ScoringFunction::FieldValueFactor {
+        field,
+        factor,
+        modifier,
+        missing,
+    })
+}
+
+/// Parse a `gauss` decay function body. MVP: keyword-encoded
+/// `YYYYMMDD` date fields with `origin` and `scale` interpretable as
+/// dates and a day-count duration. `decay` defaults to 0.5.
+fn parse_gauss_decay_function(value: &Value) -> Result<ScoringFunction, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`gauss` body must be an object",
+        )
+    })?;
+    if object.len() != 1 {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`gauss` must wrap exactly one field",
+        ));
+    }
+    let (field, params_value) = object.iter().next().expect("object has one field");
+    let params = params_value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`gauss.<field>` body must be an object",
+        )
+    })?;
+
+    let mut origin_text: Option<String> = None;
+    let mut scale_text: Option<String> = None;
+    let mut decay: f64 = 0.5;
+
+    for (key, body) in params {
+        match key.as_str() {
+            "origin" => {
+                origin_text = Some(
+                    body.as_str()
+                        .ok_or_else(|| {
+                            OpenSearchError::new(
+                                StatusCode::BAD_REQUEST,
+                                "parsing_exception",
+                                "`gauss.<field>.origin` must be a string (YYYYMMDD)",
+                            )
+                        })?
+                        .to_string(),
+                );
+            }
+            "scale" => {
+                scale_text = Some(
+                    body.as_str()
+                        .ok_or_else(|| {
+                            OpenSearchError::new(
+                                StatusCode::BAD_REQUEST,
+                                "parsing_exception",
+                                "`gauss.<field>.scale` must be a string (e.g. \"365d\")",
+                            )
+                        })?
+                        .to_string(),
+                );
+            }
+            "decay" => {
+                decay = parse_finite_number(body, "`gauss.<field>.decay`")?;
+                if !(decay > 0.0 && decay < 1.0) {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`gauss.<field>.decay` must be strictly between 0 and 1",
+                    ));
+                }
+            }
+            "offset" => {
+                // MVP: offset accepted only as "0d" / "0" for parity.
+                let text = body.as_str().unwrap_or("0");
+                if text != "0" && text != "0d" {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        "`gauss.<field>.offset` is parsed but only `\"0d\"` is honoured today (tracked under function_score phase 3)",
+                    ));
+                }
+            }
+            unknown => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("unsupported `gauss.<field>` field `{unknown}`"),
+                ));
+            }
+        }
+    }
+
+    let origin_text = origin_text.ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`gauss.<field>` must declare `origin`",
+        )
+    })?;
+    let scale_text = scale_text.ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`gauss.<field>` must declare `scale`",
+        )
+    })?;
+
+    let origin_days = parse_yyyymmdd_to_days(&origin_text).ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`gauss.<field>.origin` `{origin_text}` is not a YYYYMMDD date"),
+        )
+    })?;
+    let scale_days = parse_day_duration(&scale_text).ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!(
+                "`gauss.<field>.scale` `{scale_text}` must be a day-count duration (e.g. \"365d\")"
+            ),
+        )
+    })?;
+    if !(scale_days > 0.0) {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`gauss.<field>.scale` must be strictly positive",
+        ));
+    }
+
+    Ok(ScoringFunction::GaussDecay {
+        field: field.clone(),
+        origin_days,
+        scale_days,
+        decay,
+    })
+}
+
+/// Parse a strict finite f64 number (used by scoring-function params).
+fn parse_finite_number(value: &Value, context: &str) -> Result<f64, OpenSearchError> {
+    let number = value.as_f64().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{context} must be a number"),
+        )
+    })?;
+    if !number.is_finite() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{context} must be a finite number"),
+        ));
+    }
+    Ok(number)
+}
+
+/// Convert a `YYYYMMDD` string to a day-count since `0001-01-01` so
+/// distance arithmetic is a plain integer diff. Returns `None` for
+/// unparseable input. Uses a leap-year-aware accumulator to keep the
+/// dependency surface zero (no chrono call needed here).
+fn parse_yyyymmdd_to_days(text: &str) -> Option<i64> {
+    if text.len() != 8 || !text.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = text[0..4].parse().ok()?;
+    let month: u32 = text[4..6].parse().ok()?;
+    let day: u32 = text[6..8].parse().ok()?;
+    if !(1..=12).contains(&month) || day == 0 {
+        return None;
+    }
+    let max_day = days_in_month(year, month)?;
+    if day > max_day {
+        return None;
+    }
+
+    let mut days: i64 = 0;
+    let start_year: i64 = 1;
+    for y in start_year..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        days += days_in_month(year, m)? as i64;
+    }
+    days += (day - 1) as i64;
+    Some(days)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 => Some(if is_leap_year(year) { 29 } else { 28 }),
+        _ => None,
+    }
+}
+
+/// Parse a day-count duration string. Accepts `"<N>d"` (days),
+/// `"<N>"` (bare number = days), `"<N>m"`-style not supported in MVP.
+fn parse_day_duration(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    if let Some(stripped) = trimmed.strip_suffix('d') {
+        stripped.parse::<f64>().ok().filter(|n| n.is_finite())
+    } else if let Some(stripped) = trimmed.strip_suffix("days") {
+        stripped.trim().parse::<f64>().ok().filter(|n| n.is_finite())
+    } else {
+        trimmed.parse::<f64>().ok().filter(|n| n.is_finite())
+    }
 }
 
 /// Parse a `geo_distance` query body (matchID intake §2.6).
