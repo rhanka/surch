@@ -1,7 +1,7 @@
 {
   "name": "deces_v1",
   "dataset": "deces",
-  "description": "matchID replay v1 — 10 representative requests against the INSEE-shaped slice. v0 acceptance: at least 3 entries must execute against Surch today; the remaining 3 prefix/scroll entries are skipped on gaps A4/A6 until those gaps land. Expected hit counts and top-hit ids were captured against Surch HEAD on 2026-05-15; once an ES-7.x oracle replays the same slice, these expectations must be cross-checked.",
+  "description": "matchID replay v1 — 30 representative requests against the INSEE-shaped slice. Distribution: 8 advanced search, 5 block-match, 4 full-text, 3 sort, 2 function_score, 3 prefix, 3 scroll, 2 range. Of the 30 entries 23 execute today; 7 are skipped pending gaps (A4 scroll, A6 prefix-on-keyword-date via index_prefixes). Expected hit counts and top-hit ids were captured against Surch HEAD on 2026-05-15 using `cargo run --release -p surch-api` + curl against the same slice; once an ES-7.x oracle replays the same slice (B1 phase 3, gated on poc-k8s), these expectations must be cross-checked.",
   "requests": [
     {
       "name": "adv_nom_prenoms_date",
@@ -76,6 +76,134 @@
       }
     },
     {
+      "name": "adv_fuzzy_nom_with_match",
+      "category": "advanced_ui",
+      "description": "match-object form with integer fuzziness — exercises A1 (parse_match accepts object body with fuzziness) and the Damerau-Levenshtein matcher.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM": { "query": "DUPONT", "fuzziness": 1 } } },
+                { "term": { "SEXE": "F" } }
+              ]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 15,
+        "hits.hits[0]._id": "deces_00001"
+      }
+    },
+    {
+      "name": "adv_fuzzy_auto_prenoms_sexe",
+      "category": "advanced_ui",
+      "description": "match-object form with fuzziness `AUTO` — verbatim shape from §2.3 of the deces-backend DSL inventory.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "PRENOMS": { "query": "JEAN", "fuzziness": "AUTO" } } },
+                { "term": { "SEXE": "M" } }
+              ]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 37,
+        "hits.hits[0]._id": "deces_00028"
+      }
+    },
+    {
+      "name": "adv_bool_should_msm",
+      "category": "advanced_ui",
+      "description": "bool with should + minimum_should_match — exercises A3.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM": "MARTIN" } }
+              ],
+              "should": [
+                { "match": { "PRENOMS": "PIERRE" } },
+                { "match": { "PRENOMS": "JACQUES" } }
+              ],
+              "minimum_should_match": 1
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 5,
+        "hits.hits[0]._id": "deces_00806"
+      }
+    },
+    {
+      "name": "adv_match_filter_commune",
+      "category": "advanced_ui",
+      "description": "match + bool.filter (does not score) — exercises A3.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM": "MOREAU" } }
+              ],
+              "filter": [
+                { "term": { "COMMUNE_NAISSANCE": "VILLEURBANNE" } }
+              ]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 2,
+        "hits.hits[0]._id": "deces_00119"
+      }
+    },
+    {
+      "name": "adv_bool_must_not_sexe",
+      "category": "advanced_ui",
+      "description": "bool.must_not exclusion clause.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM": "VINCENT" } }
+              ],
+              "must_not": [
+                { "term": { "SEXE": "F" } }
+              ]
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 30,
+        "hits.hits[0]._id": "deces_00010"
+      }
+    },
+    {
       "name": "block_msearch_a",
       "category": "block_match",
       "request": {
@@ -132,6 +260,115 @@
       }
     },
     {
+      "name": "block_msearch_c",
+      "category": "block_match",
+      "description": "three-way msearch (three sub-queries on different filters).",
+      "request": {
+        "method": "POST",
+        "path": "/_msearch",
+        "body_ndjson": [
+          { "index": "deces" },
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  { "match": { "NOM": "PETIT" } },
+                  { "term": { "SEXE": "M" } }
+                ]
+              }
+            },
+            "size": 3
+          },
+          { "index": "deces" },
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  { "match": { "NOM": "BERNARD" } },
+                  { "term": { "SEXE": "F" } }
+                ]
+              }
+            },
+            "size": 3
+          },
+          { "index": "deces" },
+          { "query": { "match": { "NOM": "DUBOIS" } }, "size": 3 }
+        ]
+      },
+      "expected": {
+        "hits.total.value": 59,
+        "hits.hits[0]._id": "deces_00013"
+      }
+    },
+    {
+      "name": "block_msearch_d",
+      "category": "block_match",
+      "description": "two-way msearch on PRENOMS + filter combinations.",
+      "request": {
+        "method": "POST",
+        "path": "/_msearch",
+        "body_ndjson": [
+          { "index": "deces" },
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  { "match": { "PRENOMS": "PIERRE" } },
+                  { "term": { "SEXE": "M" } }
+                ]
+              }
+            },
+            "size": 3
+          },
+          { "index": "deces" },
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  { "match": { "PRENOMS": "MARIE" } },
+                  { "term": { "SEXE": "M" } }
+                ]
+              }
+            },
+            "size": 3
+          }
+        ]
+      },
+      "expected": {
+        "hits.total.value": 58,
+        "hits.hits[0]._id": "deces_00011"
+      }
+    },
+    {
+      "name": "block_msearch_e",
+      "category": "block_match",
+      "description": "msearch mixing term-on-date and plain match.",
+      "request": {
+        "method": "POST",
+        "path": "/_msearch",
+        "body_ndjson": [
+          { "index": "deces" },
+          {
+            "query": {
+              "bool": {
+                "must": [
+                  { "match": { "NOM": "MICHEL" } },
+                  { "term": { "DATE_NAISSANCE": "19540826" } }
+                ]
+              }
+            },
+            "size": 3
+          },
+          { "index": "deces" },
+          { "query": { "match": { "PRENOMS": "JACQUES" } }, "size": 3 }
+        ]
+      },
+      "expected": {
+        "hits.total.value": 66,
+        "hits.hits[0]._id": "deces_00006"
+      }
+    },
+    {
       "name": "ft_multi_match_nom_prenoms",
       "category": "full_text",
       "request": {
@@ -169,9 +406,154 @@
       }
     },
     {
+      "name": "ft_multi_match_from_size",
+      "category": "full_text",
+      "description": "multi_match paginated with from + size (matchID §2.8 top-level body).",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "multi_match": {
+              "query": "MARTIN",
+              "fields": ["NOM", "PRENOMS"]
+            }
+          },
+          "from": 5,
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 31,
+        "hits.hits[0]._id": "deces_00230"
+      }
+    },
+    {
+      "name": "ft_match_min_score",
+      "category": "full_text",
+      "description": "match with min_score floor (matchID §2.8).",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM": "VINCENT" } },
+          "min_score": 0.5,
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 30,
+        "hits.hits[0]._id": "deces_00010"
+      }
+    },
+    {
+      "name": "sort_date_naissance_asc",
+      "category": "sort",
+      "description": "match_all + sort on DATE_NAISSANCE keyword ascending (matchID §2.8).",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match_all": {} },
+          "sort": [ { "DATE_NAISSANCE": "asc" } ],
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 1000,
+        "hits.hits[0]._id": "deces_00141"
+      }
+    },
+    {
+      "name": "sort_nom_desc",
+      "category": "sort",
+      "description": "match_all + sort on NOM (text) descending.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match_all": {} },
+          "sort": [ { "NOM": "desc" } ],
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 1000,
+        "hits.hits[0]._id": "deces_00010"
+      }
+    },
+    {
+      "name": "sort_match_date_deces_desc",
+      "category": "sort",
+      "description": "match query + sort on DATE_DECES descending (recent-first ordering used by the UI).",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM": "MARTIN" } },
+          "sort": [ { "DATE_DECES": "desc" } ],
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 31,
+        "hits.hits[0]._id": "deces_00984"
+      }
+    },
+    {
+      "name": "fs_match_wrap",
+      "category": "function_score",
+      "description": "function_score no-op wrapper around a simple match — verbatim shape from §2.2 (A5 phase 1).",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "function_score": {
+              "query": { "match": { "NOM": "DUPONT" } }
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 30,
+        "hits.hits[0]._id": "deces_00001"
+      }
+    },
+    {
+      "name": "fs_bool_wrap",
+      "category": "function_score",
+      "description": "function_score no-op wrapper around a bool query — the typical advanced-search shape.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "function_score": {
+              "query": {
+                "bool": {
+                  "must": [
+                    { "match": { "NOM": "BONNET" } },
+                    { "term": { "SEXE": "F" } }
+                  ]
+                }
+              }
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 25,
+        "hits.hits[0]._id": "deces_00002"
+      }
+    },
+    {
       "name": "prefix_nom",
       "category": "autocomplete",
       "skip": "gap-A6",
+      "description": "prefix on NOM (text). Surch HEAD returns 30/deces_00001 today via source-scan; matchID's production path uses `index_prefixes` postings (A6 + A13). Kept skipped until A6 lands so the fixture documents the matchID-side workload regardless of source-scan behaviour.",
       "request": {
         "method": "POST",
         "path": "/deces/_search",
@@ -185,6 +567,7 @@
       "name": "prefix_prenoms",
       "category": "autocomplete",
       "skip": "gap-A6",
+      "description": "prefix on PRENOMS (text). Same A6 rationale as `prefix_nom`.",
       "request": {
         "method": "POST",
         "path": "/deces/_search",
@@ -195,9 +578,24 @@
       }
     },
     {
+      "name": "prefix_date_naissance_short",
+      "category": "autocomplete",
+      "skip": "gap-A6",
+      "description": "prefix on DATE_NAISSANCE with a short input — triggered by deces-backend when `< 8` chars are typed (`queries.ts:202`, §2.4 of the intake). Surch HEAD source-scan returns 0 because `tokenize_for_search` skips digit-only tokens; needs A6 postings-side prefix iterator on keyword fields.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "prefix": { "DATE_NAISSANCE": "1962" } },
+          "size": 5
+        }
+      }
+    },
+    {
       "name": "scroll_full",
       "category": "scroll",
       "skip": "gap-A4",
+      "description": "scroll start, full match_all, large page. A4 stateful scroll ships on `wp/a-optim`; revisit this skip once the matchID replay can chain the follow-up `POST /_search/scroll` call inside the runner.",
       "request": {
         "method": "POST",
         "path": "/deces/_search?scroll=1m",
@@ -205,6 +603,76 @@
           "query": { "match_all": {} },
           "size": 100
         }
+      }
+    },
+    {
+      "name": "scroll_filtered_size_500",
+      "category": "scroll",
+      "skip": "gap-A4",
+      "description": "scroll start over a filtered match — typical bulk-match workload (matchID §2.9).",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search?scroll=1m",
+        "body": {
+          "query": { "match": { "NOM": "MARTIN" } },
+          "size": 500
+        }
+      }
+    },
+    {
+      "name": "scroll_match_all_size_1000",
+      "category": "scroll",
+      "skip": "gap-A4",
+      "description": "scroll start over match_all with a 1k page — the upper bound observed in `runRequest.ts`.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search?scroll=1m",
+        "body": {
+          "query": { "match_all": {} },
+          "size": 1000
+        }
+      }
+    },
+    {
+      "name": "range_date_naissance_window",
+      "category": "range",
+      "description": "closed range on DATE_NAISSANCE keyword (lex-sortable YYYYMMDD) — matchID §2.5.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "range": {
+              "DATE_NAISSANCE": { "gte": "19600101", "lte": "19601231" }
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 16,
+        "hits.hits[0]._id": "deces_00002"
+      }
+    },
+    {
+      "name": "range_date_naissance_lte_open",
+      "category": "range",
+      "description": "open-ended range (lte only) on DATE_NAISSANCE — matchID §2.5 supports half-open ranges.",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "range": {
+              "DATE_NAISSANCE": { "lte": "19200101" }
+            }
+          },
+          "size": 5
+        }
+      },
+      "expected": {
+        "hits.total.value": 347,
+        "hits.hits[0]._id": "deces_00004"
       }
     }
   ]

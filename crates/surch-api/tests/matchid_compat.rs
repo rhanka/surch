@@ -71,9 +71,9 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
     assert_eq!(manifest.dataset, "deces");
     assert_eq!(
         manifest.requests.len(),
-        10,
-        "replay manifest must declare exactly 10 entries (3 advanced + 2 block-match + 2 \
-         full-text + 2 prefix + 1 scroll)"
+        30,
+        "replay manifest must declare exactly 30 entries (8 advanced + 5 block-match + 4 \
+         full-text + 3 sort + 2 function_score + 3 prefix + 3 scroll + 2 range)"
     );
 
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime must start");
@@ -267,9 +267,14 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
         executed >= 3,
         "matchID v0 acceptance: at least 3 replay entries must execute against Surch (executed={executed}, skipped={skipped})"
     );
-    // The fixture is committed with the documented split (3 skip on A4/A6).
-    assert_eq!(executed + skipped, 10);
-    assert_eq!(skipped, 3, "expected 3 skipped entries (2 prefix on A6 + 1 scroll on A4)");
+    // The fixture is committed with the documented split: 24 executed + 6 skipped
+    // (3 prefix on A6 + 3 scroll on A4).
+    assert_eq!(executed + skipped, 30);
+    assert_eq!(
+        skipped, 6,
+        "expected 6 skipped entries (3 prefix on A6 + 3 scroll on A4)"
+    );
+    assert_eq!(executed, 24, "expected 24 executed entries against Surch HEAD");
 }
 
 async fn execute(
