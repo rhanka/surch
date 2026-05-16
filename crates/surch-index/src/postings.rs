@@ -255,6 +255,14 @@ impl TermDictionary {
             .get(field)
             .and_then(|field_postings| field_postings.lookup_block_metas(term))
     }
+
+    /// Returns the names of every field that has at least one term in
+    /// the dictionary, in lexicographic order. Used by the memory
+    /// accounting helper (`surch_index::memory`) to enumerate
+    /// `(field, term)` pairs without exposing the internal `BTreeMap`.
+    pub fn field_names(&self) -> Vec<String> {
+        self.fields.keys().cloned().collect()
+    }
 }
 
 #[derive(Debug, Clone)]

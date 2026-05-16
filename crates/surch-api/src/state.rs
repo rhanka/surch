@@ -7,10 +7,12 @@ use serde_json::Value;
 use surch_index::{
     document_index::DocumentIndex,
     mapping::{FieldMapping, IndexMapping},
+    memory::{document_index_memory_usage, stored_fields_bytes_for, MemoryUsage},
     postings::BlockMeta,
 };
 
 use crate::scroll::ScrollTable;
+use crate::stats::{clear_memory_gauges, refresh_memory_gauges};
 
 /// Shared in-memory API state used by API handlers.
 #[derive(Clone, Default)]
@@ -549,6 +551,11 @@ impl AppState {
             settings,
             aliases,
         );
+        drop(store);
+        // Empty index, but seed the gauges at zero so the scrape advertises
+        // the index from the moment it exists rather than only after the
+        // first write.
+        refresh_memory_gauges(self, index);
     }
 
     pub fn put_index_template(
@@ -640,6 +647,9 @@ impl AppState {
         }
         drop(store);
         self.invalidate_search_cache(index);
+        // Index gone: zero out its gauges so dashboards do not advertise
+        // stale RAM for a vanished tenant.
+        clear_memory_gauges(index);
     }
 
     pub fn refresh_index(&self, _index: &str) {}
@@ -672,6 +682,7 @@ impl AppState {
         data.upsert_document(id, source);
         drop(store);
         self.invalidate_search_cache(index);
+        refresh_memory_gauges(self, index);
     }
 
     pub fn create_document(&self, index: &str, id: &str, source: Value) -> bool {
@@ -698,6 +709,7 @@ impl AppState {
         data.upsert_document(id, source);
         drop(store);
         self.invalidate_search_cache(index);
+        refresh_memory_gauges(self, index);
         true
     }
 
@@ -715,6 +727,10 @@ impl AppState {
             .set_mapping(mapping);
         drop(store);
         self.invalidate_search_cache(index);
+        // A mapping change triggers a `rebuild_index()` on the
+        // DocumentIndex, so postings/prefix-postings sizes can swing
+        // wildly — refresh gauges.
+        refresh_memory_gauges(self, index);
     }
 
     /// Merge the supplied field mappings into the existing index mapping.
@@ -750,6 +766,7 @@ impl AppState {
         data.set_mapping(merged);
         drop(store);
         self.invalidate_search_cache(index);
+        refresh_memory_gauges(self, index);
         Ok(())
     }
 
@@ -763,6 +780,7 @@ impl AppState {
         }
         drop(store);
         self.invalidate_search_cache(index);
+        refresh_memory_gauges(self, index);
     }
 
     pub fn apply_document_writes(
@@ -846,6 +864,9 @@ impl AppState {
         drop(store);
         for index in &touched {
             self.invalidate_search_cache(index);
+            // Refresh after the locks are dropped — `refresh_memory_gauges`
+            // re-acquires `store` in read mode.
+            refresh_memory_gauges(self, index);
         }
 
         results
@@ -1241,6 +1262,34 @@ impl AppState {
             .map_or_else(TermScoringStats::default, |data| {
                 data.term_scoring_stats(field, term)
             })
+    }
+
+    /// Approximate memory usage for `index`. Returns `None` when the
+    /// index does not exist. `stored_fields_bytes` is filled here from
+    /// the API-owned `_source` documents (which live outside
+    /// [`DocumentIndex`]).
+    pub fn index_memory_usage(&self, index: &str) -> Option<MemoryUsage> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let data = store.indices.get(index)?;
+        let mut usage = document_index_memory_usage(&data.index);
+        usage.stored_fields_bytes = stored_fields_bytes_for(data.documents.values());
+        Some(usage)
+    }
+
+    /// Doc count for `index`. Returns `None` for an unknown index, so
+    /// callers can distinguish "missing" from "empty".
+    pub fn index_doc_count(&self, index: &str) -> Option<u64> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.documents.len() as u64)
     }
 
     pub fn term_matches_count(&self, index: &str, field: &str, value: &str) -> usize {
