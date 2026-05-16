@@ -33,7 +33,25 @@ pub struct SearchRequest {
     pub sort: Vec<SortClause>,
     pub highlight: Option<HighlightRequest>,
     pub min_score: Option<f64>,
+    /// A12.1: declared aggregations. Today only `terms` aggs are
+    /// honoured; the parser rejects every other type with an explicit
+    /// "phase 2" error so the wire shape stays diagnosable.
+    pub aggs: BTreeMap<String, AggSpec>,
 }
+
+/// A12.1: aggregation specification subset supported by Surch today.
+/// matchID's wire shape uses `terms`, `date_histogram`, `composite` and
+/// `cardinality` (intake §2.10). Only `terms` is implemented in this
+/// MVP; the other three are tracked in A12 phase 2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AggSpec {
+    /// `terms` aggregation: bucket documents by the distinct values of
+    /// `field` and return the top `size` buckets ordered by descending
+    /// `doc_count` (with ascending key as the deterministic tiebreak).
+    Terms { field: String, size: usize },
+}
+
+const DEFAULT_TERMS_AGG_SIZE: usize = 10;
 
 /// Single OpenSearch `sort` clause.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +216,27 @@ pub struct SearchResponse {
     /// each non-empty page returned by `scroll_handler`.
     #[serde(rename = "_scroll_id", skip_serializing_if = "Option::is_none")]
     pub scroll_id: Option<String>,
+    /// A12.1: per-aggregation bucket set, keyed by the aggregation name
+    /// supplied in the request. Omitted when the request carries no
+    /// `aggs` (or `aggregations`) block, so existing zero-agg callers
+    /// continue to see the same response shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregations: Option<BTreeMap<String, AggBucketSet>>,
+}
+
+/// A12.1: container holding the buckets returned for a single agg name.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AggBucketSet {
+    pub buckets: Vec<AggBucket>,
+}
+
+/// A12.1: ES-7.x compatible bucket payload (`{ "key": …, "doc_count": N }`).
+/// `key` is the verbatim `_source` value so numeric / string keys keep
+/// their JSON type unchanged through the response.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AggBucket {
+    pub key: Value,
+    pub doc_count: u64,
 }
 
 /// OpenSearch-compatible shard summary for `_search`.
@@ -261,6 +300,7 @@ pub fn build_search_response_with_total(
             hits,
         },
         scroll_id: None,
+        aggregations: None,
     }
 }
 
@@ -704,8 +744,15 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     let started_at = Instant::now();
     let scoring_enabled = request.query.as_ref().is_some_and(is_scoring_query);
 
-    if let Some(response) = run_topk_search(state, indices, request, scoring_enabled, started_at) {
-        return response;
+    // A12.1: when aggregations are requested we must walk every matched
+    // document (not just the top-K window) so the bucket counts cover
+    // the full match set. Skip the top-K shortcut in that case.
+    if request.aggs.is_empty() {
+        if let Some(response) =
+            run_topk_search(state, indices, request, scoring_enabled, started_at)
+        {
+            return response;
+        }
     }
 
     let mut matched_documents: Vec<ScoredDocument> = Vec::new();
@@ -724,6 +771,7 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     sort_scored_documents(&mut matched_documents, &request.sort, scoring_enabled);
     let max_score = compute_max_score(&matched_documents, scoring_enabled);
     let total = matched_documents.len() as u64;
+    let aggregations = compute_aggregations(&request.aggs, &matched_documents);
     let hits = paginate_hits(request, &matched_documents, scoring_enabled);
     let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
 
@@ -733,7 +781,113 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
         started_at.elapsed().as_millis() as u64,
     );
     response.hits.max_score = max_score;
+    response.aggregations = aggregations;
     response
+}
+
+/// A12.1: dispatch every declared aggregation against the post-filter
+/// matched-document set. Returns `None` when no aggs are declared so
+/// the response stays shape-compatible with zero-agg callers.
+fn compute_aggregations(
+    specs: &BTreeMap<String, AggSpec>,
+    matched_documents: &[ScoredDocument],
+) -> Option<BTreeMap<String, AggBucketSet>> {
+    if specs.is_empty() {
+        return None;
+    }
+    let mut out: BTreeMap<String, AggBucketSet> = BTreeMap::new();
+    for (name, spec) in specs {
+        let bucket_set = match spec {
+            AggSpec::Terms { field, size } => {
+                compute_terms_aggregation(matched_documents, field, *size)
+            }
+        };
+        out.insert(name.clone(), bucket_set);
+    }
+    Some(out)
+}
+
+/// A12.1: `terms` aggregation executor. Iterates the matched documents,
+/// reads `_source[field]` (with the `.raw` / `.norm` sub-field alias
+/// already handled by `lookup_sort_value`), counts buckets, and returns
+/// the top `size` ordered by `doc_count` desc + key asc tiebreak.
+///
+/// Behaviour notes:
+/// - `null` and missing values are skipped (matches ES default — a
+///   `missing` bucket would need an explicit `missing: "…"` option,
+///   which is out of scope here),
+/// - array-valued fields contribute one increment per element (matches
+///   ES `keyword[]` semantics),
+/// - `size = 0` returns an empty bucket list (ES rejects this with 400,
+///   but Surch treats it as "no buckets requested" today; tighten when
+///   matchID's UI starts emitting it).
+fn compute_terms_aggregation(
+    matched_documents: &[ScoredDocument],
+    field: &str,
+    size: usize,
+) -> AggBucketSet {
+    let mut counts: BTreeMap<TermsKey, (Value, u64)> = BTreeMap::new();
+    for scored in matched_documents {
+        let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
+            continue;
+        };
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    record_terms_value(&mut counts, item);
+                }
+            }
+            other => record_terms_value(&mut counts, other),
+        }
+    }
+
+    // Two-stage sort: doc_count desc, then key asc as tiebreak.
+    let mut sorted: Vec<(Value, u64)> = counts.into_values().collect();
+    sorted.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| compare_values(&left.0, &right.0))
+    });
+
+    let buckets = sorted
+        .into_iter()
+        .take(size)
+        .map(|(key, doc_count)| AggBucket { key, doc_count })
+        .collect();
+    AggBucketSet { buckets }
+}
+
+fn record_terms_value(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Value) {
+    if matches!(value, Value::Null) {
+        return;
+    }
+    let key = TermsKey::from_value(value);
+    let entry = counts.entry(key).or_insert_with(|| (value.clone(), 0));
+    entry.1 += 1;
+}
+
+/// A12.1: dedup key for the `terms` aggregation. We cannot hash a
+/// `serde_json::Value` directly (NaN poisons `Number` equality), so we
+/// project to a stable byte-shape that round-trips through `BTreeMap`
+/// without losing JSON type fidelity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TermsKey {
+    Bool(bool),
+    Number(String),
+    String(String),
+    Other(String),
+}
+
+impl TermsKey {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Bool(b) => TermsKey::Bool(*b),
+            Value::Number(n) => TermsKey::Number(n.to_string()),
+            Value::String(s) => TermsKey::String(s.clone()),
+            other => TermsKey::Other(other.to_string()),
+        }
+    }
 }
 
 fn run_topk_search(
@@ -1502,6 +1656,7 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
             sort: Vec::new(),
             highlight: None,
             min_score: None,
+            aggs: BTreeMap::new(),
         });
     }
 
@@ -1542,6 +1697,10 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
         .unwrap_or_default();
     let highlight = object.get("highlight").map(parse_highlight).transpose()?;
     let min_score = object.get("min_score").map(parse_min_score).transpose()?;
+    // ES accepts both `aggs` and `aggregations` — matchID's UI emits
+    // the short form, the analytics tab emits the long form.
+    let aggs_value = object.get("aggs").or_else(|| object.get("aggregations"));
+    let aggs = aggs_value.map(parse_aggs).transpose()?.unwrap_or_default();
 
     // ES 7.x `index.max_result_window` defaults to 10 000. Surch refuses
     // pagination requests that would force scoring beyond that window —
@@ -1566,7 +1725,127 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
         sort,
         highlight,
         min_score,
+        aggs,
     })
+}
+
+/// A12.1: parse the top-level `aggs` / `aggregations` block. Only `terms`
+/// is honoured today — every other agg type returns a deterministic
+/// "phase 2" parse error so matchID's analytics tab sees a parseable
+/// 400 instead of a silent zero-bucket response.
+fn parse_aggs(value: &Value) -> Result<BTreeMap<String, AggSpec>, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`aggs` must be an object",
+        )
+    })?;
+    let mut aggs = BTreeMap::new();
+    for (name, body) in object {
+        if name.is_empty() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "`aggs` entries must have non-empty names",
+            ));
+        }
+        let agg_body = body.as_object().ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`aggs.{name}` must be an object"),
+            )
+        })?;
+        // Reject sub-aggregations (`aggs` nested inside an agg body) —
+        // composite already implies sub-source semantics and we only
+        // ship terms here.
+        if agg_body.contains_key("aggs") || agg_body.contains_key("aggregations") {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: nested sub-aggregations not implemented yet, tracked in A12 phase 2"
+                ),
+            ));
+        }
+        let mut spec: Option<AggSpec> = None;
+        for (agg_type, agg_options) in agg_body {
+            let parsed = match agg_type.as_str() {
+                "terms" => parse_terms_agg(name, agg_options)?,
+                "date_histogram" | "composite" | "cardinality" => {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        format!(
+                            "agg type `{agg_type}` not implemented yet, tracked in A12 phase 2"
+                        ),
+                    ));
+                }
+                other => {
+                    return Err(OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        format!(
+                            "agg type `{other}` not implemented yet, tracked in A12 phase 2"
+                        ),
+                    ));
+                }
+            };
+            if spec.is_some() {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("agg `{name}` must declare exactly one agg type"),
+                ));
+            }
+            spec = Some(parsed);
+        }
+        let spec = spec.ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("agg `{name}` must declare an agg type"),
+            )
+        })?;
+        aggs.insert(name.clone(), spec);
+    }
+    Ok(aggs)
+}
+
+fn parse_terms_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("agg `{name}`: `terms` body must be an object"),
+        )
+    })?;
+    let field = object
+        .get("field")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("agg `{name}`: `terms.field` is required"),
+            )
+        })?
+        .to_string();
+    let size = match object.get("size") {
+        None => DEFAULT_TERMS_AGG_SIZE,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("agg `{name}`: `terms.size` must be a non-negative integer"),
+                )
+            })?;
+            usize::try_from(n).unwrap_or(usize::MAX)
+        }
+    };
+    Ok(AggSpec::Terms { field, size })
 }
 
 fn parse_min_score(value: &Value) -> Result<f64, OpenSearchError> {
