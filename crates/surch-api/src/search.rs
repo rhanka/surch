@@ -973,9 +973,7 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
             matched_documents.retain(|doc| doc.score >= min);
         }
     }
-    let sort_mapping = indices
-        .first()
-        .and_then(|index| state.index_mapping(index));
+    let sort_mapping = indices.first().and_then(|index| state.index_mapping(index));
     sort_scored_documents(
         &mut matched_documents,
         &request.sort,
@@ -1032,12 +1030,7 @@ fn compute_aggregations(
                 sources,
                 size,
                 after,
-            } => compute_composite_aggregation(
-                matched_documents,
-                sources,
-                *size,
-                after.as_ref(),
-            ),
+            } => compute_composite_aggregation(matched_documents, sources, *size, after.as_ref()),
         };
         out.insert(name.clone(), result);
     }
@@ -1128,16 +1121,13 @@ fn compute_date_histogram_aggregation(
         match value {
             Value::Array(items) => {
                 for item in items {
-                    if let Some(bucket_key) =
-                        bucket_key_for_date(item, calendar_interval)
-                    {
+                    if let Some(bucket_key) = bucket_key_for_date(item, calendar_interval) {
                         *counts.entry(bucket_key).or_insert(0) += 1;
                     }
                 }
             }
             other => {
-                if let Some(bucket_key) = bucket_key_for_date(other, calendar_interval)
-                {
+                if let Some(bucket_key) = bucket_key_for_date(other, calendar_interval) {
                     *counts.entry(bucket_key).or_insert(0) += 1;
                 }
             }
@@ -1180,8 +1170,7 @@ fn bucket_key_for_date(value: &Value, interval: CalendarInterval) -> Option<Stri
             // input date. We compute the day-of-year via the Gregorian
             // calendar (no chrono dependency), then anchor on Monday
             // using Zeller's congruence-style weekday derivation.
-            let (anchor_year, anchor_month, anchor_day) =
-                week_anchor_monday(year, month, day);
+            let (anchor_year, anchor_month, anchor_day) = week_anchor_monday(year, month, day);
             format!("{anchor_year:04}{anchor_month:02}{anchor_day:02}")
         }
     })
@@ -1229,10 +1218,7 @@ fn week_anchor_monday(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
 /// (same path as terms / sort). MVP: exact count, no HyperLogLog
 /// estimation — matchID's analytics tab consumes the exact value
 /// today.
-fn compute_cardinality_aggregation(
-    matched_documents: &[ScoredDocument],
-    field: &str,
-) -> AggResult {
+fn compute_cardinality_aggregation(matched_documents: &[ScoredDocument], field: &str) -> AggResult {
     let mut distinct: BTreeSet<TermsKey> = BTreeSet::new();
     for scored in matched_documents {
         let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
@@ -2020,12 +2006,8 @@ fn score_for_query(
                 return inner_score;
             }
 
-            let combined_factor = combine_scoring_functions(
-                functions,
-                *score_mode,
-                source,
-                &scoring_context.mapping,
-            );
+            let combined_factor =
+                combine_scoring_functions(functions, *score_mode, source, &scoring_context.mapping);
             combine_with_boost_mode(inner_score, combined_factor, *boost_mode)
         }
         // `geo_distance` is a filter — constant score so it does not
@@ -2089,14 +2071,8 @@ fn combine_scoring_functions(
         ScoreMode::Sum => factors.iter().sum(),
         ScoreMode::Avg => factors.iter().sum::<f64>() / factors.len() as f64,
         ScoreMode::First => factors[0],
-        ScoreMode::Min => factors
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min),
-        ScoreMode::Max => factors
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max),
+        ScoreMode::Min => factors.iter().copied().fold(f64::INFINITY, f64::min),
+        ScoreMode::Max => factors.iter().copied().fold(f64::NEG_INFINITY, f64::max),
     }
 }
 
@@ -2504,9 +2480,7 @@ fn parse_aggs(value: &Value) -> Result<BTreeMap<String, AggSpec>, OpenSearchErro
                     return Err(OpenSearchError::new(
                         StatusCode::BAD_REQUEST,
                         "parsing_exception",
-                        format!(
-                            "agg type `{other}` not implemented yet, tracked in A12 phase 2"
-                        ),
+                        format!("agg type `{other}` not implemented yet, tracked in A12 phase 2"),
                     ));
                 }
             };
@@ -2738,9 +2712,7 @@ fn parse_composite_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchE
             return Err(OpenSearchError::new(
                 StatusCode::BAD_REQUEST,
                 "parsing_exception",
-                format!(
-                    "agg `{name}`: duplicate composite source name `{source_name}`"
-                ),
+                format!("agg `{name}`: duplicate composite source name `{source_name}`"),
             ));
         }
         let source_body = source_body.as_object().ok_or_else(|| {
@@ -2818,9 +2790,7 @@ fn parse_composite_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchE
                 OpenSearchError::new(
                     StatusCode::BAD_REQUEST,
                     "parsing_exception",
-                    format!(
-                        "agg `{name}`: `composite.size` must be a non-negative integer"
-                    ),
+                    format!("agg `{name}`: `composite.size` must be a non-negative integer"),
                 )
             })?;
             usize::try_from(n).unwrap_or(usize::MAX)
@@ -3858,9 +3828,7 @@ fn parse_boost_mode(value: &Value) -> Result<BoostMode, OpenSearchError> {
 /// `field_value_factor`, `gauss`), optionally paired with `filter`
 /// (a sub-query) and an outer `weight` multiplier. Bare
 /// `{ "weight": <num> }` is allowed (matchID intake §2.2 sample).
-fn parse_scoring_function_clause(
-    value: &Value,
-) -> Result<ScoringFunctionClause, OpenSearchError> {
+fn parse_scoring_function_clause(value: &Value) -> Result<ScoringFunctionClause, OpenSearchError> {
     let object = value.as_object().ok_or_else(|| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -3950,9 +3918,7 @@ fn parse_scoring_function_clause(
 }
 
 /// Parse a `field_value_factor` function body.
-fn parse_field_value_factor_function(
-    value: &Value,
-) -> Result<ScoringFunction, OpenSearchError> {
+fn parse_field_value_factor_function(value: &Value) -> Result<ScoringFunction, OpenSearchError> {
     let object = value.as_object().ok_or_else(|| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -4244,7 +4210,11 @@ fn parse_day_duration(text: &str) -> Option<f64> {
     if let Some(stripped) = trimmed.strip_suffix('d') {
         stripped.parse::<f64>().ok().filter(|n| n.is_finite())
     } else if let Some(stripped) = trimmed.strip_suffix("days") {
-        stripped.trim().parse::<f64>().ok().filter(|n| n.is_finite())
+        stripped
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
     } else {
         trimmed.parse::<f64>().ok().filter(|n| n.is_finite())
     }
@@ -4353,9 +4323,11 @@ fn parse_geo_distance_meters(value: &Value) -> Result<f64, OpenSearchError> {
     };
 
     match value {
-        Value::Number(number) => number_meters(number.as_f64().ok_or_else(|| {
-            bad("must fit in a 64-bit float")
-        })?),
+        Value::Number(number) => number_meters(
+            number
+                .as_f64()
+                .ok_or_else(|| bad("must fit in a 64-bit float"))?,
+        ),
         Value::String(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty() {
@@ -4368,15 +4340,21 @@ fn parse_geo_distance_meters(value: &Value) -> Result<f64, OpenSearchError> {
                 .unwrap_or(trimmed.len());
             let (head, tail) = trimmed.split_at(split_at);
             let value: f64 = head.parse().map_err(|_| {
-                bad(&format!("`{trimmed}` is not a valid number with optional unit suffix"))
+                bad(&format!(
+                    "`{trimmed}` is not a valid number with optional unit suffix"
+                ))
             })?;
             let unit = tail.trim();
             let multiplier = geo_distance_unit_meters(unit).ok_or_else(|| {
-                bad(&format!("unsupported unit `{unit}` (expected one of km|m|mi|yd|ft|NM)"))
+                bad(&format!(
+                    "unsupported unit `{unit}` (expected one of km|m|mi|yd|ft|NM)"
+                ))
             })?;
             number_meters(value * multiplier)
         }
-        _ => Err(bad("must be a string with a unit suffix or a number of metres")),
+        _ => Err(bad(
+            "must be a string with a unit suffix or a number of metres",
+        )),
     }
 }
 
@@ -4434,12 +4412,14 @@ pub fn parse_geo_point_source(value: &Value) -> Result<(f64, f64), String> {
             if parts.len() != 2 {
                 return Err("string form must be `\"<lat>,<lon>\"`".to_owned());
             }
-            let lat: f64 = parts[0].trim().parse().map_err(|_| {
-                format!("string `lat` part `{}` is not numeric", parts[0])
-            })?;
-            let lon: f64 = parts[1].trim().parse().map_err(|_| {
-                format!("string `lon` part `{}` is not numeric", parts[1])
-            })?;
+            let lat: f64 = parts[0]
+                .trim()
+                .parse()
+                .map_err(|_| format!("string `lat` part `{}` is not numeric", parts[0]))?;
+            let lon: f64 = parts[1]
+                .trim()
+                .parse()
+                .map_err(|_| format!("string `lon` part `{}` is not numeric", parts[1]))?;
             let lat = finite_coord("`lat`", lat)?;
             let lon = finite_coord("`lon`", lon)?;
             validate_geo_point_bounds(lat, lon)?;
@@ -5192,7 +5172,9 @@ fn lookup_sort_value<'a>(source: &'a Value, field: &str) -> Option<&'a Value> {
     if let Some(value) = object.get(field) {
         return Some(value);
     }
-    field.rsplit_once('.').and_then(|(parent, _)| object.get(parent))
+    field
+        .rsplit_once('.')
+        .and_then(|(parent, _)| object.get(parent))
 }
 
 fn compare_score(left: f64, right: f64, order: SortOrder) -> std::cmp::Ordering {

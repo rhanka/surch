@@ -161,7 +161,10 @@ async fn stats_grows_with_documents() {
 
     assert!(postings > 0, "postings_bytes should grow with 100 docs");
     assert!(stored > 0, "stored_fields_bytes should grow with 100 docs");
-    assert!(field_stats > 0, "field_stats_bytes should grow with 100 docs");
+    assert!(
+        field_stats > 0,
+        "field_stats_bytes should grow with 100 docs"
+    );
     assert!(
         total >= postings + stored + term_stats + field_stats + prefix,
         "total_bytes should cover every component; got total={total}, components sum={}",

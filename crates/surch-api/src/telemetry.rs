@@ -34,9 +34,7 @@ use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider, Tracer as SdkTracer};
 use opentelemetry_sdk::Resource;
-use tracing_subscriber::{
-    layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
-};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 const OTLP_ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 const OTLP_SAMPLER_ARG_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";

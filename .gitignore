@@ -37,7 +37,6 @@ surch-ban-*.png
 *.bak
 *.tmp
 target/
-Cargo.lock
 .worktrees/
 __pycache__/
 *.pyc

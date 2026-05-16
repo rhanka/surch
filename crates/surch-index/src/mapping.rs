@@ -259,11 +259,7 @@ impl FieldMapping {
         if self.field_type != FieldType::Date {
             return None;
         }
-        Some(
-            self.date_format
-                .as_deref()
-                .unwrap_or(DEFAULT_DATE_FORMAT),
-        )
+        Some(self.date_format.as_deref().unwrap_or(DEFAULT_DATE_FORMAT))
     }
 
     pub fn analyzer(&self) -> AnalyzerName {
@@ -546,36 +542,31 @@ impl IndexMapping {
     /// `lowercase`/`asciifolding` are accepted but stored verbatim for
     /// later inspection — the executor honours only the two we ship.
     pub fn from_index_settings_value(value: &Value) -> Result<AnalysisSettings, MappingError> {
-        let settings = value
-            .as_object()
-            .ok_or(MappingError::SettingsNotObject)?;
+        let settings = value.as_object().ok_or(MappingError::SettingsNotObject)?;
 
         let analysis = match settings.get("analysis") {
-            Some(value) => value
-                .as_object()
-                .ok_or(MappingError::AnalysisNotObject)?,
+            Some(value) => value.as_object().ok_or(MappingError::AnalysisNotObject)?,
             None => return Ok(AnalysisSettings::default()),
         };
 
         let mut parsed = AnalysisSettings::default();
 
         if let Some(tokenizers) = analysis.get("tokenizer") {
-            let tokenizers = tokenizers
-                .as_object()
-                .ok_or(MappingError::AnalysisSectionNotObject {
-                    section: "tokenizer".to_owned(),
-                })?;
-            for (name, definition) in tokenizers {
-                let definition = definition.as_object().ok_or_else(|| {
-                    MappingError::AnalysisEntryNotObject {
+            let tokenizers =
+                tokenizers
+                    .as_object()
+                    .ok_or(MappingError::AnalysisSectionNotObject {
                         section: "tokenizer".to_owned(),
-                        name: name.clone(),
-                    }
-                })?;
-                let kind = definition
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                    })?;
+            for (name, definition) in tokenizers {
+                let definition =
+                    definition
+                        .as_object()
+                        .ok_or_else(|| MappingError::AnalysisEntryNotObject {
+                            section: "tokenizer".to_owned(),
+                            name: name.clone(),
+                        })?;
+                let kind = definition.get("type").and_then(Value::as_str).unwrap_or("");
                 if kind != "edge_ngram" {
                     // forward-compatible: skip unsupported tokenizer types
                     continue;
@@ -617,54 +608,56 @@ impl IndexMapping {
         }
 
         if let Some(analyzers) = analysis.get("analyzer") {
-            let analyzers = analyzers
-                .as_object()
-                .ok_or(MappingError::AnalysisSectionNotObject {
-                    section: "analyzer".to_owned(),
-                })?;
-            for (name, definition) in analyzers {
-                let definition = definition.as_object().ok_or_else(|| {
-                    MappingError::AnalysisEntryNotObject {
+            let analyzers =
+                analyzers
+                    .as_object()
+                    .ok_or(MappingError::AnalysisSectionNotObject {
                         section: "analyzer".to_owned(),
-                        name: name.clone(),
-                    }
-                })?;
+                    })?;
+            for (name, definition) in analyzers {
+                let definition =
+                    definition
+                        .as_object()
+                        .ok_or_else(|| MappingError::AnalysisEntryNotObject {
+                            section: "analyzer".to_owned(),
+                            name: name.clone(),
+                        })?;
                 let tokenizer = definition
                     .get("tokenizer")
                     .and_then(Value::as_str)
                     .unwrap_or("standard")
                     .to_owned();
                 let filter = read_filter_chain(definition, name, "analyzer")?;
-                parsed.analyzers.insert(
-                    name.clone(),
-                    AnalyzerDefinition { tokenizer, filter },
-                );
+                parsed
+                    .analyzers
+                    .insert(name.clone(), AnalyzerDefinition { tokenizer, filter });
             }
         }
 
         if let Some(normalizers) = analysis.get("normalizer") {
-            let normalizers = normalizers
-                .as_object()
-                .ok_or(MappingError::AnalysisSectionNotObject {
-                    section: "normalizer".to_owned(),
-                })?;
-            for (name, definition) in normalizers {
-                let definition = definition.as_object().ok_or_else(|| {
-                    MappingError::AnalysisEntryNotObject {
+            let normalizers =
+                normalizers
+                    .as_object()
+                    .ok_or(MappingError::AnalysisSectionNotObject {
                         section: "normalizer".to_owned(),
-                        name: name.clone(),
-                    }
-                })?;
+                    })?;
+            for (name, definition) in normalizers {
+                let definition =
+                    definition
+                        .as_object()
+                        .ok_or_else(|| MappingError::AnalysisEntryNotObject {
+                            section: "normalizer".to_owned(),
+                            name: name.clone(),
+                        })?;
                 let kind = definition
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("custom")
                     .to_owned();
                 let filter = read_filter_chain(definition, name, "normalizer")?;
-                parsed.normalizers.insert(
-                    name.clone(),
-                    NormalizerDefinition { kind, filter },
-                );
+                parsed
+                    .normalizers
+                    .insert(name.clone(), NormalizerDefinition { kind, filter });
             }
         }
 
@@ -690,10 +683,7 @@ fn parse_field_definition(
             field: field.to_owned(),
         })?;
 
-    let field_type_name = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("text");
+    let field_type_name = object.get("type").and_then(Value::as_str).unwrap_or("text");
     let field_type = FieldType::from_name(field_type_name).ok_or_else(|| {
         MappingError::UnsupportedFieldType {
             field: field.to_owned(),
@@ -837,22 +827,26 @@ fn parse_index_prefixes(field: &str, value: &Value) -> Result<FieldPrefixes, Map
     }
 
     let min_chars = match object.get("min_chars") {
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| MappingError::IndexPrefixesBoundNotUnsigned {
-                field: field.to_owned(),
-                bound: "min_chars".to_owned(),
-            })? as usize,
+        Some(value) => {
+            value
+                .as_u64()
+                .ok_or_else(|| MappingError::IndexPrefixesBoundNotUnsigned {
+                    field: field.to_owned(),
+                    bound: "min_chars".to_owned(),
+                })? as usize
+        }
         None => FieldPrefixes::DEFAULT_MIN_CHARS,
     };
 
     let max_chars = match object.get("max_chars") {
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| MappingError::IndexPrefixesBoundNotUnsigned {
-                field: field.to_owned(),
-                bound: "max_chars".to_owned(),
-            })? as usize,
+        Some(value) => {
+            value
+                .as_u64()
+                .ok_or_else(|| MappingError::IndexPrefixesBoundNotUnsigned {
+                    field: field.to_owned(),
+                    bound: "max_chars".to_owned(),
+                })? as usize
+        }
         None => FieldPrefixes::DEFAULT_MAX_CHARS,
     };
 
@@ -944,7 +938,9 @@ pub enum MappingError {
         min_chars: usize,
         max_chars: usize,
     },
-    #[error("field `{field}` index_prefixes is only supported on text fields (got `{field_type}`)")]
+    #[error(
+        "field `{field}` index_prefixes is only supported on text fields (got `{field_type}`)"
+    )]
     IndexPrefixesNotSupported { field: String, field_type: String },
     #[error("field `{field}` fields must be an object")]
     SubfieldsNotObject { field: String },
@@ -1101,9 +1097,7 @@ mod tests {
             .expect("empty index_prefixes should default to min=2/max=5");
         let nom = mapping.field("NOM").expect("NOM field exists");
         assert_eq!(nom.field_type, FieldType::Text);
-        let prefixes = nom
-            .index_prefixes
-            .expect("index_prefixes recorded on NOM");
+        let prefixes = nom.index_prefixes.expect("index_prefixes recorded on NOM");
         assert_eq!(prefixes.min_chars, FieldPrefixes::DEFAULT_MIN_CHARS);
         assert_eq!(prefixes.max_chars, FieldPrefixes::DEFAULT_MAX_CHARS);
         assert_eq!(prefixes.min_chars, 2);
@@ -1185,8 +1179,7 @@ mod tests {
             "GEOPOINT_DECES": { "type": "geo_point" }
         });
 
-        let mapping = IndexMapping::from_properties_value(&properties)
-            .expect("geo_point parse");
+        let mapping = IndexMapping::from_properties_value(&properties).expect("geo_point parse");
         let value = mapping.as_value();
         assert_eq!(
             value["properties"]["GEOPOINT_DECES"]["type"],
@@ -1203,11 +1196,14 @@ mod tests {
         });
         let error = IndexMapping::from_properties_value(&properties)
             .expect_err("analyzer on geo_point must be rejected");
-        assert!(matches!(
-            &error,
-            MappingError::AnalyzerNotSupported { field, field_type }
-                if field == "GEOPOINT_NAISSANCE" && field_type == "geo_point",
-        ), "got {error:?}");
+        assert!(
+            matches!(
+                &error,
+                MappingError::AnalyzerNotSupported { field, field_type }
+                    if field == "GEOPOINT_NAISSANCE" && field_type == "geo_point",
+            ),
+            "got {error:?}"
+        );
     }
 
     // ---------------------------------------------------------------------

@@ -1563,7 +1563,10 @@ async fn prefix_query_falls_back_to_source_scan_above_max_chars() {
         .collect();
     // No DUPOND in the corpus, but the fallback must still execute without
     // returning false positives from the precomputed [2..5] prefix table.
-    assert!(ids.is_empty(), "DUPOND must not match DUPONT via prefix fallback (got {ids:?})");
+    assert!(
+        ids.is_empty(),
+        "DUPOND must not match DUPONT via prefix fallback (got {ids:?})"
+    );
 }
 
 #[tokio::test]
@@ -2579,11 +2582,7 @@ async fn match_object_form_without_fuzziness_keeps_default_semantics() {
     index_product(&router, "sku-jean", r#"{"name":"JEAN"}"#).await;
     index_product(&router, "sku-paul", r#"{"name":"PAUL"}"#).await;
 
-    let body = search_with_body(
-        &router,
-        r#"{"query":{"match":{"name":{"query":"JEAN"}}}}"#,
-    )
-    .await;
+    let body = search_with_body(&router, r#"{"query":{"match":{"name":{"query":"JEAN"}}}}"#).await;
 
     let ids: Vec<String> = body["hits"]["hits"]
         .as_array()
@@ -2758,8 +2757,11 @@ async fn search_router_a14_track_total_hits_true_returns_eq_relation() {
     index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
     index_product(&router, "sku-3", r#"{"name":"lamp"}"#).await;
 
-    let body =
-        search_with_body(&router, r#"{"query":{"match_all":{}},"track_total_hits":true}"#).await;
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"track_total_hits":true}"#,
+    )
+    .await;
 
     assert_eq!(body["hits"]["total"]["value"], 3);
     assert_eq!(body["hits"]["total"]["relation"], "eq");
@@ -2854,11 +2856,7 @@ async fn search_router_a11_min_score_is_ignored_on_unscored_queries() {
     index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
     index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
 
-    let body = search_with_body(
-        &router,
-        r#"{"query":{"match_all":{}},"min_score":1000.0}"#,
-    )
-    .await;
+    let body = search_with_body(&router, r#"{"query":{"match_all":{}},"min_score":1000.0}"#).await;
 
     assert_eq!(body["hits"]["total"]["value"], 2);
 }
@@ -2885,9 +2883,7 @@ async fn search_router_a11_min_score_rejects_negative_value() {
                 .method(Method::POST)
                 .uri("/products/_search")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"query":{"match_all":{}},"min_score":-1.0}"#,
-                ))
+                .body(Body::from(r#"{"query":{"match_all":{}},"min_score":-1.0}"#))
                 .expect("request should build"),
         )
         .await
@@ -2912,9 +2908,11 @@ async fn search_router_a9_from_size_returns_requested_slice() {
         index_product(&router, &format!("sku-{i}"), r#"{"name":"desk"}"#).await;
     }
 
-    let body =
-        search_with_body(&router, r#"{"query":{"match":{"name":"desk"}},"from":0,"size":2}"#)
-            .await;
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":"desk"}},"from":0,"size":2}"#,
+    )
+    .await;
     assert_eq!(body["hits"]["total"]["value"], 5);
     assert_eq!(body["hits"]["hits"].as_array().unwrap().len(), 2);
 }
@@ -2926,12 +2924,16 @@ async fn search_router_a9_from_size_paginates_to_next_page() {
         index_product(&router, &format!("sku-{i}"), r#"{"name":"desk"}"#).await;
     }
 
-    let page1 =
-        search_with_body(&router, r#"{"query":{"match":{"name":"desk"}},"from":0,"size":2}"#)
-            .await;
-    let page2 =
-        search_with_body(&router, r#"{"query":{"match":{"name":"desk"}},"from":2,"size":2}"#)
-            .await;
+    let page1 = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":"desk"}},"from":0,"size":2}"#,
+    )
+    .await;
+    let page2 = search_with_body(
+        &router,
+        r#"{"query":{"match":{"name":"desk"}},"from":2,"size":2}"#,
+    )
+    .await;
 
     let ids = |b: &serde_json::Value| -> Vec<String> {
         b["hits"]["hits"]
@@ -3085,15 +3087,14 @@ async fn search_router_a10_sort_missing_field_goes_last() {
     )
     .await;
 
-    let last_id = body["hits"]["hits"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()["_id"]
+    let last_id = body["hits"]["hits"].as_array().unwrap().last().unwrap()["_id"]
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(last_id, "sku-3", "missing values must sort last regardless of order");
+    assert_eq!(
+        last_id, "sku-3",
+        "missing values must sort last regardless of order"
+    );
 }
 
 // --- A10 phase 2: multi-field sub-fields (matchID intake §2.12) ---
@@ -3383,18 +3384,8 @@ async fn search_router_a5_phase2_field_value_factor_log1p_modifies_score() {
     let router = app_router();
     // Two docs match the same query but carry different AGE_DECES
     // values; the field_value_factor reranks them by log1p(age * 0.1).
-    index_product(
-        &router,
-        "deces-1",
-        r#"{"NOM":"MARTIN","AGE_DECES":90}"#,
-    )
-    .await;
-    index_product(
-        &router,
-        "deces-2",
-        r#"{"NOM":"MARTIN","AGE_DECES":10}"#,
-    )
-    .await;
+    index_product(&router, "deces-1", r#"{"NOM":"MARTIN","AGE_DECES":90}"#).await;
+    index_product(&router, "deces-2", r#"{"NOM":"MARTIN","AGE_DECES":10}"#).await;
 
     let body = search_with_body(
         &router,
@@ -3826,11 +3817,36 @@ async fn search_router_a12_4_composite_emits_one_bucket_per_unique_key() {
     //   - (MARTIN, 19620101) x 2
     //   - (MARTIN, 19620201) x 1
     //   - (DUPONT, 19500715) x 2
-    index_product(&router, "doc-1", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#).await;
-    index_product(&router, "doc-2", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#).await;
-    index_product(&router, "doc-3", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620201"}"#).await;
-    index_product(&router, "doc-4", r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#).await;
-    index_product(&router, "doc-5", r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#).await;
+    index_product(
+        &router,
+        "doc-1",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-2",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-3",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620201"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-4",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-5",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#,
+    )
+    .await;
 
     let body = search_with_body(
         &router,
@@ -3841,7 +3857,11 @@ async fn search_router_a12_4_composite_emits_one_bucket_per_unique_key() {
     let buckets = body["aggregations"]["by_pair"]["buckets"]
         .as_array()
         .expect("buckets array");
-    assert_eq!(buckets.len(), 3, "three distinct (NOM, DATE_NAISSANCE) pairs");
+    assert_eq!(
+        buckets.len(),
+        3,
+        "three distinct (NOM, DATE_NAISSANCE) pairs"
+    );
     // BTreeMap iteration order: DUPONT/19500715 < MARTIN/19620101 < MARTIN/19620201.
     assert_eq!(buckets[0]["key"]["lastName"], "DUPONT");
     assert_eq!(buckets[0]["key"]["birthDate"], "19500715");
@@ -3863,11 +3883,36 @@ async fn search_router_a12_4_composite_emits_one_bucket_per_unique_key() {
 async fn search_router_a12_4_composite_caps_at_size_and_emits_after_key() {
     let router = app_router();
     // Same 5 docs / 3 distinct keys as the previous test.
-    index_product(&router, "doc-1", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#).await;
-    index_product(&router, "doc-2", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#).await;
-    index_product(&router, "doc-3", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620201"}"#).await;
-    index_product(&router, "doc-4", r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#).await;
-    index_product(&router, "doc-5", r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#).await;
+    index_product(
+        &router,
+        "doc-1",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-2",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-3",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620201"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-4",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-5",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#,
+    )
+    .await;
 
     let body = search_with_body(
         &router,
@@ -3908,7 +3953,9 @@ async fn search_router_a12_4_composite_caps_at_size_and_emits_after_key() {
     assert_eq!(buckets_next[0]["key"]["lastName"], "MARTIN");
     assert_eq!(buckets_next[0]["key"]["birthDate"], "19620201");
     assert!(
-        body_next["aggregations"]["by_pair"].get("after_key").is_none(),
+        body_next["aggregations"]["by_pair"]
+            .get("after_key")
+            .is_none(),
         "end-of-stream → after_key omitted",
     );
 }
@@ -3954,7 +4001,6 @@ async fn search_router_a12_4_composite_rejects_date_histogram_source_with_phase2
     assert!(reason.contains("date_histogram"), "reason: {reason}");
     assert!(reason.contains("A12.4 phase 2"), "reason: {reason}");
 }
-
 
 // ---------------------------------------------------------------------------
 // A2 — `geo_point` field type + `geo_distance` filter (matchID §2.6/§2.12).

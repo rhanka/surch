@@ -318,10 +318,7 @@ impl DocumentIndex {
         analyzed_terms: &BTreeMap<(String, String), Vec<u32>>,
         prefixes: FieldPrefixes,
     ) {
-        let entry = self
-            .prefix_postings
-            .entry(field.to_owned())
-            .or_default();
+        let entry = self.prefix_postings.entry(field.to_owned()).or_default();
         for (_field, term) in analyzed_terms.keys() {
             let chars: Vec<char> = term.chars().collect();
             let token_len = chars.len();
@@ -372,8 +369,8 @@ mod tests {
 
     fn mapping_with_prefixes(field: &str, prefixes: FieldPrefixes) -> IndexMapping {
         let mut mapping = IndexMapping::new();
-        let field_mapping = FieldMapping::new(FieldType::Text, None)
-            .with_index_prefixes(Some(prefixes));
+        let field_mapping =
+            FieldMapping::new(FieldType::Text, None).with_index_prefixes(Some(prefixes));
         mapping.set_field_mapping(field, field_mapping);
         mapping
     }

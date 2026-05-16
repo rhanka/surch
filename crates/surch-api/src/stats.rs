@@ -42,18 +42,14 @@ pub fn clear_memory_gauges(index: &str) {
 
 fn set_gauges(index: &str, doc_count: u64, usage: &MemoryUsage) {
     let label = [("index", index.to_owned())];
-    metrics::gauge!("surch_index_postings_bytes", &label)
-        .set(usage.postings_bytes as f64);
+    metrics::gauge!("surch_index_postings_bytes", &label).set(usage.postings_bytes as f64);
     metrics::gauge!("surch_index_prefix_postings_bytes", &label)
         .set(usage.prefix_postings_bytes as f64);
     metrics::gauge!("surch_index_stored_fields_bytes", &label)
         .set(usage.stored_fields_bytes as f64);
-    metrics::gauge!("surch_index_field_stats_bytes", &label)
-        .set(usage.field_stats_bytes as f64);
-    metrics::gauge!("surch_index_term_stats_bytes", &label)
-        .set(usage.term_stats_bytes as f64);
-    metrics::gauge!("surch_index_total_bytes", &label)
-        .set(usage.total_bytes() as f64);
+    metrics::gauge!("surch_index_field_stats_bytes", &label).set(usage.field_stats_bytes as f64);
+    metrics::gauge!("surch_index_term_stats_bytes", &label).set(usage.term_stats_bytes as f64);
+    metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
     metrics::gauge!("surch_index_doc_count", &label).set(doc_count as f64);
 }
 

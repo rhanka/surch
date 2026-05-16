@@ -20,12 +20,9 @@ use serde_json::Value;
 use surch_api::app_router;
 use tower::ServiceExt;
 
-const MAPPING_BODY: &str =
-    include_str!("../../../tests/matchid_compat/deces/mapping.json");
-const SLICE_NDJSON: &str =
-    include_str!("../../../tests/matchid_compat/deces/slice-1000.ndjson");
-const REPLAY_JSON: &str =
-    include_str!("../../../tests/matchid_compat/replays/deces_v1.json");
+const MAPPING_BODY: &str = include_str!("../../../tests/matchid_compat/deces/mapping.json");
+const SLICE_NDJSON: &str = include_str!("../../../tests/matchid_compat/deces/slice-1000.ndjson");
+const REPLAY_JSON: &str = include_str!("../../../tests/matchid_compat/replays/deces_v1.json");
 
 const INDEX_NAME: &str = "deces";
 
@@ -129,10 +126,12 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
             continue;
         }
 
-        let expected = entry
-            .expected
-            .as_ref()
-            .unwrap_or_else(|| panic!("non-skipped replay entry `{}` must declare expected", entry.name));
+        let expected = entry.expected.as_ref().unwrap_or_else(|| {
+            panic!(
+                "non-skipped replay entry `{}` must declare expected",
+                entry.name
+            )
+        });
 
         let method = match entry.request.method.as_str() {
             "GET" => Method::GET,
@@ -150,9 +149,7 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
             (None, Some(lines)) => {
                 let mut buf = String::new();
                 for line in lines {
-                    buf.push_str(
-                        &serde_json::to_string(line).expect("ndjson line must serialize"),
-                    );
+                    buf.push_str(&serde_json::to_string(line).expect("ndjson line must serialize"));
                     buf.push('\n');
                 }
                 buf
@@ -265,9 +262,7 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
             // `POST /_search/scroll` lifecycle is covered by
             // `crates/surch-api/tests/scroll.rs`; here we only assert the
             // initial page exposes a usable cursor.
-            if entry.request.path.contains("?scroll=")
-                || entry.request.path.contains("&scroll=")
-            {
+            if entry.request.path.contains("?scroll=") || entry.request.path.contains("&scroll=") {
                 let scroll_id = body
                     .get("_scroll_id")
                     .and_then(Value::as_str)
@@ -303,15 +298,13 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
         skipped, 1,
         "expected 1 skipped entry (keyword-prefix on A6/A13)"
     );
-    assert_eq!(executed, 29, "expected 29 executed entries against Surch HEAD");
+    assert_eq!(
+        executed, 29,
+        "expected 29 executed entries against Surch HEAD"
+    );
 }
 
-async fn execute(
-    router: Router,
-    method: Method,
-    path: &str,
-    body: String,
-) -> (u16, Option<Value>) {
+async fn execute(router: Router, method: Method, path: &str, body: String) -> (u16, Option<Value>) {
     let response = router
         .oneshot(
             Request::builder()

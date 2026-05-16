@@ -103,10 +103,7 @@ pub fn stored_fields_bytes_for<'a, I>(documents: I) -> u64
 where
     I: IntoIterator<Item = &'a Value>,
 {
-    documents
-        .into_iter()
-        .map(approximate_value_bytes)
-        .sum()
+    documents.into_iter().map(approximate_value_bytes).sum()
 }
 
 /// Approximate the heap+inline footprint of a [`serde_json::Value`].
@@ -119,12 +116,7 @@ pub fn approximate_value_bytes(value: &Value) -> u64 {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => head,
         Value::String(s) => head + s.len() as u64,
-        Value::Array(items) => {
-            head + items
-                .iter()
-                .map(approximate_value_bytes)
-                .sum::<u64>()
-        }
+        Value::Array(items) => head + items.iter().map(approximate_value_bytes).sum::<u64>(),
         Value::Object(map) => {
             let mut total = head;
             for (key, value) in map {
@@ -248,8 +240,8 @@ mod tests {
     #[test]
     fn prefix_postings_are_counted_when_field_carries_index_prefixes() {
         let mut mapping = IndexMapping::new();
-        let field_mapping = FieldMapping::new(FieldType::Text, None)
-            .with_index_prefixes(Some(FieldPrefixes {
+        let field_mapping =
+            FieldMapping::new(FieldType::Text, None).with_index_prefixes(Some(FieldPrefixes {
                 min_chars: 2,
                 max_chars: 5,
             }));

@@ -163,10 +163,7 @@ pub fn app_router() -> Router {
         .route("/_cat/aliases/:name", get(cat::cat_aliases_by_name_handler))
         .route("/_cat/count", get(cat::cat_count_handler))
         .route("/_cat/count/:index", get(cat::cat_count_index_handler))
-        .route(
-            "/_surch/stats",
-            get(stats::stats_handler),
-        )
+        .route("/_surch/stats", get(stats::stats_handler))
         .route(
             "/_surch/snapshot/export",
             post(snapshot::export_handler).get(snapshot::export_handler),

@@ -269,10 +269,7 @@ pub struct EdgeNgramAnalyzer {
 
 impl EdgeNgramAnalyzer {
     pub fn new(min_gram: usize, max_gram: usize) -> Self {
-        Self {
-            min_gram,
-            max_gram,
-        }
+        Self { min_gram, max_gram }
     }
 }
 
