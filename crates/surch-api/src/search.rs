@@ -185,6 +185,17 @@ pub enum SearchQuery {
         fields: Vec<String>,
         operator: MatchOperator,
     },
+    /// `geo_distance` filter (matchID intake §2.6). Matches documents
+    /// whose `field` (a `geo_point`) is within `distance_meters` of the
+    /// `(lat, lon)` target, measured with the haversine formula. The
+    /// clause is non-scoring (constant `_score = 1.0`) — matchID always
+    /// uses it inside `bool.filter`.
+    GeoDistance {
+        field: String,
+        lat: f64,
+        lon: f64,
+        distance_meters: f64,
+    },
 }
 
 /// Inclusive/exclusive numeric or lexicographic bounds for `range` queries.
@@ -1321,6 +1332,8 @@ fn is_scoring_query(query: &SearchQuery) -> bool {
         | SearchQuery::Fuzzy { .. }
         | SearchQuery::Bool { .. } => true,
         SearchQuery::FunctionScore { inner, .. } => is_scoring_query(inner),
+        // `geo_distance` is a constant-score filter — never the scoring driver.
+        SearchQuery::GeoDistance { .. } => false,
         _ => false,
     }
 }
@@ -1474,6 +1487,9 @@ fn score_for_query(
         SearchQuery::FunctionScore { inner, boost } => {
             score_for_query(inner, internal_doc_id, scoring_context) * *boost
         }
+        // `geo_distance` is a filter — constant score so it does not
+        // perturb BM25 ranking (matchID always wraps it in `bool.filter`).
+        SearchQuery::GeoDistance { .. } => 1.0,
         _ => 1.0,
     }
 }
@@ -1563,6 +1579,8 @@ fn collect_scoring_field_tokens(
         SearchQuery::FunctionScore { inner, .. } => {
             collect_scoring_field_tokens(inner, mapping, field_tokens);
         }
+        // `geo_distance` does not contribute term statistics.
+        SearchQuery::GeoDistance { .. } => {}
         _ => {}
     }
 }
@@ -2250,6 +2268,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "wildcard" => parse_wildcard_query(query_body),
         "multi_match" => parse_multi_match_query(query_body),
         "function_score" => parse_function_score_query(query_body),
+        "geo_distance" => parse_geo_distance_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -2781,6 +2800,268 @@ fn parse_function_score_query(value: &Value) -> Result<SearchQuery, OpenSearchEr
     })
 }
 
+/// Parse a `geo_distance` query body (matchID intake §2.6).
+///
+/// Wire shape, verbatim from deces-backend:
+///
+/// ```json
+/// {
+///   "geo_distance": {
+///     "distance": "1km",
+///     "GEOPOINT_NAISSANCE": { "lat": 48.85, "lon": 2.35 }
+///   }
+/// }
+/// ```
+///
+/// The pivot field is named freely (matchID uses `GEOPOINT_NAISSANCE` and
+/// `GEOPOINT_DECES`); the parser pulls the first non-`distance`,
+/// non-`validation_method` key as the field.
+///
+/// Accepted source representations for the target point (and for the
+/// indexed geo_point at executor time, see `parse_geo_point_source`):
+/// - `{ "lat": <num>, "lon": <num> }` (matchID shape),
+/// - the string `"lat,lon"` (ES compat),
+/// - the GeoJSON-style array `[lon, lat]` (ES compat).
+///
+/// Distance units recognised (regex from `queries.ts:229`): `km`, `m`,
+/// `mi`, `yd`, `ft`, `NM`. Unit comparison is case-insensitive.
+fn parse_geo_distance_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`geo_distance` query body must be an object",
+        )
+    })?;
+
+    let distance_raw = object.get("distance").ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`geo_distance` query must contain `distance`",
+        )
+    })?;
+    let distance_meters = parse_geo_distance_meters(distance_raw)?;
+
+    // The pivot field is named freely. Skip ES-7.x bookkeeping keys
+    // (`distance`, `distance_type`, `validation_method`, `ignore_unmapped`)
+    // and take the first remaining key as the field.
+    let (field, point_value) = object
+        .iter()
+        .find(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "distance"
+                    | "distance_type"
+                    | "validation_method"
+                    | "ignore_unmapped"
+                    | "_name"
+                    | "boost",
+            )
+        })
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "`geo_distance` query must contain a geo_point field",
+            )
+        })?;
+
+    let (lat, lon) = parse_geo_point_source(point_value).map_err(|reason| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`geo_distance` field `{field}` has invalid geo_point: {reason}"),
+        )
+    })?;
+
+    Ok(SearchQuery::GeoDistance {
+        field: field.clone(),
+        lat,
+        lon,
+        distance_meters,
+    })
+}
+
+/// Parse a `distance` value into metres. matchID emits the string form
+/// `"<number><unit>"` (e.g. `"1km"`); ES also accepts a bare number,
+/// which we treat as metres.
+fn parse_geo_distance_meters(value: &Value) -> Result<f64, OpenSearchError> {
+    let bad = |reason: &str| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`geo_distance.distance` {reason}"),
+        )
+    };
+
+    let number_meters = |meters: f64| -> Result<f64, OpenSearchError> {
+        if !meters.is_finite() || meters < 0.0 {
+            return Err(bad("must be a finite non-negative number"));
+        }
+        Ok(meters)
+    };
+
+    match value {
+        Value::Number(number) => number_meters(number.as_f64().ok_or_else(|| {
+            bad("must fit in a 64-bit float")
+        })?),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(bad("must not be empty"));
+            }
+            // Walk from the start while we see digits, dot, sign, or
+            // exponent characters; the remainder is the unit suffix.
+            let split_at = trimmed
+                .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '+' | '-' | 'e' | 'E')))
+                .unwrap_or(trimmed.len());
+            let (head, tail) = trimmed.split_at(split_at);
+            let value: f64 = head.parse().map_err(|_| {
+                bad(&format!("`{trimmed}` is not a valid number with optional unit suffix"))
+            })?;
+            let unit = tail.trim();
+            let multiplier = geo_distance_unit_meters(unit).ok_or_else(|| {
+                bad(&format!("unsupported unit `{unit}` (expected one of km|m|mi|yd|ft|NM)"))
+            })?;
+            number_meters(value * multiplier)
+        }
+        _ => Err(bad("must be a string with a unit suffix or a number of metres")),
+    }
+}
+
+/// Map a distance unit suffix to a metre multiplier. Empty suffix means
+/// metres. Accepted units mirror the regex used by matchID's
+/// `queries.ts:229`. Comparison is case-insensitive except for `NM`
+/// which is the canonical ES form for nautical miles.
+fn geo_distance_unit_meters(unit: &str) -> Option<f64> {
+    match unit.to_ascii_lowercase().as_str() {
+        "" | "m" => Some(1.0),
+        "km" => Some(1_000.0),
+        "mi" | "miles" => Some(1_609.344),
+        "yd" | "yards" => Some(0.9144),
+        "ft" | "feet" => Some(0.3048),
+        "nm" | "nmi" => Some(1_852.0),
+        _ => None,
+    }
+}
+
+/// Parse a single geo_point value into `(lat, lon)`.
+///
+/// Accepted forms (all three are documented in the §2.6 / §2.12
+/// matchID intake):
+/// - `{ "lat": <number>, "lon": <number> }` — matchID's canonical wire shape,
+/// - `"<lat>,<lon>"` (string, ES compat),
+/// - `[<lon>, <lat>]` (GeoJSON array, ES compat).
+///
+/// Returns a static-friendly `&'static str` reason on parse failure so
+/// callers can wrap it in their own `OpenSearchError` context.
+pub fn parse_geo_point_source(value: &Value) -> Result<(f64, f64), String> {
+    let finite_coord = |label: &str, raw: f64| -> Result<f64, String> {
+        if !raw.is_finite() {
+            return Err(format!("{label} must be a finite number"));
+        }
+        Ok(raw)
+    };
+
+    match value {
+        Value::Object(object) => {
+            let lat = object
+                .get("lat")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| "object form requires numeric `lat`".to_owned())?;
+            let lon = object
+                .get("lon")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| "object form requires numeric `lon`".to_owned())?;
+            let lat = finite_coord("`lat`", lat)?;
+            let lon = finite_coord("`lon`", lon)?;
+            validate_geo_point_bounds(lat, lon)?;
+            Ok((lat, lon))
+        }
+        Value::String(text) => {
+            let parts: Vec<&str> = text.split(',').collect();
+            if parts.len() != 2 {
+                return Err("string form must be `\"<lat>,<lon>\"`".to_owned());
+            }
+            let lat: f64 = parts[0].trim().parse().map_err(|_| {
+                format!("string `lat` part `{}` is not numeric", parts[0])
+            })?;
+            let lon: f64 = parts[1].trim().parse().map_err(|_| {
+                format!("string `lon` part `{}` is not numeric", parts[1])
+            })?;
+            let lat = finite_coord("`lat`", lat)?;
+            let lon = finite_coord("`lon`", lon)?;
+            validate_geo_point_bounds(lat, lon)?;
+            Ok((lat, lon))
+        }
+        Value::Array(items) => {
+            // GeoJSON convention: `[lon, lat]` (longitude first). This is
+            // the source of so many production bugs that we name the
+            // axes loudly in error messages.
+            if items.len() != 2 {
+                return Err("array form must be `[<lon>, <lat>]`".to_owned());
+            }
+            let lon = items[0]
+                .as_f64()
+                .ok_or_else(|| "array form requires numeric `lon` at index 0".to_owned())?;
+            let lat = items[1]
+                .as_f64()
+                .ok_or_else(|| "array form requires numeric `lat` at index 1".to_owned())?;
+            let lon = finite_coord("`lon`", lon)?;
+            let lat = finite_coord("`lat`", lat)?;
+            validate_geo_point_bounds(lat, lon)?;
+            Ok((lat, lon))
+        }
+        _ => Err("expected object, string, or [lon, lat] array".to_owned()),
+    }
+}
+
+fn validate_geo_point_bounds(lat: f64, lon: f64) -> Result<(), String> {
+    if !(-90.0..=90.0).contains(&lat) {
+        return Err(format!("`lat` {lat} out of range [-90, 90]"));
+    }
+    if !(-180.0..=180.0).contains(&lon) {
+        return Err(format!("`lon` {lon} out of range [-180, 180]"));
+    }
+    Ok(())
+}
+
+/// Great-circle distance in metres between two `(lat, lon)` points,
+/// computed with the haversine formula on a spherical earth of radius
+/// 6 371 008.8 m (mean WGS-84 radius — the value ES uses for
+/// `geo_distance`).
+fn haversine_distance_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_METERS: f64 = 6_371_008.8;
+    let to_rad = std::f64::consts::PI / 180.0;
+    let dlat = (lat2 - lat1) * to_rad;
+    let dlon = (lon2 - lon1) * to_rad;
+    let lat1 = lat1 * to_rad;
+    let lat2 = lat2 * to_rad;
+    let a = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+    EARTH_RADIUS_METERS * c
+}
+
+/// Returns `true` when the geo_point stored under `field` in `source`
+/// is within `distance_meters` of `(lat, lon)`. Documents whose field
+/// is missing or in an unrecognised shape do not match.
+pub fn geo_distance_field_matches(
+    source: &Value,
+    field: &str,
+    target_lat: f64,
+    target_lon: f64,
+    distance_meters: f64,
+) -> bool {
+    let Some(point) = source.get(field) else {
+        return false;
+    };
+    let Ok((lat, lon)) = parse_geo_point_source(point) else {
+        return false;
+    };
+    haversine_distance_meters(target_lat, target_lon, lat, lon) <= distance_meters
+}
+
 /// Parse a `prefix` query body and return `(field, value)`.
 pub fn parse_prefix_clause(value: &Value) -> Result<(String, String), OpenSearchError> {
     let (field, body) = parse_single_field_query("prefix", value)?;
@@ -3082,6 +3363,12 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
             operator,
         } => multi_match_matches_with_mapping(source, fields, query, *operator, mapping),
         SearchQuery::FunctionScore { inner, .. } => query_matches(inner, source, mapping),
+        SearchQuery::GeoDistance {
+            field,
+            lat,
+            lon,
+            distance_meters,
+        } => geo_distance_field_matches(source, field, *lat, *lon, *distance_meters),
     }
 }
 

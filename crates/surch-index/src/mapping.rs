@@ -19,6 +19,13 @@ pub enum FieldType {
     Double,
     Boolean,
     Date,
+    /// matchID `GEOPOINT_NAISSANCE` / `GEOPOINT_DECES` (intake §2.12).
+    /// Stored shape is two `f64` floats (`lat`, `lon`) parsed at runtime
+    /// from one of three accepted source representations:
+    /// `{ "lat": …, "lon": … }`, the string `"lat,lon"`, or the GeoJSON
+    /// array `[lon, lat]`. See `parse_geo_point_source` in
+    /// `crates/surch-api/src/search.rs`.
+    GeoPoint,
     Object,
     Array,
     Unknown,
@@ -35,6 +42,7 @@ impl FieldType {
             Self::Double => "double",
             Self::Boolean => "boolean",
             Self::Date => "date",
+            Self::GeoPoint => "geo_point",
             Self::Object => "object",
             Self::Array => "array",
             Self::Unknown => "unknown",
@@ -51,6 +59,7 @@ impl FieldType {
             "double" => Some(Self::Double),
             "boolean" | "bool" => Some(Self::Boolean),
             "date" => Some(Self::Date),
+            "geo_point" => Some(Self::GeoPoint),
             "object" => Some(Self::Object),
             "array" => Some(Self::Array),
             _ => None,
@@ -977,5 +986,59 @@ mod tests {
             ),
             "expected IndexPrefixesBoundsInvalid for NOM, got {error:?}",
         );
+    }
+
+    // --- A2: `geo_point` field type (matchID intake §2.12) ---
+
+    #[test]
+    fn from_properties_value_accepts_geo_point_field_type() {
+        // matchID's `GEOPOINT_NAISSANCE` / `GEOPOINT_DECES` are declared
+        // as `{ type: geo_point }` (intake §2.12). The mapping parser
+        // must accept the type name and round-trip it back through
+        // `as_value`.
+        let properties = serde_json::json!({
+            "GEOPOINT_NAISSANCE": { "type": "geo_point" }
+        });
+
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("geo_point should be accepted as a field type");
+        let field = mapping
+            .field("GEOPOINT_NAISSANCE")
+            .expect("GEOPOINT_NAISSANCE field exists");
+        assert_eq!(field.field_type, FieldType::GeoPoint);
+    }
+
+    #[test]
+    fn geo_point_field_round_trips_through_as_value() {
+        // `IndexMapping::as_value` powers `GET /:index/_mapping`; the
+        // wire shape must preserve `"type": "geo_point"` verbatim so
+        // matchID can replay its mapping from the response.
+        let properties = serde_json::json!({
+            "GEOPOINT_DECES": { "type": "geo_point" }
+        });
+
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("geo_point parse");
+        let value = mapping.as_value();
+        assert_eq!(
+            value["properties"]["GEOPOINT_DECES"]["type"],
+            serde_json::Value::String("geo_point".to_owned()),
+        );
+    }
+
+    #[test]
+    fn geo_point_field_rejects_analyzer_and_normalizer() {
+        // `analyzer` is text-only; declaring it on a `geo_point` must
+        // fail at parse time so misuse is caught at `PUT /:index`.
+        let properties = serde_json::json!({
+            "GEOPOINT_NAISSANCE": { "type": "geo_point", "analyzer": "norm" }
+        });
+        let error = IndexMapping::from_properties_value(&properties)
+            .expect_err("analyzer on geo_point must be rejected");
+        assert!(matches!(
+            &error,
+            MappingError::AnalyzerNotSupported { field, field_type }
+                if field == "GEOPOINT_NAISSANCE" && field_type == "geo_point",
+        ), "got {error:?}");
     }
 }

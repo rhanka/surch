@@ -3216,3 +3216,198 @@ async fn search_router_a12_accepts_aggregations_long_form_alias() {
         .expect("buckets array");
     assert_eq!(buckets.len(), 2);
 }
+
+
+// ---------------------------------------------------------------------------
+// A2 — `geo_point` field type + `geo_distance` filter (matchID §2.6/§2.12).
+//
+// deces-backend's UI "near X" filter wraps a `geo_distance` clause in
+// `bool.filter` and indexes the pivot coordinates as a `geo_point` field
+// (`GEOPOINT_NAISSANCE` / `GEOPOINT_DECES`). Each test below seeds the
+// fixture corpus (Paris / Lyon / Marseille — three well-spread pivots)
+// and asserts that the haversine-bounded executor returns the right
+// hit count for the queried radius. We also pin the three accepted
+// source-point shapes (object, "lat,lon" string, GeoJSON [lon, lat]
+// array) and exercise the unit parser for km/m/mi.
+// ---------------------------------------------------------------------------
+
+/// Seed three documents — Paris (48.85, 2.35), Lyon (45.75, 4.84) and
+/// Marseille (43.30, 5.40) — under a `geo_point`-aware mapping. Returns
+/// the configured router.
+async fn seed_geo_point_corpus(point_shape: fn(f64, f64) -> serde_json::Value) -> axum::Router {
+    let router = app_router();
+
+    let create = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"GEOPOINT_NAISSANCE":{"type":"geo_point"},"city":{"type":"keyword"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create.status().is_success(), "create_index failed");
+
+    let seed = |id: &'static str, lat: f64, lon: f64, city: &'static str| {
+        let router = router.clone();
+        let body = serde_json::json!({
+            "GEOPOINT_NAISSANCE": point_shape(lat, lon),
+            "city": city,
+        })
+        .to_string();
+        async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/products/_doc/{id}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .expect("request should build"),
+                )
+                .await
+                .expect("router should respond");
+            assert_eq!(
+                response.status(),
+                StatusCode::CREATED,
+                "indexing `{id}` failed",
+            );
+        }
+    };
+
+    seed("paris", 48.85, 2.35, "Paris").await;
+    seed("lyon", 45.75, 4.84, "Lyon").await;
+    seed("marseille", 43.30, 5.40, "Marseille").await;
+    router
+}
+
+fn hit_ids(body: &serde_json::Value) -> Vec<String> {
+    body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().expect("id").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn search_router_a2_geo_distance_object_shape_returns_only_in_radius_doc() {
+    // Object form `{lat, lon}` — matchID's canonical shape. A 50 km
+    // radius around Paris keeps exactly the Paris doc.
+    let router =
+        seed_geo_point_corpus(|lat, lon| serde_json::json!({"lat": lat, "lon": lon})).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match_all":{}}],"filter":{"geo_distance":{"distance":"50km","GEOPOINT_NAISSANCE":{"lat":48.85,"lon":2.35}}}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 1);
+    assert_eq!(hit_ids(&body), vec!["paris".to_string()]);
+}
+
+#[tokio::test]
+async fn search_router_a2_geo_distance_accepts_lat_lon_string_shape() {
+    // String form `"lat,lon"` — ES compat.
+    let router = seed_geo_point_corpus(|lat, lon| serde_json::json!(format!("{lat},{lon}"))).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"geo_distance":{"distance":"50km","GEOPOINT_NAISSANCE":{"lat":48.85,"lon":2.35}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 1);
+    assert_eq!(hit_ids(&body), vec!["paris".to_string()]);
+}
+
+#[tokio::test]
+async fn search_router_a2_geo_distance_accepts_geojson_lon_lat_array_shape() {
+    // GeoJSON array `[lon, lat]` — longitude FIRST. ES compat.
+    let router = seed_geo_point_corpus(|lat, lon| serde_json::json!([lon, lat])).await;
+
+    let body = search_with_body(
+        &router,
+        // A 200 km radius around Lyon also catches Lyon's surroundings;
+        // Marseille (~280 km) and Paris (~390 km) stay out.
+        r#"{"query":{"geo_distance":{"distance":"200km","GEOPOINT_NAISSANCE":{"lat":45.75,"lon":4.84}}}}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"], 1);
+    assert_eq!(hit_ids(&body), vec!["lyon".to_string()]);
+}
+
+#[tokio::test]
+async fn search_router_a2_geo_distance_units_km_m_mi_all_parse() {
+    // The three matchID units (`km`, `m`, `mi`) must each map to the
+    // same physical radius — pick a small radius around Paris and ask
+    // for 5 km, 5000 m, and ≈3.107 mi (5 km in miles → 3.10686).
+    let router =
+        seed_geo_point_corpus(|lat, lon| serde_json::json!({"lat": lat, "lon": lon})).await;
+
+    let queries = [
+        r#"{"query":{"geo_distance":{"distance":"5km","GEOPOINT_NAISSANCE":{"lat":48.85,"lon":2.35}}}}"#,
+        r#"{"query":{"geo_distance":{"distance":"5000m","GEOPOINT_NAISSANCE":{"lat":48.85,"lon":2.35}}}}"#,
+        r#"{"query":{"geo_distance":{"distance":"3.10686mi","GEOPOINT_NAISSANCE":{"lat":48.85,"lon":2.35}}}}"#,
+    ];
+    for body in queries {
+        let response = search_with_body(&router, body).await;
+        assert_eq!(
+            response["hits"]["total"]["value"], 1,
+            "expected 1 hit for body `{body}`, got: {response}",
+        );
+        assert_eq!(hit_ids(&response), vec!["paris".to_string()]);
+    }
+}
+
+#[tokio::test]
+async fn search_router_a2_geo_distance_rejects_unknown_unit_with_parsing_exception() {
+    // Defensive: an out-of-spec unit must surface a parse error so the
+    // caller does not silently treat e.g. `"5banana"` as metres.
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"geo_distance":{"distance":"5banana","GEOPOINT_NAISSANCE":{"lat":48.85,"lon":2.35}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert!(
+        body["error"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported unit"),
+        "got: {}",
+        body["error"]["reason"],
+    );
+}
