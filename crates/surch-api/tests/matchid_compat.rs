@@ -259,6 +259,30 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
                     entry.name
                 );
             }
+
+            // For scroll-initiating requests (`?scroll=...`), the response must
+            // also carry a non-empty `_scroll_id`. The follow-up
+            // `POST /_search/scroll` lifecycle is covered by
+            // `crates/surch-api/tests/scroll.rs`; here we only assert the
+            // initial page exposes a usable cursor.
+            if entry.request.path.contains("?scroll=")
+                || entry.request.path.contains("&scroll=")
+            {
+                let scroll_id = body
+                    .get("_scroll_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "scroll request `{}` response missing _scroll_id, got {:?}",
+                            entry.name, body
+                        )
+                    });
+                assert!(
+                    !scroll_id.is_empty(),
+                    "scroll request `{}` returned an empty _scroll_id",
+                    entry.name
+                );
+            }
         }
         executed += 1;
     }
@@ -267,16 +291,19 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
         executed >= 3,
         "matchID v0 acceptance: at least 3 replay entries must execute against Surch (executed={executed}, skipped={skipped})"
     );
-    // The fixture is committed with the documented split: 26 executed + 4 skipped
-    // (1 keyword-prefix on A6/A13 + 3 scroll on A4). A6 phase 2 lifted the two
+    // The fixture is committed with the documented split: 29 executed + 1 skipped
+    // (1 keyword-prefix on A6/A13). B1 phase 2 lifted the 3 scroll skips (gap-A4)
+    // by asserting the initial `?scroll=1m` response carries a non-empty
+    // `_scroll_id`; the follow-up `POST /_search/scroll` lifecycle is covered by
+    // `crates/surch-api/tests/scroll.rs`. A6 phase 2 had previously lifted the two
     // text-typed prefix skips (prefix_nom, prefix_prenoms) via write-time
     // `index_prefixes` postings on NOM/PRENOMS.
     assert_eq!(executed + skipped, 30);
     assert_eq!(
-        skipped, 4,
-        "expected 4 skipped entries (1 keyword-prefix on A6/A13 + 3 scroll on A4)"
+        skipped, 1,
+        "expected 1 skipped entry (keyword-prefix on A6/A13)"
     );
-    assert_eq!(executed, 26, "expected 26 executed entries against Surch HEAD");
+    assert_eq!(executed, 29, "expected 29 executed entries against Surch HEAD");
 }
 
 async fn execute(

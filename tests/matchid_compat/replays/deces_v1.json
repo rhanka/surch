@@ -1,7 +1,7 @@
 {
   "name": "deces_v1",
   "dataset": "deces",
-  "description": "matchID replay v1 — 30 representative requests against the INSEE-shaped slice. Distribution: 8 advanced search, 5 block-match, 4 full-text, 3 sort, 2 function_score, 3 prefix, 3 scroll, 2 range. Of the 30 entries 26 execute today; 4 are skipped pending gaps (3 scroll on A4 + 1 prefix-on-keyword on the future A6/A13 keyword-prefix iterator). A6 phase 2 lifted the two text-typed prefix skips by adding `index_prefixes` on NOM/PRENOMS in `mapping.json` and serving them from write-time prefix postings. Expected hit counts and top-hit ids were captured against Surch HEAD on 2026-05-15 using `cargo run --release -p surch-api` + curl against the same slice; once an ES-7.x oracle replays the same slice (B1 phase 3, gated on poc-k8s), these expectations must be cross-checked.",
+  "description": "matchID replay v1 — 30 representative requests against the INSEE-shaped slice. Distribution: 8 advanced search, 5 block-match, 4 full-text, 3 sort, 2 function_score, 3 prefix, 3 scroll, 2 range. Of the 30 entries 29 execute today; 1 is skipped pending the future A6/A13 keyword-prefix iterator (prefix on a keyword field). B1 phase 2 (2026-05-15) lifted the 3 gap-A4 scroll skips: the runner now asserts `_scroll_id` is non-empty on every `?scroll=` request and validates `hits.total.value`; the follow-up `POST /_search/scroll` lifecycle is covered by `crates/surch-api/tests/scroll.rs`. A6 phase 2 had previously lifted the two text-typed prefix skips by adding `index_prefixes` on NOM/PRENOMS in `mapping.json` and serving them from write-time prefix postings. Expected hit counts and top-hit ids were captured against Surch HEAD on 2026-05-15 using `cargo run --release -p surch-api` + curl against the same slice; once an ES-7.x oracle replays the same slice (B1 phase 3, gated on poc-k8s), these expectations must be cross-checked.",
   "requests": [
     {
       "name": "adv_nom_prenoms_date",
@@ -600,8 +600,7 @@
     {
       "name": "scroll_full",
       "category": "scroll",
-      "skip": "gap-A4",
-      "description": "scroll start, full match_all, large page. A4 stateful scroll ships on `wp/a-optim`; revisit this skip once the matchID replay can chain the follow-up `POST /_search/scroll` call inside the runner.",
+      "description": "scroll start, full match_all, large page. B1 phase 2 lifted the gap-A4 skip: the runner asserts the initial `?scroll=1m` response carries hits.total.value + a non-empty `_scroll_id`; the follow-up `POST /_search/scroll` lifecycle is covered separately by `crates/surch-api/tests/scroll.rs`. `top_hit_id` is intentionally omitted: match_all returns hits in an internal order that is not part of the matchID contract (the bulk-scan consumer iterates the full corpus). Expected captured against Surch HEAD on 2026-05-15.",
       "request": {
         "method": "POST",
         "path": "/deces/_search?scroll=1m",
@@ -609,13 +608,15 @@
           "query": { "match_all": {} },
           "size": 100
         }
+      },
+      "expected": {
+        "hits.total.value": 1000
       }
     },
     {
       "name": "scroll_filtered_size_500",
       "category": "scroll",
-      "skip": "gap-A4",
-      "description": "scroll start over a filtered match — typical bulk-match workload (matchID §2.9).",
+      "description": "scroll start over a filtered match — typical bulk-match workload (matchID §2.9). B1 phase 2: gap-A4 lifted via `_scroll_id` assertion + total. `top_hit_id` omitted because BM25 ties on NOM=MARTIN are broken by internal doc order, not a matchID-visible contract. Expected captured against Surch HEAD on 2026-05-15.",
       "request": {
         "method": "POST",
         "path": "/deces/_search?scroll=1m",
@@ -623,13 +624,15 @@
           "query": { "match": { "NOM": "MARTIN" } },
           "size": 500
         }
+      },
+      "expected": {
+        "hits.total.value": 31
       }
     },
     {
       "name": "scroll_match_all_size_1000",
       "category": "scroll",
-      "skip": "gap-A4",
-      "description": "scroll start over match_all with a 1k page — the upper bound observed in `runRequest.ts`.",
+      "description": "scroll start over match_all with a 1k page — the upper bound observed in `runRequest.ts`. B1 phase 2: gap-A4 lifted via `_scroll_id` assertion + total. `top_hit_id` omitted (same rationale as `scroll_full`). Expected captured against Surch HEAD on 2026-05-15.",
       "request": {
         "method": "POST",
         "path": "/deces/_search?scroll=1m",
@@ -637,6 +640,9 @@
           "query": { "match_all": {} },
           "size": 1000
         }
+      },
+      "expected": {
+        "hits.total.value": 1000
       }
     },
     {
