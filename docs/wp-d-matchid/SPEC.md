@@ -103,7 +103,13 @@ replay first :
   language-specific stemmers, no synonyms, no shingles).
 - `script_score` / inline scripting — `function_score`'s declarative
   shape (A5) is enough for matchID.
-- Snapshot API — matchID ships raw-index tarball + boot-time
-  re-ingest. Surch will expose its own raw-index export instead
-  (tracked under wp/c-ops).
 - nested / join, suggesters, partial updates.
+
+Note: the **Snapshot API** is no longer out-of-scope — user
+decision 2026-05-16 binds Surch to ship the full ES-compatible
+`_snapshot/<repo>/<snap>` surface so the PaaS offering keeps
+Curator / Kibana / `elasticsearch-py` clients working. Tracked on
+`wp/c-ops` as `C-SNAPSHOT-S1` (FsRepository + ES routes, paused-
+writes MVP), then `C-SNAPSHOT-S2` (S3Repository via aws-sdk-s3),
+`C-SNAPSHOT-S3` (live snapshot via index-commit pinning), `C-SLM`
+(SLM cron policies). Full plan in `docs/ops/snapshot-plan.md`.
