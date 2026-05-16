@@ -3068,3 +3068,151 @@ async fn search_router_a5_function_score_rejects_non_empty_functions() {
         .unwrap()
         .contains("not implemented yet"));
 }
+
+// --- A12.1: `terms` aggregation MVP ---
+//
+// matchID's analytics tab (intake §2.10) expects `aggs.<name>.terms`
+// to return a `{ buckets: [{ key, doc_count }, …] }` payload, ordered
+// by descending doc_count with key ascending as the tiebreak. Only
+// `terms` is honoured today; `date_histogram`, `composite` and
+// `cardinality` are tracked under A12 phase 2.
+
+#[tokio::test]
+async fn search_router_a12_terms_aggregation_returns_bucket_counts() {
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-3", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "doc-4", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "doc-5", r#"{"NOM":"BERNARD"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_nom":{"terms":{"field":"NOM"}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_nom"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 3);
+    // doc_count desc tie-broken by key asc -> DUPONT before MARTIN.
+    assert_eq!(buckets[0]["key"], "DUPONT");
+    assert_eq!(buckets[0]["doc_count"], 2);
+    assert_eq!(buckets[1]["key"], "MARTIN");
+    assert_eq!(buckets[1]["doc_count"], 2);
+    assert_eq!(buckets[2]["key"], "BERNARD");
+    assert_eq!(buckets[2]["doc_count"], 1);
+}
+
+#[tokio::test]
+async fn search_router_a12_terms_aggregation_caps_buckets_to_size() {
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-3", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-4", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "doc-5", r#"{"NOM":"DUPONT"}"#).await;
+    index_product(&router, "doc-6", r#"{"NOM":"BERNARD"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_nom":{"terms":{"field":"NOM","size":2}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_nom"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 2, "size=2 must cap the bucket list");
+    assert_eq!(buckets[0]["key"], "MARTIN");
+    assert_eq!(buckets[0]["doc_count"], 3);
+    assert_eq!(buckets[1]["key"], "DUPONT");
+    assert_eq!(buckets[1]["doc_count"], 2);
+}
+
+#[tokio::test]
+async fn search_router_a12_terms_aggregation_subfield_aliases_to_parent() {
+    // matchID emits `NOM.raw` because its mapping declares
+    // `NOM: { type: text, fields: { raw: { type: keyword } } }`. Until
+    // A13 ships real multi-fields, Surch aliases the sub-field back to
+    // its parent (same alias as A10 sort) so the aggregation produces
+    // deterministic buckets instead of an empty payload.
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-3", r#"{"NOM":"DUPONT"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_nom":{"terms":{"field":"NOM.raw","size":100}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_nom"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[0]["key"], "MARTIN");
+    assert_eq!(buckets[0]["doc_count"], 2);
+    assert_eq!(buckets[1]["key"], "DUPONT");
+    assert_eq!(buckets[1]["doc_count"], 1);
+}
+
+#[tokio::test]
+async fn search_router_a12_rejects_unsupported_agg_type_with_phase2_hint() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"match_all":{}},"aggs":{"by_month":{"date_histogram":{"field":"DATE","calendar_interval":"month"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    let reason = body["error"]["reason"].as_str().unwrap();
+    assert!(reason.contains("date_histogram"));
+    assert!(reason.contains("A12 phase 2"));
+}
+
+#[tokio::test]
+async fn search_router_a12_accepts_aggregations_long_form_alias() {
+    // ES accepts both `aggs` and `aggregations`; matchID's analytics
+    // tab emits the long form.
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"DUPONT"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggregations":{"by_nom":{"terms":{"field":"NOM"}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_nom"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 2);
+}

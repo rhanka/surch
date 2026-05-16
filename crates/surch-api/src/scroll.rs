@@ -141,6 +141,7 @@ mod tests {
             sort: Vec::new(),
             highlight: None,
             min_score: None,
+            aggs: std::collections::BTreeMap::new(),
         }
     }
 
