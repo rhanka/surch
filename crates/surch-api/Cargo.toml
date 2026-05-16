@@ -29,6 +29,8 @@ metrics-exporter-prometheus = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 uuid = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 opensearch-oracle = { path = "../opensearch-oracle" }

@@ -28,6 +28,7 @@ pub mod root;
 pub mod scroll;
 pub mod search;
 pub mod snapshot;
+pub mod snapshot_es;
 pub mod state;
 pub mod stats;
 pub mod telemetry;
@@ -49,6 +50,36 @@ pub fn app_router() -> Router {
     // emitting metrics. Idempotent: safe to call from every test and
     // from `main` at startup.
     let _ = metrics::install_global();
+
+    let app_state = state::AppState::default();
+    let snapshot_registry = snapshot_es::SnapshotRepositoryRegistry::default();
+    let snapshot_state = snapshot_es::routes::SnapshotAppState {
+        app: app_state.clone(),
+        registry: snapshot_registry.clone(),
+    };
+
+    let snapshot_es_router = Router::new()
+        .route(
+            "/_snapshot",
+            get(snapshot_es::routes::list_repositories_handler),
+        )
+        .route(
+            "/_snapshot/:repository",
+            get(snapshot_es::routes::get_repository_handler)
+                .put(snapshot_es::routes::register_repository_handler)
+                .delete(snapshot_es::routes::delete_repository_handler),
+        )
+        .route(
+            "/_snapshot/:repository/:snapshot",
+            get(snapshot_es::routes::get_snapshot_handler)
+                .put(snapshot_es::routes::create_snapshot_handler)
+                .delete(snapshot_es::routes::delete_snapshot_handler),
+        )
+        .route(
+            "/_snapshot/:repository/:snapshot/_restore",
+            post(snapshot_es::routes::restore_snapshot_handler),
+        )
+        .with_state(snapshot_state);
 
     Router::new()
         .route("/", get(root::root_handler))
@@ -189,7 +220,8 @@ pub fn app_router() -> Router {
                 .put(aliases::put_index_alias_handler)
                 .delete(aliases::delete_index_alias_handler),
         )
-        .with_state(state::AppState::default())
+        .with_state(app_state)
+        .merge(snapshot_es_router)
         // HTTP middleware: one span per request with method/route/status
         // attributes. Sits at the bottom of the router so every route
         // inherits it. When the OTLP exporter is wired (see
