@@ -66,3 +66,33 @@ jobs:
           key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo build --workspace --locked --tests
       - run: cargo test --workspace --locked
+
+  # Manual scoring-side perf regression gate. Kept disabled (`if: false`)
+  # because the criterion harness takes 5–10 minutes for the four groups
+  # and `ubuntu-22.04` runners are too noisy for sub-millisecond
+  # comparisons. Flip the guard once we have a dedicated bare-metal /
+  # self-hosted runner with cpufreq pinned to `performance` and SMT off.
+  # See `docs/ops/perf-bench.md` for the local workflow.
+  #
+  # bench-regression-gate:
+  #   name: cargo bench --bench search_hot_path (manual)
+  #   runs-on: [self-hosted, perf-bare-metal]   # pin to a quiet host
+  #   if: false                                 # opt-in only
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - name: Restore baseline (downloaded from artifact registry)
+  #       run: |
+  #         mkdir -p target/criterion
+  #         # TODO: fetch `before` baseline produced by the previous
+  #         # release tag from the artifact store (S3 / GH artifacts).
+  #     - name: Run bench against saved baseline
+  #       run: |
+  #         cargo bench --bench search_hot_path -p surch-api -- \
+  #           --baseline before --output-format bencher | tee bench.txt
+  #     - name: Fail on > 5% regression
+  #       run: |
+  #         # TODO: parse `bench.txt` (or `target/criterion/*/change/estimates.json`)
+  #         # and exit 1 when any group reports >5% slowdown with
+  #         # statistical significance.
+  #         echo "regression check stub — wire when runner is ready"
