@@ -63,7 +63,7 @@ jobs:
         id: plan
         run: |
           set -euo pipefail
-          cargo dist plan --output-format=json > dist-plan.json
+          dist plan --output-format=json > dist-plan.json
           # Extract the list of target triples for the build matrix; the
           # exact JSON path is stable across cargo-dist 0.25.x.
           TARGETS=$(jq -c '[.releases[].artifacts[] | select(.kind=="executable-zip") | .target_triples[0]] | unique' dist-plan.json)
@@ -118,7 +118,7 @@ jobs:
       - name: Build release artefacts
         run: |
           set -euo pipefail
-          cargo dist build --target ${{ matrix.target }} --artifacts=local
+          dist build --target ${{ matrix.target }} --artifacts=local
           ls -la target/distrib/
 
       - name: Upload archives
