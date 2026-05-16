@@ -39,11 +39,11 @@ pub struct SearchRequest {
     pub aggs: BTreeMap<String, AggSpec>,
 }
 
-/// A12.1+A12.2+A12.3: aggregation specification subset supported by
-/// Surch today. matchID's wire shape uses `terms`, `date_histogram`,
+/// A12.1+A12.2+A12.3+A12.4: aggregation specification subset supported
+/// by Surch today. matchID's wire shape uses `terms`, `date_histogram`,
 /// `composite` and `cardinality` (intake §2.10). `terms` ships under
-/// A12.1, `date_histogram` under A12.2 and `cardinality` under A12.3;
-/// `composite` + `after_key` are tracked under A12 phase 2.
+/// A12.1, `date_histogram` under A12.2, `cardinality` under A12.3, and
+/// `composite` (with `after_key` round-trip) under A12.4.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AggSpec {
     /// `terms` aggregation: bucket documents by the distinct values of
@@ -67,7 +67,38 @@ pub enum AggSpec {
     /// (no HyperLogLog estimation); the wire shape is the ES-7.x
     /// `{ "value": N }` payload.
     Cardinality { field: String },
+    /// A12.4: `composite` aggregation — bucket documents by the
+    /// cartesian product of `sources`. MVP ships `terms` sources only
+    /// (matchID intake §2.10 also wires `date_histogram` sources;
+    /// those are tracked under A12.4 phase 2). Buckets are emitted
+    /// sorted lexicographically by their composite key (source-by-
+    /// source, ascending — parity with ES), capped to `size` (default
+    /// 10). When `after` is present, every bucket whose key is
+    /// lexicographically less-than-or-equal to `after` is skipped
+    /// (cursor round-trip). The response carries `after_key` set to
+    /// the key of the last emitted bucket whenever the cap was reached
+    /// (otherwise omitted, marking the end of the stream).
+    Composite {
+        sources: Vec<CompositeSource>,
+        size: usize,
+        after: Option<BTreeMap<String, Value>>,
+    },
 }
+
+/// A12.4: one `terms` composite-source definition. `name` is the
+/// user-supplied key under which the source's value lands in each
+/// bucket's `key` object (and in the `after` / `after_key` cursors);
+/// `field` is the `_source` path read for each matched document
+/// (honours the `.raw` / `.norm` sub-field alias via
+/// `lookup_sort_value`). Non-terms sources (`date_histogram`, etc.)
+/// are rejected at parse time with an "A12.4 phase 2" hint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompositeSource {
+    pub name: String,
+    pub field: String,
+}
+
+const DEFAULT_COMPOSITE_AGG_SIZE: usize = 10;
 
 /// A12.2: calendar bucketing unit for `date_histogram`. matchID emits
 /// `month` for the analytics tab and occasionally `day` / `year` for
@@ -266,15 +297,30 @@ pub struct SearchResponse {
     pub aggregations: Option<BTreeMap<String, AggResult>>,
 }
 
-/// A12.1+A12.2+A12.3: shape of the per-aggregation payload. `terms`
-/// and `date_histogram` emit `{ buckets: [...] }`; `cardinality`
-/// emits `{ value: N }`. Serialized untagged so the JSON envelope
-/// stays ES-7.x identical.
+/// A12.1+A12.2+A12.3+A12.4: shape of the per-aggregation payload.
+/// `terms` and `date_histogram` emit `{ buckets: [...] }`;
+/// `cardinality` emits `{ value: N }`; `composite` emits
+/// `{ buckets: [...], after_key?: {...} }`. Serialized untagged so the
+/// JSON envelope stays ES-7.x identical.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum AggResult {
-    Buckets { buckets: Vec<AggBucket> },
-    Value { value: Value },
+    Buckets {
+        buckets: Vec<AggBucket>,
+    },
+    Value {
+        value: Value,
+    },
+    /// A12.4: composite payload. `after_key` is `None` when the engine
+    /// emitted fewer buckets than the cap (i.e. the cursor stream has
+    /// reached its end), and `Some(<last bucket's key>)` otherwise so
+    /// the caller can round-trip it into the next request's
+    /// `composite.after`.
+    Composite {
+        buckets: Vec<AggBucket>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_key: Option<BTreeMap<String, Value>>,
+    },
 }
 
 /// A12.1+A12.2: ES-7.x compatible bucket payload. `terms` emits
@@ -844,9 +890,9 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     response
 }
 
-/// A12.1+A12.2+A12.3: dispatch every declared aggregation against the
-/// post-filter matched-document set. Returns `None` when no aggs are
-/// declared so the response stays shape-compatible with zero-agg
+/// A12.1+A12.2+A12.3+A12.4: dispatch every declared aggregation against
+/// the post-filter matched-document set. Returns `None` when no aggs
+/// are declared so the response stays shape-compatible with zero-agg
 /// callers.
 fn compute_aggregations(
     specs: &BTreeMap<String, AggSpec>,
@@ -874,6 +920,16 @@ fn compute_aggregations(
             AggSpec::Cardinality { field } => {
                 compute_cardinality_aggregation(matched_documents, field)
             }
+            AggSpec::Composite {
+                sources,
+                size,
+                after,
+            } => compute_composite_aggregation(
+                matched_documents,
+                sources,
+                *size,
+                after.as_ref(),
+            ),
         };
         out.insert(name.clone(), result);
     }
@@ -1101,6 +1157,132 @@ fn record_terms_value(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Val
     let key = TermsKey::from_value(value);
     let entry = counts.entry(key).or_insert_with(|| (value.clone(), 0));
     entry.1 += 1;
+}
+
+/// A12.4: `composite` aggregation executor — MVP terms-only.
+///
+/// For each matched document, project the composite key by reading
+/// `lookup_sort_value(source.field)` for every source. Documents that
+/// miss any source value are dropped (matches ES `missing_bucket`
+/// default `false`). Identical composite keys accumulate `doc_count`.
+/// Buckets are then sorted lexicographically (source-by-source,
+/// ascending) so the cursor stream is deterministic.
+///
+/// `after` is applied as a strict `>` filter against the sorted key
+/// stream (lex comparison on each source's value, in the order the
+/// sources were declared). The first `size` surviving buckets are
+/// emitted. `after_key` is set to the key of the last emitted bucket
+/// when (and only when) the cap chopped the stream — otherwise it is
+/// omitted, signalling end-of-stream to the caller.
+fn compute_composite_aggregation(
+    matched_documents: &[ScoredDocument],
+    sources: &[CompositeSource],
+    size: usize,
+    after: Option<&BTreeMap<String, Value>>,
+) -> AggResult {
+    // Collect bucket counts keyed by the composite tuple. Each entry
+    // stores both the canonical per-source `Value` (for the response
+    // payload) and the count.
+    let mut counts: BTreeMap<Vec<TermsKey>, (Vec<Value>, u64)> = BTreeMap::new();
+    for scored in matched_documents {
+        let mut composite_key: Vec<TermsKey> = Vec::with_capacity(sources.len());
+        let mut composite_values: Vec<Value> = Vec::with_capacity(sources.len());
+        let mut all_present = true;
+        for source in sources {
+            let Some(value) = lookup_sort_value(&scored.doc.source, &source.field) else {
+                all_present = false;
+                break;
+            };
+            // Array-valued fields: ES expands the cartesian product
+            // across array elements per source. The MVP collapses to
+            // the first element to keep the executor scalar — matchID
+            // only emits composite over scalar keyword / date fields,
+            // so the trade-off is invisible in practice. Tightening
+            // tracked in A12.4 phase 2.
+            let scalar = match value {
+                Value::Array(items) => items.iter().find(|v| !matches!(v, Value::Null)),
+                other if matches!(other, Value::Null) => None,
+                other => Some(other),
+            };
+            let Some(scalar) = scalar else {
+                all_present = false;
+                break;
+            };
+            composite_key.push(TermsKey::from_value(scalar));
+            composite_values.push(scalar.clone());
+        }
+        if !all_present {
+            continue;
+        }
+        let entry = counts
+            .entry(composite_key)
+            .or_insert_with(|| (composite_values, 0));
+        entry.1 += 1;
+    }
+
+    // Materialise (key, values, doc_count) sorted by the BTreeMap
+    // iteration order — TermsKey's `Ord` impl already provides the
+    // source-by-source lex order ES emits.
+    let sorted: Vec<(Vec<TermsKey>, Vec<Value>, u64)> = counts
+        .into_iter()
+        .map(|(key, (values, doc_count))| (key, values, doc_count))
+        .collect();
+
+    // Apply `after` as a strict `>` filter on the composite key. The
+    // cursor object must carry every declared source name; missing
+    // ones are treated as JSON `null` and lex-compare smaller than any
+    // present scalar.
+    let after_key_terms: Option<Vec<TermsKey>> = after.map(|cursor| {
+        sources
+            .iter()
+            .map(|source| {
+                cursor
+                    .get(&source.name)
+                    .map(TermsKey::from_value)
+                    .unwrap_or_else(|| TermsKey::from_value(&Value::Null))
+            })
+            .collect()
+    });
+
+    let filtered: Vec<(Vec<TermsKey>, Vec<Value>, u64)> = sorted
+        .into_iter()
+        .filter(|(key, _, _)| match &after_key_terms {
+            Some(cursor) => key.as_slice() > cursor.as_slice(),
+            None => true,
+        })
+        .collect();
+
+    let total = filtered.len();
+    let buckets: Vec<AggBucket> = filtered
+        .into_iter()
+        .take(size)
+        .map(|(_, values, doc_count)| {
+            let mut key_obj = serde_json::Map::new();
+            for (source, value) in sources.iter().zip(values.into_iter()) {
+                key_obj.insert(source.name.clone(), value);
+            }
+            AggBucket {
+                key: Value::Object(key_obj),
+                key_as_string: None,
+                doc_count,
+            }
+        })
+        .collect();
+
+    // `after_key` is emitted only when the cap actually truncated the
+    // stream (more buckets remained behind `size`). Otherwise the
+    // caller has reached the end and we omit the field — round-trip
+    // contract documented on `AggResult::Composite`.
+    let after_key = if buckets.len() == size && total > size {
+        buckets.last().and_then(|bucket| match &bucket.key {
+            Value::Object(map) => Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    AggResult::Composite { buckets, after_key }
 }
 
 /// A12.1: dedup key for the `terms` aggregation. We cannot hash a
@@ -2018,13 +2200,7 @@ fn parse_aggs(value: &Value) -> Result<BTreeMap<String, AggSpec>, OpenSearchErro
                 "terms" => parse_terms_agg(name, agg_options)?,
                 "date_histogram" => parse_date_histogram_agg(name, agg_options)?,
                 "cardinality" => parse_cardinality_agg(name, agg_options)?,
-                "composite" => {
-                    return Err(OpenSearchError::new(
-                        StatusCode::BAD_REQUEST,
-                        "parsing_exception",
-                        "agg type `composite` not implemented yet, tracked in A12 phase 2",
-                    ));
-                }
+                "composite" => parse_composite_agg(name, agg_options)?,
                 other => {
                     return Err(OpenSearchError::new(
                         StatusCode::BAD_REQUEST,
@@ -2183,6 +2359,198 @@ fn parse_cardinality_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearc
         })?
         .to_string();
     Ok(AggSpec::Cardinality { field })
+}
+
+/// A12.4: parse a `composite` agg body. MVP: `terms` sources only.
+/// `sources` is an ordered array of single-key objects
+/// `{ "<sourceName>": { "terms": { "field": "<path>" } } }`. Any
+/// other source kind (`date_histogram`, `histogram`, `geotile_grid`,
+/// …) is rejected with an explicit "A12.4 phase 2" hint. `size`
+/// defaults to `DEFAULT_COMPOSITE_AGG_SIZE`; `after` is captured
+/// verbatim as a `{ <sourceName>: <Value> }` cursor.
+fn parse_composite_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("agg `{name}`: `composite` body must be an object"),
+        )
+    })?;
+    let sources_value = object.get("sources").ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("agg `{name}`: `composite.sources` is required"),
+        )
+    })?;
+    let sources_array = sources_value.as_array().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("agg `{name}`: `composite.sources` must be an array"),
+        )
+    })?;
+    if sources_array.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("agg `{name}`: `composite.sources` must not be empty"),
+        ));
+    }
+
+    let mut sources: Vec<CompositeSource> = Vec::with_capacity(sources_array.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for (idx, entry) in sources_array.iter().enumerate() {
+        let entry_object = entry.as_object().ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: `composite.sources[{idx}]` must be an object \
+                     with a single source name"
+                ),
+            )
+        })?;
+        if entry_object.len() != 1 {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: `composite.sources[{idx}]` must declare exactly \
+                     one source name"
+                ),
+            ));
+        }
+        let (source_name, source_body) = entry_object
+            .iter()
+            .next()
+            .expect("len()==1 guarantees one entry");
+        if source_name.is_empty() {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: `composite.sources[{idx}]` source name must be \
+                     non-empty"
+                ),
+            ));
+        }
+        if !seen.insert(source_name.clone()) {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: duplicate composite source name `{source_name}`"
+                ),
+            ));
+        }
+        let source_body = source_body.as_object().ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: composite source `{source_name}` body must be \
+                     an object"
+                ),
+            )
+        })?;
+        if source_body.len() != 1 {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: composite source `{source_name}` must declare \
+                     exactly one source kind"
+                ),
+            ));
+        }
+        let (kind, kind_body) = source_body
+            .iter()
+            .next()
+            .expect("len()==1 guarantees one entry");
+        match kind.as_str() {
+            "terms" => {
+                let kind_object = kind_body.as_object().ok_or_else(|| {
+                    OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        format!(
+                            "agg `{name}`: composite source `{source_name}.terms` \
+                             body must be an object"
+                        ),
+                    )
+                })?;
+                let field = kind_object
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        OpenSearchError::new(
+                            StatusCode::BAD_REQUEST,
+                            "parsing_exception",
+                            format!(
+                                "agg `{name}`: composite source \
+                                 `{source_name}.terms.field` is required"
+                            ),
+                        )
+                    })?
+                    .to_string();
+                sources.push(CompositeSource {
+                    name: source_name.clone(),
+                    field,
+                });
+            }
+            other => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!(
+                        "agg `{name}`: composite source `{source_name}` kind \
+                         `{other}` not implemented yet, tracked in A12.4 phase 2"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let size = match object.get("size") {
+        None => DEFAULT_COMPOSITE_AGG_SIZE,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!(
+                        "agg `{name}`: `composite.size` must be a non-negative integer"
+                    ),
+                )
+            })?;
+            usize::try_from(n).unwrap_or(usize::MAX)
+        }
+    };
+
+    let after = match object.get("after") {
+        None => None,
+        Some(v) => {
+            let cursor = v.as_object().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("agg `{name}`: `composite.after` must be an object"),
+                )
+            })?;
+            let mut map: BTreeMap<String, Value> = BTreeMap::new();
+            for (k, val) in cursor {
+                map.insert(k.clone(), val.clone());
+            }
+            Some(map)
+        }
+    };
+
+    Ok(AggSpec::Composite {
+        sources,
+        size,
+        after,
+    })
 }
 
 fn parse_min_score(value: &Value) -> Result<f64, OpenSearchError> {
