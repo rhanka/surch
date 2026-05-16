@@ -6,7 +6,7 @@ use surch_analysis::{
 };
 use thiserror::Error;
 
-use crate::mapping::{AnalyzerName, FieldType, IndexMapping};
+use crate::mapping::{AnalyzerName, FieldPrefixes, FieldType, IndexMapping};
 use crate::postings::{
     BlockMeta, PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum,
 };
@@ -35,6 +35,13 @@ pub struct DocumentIndex {
     postings_builder: PostingsBuilder,
     terms: TermDictionary,
     field_stats: BTreeMap<String, FieldLengthStats>,
+    /// A6 phase 2: per-field write-time prefix expansion. Populated only for
+    /// fields whose `FieldMapping::index_prefixes` is `Some(_)`. The inner map
+    /// is keyed by the normalized prefix (length in `[min_chars..=max_chars]`)
+    /// and the value is the set of doc ids that contain at least one token
+    /// starting with that prefix. Kept separate from the regular postings so
+    /// the BM25 hot path (`doc_freq`, `term_freq`, norms) is unaffected.
+    prefix_postings: BTreeMap<String, BTreeMap<String, BTreeSet<u32>>>,
 }
 
 /// Per-field length statistics recorded during analysis for BM25 norms.
@@ -163,6 +170,7 @@ impl DocumentIndex {
         self.postings_builder = PostingsBuilder::new();
         self.terms = TermDictionary::default();
         self.field_stats.clear();
+        self.prefix_postings.clear();
     }
 
     pub fn doc_ids(&self) -> Vec<u32> {
@@ -197,6 +205,23 @@ impl DocumentIndex {
         self.field_stats.get(field)
     }
 
+    /// A6 phase 2: lookup the write-time prefix postings for `(field, prefix)`.
+    ///
+    /// Returns `Some(&BTreeSet<u32>)` iff `field` was indexed with
+    /// `index_prefixes` AND `prefix` has a length (in chars) within
+    /// `[min_chars..=max_chars]` of that mapping. Callers that fall outside
+    /// the bounds must fall back to the source-scan path.
+    pub fn prefix_postings(&self, field: &str, prefix: &str) -> Option<&BTreeSet<u32>> {
+        self.prefix_postings.get(field)?.get(prefix)
+    }
+
+    /// Whether `field` carries an `index_prefixes` write-time postings list.
+    /// Used by the query path to decide between the postings-backed lookup
+    /// and the source-scan fallback.
+    pub fn field_has_prefix_postings(&self, field: &str) -> bool {
+        self.prefix_postings.contains_key(field)
+    }
+
     pub fn live_doc_count(&self) -> usize {
         self.live_docs.len()
     }
@@ -219,6 +244,7 @@ impl DocumentIndex {
                     field.analyzer()
                 });
             let norms_enabled = field_mapping.is_none_or(|field| field.norms_enabled());
+            let index_prefixes = field_mapping.and_then(|m| m.index_prefixes);
 
             let analyzed_terms = analyzed_terms(analyzer, field, value);
             let token_count = analyzed_terms
@@ -231,6 +257,12 @@ impl DocumentIndex {
                     .or_insert((0, norms_enabled));
                 *doc_len += token_count;
                 *field_norms_enabled = *field_norms_enabled || norms_enabled;
+            }
+
+            // A6 phase 2: fan-out each analyzed token into its [min..=max]
+            // length prefixes, stored in a side-table so BM25 stays unaffected.
+            if let Some(prefixes) = index_prefixes {
+                self.index_prefix_terms(doc_id, field, &analyzed_terms, prefixes);
             }
 
             for ((field, term), positions) in analyzed_terms {
@@ -248,6 +280,39 @@ impl DocumentIndex {
 
         self.live_docs.insert(doc_id);
         Ok(())
+    }
+
+    /// A6 phase 2: for each analyzed token of `field`, generate the prefixes
+    /// of length `k` for every `k` in `[prefixes.min_chars..=prefixes.max_chars]`
+    /// and record `doc_id` under each prefix in `prefix_postings`.
+    ///
+    /// Operates on `char` boundaries so multibyte UTF-8 (`É`, etc.) is sliced
+    /// safely. Tokens shorter than `min_chars` contribute no entries; tokens
+    /// longer than `max_chars` only contribute prefixes up to `max_chars`
+    /// (ES `index_prefixes` semantics, see `MapperBuilder` in Lucene).
+    fn index_prefix_terms(
+        &mut self,
+        doc_id: u32,
+        field: &str,
+        analyzed_terms: &BTreeMap<(String, String), Vec<u32>>,
+        prefixes: FieldPrefixes,
+    ) {
+        let entry = self
+            .prefix_postings
+            .entry(field.to_owned())
+            .or_default();
+        for (_field, term) in analyzed_terms.keys() {
+            let chars: Vec<char> = term.chars().collect();
+            let token_len = chars.len();
+            if token_len < prefixes.min_chars {
+                continue;
+            }
+            let upper = token_len.min(prefixes.max_chars);
+            for k in prefixes.min_chars..=upper {
+                let prefix: String = chars[..k].iter().collect();
+                entry.entry(prefix).or_default().insert(doc_id);
+            }
+        }
     }
 }
 
@@ -277,4 +342,85 @@ fn analyzed_terms(
     }
 
     terms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapping::{FieldMapping, FieldPrefixes, FieldType};
+
+    fn mapping_with_prefixes(field: &str, prefixes: FieldPrefixes) -> IndexMapping {
+        let mut mapping = IndexMapping::new();
+        let field_mapping = FieldMapping::new(FieldType::Text, None)
+            .with_index_prefixes(Some(prefixes));
+        mapping.set_field_mapping(field, field_mapping);
+        mapping
+    }
+
+    #[test]
+    fn prefix_postings_populated_for_indexed_prefixes_field() {
+        // ES default: min=2, max=5. Each analyzed token contributes prefixes
+        // of length 2..=min(len, 5).
+        let mapping = mapping_with_prefixes(
+            "name",
+            FieldPrefixes {
+                min_chars: 2,
+                max_chars: 5,
+            },
+        );
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("name", "DUPONT")], &mapping)
+            .expect("doc 1");
+        index
+            .add_document_with_mapping(2, [("name", "DUPRE")], &mapping)
+            .expect("doc 2");
+        index
+            .add_document_with_mapping(3, [("name", "MARTIN")], &mapping)
+            .expect("doc 3");
+
+        // "DUP" (3 chars, in [2..=5]): docs 1 and 2.
+        let hits = index
+            .prefix_postings("name", "dup")
+            .expect("prefix postings present for dup");
+        assert_eq!(hits.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+
+        // "MAR" (3 chars, in [2..=5]): doc 3.
+        let hits = index
+            .prefix_postings("name", "mar")
+            .expect("prefix postings present for mar");
+        assert_eq!(hits.iter().copied().collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn prefix_postings_clipped_at_max_chars() {
+        // Prefix at exactly `max_chars` is recorded; longer prefixes are not.
+        let mapping = mapping_with_prefixes(
+            "name",
+            FieldPrefixes {
+                min_chars: 2,
+                max_chars: 4,
+            },
+        );
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("name", "DUPONT")], &mapping)
+            .expect("doc 1");
+
+        assert!(index.prefix_postings("name", "dupo").is_some());
+        // 5 chars > max_chars=4: not recorded; caller must fall back to scan.
+        assert!(index.prefix_postings("name", "dupon").is_none());
+    }
+
+    #[test]
+    fn prefix_postings_absent_when_field_lacks_index_prefixes() {
+        // No `index_prefixes` on field => no prefix postings table populated.
+        let mapping = IndexMapping::new();
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("name", "DUPONT")], &mapping)
+            .expect("doc 1");
+        assert!(!index.field_has_prefix_postings("name"));
+        assert!(index.prefix_postings("name", "dup").is_none());
+    }
 }

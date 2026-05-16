@@ -399,6 +399,14 @@ fn posting_candidate_ids(
                 .into_iter()
                 .collect(),
         ),
+        // A6 phase 2: `index_prefixes` write-time prefix postings turn a
+        // length-bounded `prefix` query into a direct lookup. Outside the
+        // declared `[min_chars..=max_chars]` window (or absent mapping)
+        // we return `None` so the candidate-set path falls back to the
+        // full-scan `query_matches` (which still uses `prefix_field_matches`).
+        SearchQuery::Prefix { field, value } => state
+            .documents_for_prefix(index, field, value)
+            .map(|ids| ids.into_iter().collect()),
         SearchQuery::MultiMatch {
             query,
             fields,

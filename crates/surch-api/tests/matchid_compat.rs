@@ -267,14 +267,16 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
         executed >= 3,
         "matchID v0 acceptance: at least 3 replay entries must execute against Surch (executed={executed}, skipped={skipped})"
     );
-    // The fixture is committed with the documented split: 24 executed + 6 skipped
-    // (3 prefix on A6 + 3 scroll on A4).
+    // The fixture is committed with the documented split: 26 executed + 4 skipped
+    // (1 keyword-prefix on A6/A13 + 3 scroll on A4). A6 phase 2 lifted the two
+    // text-typed prefix skips (prefix_nom, prefix_prenoms) via write-time
+    // `index_prefixes` postings on NOM/PRENOMS.
     assert_eq!(executed + skipped, 30);
     assert_eq!(
-        skipped, 6,
-        "expected 6 skipped entries (3 prefix on A6 + 3 scroll on A4)"
+        skipped, 4,
+        "expected 4 skipped entries (1 keyword-prefix on A6/A13 + 3 scroll on A4)"
     );
-    assert_eq!(executed, 24, "expected 24 executed entries against Surch HEAD");
+    assert_eq!(executed, 26, "expected 26 executed entries against Surch HEAD");
 }
 
 async fn execute(
