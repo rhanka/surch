@@ -39,16 +39,47 @@ pub struct SearchRequest {
     pub aggs: BTreeMap<String, AggSpec>,
 }
 
-/// A12.1: aggregation specification subset supported by Surch today.
-/// matchID's wire shape uses `terms`, `date_histogram`, `composite` and
-/// `cardinality` (intake §2.10). Only `terms` is implemented in this
-/// MVP; the other three are tracked in A12 phase 2.
+/// A12.1+A12.2+A12.3: aggregation specification subset supported by
+/// Surch today. matchID's wire shape uses `terms`, `date_histogram`,
+/// `composite` and `cardinality` (intake §2.10). `terms` ships under
+/// A12.1, `date_histogram` under A12.2 and `cardinality` under A12.3;
+/// `composite` + `after_key` are tracked under A12 phase 2.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AggSpec {
     /// `terms` aggregation: bucket documents by the distinct values of
     /// `field` and return the top `size` buckets ordered by descending
     /// `doc_count` (with ascending key as the deterministic tiebreak).
     Terms { field: String, size: usize },
+    /// A12.2: `date_histogram` aggregation. matchID emits this against
+    /// `DATE_NAISSANCE` / `DATE_NAISSANCE_NORM` keyword-encoded
+    /// `YYYYMMDD` dates. Each matched doc is truncated according to
+    /// `calendar_interval` (day → `YYYYMMDD`, month → `YYYYMM01`,
+    /// year → `YYYY0101`, week → ISO week-monday `YYYYMMDD`) and
+    /// counted into the bucket. Buckets are returned sorted by key
+    /// ascending. `format` is forwarded to `key_as_string` when set.
+    DateHistogram {
+        field: String,
+        calendar_interval: CalendarInterval,
+        format: Option<String>,
+    },
+    /// A12.3: `cardinality` aggregation. Counts the number of distinct
+    /// values of `field` over the matched documents. MVP: exact count
+    /// (no HyperLogLog estimation); the wire shape is the ES-7.x
+    /// `{ "value": N }` payload.
+    Cardinality { field: String },
+}
+
+/// A12.2: calendar bucketing unit for `date_histogram`. matchID emits
+/// `month` for the analytics tab and occasionally `day` / `year` for
+/// the per-decade drill-down. `week` is included for parity with ES
+/// 7.x (ISO week, Monday-anchored) even though deces-backend does not
+/// emit it today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalendarInterval {
+    Day,
+    Week,
+    Month,
+    Year,
 }
 
 const DEFAULT_TERMS_AGG_SIZE: usize = 10;
@@ -227,26 +258,35 @@ pub struct SearchResponse {
     /// each non-empty page returned by `scroll_handler`.
     #[serde(rename = "_scroll_id", skip_serializing_if = "Option::is_none")]
     pub scroll_id: Option<String>,
-    /// A12.1: per-aggregation bucket set, keyed by the aggregation name
+    /// A12.1: per-aggregation result, keyed by the aggregation name
     /// supplied in the request. Omitted when the request carries no
     /// `aggs` (or `aggregations`) block, so existing zero-agg callers
     /// continue to see the same response shape.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aggregations: Option<BTreeMap<String, AggBucketSet>>,
+    pub aggregations: Option<BTreeMap<String, AggResult>>,
 }
 
-/// A12.1: container holding the buckets returned for a single agg name.
+/// A12.1+A12.2+A12.3: shape of the per-aggregation payload. `terms`
+/// and `date_histogram` emit `{ buckets: [...] }`; `cardinality`
+/// emits `{ value: N }`. Serialized untagged so the JSON envelope
+/// stays ES-7.x identical.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct AggBucketSet {
-    pub buckets: Vec<AggBucket>,
+#[serde(untagged)]
+pub enum AggResult {
+    Buckets { buckets: Vec<AggBucket> },
+    Value { value: Value },
 }
 
-/// A12.1: ES-7.x compatible bucket payload (`{ "key": …, "doc_count": N }`).
-/// `key` is the verbatim `_source` value so numeric / string keys keep
-/// their JSON type unchanged through the response.
+/// A12.1+A12.2: ES-7.x compatible bucket payload. `terms` emits
+/// `{ "key": …, "doc_count": N }`; `date_histogram` additionally
+/// emits `{ "key_as_string": "…" }` when the agg body declared a
+/// `format`. `key` carries the verbatim JSON type so numeric /
+/// string keys round-trip through the response unchanged.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AggBucket {
     pub key: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_as_string: Option<String>,
     pub doc_count: u64,
 }
 
@@ -796,24 +836,38 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     response
 }
 
-/// A12.1: dispatch every declared aggregation against the post-filter
-/// matched-document set. Returns `None` when no aggs are declared so
-/// the response stays shape-compatible with zero-agg callers.
+/// A12.1+A12.2+A12.3: dispatch every declared aggregation against the
+/// post-filter matched-document set. Returns `None` when no aggs are
+/// declared so the response stays shape-compatible with zero-agg
+/// callers.
 fn compute_aggregations(
     specs: &BTreeMap<String, AggSpec>,
     matched_documents: &[ScoredDocument],
-) -> Option<BTreeMap<String, AggBucketSet>> {
+) -> Option<BTreeMap<String, AggResult>> {
     if specs.is_empty() {
         return None;
     }
-    let mut out: BTreeMap<String, AggBucketSet> = BTreeMap::new();
+    let mut out: BTreeMap<String, AggResult> = BTreeMap::new();
     for (name, spec) in specs {
-        let bucket_set = match spec {
+        let result = match spec {
             AggSpec::Terms { field, size } => {
                 compute_terms_aggregation(matched_documents, field, *size)
             }
+            AggSpec::DateHistogram {
+                field,
+                calendar_interval,
+                format,
+            } => compute_date_histogram_aggregation(
+                matched_documents,
+                field,
+                *calendar_interval,
+                format.as_deref(),
+            ),
+            AggSpec::Cardinality { field } => {
+                compute_cardinality_aggregation(matched_documents, field)
+            }
         };
-        out.insert(name.clone(), bucket_set);
+        out.insert(name.clone(), result);
     }
     Some(out)
 }
@@ -836,7 +890,7 @@ fn compute_terms_aggregation(
     matched_documents: &[ScoredDocument],
     field: &str,
     size: usize,
-) -> AggBucketSet {
+) -> AggResult {
     let mut counts: BTreeMap<TermsKey, (Value, u64)> = BTreeMap::new();
     for scored in matched_documents {
         let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
@@ -864,9 +918,172 @@ fn compute_terms_aggregation(
     let buckets = sorted
         .into_iter()
         .take(size)
-        .map(|(key, doc_count)| AggBucket { key, doc_count })
+        .map(|(key, doc_count)| AggBucket {
+            key,
+            key_as_string: None,
+            doc_count,
+        })
         .collect();
-    AggBucketSet { buckets }
+    AggResult::Buckets { buckets }
+}
+
+/// A12.2: `date_histogram` aggregation executor. Each matched document
+/// contributes its `field` value (string `YYYYMMDD`, as stored by the
+/// A7 `date{format:yyyyMMdd}` field type) to the bucket obtained by
+/// truncating the date to the requested `calendar_interval`. Buckets
+/// are returned sorted by key ascending — matchID's analytics tab
+/// renders the timeline left-to-right and depends on that order.
+///
+/// Behaviour notes:
+/// - Values that do not parse as `YYYYMMDD` are skipped (no synthetic
+///   bucket — matches ES default when no `missing` option is set),
+/// - array-valued fields contribute one increment per element,
+/// - `format` is forwarded verbatim into `key_as_string` when set; we
+///   do not re-render the date through a different pattern in this
+///   MVP (matchID only ever emits `yyyyMMdd`, which happens to match
+///   the storage shape).
+fn compute_date_histogram_aggregation(
+    matched_documents: &[ScoredDocument],
+    field: &str,
+    calendar_interval: CalendarInterval,
+    format: Option<&str>,
+) -> AggResult {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for scored in matched_documents {
+        let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
+            continue;
+        };
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(bucket_key) =
+                        bucket_key_for_date(item, calendar_interval)
+                    {
+                        *counts.entry(bucket_key).or_insert(0) += 1;
+                    }
+                }
+            }
+            other => {
+                if let Some(bucket_key) = bucket_key_for_date(other, calendar_interval)
+                {
+                    *counts.entry(bucket_key).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // BTreeMap iteration already yields keys ascending — but we still
+    // map through `Vec` so the response shape is identical to
+    // `terms`.
+    let buckets = counts
+        .into_iter()
+        .map(|(key, doc_count)| AggBucket {
+            key: Value::String(key.clone()),
+            key_as_string: format.map(|_| key),
+            doc_count,
+        })
+        .collect();
+    AggResult::Buckets { buckets }
+}
+
+/// A12.2: truncate a `YYYYMMDD` JSON value to the requested calendar
+/// interval. Returns `None` for any value that does not parse.
+fn bucket_key_for_date(value: &Value, interval: CalendarInterval) -> Option<String> {
+    let s = value.as_str()?;
+    if s.len() != 8 || !s.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: u32 = s[4..6].parse().ok()?;
+    let day: u32 = s[6..8].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(match interval {
+        CalendarInterval::Day => format!("{year:04}{month:02}{day:02}"),
+        CalendarInterval::Month => format!("{year:04}{month:02}01"),
+        CalendarInterval::Year => format!("{year:04}0101"),
+        CalendarInterval::Week => {
+            // Truncate to the Monday of the ISO week containing the
+            // input date. We compute the day-of-year via the Gregorian
+            // calendar (no chrono dependency), then anchor on Monday
+            // using Zeller's congruence-style weekday derivation.
+            let (anchor_year, anchor_month, anchor_day) =
+                week_anchor_monday(year, month, day);
+            format!("{anchor_year:04}{anchor_month:02}{anchor_day:02}")
+        }
+    })
+}
+
+/// A12.2 helper: return the (year, month, day) of the Monday of the
+/// ISO week containing the given Gregorian date. Pure-Rust, no
+/// dependency.
+fn week_anchor_monday(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
+    // Convert to Rata Die (day number since 0000-12-31). Algorithm
+    // from Howard Hinnant's date library, transcribed for u32 / i32.
+    fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y } as i64;
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = (y - era * 400) as u64; // [0, 399]
+        let m = m as i64;
+        let d = d as i64;
+        let doy = ((153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1) as u64;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe as i64 - 719468
+    }
+    fn civil_from_days(z: i64) -> (i32, u32, u32) {
+        let z = z + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        let y = if m <= 2 { y + 1 } else { y } as i32;
+        (y, m, d)
+    }
+    let z = days_from_civil(year, month, day);
+    // 1970-01-01 was a Thursday → weekday(Thu) = 3 in Mon=0 system.
+    // weekday = (z + 3).rem_euclid(7)
+    let weekday = (z + 3).rem_euclid(7); // 0=Mon..6=Sun
+    civil_from_days(z - weekday)
+}
+
+/// A12.3: `cardinality` aggregation executor. Counts the number of
+/// distinct values of `field` across the matched-document set. The
+/// `.raw` / `.norm` sub-field alias is handled by `lookup_sort_value`
+/// (same path as terms / sort). MVP: exact count, no HyperLogLog
+/// estimation — matchID's analytics tab consumes the exact value
+/// today.
+fn compute_cardinality_aggregation(
+    matched_documents: &[ScoredDocument],
+    field: &str,
+) -> AggResult {
+    let mut distinct: BTreeSet<TermsKey> = BTreeSet::new();
+    for scored in matched_documents {
+        let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
+            continue;
+        };
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    if !matches!(item, Value::Null) {
+                        distinct.insert(TermsKey::from_value(item));
+                    }
+                }
+            }
+            other => {
+                if !matches!(other, Value::Null) {
+                    distinct.insert(TermsKey::from_value(other));
+                }
+            }
+        }
+    }
+    AggResult::Value {
+        value: Value::from(distinct.len() as u64),
+    }
 }
 
 fn record_terms_value(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Value) {
@@ -1791,13 +2008,13 @@ fn parse_aggs(value: &Value) -> Result<BTreeMap<String, AggSpec>, OpenSearchErro
         for (agg_type, agg_options) in agg_body {
             let parsed = match agg_type.as_str() {
                 "terms" => parse_terms_agg(name, agg_options)?,
-                "date_histogram" | "composite" | "cardinality" => {
+                "date_histogram" => parse_date_histogram_agg(name, agg_options)?,
+                "cardinality" => parse_cardinality_agg(name, agg_options)?,
+                "composite" => {
                     return Err(OpenSearchError::new(
                         StatusCode::BAD_REQUEST,
                         "parsing_exception",
-                        format!(
-                            "agg type `{agg_type}` not implemented yet, tracked in A12 phase 2"
-                        ),
+                        "agg type `composite` not implemented yet, tracked in A12 phase 2",
                     ));
                 }
                 other => {
@@ -1864,6 +2081,100 @@ fn parse_terms_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchError
         }
     };
     Ok(AggSpec::Terms { field, size })
+}
+
+/// A12.2: parse a `date_histogram` agg body. `calendar_interval` is
+/// mandatory (matchID always sets it); `format` is optional and gets
+/// echoed back into the bucket's `key_as_string` when set.
+fn parse_date_histogram_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("agg `{name}`: `date_histogram` body must be an object"),
+        )
+    })?;
+    let field = object
+        .get("field")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("agg `{name}`: `date_histogram.field` is required"),
+            )
+        })?
+        .to_string();
+    let interval_str = object
+        .get("calendar_interval")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("agg `{name}`: `date_histogram.calendar_interval` is required"),
+            )
+        })?;
+    let calendar_interval = match interval_str {
+        "day" | "1d" => CalendarInterval::Day,
+        "week" | "1w" => CalendarInterval::Week,
+        "month" | "1M" => CalendarInterval::Month,
+        "year" | "1y" => CalendarInterval::Year,
+        other => {
+            return Err(OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!(
+                    "agg `{name}`: unsupported `date_histogram.calendar_interval` `{other}` \
+                     (day|week|month|year only, tracked in A12 phase 2)"
+                ),
+            ));
+        }
+    };
+    let format = match object.get("format") {
+        None => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| {
+                    OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        format!("agg `{name}`: `date_histogram.format` must be a string"),
+                    )
+                })?
+                .to_string(),
+        ),
+    };
+    Ok(AggSpec::DateHistogram {
+        field,
+        calendar_interval,
+        format,
+    })
+}
+
+/// A12.3: parse a `cardinality` agg body. `field` is the only
+/// required option; `precision_threshold` (HLL knob) is accepted and
+/// silently ignored because the MVP returns the exact count.
+fn parse_cardinality_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("agg `{name}`: `cardinality` body must be an object"),
+        )
+    })?;
+    let field = object
+        .get("field")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("agg `{name}`: `cardinality.field` is required"),
+            )
+        })?
+        .to_string();
+    Ok(AggSpec::Cardinality { field })
 }
 
 fn parse_min_score(value: &Value) -> Result<f64, OpenSearchError> {
