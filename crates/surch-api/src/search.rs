@@ -1409,7 +1409,7 @@ fn run_topk_search(
     scoring_enabled: bool,
     started_at: Instant,
 ) -> Option<SearchResponse> {
-    if !scoring_enabled || indices.len() != 1 || !is_default_score_sort(&request.sort) {
+    if indices.len() != 1 || !is_default_score_sort(&request.sort) {
         return None;
     }
     if request.highlight.is_some() {
@@ -1422,10 +1422,30 @@ fn run_topk_search(
         return None;
     }
     let query = request.query.as_ref()?;
-    if !matches!(
-        query,
-        SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. }
-    ) {
+
+    // `match_all` is a non-scoring query whose result set is the whole
+    // index in stable order — no candidate resolution, no scoring loop,
+    // no full-corpus sort. The general `run_search` path used to clone
+    // every `_source` to compute a 5 000-entry `Vec<ScoredDocument>` and
+    // then `paginate_hits` would discard all but the requested K, which
+    // dominated the bench wall clock (~7 ms on 5 k docs). Short-circuit
+    // here so we only clone the `from..from+size` window.
+    if let SearchQuery::MatchAll { .. } = query {
+        return Some(run_topk_match_all(
+            state,
+            &indices[0],
+            request,
+            scoring_enabled,
+            started_at,
+        ));
+    }
+
+    if !scoring_enabled
+        || !matches!(
+            query,
+            SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. }
+        )
+    {
         return None;
     }
 
@@ -1464,6 +1484,62 @@ fn run_topk_search(
 fn is_default_score_sort(sort: &[SortClause]) -> bool {
     sort.is_empty()
         || (sort.len() == 1 && sort[0].field == "_score" && sort[0].order == SortOrder::Desc)
+}
+
+/// `match_all` top-K shortcut. Since the query has no candidate filter
+/// and assigns a constant score (`boost`, default 1.0), we only need
+/// the `[from..from+size)` window of the index's natural document
+/// order and the cheap document-count for `total`. No clones outside
+/// the window, no full-corpus sort, no scoring loop.
+///
+/// `scoring_enabled` is always `false` for `match_all` today
+/// (`is_scoring_query` returns false), so `_score` is intentionally
+/// omitted from the hit payload — matches OpenSearch behaviour for
+/// `match_all` with no rescoring wrapper.
+fn run_topk_match_all(
+    state: &AppState,
+    index: &str,
+    request: &SearchRequest,
+    scoring_enabled: bool,
+    started_at: Instant,
+) -> SearchResponse {
+    let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
+    let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
+
+    let total = state.document_count(index);
+    let page = state.documents_paginated(index, from, size);
+    let hits: Vec<Value> = page
+        .iter()
+        .map(|doc| {
+            build_hit(
+                doc,
+                request.source.as_ref(),
+                // match_all is non-scoring, but keep the conditional so a
+                // future wrapper (e.g. function_score on match_all) sees
+                // a uniform code path.
+                scoring_enabled.then_some(1.0),
+                request.highlight.as_ref(),
+                request.query.as_ref(),
+            )
+        })
+        .collect();
+
+    let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
+    let mut response = build_search_response_with_total(
+        hits,
+        total_summary,
+        started_at.elapsed().as_millis() as u64,
+    );
+    // `max_score` mirrors the general path: `None` when scoring is
+    // disabled, otherwise the constant boost. `compute_max_score` would
+    // return `None` for an empty top-K window even when `total > 0`, so
+    // we set it explicitly to stay consistent with the full-scan path.
+    response.hits.max_score = if scoring_enabled && total > 0 {
+        Some(1.0)
+    } else {
+        None
+    };
+    response
 }
 
 fn topk_scored_documents(

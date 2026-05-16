@@ -1127,6 +1127,55 @@ impl AppState {
             .collect()
     }
 
+    /// Number of stored documents in `index`, or 0 when the index does
+    /// not exist. Avoids the O(N) clone that `documents(index).len()`
+    /// would incur — the `match_all` hot path uses this to compute
+    /// `total` without materialising every `_source`.
+    pub fn document_count(&self, index: &str) -> u64 {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map_or(0, |data| data.documents.len() as u64)
+    }
+
+    /// Returns documents at positions `[from, from + size)` in the
+    /// index's stable iteration order (BTreeMap key order on the
+    /// public `_id`). Only the requested window is cloned, so the
+    /// `match_all` top-K shortcut clones K sources instead of N.
+    /// Returns an empty vec when `index` does not exist or when `from`
+    /// lands past the last document.
+    pub fn documents_paginated(
+        &self,
+        index: &str,
+        from: usize,
+        size: usize,
+    ) -> Vec<StoredDocument> {
+        if size == 0 {
+            return Vec::new();
+        }
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let Some(data) = store.indices.get(index) else {
+            return Vec::new();
+        };
+        data.documents
+            .iter()
+            .skip(from)
+            .take(size)
+            .map(|(id, source)| StoredDocument {
+                index: index.to_owned(),
+                id: id.clone(),
+                source: source.clone(),
+            })
+            .collect()
+    }
+
     pub fn documents_by_ids(&self, index: &str, ids: &[String]) -> Vec<StoredDocument> {
         let store = self
             .store
