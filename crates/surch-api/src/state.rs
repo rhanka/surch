@@ -744,7 +744,7 @@ impl AppState {
                     ));
                 }
             }
-            merged.set_field_mapping(field.clone(), *mapping);
+            merged.set_field_mapping(field.clone(), mapping.clone());
         }
 
         data.set_mapping(merged);
@@ -1362,7 +1362,7 @@ fn snapshot_component_templates(
 
 fn merge_mapping_fields(target: &mut IndexMapping, source: &IndexMapping) {
     for (field, mapping) in source.fields() {
-        target.set_field_mapping(field.to_owned(), *mapping);
+        target.set_field_mapping(field.to_owned(), mapping.clone());
     }
 }
 

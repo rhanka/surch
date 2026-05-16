@@ -264,7 +264,7 @@ pub async fn put_mapping_handler(
 
     let fields: Vec<_> = mapping
         .fields()
-        .map(|(field, mapping)| (field.to_owned(), *mapping))
+        .map(|(field, mapping)| (field.to_owned(), mapping.clone()))
         .collect();
     if let Err(reason) = state.merge_field_mappings(&index, &fields) {
         return OpenSearchError::new(

@@ -167,7 +167,16 @@ impl FieldPrefixes {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Default `format` applied to `type: date` fields when the mapping omits it.
+///
+/// Matches matchID's `deces_index.yml` (intake §2.12) where `DATE_NAISSANCE`
+/// is declared as `{ type: date, format: yyyyMMdd }` over the `YYYYMMDD`
+/// keyword strings emitted by the INSEE extracts. The keyword-backed storage
+/// is already lex-sortable, so the parsed `format` is captured for wire-compat
+/// round-tripping only — no runtime `chrono::NaiveDate` parsing is wired yet.
+pub const DEFAULT_DATE_FORMAT: &str = "yyyyMMdd";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldMapping {
     pub field_type: FieldType,
     pub analyzer: Option<AnalyzerName>,
@@ -178,6 +187,11 @@ pub struct FieldMapping {
     pub normalizer: Option<AnalyzerName>,
     /// Field-level `index_prefixes` option (text fields only).
     pub index_prefixes: Option<FieldPrefixes>,
+    /// `format` token captured when `field_type == Date`. Defaults to
+    /// `DEFAULT_DATE_FORMAT` (`yyyyMMdd`) when the mapping omits it. The
+    /// MVP stores the value verbatim — any string is accepted but only the
+    /// lex-sortable `yyyyMMdd` shape is exercised at search time.
+    pub date_format: Option<String>,
 }
 
 impl FieldMapping {
@@ -196,6 +210,7 @@ impl FieldMapping {
             norms,
             normalizer: None,
             index_prefixes: None,
+            date_format: None,
         }
     }
 
@@ -207,6 +222,24 @@ impl FieldMapping {
     pub fn with_index_prefixes(mut self, prefixes: Option<FieldPrefixes>) -> Self {
         self.index_prefixes = prefixes;
         self
+    }
+
+    pub fn with_date_format(mut self, date_format: Option<String>) -> Self {
+        self.date_format = date_format;
+        self
+    }
+
+    /// Effective `format` for a `date` field. Returns `DEFAULT_DATE_FORMAT`
+    /// when the mapping omits the attribute. Non-date fields return `None`.
+    pub fn date_format(&self) -> Option<&str> {
+        if self.field_type != FieldType::Date {
+            return None;
+        }
+        Some(
+            self.date_format
+                .as_deref()
+                .unwrap_or(DEFAULT_DATE_FORMAT),
+        )
     }
 
     pub fn analyzer(&self) -> AnalyzerName {
@@ -255,6 +288,16 @@ impl FieldMapping {
                 Value::Number(prefixes.max_chars.into()),
             );
             object.insert("index_prefixes".to_owned(), Value::Object(inner));
+        }
+
+        if self.field_type == FieldType::Date {
+            // Always emit the effective format so wire-shape consumers
+            // (matchID, kibana-compat clients) see a fully-resolved value.
+            let format = self
+                .date_format
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DATE_FORMAT.to_owned());
+            object.insert("format".to_owned(), Value::String(format));
         }
 
         Value::Object(object)
@@ -494,11 +537,33 @@ impl IndexMapping {
                 });
             }
 
+            // `format` is only meaningful on `type: date`. Captured verbatim
+            // — MVP keyword-backs `YYYYMMDD` strings, so any shape rounds-trips
+            // without runtime validation. See gap-analysis A7.
+            let date_format = match field_definition.get("format") {
+                Some(value) => {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| MappingError::DateFormatNotString {
+                            field: field.clone(),
+                        })?;
+                    if field_type != FieldType::Date {
+                        return Err(MappingError::DateFormatNotSupported {
+                            field: field.clone(),
+                            field_type: field_type.as_str().to_owned(),
+                        });
+                    }
+                    Some(value.to_owned())
+                }
+                None => None,
+            };
+
             mapping.set_field_mapping(
                 field.to_owned(),
                 FieldMapping::with_norms(field_type, analyzer, norms)
                     .with_normalizer(normalizer)
-                    .with_index_prefixes(index_prefixes),
+                    .with_index_prefixes(index_prefixes)
+                    .with_date_format(date_format),
             );
         }
 
@@ -756,6 +821,10 @@ pub enum MappingError {
     NormalizerNotString { field: String },
     #[error("field `{field}` has unsupported normalizer `{normalizer}`")]
     UnsupportedNormalizer { field: String, normalizer: String },
+    #[error("field `{field}` format must be a string")]
+    DateFormatNotString { field: String },
+    #[error("field `{field}` format is only supported on date fields (got `{field_type}`)")]
+    DateFormatNotSupported { field: String, field_type: String },
     #[error("index settings must be an object")]
     SettingsNotObject,
     #[error("settings.analysis must be an object")]
@@ -1040,5 +1109,70 @@ mod tests {
             MappingError::AnalyzerNotSupported { field, field_type }
                 if field == "GEOPOINT_NAISSANCE" && field_type == "geo_point",
         ), "got {error:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // A7: `date{format:yyyyMMdd}` mapping (MVP keyword-backed)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn from_properties_value_accepts_date_with_explicit_yyyymmdd_format() {
+        let properties = serde_json::json!({
+            "DATE_NAISSANCE": { "type": "date", "format": "yyyyMMdd" }
+        });
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("date{format:yyyyMMdd} should parse");
+        let field = mapping
+            .field("DATE_NAISSANCE")
+            .expect("DATE_NAISSANCE field exists");
+        assert_eq!(field.field_type, FieldType::Date);
+        assert_eq!(field.date_format.as_deref(), Some("yyyyMMdd"));
+        assert_eq!(field.date_format(), Some("yyyyMMdd"));
+    }
+
+    #[test]
+    fn from_properties_value_accepts_bare_date_with_default_format() {
+        let properties = serde_json::json!({
+            "DATE_NAISSANCE": { "type": "date" }
+        });
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("bare `type: date` should parse");
+        let field = mapping
+            .field("DATE_NAISSANCE")
+            .expect("DATE_NAISSANCE field exists");
+        assert_eq!(field.field_type, FieldType::Date);
+        assert!(field.date_format.is_none());
+        assert_eq!(field.date_format(), Some(DEFAULT_DATE_FORMAT));
+        assert_eq!(field.date_format(), Some("yyyyMMdd"));
+    }
+
+    #[test]
+    fn from_properties_value_accepts_arbitrary_date_format_string_for_mvp() {
+        let properties = serde_json::json!({
+            "WHEN": { "type": "date", "format": "nonsensical" }
+        });
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("unknown date format strings are accepted at parse time");
+        let field = mapping.field("WHEN").expect("WHEN field exists");
+        assert_eq!(field.field_type, FieldType::Date);
+        assert_eq!(field.date_format.as_deref(), Some("nonsensical"));
+        let rendered = mapping.as_value();
+        let format = rendered
+            .pointer("/properties/WHEN/format")
+            .and_then(Value::as_str);
+        assert_eq!(format, Some("nonsensical"));
+    }
+
+    #[test]
+    fn from_properties_value_rejects_format_on_non_date_field() {
+        let properties = serde_json::json!({
+            "NOM": { "type": "text", "format": "yyyyMMdd" }
+        });
+        let error = IndexMapping::from_properties_value(&properties)
+            .expect_err("format on non-date should error");
+        assert!(
+            matches!(error, MappingError::DateFormatNotSupported { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 }
