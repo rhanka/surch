@@ -127,6 +127,37 @@ impl AnalyzerName {
     }
 }
 
+/// Parsed `index_prefixes` field option (matchID §2.12).
+///
+/// matchID enables `index_prefixes: { min_chars: 2, max_chars: 10 }` on
+/// `PRENOMS` to back fast autocomplete prefix queries. ES defaults are
+/// `min_chars=2`, `max_chars=5`; both are clamped to `2..=20` and the
+/// strict ordering `min < max` is enforced (see ES `IndexPrefixes`
+/// validation in `MapperBuilder`).
+///
+/// Phase-1: this is parse-only metadata — the runtime still answers
+/// `prefix` queries via the existing scan/token-iterator in
+/// `surch-api/src/search.rs::prefix_field_matches`. A6's runtime
+/// acceleration (write-time edge-ngram fan-out) is tracked separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldPrefixes {
+    pub min_chars: usize,
+    pub max_chars: usize,
+}
+
+impl FieldPrefixes {
+    pub const DEFAULT_MIN_CHARS: usize = 2;
+    pub const DEFAULT_MAX_CHARS: usize = 5;
+    pub const MAX_BOUND: usize = 20;
+
+    pub const fn defaults() -> Self {
+        Self {
+            min_chars: Self::DEFAULT_MIN_CHARS,
+            max_chars: Self::DEFAULT_MAX_CHARS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldMapping {
     pub field_type: FieldType,
@@ -136,6 +167,8 @@ pub struct FieldMapping {
     /// builtin (`AnalyzerName::Norm`) when the named normalizer matches the
     /// canonical `lowercase + asciifolding` shape; otherwise `None`.
     pub normalizer: Option<AnalyzerName>,
+    /// Field-level `index_prefixes` option (text fields only).
+    pub index_prefixes: Option<FieldPrefixes>,
 }
 
 impl FieldMapping {
@@ -153,11 +186,17 @@ impl FieldMapping {
             analyzer,
             norms,
             normalizer: None,
+            index_prefixes: None,
         }
     }
 
     pub fn with_normalizer(mut self, normalizer: Option<AnalyzerName>) -> Self {
         self.normalizer = normalizer;
+        self
+    }
+
+    pub fn with_index_prefixes(mut self, prefixes: Option<FieldPrefixes>) -> Self {
+        self.index_prefixes = prefixes;
         self
     }
 
@@ -187,6 +226,26 @@ impl FieldMapping {
 
         if let Some(norms) = self.norms {
             object.insert("norms".to_owned(), Value::Bool(norms));
+        }
+
+        if let Some(normalizer) = self.normalizer {
+            object.insert(
+                "normalizer".to_owned(),
+                Value::String(normalizer.as_str().to_owned()),
+            );
+        }
+
+        if let Some(prefixes) = self.index_prefixes {
+            let mut inner = Map::new();
+            inner.insert(
+                "min_chars".to_owned(),
+                Value::Number(prefixes.min_chars.into()),
+            );
+            inner.insert(
+                "max_chars".to_owned(),
+                Value::Number(prefixes.max_chars.into()),
+            );
+            object.insert("index_prefixes".to_owned(), Value::Object(inner));
         }
 
         Value::Object(object)
@@ -414,10 +473,23 @@ impl IndexMapping {
                 None => None,
             };
 
+            let index_prefixes = match field_definition.get("index_prefixes") {
+                Some(value) => Some(parse_index_prefixes(field, value)?),
+                None => None,
+            };
+
+            if index_prefixes.is_some() && field_type != FieldType::Text {
+                return Err(MappingError::IndexPrefixesNotSupported {
+                    field: field.clone(),
+                    field_type: field_type.as_str().to_owned(),
+                });
+            }
+
             mapping.set_field_mapping(
                 field.to_owned(),
                 FieldMapping::with_norms(field_type, analyzer, norms)
-                    .with_normalizer(normalizer),
+                    .with_normalizer(normalizer)
+                    .with_index_prefixes(index_prefixes),
             );
         }
 
@@ -580,6 +652,60 @@ impl IndexMapping {
     }
 }
 
+fn parse_index_prefixes(field: &str, value: &Value) -> Result<FieldPrefixes, MappingError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| MappingError::IndexPrefixesNotObject {
+            field: field.to_owned(),
+        })?;
+
+    let unknown_key = object
+        .keys()
+        .find(|key| key.as_str() != "min_chars" && key.as_str() != "max_chars");
+    if let Some(key) = unknown_key {
+        return Err(MappingError::IndexPrefixesUnknownKey {
+            field: field.to_owned(),
+            key: key.to_owned(),
+        });
+    }
+
+    let min_chars = match object.get("min_chars") {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| MappingError::IndexPrefixesBoundNotUnsigned {
+                field: field.to_owned(),
+                bound: "min_chars".to_owned(),
+            })? as usize,
+        None => FieldPrefixes::DEFAULT_MIN_CHARS,
+    };
+
+    let max_chars = match object.get("max_chars") {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| MappingError::IndexPrefixesBoundNotUnsigned {
+                field: field.to_owned(),
+                bound: "max_chars".to_owned(),
+            })? as usize,
+        None => FieldPrefixes::DEFAULT_MAX_CHARS,
+    };
+
+    if min_chars < FieldPrefixes::DEFAULT_MIN_CHARS
+        || max_chars > FieldPrefixes::MAX_BOUND
+        || min_chars >= max_chars
+    {
+        return Err(MappingError::IndexPrefixesBoundsInvalid {
+            field: field.to_owned(),
+            min_chars,
+            max_chars,
+        });
+    }
+
+    Ok(FieldPrefixes {
+        min_chars,
+        max_chars,
+    })
+}
+
 fn read_filter_chain(
     definition: &Map<String, Value>,
     name: &str,
@@ -633,6 +759,22 @@ pub enum MappingError {
     AnalysisFilterNotArray { section: String, name: String },
     #[error("edge_ngram tokenizer `{name}` missing required field `{bound}`")]
     EdgeNgramMissingBound { name: String, bound: String },
+    #[error("field `{field}` index_prefixes must be an object")]
+    IndexPrefixesNotObject { field: String },
+    #[error("field `{field}` index_prefixes has unknown key `{key}`")]
+    IndexPrefixesUnknownKey { field: String, key: String },
+    #[error("field `{field}` index_prefixes.{bound} must be a non-negative integer")]
+    IndexPrefixesBoundNotUnsigned { field: String, bound: String },
+    #[error(
+        "field `{field}` index_prefixes bounds invalid (min_chars={min_chars}, max_chars={max_chars}); expected 2 <= min_chars < max_chars <= 20"
+    )]
+    IndexPrefixesBoundsInvalid {
+        field: String,
+        min_chars: usize,
+        max_chars: usize,
+    },
+    #[error("field `{field}` index_prefixes is only supported on text fields (got `{field_type}`)")]
+    IndexPrefixesNotSupported { field: String, field_type: String },
 }
 
 pub fn infer_field_type(value: &Value) -> FieldType {
@@ -767,5 +909,73 @@ mod tests {
         let raw = mapping.field("raw").expect("raw field exists");
         assert_eq!(raw.field_type, FieldType::Keyword);
         assert_eq!(raw.normalizer, Some(AnalyzerName::Norm));
+    }
+
+    // --- A6: `index_prefixes` field-level option (matchID §2.12) ---
+
+    #[test]
+    fn from_properties_value_accepts_empty_index_prefixes_with_defaults() {
+        // ES default: `index_prefixes: {}` -> min_chars=2, max_chars=5.
+        let properties = serde_json::json!({
+            "NOM": { "type": "text", "index_prefixes": {} }
+        });
+
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("empty index_prefixes should default to min=2/max=5");
+        let nom = mapping.field("NOM").expect("NOM field exists");
+        assert_eq!(nom.field_type, FieldType::Text);
+        let prefixes = nom
+            .index_prefixes
+            .expect("index_prefixes recorded on NOM");
+        assert_eq!(prefixes.min_chars, FieldPrefixes::DEFAULT_MIN_CHARS);
+        assert_eq!(prefixes.max_chars, FieldPrefixes::DEFAULT_MAX_CHARS);
+        assert_eq!(prefixes.min_chars, 2);
+        assert_eq!(prefixes.max_chars, 5);
+    }
+
+    #[test]
+    fn from_properties_value_accepts_explicit_index_prefixes_bounds() {
+        // Matches the matchID `PRENOMS: { index_prefixes: { min_chars: 2, max_chars: 5 } }` shape.
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "index_prefixes": { "min_chars": 2, "max_chars": 5 }
+            }
+        });
+
+        let mapping = IndexMapping::from_properties_value(&properties)
+            .expect("explicit index_prefixes bounds should parse");
+        let prefixes = mapping
+            .field("NOM")
+            .and_then(|field| field.index_prefixes)
+            .expect("index_prefixes recorded on NOM");
+        assert_eq!(prefixes.min_chars, 2);
+        assert_eq!(prefixes.max_chars, 5);
+    }
+
+    #[test]
+    fn from_properties_value_rejects_inverted_index_prefixes_bounds() {
+        // ES rejects `min_chars >= max_chars`; we must reject the mapping
+        // outright so the index never reaches a half-initialised state.
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "index_prefixes": { "min_chars": 20, "max_chars": 5 }
+            }
+        });
+
+        let error = IndexMapping::from_properties_value(&properties)
+            .expect_err("min_chars > max_chars should be rejected");
+        assert!(
+            matches!(
+                &error,
+                MappingError::IndexPrefixesBoundsInvalid {
+                    field,
+                    min_chars: 20,
+                    max_chars: 5,
+                } if field == "NOM"
+            ),
+            "expected IndexPrefixesBoundsInvalid for NOM, got {error:?}",
+        );
     }
 }
