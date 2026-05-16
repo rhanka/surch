@@ -8,7 +8,7 @@
 # Run:
 #   docker run --rm -p 7700:7700 ghcr.io/rhanka/surch:dev
 
-ARG RUST_VERSION=1.83
+ARG RUST_VERSION=1.88
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 WORKDIR /usr/src/surch
