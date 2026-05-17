@@ -61,7 +61,12 @@ jobs:
           KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
         run: |
           mkdir -p "$HOME/.kube"
-          printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$HOME/.kube/config"
+          # Accept the secret in either raw YAML or base64-encoded form.
+          if printf '%s' "$KUBE_CONFIG_DATA" | base64 -d 2>/dev/null | grep -q '^apiVersion:'; then
+            printf '%s' "$KUBE_CONFIG_DATA" | base64 -d > "$HOME/.kube/config"
+          else
+            printf '%s' "$KUBE_CONFIG_DATA" > "$HOME/.kube/config"
+          fi
           chmod 600 "$HOME/.kube/config"
           kubectl get namespace "$SCW_NAMESPACE"
 
