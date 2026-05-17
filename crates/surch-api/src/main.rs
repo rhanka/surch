@@ -81,8 +81,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bind_addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
+    let shared = surch_api::AppRouterState::default();
+    let _slm_scheduler = surch_api::slm::scheduler::spawn(
+        surch_api::slm::SchedulerConfig::default(),
+        shared.slm_policies.clone(),
+        shared.snapshot_repositories.clone(),
+        shared.app.clone(),
+    );
+
     eprintln!("surch-api listening on http://{bind_addr}");
-    axum::serve(listener, surch_api::app_router()).await?;
+    axum::serve(listener, surch_api::app_router_with_state(shared)).await?;
 
     Ok(())
 }
