@@ -4102,8 +4102,205 @@ async fn search_router_a12_4_composite_caps_at_size_and_emits_after_key() {
     );
 }
 
+// --- A12.4 phase 2: composite with `date_histogram` sources ---
+//
+// matchID intake §2.10 wires `composite` against a mix of `terms`
+// (lastName) and `date_histogram` (birthDate truncated to the
+// calendar month) sources to drive the analytics cross-tab. Phase 1
+// rejected `date_histogram` sources at parse time; phase 2 accepts
+// them and bucketises with the same truncation logic the standalone
+// `date_histogram` agg already uses (intake §2.10).
+
 #[tokio::test]
-async fn search_router_a12_4_composite_rejects_date_histogram_source_with_phase2_hint() {
+async fn search_router_a12_4_phase2_composite_mixed_sources_emits_one_bucket_per_unique_key() {
+    let router = app_router();
+    // 5 docs / 3 distinct (NOM, MONTH(DATE_NAISSANCE)) combinations:
+    //   - (MARTIN, 1962-01) x 2  (two days in January 1962)
+    //   - (MARTIN, 1962-02) x 1
+    //   - (DUPONT, 1950-07) x 2  (two days in July 1950)
+    index_product(
+        &router,
+        "doc-1",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-2",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620115"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-3",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620201"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-4",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-5",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500728"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_pair":{"composite":{"size":100,"sources":[{"lastName":{"terms":{"field":"NOM"}}},{"birthDate":{"date_histogram":{"field":"DATE_NAISSANCE","calendar_interval":"month","format":"yyyyMMdd"}}}]}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_pair"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(
+        buckets.len(),
+        3,
+        "three distinct (NOM, MONTH(DATE_NAISSANCE)) pairs"
+    );
+    // Lex order: DUPONT/19500701 < MARTIN/19620101 < MARTIN/19620201.
+    assert_eq!(buckets[0]["key"]["lastName"], "DUPONT");
+    assert_eq!(buckets[0]["key"]["birthDate"], "19500701");
+    assert_eq!(buckets[0]["doc_count"], 2);
+    assert_eq!(buckets[1]["key"]["lastName"], "MARTIN");
+    assert_eq!(buckets[1]["key"]["birthDate"], "19620101");
+    assert_eq!(buckets[1]["doc_count"], 2);
+    assert_eq!(buckets[2]["key"]["lastName"], "MARTIN");
+    assert_eq!(buckets[2]["key"]["birthDate"], "19620201");
+    assert_eq!(buckets[2]["doc_count"], 1);
+    // End-of-stream: cap not reached.
+    assert!(
+        body["aggregations"]["by_pair"].get("after_key").is_none(),
+        "after_key must be omitted when the cap was not reached",
+    );
+}
+
+#[tokio::test]
+async fn search_router_a12_4_phase2_composite_mixed_sources_caps_at_size_and_emits_after_key() {
+    let router = app_router();
+    index_product(
+        &router,
+        "doc-1",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-2",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620115"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-3",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620201"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-4",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-5",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500728"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_pair":{"composite":{"size":2,"sources":[{"lastName":{"terms":{"field":"NOM"}}},{"birthDate":{"date_histogram":{"field":"DATE_NAISSANCE","calendar_interval":"month"}}}]}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_pair"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 2, "size=2 must cap the bucket list");
+    assert_eq!(buckets[0]["key"]["lastName"], "DUPONT");
+    assert_eq!(buckets[0]["key"]["birthDate"], "19500701");
+    assert_eq!(buckets[1]["key"]["lastName"], "MARTIN");
+    assert_eq!(buckets[1]["key"]["birthDate"], "19620101");
+    // `after_key` echoes the last emitted bucket's (already-truncated)
+    // composite key so the caller can replay it as `composite.after`.
+    assert_eq!(
+        body["aggregations"]["by_pair"]["after_key"]["lastName"],
+        "MARTIN"
+    );
+    assert_eq!(
+        body["aggregations"]["by_pair"]["after_key"]["birthDate"],
+        "19620101"
+    );
+}
+
+#[tokio::test]
+async fn search_router_a12_4_phase2_composite_mixed_sources_round_trips_after_cursor() {
+    let router = app_router();
+    index_product(
+        &router,
+        "doc-1",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620101"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-2",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620115"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-3",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19620201"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-4",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500715"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-5",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19500728"}"#,
+    )
+    .await;
+
+    // Replay the `after_key` emitted by the size=2 cap above. The
+    // cursor must skip the first two buckets (DUPONT/19500701,
+    // MARTIN/19620101) and surface the remaining MARTIN/19620201
+    // entry.
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_pair":{"composite":{"size":2,"sources":[{"lastName":{"terms":{"field":"NOM"}}},{"birthDate":{"date_histogram":{"field":"DATE_NAISSANCE","calendar_interval":"month"}}}],"after":{"lastName":"MARTIN","birthDate":"19620101"}}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_pair"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["key"]["lastName"], "MARTIN");
+    assert_eq!(buckets[0]["key"]["birthDate"], "19620201");
+    assert_eq!(buckets[0]["doc_count"], 1);
+    assert!(
+        body["aggregations"]["by_pair"]
+            .get("after_key")
+            .is_none(),
+        "end-of-stream → after_key omitted",
+    );
+}
+
+#[tokio::test]
+async fn search_router_a12_4_phase2_composite_rejects_unsupported_source_with_phase3_hint() {
     let router = app_router();
     let create_index = router
         .clone()
@@ -4118,10 +4315,10 @@ async fn search_router_a12_4_composite_rejects_date_histogram_source_with_phase2
         .expect("router should respond");
     assert!(create_index.status().is_success());
 
-    // matchID's wire shape wires `date_histogram` as a composite
-    // source kind; A12.4 ships only the `terms` MVP and must reject
-    // the other variants with an explicit "A12.4 phase 2" hint so the
-    // caller can downgrade gracefully.
+    // Phase 2 ships `terms` + `date_histogram` only. `histogram`
+    // (numeric bucketing), `geotile_grid`, etc. remain rejected with
+    // an explicit "A12.4 phase 3" hint so the caller can downgrade
+    // gracefully.
     let response = router
         .oneshot(
             Request::builder()
@@ -4129,7 +4326,7 @@ async fn search_router_a12_4_composite_rejects_date_histogram_source_with_phase2
                 .uri("/products/_search")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"query":{"match_all":{}},"aggs":{"by_pair":{"composite":{"sources":[{"lastName":{"terms":{"field":"NOM.raw"}}},{"birthDate":{"date_histogram":{"field":"DATE_NAISSANCE","calendar_interval":"month"}}}]}}}}"#,
+                    r#"{"query":{"match_all":{}},"aggs":{"by_pair":{"composite":{"sources":[{"lastName":{"terms":{"field":"NOM.raw"}}},{"age":{"histogram":{"field":"AGE","interval":10}}}]}}}}"#,
                 ))
                 .expect("request should build"),
         )
@@ -4140,8 +4337,8 @@ async fn search_router_a12_4_composite_rejects_date_histogram_source_with_phase2
     let body = response_json(response).await;
     assert_eq!(body["error"]["type"], "parsing_exception");
     let reason = body["error"]["reason"].as_str().unwrap();
-    assert!(reason.contains("date_histogram"), "reason: {reason}");
-    assert!(reason.contains("A12.4 phase 2"), "reason: {reason}");
+    assert!(reason.contains("histogram"), "reason: {reason}");
+    assert!(reason.contains("A12.4 phase 3"), "reason: {reason}");
 }
 
 // ---------------------------------------------------------------------------
