@@ -5,9 +5,10 @@
 #   surch-corpus-insee  — INSEE Deces 2024+2025 (~500 MiB ndjson)
 #   surch-scratch       — empty scratch (5 GiB) for engine index dirs
 #
-# Lightweight: pure curlimages/curl image (~5 MB, public Docker Hub).
-# No Surch logic here; we just hydrate volumes and exit. Subsequent Jobs
-# mount these PVCs read-only and never re-download.
+# Uses a Python image so downloads and zip extraction do not depend on
+# optional shell utilities in the container image. No Surch logic here; we
+# just hydrate volumes and exit. Subsequent Jobs mount these PVCs read-only
+# and never re-download.
 #
 # Cost: ~5 min single DEV1-L burst node = ~0.007€.
 apiVersion: batch/v1
@@ -58,7 +59,7 @@ spec:
             claimName: surch-scratch
       containers:
         - name: fetch
-          image: curlimages/curl:8.10.1
+          image: python:3.12-alpine
           imagePullPolicy: IfNotPresent
           # Resource envelope: well under the tenant quota (req 200m/256Mi,
           # limit 1000m/512Mi as per requests/surch.md § Workloads).
@@ -74,38 +75,82 @@ spec:
               value: /data/beir
             - name: INSEE_DIR
               value: /data/insee
-          command: ["/bin/sh", "-c"]
+          command: ["python3", "-c"]
           args:
             - |
-              set -eu
-              echo "== BEIR SciFact (binary qrels, ~50 MiB) =="
-              mkdir -p "$BEIR_DIR/scifact"
-              # Public mirror — Anserini-friendly tarball; canonical BEIR cellar.
-              curl -fsSL --retry 3 \
-                "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip" \
-                -o "$BEIR_DIR/scifact.zip"
-              cd "$BEIR_DIR" && unzip -qo scifact.zip && rm scifact.zip
+              import os
+              import shutil
+              import sys
+              import time
+              import urllib.request
+              import zipfile
+              from pathlib import Path
 
-              echo "== BEIR TREC-COVID (graded qrels, ~1 GiB) =="
-              mkdir -p "$BEIR_DIR/trec-covid"
-              curl -fsSL --retry 3 \
-                "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-covid.zip" \
-                -o "$BEIR_DIR/trec-covid.zip"
-              cd "$BEIR_DIR" && unzip -qo trec-covid.zip && rm trec-covid.zip
+              beir_dir = Path(os.environ["BEIR_DIR"])
+              insee_dir = Path(os.environ["INSEE_DIR"])
 
-              echo "== INSEE Deces 2024+2025 (~500 MiB ndjson) =="
-              mkdir -p "$INSEE_DIR"
-              # INSEE Open Data CDN — annual aggregated files. URLs may
-              # change yearly; cluster owner pins the latest stable.
-              for year in 2024 2025; do
-                curl -fsSL --retry 3 \
-                  "https://www.insee.fr/fr/statistiques/fichier/4769950/deces-${year}.txt" \
-                  -o "$INSEE_DIR/deces-${year}.txt" || \
-                  echo "WARN: INSEE ${year} not yet published; continuing"
-              done
+              def fetch(url, dest, required=True):
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  last_error = None
+                  for attempt in range(1, 4):
+                      try:
+                          print(f"fetch {url} -> {dest} (attempt {attempt}/3)", flush=True)
+                          with urllib.request.urlopen(url, timeout=300) as response:
+                              with dest.open("wb") as output:
+                                  shutil.copyfileobj(response, output)
+                          return True
+                      except Exception as exc:
+                          last_error = exc
+                          print(f"WARN: fetch failed: {exc}", file=sys.stderr, flush=True)
+                          time.sleep(2 * attempt)
+                  if required:
+                      raise RuntimeError(f"failed to fetch required URL {url}: {last_error}")
+                  return False
 
-              echo "== Done; PVCs hydrated =="
-              du -sh "$BEIR_DIR" "$INSEE_DIR"
+              def extract_zip(archive, dest):
+                  root = dest.resolve()
+                  with zipfile.ZipFile(archive) as zf:
+                      for info in zf.infolist():
+                          target = (dest / info.filename).resolve()
+                          if target != root and root not in target.parents:
+                              raise RuntimeError(f"unsafe zip member path: {info.filename}")
+                      zf.extractall(dest)
+                  archive.unlink()
+
+              def tree_mib(path):
+                  total = 0
+                  for child in path.rglob("*"):
+                      if child.is_file():
+                          total += child.stat().st_size
+                  return total / (1024 * 1024)
+
+              print("== BEIR SciFact (binary qrels, ~50 MiB) ==", flush=True)
+              scifact_zip = beir_dir / "scifact.zip"
+              fetch(
+                  "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip",
+                  scifact_zip,
+              )
+              extract_zip(scifact_zip, beir_dir)
+
+              print("== BEIR TREC-COVID (graded qrels, ~1 GiB) ==", flush=True)
+              trec_covid_zip = beir_dir / "trec-covid.zip"
+              fetch(
+                  "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-covid.zip",
+                  trec_covid_zip,
+              )
+              extract_zip(trec_covid_zip, beir_dir)
+
+              print("== INSEE Deces 2024+2025 (~500 MiB ndjson) ==", flush=True)
+              insee_dir.mkdir(parents=True, exist_ok=True)
+              for year in (2024, 2025):
+                  url = f"https://www.insee.fr/fr/statistiques/fichier/4769950/deces-{year}.txt"
+                  dest = insee_dir / f"deces-{year}.txt"
+                  if not fetch(url, dest, required=False):
+                      print(f"WARN: INSEE {year} not yet published; continuing", flush=True)
+
+              print("== Done; PVCs hydrated ==", flush=True)
+              print(f"{beir_dir}: {tree_mib(beir_dir):.1f} MiB", flush=True)
+              print(f"{insee_dir}: {tree_mib(insee_dir):.1f} MiB", flush=True)
           volumeMounts:
             - { name: beir,    mountPath: /data/beir }
             - { name: insee,   mountPath: /data/insee }

@@ -133,7 +133,7 @@ spec:
               # Emit a `surch.bench.pair.v1` envelope picked up by `kubectl cp`.
               /usr/local/bin/bench_report \
                 --dir "$REPORTS_DIR" \
-                --out "$REPORTS_DIR/bench.json" || true
+                --output "$REPORTS_DIR/bench.json"
               echo "insee-bench complete."
           volumeMounts:
             - { name: insee,   mountPath: /data/insee, readOnly: true }

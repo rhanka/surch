@@ -74,7 +74,7 @@ jobs:
         run: |
           mkdir -p target/k8s
           export SURCH_SHA="${{ steps.image.outputs.sha }}"
-          envsubst < "deploy/k8s/jobs/${{ inputs.job }}.yaml" \
+          envsubst '${SURCH_SHA}' < "deploy/k8s/jobs/${{ inputs.job }}.yaml" \
             > "target/k8s/${{ inputs.job }}.yaml"
           cat "target/k8s/${{ inputs.job }}.yaml"
 
@@ -91,28 +91,79 @@ jobs:
 
       - name: Wait for Job completion (30 min cap)
         run: |
-          kubectl -n "$SCW_NAMESPACE" wait \
-            --for=condition=Complete \
-            --timeout=1800s \
-            "job/${{ steps.jobname.outputs.name }}" \
-          || kubectl -n "$SCW_NAMESPACE" wait \
-            --for=condition=Failed \
-            --timeout=10s \
-            "job/${{ steps.jobname.outputs.name }}"
+          set -eu
+          JOB_NAME="${{ steps.jobname.outputs.name }}"
+          deadline=$((SECONDS + 1800))
+          while [ "$SECONDS" -le "$deadline" ]; do
+            conditions="$(kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" \
+              -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true)"
+            if printf '%s\n' "$conditions" | grep -qx 'Complete=True'; then
+              echo "Kubernetes Job $JOB_NAME completed."
+              exit 0
+            fi
+            if printf '%s\n' "$conditions" | grep -qx 'Failed=True'; then
+              echo "::error::Kubernetes Job $JOB_NAME failed."
+              exit 1
+            fi
+            kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" -o wide || true
+            sleep 10
+          done
+          echo "::error::Timed out waiting for Kubernetes Job $JOB_NAME to complete."
+          exit 1
 
       - name: Collect logs + report
         if: always()
         run: |
+          set +e
           mkdir -p target/bench-reports/k8s
-          POD=$(kubectl -n "$SCW_NAMESPACE" get pod \
-            -l "app.kubernetes.io/component=${{ inputs.job }}" \
-            -o jsonpath='{.items[0].metadata.name}' || true)
-          if [ -n "$POD" ]; then
-            kubectl -n "$SCW_NAMESPACE" logs "$POD" \
-              > "target/bench-reports/k8s/${{ inputs.job }}.log" || true
-            kubectl -n "$SCW_NAMESPACE" cp \
-              "${POD}:/reports/bench.json" \
-              "target/bench-reports/k8s/${{ inputs.job }}.json" 2>/dev/null || true
+          OUT_DIR="target/bench-reports/k8s"
+          JOB_NAME="${{ steps.jobname.outputs.name }}"
+          JOB_LABEL="app.kubernetes.io/component=${{ inputs.job }}"
+
+          kubectl -n "$SCW_NAMESPACE" describe "job/$JOB_NAME" \
+            > "$OUT_DIR/${{ inputs.job }}.job.describe.txt" 2>&1 || true
+          kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" -o yaml \
+            > "$OUT_DIR/${{ inputs.job }}.job.yaml" 2>&1 || true
+          kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide \
+            > "$OUT_DIR/${{ inputs.job }}.pods.txt" 2>&1 || true
+          kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" \
+            > "$OUT_DIR/${{ inputs.job }}.pods.describe.txt" 2>&1 || true
+          kubectl -n "$SCW_NAMESPACE" get events --sort-by='.metadata.creationTimestamp' \
+            > "$OUT_DIR/${{ inputs.job }}.events.txt" 2>&1 || true
+          kubectl -n "$SCW_NAMESPACE" logs "job/$JOB_NAME" --all-containers=true --prefix=true \
+            > "$OUT_DIR/${{ inputs.job }}.job.log" 2>&1 || true
+
+          REPORT_CONTAINER=""
+          case "${{ inputs.job }}" in
+            ndcg-gate) REPORT_CONTAINER="ndcg-driver" ;;
+            insee-bench) REPORT_CONTAINER="artillery-runner" ;;
+          esac
+
+          PODS="$(kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+          for POD in $PODS; do
+            kubectl -n "$SCW_NAMESPACE" describe "pod/$POD" \
+              > "$OUT_DIR/$POD.describe.txt" 2>&1 || true
+            CONTAINERS="$(kubectl -n "$SCW_NAMESPACE" get "pod/$POD" \
+              -o jsonpath='{range .spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)"
+            for CONTAINER in $CONTAINERS; do
+              kubectl -n "$SCW_NAMESPACE" logs "$POD" -c "$CONTAINER" \
+                > "$OUT_DIR/$POD.$CONTAINER.log" 2>&1 || true
+              kubectl -n "$SCW_NAMESPACE" logs "$POD" -c "$CONTAINER" --previous \
+                > "$OUT_DIR/$POD.$CONTAINER.previous.log" 2>&1 || true
+            done
+            if [ -n "$REPORT_CONTAINER" ]; then
+              kubectl -n "$SCW_NAMESPACE" cp -c "$REPORT_CONTAINER" \
+                "$POD:/reports/bench.json" \
+                "$OUT_DIR/${{ inputs.job }}.json" 2>/dev/null || true
+            fi
+          done
+
+          if [ -n "$JOB_NAME" ]; then
+            kubectl -n "$SCW_NAMESPACE" get events \
+              --field-selector "involvedObject.kind=Job,involvedObject.name=$JOB_NAME" \
+              --sort-by='.metadata.creationTimestamp' \
+              > "$OUT_DIR/${{ inputs.job }}.job.events.txt" 2>&1 || true
           fi
 
       - name: Upload report
@@ -121,9 +172,13 @@ jobs:
         with:
           name: k8s-bench-${{ inputs.job }}-${{ steps.image.outputs.sha }}
           path: target/bench-reports/k8s/
+          if-no-files-found: warn
 
       - name: Delete Job (always)
         if: always()
         run: |
-          kubectl -n "$SCW_NAMESPACE" delete \
-            "job/${{ steps.jobname.outputs.name }}" --ignore-not-found=true
+          JOB_NAME="${{ steps.jobname.outputs.name }}"
+          if [ -n "$JOB_NAME" ]; then
+            kubectl -n "$SCW_NAMESPACE" delete \
+              "job/$JOB_NAME" --ignore-not-found=true
+          fi

@@ -2,7 +2,7 @@
 #
 # Spins up a single Pod with two sidecars (surch + opensearch) and a
 # driver container that runs `scripts/bench/scifact-ndcg.sh` against both
-# engines, then emits a `surch.bench.report.v1` JSON to /reports.
+# engines, then emits text outputs plus a JSON index to /reports.
 #
 # The Pod-anti-affinity story stays simple here: both engines are local
 # to the Pod, talking over localhost. Resource envelope is tuned to fit
@@ -109,7 +109,7 @@ spec:
           command: ["/bin/sh", "-c"]
           # The Surch image bundles scripts/bench/scifact-ndcg.sh; this
           # driver waits for both engines, runs the gate, and exits with
-          # the script's own status. CI reads /reports/ndcg-gate.json.
+          # the script's own status. CI reads /reports/bench.json.
           args:
             - |
               set -eu
@@ -120,7 +120,9 @@ spec:
               mkdir -p "$REPORTS_DIR"
               /usr/local/bin/scifact-ndcg.sh "ndcg-surch-k8s" "$REPORTS_DIR/scifact-surch.out" "$SURCH_URL"
               /usr/local/bin/scifact-ndcg.sh "ndcg-os-k8s"    "$REPORTS_DIR/scifact-os.out"    "$OPENSEARCH_URL"
-              cp "$REPORTS_DIR/scifact-surch.out" "$REPORTS_DIR/bench.json"
+              cat > "$REPORTS_DIR/bench.json" <<EOF
+              {"schema":"surch.bench.ndcg_gate.v1","surch_out":"$REPORTS_DIR/scifact-surch.out","opensearch_out":"$REPORTS_DIR/scifact-os.out"}
+              EOF
               echo "ndcg-gate complete."
           volumeMounts:
             - { name: beir,    mountPath: /data/beir, readOnly: true }
