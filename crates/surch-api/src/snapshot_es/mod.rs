@@ -26,7 +26,10 @@ pub mod repository;
 pub mod routes;
 pub mod service;
 
-pub use repository::{FsRepository, RepositoryError, RepositoryResult, SnapshotRepository};
+pub use repository::{
+    FsRepository, RepositoryError, RepositoryResult, S3Repository, S3RepositoryConfig,
+    SnapshotRepository,
+};
 pub use service::{
     create_snapshot, delete_snapshot, get_snapshot, restore_snapshot, RegisteredRepository,
     RootManifest, SnapshotEntry, SnapshotRepositoryRegistry, SnapshotServiceError, SnapshotState,

@@ -166,13 +166,15 @@ async fn put_fs_repository_then_get_returns_metadata() {
 }
 
 #[tokio::test]
-async fn put_s3_repository_is_rejected() {
+async fn put_unknown_repository_type_is_rejected() {
+    // `gcs` is intentionally unwired — `s3` (incl. R2 / MinIO / GCS
+    // interop endpoint) is the only non-fs backend in C-SNAPSHOT-S2.
     let router = app_router();
     let (status, body) = put(
         &router,
         "/_snapshot/cloud",
         json!({
-            "type": "s3",
+            "type": "gcs",
             "settings": { "bucket": "irrelevant" }
         }),
     )
@@ -181,8 +183,8 @@ async fn put_s3_repository_is_rejected() {
     assert_eq!(body["error"]["type"], json!("repository_exception"));
     let reason = body["error"]["reason"].as_str().unwrap_or_default();
     assert!(
-        reason.contains("s3") && reason.contains("not supported"),
-        "reason should mention unsupported s3 type, got `{reason}`"
+        reason.contains("gcs") && reason.contains("not supported"),
+        "reason should mention unsupported type, got `{reason}`"
     );
 }
 
