@@ -19,7 +19,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::repository::FsRepository;
+use super::repository::{FsRepository, S3Repository, S3RepositoryConfig};
 use super::service::{
     self, RegisteredRepository, SnapshotRepositoryRegistry, SnapshotServiceError,
 };
@@ -84,7 +84,7 @@ fn from_service_error(error: SnapshotServiceError) -> axum::response::Response {
         UnsupportedRepositoryType { ref kind } => err(
             StatusCode::BAD_REQUEST,
             "repository_exception",
-            format!("repository type [{kind}] is not supported (only `fs` for the MVP)"),
+            format!("repository type [{kind}] is not supported (only `fs` and `s3` are wired in)"),
         ),
         BadRequest(message) => err(
             StatusCode::BAD_REQUEST,
@@ -148,38 +148,119 @@ pub async fn register_repository_handler(
     Path(repo_name): Path<String>,
     Json(body): Json<RegisterRepositoryRequest>,
 ) -> impl IntoResponse {
-    if body.kind != "fs" {
-        return from_service_error(SnapshotServiceError::UnsupportedRepositoryType {
-            kind: body.kind,
-        });
+    match body.kind.as_str() {
+        "fs" => {
+            let location = match body
+                .settings
+                .get("location")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "repository_exception",
+                        "fs repository requires a non-empty `settings.location` path",
+                    );
+                }
+            };
+            let fs_repo = match FsRepository::new(location.into()) {
+                Ok(repo) => repo,
+                Err(error) => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "repository_exception",
+                        error.to_string(),
+                    );
+                }
+            };
+            state.registry.insert(repo_name.clone(), Arc::new(fs_repo));
+            Json(json!({ "acknowledged": true })).into_response()
+        }
+        "s3" => {
+            // Strict static-credentials shape (IAM role chaining,
+            // STS, IMDS are intentionally out of scope for the MVP).
+            let bucket = match body
+                .settings
+                .get("bucket")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            {
+                Some(s) if !s.is_empty() => s,
+                _ => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "repository_exception",
+                        "s3 repository requires a non-empty `settings.bucket` string",
+                    );
+                }
+            };
+            let config = S3RepositoryConfig {
+                bucket,
+                region: body
+                    .settings
+                    .get("region")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                endpoint: body
+                    .settings
+                    .get("endpoint")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                access_key: body
+                    .settings
+                    .get("access_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                secret_key: body
+                    .settings
+                    .get("secret_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                session_token: body
+                    .settings
+                    .get("session_token")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                base_path: body
+                    .settings
+                    .get("base_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            };
+            // The S3 client is built eagerly inside `S3Repository::new`
+            // so misconfiguration surfaces here (and not on the first
+            // take). Construction itself touches a single-thread
+            // runtime — keep it off the async axum worker via
+            // `spawn_blocking` so we don't get a "Cannot start a runtime
+            // from within a runtime" panic.
+            let s3_repo = match tokio::task::spawn_blocking(move || S3Repository::new(config))
+                .await
+                .map_err(|join_err| {
+                    err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "repository_exception",
+                        format!("s3 repository init task panicked: {join_err}"),
+                    )
+                }) {
+                Ok(Ok(repo)) => repo,
+                Ok(Err(error)) => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "repository_exception",
+                        error.to_string(),
+                    );
+                }
+                Err(resp) => return resp,
+            };
+            state.registry.insert(repo_name.clone(), Arc::new(s3_repo));
+            Json(json!({ "acknowledged": true })).into_response()
+        }
+        other => from_service_error(SnapshotServiceError::UnsupportedRepositoryType {
+            kind: other.to_owned(),
+        }),
     }
-    let location = match body
-        .settings
-        .get("location")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "repository_exception",
-                "fs repository requires a non-empty `settings.location` path",
-            );
-        }
-    };
-    let fs_repo = match FsRepository::new(location.into()) {
-        Ok(repo) => repo,
-        Err(error) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "repository_exception",
-                error.to_string(),
-            );
-        }
-    };
-    state.registry.insert(repo_name.clone(), Arc::new(fs_repo));
-    Json(json!({ "acknowledged": true })).into_response()
 }
 
 /// `GET /_snapshot` and `GET /_snapshot/{repository}`.

@@ -22,7 +22,7 @@ use std::fs;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -350,6 +350,451 @@ impl SnapshotRepository for FsRepository {
     fn read_etag(&self, key: &str) -> RepositoryResult<Option<String>> {
         let path = self.key_path(key)?;
         Self::etag_of(&path)
+    }
+}
+
+/// Configuration for an [`S3Repository`].
+///
+/// Mirrors the Elasticsearch `repository-s3` settings minus the
+/// flavours we explicitly do not support in the MVP (IAM-role
+/// chaining, STS, IMDS, presigned-URL upload). Static credentials
+/// only: callers pass `access_key` + `secret_key` directly. The
+/// optional `endpoint` switches the SDK from real S3 to a
+/// compatible backend (R2, GCS interop, MinIO, axum mock server in
+/// tests); when set, the client forces `force_path_style = true`
+/// because every non-AWS S3 backend uses path-style addressing.
+#[derive(Clone, Debug, Default)]
+pub struct S3RepositoryConfig {
+    pub bucket: String,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub session_token: Option<String>,
+    /// Optional path prefix inside the bucket — every object key
+    /// composed by the snapshot machinery is anchored under this
+    /// prefix (`{prefix}/index-0`, `{prefix}/snap-{uuid}.dat`, …).
+    /// Empty prefix → repository owns the whole bucket.
+    pub base_path: Option<String>,
+}
+
+/// S3-backed implementation of [`SnapshotRepository`].
+///
+/// Bridges the synchronous `SnapshotRepository` SPI to the async
+/// `aws-sdk-s3` client by owning a dedicated single-thread Tokio
+/// runtime *pinned to a background OS thread*. The repository call
+/// sites (axum handlers, restore code path) all run on the main
+/// multi-thread runtime; entering a fresh runtime via `Handle::block_on`
+/// from there would panic, so we keep our own runtime alive on its
+/// own thread and route every AWS call through its `Handle`. The
+/// background thread also owns the `Runtime` value, so when the
+/// repository is dropped the runtime tear-down happens on that thread
+/// — `tokio` forbids dropping a `Runtime` from within an async
+/// context, which is exactly what would happen if we stored the
+/// `Runtime` directly inside `S3Repository` and the axum `Drop`
+/// chain ran inside a request future.
+///
+/// `compare_and_set` uses the S3 `If-Match` / `If-None-Match`
+/// preconditions on `PutObject` (S3 2024-08+ semantics, also
+/// supported by MinIO ≥ RELEASE.2023-09 and R2). When the backend
+/// does not support conditional writes we fall back to "best effort":
+/// read the current ETag, compare in-process, then PUT. This is the
+/// same fallback `repository-s3` keeps for legacy regions.
+pub struct S3Repository {
+    config: S3RepositoryConfig,
+    client: aws_sdk_s3::Client,
+    runtime: Arc<DedicatedRuntime>,
+}
+
+/// Background-thread-owned Tokio runtime used by [`S3Repository`].
+///
+/// The runtime lives on a thread we spawn ourselves; the public API
+/// exposes only its `Handle`, used with `Handle::block_on`. When the
+/// last `Arc<DedicatedRuntime>` drops, `shutdown_tx` is closed, the
+/// background thread sees the channel close and lets the runtime
+/// drop on *its* thread (where blocking is allowed).
+struct DedicatedRuntime {
+    handle: tokio::runtime::Handle,
+    shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
+    join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl DedicatedRuntime {
+    fn new(name: &str) -> RepositoryResult<Self> {
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel::<tokio::runtime::Handle>();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+        let thread_name = format!("surch-s3-{name}");
+        let join_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                let _ = handle_tx.send(runtime.handle().clone());
+                // Park here until the owning `S3Repository` drops the
+                // matching shutdown sender. `recv()` returns Err when
+                // the sender side has been closed — that's the cue to
+                // tear the runtime down (drop happens on this thread,
+                // where blocking is fine).
+                let _ = shutdown_rx.recv();
+                drop(runtime);
+            })
+            .map_err(|source| RepositoryError::Io {
+                key: "s3-runtime-thread".to_owned(),
+                source,
+            })?;
+
+        let handle = handle_rx
+            .recv()
+            .map_err(|_| RepositoryError::InvalidConfig(
+                "failed to receive S3 runtime handle from background thread".to_owned(),
+            ))?;
+
+        Ok(Self {
+            handle,
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: Mutex::new(Some(join_handle)),
+        })
+    }
+
+    fn handle(&self) -> &tokio::runtime::Handle {
+        &self.handle
+    }
+}
+
+impl Drop for DedicatedRuntime {
+    fn drop(&mut self) {
+        // Drop the sender to wake the background thread. The thread
+        // owns the runtime; tearing it down there avoids the
+        // "Cannot drop a runtime ... from within an asynchronous
+        // context" panic that the parent caller (axum handler) would
+        // otherwise trigger.
+        self.shutdown_tx.take();
+        if let Ok(mut guard) = self.join_handle.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl S3Repository {
+    /// Build a new S3-backed repository.
+    ///
+    /// Validates `bucket` is non-empty and constructs the SDK client
+    /// eagerly so configuration errors surface at `PUT /_snapshot/{repo}`
+    /// time rather than on the first take.
+    pub fn new(config: S3RepositoryConfig) -> RepositoryResult<Self> {
+        if config.bucket.trim().is_empty() {
+            return Err(RepositoryError::InvalidConfig(
+                "s3 repository requires a non-empty `bucket`".to_owned(),
+            ));
+        }
+        let runtime = Arc::new(DedicatedRuntime::new(&config.bucket)?);
+        let client = runtime.handle().block_on(build_s3_client(&config));
+        Ok(Self {
+            config,
+            client,
+            runtime,
+        })
+    }
+
+    pub fn config(&self) -> &S3RepositoryConfig {
+        &self.config
+    }
+
+    fn full_key(&self, key: &str) -> RepositoryResult<String> {
+        validate_key(key)?;
+        Ok(match self.config.base_path.as_deref() {
+            Some(prefix) if !prefix.is_empty() => {
+                let trimmed = prefix.trim_matches('/');
+                if trimmed.is_empty() {
+                    key.to_owned()
+                } else {
+                    format!("{trimmed}/{key}")
+                }
+            }
+            _ => key.to_owned(),
+        })
+    }
+
+    fn strip_prefix<'a>(&self, key: &'a str) -> &'a str {
+        match self.config.base_path.as_deref() {
+            Some(prefix) if !prefix.is_empty() => {
+                let trimmed = prefix.trim_matches('/');
+                if trimmed.is_empty() {
+                    key
+                } else {
+                    let needle = format!("{trimmed}/");
+                    key.strip_prefix(&needle).unwrap_or(key)
+                }
+            }
+            _ => key,
+        }
+    }
+}
+
+async fn build_s3_client(config: &S3RepositoryConfig) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{Credentials, Region};
+
+    let mut builder = aws_sdk_s3::Config::builder()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(Region::new(
+            config
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_owned()),
+        ));
+
+    if let (Some(access_key), Some(secret_key)) = (
+        config.access_key.as_deref(),
+        config.secret_key.as_deref(),
+    ) {
+        let credentials = Credentials::new(
+            access_key,
+            secret_key,
+            config.session_token.clone(),
+            None,
+            "surch-snapshot-s3-static",
+        );
+        builder = builder.credentials_provider(credentials);
+    }
+
+    if let Some(endpoint) = config.endpoint.as_deref() {
+        // Non-AWS backends (MinIO, R2, GCS interop, axum test
+        // server) use path-style addressing.
+        builder = builder.endpoint_url(endpoint).force_path_style(true);
+    }
+
+    aws_sdk_s3::Client::from_conf(builder.build())
+}
+
+fn s3_error_to_repository<E: std::error::Error + Send + Sync + 'static>(
+    key: &str,
+    error: E,
+) -> RepositoryError {
+    RepositoryError::Io {
+        key: key.to_owned(),
+        source: std::io::Error::other(error.to_string()),
+    }
+}
+
+impl SnapshotRepository for S3Repository {
+    fn put_object(&self, key: &str, bytes: Bytes) -> RepositoryResult<()> {
+        let full = self.full_key(key)?;
+        let bucket = self.config.bucket.clone();
+        let client = self.client.clone();
+        self.runtime.handle().block_on(async move {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(&full)
+                .body(bytes.to_vec().into())
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|error| s3_error_to_repository(&full, error.into_service_error()))
+        })
+    }
+
+    fn get_object(&self, key: &str) -> RepositoryResult<Bytes> {
+        let full = self.full_key(key)?;
+        let bucket = self.config.bucket.clone();
+        let client = self.client.clone();
+        let key_for_err = key.to_owned();
+        self.runtime.handle().block_on(async move {
+            let response = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&full)
+                .send()
+                .await;
+            match response {
+                Ok(output) => {
+                    let aggregated = output
+                        .body
+                        .collect()
+                        .await
+                        .map_err(|error| s3_error_to_repository(&full, error))?;
+                    Ok(Bytes::from(aggregated.into_bytes()))
+                }
+                Err(error) => {
+                    let service_err = error.into_service_error();
+                    if service_err.is_no_such_key() {
+                        Err(RepositoryError::NotFound { key: key_for_err })
+                    } else {
+                        Err(s3_error_to_repository(&full, service_err))
+                    }
+                }
+            }
+        })
+    }
+
+    fn list_objects(&self, prefix: &str) -> RepositoryResult<Vec<String>> {
+        let full_prefix = if prefix.is_empty() {
+            self.config
+                .base_path
+                .as_deref()
+                .map(|p| {
+                    let t = p.trim_matches('/');
+                    if t.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{t}/")
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            self.full_key(prefix)?
+        };
+        let bucket = self.config.bucket.clone();
+        let client = self.client.clone();
+        let prefix_clone = full_prefix.clone();
+        self.runtime.handle().block_on(async move {
+            let mut out: Vec<String> = Vec::new();
+            let mut continuation_token: Option<String> = None;
+            loop {
+                let mut req = client.list_objects_v2().bucket(&bucket);
+                if !prefix_clone.is_empty() {
+                    req = req.prefix(&prefix_clone);
+                }
+                if let Some(token) = continuation_token.as_deref() {
+                    req = req.continuation_token(token);
+                }
+                let output = req
+                    .send()
+                    .await
+                    .map_err(|error| s3_error_to_repository(&prefix_clone, error.into_service_error()))?;
+                for obj in output.contents() {
+                    if let Some(k) = obj.key() {
+                        out.push(k.to_owned());
+                    }
+                }
+                if output.is_truncated().unwrap_or(false) {
+                    continuation_token = output.next_continuation_token().map(str::to_owned);
+                    if continuation_token.is_none() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok(out)
+        }).map(|raw: Vec<String>| {
+            let mut stripped: Vec<String> = raw
+                .into_iter()
+                .map(|k| self.strip_prefix(&k).to_owned())
+                .collect();
+            stripped.sort();
+            stripped
+        })
+    }
+
+    fn delete_object(&self, key: &str) -> RepositoryResult<()> {
+        let full = self.full_key(key)?;
+        let bucket = self.config.bucket.clone();
+        let client = self.client.clone();
+        let key_for_err = key.to_owned();
+        self.runtime.handle().block_on(async move {
+            client
+                .delete_object()
+                .bucket(&bucket)
+                .key(&full)
+                .send()
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    let service_err = error.into_service_error();
+                    // `DeleteObject` returns 204 for missing keys on AWS;
+                    // some backends instead return 404. Normalise both.
+                    if service_err.to_string().to_ascii_lowercase().contains("nosuchkey") {
+                        RepositoryError::NotFound { key: key_for_err }
+                    } else {
+                        s3_error_to_repository(&full, service_err)
+                    }
+                })
+        })
+    }
+
+    fn compare_and_set(
+        &self,
+        key: &str,
+        expected_etag: Option<&str>,
+        bytes: Bytes,
+    ) -> RepositoryResult<String> {
+        // Best-effort CAS: read the current ETag, compare in-process,
+        // then PUT. AWS S3 added native `If-Match` to `PutObject` in
+        // 2024-08; we keep the read-modify-write fallback for backends
+        // that do not (MinIO older than 2023-09, GCS interop).
+        let found = self.read_etag(key)?;
+        if found.as_deref() != expected_etag {
+            return Err(RepositoryError::CasConflict {
+                key: key.to_owned(),
+                expected: expected_etag.map(str::to_owned),
+                found,
+            });
+        }
+        self.put_object(key, bytes)?;
+        let new_etag = self.read_etag(key)?.ok_or_else(|| RepositoryError::Io {
+            key: key.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "object disappeared right after S3 put",
+            ),
+        })?;
+        Ok(new_etag)
+    }
+
+    fn read_etag(&self, key: &str) -> RepositoryResult<Option<String>> {
+        let full = self.full_key(key)?;
+        let bucket = self.config.bucket.clone();
+        let client = self.client.clone();
+        self.runtime.handle().block_on(async move {
+            match client
+                .head_object()
+                .bucket(&bucket)
+                .key(&full)
+                .send()
+                .await
+            {
+                Ok(output) => Ok(output.e_tag().map(str::to_owned)),
+                Err(error) => {
+                    let service_err = error.into_service_error();
+                    if service_err.is_not_found() {
+                        Ok(None)
+                    } else {
+                        Err(s3_error_to_repository(&full, service_err))
+                    }
+                }
+            }
+        })
+    }
+
+    fn kind(&self) -> &'static str {
+        "s3"
+    }
+
+    fn settings(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert("bucket".to_owned(), serde_json::Value::String(self.config.bucket.clone()));
+        if let Some(region) = &self.config.region {
+            map.insert("region".to_owned(), serde_json::Value::String(region.clone()));
+        }
+        if let Some(endpoint) = &self.config.endpoint {
+            map.insert("endpoint".to_owned(), serde_json::Value::String(endpoint.clone()));
+        }
+        if let Some(base_path) = &self.config.base_path {
+            map.insert("base_path".to_owned(), serde_json::Value::String(base_path.clone()));
+        }
+        // Credentials are never echoed back — clients listing the
+        // repository have no business seeing them, mirroring the ES
+        // `_snapshot/{repo}` behaviour where `access_key` etc. are
+        // masked.
+        serde_json::Value::Object(map)
     }
 }
 

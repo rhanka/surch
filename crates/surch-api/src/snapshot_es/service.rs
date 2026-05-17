@@ -132,7 +132,7 @@ pub enum SnapshotServiceError {
     SnapshotMissing { repo: String, snap: String },
     #[error("snapshot [{repo}:{snap}] already exists")]
     SnapshotAlreadyExists { repo: String, snap: String },
-    #[error("repository type [{kind}] is not supported (only `fs` for now)")]
+    #[error("repository type [{kind}] is not supported (only `fs` and `s3` are wired in)")]
     UnsupportedRepositoryType { kind: String },
     #[error("invalid snapshot request: {0}")]
     BadRequest(String),
