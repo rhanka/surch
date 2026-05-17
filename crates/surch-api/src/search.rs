@@ -4572,6 +4572,18 @@ pub fn geo_distance_field_matches(
 pub fn parse_prefix_clause(value: &Value) -> Result<(String, String), OpenSearchError> {
     let (field, body) = parse_single_field_query("prefix", value)?;
     let value = parse_term_query_value(body)?;
+    // A6 phase 3: reject the empty-prefix degenerate. ES 7.x is lenient
+    // here (returns 0 hits silently) but the matchID autocomplete contract
+    // only fires `prefix` once the user has typed at least one character;
+    // a hard 400 catches caller bugs early and matches our `wildcard`
+    // validation (`parse_wildcard_clause` above) for symmetry.
+    if value.is_empty() {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "prefix query value must not be empty",
+        ));
+    }
     Ok((field, value))
 }
 

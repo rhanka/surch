@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use thiserror::Error;
@@ -210,6 +210,53 @@ impl FieldPostings {
         }
         out
     }
+
+    /// A6 phase 3: collect the union of doc ids across every term whose
+    /// bytes start with `prefix`. Implemented as an FST range scan
+    /// `[prefix, upper_bound(prefix))` so the cost is O(matching_terms +
+    /// returned_postings) instead of O(distinct_terms). Returns an empty
+    /// `BTreeSet` when no term matches.
+    fn collect_prefix_doc_ids(&self, prefix: &[u8]) -> BTreeSet<u32> {
+        let mut out = BTreeSet::new();
+        let mut builder = self.fst.range().ge(prefix);
+        // Upper bound: smallest byte string lexicographically greater than
+        // every `prefix.<suffix>`. We increment the rightmost byte that can
+        // be incremented; if every byte is 0xFF (degenerate, never happens
+        // with UTF-8 analyzer output), we fall back to an unbounded scan.
+        if let Some(upper) = prefix_upper_bound(prefix) {
+            builder = builder.lt(upper);
+        }
+        let mut stream = builder.into_stream();
+        while let Some((_, idx)) = stream.next() {
+            let Some(term_postings) = self.postings.get(idx as usize) else {
+                continue;
+            };
+            for posting in term_postings {
+                out.insert(posting.doc_id);
+            }
+        }
+        out
+    }
+}
+
+/// Compute the smallest byte string greater than every byte string that
+/// starts with `prefix` — i.e. the exclusive upper bound for an FST range
+/// `prefix.*` scan. Returns `None` when `prefix` is empty or composed
+/// entirely of `0xFF` bytes, in which case the caller must omit the upper
+/// bound (the half-open range degenerates to `[prefix, +inf)`).
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(upper);
+        }
+        upper.pop();
+    }
+    None
 }
 
 #[derive(Debug, Default, Clone)]
@@ -262,6 +309,22 @@ impl TermDictionary {
     /// `(field, term)` pairs without exposing the internal `BTreeMap`.
     pub fn field_names(&self) -> Vec<String> {
         self.fields.keys().cloned().collect()
+    }
+
+    /// A6 phase 3: union of doc ids across every term of `field` whose
+    /// bytes start with `prefix`. Used by the keyword-prefix iterator on
+    /// fields that did not declare `index_prefixes` (e.g. matchID's
+    /// `DATE_NAISSANCE` keyword). The FST range scan is O(matching_terms)
+    /// instead of O(distinct_terms): on the deces 1k slice and the matchID
+    /// `< 8 chars` autocomplete contract, `matching_terms` is bounded by
+    /// the year cardinality (~365 dates per year).
+    ///
+    /// Returns an empty set when the field is absent or no term matches.
+    pub fn prefix_doc_ids(&self, field: &str, prefix: &str) -> BTreeSet<u32> {
+        self.fields
+            .get(field)
+            .map(|field_postings| field_postings.collect_prefix_doc_ids(prefix.as_bytes()))
+            .unwrap_or_default()
     }
 }
 
