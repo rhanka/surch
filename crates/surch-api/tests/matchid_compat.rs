@@ -8,7 +8,9 @@
 //! Skipped entries carry a `skip` field referencing the active gap
 //! (e.g. `gap-A4` for scroll, `gap-A6` for `prefix + index_prefixes`).
 //! They are not executed; they document the workload the future
-//! parser-side gap closure must unblock.
+//! parser-side gap closure must unblock. As of 2026-05-16 (A6 phase 3)
+//! the manifest contains 0 skipped entries — kept here defensively so a
+//! future skip is still validated against an A-series gap label.
 
 use axum::{
     body::{to_bytes, Body},
@@ -286,21 +288,21 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
         executed >= 3,
         "matchID v0 acceptance: at least 3 replay entries must execute against Surch (executed={executed}, skipped={skipped})"
     );
-    // The fixture is committed with the documented split: 29 executed + 1 skipped
-    // (1 keyword-prefix on A6/A13). B1 phase 2 lifted the 3 scroll skips (gap-A4)
-    // by asserting the initial `?scroll=1m` response carries a non-empty
-    // `_scroll_id`; the follow-up `POST /_search/scroll` lifecycle is covered by
+    // The fixture is committed with the documented split: 30 executed + 0 skipped.
+    // B1 phase 2 lifted the 3 scroll skips (gap-A4) by asserting the initial
+    // `?scroll=1m` response carries a non-empty `_scroll_id`; the follow-up
+    // `POST /_search/scroll` lifecycle is covered by
     // `crates/surch-api/tests/scroll.rs`. A6 phase 2 had previously lifted the two
     // text-typed prefix skips (prefix_nom, prefix_prenoms) via write-time
-    // `index_prefixes` postings on NOM/PRENOMS.
+    // `index_prefixes` postings on NOM/PRENOMS. A6 phase 3 (2026-05-16) lifted the
+    // last skip (`prefix_date_naissance_short`, gap-A6) via an FST range-scan
+    // iterator on the term dictionary (see
+    // `surch_index::DocumentIndex::term_prefix_doc_ids`).
     assert_eq!(executed + skipped, 30);
+    assert_eq!(skipped, 0, "expected 0 skipped entries against Surch HEAD");
     assert_eq!(
-        skipped, 1,
-        "expected 1 skipped entry (keyword-prefix on A6/A13)"
-    );
-    assert_eq!(
-        executed, 29,
-        "expected 29 executed entries against Surch HEAD"
+        executed, 30,
+        "expected 30 executed entries against Surch HEAD"
     );
 }
 

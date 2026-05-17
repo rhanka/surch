@@ -243,6 +243,15 @@ impl DocumentIndex {
         self.prefix_postings.contains_key(field)
     }
 
+    /// A6 phase 3: union of doc ids across every term of `field` whose
+    /// bytes start with `prefix`. Delegates to
+    /// [`TermDictionary::prefix_doc_ids`]; see that method for the cost
+    /// model. The keyword-prefix iterator uses this on fields that did
+    /// not declare `index_prefixes` (e.g. matchID's `DATE_NAISSANCE`).
+    pub fn term_prefix_doc_ids(&self, field: &str, prefix: &str) -> BTreeSet<u32> {
+        self.terms.prefix_doc_ids(field, prefix)
+    }
+
     pub fn live_doc_count(&self) -> usize {
         self.live_docs.len()
     }

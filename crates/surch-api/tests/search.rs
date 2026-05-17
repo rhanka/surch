@@ -1569,6 +1569,148 @@ async fn prefix_query_falls_back_to_source_scan_above_max_chars() {
     );
 }
 
+// --- A6 phase 3: keyword-prefix iterator via FST range scan ---
+
+async fn create_keyword_dates_index(router: &axum::Router) {
+    // matchID's `DATE_NAISSANCE` is typed `keyword` (mapping.json), not `date`,
+    // and matchID forbids `index_prefixes` on non-text mappings (parity with
+    // ES 7.x: see `mapping.rs::parse_field_mapping`). Phase 3 must therefore
+    // serve `prefix` from an FST range scan on the term dictionary.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"DATE_NAISSANCE":{"type":"keyword"},"NOM":{"type":"text","index_prefixes":{"min_chars":2,"max_chars":5}}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn prefix_query_on_keyword_field_uses_fst_range_scan() {
+    // A6 phase 3: with `DATE_NAISSANCE` typed `keyword` and no
+    // `index_prefixes` (forbidden on non-text fields, parity with ES 7.x),
+    // the prefix `"1962"` must still match every doc whose
+    // `DATE_NAISSANCE` token starts with `"1962"`. This is the matchID
+    // autocomplete contract on `< 8` chars typed (deces-backend
+    // `queries.ts:202`, intake §2.4).
+    let router = app_router();
+    create_keyword_dates_index(&router).await;
+    index_product(&router, "id-1", r#"{"DATE_NAISSANCE":"19620115"}"#).await;
+    index_product(&router, "id-2", r#"{"DATE_NAISSANCE":"19620830"}"#).await;
+    index_product(&router, "id-3", r#"{"DATE_NAISSANCE":"19710405"}"#).await;
+    index_product(&router, "id-4", r#"{"DATE_NAISSANCE":"19621231"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"prefix":{"DATE_NAISSANCE":"1962"}},"sort":[{"_id":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["id-1", "id-2", "id-4"]);
+    assert_eq!(body["hits"]["total"]["value"].as_u64(), Some(3));
+}
+
+#[tokio::test]
+async fn prefix_query_on_keyword_field_returns_zero_when_no_term_matches() {
+    // A6 phase 3 invariant: the FST range scan reports an empty hit set
+    // (not a 5xx, not a fallback to source-scan) when no indexed term
+    // starts with the prefix. The query must still execute through the
+    // postings path — exercised here by checking the response is 200 and
+    // `hits.total.value == 0` against a corpus where no DATE_NAISSANCE
+    // begins with `"2099"`.
+    let router = app_router();
+    create_keyword_dates_index(&router).await;
+    index_product(&router, "id-1", r#"{"DATE_NAISSANCE":"19620115"}"#).await;
+    index_product(&router, "id-2", r#"{"DATE_NAISSANCE":"19710405"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"prefix":{"DATE_NAISSANCE":"2099"}},"_source":false}"#,
+    )
+    .await;
+
+    assert_eq!(body["hits"]["total"]["value"].as_u64(), Some(0));
+    assert!(body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn prefix_query_text_with_index_prefixes_still_wins_over_keyword_path() {
+    // A6 phase 3 must not regress phase 2: when the field is `text` with
+    // `index_prefixes`, the write-time prefix postings table is the
+    // priority branch, not the FST range scan. Same corpus, same query
+    // as `prefix_query_uses_index_prefixes_postings_within_bounds`,
+    // re-asserted here after adding the keyword-prefix branch to make
+    // sure the `Text + index_prefixes` priority did not flip.
+    let router = app_router();
+    create_keyword_dates_index(&router).await;
+    index_product(&router, "id-1", r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19620115"}"#).await;
+    index_product(&router, "id-2", r#"{"NOM":"DUPRE","DATE_NAISSANCE":"19710405"}"#).await;
+    index_product(&router, "id-3", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19621231"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"prefix":{"NOM":"DUP"}},"sort":[{"_id":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["_id"].as_str().map(str::to_owned).expect("id"))
+        .collect();
+    assert_eq!(ids, vec!["id-1", "id-2"]);
+}
+
+#[tokio::test]
+async fn prefix_query_rejects_empty_value_with_400() {
+    // A6 phase 3: a `prefix` with an empty value is rejected at parse
+    // time with `400 parsing_exception`. ES 7.x is lenient here (returns
+    // 0 hits silently) but the matchID autocomplete contract only fires
+    // `prefix` once at least one character has been typed; a hard 400
+    // catches caller bugs early and is symmetric with `wildcard`'s
+    // existing empty-pattern rejection.
+    let router = app_router();
+    create_keyword_dates_index(&router).await;
+    index_product(&router, "id-1", r#"{"DATE_NAISSANCE":"19620115"}"#).await;
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"prefix":{"DATE_NAISSANCE":""}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = response_json(response).await;
+    assert_eq!(body["status"].as_u64(), Some(400));
+    assert_eq!(body["error"]["type"].as_str(), Some("parsing_exception"));
+}
+
 #[tokio::test]
 async fn search_router_wildcard_query_matches_star_and_question_patterns() {
     let router = app_router();

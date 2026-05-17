@@ -6,7 +6,7 @@ use std::{
 use serde_json::Value;
 use surch_index::{
     document_index::DocumentIndex,
-    mapping::{FieldMapping, IndexMapping},
+    mapping::{FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, stored_fields_bytes_for, MemoryUsage},
     postings::BlockMeta,
 };
@@ -246,41 +246,80 @@ impl InMemoryIndex {
         self.term_hits(field, value).len()
     }
 
-    /// A6 phase 2: postings-backed prefix lookup.
+    /// A6 phases 2 & 3: postings-backed prefix lookup.
     ///
-    /// Returns `Some(Vec<doc_public_id>)` when the field carries
-    /// `index_prefixes` AND the normalized prefix length falls inside
-    /// `[min_chars..=max_chars]` — in that case the result is the exact
-    /// set of docs containing a token starting with `prefix`. Returns
-    /// `None` when the postings-backed path is not applicable (no
-    /// `index_prefixes` on the field, or prefix length out of bounds);
-    /// callers fall back to source-scan via `prefix_field_matches`.
+    /// Three branches, in priority order:
+    ///
+    /// 1. **Text field with `index_prefixes` (phase 2)** — the field
+    ///    carries a write-time prefix postings table; the normalized
+    ///    prefix length must fall inside `[min_chars..=max_chars]`. The
+    ///    lookup is O(1) on the side table.
+    /// 2. **Keyword / Date field (phase 3)** — no `index_prefixes`
+    ///    (matchID forbids it on non-text mappings, parity with ES 7.x:
+    ///    see `mapping.rs::parse_field_mapping`). We FST-range-scan the
+    ///    term dictionary for every term starting with the prefix and
+    ///    union their doc id sets. Cost: O(matching_terms +
+    ///    matching_postings). On the matchID `DATE_NAISSANCE`
+    ///    autocomplete contract (`< 8 chars`, year + month range), the
+    ///    cardinality is bounded by ~365 dates per matching year.
+    /// 3. **Otherwise** — returns `None` so the candidate-set path falls
+    ///    back to source-scan via
+    ///    [`crate::search::prefix_field_matches`].
+    ///
+    /// `Some(vec)` always means the result is exact (possibly empty);
+    /// `None` strictly means "the postings path is not applicable here".
     fn prefix_hits(&self, field: &str, prefix: &str) -> Option<Vec<String>> {
         if field.trim().is_empty() || prefix.is_empty() {
             return None;
         }
         let field_mapping = self.mapping.field(field)?;
-        let bounds = field_mapping.index_prefixes?;
 
-        let normalized = normalized_term_for_field(prefix, field, &self.mapping);
-        if normalized.is_empty() {
-            return None;
-        }
-        let prefix_len = normalized.chars().count();
-        if prefix_len < bounds.min_chars || prefix_len > bounds.max_chars {
-            return None;
+        // Phase 2 path: text with index_prefixes.
+        if let Some(bounds) = field_mapping.index_prefixes {
+            let normalized = normalized_term_for_field(prefix, field, &self.mapping);
+            if normalized.is_empty() {
+                return None;
+            }
+            let prefix_len = normalized.chars().count();
+            if prefix_len < bounds.min_chars || prefix_len > bounds.max_chars {
+                return None;
+            }
+
+            let hits = self
+                .index
+                .prefix_postings(field, &normalized)
+                .map(|set| {
+                    set.iter()
+                        .filter_map(|doc_id| self.reverse_document_ids.get(doc_id).cloned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Some(hits);
         }
 
-        let hits = self
-            .index
-            .prefix_postings(field, &normalized)
-            .map(|set| {
-                set.iter()
+        // Phase 3 path: keyword / date — FST range scan over the term
+        // dictionary. We deliberately scope this to types whose default
+        // analyzer is `KeywordAnalyzer` (whole-value token) so the FST
+        // bytes line up with the user-supplied prefix without surprise:
+        // a `text` field with `Simple`/`Standard` analysis would have
+        // tokenized & folded the source before indexing, so a raw FST
+        // prefix scan would diverge from `prefix_field_matches`. Those
+        // fields stay on the source-scan fallback.
+        match field_mapping.field_type {
+            FieldType::Keyword | FieldType::Date => {
+                let normalized = normalized_term_for_field(prefix, field, &self.mapping);
+                if normalized.is_empty() {
+                    return None;
+                }
+                let doc_ids = self.index.term_prefix_doc_ids(field, &normalized);
+                let hits = doc_ids
+                    .iter()
                     .filter_map(|doc_id| self.reverse_document_ids.get(doc_id).cloned())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Some(hits)
+                    .collect::<Vec<_>>();
+                Some(hits)
+            }
+            _ => None,
+        }
     }
 
     fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats> {
