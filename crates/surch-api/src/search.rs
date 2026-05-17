@@ -2055,7 +2055,7 @@ fn score_documents(
         .zip(internal_ids)
         .map(|(doc, internal_id)| {
             let score = internal_id
-                .map(|id| score_for_query(query, id, &scoring_context, Some(&doc.source)))
+                .map(|id| score_for_query(query, id, &scoring_context, Some(doc.source.as_ref())))
                 .unwrap_or(1.0);
             ScoredDocument { doc, score }
         })
