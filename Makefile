@@ -171,19 +171,31 @@ bench-remote-scw:
 # ---------------------------------------------------------------------------
 # Dispatches the .github/workflows/ci-k8s.yml workflow that runs a Surch Job
 # (ndcg-gate | insee-bench | 00-init-corpora) on the Scaleway Kapsule burst
-# pool. The workflow is dormant (`if: false`) for the MVP — enable after:
-#   1. poc-k8s PR #2 merged (surch namespace + burst pool live)
-#   2. `ghcr-pull` Secret provisioned in the surch namespace
-#   3. SCW_OIDC_ROLE GitHub secret set
-# Until then, this target only emits a TODO message and exits non-zero.
+# pool. Set K8S_DRY_RUN=1 to print the gh command without dispatching.
 K8S_JOB ?= ndcg-gate
+K8S_REF ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+K8S_WATCH ?= 1
+K8S_DRY_RUN ?= 0
 bench-k8s:
-	@echo "bench-k8s: dispatching ci-k8s.yml (job=$(K8S_JOB))"
-	@echo "TODO: enable after poc-k8s PR #2 merged + ghcr-pull Secret provisioned + SCW_OIDC_ROLE set"
-	@echo "Then drop the leading '#' from the gh invocation below."
-	@# gh workflow run ci-k8s.yml -f job=$(K8S_JOB)
-	@# gh run watch --exit-status $$(gh run list --workflow=ci-k8s.yml --limit=1 --json databaseId --jq '.[0].databaseId')
-	@exit 1
+	@case "$(K8S_JOB)" in \
+	  ndcg-gate|insee-bench|00-init-corpora) ;; \
+	  *) echo "bench-k8s: invalid K8S_JOB=$(K8S_JOB) (expected ndcg-gate|insee-bench|00-init-corpora)" >&2; exit 2 ;; \
+	esac
+	@echo "bench-k8s: dispatching ci-k8s.yml (job=$(K8S_JOB), ref=$(K8S_REF))"
+	@if [ "$(K8S_DRY_RUN)" = "1" ]; then \
+	  echo "gh workflow run ci-k8s.yml --ref $(K8S_REF) -f job=$(K8S_JOB)"; \
+	else \
+	  gh workflow run ci-k8s.yml --ref "$(K8S_REF)" -f job="$(K8S_JOB)"; \
+	  if [ "$(K8S_WATCH)" = "1" ]; then \
+	    sleep 5; \
+	    run_id=$$(gh run list --workflow=ci-k8s.yml --branch "$(K8S_REF)" --limit=1 --json databaseId --jq '.[0].databaseId'); \
+	    if [ -z "$$run_id" ]; then \
+	      echo "bench-k8s: dispatched workflow, but could not resolve the run id for ref $(K8S_REF)" >&2; \
+	      exit 1; \
+	    fi; \
+	    gh run watch --exit-status "$$run_id"; \
+	  fi; \
+	fi
 
 bench-all: bench-local bench-recall bench-stress
 

@@ -1,52 +1,62 @@
 # Surch — K8s burst CI/CD
 
-Date: 2026-05-15
-Status: MVP scaffolded (workflow dormant), waiting on poc-k8s PR #2.
+Date: 2026-05-17
+Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
 
 ## Architecture
 
 ```
-+-----------------+    OIDC     +------------------+   kubeconfig   +-----------------+
-| GitHub Actions  | <---------> | Scaleway IAM     | -------------> | Kapsule "poc"   |
-| .github/...     |             | (short-lived JWT)|                | namespace surch |
-| ci-k8s.yml      |             +------------------+                +--------+--------+
-+-----------------+                                                          |
-                                                                             v
-                                                       +---------------------+----+
-                                                       | burst pool (DEV1-L, 0..1)|
-                                                       |   Job ndcg-gate         |
-                                                       |   Job insee-bench       |
-                                                       |   Job 00-init-corpora   |
-                                                       +-------------------------+
++-----------------+   KUBE_CONFIG_DATA   +-----------------+
+| GitHub Actions  | -------------------> | Kapsule "poc"   |
+| .github/...     |                      | namespace surch |
+| ci-k8s.yml      |                      +--------+--------+
++-----------------+                               |
+                                                  v
+                            +---------------------+----+
+                            | burst pool (DEV1-L, 0..1)|
+                            |   Job ndcg-gate         |
+                            |   Job insee-bench       |
+                            |   Job 00-init-corpora   |
+                            +-------------------------+
 ```
 
-- GHA acquires a Scaleway IAM token via OIDC federation (no static
-  `SCW_SECRET_KEY` in repo secrets).
-- `scw k8s kubeconfig get poc` writes a short-lived `~/.kube/config`.
+- GHA reads `KUBE_CONFIG_DATA` from repository secrets. The secret may be
+  raw kubeconfig YAML or base64-encoded YAML.
 - The burst pool (DEV1-L, 0..1 autoscaled, taint `pool=burst:NoSchedule`)
   scales `0 -> 1` for the Job duration and back to `0` after the TTL.
 - All Jobs carry `nodeSelector: pool=burst` + a matching toleration.
-- Reports surface either via `kubectl cp` from a Pod `emptyDir` or via
-  GHA `actions/upload-artifact@v4`.
+- Reports and diagnostics are written under `target/bench-reports/k8s/`
+  and uploaded with `actions/upload-artifact@v4` even when the Job fails.
+- The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
+  shell variables inside the Job scripts stay intact.
+- Job status is fail-closed: `Complete=True` passes, `Failed=True` or a
+  30 min timeout fails the workflow.
 
 ## Manual run
 
 ```bash
-gh workflow run ci-k8s.yml -f job=ndcg-gate
-gh workflow run ci-k8s.yml -f job=insee-bench
-gh workflow run ci-k8s.yml -f job=00-init-corpora   # only after first landing
+make bench-k8s K8S_JOB=00-init-corpora
+make bench-k8s K8S_JOB=ndcg-gate
+make bench-k8s K8S_JOB=insee-bench
 ```
 
-The workflow is gated `if: false` for the MVP. Remove that flag in
-`.github/workflows/ci-k8s.yml` once poc-k8s PR #2 is merged and the
-cluster owner confirms:
+Useful local knobs:
 
-- the `surch` namespace exists with quotas applied,
-- the `ghcr-pull` Secret is provisioned (PAT with `read:packages` on
-  `ghcr.io/rhanka/surch`),
-- the `burst` pool exists with the taint + nodeSelector contract,
-- the three PVCs are bound (`surch-corpus-beir`, `surch-corpus-insee`,
-  `surch-scratch`).
+```bash
+make bench-k8s K8S_JOB=ndcg-gate K8S_DRY_RUN=1
+make bench-k8s K8S_JOB=ndcg-gate K8S_WATCH=0
+make bench-k8s K8S_JOB=ndcg-gate K8S_REF=main
+```
+
+Cluster prerequisites:
+
+- the `surch` namespace exists with quotas applied;
+- the `burst` pool exists with the taint + nodeSelector contract;
+- `KUBE_CONFIG_DATA` is set in GitHub secrets;
+- the three PVCs are bound: `surch-corpus-beir`,
+  `surch-corpus-insee`, `surch-scratch`;
+- the Surch image tag `ghcr.io/rhanka/surch:sha-<short_sha>` exists and
+  is pullable by the cluster.
 
 ## Reading results
 
@@ -55,20 +65,26 @@ cluster owner confirms:
 kubectl logs -n surch -l app.kubernetes.io/component=ndcg-gate -c ndcg-driver -f
 kubectl logs -n surch -l app.kubernetes.io/component=insee-bench -c artillery-runner -f
 
-# After completion, grab the JSON report:
-POD=$(kubectl get pod -n surch -l app.kubernetes.io/component=ndcg-gate \
-        -o jsonpath='{.items[0].metadata.name}')
-kubectl cp -n surch "${POD}:/reports/bench.json" ./ndcg-gate.json -c ndcg-driver
+# Inspect status and events after a failed run:
+kubectl describe job -n surch ndcg-gate
+kubectl get events -n surch --sort-by='.metadata.creationTimestamp'
 ```
 
-GHA also uploads the report as an artifact named
-`k8s-bench-<job>-<sha>` (see workflow step `Upload report`).
+GHA uploads an artifact named `k8s-bench-<job>-<sha>`. It contains:
+
+- `<job>.job.describe.txt` and `<job>.job.yaml`;
+- `<job>.pods.txt` and `<job>.pods.describe.txt`;
+- `<job>.events.txt` and `<job>.job.events.txt`;
+- `<job>.job.log`;
+- per-pod/per-container logs, including `*.previous.log` when present;
+- `<job>.json` when `/reports/bench.json` can be copied from the report
+  container.
 
 ## Cost guardrails
 
 | Knob                  | Value | Where enforced                                                |
 | --------------------- | ----- | ------------------------------------------------------------- |
-| `SCW_MAX_COST_EUR`    | 2     | trap on burst-pool tear-down (workflow `Burst pool down`)     |
+| `SCW_MAX_COST_EUR`    | 2     | documented guardrail; pool autoscaling keeps idle cost at 0   |
 | `SCW_MAX_DURATION_MIN`| 30    | `activeDeadlineSeconds: 1800` on every Surch Job              |
 | `timeout-minutes`     | 35    | GHA workflow-level safety net (cap + 5 min)                   |
 
@@ -82,31 +98,21 @@ namespace returns to its 500m / 512Mi quota baseline.
 
 ## Files in this repo
 
-- `.github/workflows/ci-k8s.yml` — GHA workflow (currently `if: false`)
+- `.github/workflows/ci-k8s.yml` — manual GHA workflow
 - `deploy/k8s/jobs/00-init-corpora.yaml` — one-shot PVC pre-warm
 - `deploy/k8s/jobs/ndcg-gate.yaml` — SciFact NDCG@10 parity gate
 - `deploy/k8s/jobs/insee-bench.yaml` — paired bench Surch vs OS
 - `Makefile` target `bench-k8s` — wrapper around `gh workflow run`
 
-## TODO (tracked in the workflow as `# TODO`)
+## Known limits
 
-1. **OIDC role** — `SCW_OIDC_ROLE` secret to be set once poc-k8s issues
-   the IAM role ARN. The Scaleway action name (`scaleway/action-oidc-auth`)
-   is a placeholder until Scaleway publishes their official one.
-2. **Kubeconfig fetch** — `scw k8s kubeconfig get` step is commented;
-   re-enable after OIDC.
-3. **Burst pool scale up/down** — `scw k8s pool update min-size=0 max-size=1`
-   pre-run; revert post-run in `if: always()`. Needs the pool ID lookup
-   wired (currently a shell pipe to `jq`).
-4. **`envsubst` patch of the image SHA** — once the release workflow
-   publishes `ghcr.io/rhanka/surch:sha-<short>`, the Job manifests can
-   be applied verbatim. Until then the manifests carry `${SURCH_SHA}`
-   placeholders.
-5. **PR trigger** — currently `workflow_dispatch` only. Once the budget
-   is reproduced on a few manual runs, uncomment the `pull_request`
-   trigger at the top of `ci-k8s.yml`.
-6. **bench_report `--out` flag** — `insee-bench.yaml` calls
-   `bench_report --out`. The binary currently emits to stdout; add the
-   flag in a follow-up so the kubectl cp path becomes deterministic.
-7. **`make bench-k8s` body** — wrapper currently echoes a TODO; flip to
-   `gh workflow run ci-k8s.yml -f job=$(JOB)` after the workflow ships.
+- `00-init-corpora` is the first smoke target to run. It uses a Python
+  image so download and zip extraction do not depend on optional shell
+  tools.
+- `ndcg-gate` and `insee-bench` still depend on the Surch runtime image
+  shipping the driver tools they call (`/bin/sh`, `wget`,
+  `scifact-ndcg.sh`, `artillery_bench`, `bench_report`). Until the image
+  contract is updated, failures from those Jobs should be diagnosed from
+  the uploaded describe/events/log artifacts.
+- `workflow_dispatch` is intentional. Add a PR trigger only after a few
+  manual runs have reproduced the budget and image contract.
