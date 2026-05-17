@@ -10,3 +10,4 @@ repository.workspace = true
 [dependencies]
 surch-types = { path = "../surch-types" }
 unicode-segmentation = { workspace = true }
+unicode-normalization = { workspace = true }

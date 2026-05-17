@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 //! Lucene-compatible analyzer and token stream primitives.
 
+use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::UnicodeNormalization;
+
 /// Short crate purpose used by workspace smoke tests.
 pub const CRATE_PURPOSE: &str = "Lucene-compatible analysis";
 
@@ -206,11 +209,11 @@ impl Analyzer for StopAnalyzer {
 
 /// Folds a single character to its closest ASCII equivalent.
 ///
-/// Covers the French diacritic set (`éèêëàâäîïôöùûüç` + uppercase) plus the
-/// most common Western-European letters seen in INSEE/Etat-civil data
-/// (`ñõåæœÿ`). Characters that do not have an ASCII fold mapping are
-/// returned unchanged. This is the inline fallback used while a full
-/// Lucene `ASCIIFoldingFilter` port is out of scope for the WP-D MVP.
+/// Kept for backwards compatibility with callers that need a 1:1 char map
+/// on the French diacritic set. Multi-character expansions and barred /
+/// stroked letters that NFD cannot decompose (e.g. `Ł`, `Đ`, `Ø`) live in
+/// [`asciifold_override`] / [`asciifold_string`]. Characters without an
+/// ASCII fold mapping are returned unchanged.
 pub fn asciifold_char(input: char) -> char {
     match input {
         'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
@@ -233,20 +236,76 @@ pub fn asciifold_char(input: char) -> char {
     }
 }
 
-/// Folds every character of `input` through [`asciifold_char`].
+/// Override table for characters NFD cannot decompose to ASCII + combining
+/// marks. Covers stroked / barred letters and historical ligatures used
+/// across Western and Central European names (Polish `Ł`, Croatian `Đ`,
+/// Danish/Norwegian `Ø` `Æ`, French `Œ`, German `ß`, Icelandic `Þ` `Ð`,
+/// Turkish dotless `ı`, etc.). Returned values are pushed onto the output
+/// buffer verbatim — `None` means "fall through to NFD + strip-marks".
 ///
-/// Multi-character expansions (`æ → ae`, `œ → oe`, `ß → ss`) are handled
-/// here so the function returns an owned `String` rather than a `char`.
+/// Mirrors the subset of Lucene's `ASCIIFoldingFilter` that targets the
+/// Latin-supplement, Latin Extended-A, and Latin Extended-B code blocks
+/// most commonly seen in INSEE/Etat-civil and broader European corpora.
+fn asciifold_override(input: char) -> Option<&'static str> {
+    match input {
+        'Æ' => Some("AE"),
+        'æ' => Some("ae"),
+        'Œ' => Some("OE"),
+        'œ' => Some("oe"),
+        'Ĳ' => Some("IJ"),
+        'ĳ' => Some("ij"),
+        'ß' => Some("ss"),
+        'ẞ' => Some("SS"),
+        'Ł' => Some("L"),
+        'ł' => Some("l"),
+        'Đ' | 'Ð' => Some("D"),
+        'đ' | 'ð' => Some("d"),
+        'Ø' => Some("O"),
+        'ø' => Some("o"),
+        'Þ' => Some("TH"),
+        'þ' => Some("th"),
+        'Ħ' => Some("H"),
+        'ħ' => Some("h"),
+        'Ŧ' => Some("T"),
+        'ŧ' => Some("t"),
+        'Ŀ' => Some("L"),
+        'ŀ' => Some("l"),
+        'ı' => Some("i"),
+        'Ŋ' => Some("N"),
+        'ŋ' => Some("n"),
+        'Ə' => Some("E"),
+        'ə' => Some("e"),
+        '«' | '»' => Some("\""),
+        '“' | '”' | '„' => Some("\""),
+        '‘' | '’' | '‚' => Some("'"),
+        '–' | '—' => Some("-"),
+        _ => None,
+    }
+}
+
+/// Folds `input` to ASCII via Unicode NFD decomposition plus an override
+/// table for non-decomposable letters and ligatures.
+///
+/// Pipeline (mirrors Lucene's `ASCIIFoldingFilter` for the Latin blocks):
+///
+/// 1. Apply [`asciifold_override`] to handle ligatures (`Æ → AE`,
+///    `Œ → OE`, `ß → ss`), barred / stroked letters (`Ł → L`, `Đ → D`,
+///    `Ø → O`), and a handful of typographic quotes / dashes.
+/// 2. For every remaining character, run NFD canonical decomposition and
+///    drop combining marks. This covers virtually all Latin / Greek /
+///    Cyrillic diacritics (`é → e`, `ñ → n`, `ć → c`, `ỹ → y`, …).
+/// 3. Characters that survive both steps are passed through unchanged.
 pub fn asciifold_string(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     for character in input.chars() {
-        match character {
-            'æ' => output.push_str("ae"),
-            'Æ' => output.push_str("AE"),
-            'œ' => output.push_str("oe"),
-            'Œ' => output.push_str("OE"),
-            'ß' => output.push_str("ss"),
-            other => output.push(asciifold_char(other)),
+        if let Some(replacement) = asciifold_override(character) {
+            output.push_str(replacement);
+            continue;
+        }
+        for decomposed in character.nfd() {
+            if !is_combining_mark(decomposed) {
+                output.push(decomposed);
+            }
         }
     }
     output
@@ -297,8 +356,7 @@ impl Analyzer for EdgeNgramAnalyzer {
             let char_count = char_offsets.len().saturating_sub(1);
 
             let upper = self.max_gram.min(char_count);
-            for size in self.min_gram..=upper {
-                let byte_end = char_offsets[size];
+            for &byte_end in char_offsets.iter().take(upper + 1).skip(self.min_gram) {
                 tokens.push(Token {
                     term: base.term[..byte_end].to_owned(),
                     start_offset: base.start_offset,
@@ -452,5 +510,54 @@ mod tests {
     fn asciifold_string_handles_multi_char_expansions() {
         assert_eq!(asciifold_string("Œuvre cœur"), "OEuvre coeur");
         assert_eq!(asciifold_string("Straße"), "Strasse");
+    }
+
+    #[test]
+    fn asciifold_string_folds_french_diacritics_via_nfd() {
+        // Élève — historical phase-1 anchor.
+        assert_eq!(asciifold_string("Élève"), "Eleve");
+    }
+
+    #[test]
+    fn asciifold_string_folds_spanish_tilde_via_nfd() {
+        // Ñoño — Spanish n-tilde, both cases.
+        assert_eq!(asciifold_string("Ñoño"), "Nono");
+    }
+
+    #[test]
+    fn asciifold_string_folds_croatian_acute_via_nfd() {
+        // Ćelo — Croatian c-acute.
+        assert_eq!(asciifold_string("Ćelo"), "Celo");
+    }
+
+    #[test]
+    fn asciifold_string_folds_polish_stroked_letters_via_override() {
+        // Łódź — Polish: Ł and ł must come from the override table since
+        // NFD cannot decompose stroked letters; ó / ź decompose via NFD.
+        assert_eq!(asciifold_string("Łódź"), "Lodz");
+    }
+
+    #[test]
+    fn asciifold_string_folds_danish_ligature_and_slashed_o() {
+        // Ærø — Danish: Æ via override (ligature), ø via override
+        // (slashed-o, non-decomposable).
+        assert_eq!(asciifold_string("Ærø"), "AEro");
+    }
+
+    #[test]
+    fn asciifold_string_folds_vietnamese_via_nfd() {
+        // Mỹ — Vietnamese: y with tilde above (U+1EF9) decomposes via NFD.
+        assert_eq!(asciifold_string("Mỹ"), "My");
+    }
+
+    #[test]
+    fn asciifold_string_passes_ascii_through_unchanged() {
+        // SciFact-style payloads must round-trip byte-for-byte.
+        assert_eq!(asciifold_string("Hello, World! 123"), "Hello, World! 123");
+    }
+
+    #[test]
+    fn asciifold_string_handles_icelandic_thorn_and_eth() {
+        assert_eq!(asciifold_string("Þór Eð"), "THor Ed");
     }
 }
