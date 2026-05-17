@@ -37,6 +37,7 @@ aws-credential-types = { workspace = true }
 
 [dev-dependencies]
 opensearch-oracle = { path = "../opensearch-oracle" }
+surch-codec = { path = "../surch-codec" }
 tower = { workspace = true, features = ["util"] }
 tar = { workspace = true }
 flate2 = { workspace = true }
@@ -47,4 +48,14 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # compared with sub-millisecond resolution. See docs/ops/perf-bench.md.
 [[bench]]
 name = "search_hot_path"
+harness = false
+
+# Phase 1 measurement bench: JSON vs FoR-encoded postings on a
+# synthetic 100-doc index. Replaces the wire-up that
+# `for-integration-plan.md` originally proposed under `snapshot.rs` —
+# the ES-parity snapshot path is currently document-NDJSON, not
+# postings, so we ship the gain as a measurement rather than a wire
+# change. See `crates/surch-api/benches/snapshot_size.rs` header.
+[[bench]]
+name = "snapshot_size"
 harness = false
