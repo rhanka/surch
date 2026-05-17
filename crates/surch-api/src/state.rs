@@ -42,7 +42,17 @@ struct MemoryStore {
 
 #[derive(Debug, Default, Clone)]
 struct InMemoryIndex {
-    documents: BTreeMap<String, Value>,
+    /// `_source` payloads, refcounted so the search hot path
+    /// (`build_hit`, `score_documents`, `lookup_sort_value`, …) can
+    /// hand each reader a fresh [`StoredDocument`] without cloning
+    /// the entire JSON. Multiple concurrent reads on the same doc
+    /// share the same `Arc<Value>`; writes always allocate a fresh
+    /// `Arc` so an in-flight reader's snapshot stays untouched. The
+    /// Prometheus gauge `surch_index_stored_fields_bytes` keeps
+    /// counting the `Value` payload size once (regardless of the
+    /// strong count), so the gauge tracks unique stored bytes —
+    /// which is what capacity planning cares about.
+    documents: BTreeMap<String, Arc<Value>>,
     document_ids: BTreeMap<String, u32>,
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
@@ -55,7 +65,12 @@ struct InMemoryIndex {
 pub struct StoredDocument {
     pub index: String,
     pub id: String,
-    pub source: Value,
+    /// Refcounted handle on the stored `_source`. Cloning a
+    /// `StoredDocument` only bumps the [`Arc`] strong count instead
+    /// of duplicating the underlying JSON tree, which is the main
+    /// driver of the matchID INSEE RAM footprint (~1.3 M docs).
+    /// Consumers that need a `&Value` get one via deref coercion.
+    pub source: Arc<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,7 +179,10 @@ impl InMemoryIndex {
             doc_id
         });
 
-        self.documents.insert(id.to_owned(), source);
+        // Wrap once per upsert so concurrent readers that already
+        // hold the previous `Arc` keep observing their consistent
+        // snapshot; the write replaces the slot with a fresh handle.
+        self.documents.insert(id.to_owned(), Arc::new(source));
         let inserted_source = self
             .documents
             .get(id)
@@ -456,7 +474,8 @@ impl InMemoryIndex {
                 self.documents.get(id).map(|source| StoredDocument {
                     index: index.to_owned(),
                     id: id.clone(),
-                    source: source.clone(),
+                    // Refcount bump, not a JSON deep clone.
+                    source: Arc::clone(source),
                 })
             })
             .collect()
@@ -1144,7 +1163,7 @@ impl AppState {
         store
             .indices
             .get(index)
-            .and_then(|data| data.documents.get(id).cloned())
+            .and_then(|data| data.documents.get(id).map(|source| (**source).clone()))
     }
 
     pub fn documents(&self, index: &str) -> Vec<StoredDocument> {
@@ -1160,7 +1179,8 @@ impl AppState {
                 data.documents.iter().map(|(id, source)| StoredDocument {
                     index: index.to_owned(),
                     id: id.clone(),
-                    source: source.clone(),
+                    // Refcount bump per hit, not a JSON deep clone.
+                    source: Arc::clone(source),
                 })
             })
             .collect()
@@ -1210,7 +1230,8 @@ impl AppState {
             .map(|(id, source)| StoredDocument {
                 index: index.to_owned(),
                 id: id.clone(),
-                source: source.clone(),
+                // Refcount bump per hit, not a JSON deep clone.
+                source: Arc::clone(source),
             })
             .collect()
     }
@@ -1229,7 +1250,8 @@ impl AppState {
                 data.documents.get(id).map(|source| StoredDocument {
                     index: index.to_owned(),
                     id: id.clone(),
-                    source: source.clone(),
+                    // Refcount bump per hit, not a JSON deep clone.
+                    source: Arc::clone(source),
                 })
             })
             .collect()
@@ -1363,7 +1385,12 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
         let mut usage = document_index_memory_usage(&data.index);
-        usage.stored_fields_bytes = stored_fields_bytes_for(data.documents.values());
+        // Each stored payload is counted once regardless of the
+        // outstanding `Arc` strong count: the gauge tracks the
+        // unique RAM held by `_source` JSON, not the per-reader
+        // cumulative footprint.
+        usage.stored_fields_bytes =
+            stored_fields_bytes_for(data.documents.values().map(Arc::as_ref));
         Some(usage)
     }
 

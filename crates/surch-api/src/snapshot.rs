@@ -333,7 +333,7 @@ fn build_tarball(
 
     let mut documents_bytes = Vec::new();
     for doc in documents {
-        let entry = json!({ "_id": doc.id, "_source": doc.source });
+        let entry = json!({ "_id": doc.id, "_source": doc.source.as_ref() });
         let line =
             serde_json::to_vec(&entry).map_err(|e| format!("document serialisation: {e}"))?;
         documents_bytes.extend_from_slice(&line);
