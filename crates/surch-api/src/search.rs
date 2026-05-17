@@ -68,16 +68,19 @@ pub enum AggSpec {
     /// `{ "value": N }` payload.
     Cardinality { field: String },
     /// A12.4: `composite` aggregation — bucket documents by the
-    /// cartesian product of `sources`. MVP ships `terms` sources only
-    /// (matchID intake §2.10 also wires `date_histogram` sources;
-    /// those are tracked under A12.4 phase 2). Buckets are emitted
-    /// sorted lexicographically by their composite key (source-by-
-    /// source, ascending — parity with ES), capped to `size` (default
-    /// 10). When `after` is present, every bucket whose key is
-    /// lexicographically less-than-or-equal to `after` is skipped
-    /// (cursor round-trip). The response carries `after_key` set to
-    /// the key of the last emitted bucket whenever the cap was reached
-    /// (otherwise omitted, marking the end of the stream).
+    /// cartesian product of `sources`. Phase 1 shipped `terms`
+    /// sources; phase 2 (this change) accepts `date_histogram`
+    /// sources too, matching matchID's wire shape (intake §2.10).
+    /// Remaining source kinds (`histogram`, `geotile_grid`, …) are
+    /// still rejected at parse time with an "A12.4 phase 3" hint.
+    /// Buckets are emitted sorted lexicographically by their
+    /// composite key (source-by-source, ascending — parity with ES),
+    /// capped to `size` (default 10). When `after` is present, every
+    /// bucket whose key is lexicographically less-than-or-equal to
+    /// `after` is skipped (cursor round-trip). The response carries
+    /// `after_key` set to the key of the last emitted bucket whenever
+    /// the cap was reached (otherwise omitted, marking the end of the
+    /// stream).
     Composite {
         sources: Vec<CompositeSource>,
         size: usize,
@@ -85,17 +88,39 @@ pub enum AggSpec {
     },
 }
 
-/// A12.4: one `terms` composite-source definition. `name` is the
-/// user-supplied key under which the source's value lands in each
-/// bucket's `key` object (and in the `after` / `after_key` cursors);
-/// `field` is the `_source` path read for each matched document
-/// (honours the `.raw` / `.norm` sub-field alias via
-/// `lookup_sort_value`). Non-terms sources (`date_histogram`, etc.)
-/// are rejected at parse time with an "A12.4 phase 2" hint.
+/// A12.4: one composite-source definition. `name` is the user-supplied
+/// key under which the source's value lands in each bucket's `key`
+/// object (and in the `after` / `after_key` cursors); `kind` describes
+/// how the per-document value is projected from `_source`. Phase 1
+/// shipped the `terms` variant; phase 2 added `date_histogram`.
+/// Remaining ES source kinds (`histogram`, `geotile_grid`, …) are
+/// rejected at parse time with an "A12.4 phase 3" hint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompositeSource {
     pub name: String,
-    pub field: String,
+    pub kind: CompositeSourceKind,
+}
+
+/// A12.4: how a composite source projects a per-document value.
+///
+/// - `Terms` reads `_source[field]` verbatim (honours the `.raw` /
+///   `.norm` sub-field alias via `lookup_sort_value`).
+/// - `DateHistogram` reads `_source[field]` as a `YYYYMMDD` keyword
+///   and truncates it to `calendar_interval` (same bucketing logic as
+///   the standalone `date_histogram` agg). `format`, when set, is
+///   echoed back as the per-source value — matchID currently only
+///   emits `yyyyMMdd` which already matches the storage shape, so no
+///   reformatting takes place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompositeSourceKind {
+    Terms {
+        field: String,
+    },
+    DateHistogram {
+        field: String,
+        calendar_interval: CalendarInterval,
+        format: Option<String>,
+    },
 }
 
 const DEFAULT_COMPOSITE_AGG_SIZE: usize = 10;
@@ -1253,14 +1278,16 @@ fn record_terms_value(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Val
     entry.1 += 1;
 }
 
-/// A12.4: `composite` aggregation executor — MVP terms-only.
+/// A12.4: `composite` aggregation executor.
 ///
-/// For each matched document, project the composite key by reading
-/// `lookup_sort_value(source.field)` for every source. Documents that
-/// miss any source value are dropped (matches ES `missing_bucket`
-/// default `false`). Identical composite keys accumulate `doc_count`.
-/// Buckets are then sorted lexicographically (source-by-source,
-/// ascending) so the cursor stream is deterministic.
+/// For each matched document, project the composite key by applying
+/// each source's projection (`terms` reads `_source[field]` verbatim,
+/// `date_histogram` truncates a `YYYYMMDD` keyword to the requested
+/// `calendar_interval`). Documents that miss any source value are
+/// dropped (matches ES `missing_bucket` default `false`). Identical
+/// composite keys accumulate `doc_count`. Buckets are then sorted
+/// lexicographically (source-by-source, ascending) so the cursor
+/// stream is deterministic.
 ///
 /// `after` is applied as a strict `>` filter against the sorted key
 /// stream (lex comparison on each source's value, in the order the
@@ -1283,7 +1310,11 @@ fn compute_composite_aggregation(
         let mut composite_values: Vec<Value> = Vec::with_capacity(sources.len());
         let mut all_present = true;
         for source in sources {
-            let Some(value) = lookup_sort_value(&scored.doc.source, &source.field) else {
+            let field = match &source.kind {
+                CompositeSourceKind::Terms { field } => field,
+                CompositeSourceKind::DateHistogram { field, .. } => field,
+            };
+            let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
                 all_present = false;
                 break;
             };
@@ -1292,7 +1323,7 @@ fn compute_composite_aggregation(
             // the first element to keep the executor scalar — matchID
             // only emits composite over scalar keyword / date fields,
             // so the trade-off is invisible in practice. Tightening
-            // tracked in A12.4 phase 2.
+            // tracked in A12.4 phase 3.
             let scalar = match value {
                 Value::Array(items) => items.iter().find(|v| !matches!(v, Value::Null)),
                 other if matches!(other, Value::Null) => None,
@@ -1302,8 +1333,26 @@ fn compute_composite_aggregation(
                 all_present = false;
                 break;
             };
-            composite_key.push(TermsKey::from_value(scalar));
-            composite_values.push(scalar.clone());
+            // Project the scalar through the source kind. `terms`
+            // keeps the value verbatim; `date_histogram` truncates the
+            // `YYYYMMDD` keyword to the requested calendar interval —
+            // identical logic to the standalone date_histogram agg so
+            // a (source, bucket) pair carries the same key on either
+            // path.
+            let projected = match &source.kind {
+                CompositeSourceKind::Terms { .. } => scalar.clone(),
+                CompositeSourceKind::DateHistogram {
+                    calendar_interval, ..
+                } => match bucket_key_for_date(scalar, *calendar_interval) {
+                    Some(bucket_key) => Value::String(bucket_key),
+                    None => {
+                        all_present = false;
+                        break;
+                    }
+                },
+            };
+            composite_key.push(TermsKey::from_value(&projected));
+            composite_values.push(projected);
         }
         if !all_present {
             continue;
@@ -2710,13 +2759,15 @@ fn parse_cardinality_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearc
     Ok(AggSpec::Cardinality { field })
 }
 
-/// A12.4: parse a `composite` agg body. MVP: `terms` sources only.
-/// `sources` is an ordered array of single-key objects
-/// `{ "<sourceName>": { "terms": { "field": "<path>" } } }`. Any
-/// other source kind (`date_histogram`, `histogram`, `geotile_grid`,
-/// …) is rejected with an explicit "A12.4 phase 2" hint. `size`
-/// defaults to `DEFAULT_COMPOSITE_AGG_SIZE`; `after` is captured
-/// verbatim as a `{ <sourceName>: <Value> }` cursor.
+/// A12.4: parse a `composite` agg body. Phase 1 accepted `terms`
+/// sources; phase 2 (this change) additionally accepts
+/// `date_histogram` sources (matchID intake §2.10). `sources` is an
+/// ordered array of single-key objects
+/// `{ "<sourceName>": { "terms"|"date_histogram": { … } } }`. Other
+/// source kinds (`histogram`, `geotile_grid`, …) are rejected with
+/// an explicit "A12.4 phase 3" hint. `size` defaults to
+/// `DEFAULT_COMPOSITE_AGG_SIZE`; `after` is captured verbatim as a
+/// `{ <sourceName>: <Value> }` cursor.
 fn parse_composite_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchError> {
     let object = value.as_object().ok_or_else(|| {
         OpenSearchError::new(
@@ -2843,7 +2894,94 @@ fn parse_composite_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchE
                     .to_string();
                 sources.push(CompositeSource {
                     name: source_name.clone(),
-                    field,
+                    kind: CompositeSourceKind::Terms { field },
+                });
+            }
+            "date_histogram" => {
+                // A12.4 phase 2: composite `date_histogram` source —
+                // same option surface as the standalone agg
+                // (`field` + `calendar_interval` required, `format`
+                // optional), bucketing logic shared via
+                // `bucket_key_for_date` at execution time.
+                let kind_object = kind_body.as_object().ok_or_else(|| {
+                    OpenSearchError::new(
+                        StatusCode::BAD_REQUEST,
+                        "parsing_exception",
+                        format!(
+                            "agg `{name}`: composite source \
+                             `{source_name}.date_histogram` body must be an object"
+                        ),
+                    )
+                })?;
+                let field = kind_object
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        OpenSearchError::new(
+                            StatusCode::BAD_REQUEST,
+                            "parsing_exception",
+                            format!(
+                                "agg `{name}`: composite source \
+                                 `{source_name}.date_histogram.field` is required"
+                            ),
+                        )
+                    })?
+                    .to_string();
+                let interval_str = kind_object
+                    .get("calendar_interval")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        OpenSearchError::new(
+                            StatusCode::BAD_REQUEST,
+                            "parsing_exception",
+                            format!(
+                                "agg `{name}`: composite source \
+                                 `{source_name}.date_histogram.calendar_interval` is required"
+                            ),
+                        )
+                    })?;
+                let calendar_interval = match interval_str {
+                    "day" | "1d" => CalendarInterval::Day,
+                    "week" | "1w" => CalendarInterval::Week,
+                    "month" | "1M" => CalendarInterval::Month,
+                    "year" | "1y" => CalendarInterval::Year,
+                    other => {
+                        return Err(OpenSearchError::new(
+                            StatusCode::BAD_REQUEST,
+                            "parsing_exception",
+                            format!(
+                                "agg `{name}`: composite source \
+                                 `{source_name}.date_histogram.calendar_interval` \
+                                 `{other}` not supported (day|week|month|year only)"
+                            ),
+                        ));
+                    }
+                };
+                let format = match kind_object.get("format") {
+                    None => None,
+                    Some(v) => Some(
+                        v.as_str()
+                            .ok_or_else(|| {
+                                OpenSearchError::new(
+                                    StatusCode::BAD_REQUEST,
+                                    "parsing_exception",
+                                    format!(
+                                        "agg `{name}`: composite source \
+                                         `{source_name}.date_histogram.format` must be \
+                                         a string"
+                                    ),
+                                )
+                            })?
+                            .to_string(),
+                    ),
+                };
+                sources.push(CompositeSource {
+                    name: source_name.clone(),
+                    kind: CompositeSourceKind::DateHistogram {
+                        field,
+                        calendar_interval,
+                        format,
+                    },
                 });
             }
             other => {
@@ -2852,7 +2990,7 @@ fn parse_composite_agg(name: &str, value: &Value) -> Result<AggSpec, OpenSearchE
                     "parsing_exception",
                     format!(
                         "agg `{name}`: composite source `{source_name}` kind \
-                         `{other}` not implemented yet, tracked in A12.4 phase 2"
+                         `{other}` not implemented yet, tracked in A12.4 phase 3"
                     ),
                 ));
             }
