@@ -27,6 +27,7 @@ pub mod msearch;
 pub mod root;
 pub mod scroll;
 pub mod search;
+pub mod slm;
 pub mod snapshot;
 pub mod snapshot_es;
 pub mod state;
@@ -44,19 +45,64 @@ const BULK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 /// so a hostile uploader cannot exhaust memory.
 const SNAPSHOT_IMPORT_BODY_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Bundle of long-lived shared state surfaced by the router builder so
+/// the scheduler / tests can drive the same registries the HTTP layer
+/// observes. `app_router_with_state` is the explicit entry point used
+/// by `main.rs` to also spawn the SLM background task; `app_router()`
+/// keeps the simple no-side-effect shape that tests rely on.
+#[derive(Clone, Default)]
+pub struct AppRouterState {
+    pub app: state::AppState,
+    pub snapshot_repositories: snapshot_es::SnapshotRepositoryRegistry,
+    pub slm_policies: slm::SlmPolicyRegistry,
+}
+
 /// Build the P0 OpenSearch-compatible API router.
 pub fn app_router() -> Router {
+    app_router_with_state(AppRouterState::default())
+}
+
+/// Build the router on top of an explicit shared-state bundle. Useful
+/// for `main.rs` (which also spawns the SLM scheduler against the same
+/// `slm_policies` registry) and for integration tests that drive the
+/// scheduler tick loop directly.
+pub fn app_router_with_state(shared: AppRouterState) -> Router {
     // Install the global Prometheus recorder before the router starts
     // emitting metrics. Idempotent: safe to call from every test and
     // from `main` at startup.
     let _ = metrics::install_global();
 
-    let app_state = state::AppState::default();
-    let snapshot_registry = snapshot_es::SnapshotRepositoryRegistry::default();
+    let app_state = shared.app;
+    let snapshot_registry = shared.snapshot_repositories;
+    let slm_policies = shared.slm_policies;
     let snapshot_state = snapshot_es::routes::SnapshotAppState {
         app: app_state.clone(),
         registry: snapshot_registry.clone(),
     };
+    let slm_state = slm::routes::SlmAppState {
+        app: app_state.clone(),
+        repositories: snapshot_registry.clone(),
+        policies: slm_policies.clone(),
+    };
+
+    let slm_router = Router::new()
+        .route("/_slm/policy", get(slm::routes::list_policies_handler))
+        .route(
+            "/_slm/policy/:name",
+            get(slm::routes::get_policy_handler)
+                .put(slm::routes::put_policy_handler)
+                .delete(slm::routes::delete_policy_handler),
+        )
+        .route(
+            "/_slm/policy/:name/_execute",
+            post(slm::routes::execute_policy_handler),
+        )
+        .route(
+            "/_slm/policy/:name/_executions",
+            get(slm::routes::executions_handler),
+        )
+        .route("/_slm/status", get(slm::routes::status_handler))
+        .with_state(slm_state);
 
     let snapshot_es_router = Router::new()
         .route(
@@ -219,6 +265,7 @@ pub fn app_router() -> Router {
         )
         .with_state(app_state)
         .merge(snapshot_es_router)
+        .merge(slm_router)
         // HTTP middleware: one span per request with method/route/status
         // attributes. Sits at the bottom of the router so every route
         // inherits it. When the OTLP exporter is wired (see
