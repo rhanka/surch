@@ -82,16 +82,23 @@ jobs:
         run: |
           kubectl -n "$SCW_NAMESPACE" apply -f "target/k8s/${{ inputs.job }}.yaml"
 
+      - name: Resolve Job name
+        id: jobname
+        run: |
+          JOB_NAME=$(grep -m1 '^  name:' "target/k8s/${{ inputs.job }}.yaml" | awk '{print $2}')
+          echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+          echo "Job name resolved: $JOB_NAME"
+
       - name: Wait for Job completion (30 min cap)
         run: |
           kubectl -n "$SCW_NAMESPACE" wait \
             --for=condition=Complete \
             --timeout=1800s \
-            "job/${{ inputs.job }}" \
+            "job/${{ steps.jobname.outputs.name }}" \
           || kubectl -n "$SCW_NAMESPACE" wait \
             --for=condition=Failed \
             --timeout=10s \
-            "job/${{ inputs.job }}"
+            "job/${{ steps.jobname.outputs.name }}"
 
       - name: Collect logs + report
         if: always()
@@ -119,4 +126,4 @@ jobs:
         if: always()
         run: |
           kubectl -n "$SCW_NAMESPACE" delete \
-            "job/${{ inputs.job }}" --ignore-not-found=true
+            "job/${{ steps.jobname.outputs.name }}" --ignore-not-found=true
