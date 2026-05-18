@@ -176,13 +176,24 @@ K8S_JOB ?= ndcg-gate
 K8S_REF ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
 K8S_WATCH ?= 1
 K8S_DRY_RUN ?= 0
+K8S_IMAGE_REPO ?= ghcr.io/rhanka/surch
+K8S_SHA ?= $(shell git rev-parse "$(K8S_REF)" 2>/dev/null || git rev-parse HEAD 2>/dev/null || echo unknown)
+K8S_IMAGE_TAG ?= sha-$(K8S_SHA)
+K8S_IMAGE ?= $(K8S_IMAGE_REPO):$(K8S_IMAGE_TAG)
 bench-k8s:
 	@case "$(K8S_JOB)" in \
 	  ndcg-gate|insee-bench|00-init-corpora) ;; \
 	  *) echo "bench-k8s: invalid K8S_JOB=$(K8S_JOB) (expected ndcg-gate|insee-bench|00-init-corpora)" >&2; exit 2 ;; \
 	esac
+	@if [ "$(K8S_SHA)" = "unknown" ]; then \
+	  echo "bench-k8s: could not resolve K8S_REF=$(K8S_REF) to a commit SHA" >&2; \
+	  exit 2; \
+	fi
+	@echo "bench-k8s: expected image=$(K8S_IMAGE)"
+	@echo "bench-k8s: if the image is missing, run: gh workflow run docker-build.yml --ref $(K8S_REF)"
 	@echo "bench-k8s: dispatching ci-k8s.yml (job=$(K8S_JOB), ref=$(K8S_REF))"
 	@if [ "$(K8S_DRY_RUN)" = "1" ]; then \
+	  echo "gh workflow run docker-build.yml --ref $(K8S_REF)"; \
 	  echo "gh workflow run ci-k8s.yml --ref $(K8S_REF) -f job=$(K8S_JOB)"; \
 	else \
 	  gh workflow run ci-k8s.yml --ref "$(K8S_REF)" -f job="$(K8S_JOB)"; \

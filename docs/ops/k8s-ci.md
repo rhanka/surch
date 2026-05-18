@@ -33,8 +33,9 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   The workflow also publishes a GitHub Actions step summary and stores
   the same Markdown recap as `<job>.gha-summary.md` inside the artifact.
 - Before `kubectl apply`, `ci-k8s` now verifies that the expected GHCR
-  tag already exists. A missing `ghcr.io/rhanka/surch:sha-<short_sha>`
-  image fails immediately instead of burning the full 30 min Job budget.
+  tag already exists. A missing `ghcr.io/rhanka/surch:sha-<full_sha>`
+  image fails immediately with the matching `docker-build.yml` command
+  instead of burning the full 30 min Job budget.
 - The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
   shell variables inside the Job scripts stay intact.
 - PVC dependencies declared by `claimName:` are checked before `kubectl
@@ -66,13 +67,14 @@ Cluster prerequisites:
 - the `surch` namespace exists with quotas applied;
 - the `burst` pool exists with the taint + nodeSelector contract;
 - `KUBE_CONFIG_DATA` is set in GitHub secrets;
-- the Surch image tag `ghcr.io/rhanka/surch:sha-<short_sha>` exists and
+- the Surch image tag `ghcr.io/rhanka/surch:sha-<full_sha>` exists and
   is pullable by the cluster. `ci-k8s` does not build or publish that
   image; it only verifies the tag before dispatching the K8s Job.
 
-`make bench-k8s` prints the dispatched run id and run URL before it
-starts watching, so the heavy run can be resumed later from the exact
-GitHub Actions page.
+`make bench-k8s` prints the exact image tag expected for `K8S_REF` and
+the remediation command before it dispatches `ci-k8s`. It also prints
+the dispatched run id and run URL before it starts watching, so the
+heavy run can be resumed later from the exact GitHub Actions page.
 
 `00-init-corpora` declares the three PVCs it needs:
 `surch-corpus-beir` (5 Gi), `surch-corpus-insee` (2 Gi), and

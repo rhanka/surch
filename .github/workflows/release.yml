@@ -260,7 +260,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha,prefix=sha-
+            type=sha,prefix=sha-,format=long
 
       - name: Build + push multi-arch image
         id: build

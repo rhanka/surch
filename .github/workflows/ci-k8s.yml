@@ -47,9 +47,9 @@ jobs:
       - name: Resolve image SHA
         id: image
         run: |
-          SHORT_SHA="${GITHUB_SHA::12}"
-          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "image=${GHCR_IMAGE}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          IMAGE_SHA="${GITHUB_SHA}"
+          echo "sha=$IMAGE_SHA" >> "$GITHUB_OUTPUT"
+          echo "image=${GHCR_IMAGE}:sha-${IMAGE_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Verify GHCR image exists
         run: |
@@ -62,10 +62,13 @@ jobs:
             echo "::error::Could not acquire a GHCR pull token for ${IMAGE_REPO}."
             exit 1
           fi
-          curl -fsSI \
+          if ! curl -fsSI \
             -H "Authorization: Bearer $TOKEN" \
             -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-            "https://ghcr.io/v2/${IMAGE_REPO}/manifests/${IMAGE_TAG}" >/dev/null
+            "https://ghcr.io/v2/${IMAGE_REPO}/manifests/${IMAGE_TAG}" >/dev/null; then
+            echo "::error title=Missing GHCR image::Expected ${GHCR_IMAGE}:${IMAGE_TAG}. Build it first with: gh workflow run docker-build.yml --ref ${GITHUB_REF_NAME}. Then rerun: gh workflow run ci-k8s.yml --ref ${GITHUB_REF_NAME} -f job=${{ inputs.job }}"
+            exit 1
+          fi
           echo "Verified image tag ${GHCR_IMAGE}:${IMAGE_TAG}"
 
       - name: Install kubectl

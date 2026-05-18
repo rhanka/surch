@@ -158,7 +158,9 @@ minisign -Vm surch-api-<ver>-<triple>.tar.xz -p surch.pub
 - **Base**: `gcr.io/distroless/cc-debian12:nonroot`. Provides `/etc/ssl/certs` for S3 TLS and `/etc/passwd` for the `nonroot` user. Pure `scratch` is rejected for those reasons.
 - **Build pipeline**: current repo state is a plain multi-stage Docker build locally plus multi-arch publication from `release.yml` / `docker-build.yml`. The earlier `cargo-chef` / `docker-bake.hcl` sketch has not landed.
 - **Publication**: primary `ghcr.io/rhanka/surch`; Docker Hub mirror remains future work.
-- **Tags**: `latest`, `0.2`, `0.2.3`, `sha-<short>`, `edge` (main).
+- **Tags**: `latest`, `0.2`, `0.2.3`, `sha-<full commit SHA>`.
+  `ci-k8s` consumes the full-SHA tag so `docker-build.yml`,
+  `release.yml`, and K8s manifests share one unambiguous image contract.
 - **Signing**: cosign keyless (OIDC GitHub Actions). SBOM via `cargo-cyclonedx` (CycloneDX format) attached to each tag.
 - **Verification command** (downstream consumers):
 
