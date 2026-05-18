@@ -1,10 +1,9 @@
 # Snapshot plan — cloning the ES/OS live-snapshot architecture
 
-Date: 2026-05-16. Status: design, no code. This doc fixes the
-target architecture for `C-SNAPSHOT-S3`, `C-SNAPSHOT-RESTORE` and
-`C-SLM-CRON` (cf. `docs/ops/workpackages.md` lines 211-214) by
-cloning what Elasticsearch and OpenSearch have shipped since the
-2.x line, then adapting it to Surch's single-node in-memory shape.
+Date: 2026-05-16. Last checked against the repo: 2026-05-18.
+Status: partial implementation shipped. This doc now tracks the
+remaining work for `C-SNAPSHOT-S3`, `C-SNAPSHOT-RESTORE` hardening
+and `C-SLM-CRON` follow-ups on top of what already exists in `main`.
 
 It complements two existing docs:
 
@@ -16,8 +15,56 @@ It complements two existing docs:
   a high level. The current doc is the detailed roadmap.
 
 This is the only place where the three snapshot work-packages share
-a single decision tree. No code changes here — the implementation
-follows in R16+.
+a single decision tree. It is no longer a pure design note: the
+sections below distinguish what is already shipped from what remains
+open.
+
+## 0. Status checkpoint — repo state on 2026-05-18
+
+### Already shipped on `main`
+
+- Legacy raw export/import still exists under
+  `/_surch/snapshot/{export,import}` in
+  `crates/surch-api/src/snapshot.rs`.
+- ES-parity `_snapshot` routes are live in
+  `crates/surch-api/src/lib.rs` and
+  `crates/surch-api/src/snapshot_es/routes.rs`:
+  `PUT/GET/DELETE /_snapshot/{repo}`,
+  `PUT/GET/DELETE /_snapshot/{repo}/{snap}`,
+  `POST /_snapshot/{repo}/{snap}/_restore`.
+- The repository SPI is implemented for both filesystem and S3 in
+  `crates/surch-api/src/snapshot_es/repository.rs`.
+- The on-repository layout, manifest handling and tarball-backed
+  restore logic are implemented in
+  `crates/surch-api/src/snapshot_es/service.rs`.
+- SLM REST + scheduler are already wired in
+  `crates/surch-api/src/slm/` and spawned from
+  `crates/surch-api/src/main.rs`.
+
+### Still open / intentionally incomplete
+
+- Repository registration and SLM policies are in-memory only; no
+  `surch.toml` persistence yet.
+- `_snapshot` take/restore is still tarball-per-index, not the
+  incremental chunk graph sketched for later phases.
+- Snapshot takes are synchronous; `/_snapshot/{repo}/{snap}/_status`
+  is not exposed yet.
+- S3 is covered at registration/config-validation level, but the real
+  MinIO/S3 end-to-end `take -> wipe -> restore` path is still missing.
+- SLM retention fields are accepted and stored, but trimming is not
+  enforced yet.
+- Concurrent-write fencing remains operator-driven; restore still
+  refuses to overwrite an existing index instead of providing a richer
+  close/reopen lifecycle.
+
+### Next Track C steps
+
+1. Add persistent repo/policy storage so `_snapshot` and `_slm`
+   survive process restarts.
+2. Land the MinIO/S3 e2e path and cite its CI run ids in Track C
+   reporting.
+3. Finish SLM retention and decide whether `_status` stays deferred or
+   ships with any future async take path.
 
 ---
 
@@ -153,20 +200,27 @@ What already ships in `main`:
   tarball carrying `manifest.json` + `mapping.json` +
   `settings.json` + `aliases.json` + `documents.ndjson`. Code in
   `crates/surch-api/src/snapshot.rs`. Format version pinned at
-  `surch_snapshot_format_version: 1`. No repository abstraction,
-  no incremental, no scheduling.
+  `surch_snapshot_format_version: 1`.
+- `C-SNAPSHOT-API` / `C-SNAPSHOT-RESTORE` MVP: ES-parity REST
+  endpoints backed by the repository SPI, root manifest, and
+  tarball-based restore logic in `crates/surch-api/src/snapshot_es/`.
+- `C-SNAPSHOT-S3` MVP: `type: "s3"` repository registration and
+  config validation, including credential redaction in
+  `GET /_snapshot/{repo}` responses.
+- `C-SLM-CRON` MVP: `_slm/policy/*`, `_slm/status`, a background
+  scheduler, and execution history in `crates/surch-api/src/slm/`.
 
-What Surch does **not** have and must add to clone the ES surface:
+What Surch still does **not** have and must add to close the gap with
+the full ES / OS surface:
 
-- A repository abstraction (S3, GCS, FS, …). Today the tarball
-  travels in the HTTP body — there is no third-party storage.
-- A snapshot-by-name registry. `C-SNAPSHOT-RAW` is fire-and-forget.
+- Persistent repository and SLM registries. Today they are rebuilt in
+  memory on each process start.
 - Incremental snapshots. A full re-export is cheap at the matchID
   25 M-record scale (~3 GiB gzipped) but does not scale past it.
-- Restore atomicity / write fencing. The import handler refuses
-  to overwrite, but does not pause concurrent writes to *other*
-  indices, nor does it offer a "close index" step.
-- A scheduler. SLM-equivalent cron policies do not exist.
+- Restore hardening / write fencing. Restore refuses to overwrite, but
+  does not pause concurrent writes to *other* indices, nor does it
+  offer a "close index" step.
+- Async status reporting (`/_status`) and retention enforcement.
 
 The plan below incrementally lifts Surch from "single-tarball" to
 "ES-compatible live snapshot" in three phases, each shippable on
@@ -177,6 +231,10 @@ its own.
 ## 3. Roadmap
 
 ### Phase S1 — repository abstraction + full-tarball write
+
+Status on 2026-05-18: mostly shipped on `main` for `fs`, with S3
+registration in place and restore already working for the tarball
+payload.
 
 **Goal:** make a snapshot leave the box. Same content as
 `C-SNAPSHOT-RAW`, but written through a pluggable repository SPI,
@@ -240,10 +298,8 @@ re-ingest. Write fencing: the target index must be absent (same
 as `C-SNAPSHOT-RAW`); when index aliasing under cluster mode
 lands, we add a `closed` flag to the state.
 
-**Effort:** 8-12 j (matches the packaging-plan estimate). Splits
-naturally into `C-SNAPSHOT-API` (4-5 j, repo SPI + REST without
-S3), `C-SNAPSHOT-S3` (3-4 j, the `aws-sdk-s3` impl), and
-`C-SNAPSHOT-RESTORE` (4-5 j, the restore half + e2e CI test).
+Remaining work from S1: persistent registration, real S3
+take/restore e2e, and stronger write fencing around restore.
 
 ### Phase S2 — incremental snapshots via generation IDs
 
@@ -292,6 +348,10 @@ landing first so that the posting iterator can emit deltas
 cheaply.
 
 ### Phase S3 — SLM-equivalent scheduling
+
+Status on 2026-05-18: the REST surface, scheduler loop and execution
+history are already present; retention and persistence are the
+missing pieces.
 
 **Goal:** match the ES SLM surface so Kibana / Curator clients
 work unchanged.

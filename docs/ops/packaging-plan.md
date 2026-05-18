@@ -1,8 +1,49 @@
 # Surch packaging plan
 
-Date: 2026-05-15. Surch is `0.1.0` alpha, in-memory only, no Dockerfile or
-release CI yet. The release profile in `Cargo.toml` already has
-`opt-level = 3`, `lto = true`, `codegen-units = 1`, `strip = true`.
+Date: 2026-05-15. Last checked against the repo: 2026-05-18.
+Surch is still `0.1.0` alpha and in-memory only, but the packaging
+baseline has moved: Dockerfile, Helm chart, release workflow,
+minisign signing, cosign image signing, CycloneDX SBOM generation and
+`scripts/verify-release.sh` are now present in the repo. The release
+profile in `Cargo.toml` already has `opt-level = 3`, `lto = true`,
+`codegen-units = 1`, `strip = true`.
+
+## Status checkpoint — repo state on 2026-05-18
+
+### Already shipped on `main`
+
+- Multi-stage distroless image in `Dockerfile`.
+- Local docker helpers in `Makefile` (`docker-build`, `docker-smoke`).
+- Release workflow in `.github/workflows/release.yml` with
+  `cargo-dist`, five binary targets, minisign, CycloneDX SBOM, GitHub
+  release publication, `ghcr.io` image push, cosign signing and SBOM
+  attestation.
+- Tag-triggered fallback image workflow in
+  `.github/workflows/docker-build.yml`.
+- Minimal Helm chart in `charts/surch/` using a `Deployment`, not the
+  older StatefulSet sketch.
+- Public minisign verification flow documented in `README.md` and
+  helper verification script in `scripts/verify-release.sh`.
+
+### Still open / intentionally incomplete
+
+- No evidence yet in this repo of a published Helm repository via
+  `helm/chart-releaser-action`.
+- No Docker Hub mirror; publication is scoped to `ghcr.io`.
+- The Docker build is multi-stage distroless, but not the earlier
+  `cargo-chef` / `docker-bake.hcl` design.
+- Snapshot packaging remains partially delivered: `_snapshot` /
+  `_slm` are present, but persistent registries, S3 e2e and retention
+  are still open.
+
+### Next Track C steps
+
+1. Keep release verification reproducible from workflow artefacts and
+   cite release run ids in Track C reports.
+2. Decide whether chart publication is still needed or whether a
+   repo-local chart is sufficient for this phase.
+3. Finish the remaining snapshot / SLM gaps documented in
+   `docs/ops/snapshot-plan.md`.
 
 ## Artifact pipeline
 
@@ -19,7 +60,7 @@ release CI yet. The release profile in `Cargo.toml` already has
                                        │
             ┌──────────────────────────┴────────────────────┐
             │ Helm chart (charts/surch)                     │
-            │ StatefulSet + Service + ConfigMap + PVC       │
+            │ Deployment + Service + probes                 │
             └────────────▲──────────────────────────────────┘
                          │
    ┌─────────────────────┴────────┐
@@ -107,15 +148,16 @@ minisign -Vm surch-api-<ver>-<triple>.tar.xz -p surch.pub
 - **SemVer strict** on the Surch binary and on the REST surface that is **not** OS-compatible.
 - Separate `opensearch_compat_version` field exposed in the `GET /` root response (mirrors Quickwit's `quickwit_version` + `elasticsearch_version` split).
 - Surch stays in `0.x.y` until the internal API is stable; breaking changes on minor are allowed during alpha (state explicitly in `CONTRIBUTING.md`).
-- `opensearch_compat_version` pinned at `2.11.0` today (per `spec/`). Bumps documented in `CHANGELOG.md`.
+- `opensearch_compat_version` is already wired and the live conductor
+  plan tracks `2.17.1` as the current compatibility target.
 - Git tag `v0.2.0` style; do not publish individual crates on crates.io until someone needs them as a library.
 - **Effort**: 0.5 day (root endpoint change + policy doc).
 
 ### 3. Docker image
 
 - **Base**: `gcr.io/distroless/cc-debian12:nonroot`. Provides `/etc/ssl/certs` for S3 TLS and `/etc/passwd` for the `nonroot` user. Pure `scratch` is rejected for those reasons.
-- **Build pipeline**: `cargo-chef` for dependency caching + multi-stage builder + `docker buildx` multi-arch (`linux/amd64`, `linux/arm64`).
-- **Publication**: primary `ghcr.io/rhanka/surch` (OIDC auth, free, scoped to the repo); mirror to Docker Hub `surch/surch` for visibility.
+- **Build pipeline**: current repo state is a plain multi-stage Docker build locally plus multi-arch publication from `release.yml` / `docker-build.yml`. The earlier `cargo-chef` / `docker-bake.hcl` sketch has not landed.
+- **Publication**: primary `ghcr.io/rhanka/surch`; Docker Hub mirror remains future work.
 - **Tags**: `latest`, `0.2`, `0.2.3`, `sha-<short>`, `edge` (main).
 - **Signing**: cosign keyless (OIDC GitHub Actions). SBOM via `cargo-cyclonedx` (CycloneDX format) attached to each tag.
 - **Verification command** (downstream consumers):
@@ -167,6 +209,12 @@ one shipped first.
 
 ### 4. Snapshots compatible with the Elasticsearch SLM surface
 
+Status on 2026-05-18: this section is no longer purely prospective.
+The repo already ships `_snapshot` / `_slm` routes, filesystem
+take/get/delete/restore coverage, S3 repository registration, and the
+background SLM scheduler. The open items are persistent registries,
+real S3 e2e, retention enforcement and richer restore fencing.
+
 Implement the REST subset that real clients use:
 
 ```
@@ -205,10 +253,19 @@ Close to ES `BlobStoreRepository` to keep clients happy and force us to think ab
 
 ## Sequencing
 
+Status on 2026-05-18:
+
+- Phase A is partially landed: release workflow, Dockerfile, local
+  docker smoke path, Helm chart and compat version split all exist.
+- Phase B is partially landed: `/_prometheus_metrics`, `_snapshot`
+  and `_slm` exist, but snapshot persistence / S3 e2e / retention are
+  not finished.
+- Phases C and D remain open.
+
 1. **Phase A — week 1**
    - D1–D2: `cargo-dist` + GitHub Actions `release.yml` (tag-triggered, 5 targets, sha256, minisign)
-   - D3: `Dockerfile` (cargo-chef multi-stage + distroless), `docker-bake.hcl` multi-arch, push ghcr.io + cosign keyless
-   - D4: minimal Helm chart in `charts/surch/` (StatefulSet + Service + ConfigMap), publish via `helm/chart-releaser-action`
+   - D3: `Dockerfile` (current repo state: multi-stage + distroless), push ghcr.io + cosign keyless
+   - D4: minimal Helm chart in `charts/surch/` (current repo state: `Deployment` + Service + probes); chart publication still open
    - D5: `INSTALL.md` docs (binary / docker / helm), `opensearch_compat_version` in `crates/surch-api/src/root.rs`
 2. **Phase B — weeks 2–3**
    - `/_prometheus_metrics` (`metrics-exporter-prometheus`)
