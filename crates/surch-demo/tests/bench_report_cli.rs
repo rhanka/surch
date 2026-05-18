@@ -63,6 +63,10 @@ fn help_prints_usage_and_schemas() {
         "missing artillery schema in help"
     );
     assert!(
+        stdout.contains("surch.bench.ban_http.v1"),
+        "missing BAN HTTP schema in help"
+    );
+    assert!(
         stdout.contains("surch.bench.rss.v1"),
         "missing rss schema in help"
     );
@@ -168,6 +172,7 @@ fn empty_directory_produces_stable_summary_and_zero_exit() {
     let markdown = fs::read_to_string(&out_path).expect("summary.md should exist");
     assert!(markdown.starts_with("# Surch bench summary "));
     assert!(markdown.contains("## Artillery results"));
+    assert!(markdown.contains("## BAN HTTP results"));
     assert!(markdown.contains("## RSS samples"));
     assert!(markdown.contains("## SLO checks"));
     assert!(markdown.contains("_no data_"));
@@ -219,6 +224,61 @@ fn summary_contains_tables_for_known_schemas() {
             "os_out": "/tmp/insee25k-os.out"
         }"#,
     );
+    write_json(
+        &dir,
+        "ban-http.json",
+        r#"{
+            "schema": "surch.bench.ban_http.v1",
+            "benchmark": "ban-http-bench",
+            "index": "ban_ci",
+            "engines": [
+                {
+                    "name": "surch",
+                    "url": "http://127.0.0.1:7700",
+                    "metrics": [
+                        {
+                            "operation": "bulk_ingest",
+                            "status": 200,
+                            "iterations": 1,
+                            "docs_per_second": 2000.0,
+                            "bytes_per_second": 600000.0,
+                            "error_count": 0,
+                            "latency_us": {
+                                "min": 100,
+                                "p50": 300,
+                                "p95": 500,
+                                "p99": 500,
+                                "max": 500,
+                                "total": 1500
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "elasticsearch",
+                    "url": "http://127.0.0.1:9200",
+                    "metrics": [
+                        {
+                            "operation": "bulk_ingest",
+                            "status": 200,
+                            "iterations": 1,
+                            "docs_per_second": 1000.0,
+                            "bytes_per_second": 300000.0,
+                            "error_count": 0,
+                            "latency_us": {
+                                "min": 200,
+                                "p50": 600,
+                                "p95": 900,
+                                "p99": 900,
+                                "max": 900,
+                                "total": 3000
+                            }
+                        }
+                    ]
+                }
+            ]
+        }"#,
+    );
 
     let out_path = dir.join("summary.md");
     let output = Command::new(bin())
@@ -245,6 +305,14 @@ fn summary_contains_tables_for_known_schemas() {
     // Pair section appears when at least one pair envelope is present.
     assert!(md.contains("## Pair envelopes"));
     assert!(md.contains("insee25k"));
+    // BAN HTTP rows render for human comparison without opening JSON.
+    assert!(md.contains("## BAN HTTP results"));
+    assert!(md.contains(
+        "| surch | bulk_ingest | 200 | 1 | 300 | 500 | 500 | 500 | 0 | 2000.0 | 600000.0 |"
+    ));
+    assert!(md.contains(
+        "| elasticsearch | bulk_ingest | 200 | 1 | 600 | 900 | 900 | 900 | 0 | 1000.0 | 300000.0 |"
+    ));
     // SLO checks all PASS.
     assert!(md.contains("PASS"));
     assert!(!md.contains("FAIL"));
@@ -253,6 +321,8 @@ fn summary_contains_tables_for_known_schemas() {
             .expect("summary.json valid json");
     assert_eq!(json["schema"], "surch.bench.summary.v1");
     assert_eq!(json["artillery"][0]["engine"], "surch");
+    assert_eq!(json["ban_http"][0]["engine"], "elasticsearch");
+    assert_eq!(json["ban_http"][1]["engine"], "surch");
     assert_eq!(json["rss"][0]["peak_mb"], 512.0);
     assert_eq!(json["pair"][0]["workload"], "insee25k");
     let _ = fs::remove_dir_all(&dir);

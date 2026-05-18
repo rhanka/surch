@@ -71,7 +71,7 @@ Reste estime: ~30% (5 open / 18 leaf tasks).
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~40% (3 open / 8 leaf tasks).
+Reste estime: ~35% (3 open / 9 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -87,7 +87,11 @@ Reste estime: ~40% (3 open / 8 leaf tasks).
 - [x] `bd00e9e` adds promoted human output via `--promote-dir`:
   `summary.md` stays local, promoted reports write `README.md`, and
   `summary.json` remains the agent/CI machine contract.
-- [ ] Ensure every benchmark producer can feed the summary contract.
+- [x] BAN HTTP Surch/Elasticsearch reports now emit
+  `surch.bench.ban_http.v1` and are rendered by `bench_report` into
+  human Markdown plus `summary.json`.
+- [ ] Ensure remaining benchmark producers can feed the summary
+  contract.
 - [ ] Add paired RSS reporting for Surch vs Elasticsearch.
 - [ ] Promote official Elasticsearch/Surch paired reports for INSEE,
   artillery,

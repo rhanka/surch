@@ -4,6 +4,7 @@
 //!
 //! Recognised schemas:
 //!   * `surch.bench.artillery.v1` — produced by `artillery_bench`
+//!   * `surch.bench.ban_http.v1`  — produced by `surch-demo ban-http-bench`
 //!   * `surch.bench.rss.v1`       — produced by `scripts/bench/rss-sample.sh`
 //!   * `surch.bench.pair.v1`      — produced by `scripts/bench/run-pair.sh`
 //!
@@ -42,6 +43,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 
 const SCHEMA_ARTILLERY: &str = "surch.bench.artillery.v1";
+const SCHEMA_BAN_HTTP: &str = "surch.bench.ban_http.v1";
 const SCHEMA_RSS: &str = "surch.bench.rss.v1";
 const SCHEMA_PAIR: &str = "surch.bench.pair.v1";
 const SCHEMA_SUMMARY: &str = "surch.bench.summary.v1";
@@ -198,6 +200,7 @@ fn required<I: Iterator<Item = String>>(
 #[derive(Debug, Default, Clone)]
 struct Aggregate {
     artillery: Vec<ArtilleryRow>,
+    ban_http: Vec<BanHttpRow>,
     rss: Vec<RssRow>,
     pair: Vec<PairRow>,
     unknown_files: Vec<String>,
@@ -214,6 +217,21 @@ struct ArtilleryRow {
     max_ms: f64,
     issued: u64,
     errors: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BanHttpRow {
+    engine: String,
+    operation: String,
+    status: u64,
+    iterations: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+    errors: u64,
+    docs_per_second: Option<f64>,
+    bytes_per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,6 +302,14 @@ fn load_directory(dir: &Path) -> Result<Aggregate, CliError> {
                         .push(format!("{}: malformed artillery report", path.display()));
                 }
             }
+            SCHEMA_BAN_HTTP => {
+                if let Some(rows) = parse_ban_http(&value) {
+                    agg.ban_http.extend(rows);
+                } else {
+                    agg.unknown_files
+                        .push(format!("{}: malformed BAN HTTP report", path.display()));
+                }
+            }
             SCHEMA_RSS => {
                 if let Some(row) = parse_rss(&value, &stem) {
                     agg.rss.push(row);
@@ -314,6 +340,8 @@ fn load_directory(dir: &Path) -> Result<Aggregate, CliError> {
     // Stable order: artillery rows by engine then workload.
     agg.artillery
         .sort_by(|a, b| a.engine.cmp(&b.engine).then(a.workload.cmp(&b.workload)));
+    agg.ban_http
+        .sort_by(|a, b| a.engine.cmp(&b.engine).then(a.operation.cmp(&b.operation)));
     agg.rss
         .sort_by(|a, b| a.engine.cmp(&b.engine).then(a.workload.cmp(&b.workload)));
     agg.pair.sort_by(|a, b| a.workload.cmp(&b.workload));
@@ -352,6 +380,32 @@ fn parse_artillery(value: &Value, stem: &str) -> Option<ArtilleryRow> {
     })
 }
 
+fn parse_ban_http(value: &Value) -> Option<Vec<BanHttpRow>> {
+    let engines = value.get("engines")?.as_array()?;
+    let mut rows = Vec::new();
+    for engine in engines {
+        let engine_name = normalize_engine_name(engine.get("name")?.as_str()?);
+        let metrics = engine.get("metrics")?.as_array()?;
+        for metric in metrics {
+            let latency = metric.get("latency_us")?;
+            rows.push(BanHttpRow {
+                engine: engine_name.clone(),
+                operation: metric.get("operation")?.as_str()?.to_owned(),
+                status: metric.get("status")?.as_u64()?,
+                iterations: metric.get("iterations")?.as_u64()?,
+                p50_us: latency.get("p50")?.as_u64()?,
+                p95_us: latency.get("p95")?.as_u64()?,
+                p99_us: latency.get("p99")?.as_u64()?,
+                max_us: latency.get("max")?.as_u64()?,
+                errors: metric.get("error_count")?.as_u64()?,
+                docs_per_second: metric.get("docs_per_second").and_then(Value::as_f64),
+                bytes_per_second: metric.get("bytes_per_second").and_then(Value::as_f64),
+            });
+        }
+    }
+    Some(rows)
+}
+
 fn parse_rss(value: &Value, stem: &str) -> Option<RssRow> {
     let peak_mb = value.get("peak_mb").and_then(|v| v.as_f64())?;
     let final_mb = value.get("final_mb").and_then(|v| v.as_f64())?;
@@ -383,6 +437,13 @@ fn parse_pair(value: &Value) -> Option<PairRow> {
         surch_out,
         os_out,
     })
+}
+
+fn normalize_engine_name(name: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "es" | "os" | "opensearch" => "elasticsearch".to_owned(),
+        other => other.to_owned(),
+    }
 }
 
 /// Best-effort engine detection from URL (port 7700 = surch, 9200 = OS),
@@ -610,6 +671,32 @@ fn render_markdown(
     }
     out.push('\n');
 
+    // BAN HTTP section.
+    out.push_str(&format!("## BAN HTTP results ({SCHEMA_BAN_HTTP})\n\n"));
+    out.push_str("| Engine | Operation | status | iterations | p50 us | p95 us | p99 us | max us | errors | docs/s | bytes/s |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+    if current.ban_http.is_empty() {
+        out.push_str("| _no data_ |  |  |  |  |  |  |  |  |  |  |\n");
+    } else {
+        for row in &current.ban_http {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                row.engine,
+                row.operation,
+                row.status,
+                row.iterations,
+                row.p50_us,
+                row.p95_us,
+                row.p99_us,
+                row.max_us,
+                row.errors,
+                format_optional_rate(row.docs_per_second),
+                format_optional_rate(row.bytes_per_second),
+            ));
+        }
+    }
+    out.push('\n');
+
     // RSS section.
     out.push_str(&format!("## RSS samples ({SCHEMA_RSS})\n\n"));
     out.push_str("| Engine | Workload | peak MB | final MB |\n");
@@ -724,6 +811,27 @@ fn render_json_summary(
             })
         })
         .collect();
+    let ban_http: Vec<Value> = current
+        .ban_http
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "engine": row.engine,
+                "operation": row.operation,
+                "status": row.status,
+                "iterations": row.iterations,
+                "latency_us": {
+                    "p50": row.p50_us,
+                    "p95": row.p95_us,
+                    "p99": row.p99_us,
+                    "max": row.max_us,
+                },
+                "errors": row.errors,
+                "docs_per_second": row.docs_per_second,
+                "bytes_per_second": row.bytes_per_second,
+            })
+        })
+        .collect();
     let pair: Vec<Value> = current
         .pair
         .iter()
@@ -762,6 +870,7 @@ fn render_json_summary(
         "baseline_sha": baseline_sha,
         "generated_at": generated_at,
         "artillery": artillery,
+        "ban_http": ban_http,
         "rss": rss,
         "pair": pair,
         "slo_checks": slo_checks,
@@ -779,6 +888,10 @@ fn render_json_summary(
 // ---------------------------------------------------------------------------
 // Misc helpers
 // ---------------------------------------------------------------------------
+
+fn format_optional_rate(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| format!("{value:.1}"))
+}
 
 fn infer_sha(dir: &Path) -> String {
     dir.file_name()
@@ -827,6 +940,7 @@ fn print_help() {
     println!();
     println!("RECOGNISED SCHEMAS:");
     println!("  {SCHEMA_ARTILLERY}");
+    println!("  {SCHEMA_BAN_HTTP}");
     println!("  {SCHEMA_RSS}");
     println!("  {SCHEMA_PAIR}");
     println!("  {SCHEMA_SUMMARY} (written as summary.json)");
@@ -889,6 +1003,13 @@ mod tests {
     }
 
     #[test]
+    fn normalize_engine_name_maps_legacy_os_labels_to_elasticsearch() {
+        assert_eq!(normalize_engine_name("opensearch"), "elasticsearch");
+        assert_eq!(normalize_engine_name("os"), "elasticsearch");
+        assert_eq!(normalize_engine_name("surch"), "surch");
+    }
+
+    #[test]
     fn workload_from_stem_strips_engine_tokens() {
         assert_eq!(workload_from_stem("art-surch"), "art");
         assert_eq!(workload_from_stem("insee25k-os"), "insee25k");
@@ -914,6 +1035,43 @@ mod tests {
         assert_eq!(row.workload, "deces_25k");
         assert_eq!(row.p95_ms, 20.0);
         assert_eq!(row.issued, 100);
+    }
+
+    #[test]
+    fn parse_ban_http_extracts_engine_operation_rows() {
+        let value: Value = serde_json::from_str(
+            r#"{
+                "schema": "surch.bench.ban_http.v1",
+                "engines": [
+                    {
+                        "name": "opensearch",
+                        "metrics": [
+                            {
+                                "operation": "bulk_ingest",
+                                "status": 200,
+                                "iterations": 1,
+                                "docs_per_second": 2000.0,
+                                "bytes_per_second": 600000.0,
+                                "error_count": 0,
+                                "latency_us": {
+                                    "p50": 300,
+                                    "p95": 500,
+                                    "p99": 500,
+                                    "max": 500
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rows = parse_ban_http(&value).expect("BAN HTTP should parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].engine, "elasticsearch");
+        assert_eq!(rows[0].operation, "bulk_ingest");
+        assert_eq!(rows[0].p95_us, 500);
+        assert_eq!(rows[0].docs_per_second, Some(2000.0));
     }
 
     #[test]
@@ -1012,6 +1170,19 @@ mod tests {
                 peak_mb: 256.0,
                 final_mb: 220.0,
             }],
+            ban_http: vec![BanHttpRow {
+                engine: "elasticsearch".into(),
+                operation: "bulk_ingest".into(),
+                status: 200,
+                iterations: 1,
+                p50_us: 300,
+                p95_us: 500,
+                p99_us: 500,
+                max_us: 500,
+                errors: 0,
+                docs_per_second: Some(2000.0),
+                bytes_per_second: Some(600000.0),
+            }],
             ..Aggregate::default()
         };
         let slo = evaluate_slo(&agg);
@@ -1026,7 +1197,9 @@ mod tests {
         );
         assert!(md.contains("# Surch bench summary abc1234"));
         assert!(md.contains("## Artillery results"));
+        assert!(md.contains("## BAN HTTP results"));
         assert!(md.contains("## RSS samples"));
+        assert!(md.contains("| elasticsearch | bulk_ingest |"));
         assert!(md.contains("## SLO checks"));
         assert!(!md.contains("## Regression vs baseline"));
     }

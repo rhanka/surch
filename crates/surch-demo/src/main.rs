@@ -29,6 +29,7 @@ const DEFAULT_HTTP_BENCH_INDEX: &str = "ban_tiny";
 const DEFAULT_HTTP_BENCH_DATASET: &str =
     "tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson";
 const DEFAULT_HTTP_TIMEOUT_SECONDS: u64 = 30;
+const BAN_HTTP_BENCH_SCHEMA: &str = "surch.bench.ban_http.v1";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -572,9 +573,9 @@ async fn run_ban_http_bench(plan: BanHttpBenchPlan) -> Result<(), CliError> {
     let opensearch = HttpEndpoint::parse(&plan.opensearch_url)?;
 
     let surch_report = run_engine_http_bench("surch", &surch, &plan, &dataset, &oracle)?;
-    let opensearch_report =
-        run_engine_http_bench("opensearch", &opensearch, &plan, &dataset, &oracle)?;
-    let reports = vec![surch_report, opensearch_report];
+    let elasticsearch_report =
+        run_engine_http_bench("elasticsearch", &opensearch, &plan, &dataset, &oracle)?;
+    let reports = vec![surch_report, elasticsearch_report];
 
     print_ban_http_bench_result(&plan, &dataset, &reports);
     if let Some(report) = &plan.report {
@@ -593,6 +594,7 @@ fn ban_http_bench_report_json(
     reports: &[EngineBenchReport],
 ) -> Value {
     json!({
+        "schema": BAN_HTTP_BENCH_SCHEMA,
         "benchmark": "ban-http-bench",
         "dataset": &plan.dataset,
         "dataset_bytes": dataset.bytes,
@@ -609,7 +611,7 @@ fn ban_http_bench_report_json(
             "same Rust HTTP client path for both engines",
             "persistent HTTP/1.1 connections are reused across warmup and measured samples",
             "oracle validation is required before measured query iterations",
-            "no global Surch/OpenSearch ratio is emitted"
+            "no global Surch/Elasticsearch ratio is emitted"
         ]
     })
 }
@@ -1557,7 +1559,7 @@ fn print_ban_http_bench_result(
     }
     println!("guardrails:");
     println!("  - oracle validation passed before measured query iterations");
-    println!("  - Surch and OpenSearch used the same persistent Rust HTTP client path");
+    println!("  - Surch and Elasticsearch used the same persistent Rust HTTP client path");
     println!("  - no global performance ratio emitted");
 }
 
@@ -1937,6 +1939,7 @@ mod tests {
 
         let value = ban_http_bench_report_json(&plan, &dataset, &reports);
 
+        assert_eq!(value["schema"], json!("surch.bench.ban_http.v1"));
         assert_eq!(value["benchmark"], json!("ban-http-bench"));
         assert_eq!(value["dataset"], json!("tests/fixtures/ban.ndjson"));
         assert_eq!(value["dataset_bytes"], json!(941));
@@ -1961,7 +1964,7 @@ mod tests {
         assert!(value["guardrails"]
             .as_array()
             .expect("guardrails should be an array")
-            .contains(&json!("no global Surch/OpenSearch ratio is emitted")));
+            .contains(&json!("no global Surch/Elasticsearch ratio is emitted")));
     }
 
     #[test]

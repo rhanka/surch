@@ -38,6 +38,8 @@ Status: active branch exists; latest branch head `65fc759`
 - [x] Local gates recorded:
   `cargo test -p surch-demo render_markdown_contains_required_sections --bin bench_report` OK.
 - [x] Promotion output merged to `main`: `bd00e9e`.
+- [x] BAN HTTP Surch/Elasticsearch producer is wired into
+  `bench_report` via `surch.bench.ban_http.v1`.
 - [ ] `wp/b-test-auto` contains the next branch-specific delivery.
 
 ## Lots
@@ -70,7 +72,13 @@ Status: active branch exists; latest branch head `65fc759`
   - [x] Commit main: `bd00e9e`.
 
 - [ ] Lot 3 - Promoted reports
-  - [ ] Ensure every benchmark producer can feed the summary contract.
+  - [x] Add `surch.bench.ban_http.v1` to `surch-demo ban-http-bench`.
+  - [x] Render BAN HTTP Surch/Elasticsearch rows in human Markdown and
+    `summary.json`.
+  - [x] Gate: user can compare Surch/Elasticsearch BAN HTTP p50 / p95 /
+    p99 / max, errors, docs/s and bytes/s in Markdown.
+  - [ ] Ensure remaining benchmark producers can feed the summary
+    contract.
   - [ ] Add paired RSS reporting for Surch vs Elasticsearch.
   - [ ] Promote INSEE report to
     `docs/ops/bench-reports/<date>-insee-*/README.md` with SLO verdict.
