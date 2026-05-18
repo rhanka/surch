@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
+use surch_codec::postings_block::FOR_BLOCK_SIZE;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, PostingsError>;
@@ -47,7 +48,7 @@ impl Posting {
 /// and last entry of the chunk).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockMeta {
-    /// Greatest term_freq inside this block of up to 128 postings.
+    /// Greatest term_freq inside this block of up to [`BLOCK_SIZE`] postings.
     pub max_term_freq: u32,
     /// Smallest `doc_id` inside this block (so callers can range-skip).
     pub min_doc_id: u32,
@@ -58,7 +59,7 @@ pub struct BlockMeta {
 /// Number of postings per BMW block. Must match the `BLOCK_SIZE` used by
 /// `maxscore_match` in `surch-api` — block metas are aligned with the
 /// `Vec<Posting>` chunks produced by `Vec::chunks(BLOCK_SIZE)`.
-pub const BLOCK_SIZE: usize = 128;
+pub const BLOCK_SIZE: usize = FOR_BLOCK_SIZE;
 
 fn build_block_metas(postings: &[Posting]) -> Vec<BlockMeta> {
     postings

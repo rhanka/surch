@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use surch_codec::postings_block::FOR_BLOCK_SIZE;
 use surch_index::postings::{PostingsBuilder, PostingsError, BLOCK_SIZE};
 
 #[test]
@@ -231,6 +232,58 @@ fn term_dictionary_block_metas_match_postings_chunks() {
     // Unknown field / term yields `None`, consistent with `postings()`.
     assert!(dictionary.block_metas("body", "miss").is_none());
     assert!(dictionary.block_metas("missing", "hit").is_none());
+}
+
+#[test]
+fn term_dictionary_block_metas_follow_codec_block_size() {
+    assert_eq!(
+        BLOCK_SIZE, FOR_BLOCK_SIZE,
+        "surch-index block metas must stay aligned with the codec FoR block size"
+    );
+
+    let source = include_str!("../src/postings.rs");
+    assert!(
+        !source.contains("pub const BLOCK_SIZE: usize = 128;"),
+        "surch-index must not duplicate the codec block size literal"
+    );
+
+    let mut builder = PostingsBuilder::new();
+    let total_docs = FOR_BLOCK_SIZE * 2 + 17;
+    for doc_id in 0..total_docs {
+        let positions = if doc_id == FOR_BLOCK_SIZE + 3 {
+            vec![0, 1, 2, 3]
+        } else {
+            vec![0]
+        };
+        builder
+            .add("body", "codec-sized", doc_id as u32, positions)
+            .expect("codec-sized posting");
+    }
+
+    let dictionary = builder.build();
+    let postings = dictionary
+        .postings("body", "codec-sized")
+        .expect("codec-sized postings")
+        .collect::<Vec<_>>();
+    let metas = dictionary
+        .block_metas("body", "codec-sized")
+        .expect("codec-sized block_metas");
+
+    let chunk_lengths = postings
+        .chunks(FOR_BLOCK_SIZE)
+        .map(<[_]>::len)
+        .collect::<Vec<_>>();
+    assert_eq!(chunk_lengths, vec![FOR_BLOCK_SIZE, FOR_BLOCK_SIZE, 17]);
+    assert_eq!(metas.len(), chunk_lengths.len());
+    assert_eq!(metas[0].min_doc_id, 0);
+    assert_eq!(metas[0].max_doc_id, (FOR_BLOCK_SIZE - 1) as u32);
+    assert_eq!(metas[0].max_term_freq, 1);
+    assert_eq!(metas[1].min_doc_id, FOR_BLOCK_SIZE as u32);
+    assert_eq!(metas[1].max_doc_id, (FOR_BLOCK_SIZE * 2 - 1) as u32);
+    assert_eq!(metas[1].max_term_freq, 4);
+    assert_eq!(metas[2].min_doc_id, (FOR_BLOCK_SIZE * 2) as u32);
+    assert_eq!(metas[2].max_doc_id, (total_docs - 1) as u32);
+    assert_eq!(metas[2].max_term_freq, 1);
 }
 
 #[test]
