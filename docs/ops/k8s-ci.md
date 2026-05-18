@@ -30,6 +30,8 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   nodes explicitly.
 - Reports and diagnostics are written under `target/bench-reports/k8s/`
   and uploaded with `actions/upload-artifact@v4` even when the Job fails.
+  The workflow also publishes a GitHub Actions step summary and stores
+  the same Markdown recap as `<job>.gha-summary.md` inside the artifact.
 - The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
   shell variables inside the Job scripts stay intact.
 - PVC dependencies declared by `claimName:` are checked before `kubectl
@@ -62,6 +64,10 @@ Cluster prerequisites:
 - the Surch image tag `ghcr.io/rhanka/surch:sha-<short_sha>` exists and
   is pullable by the cluster.
 
+`make bench-k8s` prints the dispatched run id and run URL before it
+starts watching, so the heavy run can be resumed later from the exact
+GitHub Actions page.
+
 `00-init-corpora` declares the three PVCs it needs:
 `surch-corpus-beir` (5 Gi), `surch-corpus-insee` (2 Gi), and
 `surch-scratch` (5 Gi). Run it before `ndcg-gate` or `insee-bench` so
@@ -86,13 +92,19 @@ kubectl get events -n surch --sort-by='.metadata.creationTimestamp'
 
 GHA uploads an artifact named `k8s-bench-<job>-<sha>`. It contains:
 
+- `<job>.gha-summary.md` with the run URL, K8s Job name, conditions, and
+  the copied benchmark summary when one exists;
 - `<job>.job.describe.txt` and `<job>.job.yaml`;
+- `<job>.job.conditions.txt`;
 - `<job>.pods.txt` and `<job>.pods.describe.txt`;
 - `<job>.events.txt` and `<job>.job.events.txt`;
 - `<job>.job.log`;
 - per-pod/per-container logs, including `*.previous.log` when present;
-- `<job>.json` when `/reports/bench.json` can be copied from the report
-  container.
+- job-specific `/reports` files copied from the report container:
+  - `ndcg-gate.bench.json`, `ndcg-gate.scifact-surch.out`,
+    `ndcg-gate.scifact-os.out`
+  - `insee-bench.summary.md`, `insee-bench.art-surch.json`,
+    `insee-bench.art-os.json`
 
 ## Cost guardrails
 
@@ -117,6 +129,7 @@ namespace returns to its 500m / 512Mi quota baseline.
 - `deploy/k8s/jobs/ndcg-gate.yaml` — SciFact NDCG@10 parity gate
 - `deploy/k8s/jobs/insee-bench.yaml` — paired bench Surch vs OS
 - `Makefile` target `bench-k8s` — wrapper around `gh workflow run`
+  that prints the run id / URL before optional `gh run watch`
 
 ## Known limits
 

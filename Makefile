@@ -186,13 +186,18 @@ bench-k8s:
 	  echo "gh workflow run ci-k8s.yml --ref $(K8S_REF) -f job=$(K8S_JOB)"; \
 	else \
 	  gh workflow run ci-k8s.yml --ref "$(K8S_REF)" -f job="$(K8S_JOB)"; \
+	  sleep 5; \
+	  run_id=$$(gh run list --workflow=ci-k8s.yml --branch "$(K8S_REF)" --event workflow_dispatch --limit=1 --json databaseId --jq '.[0].databaseId'); \
+	  run_url=$$(gh run list --workflow=ci-k8s.yml --branch "$(K8S_REF)" --event workflow_dispatch --limit=1 --json url --jq '.[0].url'); \
+	  if [ -z "$$run_id" ]; then \
+	    echo "bench-k8s: dispatched workflow, but could not resolve the run id for ref $(K8S_REF)" >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "bench-k8s: run_id=$$run_id"; \
+	  if [ -n "$$run_url" ]; then \
+	    echo "bench-k8s: run_url=$$run_url"; \
+	  fi; \
 	  if [ "$(K8S_WATCH)" = "1" ]; then \
-	    sleep 5; \
-	    run_id=$$(gh run list --workflow=ci-k8s.yml --branch "$(K8S_REF)" --limit=1 --json databaseId --jq '.[0].databaseId'); \
-	    if [ -z "$$run_id" ]; then \
-	      echo "bench-k8s: dispatched workflow, but could not resolve the run id for ref $(K8S_REF)" >&2; \
-	      exit 1; \
-	    fi; \
 	    gh run watch --exit-status "$$run_id"; \
 	  fi; \
 	fi

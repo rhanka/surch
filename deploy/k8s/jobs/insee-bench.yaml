@@ -5,10 +5,12 @@
 #   opensearch         opensearchproject/opensearch:2.17.1  (port 9200)
 #   artillery-runner   ghcr.io/rhanka/surch:${SURCH_SHA}    (runs artillery_bench)
 #
-# Output: a `surch.bench.pair.v1` JSON at /reports/bench.json (collected
-# by the CI workflow via kubectl cp). The artillery harness drives both
-# engines sequentially per the matchID `test-backend-v1.yml` scenario:
-# 50 RPS sustained, 4 min.
+# Output under `/reports/`:
+#   * `art-surch.json` / `art-os.json` — `surch.bench.artillery.v1`
+#   * `summary.md`                     — aggregated Markdown summary
+# collected by the CI workflow via `kubectl cp`. The artillery harness
+# drives both engines sequentially per the matchID `test-backend-v1.yml`
+# scenario: 50 RPS sustained, 4 min.
 #
 # Resource envelope tuned to the tenant ResourceQuota
 # (requests.cpu=500m, limits.cpu=2500m, requests.memory=512Mi,
@@ -130,10 +132,9 @@ spec:
                 --names "$INSEE_DIR/artillery_names.txt" \
                 --workers "$ART_WORKERS" --phases "$ART_PHASES" \
                 --report "$REPORTS_DIR/art-os.json"
-              # Emit a `surch.bench.pair.v1` envelope picked up by `kubectl cp`.
               /usr/local/bin/bench_report \
                 --dir "$REPORTS_DIR" \
-                --output "$REPORTS_DIR/bench.json"
+                --output "$REPORTS_DIR/summary.md"
               echo "insee-bench complete."
           volumeMounts:
             - { name: insee,   mountPath: /data/insee, readOnly: true }

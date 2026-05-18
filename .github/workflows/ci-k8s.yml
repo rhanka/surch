@@ -156,6 +156,7 @@ jobs:
           OUT_DIR="target/bench-reports/k8s"
           JOB_NAME="${{ steps.jobname.outputs.name }}"
           JOB_LABEL="app.kubernetes.io/component=${{ inputs.job }}"
+          ARTIFACT_NAME="k8s-bench-${{ inputs.job }}-${{ steps.image.outputs.sha }}"
 
           kubectl -n "$SCW_NAMESPACE" describe "job/$JOB_NAME" \
             > "$OUT_DIR/${{ inputs.job }}.job.describe.txt" 2>&1 || true
@@ -169,11 +170,21 @@ jobs:
             > "$OUT_DIR/${{ inputs.job }}.events.txt" 2>&1 || true
           kubectl -n "$SCW_NAMESPACE" logs "job/$JOB_NAME" --all-containers=true --prefix=true \
             > "$OUT_DIR/${{ inputs.job }}.job.log" 2>&1 || true
+          kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" \
+            -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' \
+            > "$OUT_DIR/${{ inputs.job }}.job.conditions.txt" 2>&1 || true
 
           REPORT_CONTAINER=""
+          REPORT_FILES=""
           case "${{ inputs.job }}" in
-            ndcg-gate) REPORT_CONTAINER="ndcg-driver" ;;
-            insee-bench) REPORT_CONTAINER="artillery-runner" ;;
+            ndcg-gate)
+              REPORT_CONTAINER="ndcg-driver"
+              REPORT_FILES="bench.json scifact-surch.out scifact-os.out"
+              ;;
+            insee-bench)
+              REPORT_CONTAINER="artillery-runner"
+              REPORT_FILES="summary.md art-surch.json art-os.json"
+              ;;
           esac
 
           PODS="$(kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" \
@@ -189,10 +200,13 @@ jobs:
               kubectl -n "$SCW_NAMESPACE" logs "$POD" -c "$CONTAINER" --previous \
                 > "$OUT_DIR/$POD.$CONTAINER.previous.log" 2>&1 || true
             done
-            if [ -n "$REPORT_CONTAINER" ]; then
-              kubectl -n "$SCW_NAMESPACE" cp -c "$REPORT_CONTAINER" \
-                "$POD:/reports/bench.json" \
-                "$OUT_DIR/${{ inputs.job }}.json" 2>/dev/null || true
+            if [ -n "$REPORT_CONTAINER" ] && [ -n "$REPORT_FILES" ]; then
+              for REPORT_FILE in $REPORT_FILES; do
+                DEST_NAME="$(printf '%s' "$REPORT_FILE" | tr '/' '_')"
+                kubectl -n "$SCW_NAMESPACE" cp -c "$REPORT_CONTAINER" \
+                  "$POD:/reports/$REPORT_FILE" \
+                  "$OUT_DIR/${{ inputs.job }}.$DEST_NAME" 2>/dev/null || true
+              done
             fi
           done
 
@@ -202,6 +216,67 @@ jobs:
               --sort-by='.metadata.creationTimestamp' \
               > "$OUT_DIR/${{ inputs.job }}.job.events.txt" 2>&1 || true
           fi
+
+          {
+            echo "artifact_name=$ARTIFACT_NAME"
+            echo "out_dir=$OUT_DIR"
+          } > "$OUT_DIR/${{ inputs.job }}.metadata.env"
+
+      - name: Write run summary
+        if: always()
+        run: |
+          set -eu
+          OUT_DIR="target/bench-reports/k8s"
+          SUMMARY_PATH="$OUT_DIR/${{ inputs.job }}.gha-summary.md"
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          ARTIFACT_NAME="k8s-bench-${{ inputs.job }}-${{ steps.image.outputs.sha }}"
+          JOB_NAME="${{ steps.jobname.outputs.name }}"
+          CONDITIONS_FILE="$OUT_DIR/${{ inputs.job }}.job.conditions.txt"
+
+          {
+            echo "# ci-k8s summary"
+            echo
+            echo "- Run: $RUN_URL"
+            echo "- Attempt: $GITHUB_RUN_ATTEMPT"
+            echo "- Ref: $GITHUB_REF_NAME"
+            echo "- Input job: \`${{ inputs.job }}\`"
+            echo "- Kubernetes Job: \`$JOB_NAME\`"
+            echo "- Namespace: \`$SCW_NAMESPACE\`"
+            echo "- Image: \`${{ steps.image.outputs.image }}\`"
+            echo "- Artifact: \`$ARTIFACT_NAME\`"
+            echo
+            echo "## Job conditions"
+            echo
+            if [ -s "$CONDITIONS_FILE" ]; then
+              echo '```text'
+              cat "$CONDITIONS_FILE"
+              echo '```'
+            else
+              echo "- no conditions captured"
+            fi
+
+            if [ -s "$OUT_DIR/${{ inputs.job }}.summary.md" ]; then
+              echo
+              echo "## Bench summary"
+              echo
+              cat "$OUT_DIR/${{ inputs.job }}.summary.md"
+            elif [ -s "$OUT_DIR/${{ inputs.job }}.bench.json" ]; then
+              echo
+              echo "## Report index"
+              echo
+              echo '```json'
+              cat "$OUT_DIR/${{ inputs.job }}.bench.json"
+              echo
+              echo '```'
+            else
+              echo
+              echo "## Reports"
+              echo
+              echo "- no benchmark summary file copied from /reports"
+            fi
+          } > "$SUMMARY_PATH"
+
+          cat "$SUMMARY_PATH" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report
         if: always()

@@ -159,18 +159,16 @@ fn segment_store_performs_minimal_merge_of_old_segments() {
     let root = unique_temp_dir("surch-segment-merge");
     let mut segment_store = SegmentStore::open(root.join("segments")).expect("open segment store");
 
-    let mut sequence = 1_u64;
-    for index in 0..3 {
+    for (sequence, index) in (1_u64..).zip(0_u64..3) {
         let entry = WalRecord {
             sequence,
-            timestamp_millis: 10_000 + index as u64 * 100,
+            timestamp_millis: 10_000 + index * 100,
             index: "products".to_owned(),
             doc_id: format!("doc-{index}"),
             operation: WalOperation::Index {
                 source: format!("{{\"title\":\"{index}\"}}").as_bytes().to_vec(),
             },
         };
-        sequence += 1;
 
         let _ = segment_store
             .append_entries(vec![entry])
