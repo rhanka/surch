@@ -71,7 +71,7 @@ Status: active branch exists; latest branch head `65fc759`
 
 - [ ] Lot 3 - Promoted reports
   - [ ] Ensure every benchmark producer can feed the summary contract.
-  - [ ] Add paired RSS reporting for Surch vs OpenSearch.
+  - [ ] Add paired RSS reporting for Surch vs Elasticsearch.
   - [ ] Promote INSEE report to
     `docs/ops/bench-reports/<date>-insee-*/README.md` with SLO verdict.
   - [ ] Promote artillery report to

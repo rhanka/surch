@@ -1,6 +1,6 @@
 # MatchID Compatibility Replay Contract
 
-This directory is the commit-safe home for sanitized MatchID Elasticsearch/OpenSearch replay
+This directory is the commit-safe home for sanitized MatchID Elasticsearch replay
 fixtures. It must never contain production secrets, customer data, raw identifiers, raw traffic
 logs, unredacted payloads, reversible hashes, or private redaction mapping tables.
 
@@ -46,7 +46,7 @@ Every MatchID export must provide:
   `comparison`, and ordered `requests`. Each request must include `name`, `method`, `path`,
   optional `body`, `expected_status`, and a full normalized `expected_response` when the response
   body matters.
-- Expected responses: captured from the Elasticsearch/OpenSearch reference, then sanitized and
+- Expected responses: captured from the Elasticsearch reference, then sanitized and
   normalized. Do not generate oracle responses from Surch.
 - Redaction note: a short human-readable note describing the redaction method, reviewer, known
   lossy transformations, and the private location of any non-committed evidence. Do not commit the
@@ -56,7 +56,7 @@ Parser-smoke fixtures may use partial responses elsewhere in the repo. MatchID g
 prefer full normalized responses because the current JSON comparator rejects unexpected paths after
 normalization.
 
-## deces_v1 OpenSearch Oracle Gate
+## deces_v1 Elasticsearch Oracle Gate
 
 The committed `deces_v1` replay currently executes all 30 requests against
 Surch HEAD via:
@@ -65,9 +65,9 @@ Surch HEAD via:
 cargo test -p surch-api matchid_replay_deces_v1_executes_all_non_skipped_requests --test matchid_compat
 ```
 
-The external OpenSearch / Elasticsearch 7.x oracle gate is documented in
+The external Elasticsearch 7.x oracle gate is documented in
 `tests/matchid_compat/oracle/deces_v1.md`. Run it against a clean reference
-node with `OPENSEARCH_URL` set; it loads
+node with `ELASTICSEARCH_URL` set; it loads
 `tests/matchid_compat/deces/mapping.json`, bulks
 `tests/matchid_compat/deces/slice-1000.ndjson`, replays
 `tests/matchid_compat/replays/deces_v1.json`, and writes the human review
@@ -236,7 +236,8 @@ Keep normalization minimal and request-specific. Common candidates:
 
 Do not ignore these fields for MatchID gate requests:
 
-- HTTP status and OpenSearch error envelope (`error.type`, `error.reason`, `status`)
+- HTTP status and Elasticsearch-style error envelope (`error.type`,
+  `error.reason`, `status`)
 - `hits.total.value`, `hits.total.relation`, hit `_id`, hit order, `_index`, `_source`, `fields`,
   `sort`, `highlight`, aggregation buckets, and `_ignored`
 - Query-dependent timestamps, date ranges, routing values, or tenant filters after they have been
@@ -253,7 +254,7 @@ Surch can enter MatchID shadow UAT only when all of the following are true:
   every critical MatchID read workflow and every endpoint observed in the capture window.
 - Redaction review is complete, `approved_for_commit` is true in the export manifest, and no secret,
   PII, raw identifier, raw host, token, or reversible value appears in committed files.
-- The dataset loads into a fresh Elasticsearch/OpenSearch reference node and all replay requests
+- The dataset loads into a fresh Elasticsearch reference node and all replay requests
   pass against the reference oracle.
 - The same dataset loads into Surch and all P0/P1 replay requests pass on status, totals, top-hit
   IDs, source fields, sort order, and compatible error envelopes.

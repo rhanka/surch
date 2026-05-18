@@ -8,8 +8,8 @@ Status: active branch exists; latest branch head `9e0e6b3`
 
 ## Finality
 
-- [ ] Prove matchID parity against OpenSearch / ES-7.x, not only
-  against Surch HEAD.
+- [ ] Prove matchID parity against Elasticsearch 7.x, not only against
+  Surch HEAD.
 
 ## Scope
 
@@ -24,7 +24,7 @@ Status: active branch exists; latest branch head `9e0e6b3`
   `tests/matchid_compat/oracle/deces_v1.md`,
   `tests/matchid_compat/README.md`,
   `crates/surch-api/tests/matchid_compat.rs`.
-- [ ] Next scope: execute OpenSearch oracle and refresh fixture
+- [ ] Next scope: execute Elasticsearch oracle and refresh fixture
   expectations.
 - [x] Evidence source: matchID replay and search integration tests.
 
@@ -40,7 +40,7 @@ Status: active branch exists; latest branch head `9e0e6b3`
   OK.
 - [x] Oracle runbook merged and documented on `main`: `e8aca54`
   (branch commit `9e0e6b3`).
-- [ ] Oracle OpenSearch replay executed against a reference node.
+- [ ] Oracle Elasticsearch replay executed against a reference node.
 
 ## Lots
 
@@ -60,15 +60,15 @@ Status: active branch exists; latest branch head `9e0e6b3`
   - [x] Update B1 replay state in gap-analysis.
   - [x] Commit docs: `e532a08`.
 
-- [ ] Lot 3 - OpenSearch oracle harness
-  - [x] Define the action path for OpenSearch / ES-7.x via
-    `OPENSEARCH_URL`.
+- [ ] Lot 3 - Elasticsearch oracle harness
+  - [x] Define the action path for Elasticsearch 7.x via
+    `ELASTICSEARCH_URL`.
   - [x] Document comparison of status, total hits, top ids, and critical
     response shape.
   - [x] Document the human review artefact:
     `target/matchid-oracle/deces_v1/summary.md`.
   - [ ] Replay `tests/matchid_compat/replays/deces_v1.json` against
-    OpenSearch.
+    Elasticsearch.
   - [ ] Persist oracle expectations or documented deltas.
 
 - [ ] Lot N - Closure

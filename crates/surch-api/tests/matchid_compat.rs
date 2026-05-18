@@ -331,7 +331,7 @@ fn matchid_deces_v1_oracle_runbook_is_actionable() {
         "hits.hits[0]._id",
         "critical shape",
         "summary.md",
-        "OPENSEARCH_URL",
+        "ELASTICSEARCH_URL",
     ] {
         assert!(
             runbook.contains(required),

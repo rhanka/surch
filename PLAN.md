@@ -38,12 +38,24 @@ global status source; branch files carry executable detail.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~50% (4 open / 8 leaf tasks).
+Reste estime: ~30% (5 open / 18 leaf tasks).
 
-- [x] Land first hot-path wins on `main`: top-K collection, lazy
-  `_source` hydration, WAND / Block-Max WAND, search cache, shared
-  stored fields.
-- [x] Publish paired OpenSearch baseline in
+- [x] Land scalar top-K finalization: `5081cc7`.
+- [x] Land lazy `_source` hydration for scored top-K: `3157afb`.
+- [x] Land MaxScore/WAND skipping for OR-match top-K: `ed76014`.
+- [x] Extend WAND to `multi_match` and drop stale postings builders:
+  `65ccfbe`.
+- [x] Land Block-Max WAND per-128 max contribution skipping:
+  `e38bf91`.
+- [x] Land per-index LRU search response cache: `644f62b`.
+- [x] Share stored document sources: `4e9405a`, merge `f910094`.
+- [x] Replace nested term map with FST term dictionary:
+  `c5f3155`, merge `0800f98`.
+- [x] Persist per-block stats next to postings:
+  `b680232`, merge `6df877d`.
+- [x] Add memory metrics and `GET /_surch/stats`:
+  `b8ed2bc`, merge `7caf339`.
+- [x] Publish historical paired reference baseline in
   `docs/ops/bench-reports/2026-05-16-vs-os-2.17.1/README.md`.
 - [x] Add codec block metadata helper:
   `6f56fd2` on `main`, `30a7b32` on `wp/a-optim`.
@@ -52,8 +64,10 @@ Reste estime: ~50% (4 open / 8 leaf tasks).
 - [ ] Finish runtime wiring from encoded FoR postings metadata into the
   search execution path.
 - [ ] Add skip lists on top of the codec path.
-- [ ] Add the next Block-Max WAND step on top of block metadata.
-- [ ] Finish the FST term dictionary path and refresh memory baselines.
+- [ ] Add the next Block-Max WAND step on top of encoded block metadata.
+- [ ] Refresh memory baselines after the FST / shared-source / FoR
+  sequence.
+- [ ] Record a current perf + quality guardrail for the complete hot path.
 
 ## Track B - Test Automation / Perf Reporting
 
@@ -62,11 +76,11 @@ Reste estime: ~40% (3 open / 8 leaf tasks).
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
   `make bench-*`, `make report`, `artillery_bench`, `bench_report`.
-- [x] Promoted paired SciFact baseline exists:
-  `NDCG@10 0.6576` vs OpenSearch `0.6537`,
-  `Recall@10 0.8100` vs `0.8033`.
+- [x] Promoted historical SciFact paired baseline exists:
+  Surch `NDCG@10 0.6576`, reference `0.6537`;
+  Surch `Recall@10 0.8100`, reference `0.8033`.
 - [x] Promoted BAN Paris 25k baseline exists:
-  Surch `p50 0 ms`, `p95 20 ms`, `max 20 ms` vs OpenSearch
+  Surch `p50 0 ms`, `p95 20 ms`, `max 20 ms` vs reference
   `20 / 108 / 108 ms`.
 - [x] `ec31e69` emits `summary.md` plus stable `summary.json`
   (`surch.bench.summary.v1`); `6a1fe89` fixes rustfmt.
@@ -74,8 +88,9 @@ Reste estime: ~40% (3 open / 8 leaf tasks).
   `summary.md` stays local, promoted reports write `README.md`, and
   `summary.json` remains the agent/CI machine contract.
 - [ ] Ensure every benchmark producer can feed the summary contract.
-- [ ] Add paired RSS reporting for Surch vs OpenSearch.
-- [ ] Promote official paired reports for INSEE, artillery,
+- [ ] Add paired RSS reporting for Surch vs Elasticsearch.
+- [ ] Promote official Elasticsearch/Surch paired reports for INSEE,
+  artillery,
   TREC-COVID, and mMARCO-fr.
 
 ## Track C - Ops / Packaging / Snapshots
@@ -107,9 +122,9 @@ Reste estime: ~25% (2 open / 8 leaf tasks).
 - [x] `3cdac1f` implements `bool.must_not`.
 - [x] `e532a08` syncs gap-analysis with A3 and B1 replay state.
 - [x] B1 replay executes all 30 requests against Surch HEAD.
-- [x] `e8aca54` documents the `deces_v1` OpenSearch / ES-7.x oracle
+- [x] `e8aca54` documents the `deces_v1` Elasticsearch 7.x oracle
   gate and human `summary.md` output.
-- [ ] Execute the OpenSearch / ES-7.x oracle gate and refresh fixture
+- [ ] Execute the Elasticsearch 7.x oracle gate and refresh fixture
   expectations from that reference, not Surch.
 - [ ] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the oracle
   replay and document remaining parity gaps.
@@ -143,7 +158,7 @@ Reste estime: ~45% (4 open / 9 leaf tasks).
 - [ ] Track B finality: replayable, comparable benchmark reporting with
   explicit SLO verdicts.
 - [ ] Track C finality: release and snapshot paths verified end to end.
-- [ ] Track D finality: matchID parity proven against OpenSearch /
-  ES-7.x, not only Surch HEAD.
+- [ ] Track D finality: matchID parity proven against Elasticsearch 7.x,
+  not only Surch HEAD.
 - [ ] Track E finality: `ci-k8s` is a reliable heavy-benchmark target
   with preserved diagnostics.

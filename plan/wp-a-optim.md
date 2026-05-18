@@ -35,6 +35,21 @@ Status: active, pushed; latest branch head `30a7b32`
 
 ## Lots
 
+- [x] Lot -2 - Earlier hot-path deliveries already on `main`
+  - [x] Scalar top-K finalization: `5081cc7`.
+  - [x] Lazy `_source` hydration: `3157afb`.
+  - [x] MaxScore/WAND OR-match skipping: `ed76014`.
+  - [x] WAND `multi_match` extension and stale postings-builder drop:
+    `65ccfbe`.
+  - [x] Block-Max WAND per-128 contribution skipping: `e38bf91`.
+  - [x] Search response cache: `644f62b`.
+  - [x] Shared stored document sources: `4e9405a`, merge `f910094`.
+  - [x] FST term dictionary: `c5f3155`, merge `0800f98`.
+  - [x] Per-block stats persisted next to postings:
+    `b680232`, merge `6df877d`.
+  - [x] Memory metrics and `GET /_surch/stats`:
+    `b8ed2bc`, merge `7caf339`.
+
 - [x] Lot 0 - Baseline and constraints
   - [x] Confirm worktree `.worktrees/wp-a`.
   - [x] Confirm branch `wp/a-optim`.
@@ -65,6 +80,8 @@ Status: active, pushed; latest branch head `30a7b32`
   - [ ] Run before/after smoke perf on a small reproducible workload.
   - [ ] Run quality guardrail when search hot path changes.
   - [ ] Record p50 / p95 / p99 / max and quality verdict in the report.
+  - [ ] Refresh memory baselines after the FST / shared-source / FoR
+    sequence.
 
 - [ ] Lot N - Closure
   - [ ] Update this plan and `PLAN.md`.

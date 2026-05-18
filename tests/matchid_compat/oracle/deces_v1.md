@@ -1,7 +1,7 @@
-# deces_v1 OpenSearch Oracle Gate
+# deces_v1 Elasticsearch Oracle Gate
 
 This runbook turns the committed `deces_v1` replay into an explicit
-OpenSearch / Elasticsearch 7.x gate. It is intentionally human-readable:
+Elasticsearch 7.x gate. It is intentionally human-readable:
 the run produces `summary.md` and exits non-zero on any mismatch, so the
 user does not need to inspect raw JSON.
 
@@ -36,15 +36,15 @@ identity, and response shape.
 
 Prerequisites:
 
-- A clean OpenSearch or Elasticsearch 7.x node is running.
-- `OPENSEARCH_URL` points at that node, for example
+- A clean Elasticsearch 7.x node is running.
+- `ELASTICSEARCH_URL` points at that node, for example
   `http://127.0.0.1:9200`.
 - Python 3 is available.
 
 Run from the repository root:
 
 ```sh
-OPENSEARCH_URL="${OPENSEARCH_URL:-http://127.0.0.1:9200}" python3 - <<'PY'
+ELASTICSEARCH_URL="${ELASTICSEARCH_URL:-http://127.0.0.1:9200}" python3 - <<'PY'
 import json
 import os
 import sys
@@ -58,7 +58,7 @@ REPLAY = ROOT / "tests/matchid_compat/replays/deces_v1.json"
 MAPPING = ROOT / "tests/matchid_compat/deces/mapping.json"
 BULK = ROOT / "tests/matchid_compat/deces/slice-1000.ndjson"
 OUT_DIR = ROOT / "target/matchid-oracle/deces_v1"
-BASE = os.environ.get("OPENSEARCH_URL", "http://127.0.0.1:9200").rstrip("/")
+BASE = os.environ.get("ELASTICSEARCH_URL", "http://127.0.0.1:9200").rstrip("/")
 
 
 def request(method, path, body=None):
@@ -190,8 +190,8 @@ def main():
 
     summary = OUT_DIR / "summary.md"
     with summary.open("w", encoding="utf-8") as out:
-        out.write("# deces_v1 OpenSearch Oracle Summary\n\n")
-        out.write(f"OpenSearch URL: `{BASE}`\n\n")
+        out.write("# deces_v1 Elasticsearch Oracle Summary\n\n")
+        out.write(f"Elasticsearch URL: `{BASE}`\n\n")
         out.write("| request | verdict | status | hits.total.value | top id | notes |\n")
         out.write("|---|---:|---:|---:|---|---|\n")
         for row in rows:
