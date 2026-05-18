@@ -17,6 +17,11 @@
 
 use thiserror::Error;
 
+/// Number of postings per logical block for the future block-128 FoR
+/// integration path. Kept local to `surch-codec` so the codec can be
+/// exercised independently from `surch-index`.
+pub const FOR_BLOCK_SIZE: usize = 128;
+
 /// Errors returned by [`decode_doc_ids_delta_varint`] and
 /// [`encode_doc_ids_delta_varint`].
 ///
@@ -39,6 +44,21 @@ pub enum PostingsBlockError {
     /// overflow when accumulating.
     #[error("postings block: doc ids are not strictly monotonic")]
     NotMonotonic,
+}
+
+/// Lightweight metadata describing one logical block inside the payload
+/// produced by [`encode_postings_doc_id_freq`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostingsBlockMeta {
+    pub block_index: usize,
+    pub posting_count: usize,
+    pub min_doc_id: u32,
+    pub max_doc_id: u32,
+    pub max_term_freq: u32,
+    pub doc_ids_byte_start: usize,
+    pub doc_ids_byte_end: usize,
+    pub freqs_byte_start: usize,
+    pub freqs_byte_end: usize,
 }
 
 /// Encode `sorted` (a strictly increasing slice of `u32` doc ids) as a
@@ -220,6 +240,73 @@ pub fn decode_postings_doc_id_freq(
     }
 
     Ok((doc_ids, freqs))
+}
+
+/// Inspect the encoded postings payload block-by-block without fully
+/// materialising any intermediate posting structs.
+pub fn inspect_postings_blocks(bytes: &[u8]) -> Result<Vec<PostingsBlockMeta>, PostingsBlockError> {
+    let mut position = 0;
+    let length = read_varint_u32(bytes, &mut position)? as usize;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut blocks = Vec::with_capacity(length.div_ceil(FOR_BLOCK_SIZE));
+    let mut previous: u32 = 0;
+    let mut started = false;
+    let mut remaining = length;
+    let mut block_index = 0usize;
+
+    while remaining > 0 {
+        let posting_count = remaining.min(FOR_BLOCK_SIZE);
+        let doc_ids_byte_start = position;
+        let mut min_doc_id = 0u32;
+        let mut max_doc_id = 0u32;
+
+        for slot in 0..posting_count {
+            let delta = read_varint_u32(bytes, &mut position)?;
+            if started && delta == 0 {
+                return Err(PostingsBlockError::NotMonotonic);
+            }
+            let value = previous
+                .checked_add(delta)
+                .ok_or(PostingsBlockError::NotMonotonic)?;
+            if slot == 0 {
+                min_doc_id = value;
+            }
+            max_doc_id = value;
+            previous = value;
+            started = true;
+        }
+
+        blocks.push(PostingsBlockMeta {
+            block_index,
+            posting_count,
+            min_doc_id,
+            max_doc_id,
+            max_term_freq: 0,
+            doc_ids_byte_start,
+            doc_ids_byte_end: position,
+            freqs_byte_start: 0,
+            freqs_byte_end: 0,
+        });
+
+        remaining -= posting_count;
+        block_index += 1;
+    }
+
+    for block in &mut blocks {
+        block.freqs_byte_start = position;
+        let mut max_term_freq = 0u32;
+        for _ in 0..block.posting_count {
+            let freq = read_varint_u32(bytes, &mut position)?;
+            max_term_freq = max_term_freq.max(freq);
+        }
+        block.max_term_freq = max_term_freq;
+        block.freqs_byte_end = position;
+    }
+
+    Ok(blocks)
 }
 
 /// Streaming decoder for the doc-id channel of a payload produced by
@@ -487,5 +574,77 @@ mod tests {
             encoded.len(),
             naive_bytes
         );
+    }
+
+    #[test]
+    fn inspect_postings_blocks_splits_payload_on_block_128_boundary() {
+        let doc_ids: Vec<u32> = (0..129).map(|i| i * 3 + 7).collect();
+        let freqs: Vec<u32> = (0..129).map(|i| (i % 17) as u32 + 1).collect();
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+
+        let blocks = inspect_postings_blocks(&encoded).unwrap();
+        assert_eq!(blocks.len(), 2);
+
+        assert_eq!(blocks[0].block_index, 0);
+        assert_eq!(blocks[0].posting_count, 128);
+        assert_eq!(blocks[0].min_doc_id, doc_ids[0]);
+        assert_eq!(blocks[0].max_doc_id, doc_ids[127]);
+        assert_eq!(blocks[0].max_term_freq, 17);
+
+        assert_eq!(blocks[1].block_index, 1);
+        assert_eq!(blocks[1].posting_count, 1);
+        assert_eq!(blocks[1].min_doc_id, doc_ids[128]);
+        assert_eq!(blocks[1].max_doc_id, doc_ids[128]);
+        assert_eq!(blocks[1].max_term_freq, freqs[128]);
+
+        assert!(blocks[0].doc_ids_byte_end <= blocks[1].doc_ids_byte_start);
+        assert!(blocks[0].freqs_byte_end <= blocks[1].freqs_byte_start);
+        assert_eq!(blocks[1].freqs_byte_end, encoded.len());
+    }
+
+    #[test]
+    fn inspect_postings_blocks_matches_decoded_chunks_on_seeded_corpus() {
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+
+        let mut doc_ids: Vec<u32> = (0..2000).map(|_| next() % 10_000_000).collect();
+        doc_ids.sort_unstable();
+        doc_ids.dedup();
+        let freqs: Vec<u32> = doc_ids.iter().map(|d| (d % 16) + 1).collect();
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+
+        let blocks = inspect_postings_blocks(&encoded).unwrap();
+        assert_eq!(blocks.len(), doc_ids.len().div_ceil(FOR_BLOCK_SIZE));
+        assert_eq!(
+            blocks.iter().map(|meta| meta.posting_count).sum::<usize>(),
+            doc_ids.len()
+        );
+
+        for (meta, (doc_chunk, freq_chunk)) in blocks.iter().zip(
+            doc_ids
+                .chunks(FOR_BLOCK_SIZE)
+                .zip(freqs.chunks(FOR_BLOCK_SIZE)),
+        ) {
+            assert_eq!(meta.posting_count, doc_chunk.len());
+            assert_eq!(meta.min_doc_id, *doc_chunk.first().unwrap());
+            assert_eq!(meta.max_doc_id, *doc_chunk.last().unwrap());
+            assert_eq!(meta.max_term_freq, *freq_chunk.iter().max().unwrap());
+        }
+    }
+
+    #[test]
+    fn inspect_postings_blocks_rejects_truncated_freq_tail() {
+        let doc_ids: Vec<u32> = (0..130).collect();
+        let freqs: Vec<u32> = vec![1; 130];
+        let mut encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+        encoded.pop();
+
+        let err = inspect_postings_blocks(&encoded).unwrap_err();
+        assert_eq!(err, PostingsBlockError::UnexpectedEof);
     }
 }
