@@ -42,7 +42,7 @@ spec:
       restartPolicy: Never
       serviceAccountName: surch
       nodeSelector:
-        pool: burst
+        k8s.scaleway.com/pool-name: burst
       tolerations:
         - key: pool
           operator: Equal

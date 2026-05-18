@@ -78,10 +78,10 @@ spec:
     spec:
       restartPolicy: OnFailure
       serviceAccountName: surch
-      # Schedule on the dedicated burst pool. The pool taint is applied
-      # by `make pool-burst` in poc-k8s; tolerate it explicitly.
+      # Schedule on the dedicated Scaleway burst pool. Keep the toleration
+      # for clusters that also taint burst nodes with pool=burst.
       nodeSelector:
-        pool: burst
+        k8s.scaleway.com/pool-name: burst
       tolerations:
         - key: pool
           operator: Equal

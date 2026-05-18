@@ -22,9 +22,12 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
 
 - GHA reads `KUBE_CONFIG_DATA` from repository secrets. The secret may be
   raw kubeconfig YAML or base64-encoded YAML.
-- The burst pool (DEV1-L, 0..1 autoscaled, taint `pool=burst:NoSchedule`)
-  scales `0 -> 1` for the Job duration and back to `0` after the TTL.
-- All Jobs carry `nodeSelector: pool=burst` + a matching toleration.
+- The burst pool (DEV1-L, 0..1 autoscaled, Scaleway label
+  `k8s.scaleway.com/pool-name=burst`) scales `0 -> 1` for the Job
+  duration and back to `0` after the TTL.
+- All Jobs carry `nodeSelector: k8s.scaleway.com/pool-name=burst`.
+  They also keep a `pool=burst` toleration for clusters that taint burst
+  nodes explicitly.
 - Reports and diagnostics are written under `target/bench-reports/k8s/`
   and uploaded with `actions/upload-artifact@v4` even when the Job fails.
 - The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
