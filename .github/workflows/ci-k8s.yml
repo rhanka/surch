@@ -238,7 +238,7 @@ jobs:
           case "${{ inputs.job }}" in
             ndcg-gate)
               REPORT_CONTAINER="ndcg-driver"
-              REPORT_FILES="bench.json scifact-surch.out scifact-os.out"
+              REPORT_FILES="summary.md bench.json scifact-surch.out scifact-os.out"
               ;;
             insee-bench)
               REPORT_CONTAINER="artillery-runner"

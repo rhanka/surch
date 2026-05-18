@@ -38,8 +38,9 @@ COPY tests ./tests
 RUN cargo build --release --locked -p surch-api -p surch-demo --bins
 
 # Bench driver stage: used only by K8s Jobs that need `/bin/sh`, curl,
-# wget, jq, awk, and the benchmark/reporting tools. Keeping it separate
-# preserves the small distroless runtime image for the actual API server.
+# wget, jq, awk, tar, and the benchmark/reporting tools. Keeping it
+# separate preserves the small distroless runtime image for the actual
+# API server.
 FROM debian:bookworm-slim AS bench-driver
 
 RUN apt-get update \
@@ -50,6 +51,7 @@ RUN apt-get update \
       gawk \
       jq \
       libssl3 \
+      tar \
       wget \
  && rm -rf /var/lib/apt/lists/*
 

@@ -2,8 +2,8 @@
 #
 # Spins up a single Pod with two restartable init-container sidecars
 # (surch + opensearch) and a driver container that runs
-# `scripts/bench/scifact-ndcg.sh` against both engines, then emits text
-# outputs plus a JSON index to /reports.
+# `scripts/bench/scifact-ndcg.sh` against both engines, then emits a
+# human summary, text outputs, and a JSON index to /reports.
 #
 # The Pod-anti-affinity story stays simple here: both engines are local
 # to the Pod, talking over localhost. Resource envelope is tuned to fit
@@ -118,7 +118,8 @@ spec:
           command: ["/bin/sh", "-c"]
           # The bench driver image bundles scripts/bench/scifact-ndcg.sh;
           # this driver waits for both engines, runs the gate, and exits
-          # with the script's own status. CI reads /reports/bench.json.
+          # with the script's own status. CI reads /reports/summary.md
+          # and /reports/bench.json.
           args:
             - |
               set -eu
@@ -129,6 +130,15 @@ spec:
               mkdir -p "$REPORTS_DIR"
               /usr/local/bin/scifact-ndcg.sh "ndcg-surch-k8s" "$REPORTS_DIR/scifact-surch.out" "$SURCH_URL"
               /usr/local/bin/scifact-ndcg.sh "ndcg-os-k8s"    "$REPORTS_DIR/scifact-os.out"    "$OPENSEARCH_URL"
+              {
+                echo "# SciFact NDCG gate"
+                echo
+                echo "## Surch"
+                cat "$REPORTS_DIR/scifact-surch.out"
+                echo
+                echo "## OpenSearch"
+                cat "$REPORTS_DIR/scifact-os.out"
+              } > "$REPORTS_DIR/summary.md"
               cat > "$REPORTS_DIR/bench.json" <<EOF
               {"schema":"surch.bench.ndcg_gate.v1","surch_out":"$REPORTS_DIR/scifact-surch.out","opensearch_out":"$REPORTS_DIR/scifact-os.out"}
               EOF
