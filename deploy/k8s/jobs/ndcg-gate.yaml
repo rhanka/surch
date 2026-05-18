@@ -15,7 +15,8 @@
 #   total       cpu  500m req / 2500m lim ; mem 512Mi req / 2560Mi lim
 # Fits a DEV1-L (2 vCPU / 4 GiB) burst node with Kapsule overhead.
 #
-# `${SURCH_SHA}` is substituted by the GHA workflow via envsubst.
+# `${SURCH_SHA}` is substituted by the GHA workflow via envsubst and
+# rendered into the docker-build.yml tag format: `sha-<full commit SHA>`.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -63,7 +64,7 @@ spec:
       containers:
         # --- Engine sidecar #1: Surch ---------------------------------
         - name: surch
-          image: ghcr.io/rhanka/surch:${SURCH_SHA}
+          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 7700, name: surch-http }
@@ -96,7 +97,7 @@ spec:
             - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data }
         # --- Driver: scifact-ndcg.sh against both engines -------------
         - name: ndcg-driver
-          image: ghcr.io/rhanka/surch:${SURCH_SHA}
+          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
           env:
             - { name: SURCH_URL,      value: "http://127.0.0.1:7700" }

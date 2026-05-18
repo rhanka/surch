@@ -37,7 +37,9 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   image fails immediately with the matching `docker-build.yml` command
   instead of burning the full 30 min Job budget.
 - The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
-  shell variables inside the Job scripts stay intact.
+  shell variables inside the Job scripts stay intact. Job manifests must
+  use `ghcr.io/rhanka/surch:sha-${SURCH_SHA}`, matching the
+  `docker-build.yml` long-SHA tag contract.
 - PVC dependencies declared by `claimName:` are checked before `kubectl
   apply`, so a missing corpus volume fails in seconds instead of waiting
   for the Job deadline.

@@ -1,9 +1,9 @@
 # Surch — paired bench Surch vs OpenSearch on INSEE Deces (~1.3M docs).
 #
 # Three containers in the same Pod, all on localhost:
-#   surch              ghcr.io/rhanka/surch:${SURCH_SHA}    (port 7700)
+#   surch              ghcr.io/rhanka/surch:sha-${SURCH_SHA} (port 7700)
 #   opensearch         opensearchproject/opensearch:2.17.1  (port 9200)
-#   artillery-runner   ghcr.io/rhanka/surch:${SURCH_SHA}    (runs artillery_bench)
+#   artillery-runner   ghcr.io/rhanka/surch:sha-${SURCH_SHA} (runs artillery_bench)
 #
 # Output under `/reports/`:
 #   * `art-surch.json` / `art-os.json` — `surch.bench.artillery.v1`
@@ -68,7 +68,7 @@ spec:
       containers:
         # --- Engine #1: Surch -----------------------------------------
         - name: surch
-          image: ghcr.io/rhanka/surch:${SURCH_SHA}
+          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 7700, name: surch-http }
@@ -100,7 +100,7 @@ spec:
             - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data }
         # --- Driver: artillery_bench Rust harness ---------------------
         - name: artillery-runner
-          image: ghcr.io/rhanka/surch:${SURCH_SHA}
+          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
           env:
             - { name: SURCH_URL,      value: "http://127.0.0.1:7700" }

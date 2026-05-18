@@ -131,7 +131,7 @@ Reste estime: ~25% (2 open / 8 leaf tasks).
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~45% (4 open / 9 leaf tasks).
+Reste estime: ~40% (4 open / 10 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -147,6 +147,9 @@ Reste estime: ~45% (4 open / 9 leaf tasks).
 - [x] Docker builder toolchain aligned with the Cargo.lock MSRV floor
   (`rustc >= 1.91.1`) after `docker-build` run `26057290880` exposed
   the stale `rust:1.88` base image.
+- [x] K8s Job manifests now consume the same `sha-<full commit SHA>`
+  image tag that `docker-build.yml`, `ci-k8s.yml`, and `make bench-k8s`
+  verify before dispatch.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
 - [ ] Verify on GitHub Actions that missing-image preflight still fails

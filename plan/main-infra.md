@@ -3,7 +3,7 @@
 Track principal: E - infra K8s / poc-k8s
 Branch: `main` until a dedicated infra branch is created
 Owner: conductor / infra owner
-Status: active infra lane; latest tracked main commit `5c25463`
+Status: active infra lane; merge state below is the source of truth
 
 ## Finality
 
@@ -32,10 +32,14 @@ Status: active infra lane; latest tracked main commit `5c25463`
 - [x] Docker builder toolchain moved from `rust:1.88` to
   `rust:1.91.1` after `docker-build` run `26057290880` failed on AWS
   dependency MSRV.
+- [x] K8s Job manifests consume the `sha-<full commit SHA>` GHCR tag
+  that `docker-build.yml` actually publishes.
 - [x] Verification run recorded: `ci-k8s` `26038117579` failed in 16s
   on missing image, replacing 30m timeout pattern.
 - [x] `main` CI after latest integration was green: `26038398172`.
 - [ ] `ci-k8s` heavy run reaches actual `ndcg-gate` benchmark.
+  - [x] Diagnose image contract mismatch between GHCR preflight and
+    rendered Job manifests.
 
 ## Lots
 
@@ -57,6 +61,8 @@ Status: active infra lane; latest tracked main commit `5c25463`
 - [ ] Lot 2 - Image handoff
   - [x] Align image tag convention between `docker-build.yml`,
     `release.yml`, and `ci-k8s.yml`.
+  - [x] Align rendered Job images with the same `sha-<full commit SHA>`
+    tag convention.
   - [x] Make `make bench-k8s` print the exact image tag it expects.
   - [x] If the tag is missing, print the exact remediation command:
     trigger `docker-build.yml` for the same ref, then rerun `ci-k8s`.
