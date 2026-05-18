@@ -142,6 +142,12 @@ spec:
               cat > "$REPORTS_DIR/bench.json" <<EOF
               {"schema":"surch.bench.ndcg_gate.v1","surch_out":"$REPORTS_DIR/scifact-surch.out","opensearch_out":"$REPORTS_DIR/scifact-os.out"}
               EOF
+              echo "BEGIN_SURCH_K8S_SUMMARY"
+              cat "$REPORTS_DIR/summary.md"
+              echo "END_SURCH_K8S_SUMMARY"
+              echo "BEGIN_SURCH_K8S_BENCH_JSON"
+              cat "$REPORTS_DIR/bench.json"
+              echo "END_SURCH_K8S_BENCH_JSON"
               echo "ndcg-gate complete."
           volumeMounts:
             - { name: beir,    mountPath: /data/beir, readOnly: true }
