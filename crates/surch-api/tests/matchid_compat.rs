@@ -18,6 +18,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::{fs, path::PathBuf};
 use surch_api::app_router;
 use tower::ServiceExt;
 
@@ -26,6 +27,7 @@ const SLICE_NDJSON: &str = include_str!("../../../tests/matchid_compat/deces/sli
 const REPLAY_JSON: &str = include_str!("../../../tests/matchid_compat/replays/deces_v1.json");
 
 const INDEX_NAME: &str = "deces";
+const DECES_V1_ORACLE_RUNBOOK: &str = "../../tests/matchid_compat/oracle/deces_v1.md";
 
 #[derive(Debug, Deserialize)]
 struct ReplayFile {
@@ -305,6 +307,45 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
         executed, 30,
         "expected 30 executed entries against Surch HEAD"
     );
+}
+
+#[test]
+fn matchid_deces_v1_oracle_runbook_is_actionable() {
+    let manifest: ReplayFile =
+        serde_json::from_str(REPLAY_JSON).expect("replay manifest must parse");
+
+    let runbook_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DECES_V1_ORACLE_RUNBOOK);
+    let runbook = fs::read_to_string(&runbook_path).unwrap_or_else(|err| {
+        panic!(
+            "deces_v1 oracle runbook must be readable at {}: {err}",
+            runbook_path.display()
+        )
+    });
+
+    for required in [
+        "tests/matchid_compat/replays/deces_v1.json",
+        "tests/matchid_compat/deces/mapping.json",
+        "tests/matchid_compat/deces/slice-1000.ndjson",
+        "status",
+        "hits.total.value",
+        "hits.hits[0]._id",
+        "critical shape",
+        "summary.md",
+        "OPENSEARCH_URL",
+    ] {
+        assert!(
+            runbook.contains(required),
+            "deces_v1 oracle runbook must mention `{required}`"
+        );
+    }
+
+    for entry in &manifest.requests {
+        assert!(
+            runbook.contains(&entry.name),
+            "deces_v1 oracle runbook must list replay request `{}`",
+            entry.name
+        );
+    }
 }
 
 async fn execute(router: Router, method: Method, path: &str, body: String) -> (u16, Option<Value>) {

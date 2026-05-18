@@ -56,6 +56,32 @@ Parser-smoke fixtures may use partial responses elsewhere in the repo. MatchID g
 prefer full normalized responses because the current JSON comparator rejects unexpected paths after
 normalization.
 
+## deces_v1 OpenSearch Oracle Gate
+
+The committed `deces_v1` replay currently executes all 30 requests against
+Surch HEAD via:
+
+```sh
+cargo test -p surch-api matchid_replay_deces_v1_executes_all_non_skipped_requests --test matchid_compat
+```
+
+The external OpenSearch / Elasticsearch 7.x oracle gate is documented in
+`tests/matchid_compat/oracle/deces_v1.md`. Run it against a clean reference
+node with `OPENSEARCH_URL` set; it loads
+`tests/matchid_compat/deces/mapping.json`, bulks
+`tests/matchid_compat/deces/slice-1000.ndjson`, replays
+`tests/matchid_compat/replays/deces_v1.json`, and writes the human review
+artifact:
+
+```text
+target/matchid-oracle/deces_v1/summary.md
+```
+
+That `summary.md` is the review surface. It has one row per replay request
+and fails the run on any mismatch in HTTP status, `hits.total.value`,
+`hits.hits[0]._id`, or critical response shape. Do not ask a user to inspect
+raw JSON for this gate.
+
 ## Endpoints To Capture
 
 At minimum, capture the endpoints MatchID actually uses:
