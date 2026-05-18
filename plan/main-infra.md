@@ -29,6 +29,9 @@ Status: active infra lane; latest tracked main commit `5c25463`
 
 - [x] Fail-fast GHCR preflight merged to `main`: `23e60b8`.
 - [x] Full-SHA image handoff merged to `main`: `5c25463`.
+- [x] Docker builder toolchain moved from `rust:1.88` to
+  `rust:1.91.1` after `docker-build` run `26057290880` failed on AWS
+  dependency MSRV.
 - [x] Verification run recorded: `ci-k8s` `26038117579` failed in 16s
   on missing image, replacing 30m timeout pattern.
 - [x] `main` CI after latest integration was green: `26038398172`.
@@ -63,6 +66,8 @@ Status: active infra lane; latest tracked main commit `5c25463`
   - [ ] Gate 2: existing image reaches benchmark execution.
 
 - [ ] Lot 3 - Heavy-run standardisation
+  - [x] Keep Docker builder MSRV aligned with locked dependencies before
+    dispatching `ci-k8s`.
   - [ ] Make `ci-k8s` the standard burst / large-corpus path.
   - [ ] Ensure diagnostics and artefacts are preserved on failure.
   - [ ] Turn `make bench-k8s` into a real entry point.

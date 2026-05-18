@@ -8,7 +8,9 @@
 # Run:
 #   docker run --rm -p 7700:7700 ghcr.io/rhanka/surch:dev
 
-ARG RUST_VERSION=1.88
+# Keep this at or above the Cargo.lock MSRV floor. The AWS SDK family
+# currently requires rustc 1.91.1.
+ARG RUST_VERSION=1.91.1
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 WORKDIR /usr/src/surch

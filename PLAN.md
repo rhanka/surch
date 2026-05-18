@@ -144,6 +144,9 @@ Reste estime: ~45% (4 open / 9 leaf tasks).
 - [x] `5c25463` aligns image handoff on `sha-<full commit SHA>` across
   `docker-build.yml`, `release.yml`, `ci-k8s.yml`, and `make bench-k8s`;
   missing-image errors now print the exact remediation command.
+- [x] Docker builder toolchain aligned with the Cargo.lock MSRV floor
+  (`rustc >= 1.91.1`) after `docker-build` run `26057290880` exposed
+  the stale `rust:1.88` base image.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
 - [ ] Verify on GitHub Actions that missing-image preflight still fails
