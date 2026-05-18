@@ -29,16 +29,16 @@ global status source; branch files carry executable detail.
   detailed plan: `plan/wp-a-optim.md`.
 - [ ] `wp/b-test-auto`: Track B long branch, head `65fc759`;
   detailed plan: `plan/wp-b-test-auto.md`.
-- [ ] `wp/c-ops`: Track C long branch, head `8d0ba97`;
+- [ ] `wp/c-ops`: Track C long branch, head `2625edd`;
   detailed plan: `plan/wp-c-ops.md`.
-- [ ] `wp/d-matchid`: Track D long branch, head `d5c6da0`;
+- [ ] `wp/d-matchid`: Track D long branch, head `9e0e6b3`;
   detailed plan: `plan/wp-d-matchid.md`.
 - [ ] `main` infra lane: Track E lives on `main` for now;
   detailed plan: `plan/main-infra.md`.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~60% (4 open / 7 leaf tasks).
+Reste estime: ~50% (4 open / 8 leaf tasks).
 
 - [x] Land first hot-path wins on `main`: top-K collection, lazy
   `_source` hydration, WAND / Block-Max WAND, search cache, shared
@@ -47,14 +47,17 @@ Reste estime: ~60% (4 open / 7 leaf tasks).
   `docs/ops/bench-reports/2026-05-16-vs-os-2.17.1/README.md`.
 - [x] Add codec block metadata helper:
   `6f56fd2` on `main`, `30a7b32` on `wp/a-optim`.
-- [ ] Wire the FoR postings codec metadata into the runtime engine path.
+- [x] Align `surch-index` block metadata sizing with the codec source of
+  truth: `2da9249` makes `BLOCK_SIZE` derive from `FOR_BLOCK_SIZE`.
+- [ ] Finish runtime wiring from encoded FoR postings metadata into the
+  search execution path.
 - [ ] Add skip lists on top of the codec path.
 - [ ] Add the next Block-Max WAND step on top of block metadata.
 - [ ] Finish the FST term dictionary path and refresh memory baselines.
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~50% (4 open / 8 leaf tasks).
+Reste estime: ~40% (3 open / 8 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -67,18 +70,17 @@ Reste estime: ~50% (4 open / 8 leaf tasks).
   `20 / 108 / 108 ms`.
 - [x] `ec31e69` emits `summary.md` plus stable `summary.json`
   (`surch.bench.summary.v1`); `6a1fe89` fixes rustfmt.
-- [ ] Promote the human report surface:
-  `target/bench-reports/<sha>/summary.md` locally and
-  `docs/ops/bench-reports/<date>-<context>/README.md` when promoted.
-- [ ] Keep `summary.json` as an agent/CI-validated machine contract next
-  to `summary.md`; the user should not be asked to review raw JSON.
+- [x] `bd00e9e` adds promoted human output via `--promote-dir`:
+  `summary.md` stays local, promoted reports write `README.md`, and
+  `summary.json` remains the agent/CI machine contract.
+- [ ] Ensure every benchmark producer can feed the summary contract.
 - [ ] Add paired RSS reporting for Surch vs OpenSearch.
 - [ ] Promote official paired reports for INSEE, artillery,
   TREC-COVID, and mMARCO-fr.
 
 ## Track C - Ops / Packaging / Snapshots
 
-Reste estime: ~55% (6 open / 11 leaf tasks).
+Reste estime: ~50% (6 open / 12 leaf tasks).
 
 - [x] Docker, Helm, release, signing, and SBOM work landed.
 - [x] Snapshot and SLM work started on `wp/c-ops`.
@@ -86,16 +88,18 @@ Reste estime: ~55% (6 open / 11 leaf tasks).
 - [x] `0a4ca02` refreshes snapshot/packaging plans against repo state.
 - [x] `b14ca94` replaces stale `_pending_` workpackage rows with
   shipped SHAs.
+- [x] `92a8ed9` covers and implements SLM `retention.max_count`
+  pruning for successful snapshots.
 - [ ] Finish snapshot REST coverage.
 - [ ] Run and document S3/MinIO end-to-end snapshot coverage.
 - [ ] Finish restore coverage.
-- [ ] Finish SLM retention.
+- [ ] Finish remaining SLM retention behavior beyond `max_count`.
 - [ ] Keep release verification reproducible from CI artefacts.
 - [ ] Preserve a minimal path to inspect failing release/snapshot runs.
 
 ## Track D - matchID
 
-Reste estime: ~30% (2 open / 7 leaf tasks).
+Reste estime: ~25% (2 open / 8 leaf tasks).
 
 - [x] Intake flow exists under `docs/wp-d-matchid/incoming/`,
   `decisions/`, and `gap-analysis.md`.
@@ -103,14 +107,16 @@ Reste estime: ~30% (2 open / 7 leaf tasks).
 - [x] `3cdac1f` implements `bool.must_not`.
 - [x] `e532a08` syncs gap-analysis with A3 and B1 replay state.
 - [x] B1 replay executes all 30 requests against Surch HEAD.
-- [ ] Refresh OpenSearch / ES-7.x oracle fixtures so replay
-  expectations come from OpenSearch, not Surch.
+- [x] `e8aca54` documents the `deces_v1` OpenSearch / ES-7.x oracle
+  gate and human `summary.md` output.
+- [ ] Execute the OpenSearch / ES-7.x oracle gate and refresh fixture
+  expectations from that reference, not Surch.
 - [ ] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the oracle
   replay and document remaining parity gaps.
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~50% (4 open / 8 leaf tasks).
+Reste estime: ~45% (4 open / 9 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -120,12 +126,13 @@ Reste estime: ~50% (4 open / 8 leaf tasks).
   is missing.
 - [x] `ci-k8s` run `26038117579` failed in 16s instead of the prior
   30m timeout pattern; `ci` run `26038398172` was green.
+- [x] `5c25463` aligns image handoff on `sha-<full commit SHA>` across
+  `docker-build.yml`, `release.yml`, `ci-k8s.yml`, and `make bench-k8s`;
+  missing-image errors now print the exact remediation command.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
-- [ ] Repair the GHCR image handoff so `ndcg-gate` runs the benchmark:
-  align the image tag contract between `docker-build.yml` and
-  `ci-k8s.yml`, then make `make bench-k8s` fail with a clear next
-  command when the image is missing.
+- [ ] Verify on GitHub Actions that missing-image preflight still fails
+  fast and that an existing GHCR image reaches `ndcg-gate` execution.
 - [ ] Always publish run diagnostics and artefacts on failure.
 - [ ] Turn `make bench-k8s` into a real entry point.
 

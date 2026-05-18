@@ -4,7 +4,7 @@ Track principal: C - ops / packaging / snapshots
 Branch: `wp/c-ops`
 Worktree: `.worktrees/wp-c`
 Owner: conductor / APIServer / StorageEngine depending on slice
-Status: active branch exists; latest branch head `8d0ba97`
+Status: active branch exists; latest branch head `2625edd`
 
 ## Finality
 
@@ -15,8 +15,8 @@ Status: active branch exists; latest branch head `8d0ba97`
 - [x] Delivered docs scope:
   `docs/ops/snapshot-plan.md`, `docs/ops/packaging-plan.md`,
   `docs/ops/workpackages.md`.
-- [ ] Next functional scope: snapshot REST, S3/MinIO e2e, restore, SLM
-  retention, release verification.
+- [ ] Next functional scope: snapshot REST, S3/MinIO e2e, restore,
+  remaining SLM retention, release verification.
 - [x] Evidence source: release workflow, Helm chart, snapshot/SLM API,
   `ci`, `ci-k8s`, and verification scripts.
 
@@ -25,6 +25,8 @@ Status: active branch exists; latest branch head `8d0ba97`
 - [x] Snapshot/packaging docs refreshed on `main`: `0a4ca02`.
 - [x] Workpackage SHAs refreshed on `main`: `b14ca94`.
 - [x] SLM policy API exists on `main`.
+- [x] SLM `retention.max_count` merged to `main`: `92a8ed9`
+  (branch commit `2625edd`).
 - [ ] Next functional Track C delivery selected and merged.
 
 ## Lots
@@ -49,7 +51,9 @@ Status: active branch exists; latest branch head `8d0ba97`
 - [ ] Lot 3 - Snapshot / SLM completeness
   - [ ] Finish snapshot REST coverage.
   - [ ] Finish restore coverage.
-  - [ ] Finish SLM retention behavior.
+  - [x] Cover and implement SLM `retention.max_count` pruning for
+    successful snapshots.
+  - [ ] Finish remaining SLM retention behavior beyond `max_count`.
   - [ ] Preserve diagnostics for failure cases.
 
 - [ ] Lot 4 - Release verification

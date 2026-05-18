@@ -3,7 +3,7 @@
 Track principal: E - infra K8s / poc-k8s
 Branch: `main` until a dedicated infra branch is created
 Owner: conductor / infra owner
-Status: active infra lane; latest tracked main commit `23e60b8`
+Status: active infra lane; latest tracked main commit `5c25463`
 
 ## Finality
 
@@ -28,6 +28,7 @@ Status: active infra lane; latest tracked main commit `23e60b8`
 ## Merge State
 
 - [x] Fail-fast GHCR preflight merged to `main`: `23e60b8`.
+- [x] Full-SHA image handoff merged to `main`: `5c25463`.
 - [x] Verification run recorded: `ci-k8s` `26038117579` failed in 16s
   on missing image, replacing 30m timeout pattern.
 - [x] `main` CI after latest integration was green: `26038398172`.
@@ -57,6 +58,7 @@ Status: active infra lane; latest tracked main commit `23e60b8`
   - [x] If the tag is missing, print the exact remediation command:
     trigger `docker-build.yml` for the same ref, then rerun `ci-k8s`.
   - [x] Keep the missing-image preflight fail-fast.
+  - [x] Commit main: `5c25463`.
   - [ ] Gate 1: missing image fails fast with actionable message.
   - [ ] Gate 2: existing image reaches benchmark execution.
 

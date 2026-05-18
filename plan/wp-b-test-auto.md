@@ -15,13 +15,15 @@ Status: active branch exists; latest branch head `65fc759`
 
 - [x] Allowed delivered scope on `main`: `crates/surch-demo/src/bin/`
   and `crates/surch-demo/tests/`.
-- [ ] Next allowed scope: report promotion docs and benchmark artefact
-  schema wiring.
-- [ ] Human-facing report surface:
+- [x] Delivered promotion scope on `main`: `--promote-dir` in
+  `bench_report` and CLI tests.
+- [ ] Next allowed scope: producer coverage and promoted benchmark
+  report publication.
+- [x] Human-facing report surface:
   `target/bench-reports/<sha>/summary.md` for local runs and
   `docs/ops/bench-reports/<date>-<context>/README.md` for promoted
   reports.
-- [ ] Machine-facing artefact:
+- [x] Machine-facing artefact:
   `target/bench-reports/<sha>/summary.json`, generated next to
   `summary.md`; agents/CI validate it, not the user.
 - [x] Evidence source: bench report CLI tests, report artefacts,
@@ -35,6 +37,7 @@ Status: active branch exists; latest branch head `65fc759`
   `cargo test -p surch-demo --test bench_report_cli` OK.
 - [x] Local gates recorded:
   `cargo test -p surch-demo render_markdown_contains_required_sections --bin bench_report` OK.
+- [x] Promotion output merged to `main`: `bd00e9e`.
 - [ ] `wp/b-test-auto` contains the next branch-specific delivery.
 
 ## Lots
@@ -53,18 +56,21 @@ Status: active branch exists; latest branch head `65fc759`
   - [x] Commit main: `ec31e69`.
   - [x] Commit formatting fix: `6a1fe89`.
 
-- [ ] Lot 2 - Official report contract
-  - [ ] Declare `summary.md` / promoted `README.md` as the human review
+- [x] Lot 2 - Official report contract
+  - [x] Declare `summary.md` / promoted `README.md` as the human review
     surface.
-  - [ ] Declare `summary.json` as the agent/CI comparison contract.
-  - [ ] Add a doc note with exact output paths:
+  - [x] Declare `summary.json` as the agent/CI comparison contract.
+  - [x] Add a help note with exact output paths:
     `target/bench-reports/<sha>/summary.md` and
-    `target/bench-reports/<sha>/summary.json`.
-  - [ ] Ensure every benchmark producer can feed the summary contract.
-  - [ ] Gate: user-facing report contains a plain-language verdict;
+    promoted `docs/ops/bench-reports/<date>-<context>/README.md`.
+  - [x] Add `--promote-dir` to write promoted `README.md` plus
+    `summary.json`.
+  - [x] Gate: user-facing report contains a plain-language verdict;
     JSON schema is validated by tests or CI, not by user review.
+  - [x] Commit main: `bd00e9e`.
 
 - [ ] Lot 3 - Promoted reports
+  - [ ] Ensure every benchmark producer can feed the summary contract.
   - [ ] Add paired RSS reporting for Surch vs OpenSearch.
   - [ ] Promote INSEE report to
     `docs/ops/bench-reports/<date>-insee-*/README.md` with SLO verdict.
