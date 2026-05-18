@@ -178,8 +178,8 @@ Tu es [AGENT_NAME], subagent de Surch.
 
 ## Format de reporting utilisateur obligatoire
 
-Tout retour de statut terminal ou intermediaire doit utiliser exactement
-ces trois sections top-level, dans cet ordre:
+Tout retour de statut final, terminal ou intermediaire doit utiliser
+exactement ces trois sections top-level, dans cet ordre:
 
 1. `## Fait`
 2. `## A faire`
@@ -189,7 +189,10 @@ Chaque section doit couvrir Track A a Track E, meme si un track est
 `RAS`.
 
 Le rendu doit etre un tableau texte a largeur fixe dans un bloc
-`text`. Ne pas utiliser de tableau Markdown pour ces statuts: les
+`text`. Cette regle prime sur les anciennes consignes de suivi qui
+demandaient des listes simples ou interdisaient les tableaux larges: les
+tableaux attendus ici sont des tableaux texte paddes, bornes et
+multilignes. Ne pas utiliser de tableau Markdown pour ces statuts: les
 cellules longues debordent dans les terminaux et interfaces chat. Ne pas
 utiliser `<br>`. Gerer les retours ligne manuellement avec des lignes
 multi-cellules ou le track est laisse vide.
