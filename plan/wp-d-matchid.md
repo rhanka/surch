@@ -40,6 +40,8 @@ Status: active branch exists; latest branch head `9e0e6b3`
   OK.
 - [x] Oracle runbook merged and documented on `main`: `e8aca54`
   (branch commit `9e0e6b3`).
+- [x] Oracle runbook now points at a replayable script:
+  `scripts/matchid/deces_v1_elasticsearch_oracle.py`.
 - [ ] Oracle Elasticsearch replay executed against a reference node.
 
 ## Lots
@@ -67,6 +69,10 @@ Status: active branch exists; latest branch head `9e0e6b3`
     response shape.
   - [x] Document the human review artefact:
     `target/matchid-oracle/deces_v1/summary.md`.
+  - [x] Extract the runbook heredoc into
+    `scripts/matchid/deces_v1_elasticsearch_oracle.py`.
+  - [x] Add a local `--dry-run` that validates inputs without requiring
+    Elasticsearch.
   - [ ] Replay `tests/matchid_compat/replays/deces_v1.json` against
     Elasticsearch.
   - [ ] Persist oracle expectations or documented deltas.

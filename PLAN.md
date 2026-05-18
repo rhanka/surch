@@ -118,7 +118,7 @@ Reste estime: ~50% (6 open / 12 leaf tasks).
 
 ## Track D - matchID
 
-Reste estime: ~25% (2 open / 8 leaf tasks).
+Reste estime: ~20% (2 open / 9 leaf tasks).
 
 - [x] Intake flow exists under `docs/wp-d-matchid/incoming/`,
   `decisions/`, and `gap-analysis.md`.
@@ -128,6 +128,9 @@ Reste estime: ~25% (2 open / 8 leaf tasks).
 - [x] B1 replay executes all 30 requests against Surch HEAD.
 - [x] `e8aca54` documents the `deces_v1` Elasticsearch 7.x oracle
   gate and human `summary.md` output.
+- [x] The `deces_v1` Elasticsearch oracle gate is now an executable
+  script with a local `--dry-run`, so the external run no longer depends
+  on copying Python out of Markdown.
 - [ ] Execute the Elasticsearch 7.x oracle gate and refresh fixture
   expectations from that reference, not Surch.
 - [ ] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the oracle

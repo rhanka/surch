@@ -28,6 +28,7 @@ const REPLAY_JSON: &str = include_str!("../../../tests/matchid_compat/replays/de
 
 const INDEX_NAME: &str = "deces";
 const DECES_V1_ORACLE_RUNBOOK: &str = "../../tests/matchid_compat/oracle/deces_v1.md";
+const DECES_V1_ORACLE_SCRIPT: &str = "../../scripts/matchid/deces_v1_elasticsearch_oracle.py";
 
 #[derive(Debug, Deserialize)]
 struct ReplayFile {
@@ -323,6 +324,7 @@ fn matchid_deces_v1_oracle_runbook_is_actionable() {
     });
 
     for required in [
+        "scripts/matchid/deces_v1_elasticsearch_oracle.py",
         "tests/matchid_compat/replays/deces_v1.json",
         "tests/matchid_compat/deces/mapping.json",
         "tests/matchid_compat/deces/slice-1000.ndjson",
@@ -332,6 +334,7 @@ fn matchid_deces_v1_oracle_runbook_is_actionable() {
         "critical shape",
         "summary.md",
         "ELASTICSEARCH_URL",
+        "--dry-run",
     ] {
         assert!(
             runbook.contains(required),
@@ -344,6 +347,27 @@ fn matchid_deces_v1_oracle_runbook_is_actionable() {
             runbook.contains(&entry.name),
             "deces_v1 oracle runbook must list replay request `{}`",
             entry.name
+        );
+    }
+
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DECES_V1_ORACLE_SCRIPT);
+    let script = fs::read_to_string(&script_path).unwrap_or_else(|err| {
+        panic!(
+            "deces_v1 oracle script must be readable at {}: {err}",
+            script_path.display()
+        )
+    });
+    for required in [
+        "ELASTICSEARCH_URL",
+        "target/matchid-oracle/deces_v1",
+        "hits.total.value",
+        "hits.hits[0]._id",
+        "critical shape",
+        "--dry-run",
+    ] {
+        assert!(
+            script.contains(required),
+            "deces_v1 oracle script must mention `{required}`"
         );
     }
 }
