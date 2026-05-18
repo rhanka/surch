@@ -29,6 +29,9 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   and uploaded with `actions/upload-artifact@v4` even when the Job fails.
 - The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
   shell variables inside the Job scripts stay intact.
+- PVC dependencies declared by `claimName:` are checked before `kubectl
+  apply`, so a missing corpus volume fails in seconds instead of waiting
+  for the Job deadline.
 - Job status is fail-closed: `Complete=True` passes, `Failed=True` or a
   30 min timeout fails the workflow.
 

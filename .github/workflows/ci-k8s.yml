@@ -78,16 +78,38 @@ jobs:
             > "target/k8s/${{ inputs.job }}.yaml"
           cat "target/k8s/${{ inputs.job }}.yaml"
 
-      - name: Apply Job manifest
-        run: |
-          kubectl -n "$SCW_NAMESPACE" apply -f "target/k8s/${{ inputs.job }}.yaml"
-
       - name: Resolve Job name
         id: jobname
         run: |
           JOB_NAME=$(grep -m1 '^  name:' "target/k8s/${{ inputs.job }}.yaml" | awk '{print $2}')
           echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
           echo "Job name resolved: $JOB_NAME"
+
+      - name: Validate PVC dependencies
+        run: |
+          set -eu
+          missing=0
+          pvcs="$(awk '/claimName:/ { print $2 }' "target/k8s/${{ inputs.job }}.yaml" | sort -u)"
+          if [ -z "$pvcs" ]; then
+            echo "No PVC dependencies declared by ${{ inputs.job }}."
+            exit 0
+          fi
+          for pvc in $pvcs; do
+            if kubectl -n "$SCW_NAMESPACE" get pvc "$pvc" >/dev/null 2>&1; then
+              echo "PVC present: $pvc"
+            else
+              echo "::error::Missing required PVC in namespace $SCW_NAMESPACE: $pvc"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            kubectl -n "$SCW_NAMESPACE" get pvc || true
+            exit 1
+          fi
+
+      - name: Apply Job manifest
+        run: |
+          kubectl -n "$SCW_NAMESPACE" apply -f "target/k8s/${{ inputs.job }}.yaml"
 
       - name: Wait for Job completion (30 min cap)
         run: |
