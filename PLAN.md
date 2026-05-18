@@ -38,7 +38,7 @@ global status source; branch files carry executable detail.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~70% (5 open / 7 leaf tasks).
+Reste estime: ~60% (4 open / 7 leaf tasks).
 
 - [x] Land first hot-path wins on `main`: top-K collection, lazy
   `_source` hydration, WAND / Block-Max WAND, search cache, shared
@@ -54,7 +54,7 @@ Reste estime: ~70% (5 open / 7 leaf tasks).
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~55% (4 open / 7 leaf tasks).
+Reste estime: ~50% (4 open / 8 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -67,15 +67,18 @@ Reste estime: ~55% (4 open / 7 leaf tasks).
   `20 / 108 / 108 ms`.
 - [x] `ec31e69` emits `summary.md` plus stable `summary.json`
   (`surch.bench.summary.v1`); `6a1fe89` fixes rustfmt.
-- [ ] Promote `summary.json` as the official comparable benchmark
-  contract across report artefacts.
+- [ ] Promote the human report surface:
+  `target/bench-reports/<sha>/summary.md` locally and
+  `docs/ops/bench-reports/<date>-<context>/README.md` when promoted.
+- [ ] Keep `summary.json` as an agent/CI-validated machine contract next
+  to `summary.md`; the user should not be asked to review raw JSON.
 - [ ] Add paired RSS reporting for Surch vs OpenSearch.
 - [ ] Promote official paired reports for INSEE, artillery,
   TREC-COVID, and mMARCO-fr.
 
 ## Track C - Ops / Packaging / Snapshots
 
-Reste estime: ~65% (6 open / 9 leaf tasks).
+Reste estime: ~55% (6 open / 11 leaf tasks).
 
 - [x] Docker, Helm, release, signing, and SBOM work landed.
 - [x] Snapshot and SLM work started on `wp/c-ops`.
@@ -107,7 +110,7 @@ Reste estime: ~30% (2 open / 7 leaf tasks).
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~60% (4 open / 7 leaf tasks).
+Reste estime: ~50% (4 open / 8 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -119,8 +122,10 @@ Reste estime: ~60% (4 open / 7 leaf tasks).
   30m timeout pattern; `ci` run `26038398172` was green.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
-- [ ] Repair the GHCR image handoff so `ndcg-gate` runs the benchmark
-  after the fail-fast preflight succeeds.
+- [ ] Repair the GHCR image handoff so `ndcg-gate` runs the benchmark:
+  align the image tag contract between `docker-build.yml` and
+  `ci-k8s.yml`, then make `make bench-k8s` fail with a clear next
+  command when the image is missing.
 - [ ] Always publish run diagnostics and artefacts on failure.
 - [ ] Turn `make bench-k8s` into a real entry point.
 

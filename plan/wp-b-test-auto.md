@@ -17,6 +17,13 @@ Status: active branch exists; latest branch head `65fc759`
   and `crates/surch-demo/tests/`.
 - [ ] Next allowed scope: report promotion docs and benchmark artefact
   schema wiring.
+- [ ] Human-facing report surface:
+  `target/bench-reports/<sha>/summary.md` for local runs and
+  `docs/ops/bench-reports/<date>-<context>/README.md` for promoted
+  reports.
+- [ ] Machine-facing artefact:
+  `target/bench-reports/<sha>/summary.json`, generated next to
+  `summary.md`; agents/CI validate it, not the user.
 - [x] Evidence source: bench report CLI tests, report artefacts,
   promoted baselines.
 
@@ -47,15 +54,25 @@ Status: active branch exists; latest branch head `65fc759`
   - [x] Commit formatting fix: `6a1fe89`.
 
 - [ ] Lot 2 - Official report contract
-  - [ ] Declare `summary.json` as the official comparable output.
+  - [ ] Declare `summary.md` / promoted `README.md` as the human review
+    surface.
+  - [ ] Declare `summary.json` as the agent/CI comparison contract.
+  - [ ] Add a doc note with exact output paths:
+    `target/bench-reports/<sha>/summary.md` and
+    `target/bench-reports/<sha>/summary.json`.
   - [ ] Ensure every benchmark producer can feed the summary contract.
-  - [ ] Add or update docs for replaying a report from artefacts.
+  - [ ] Gate: user-facing report contains a plain-language verdict;
+    JSON schema is validated by tests or CI, not by user review.
 
 - [ ] Lot 3 - Promoted reports
   - [ ] Add paired RSS reporting for Surch vs OpenSearch.
-  - [ ] Promote INSEE report with SLO verdict.
-  - [ ] Promote artillery report with p50 / p95 / p99 / max.
+  - [ ] Promote INSEE report to
+    `docs/ops/bench-reports/<date>-insee-*/README.md` with SLO verdict.
+  - [ ] Promote artillery report to
+    `docs/ops/bench-reports/<date>-artillery-*/README.md` with
+    p50 / p95 / p99 / max.
   - [ ] Add TREC-COVID and mMARCO-fr measurement entries.
+  - [ ] Gate: human can read the promoted Markdown without opening JSON.
 
 - [ ] Lot N - Closure
   - [ ] Update this plan and `PLAN.md`.

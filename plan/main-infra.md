@@ -16,6 +16,12 @@ Status: active infra lane; latest tracked main commit `23e60b8`
   `.github/workflows/ci-k8s.yml`, `docs/ops/k8s-ci.md`.
 - [ ] Next scope: image production / consumption handoff and
   `make bench-k8s` entry point.
+- [ ] Current actionable issue:
+  `ci-k8s.yml` checks `ghcr.io/rhanka/surch:sha-${GITHUB_SHA::12}`,
+  while `docker-build.yml` currently publishes SHA tags through
+  `docker/metadata-action` with `format=long`.
+- [ ] Human action expected for next infra lot: none by default; agent
+  should align the tag contract and make the command path explicit.
 - [x] Evidence source: GitHub Actions runs, pod diagnostics, and
   workflow artefacts.
 
@@ -45,11 +51,14 @@ Status: active infra lane; latest tracked main commit `23e60b8`
   - [x] Verify with run `26038117579`.
 
 - [ ] Lot 2 - Image handoff
-  - [ ] Decide whether `ci-k8s` depends on a prior image-build workflow,
-    uses a tag fallback, or builds/pushes before bench.
-  - [ ] Implement the chosen handoff.
-  - [ ] Gate: missing image still fails fast; existing image reaches
-    benchmark execution.
+  - [ ] Align image tag convention between `docker-build.yml`,
+    `release.yml`, and `ci-k8s.yml`.
+  - [ ] Make `make bench-k8s` print the exact image tag it expects.
+  - [ ] If the tag is missing, print the exact remediation command:
+    trigger `docker-build.yml` for the same ref, then rerun `ci-k8s`.
+  - [ ] Keep the missing-image preflight fail-fast.
+  - [ ] Gate 1: missing image fails fast with actionable message.
+  - [ ] Gate 2: existing image reaches benchmark execution.
 
 - [ ] Lot 3 - Heavy-run standardisation
   - [ ] Make `ci-k8s` the standard burst / large-corpus path.

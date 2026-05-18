@@ -268,8 +268,23 @@ Chaque track doit contenir:
 
 - `Finalite`: resultat produit attendu a long terme
 - `Livraison proposee`: prochain increment livrable
-- `Decision` ou `Action`: ce que l'utilisateur doit valider, debloquer
-  ou tester, si necessaire
+- `Decision/Action`: qui fait quoi, sur quel artefact, avec quelle
+  valeur par defaut si l'utilisateur ne tranche pas
+
+Regles pour `Decision/Action`:
+
+- ne jamais demander a l'utilisateur de valider un artefact machine brut
+  (`summary.json`, logs JSON, manifests generes) quand un rendu humain
+  existe ou peut etre produit
+- l'agent valide les formats machine, schemas, logs, manifests et run
+  ids; l'utilisateur valide les decisions produit, priorites, UAT et
+  rapports humains (`summary.md`, `README.md`, capture, URL, release)
+- si aucune action utilisateur n'est requise, ecrire
+  `Action: agent inline, aucune decision utilisateur`
+- si une decision est requise, donner une recommandation par defaut et
+  l'impact concret si elle est acceptee
+- si un UAT utilisateur est requis, citer le chemin, l'URL ou le
+  scenario exact a regarder
 
 ```text
 +-------+------------------------------------------------------------------------+
@@ -277,25 +292,51 @@ Chaque track doit contenir:
 +-------+------------------------------------------------------------------------+
 | A     | Finalite: <objectif track A>.                                         |
 |       | Livraison proposee: <prochain increment>.                             |
-|       | Decision/Action: <validation ou action utilisateur>.                  |
+|       | Decision/Action: <qui fait quoi, artefact, defaut>.                   |
 +-------+------------------------------------------------------------------------+
 | B     | Finalite: <objectif track B>.                                         |
 |       | Livraison proposee: <prochain increment>.                             |
-|       | Decision/Action: <validation ou action utilisateur>.                  |
+|       | Decision/Action: <qui fait quoi, artefact, defaut>.                   |
 +-------+------------------------------------------------------------------------+
 | C     | Finalite: <objectif track C>.                                         |
 |       | Livraison proposee: <prochain increment>.                             |
-|       | Decision/Action: <validation ou action utilisateur>.                  |
+|       | Decision/Action: <qui fait quoi, artefact, defaut>.                   |
 +-------+------------------------------------------------------------------------+
 | D     | Finalite: <objectif track D>.                                         |
 |       | Livraison proposee: <prochain increment>.                             |
-|       | Decision/Action: <validation ou action utilisateur>.                  |
+|       | Decision/Action: <qui fait quoi, artefact, defaut>.                   |
 +-------+------------------------------------------------------------------------+
 | E     | Finalite: <objectif track E>.                                         |
 |       | Livraison proposee: <prochain increment>.                             |
-|       | Decision/Action: <validation ou action utilisateur>.                  |
+|       | Decision/Action: <qui fait quoi, artefact, defaut>.                   |
 +-------+------------------------------------------------------------------------+
 ```
+
+### Wrap-up apres tableaux
+
+Apres les trois tableaux, ajouter un court wrap-up obligatoire. Il doit
+dire comment l'agent va executer le prochain pas.
+
+Format:
+
+```text
+Wrap-up:
+- Mode: inline | agents paralleles | attente decision.
+- Prochain lot execute: <track + lot + fichier de plan>.
+- Pourquoi ce mode: <raison courte>.
+- Action utilisateur: <aucune | decision | UAT exact>.
+- Preuve visee: <tests, run ids, artefacts, commit>.
+```
+
+Regles:
+
+- `inline`: a utiliser quand le prochain lot est serre, dans un seul
+  ownership, ou quand la delegation n'a pas ete explicitement autorisee
+- `agents paralleles`: a utiliser seulement si l'utilisateur ou le
+  conductor autorise explicitement la delegation et si les ownerships
+  sont disjoints
+- `attente decision`: a utiliser seulement si avancer sans decision
+  ferait perdre du temps ou risquerait de livrer le mauvais lot
 
 ## Attendus par track
 
