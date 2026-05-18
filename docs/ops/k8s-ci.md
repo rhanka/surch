@@ -65,7 +65,12 @@ Cluster prerequisites:
 `00-init-corpora` declares the three PVCs it needs:
 `surch-corpus-beir` (5 Gi), `surch-corpus-insee` (2 Gi), and
 `surch-scratch` (5 Gi). Run it before `ndcg-gate` or `insee-bench` so
-those recurring Jobs can mount the corpus PVCs read-only.
+those recurring Jobs can mount the corpus PVCs read-only. The INSEE PVC
+is hydrated from matchID's stable examples fixtures:
+`clients_test.csv`, `deaths_test.csv`, and the generated
+`artillery_names.txt` adapter consumed by Surch's Rust artillery harness.
+It intentionally avoids the live INSEE public endpoints, which are not a
+reliable CI dependency.
 
 ## Reading results
 
@@ -116,8 +121,8 @@ namespace returns to its 500m / 512Mi quota baseline.
 ## Known limits
 
 - `00-init-corpora` is the first smoke target to run. It uses a Python
-  image so download and zip extraction do not depend on optional shell
-  tools.
+  image so download, zip extraction, and matchID CSV validation do not
+  depend on optional shell tools.
 - `ndcg-gate` and `insee-bench` still depend on the Surch runtime image
   shipping the driver tools they call (`/bin/sh`, `wget`,
   `scifact-ndcg.sh`, `artillery_bench`, `bench_report`). Until the image
