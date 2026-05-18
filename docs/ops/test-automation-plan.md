@@ -26,7 +26,7 @@ make bench-stress    # artillery-replay vs Surch and OS (~10 min)
 make bench-perf      # bench-local + bench-stress + RSS sampling
 make bench-remote-scw  # provision Scaleway, run bench-perf + 1M scale, teardown
 make bench-all       # full local suite (~30 min)
-make report          # aggregate target/bench-reports/<sha>/*.json -> summary.md
+make report          # aggregate target/bench-reports/<sha>/*.json -> summary.md + summary.json
 ```
 
 Each target: `setup → wait healthy → run → collect → teardown → emit JSON + MD`.
@@ -119,8 +119,9 @@ Implemented:
 - `/crates/surch-demo/src/bin/bench_report.rs` — **B-BENCH-REPORT**.
   Rust binary that scans `target/bench-reports/<sha>/*.json`, recognises
   the three envelope schemas (`surch.bench.artillery.v1`,
-  `surch.bench.rss.v1`, `surch.bench.pair.v1`) and renders a
-  `summary.md` with artillery latency tables (p50/p95/p99/max,
+  `surch.bench.rss.v1`, `surch.bench.pair.v1`) and renders both
+  `summary.md` and a stable machine-readable `summary.json`
+  (`surch.bench.summary.v1`) with artillery latency tables (p50/p95/p99/max,
   issued/errors), RSS peak/final per workload, and a "## SLO checks"
   section gated on the matchID v1 thresholds (p95 ≤ 200 ms,
   max ≤ 500 ms, error rate ≤ 1 %, RSS peak ≤ 1024 MB on the artillery

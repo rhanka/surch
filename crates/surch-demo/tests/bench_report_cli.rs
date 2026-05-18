@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use serde_json::Value;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_bench_report")
@@ -63,6 +64,7 @@ fn help_prints_usage_and_schemas() {
 fn empty_directory_produces_stable_summary_and_zero_exit() {
     let dir = unique_dir("empty");
     let out_path = dir.join("summary.md");
+    let json_path = dir.join("summary.json");
     let output = Command::new(bin())
         .args([
             "--dir",
@@ -85,12 +87,18 @@ fn empty_directory_produces_stable_summary_and_zero_exit() {
     assert!(markdown.contains("_no data_"));
     // No baseline → no regression section.
     assert!(!markdown.contains("## Regression vs baseline"));
+    let json: Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).expect("summary.json should exist"))
+            .expect("summary.json valid json");
+    assert_eq!(json["schema"], "surch.bench.summary.v1");
+    assert_eq!(json["verdict"]["exit_ok"], true);
     let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn summary_contains_tables_for_known_schemas() {
     let dir = unique_dir("tables");
+    let json_path = dir.join("summary.json");
     // Artillery report with PASSING SLOs.
     write_json(
         &dir,
@@ -154,6 +162,13 @@ fn summary_contains_tables_for_known_schemas() {
     // SLO checks all PASS.
     assert!(md.contains("PASS"));
     assert!(!md.contains("FAIL"));
+    let json: Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).expect("summary.json should exist"))
+            .expect("summary.json valid json");
+    assert_eq!(json["schema"], "surch.bench.summary.v1");
+    assert_eq!(json["artillery"][0]["engine"], "surch");
+    assert_eq!(json["rss"][0]["peak_mb"], 512.0);
+    assert_eq!(json["pair"][0]["workload"], "insee25k");
     let _ = fs::remove_dir_all(&dir);
 }
 

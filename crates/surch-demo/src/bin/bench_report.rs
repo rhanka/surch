@@ -12,6 +12,10 @@
 //!                [--baseline target/bench-reports/<other_sha>]
 //!                [--output target/bench-reports/<sha>/summary.md]
 //!
+//! Output:
+//!   * Markdown summary at `--output` (or `<DIR>/summary.md`)
+//!   * Stable JSON summary next to it (`summary.json`)
+//!
 //! Exit code:
 //!   0 → all SLOs pass *and* no regression beyond thresholds vs baseline
 //!   1 → at least one SLO failed or a regression breached the threshold
@@ -38,6 +42,7 @@ use serde_json::Value;
 const SCHEMA_ARTILLERY: &str = "surch.bench.artillery.v1";
 const SCHEMA_RSS: &str = "surch.bench.rss.v1";
 const SCHEMA_PAIR: &str = "surch.bench.pair.v1";
+const SCHEMA_SUMMARY: &str = "surch.bench.summary.v1";
 
 const SLO_ARTILLERY_P95_MS: f64 = 200.0;
 const SLO_ARTILLERY_MAX_MS: f64 = 500.0;
@@ -96,11 +101,22 @@ fn run() -> Result<bool, CliError> {
         .output
         .clone()
         .unwrap_or_else(|| plan.dir.join("summary.md"));
-    write_output(&output_path, &markdown)?;
-    println!("wrote {}", output_path.display());
-
     let slo_ok = slo_results.iter().all(|check| check.passed);
     let regression_ok = regression_results.iter().all(|check| check.passed);
+    write_output(&output_path, &markdown)?;
+    println!("wrote {}", output_path.display());
+    let json_output_path = output_path.with_extension("json");
+    let json_summary = render_json_summary(
+        &sha,
+        baseline_sha.as_deref(),
+        &now,
+        &current,
+        &slo_results,
+        &regression_results,
+        slo_ok && regression_ok,
+    );
+    write_output(&json_output_path, &json_summary)?;
+    println!("wrote {}", json_output_path.display());
     Ok(slo_ok && regression_ok)
 }
 
@@ -636,6 +652,99 @@ fn render_markdown(
     out
 }
 
+fn render_json_summary(
+    sha: &str,
+    baseline_sha: Option<&str>,
+    generated_at: &str,
+    current: &Aggregate,
+    slo: &[SloCheck],
+    regressions: &[RegressionCheck],
+    exit_ok: bool,
+) -> String {
+    let artillery: Vec<Value> = current
+        .artillery
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "label": row.label,
+                "engine": row.engine,
+                "workload": row.workload,
+                "latency_ms": {
+                    "p50": row.p50_ms,
+                    "p95": row.p95_ms,
+                    "p99": row.p99_ms,
+                    "max": row.max_ms,
+                },
+                "issued": row.issued,
+                "errors": row.errors,
+            })
+        })
+        .collect();
+    let rss: Vec<Value> = current
+        .rss
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "label": row.label,
+                "engine": row.engine,
+                "workload": row.workload,
+                "peak_mb": row.peak_mb,
+                "final_mb": row.final_mb,
+            })
+        })
+        .collect();
+    let pair: Vec<Value> = current
+        .pair
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "workload": row.workload,
+                "surch_out": row.surch_out,
+                "os_out": row.os_out,
+            })
+        })
+        .collect();
+    let slo_checks: Vec<Value> = slo
+        .iter()
+        .map(|check| {
+            serde_json::json!({
+                "name": check.name,
+                "detail": check.detail,
+                "passed": check.passed,
+            })
+        })
+        .collect();
+    let regression_checks: Vec<Value> = regressions
+        .iter()
+        .map(|check| {
+            serde_json::json!({
+                "name": check.name,
+                "detail": check.detail,
+                "passed": check.passed,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&serde_json::json!({
+        "schema": SCHEMA_SUMMARY,
+        "sha": sha,
+        "baseline_sha": baseline_sha,
+        "generated_at": generated_at,
+        "artillery": artillery,
+        "rss": rss,
+        "pair": pair,
+        "slo_checks": slo_checks,
+        "regression_checks": regression_checks,
+        "unknown_files": current.unknown_files,
+        "verdict": {
+            "slo_ok": slo.iter().all(|check| check.passed),
+            "regression_ok": regressions.iter().all(|check| check.passed),
+            "exit_ok": exit_ok,
+        }
+    }))
+    .expect("summary json serialization should not fail")
+}
+
 // ---------------------------------------------------------------------------
 // Misc helpers
 // ---------------------------------------------------------------------------
@@ -667,7 +776,7 @@ fn write_output(path: &Path, content: &str) -> Result<(), CliError> {
 fn print_help() {
     println!("surch-demo bench_report");
     println!(
-        "Aggregates JSON envelopes under target/bench-reports/<sha>/ into a Markdown summary."
+        "Aggregates JSON envelopes under target/bench-reports/<sha>/ into Markdown + JSON summaries."
     );
     println!();
     println!("USAGE:");
@@ -683,6 +792,7 @@ fn print_help() {
     println!("  {SCHEMA_ARTILLERY}");
     println!("  {SCHEMA_RSS}");
     println!("  {SCHEMA_PAIR}");
+    println!("  {SCHEMA_SUMMARY} (written as summary.json)");
     println!();
     println!("SLO THRESHOLDS:");
     println!("  artillery p95 ≤ {SLO_ARTILLERY_P95_MS} ms");
