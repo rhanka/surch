@@ -1,110 +1,164 @@
-# Surch Portage Plan
+# Surch Conductor Plan
 
-Date: 2026-05-04
+Updated: 2026-05-18
 
-## Objective
+This is the live conductor plan for Surch. Official tracking runs on
+five tracks:
 
-Rebuild Surch from a clean planning baseline as a Rust port of OpenSearch plus Lucene, with function-level traceability to upstream source, compatibility tests, and autonomous subagent execution.
+- Track A: perf / optimisation
+- Track B: test automation / perf reporting
+- Track C: ops / packaging / snapshots
+- Track D: matchID
+- Track E: infra K8s / poc-k8s
 
-The current Rust prototype remains only as migration context. It is not the target architecture.
+The old phase plan from 2026-05-04 remains useful as an architecture
+reference, but it is no longer the primary day-to-day tracking format.
 
-## Upstream References
+Official work branches:
 
-- OpenSearch clone: `/tmp/surch-portage-references/opensearch`
-- OpenSearch commit: `fead3a928236b61f9c759c61e738b541a148ab9f`
-- Lucene clone: `/tmp/surch-portage-references/lucene`
-- Lucene commit: `7691b7ef9cfe3b87178646f4f32b3854afa0a567`
-- Graphify reports copied under `docs/portage/graphify/`
-- Full graph outputs remain in `/tmp/surch-portage-graph-corpora/*/.graphify/`
+- `wp/a-optim`
+- `wp/b-test-auto`
+- `wp/c-ops`
+- `wp/d-matchid`
 
-## Target Architecture
+Track E currently lives on `main` through CI and `deploy/k8s/` changes
+until a dedicated infra branch is needed.
 
-The target workspace is split by porting boundary, not by prototype convenience:
+## Fait
 
-```text
-crates/
-  surch-types/        # OpenSearch JSON/API types, documents, errors
-  surch-analysis/     # Lucene analyzer/token stream model
-  surch-codec/        # Lucene codec utilities, binary formats, checksums
-  surch-store/        # Directory, translog, manifests, segments, docstore
-  surch-index/        # mappings, indexing chain, postings, term dictionary
-  surch-search/       # Lucene query model, scorers, collectors, fuzzy automata
-  surch-api/          # Axum REST API compatible with OpenSearch
-```
+### Track A - perf / optimisation
 
-Existing `surch-core` and `surch-api` prototype crates must be archived out of the active workspace before new implementation work starts. New feature work lands in `crates/*`.
+- `main` already carries the first hot-path wins: top-K collection,
+  lazy `_source` hydration, WAND / Block-Max WAND, search cache, and
+  shared stored fields.
+- The current optimisation branch is `wp/a-optim` with its worktree in
+  `.worktrees/wp-a`.
+- The published paired baseline against OpenSearch lives in
+  `docs/ops/bench-reports/2026-05-16-vs-os-2.17.1/README.md`.
 
-## Execution Rule
+### Track B - test automation / perf reporting
 
-Every feature ticket must be traceable to upstream:
+- Bench plumbing already exists: `scripts/bench/run-pair.sh`,
+  `scripts/bench/rss-sample.sh`, `make bench-*`, `make report`,
+  `crates/surch-demo/src/bin/artillery_bench.rs`, and
+  `crates/surch-demo/src/bin/bench_report.rs`.
+- JSON artefacts are expected under `target/bench-reports/<sha>/`.
+- Promoted paired baselines already exist for:
+  - SciFact: `NDCG@10 0.6576` vs OpenSearch `0.6537`,
+    `Recall@10 0.8100` vs `0.8033`
+  - BAN Paris 25k: `p50 0 ms`, `p95 20 ms`, `max 20 ms`
+    vs OpenSearch `20 / 108 / 108 ms`
 
-```text
-Epic -> Capability -> Feature -> Function/API -> Golden scenario
-```
+### Track C - ops / packaging / snapshots
 
-No ticket is ready unless it includes:
+- Docker, Helm, release, signing, and SBOM work is already landed.
+- Snapshot and SLM work is already started on `wp/c-ops`; the SLM policy
+  API is merged on `main`.
+- `ci` and `ci-k8s` are the current automation anchors for this track.
 
-- upstream repository, commit, file, class, and method or REST spec
-- owner subagent
-- dependencies
-- allowed paths and forbidden paths
-- failing golden test against Surch and passing oracle against upstream
-- unit, integration, security, and parity gates
+### Track D - matchID
 
-## Phase Order
+- The intake flow exists under `docs/wp-d-matchid/incoming/`,
+  `decisions/`, and `gap-analysis.md`.
+- Replay fixtures already exist under `tests/matchid_compat/`.
+- Actual implementation is ahead of the stale doc on several points:
+  A6, A12, B1, and A13 have already moved.
 
-0. Clean restart housekeeping: archive current prototype state, remove obsolete branch plans, remove stale worktrees, clear runtime/build artifacts, and leave only governance plus upstream references.
-1. Reference harness and blank workspace reset.
-2. Lucene store, codec utilities, segment metadata.
-3. Lucene postings, term dictionary, writer, reader, stored fields, doc values.
-4. Lucene analysis, search model, BM25, collectors, automata, fuzzy query.
-5. OpenSearch REST contracts, response rendering, errors, mappings/settings.
-6. OpenSearch document, update, delete, get, bulk, refresh, translog semantics.
-7. OpenSearch Query DSL, search responses, sorting, pagination, fuzzy signature.
-8. P1/P2 compatibility, admin endpoints, security, performance, release parity.
+### Track E - infra K8s / poc-k8s
 
-## Clean Restart Housekeeping
+- The infra surface already exists in `.github/workflows/ci-k8s.yml`,
+  `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
+- Recent fixes on `main` hardened burst-bench failure handling and PVC
+  bootstrap for K8s jobs.
 
-Before implementation starts, the conductor must make the repository intentionally blank for the new port while preserving recoverability:
+## A faire
 
-- record `git status --short`, `git diff --stat`, and `git worktree list` in `docs/portage/reset/RESET_INVENTORY.md`
-- create an archive branch named `archive/prototype-before-portage-2026-05-04` from the current `develop` tip
-- save a patch of uncommitted user/prototype changes to `docs/portage/reset/prototype-dirty-worktree.patch`
-- remove obsolete `plan/01_BRANCH_*.md`, old `spec/SPEC_*.md`, and old branch prompt/template files
-- remove stale `.worktrees/br-*` only after confirming they have no unique commits not reachable from named branches
-- move or delete prototype implementation crates from the active workspace before creating `crates/*`
-- remove runtime/build artifacts from version consideration: `target/`, `data/`, `.worktrees/runtime-surch/`, generated captures, and local caches
-- rewrite README claims so the repo states "portage in progress" until parity gates prove compatibility
-- update `rules/MASTER.md` and related governance docs so they point at the new `PLAN.md`, `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`, and `spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md`
-- require a clean `git status --short` except for the intentionally staged reset commit before spawning feature subagents
+### Track A - perf / optimisation
 
-## Subagent Allocation
+- Wire the live FoR postings codec into the engine path.
+- Add skip lists and the next Block-Max WAND step on top of the codec.
+- Finish the FST term dictionary path and keep memory baselines current.
 
-- `#1 StorageEngine`: `surch-codec`, `surch-store`, Lucene segment/commit/translog foundations.
-- `#2 Indexer`: `surch-analysis`, `surch-index`, mappings, field types, indexing chain.
-- `#3 SearchEngine`: `surch-search`, Query DSL execution, BM25, fuzzy automata, collectors.
-- `#4 APIServer`: `surch-types`, `surch-api`, REST compatibility, request/response rendering.
+### Track B - test automation / perf reporting
 
-Maximum active work in parallel: four subagents, one feature per subagent.
+- Unify every benchmark output into one comparable JSON schema.
+- Add paired RSS reporting for Surch vs OpenSearch.
+- Promote official paired reports for INSEE and artillery, not only PoC
+  notes.
+- Measure and report TREC-COVID and mMARCO-fr instead of keeping only
+  targets.
 
-## Gates
+### Track C - ops / packaging / snapshots
 
-Each branch must pass:
+- Finish snapshot REST coverage, S3 e2e, restore, and SLM retention.
+- Keep release verification reproducible from CI artefacts.
+- Preserve a minimal path to inspect failing release and snapshot runs.
 
-- `cargo fmt --all`
-- `cargo clippy --workspace --all-targets --all-features`
-- targeted unit tests
-- targeted integration tests
-- targeted golden parity tests
-- unsafe scan with documented exception for any `unsafe`
-- dependency/security scan once `cargo-audit` or `cargo-deny` is configured
+### Track D - matchID
 
-PRs target `develop`. `main` is release-only.
+- Fix A3 first: `bool.must_not` must no longer be ignored silently.
+- Refresh OpenSearch-oracle fixtures so replay expectations come from
+  OpenSearch, not from Surch itself.
+- Bring `docs/wp-d-matchid/gap-analysis.md` back in sync with the code.
 
-## Source Documents
+### Track E - infra K8s / poc-k8s
 
-- Portage spec: `spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md`
-- Autonomous execution plan: `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
-- Reference inventory: `docs/portage/REFERENCES.md`
-- Superpowers design: `docs/superpowers/specs/2026-05-04-opensearch-lucene-rust-port-design.md`
-- Superpowers plan: `docs/superpowers/plans/2026-05-04-opensearch-lucene-rust-portage.md`
+- Make `ci-k8s` the standard heavy-run target for burst and large-corpus
+  checks.
+- Always publish run diagnostics and artefacts on failure.
+- Turn `make bench-k8s` into a real entry point instead of a placeholder.
+
+## Attendus
+
+### Track A - perf / optimisation
+
+- Every major hot-path change must report before/after metrics.
+- Minimum acceptance gate for merges to `main`:
+  - SciFact `NDCG@10 >= 0.65`
+  - explicit non-regression on Rue Payenne
+
+### Track B - test automation / perf reporting
+
+- Every meaningful perf advance must produce a replayable benchmark
+  report.
+- The minimal recurring report must state:
+  - latency `p50 / p95 / p99 / max`
+  - ingestion throughput (`docs/s` or indexed corpus duration)
+  - RSS peak and final
+  - `NDCG@10`
+  - `Recall@10`
+  - SLO verdict (`pass` / `fail`)
+  - OpenSearch baseline comparison when available
+- Heavy perf runs should prefer CI / K8s over local execution.
+
+### Track C - ops / packaging / snapshots
+
+- Snapshot, packaging, and release work must be reported with the exact
+  CI or K8s run ids and produced artefacts.
+- CI must fail closed on broken snapshot or release paths.
+
+### Track D - matchID
+
+- Every matchID status must say which replay or fixture was exercised,
+  what was compared to OpenSearch, and what remains partial.
+- A replay that passes only against Surch-generated expectations is not
+  sufficient to declare parity.
+
+### Track E - infra K8s / poc-k8s
+
+- K8s jobs are expected to emit diagnostics, pod logs, and artefacts
+  even on failure.
+- Cost and timeout guardrails must stay inside the workflows and helper
+  scripts, not only in oral process.
+
+### Reporting format for all tracks
+
+- User-facing status and restart reports must use exactly three
+  top-level sections:
+  - `Fait`
+  - `A faire`
+  - `Attendus`
+- Each section is multi-track and must cover Track A through Track E,
+  even if a track only says `RAS`.
+- Do not use wide Markdown tables for status reports; prefer short
+  bullets with paths, SHAs, run ids, and verdicts inline.

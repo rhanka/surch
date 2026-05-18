@@ -1,10 +1,11 @@
 # Surch workpackages
 
-Surch development runs in three parallel workpackages. Each has its own
-long-lived branch under `wp/` and its own reporting block at the bottom
-of this document. Each commit lands on its WP branch first, then merges
-to `main` as soon as it is green — fast iterative merges while we are
-still pre-production.
+Surch development now runs on five official tracks: A through E.
+Tracks A-D each have a long-lived branch under `wp/`. Track E covers
+infra K8s / `poc-k8s` work and currently lives mostly on `main`
+through CI and `deploy/k8s/` changes. Each commit lands on its track
+branch first when one exists, then merges to `main` as soon as it is
+green — fast iterative merges while we are still pre-production.
 
 ## WP definitions
 
@@ -83,15 +84,36 @@ deployment artefacts (→ WP-C). matchID intake files live in
 `docs/wp-d-matchid/incoming/` only — see that directory's README for
 the exact authoring contract.
 
+### Track E — Infra K8s / poc-k8s
+
+Branch: **`main`** until a dedicated infra branch is needed
+
+Scope:
+
+- `.github/workflows/ci-k8s.yml`
+- `deploy/k8s/jobs/`
+- `docs/ops/k8s-ci.md`
+- heavy-run orchestration for burst bench, corpora bootstrap, and
+  bench artefact publication
+- CI/K8s guardrails: fail-closed behavior, timeouts, PVC/bootstrap,
+  diagnostics, run ergonomics
+
+Out of scope: engine-path optimisation work (→ WP-A), benchmark logic
+itself (→ WP-B), and snapshot/packaging product work unless the change
+is strictly infra glue (→ WP-C).
+
 ## Branch + merge policy
 
-- Four long-lived branches: `wp/a-optim`, `wp/b-test-auto`,
-  `wp/c-ops`, `wp/d-matchid`.
+- Four long-lived workpackage branches:
+  `wp/a-optim`, `wp/b-test-auto`, `wp/c-ops`, `wp/d-matchid`.
+- Track E currently has no dedicated long-lived branch; it is tracked as
+  infra work on `main` and related CI/K8s files.
 - Direct commits stay possible on `main` for tiny cross-cutting
   changes (typos, README), but anything implementation-bearing lands
   on its WP branch first.
-- Each commit carries a `[wp-a]`, `[wp-b]`, `[wp-c]` or `[wp-d]`
-  prefix in the subject so retrospective reading stays simple.
+- Each commit carries a `[wp-a]`, `[wp-b]`, `[wp-c]`, `[wp-d]`, or
+  `[track-e]` prefix in the subject so retrospective reading stays
+  simple.
 - Merges from a WP branch to `main` should happen as soon as the
   commit is green (cargo test + the WP-relevant bench / chart lint).
   No PR ceremony until the first production release.
@@ -102,7 +124,9 @@ the exact authoring contract.
 ## Reporting
 
 The retrospective below covers every commit currently on `main`,
-grouped by workpackage.
+grouped by workpackage. The live conductor status format is now defined
+in `PLAN.md` and `AGENTS.md`; this document remains the longer-form
+backlog and retrospective.
 
 ### WP-A — Optimisation
 
@@ -240,6 +264,8 @@ Ordered by priority gain/effort on the BAN + INSEE + SciFact workloads:
 - WP-D drives WP-A priorities once matchID drops its first intake:
   any missing query type in `incoming/` becomes the new top of the
   WP-A backlog.
+- Track E is the preferred home for heavy-run orchestration and K8s
+  diagnostics once a benchmark no longer belongs in the local loop.
 
 ### WP-D — Évolutions queries pour le portage matchID
 
