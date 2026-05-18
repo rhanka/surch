@@ -51,6 +51,23 @@ jobs:
           echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "image=${GHCR_IMAGE}:sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
+      - name: Verify GHCR image exists
+        run: |
+          set -eu
+          IMAGE_REPO="${GHCR_IMAGE#ghcr.io/}"
+          IMAGE_TAG="sha-${{ steps.image.outputs.sha }}"
+          TOKEN="$(curl -fsSL "https://ghcr.io/token?scope=repository:${IMAGE_REPO}:pull" \
+            | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Could not acquire a GHCR pull token for ${IMAGE_REPO}."
+            exit 1
+          fi
+          curl -fsSI \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${IMAGE_REPO}/manifests/${IMAGE_TAG}" >/dev/null
+          echo "Verified image tag ${GHCR_IMAGE}:${IMAGE_TAG}"
+
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
@@ -130,6 +147,7 @@ jobs:
         run: |
           set -eu
           JOB_NAME="${{ steps.jobname.outputs.name }}"
+          JOB_LABEL="app.kubernetes.io/component=${{ inputs.job }}"
           deadline=$((SECONDS + 1800))
           while [ "$SECONDS" -le "$deadline" ]; do
             conditions="$(kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" \
@@ -138,8 +156,23 @@ jobs:
               echo "Kubernetes Job $JOB_NAME completed."
               exit 0
             fi
-            if printf '%s\n' "$conditions" | grep -qx 'Failed=True'; then
-              echo "::error::Kubernetes Job $JOB_NAME failed."
+            if printf '%s\n' "$conditions" | grep -Eq '^(Failed|FailureTarget)=True$'; then
+              echo "::error::Kubernetes Job $JOB_NAME entered a failure state."
+              kubectl -n "$SCW_NAMESPACE" describe "job/$JOB_NAME" || true
+              kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true
+              kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
+              exit 1
+            fi
+
+            pod_states="$(kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" \
+              -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.name}{":"}{if .state.waiting}{.state.waiting.reason}{end}{if .state.terminated}{.state.terminated.reason}{end}{","}{end}{"\n"}{end}' 2>/dev/null || true)"
+            if [ -n "$pod_states" ]; then
+              printf '%s\n' "$pod_states"
+            fi
+            if printf '%s\n' "$pod_states" | grep -Eq ':(ErrImagePull|ImagePullBackOff|InvalidImageName|CreateContainerConfigError|CreateContainerError|RunContainerError|ContainerCannotRun|StartError)(,|$)'; then
+              echo "::error::Kubernetes pod for Job $JOB_NAME hit a terminal container startup error."
+              kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true
+              kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
               exit 1
             fi
             kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" -o wide || true

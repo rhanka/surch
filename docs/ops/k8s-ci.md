@@ -32,13 +32,18 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   and uploaded with `actions/upload-artifact@v4` even when the Job fails.
   The workflow also publishes a GitHub Actions step summary and stores
   the same Markdown recap as `<job>.gha-summary.md` inside the artifact.
+- Before `kubectl apply`, `ci-k8s` now verifies that the expected GHCR
+  tag already exists. A missing `ghcr.io/rhanka/surch:sha-<short_sha>`
+  image fails immediately instead of burning the full 30 min Job budget.
 - The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
   shell variables inside the Job scripts stay intact.
 - PVC dependencies declared by `claimName:` are checked before `kubectl
   apply`, so a missing corpus volume fails in seconds instead of waiting
   for the Job deadline.
-- Job status is fail-closed: `Complete=True` passes, `Failed=True` or a
-  30 min timeout fails the workflow.
+- Job status is fail-closed: `Complete=True` passes; `Failed=True`,
+  `FailureTarget=True`, terminal pod startup errors
+  (`ErrImagePull` / `ImagePullBackOff` / container config errors), or a
+  30 min timeout fail the workflow.
 
 ## Manual run
 
@@ -62,7 +67,8 @@ Cluster prerequisites:
 - the `burst` pool exists with the taint + nodeSelector contract;
 - `KUBE_CONFIG_DATA` is set in GitHub secrets;
 - the Surch image tag `ghcr.io/rhanka/surch:sha-<short_sha>` exists and
-  is pullable by the cluster.
+  is pullable by the cluster. `ci-k8s` does not build or publish that
+  image; it only verifies the tag before dispatching the K8s Job.
 
 `make bench-k8s` prints the dispatched run id and run URL before it
 starts watching, so the heavy run can be resumed later from the exact
@@ -141,5 +147,8 @@ namespace returns to its 500m / 512Mi quota baseline.
   `scifact-ndcg.sh`, `artillery_bench`, `bench_report`). Until the image
   contract is updated, failures from those Jobs should be diagnosed from
   the uploaded describe/events/log artifacts.
+- A missing GHCR tag is treated as a workflow precondition failure, not
+  as a 30 min benchmark timeout. When that happens, inspect the image
+  publication workflow before re-running `ci-k8s`.
 - `workflow_dispatch` is intentional. Add a PR trigger only after a few
   manual runs have reproduced the budget and image contract.
