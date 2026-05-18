@@ -123,11 +123,13 @@ GHA uploads an artifact named `k8s-bench-<job>-<sha>`. It contains:
 - `<job>.events.txt` and `<job>.job.events.txt`;
 - `<job>.job.log`;
 - per-pod/per-container logs, including `*.previous.log` when present;
-- job-specific `/reports` files copied from the report container:
-  - `ndcg-gate.bench.json`, `ndcg-gate.scifact-surch.out`,
-    `ndcg-gate.scifact-os.out`
-  - `insee-bench.summary.md`, `insee-bench.art-surch.json`,
-    `insee-bench.art-os.json`
+- job-specific benchmark summaries:
+  - `ndcg-gate.summary.md` and `ndcg-gate.bench.json`
+  - `insee-bench.summary.md`
+- raw `/reports` files are copied best-effort from the report container.
+  Completed Pods cannot always be exec'ed by `kubectl cp`, so the
+  workflow also reconstructs benchmark summaries from marked driver logs
+  after Job completion.
 
 ## Latest diagnostics
 
@@ -172,6 +174,27 @@ Current repo response:
   generated `corpus.ndjson` into the read-only BEIR PVC and did not fail
   closed on later HTTP errors. The script now generates that file under
   `mktemp` when needed and uses `set -euo pipefail`.
+- `ci-k8s` run `26065662879` then proved restartable sidecar completion:
+  `SuccessCriteriaMet=True`, `Complete=True`, and the Pod reached
+  `Succeeded`.
+- `f6687db` added a human `ndcg-gate` summary and `tar` to the
+  bench-driver image. `docker-build` run `26066037314` and `ci-k8s` run
+  `26066084990` were green, but the uploaded artifact still lacked the
+  report files because post-completion `kubectl cp` cannot be the only
+  collection path for terminated driver containers.
+- `09d1f15` adds a log-backed report fallback for `ndcg-gate` and
+  `insee-bench`: drivers print marked summary blocks, and the workflow
+  reconstructs `<job>.summary.md` from logs when `/reports` copy is not
+  available.
+- `docker-build` run `26066406292` published runtime and bench-driver
+  images for `09d1f15`.
+- `ci-k8s` run `26066458910` completed `ndcg-gate` in 5m34s and
+  uploaded
+  `k8s-bench-ndcg-gate-09d1f15dedb3e176ae6a9d5f89ef49100496776f`.
+  The artifact contains `ndcg-gate.summary.md` and
+  `ndcg-gate.bench.json`; the summary records Surch
+  `NDCG@10 0.6576`, `Recall@10 0.8100`, bulk `2837.7 ms`, and
+  OpenSearch `NDCG@10 0.6537`, `Recall@10 0.8033`, bulk `9223.1 ms`.
 
 ## Cost guardrails
 
@@ -216,6 +239,10 @@ baseline.
   prebuilt `corpus.ndjson` from the dataset, otherwise it writes the
   generated bulk file to a temporary directory inside the driver
   container.
+- Benchmark summaries are also printed to driver logs with
+  `BEGIN_SURCH_K8S_SUMMARY` / `END_SURCH_K8S_SUMMARY` markers. This is
+  intentional: it preserves a human report after Job completion even
+  when raw `/reports` files cannot be copied from the terminated driver.
 - The reference engine sidecar now declares its own `1000:1000`
   security context instead of inheriting the Surch runtime user's
   `65532:65532` pod default.

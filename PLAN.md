@@ -141,7 +141,7 @@ Reste estime: ~20% (2 open / 9 leaf tasks).
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~9% (2 open / 22 leaf tasks).
+Reste estime: ~4% (1 open / 25 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -200,6 +200,20 @@ Reste estime: ~9% (2 open / 22 leaf tasks).
   security context instead of inheriting the Surch runtime user.
 - [x] `make bench-k8s` prints both the runtime and bench driver image
   tags before dispatch.
+- [x] `f6687db` added a shell/tar-capable bench driver path plus an
+  `ndcg-gate` summary output; `docker-build` run `26066037314` and
+  `ci-k8s` run `26066084990` proved the images and Job completion path,
+  then exposed that post-completion `kubectl cp` cannot be the only
+  report collection path.
+- [x] `09d1f15` reconstructs benchmark summaries from marked driver
+  logs for both `ndcg-gate` and `insee-bench` when direct `/reports`
+  copy is unavailable after container termination.
+- [x] `docker-build` run `26066406292` published both runtime and
+  bench-driver images for `09d1f15`.
+- [x] `ci-k8s` run `26066458910` completed `ndcg-gate` with
+  `SuccessCriteriaMet=True`, `Complete=True`, and artifact
+  `k8s-bench-ndcg-gate-09d1f15dedb3e176ae6a9d5f89ef49100496776f`
+  containing `ndcg-gate.summary.md` and `ndcg-gate.bench.json`.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
 - [x] Always publish run diagnostics and artefacts on failure.
@@ -209,7 +223,7 @@ Reste estime: ~9% (2 open / 22 leaf tasks).
   security context.
 - [x] Verify on GitHub Actions that a published GHCR image reaches
   `ndcg-gate` benchmark execution after the runtime fixes.
-- [ ] Verify on GitHub Actions that the restartable sidecar manifests
+- [x] Verify on GitHub Actions that the restartable sidecar manifests
   report Job `Complete=True`.
 - [x] Turn `make bench-k8s` into a real entry point.
 

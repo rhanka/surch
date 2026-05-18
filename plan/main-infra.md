@@ -14,8 +14,8 @@ Status: active infra lane; merge state below is the source of truth
 
 - [x] Delivered scope:
   `.github/workflows/ci-k8s.yml`, `docs/ops/k8s-ci.md`.
-- [ ] Next scope: prove restartable sidecar completion on GitHub
-  Actions and promote `ci-k8s` as the heavy-run target.
+- [ ] Next scope: promote `ci-k8s` as the standard burst /
+  large-corpus heavy-run target.
 - [x] Image handoff issue fixed locally for next commit:
   `ci-k8s.yml`, `docker-build.yml`, and `release.yml` use
   `ghcr.io/rhanka/surch:sha-<full commit SHA>`.
@@ -68,10 +68,24 @@ Status: active infra lane; merge state below is the source of truth
   security context.
 - [x] `make bench-k8s` prints the runtime and bench driver tags before
   dispatch.
+- [x] `f6687db` made `ndcg-gate` emit a human summary and added `tar` to
+  the bench-driver image. `docker-build` run `26066037314` published
+  the images and `ci-k8s` run `26066084990` proved Job completion, but
+  still showed no copied benchmark summary because the completed driver
+  container was no longer execable by `kubectl cp`.
+- [x] `09d1f15` added a log-backed report fallback for `ndcg-gate` and
+  `insee-bench`; marked driver logs can now reconstruct
+  `<job>.summary.md` after Job completion.
+- [x] `docker-build` run `26066406292` published runtime and bench
+  driver images for `09d1f15`.
+- [x] `ci-k8s` run `26066458910` completed `ndcg-gate` in 5m34s with
+  `SuccessCriteriaMet=True`, `Complete=True`, and artifact
+  `k8s-bench-ndcg-gate-09d1f15dedb3e176ae6a9d5f89ef49100496776f`
+  containing the reconstructed benchmark summary and report index.
 - [x] Verification run recorded: `ci-k8s` `26038117579` failed in 16s
   on missing image, replacing 30m timeout pattern.
 - [x] `main` CI after latest integration was green: `26038398172`.
-- [ ] `ci-k8s` heavy run reports Job `Complete=True`.
+- [x] `ci-k8s` heavy run reports Job `Complete=True`.
   - [x] Diagnose image contract mismatch between GHCR preflight and
     rendered Job manifests.
   - [x] Diagnose next runtime blockers: Surch distroless driver image
@@ -79,7 +93,8 @@ Status: active infra lane; merge state below is the source of truth
     pod-level `65532:65532` security context.
   - [x] Prove `ndcg-driver` benchmark execution with run `26064198159`.
   - [x] Diagnose sidecar completion blocker from run `26064198159`.
-  - [ ] Prove restartable sidecar manifests on GitHub Actions.
+  - [x] Prove restartable sidecar manifests on GitHub Actions:
+    `ci-k8s` runs `26065662879`, `26066084990`, and `26066458910`.
 
 ## Lots
 
@@ -98,7 +113,7 @@ Status: active infra lane; merge state below is the source of truth
   - [x] Commit main: `23e60b8`.
   - [x] Verify with run `26038117579`.
 
-- [ ] Lot 2 - Image handoff
+- [x] Lot 2 - Image handoff
   - [x] Align image tag convention between `docker-build.yml`,
     `release.yml`, and `ci-k8s.yml`.
   - [x] Align rendered Job images with the same `sha-<full commit SHA>`
@@ -113,7 +128,7 @@ Status: active infra lane; merge state below is the source of truth
     pull failure; run `26058595173`.
   - [x] Gate 2b: existing image reaches benchmark execution after the
     driver/security-context runtime fixes.
-  - [ ] Gate 2c: restartable sidecar manifests allow Job
+  - [x] Gate 2c: restartable sidecar manifests allow Job
     `Complete=True` after driver exit.
 
 - [ ] Lot 3 - Heavy-run standardisation
@@ -136,9 +151,12 @@ Status: active infra lane; merge state below is the source of truth
     fail closed on HTTP/script errors.
   - [x] Make `bench-k8s` print the runtime and bench driver image
     contracts before dispatch.
+  - [x] Make `ndcg-gate` publish a human benchmark summary into the
+    uploaded artifact even when post-completion `kubectl cp` cannot
+    read `/reports` from the terminated driver container.
   - [ ] Make `ci-k8s` the standard burst / large-corpus path.
   - [x] Turn `make bench-k8s` into a real entry point.
 
-- [ ] Lot N - Closure
-  - [ ] Update this plan and `PLAN.md`.
-  - [ ] Record run ids and artefact paths.
+- [x] Lot N - Closure
+  - [x] Update this plan and `PLAN.md` for the K8s gate proof.
+  - [x] Record run ids and artefact paths for `ndcg-gate`.
