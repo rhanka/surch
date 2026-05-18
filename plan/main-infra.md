@@ -43,6 +43,11 @@ Status: active infra lane; merge state below is the source of truth
 - [x] Docker build publishes a shell-capable benchmark driver image as
   `ghcr.io/rhanka/surch:bench-sha-<full commit SHA>` while keeping the
   default runtime image distroless.
+- [x] `docker-build` run `26063701483` kept the runtime image green but
+  failed the bench-driver stage because `.dockerignore` excluded
+  `scripts/bench/scifact-ndcg.sh`.
+- [x] `.dockerignore` now re-includes only the K8s SciFact gate script
+  needed by the bench-driver image.
 - [x] `ndcg-gate` and `insee-bench` use the bench driver image for
   shell/scripts/tools; the Surch sidecar keeps the runtime image.
 - [x] The reference engine sidecar now has a per-container `1000:1000`
@@ -101,6 +106,9 @@ Status: active infra lane; merge state below is the source of truth
   - [x] Make the wait loop fail early on terminal pod/container states.
   - [x] Provide a shell-capable benchmark driver image/stage for
     `ndcg-gate` and `insee-bench`.
+  - [x] Fix the Docker build context so the bench-driver stage can copy
+    `scripts/bench/scifact-ndcg.sh`; first failing run:
+    `26063701483`.
   - [x] Move the reference engine sidecar to a compatible per-container
     security context.
   - [x] Make `bench-k8s` print the runtime and bench driver image

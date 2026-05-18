@@ -152,6 +152,10 @@ Current repo response:
   benchmark tooling.
 - The reference engine sidecar overrides the pod default with a
   `1000:1000` security context.
+- `docker-build` run `26063701483` kept the runtime image publication
+  green but failed the first bench-driver push because `.dockerignore`
+  still excluded `scripts/bench/scifact-ndcg.sh`; the Docker context now
+  re-includes only that script from the ignored scripts tree.
 
 ## Cost guardrails
 

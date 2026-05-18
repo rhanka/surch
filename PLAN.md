@@ -141,7 +141,7 @@ Reste estime: ~20% (2 open / 9 leaf tasks).
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~15% (2 open / 16 leaf tasks).
+Reste estime: ~11% (2 open / 18 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -173,6 +173,12 @@ Reste estime: ~15% (2 open / 16 leaf tasks).
 - [x] Docker build now publishes a separate shell-capable benchmark
   driver tag `bench-sha-<full commit SHA>` next to the distroless
   runtime tag.
+- [x] `docker-build` run `26063701483` proved the runtime image still
+  publishes, then failed the new bench-driver stage because
+  `.dockerignore` excluded `scripts/bench/scifact-ndcg.sh`.
+- [x] `.dockerignore` now re-includes only
+  `scripts/bench/scifact-ndcg.sh` from the ignored scripts tree, so the
+  bench-driver stage can copy the K8s SciFact gate script.
 - [x] `ndcg-gate` and `insee-bench` use the bench driver tag for
   scripts/tools while keeping `surch-api` on the runtime image.
 - [x] The reference engine sidecar declares its own `1000:1000`

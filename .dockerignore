@@ -12,5 +12,8 @@ demo/node_modules
 docs/poc/reports
 plan
 scripts
+!scripts/
+!scripts/bench/
+!scripts/bench/scifact-ndcg.sh
 *.png
 .DS_Store
