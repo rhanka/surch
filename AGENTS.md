@@ -1,5 +1,26 @@
 # Directives de developpement agentique - Surch
 
+Ce fichier est la source canonique unique pour les agents humains ou
+LLM travaillant sur ce repo, incluant Codex et Claude. Ne pas dupliquer
+ces regles dans un `CLAUDE.md`, `CODEX.md` ou autre fichier local: si
+une guidance agentique change, elle change ici.
+
+## Articulation avec Superpowers
+
+Les skills Superpowers cadrent l'execution locale d'une tache:
+brainstorming, TDD, debugging, plans d'implementation ponctuels,
+verification avant cloture, etc.
+
+Ils ne remplacent pas le suivi persistant du repo. Pour Surch:
+
+- `AGENTS.md` definit les regles de pilotage, reporting et coordination
+  multi-agents
+- `PLAN.md` porte l'etat global vivant par tracks A-E
+- les plans detailles par branche, lorsqu'ils existent, decomposent le
+  travail executable en cases a cocher
+- les specs/plans Superpowers restent utiles pour une feature bornee,
+  mais ne sont pas la source du reporting global dans le temps
+
 ## Role du Conductor
 
 Le Conductor pilote le repo sur l'etat reel du codebase, pas sur des
@@ -106,57 +127,126 @@ Tu es [AGENT_NAME], subagent de Surch.
 === FIN DIRECTIVE ===
 ```
 
-## Format de retour subagent obligatoire
+## Format de reporting utilisateur obligatoire
 
-Tout retour terminal ou intermediaire doit utiliser exactement:
+Tout retour de statut terminal ou intermediaire doit utiliser exactement
+ces trois sections top-level, dans cet ordre:
 
-```md
-## Fait
-### Track A
-- ...
-### Track B
-- ...
-### Track C
-- ...
-### Track D
-- ...
-### Track E
-- ...
+1. `## Fait`
+2. `## A faire`
+3. `## Attendus`
 
-## A faire
-### Track A
-- ...
-### Track B
-- ...
-### Track C
-- ...
-### Track D
-- ...
-### Track E
-- ...
+Chaque section doit couvrir Track A a Track E, meme si un track est
+`RAS`.
 
-## Attendus
-### Track A
-- ...
-### Track B
-- ...
-### Track C
-- ...
-### Track D
-- ...
-### Track E
-- ...
+Le rendu doit etre un tableau texte a largeur fixe dans un bloc
+`text`. Ne pas utiliser de tableau Markdown pour ces statuts: les
+cellules longues debordent dans les terminaux et interfaces chat. Ne pas
+utiliser `<br>`. Gerer les retours ligne manuellement avec des lignes
+multi-cellules ou le track est laisse vide.
+
+### `Fait`
+
+Objectif: dire ce qui est livre, committe, pousse et merge vers `main`.
+
+```text
++-------+------------------------------------------------------------------------+
+| Track | Commit / merge vers main                                               |
++-------+------------------------------------------------------------------------+
+| A     | MERGE MAIN: oui/non.                                                   |
+|       | main: <sha ou RAS>. branche: <sha ou RAS>.                             |
+|       | Preuve: <test/run/verdict utile>.                                      |
++-------+------------------------------------------------------------------------+
+| B     | MERGE MAIN: oui/non.                                                   |
+|       | main: <sha ou RAS>. branche: <sha ou RAS>.                             |
+|       | Preuve: <test/run/verdict utile>.                                      |
++-------+------------------------------------------------------------------------+
+| C     | MERGE MAIN: oui/non.                                                   |
+|       | main: <sha ou RAS>. branche: <sha ou RAS>.                             |
+|       | Preuve: <test/run/verdict utile>.                                      |
++-------+------------------------------------------------------------------------+
+| D     | MERGE MAIN: oui/non.                                                   |
+|       | main: <sha ou RAS>. branche: <sha ou RAS>.                             |
+|       | Preuve: <test/run/verdict utile>.                                      |
++-------+------------------------------------------------------------------------+
+| E     | MERGE MAIN: oui/non.                                                   |
+|       | main: <sha ou RAS>. branche: <sha ou RAS>.                             |
+|       | Preuve: <test/run/verdict utile>.                                      |
++-------+------------------------------------------------------------------------+
 ```
 
-Regles de forme:
+### `A faire`
 
-- exactement ces trois sections top-level
-- couvrir Track A a Track E meme si c'est `RAS`
-- pas de tableaux larges dans les statuts utilisateur
-- preferer des listes courtes avec SHAs, run ids, chemins et verdicts
-  inline
-- definir les acronymes de benchmark au premier usage si le contexte
-  ne les rend pas evidents
+Objectif: donner le reste a faire, avec un pourcentage relatif au plan
+vivant, pas une estimation floue du projet total.
+
+Regles:
+
+- le `% reste` est calcule par rapport au `PLAN.md` courant ou au plan
+  de branche explicitement cite
+- si le plan est stale, l'agent doit d'abord le signaler et proposer de
+  l'actualiser avant de donner un pourcentage
+- si le pourcentage est une estimation de conductor, l'ecrire comme
+  `~NN%` et citer la base
+
+```text
++-------+--------+----------------------------------------------------------------+
+| Track | Reste  | Travail restant                                                |
++-------+--------+----------------------------------------------------------------+
+| A     | ~NN%   | Base: PLAN.md Track A.                                         |
+|       |        | <prochain travail concret>.                                   |
++-------+--------+----------------------------------------------------------------+
+| B     | ~NN%   | Base: PLAN.md Track B.                                         |
+|       |        | <prochain travail concret>.                                   |
++-------+--------+----------------------------------------------------------------+
+| C     | ~NN%   | Base: PLAN.md Track C.                                         |
+|       |        | <prochain travail concret>.                                   |
++-------+--------+----------------------------------------------------------------+
+| D     | ~NN%   | Base: PLAN.md Track D.                                         |
+|       |        | <prochain travail concret>.                                   |
++-------+--------+----------------------------------------------------------------+
+| E     | ~NN%   | Base: PLAN.md Track E.                                         |
+|       |        | <prochain travail concret>.                                   |
++-------+--------+----------------------------------------------------------------+
+```
+
+### `Attendus`
+
+Objectif: orienter livraison et decisions utilisateur. Chaque track doit
+rappeler la finalite pour eviter la derive.
+
+Chaque track doit contenir:
+
+- `Finalite`: resultat produit attendu a long terme
+- `Livraison proposee`: prochain increment livrable
+- `Decision` ou `Action`: ce que l'utilisateur doit valider, debloquer
+  ou tester, si necessaire
+
+```text
++-------+------------------------------------------------------------------------+
+| Track | Attendu oriente livraison                                             |
++-------+------------------------------------------------------------------------+
+| A     | Finalite: <objectif track A>.                                         |
+|       | Livraison proposee: <prochain increment>.                             |
+|       | Decision/Action: <validation ou action utilisateur>.                  |
++-------+------------------------------------------------------------------------+
+| B     | Finalite: <objectif track B>.                                         |
+|       | Livraison proposee: <prochain increment>.                             |
+|       | Decision/Action: <validation ou action utilisateur>.                  |
++-------+------------------------------------------------------------------------+
+| C     | Finalite: <objectif track C>.                                         |
+|       | Livraison proposee: <prochain increment>.                             |
+|       | Decision/Action: <validation ou action utilisateur>.                  |
++-------+------------------------------------------------------------------------+
+| D     | Finalite: <objectif track D>.                                         |
+|       | Livraison proposee: <prochain increment>.                             |
+|       | Decision/Action: <validation ou action utilisateur>.                  |
++-------+------------------------------------------------------------------------+
+| E     | Finalite: <objectif track E>.                                         |
+|       | Livraison proposee: <prochain increment>.                             |
+|       | Decision/Action: <validation ou action utilisateur>.                  |
++-------+------------------------------------------------------------------------+
+```
 
 ## Attendus par track
 
