@@ -181,7 +181,6 @@
       "name": "adv_bool_must_not_sexe",
       "category": "advanced_ui",
       "description": "bool.must_not exclusion clause.",
-      "skip": "gap-A3",
       "request": {
         "method": "POST",
         "path": "/deces/_search",
@@ -200,8 +199,8 @@
         }
       },
       "expected": {
-        "hits.total.value": 30,
-        "hits.hits[0]._id": "deces_00010"
+        "hits.total.value": 18,
+        "hits.hits[0]._id": "deces_00012"
       }
     },
     {

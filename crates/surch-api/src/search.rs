@@ -219,14 +219,16 @@ pub enum SearchQuery {
     ///
     /// Semantics (mirroring ES 7.x):
     /// - a document matches when **all** `must` and `filter` clauses match,
-    ///   **and** at least `minimum_should_match` of the `should` clauses
-    ///   match (if `should` is non-empty and `minimum_should_match > 0`),
-    /// - `filter` clauses do **not** contribute to `_score`,
+    ///   **none** of the `must_not` clauses match, **and** at least
+    ///   `minimum_should_match` of the `should` clauses match (if
+    ///   `should` is non-empty and `minimum_should_match > 0`),
+    /// - `filter` and `must_not` clauses do **not** contribute to `_score`,
     /// - `must` and matching `should` clauses sum into `_score`,
     /// - the result `_score` is multiplied by `boost`.
     Bool {
         must: Vec<SearchQuery>,
         filter: Vec<SearchQuery>,
+        must_not: Vec<SearchQuery>,
         should: Vec<SearchQuery>,
         minimum_should_match: u32,
         boost: f64,
@@ -2087,16 +2089,19 @@ fn score_for_query(
         }
         SearchQuery::Bool {
             must,
+            must_not,
             should,
             minimum_should_match,
             boost,
             ..
         } => {
-            // `filter` clauses are excluded — they restrict candidacy, not score.
+            // `filter` and `must_not` clauses are excluded — they restrict
+            // candidacy, not score.
             let must_score: f64 = must
                 .iter()
                 .map(|clause| score_for_query(clause, internal_doc_id, scoring_context, source))
                 .sum();
+            let _ = must_not;
 
             // The wildcard arm at the bottom returns 1.0 for non-scoring
             // sub-queries; filter that placeholder out so it doesn't inflate
@@ -2372,13 +2377,19 @@ fn collect_scoring_field_tokens(
         SearchQuery::Bool {
             must,
             filter,
+            must_not,
             should,
             ..
         } => {
             // `filter` clauses do not score but we still need their term
             // statistics for correct posting candidate evaluation when
             // they wrap scoring sub-queries indirectly (cheap, idempotent).
-            for clause in must.iter().chain(filter.iter()).chain(should.iter()) {
+            for clause in must
+                .iter()
+                .chain(filter.iter())
+                .chain(must_not.iter())
+                .chain(should.iter())
+            {
                 collect_scoring_field_tokens(clause, mapping, field_tokens);
             }
         }
@@ -3588,14 +3599,7 @@ fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
 
     for key in object.keys() {
         match key.as_str() {
-            "must" | "filter" | "should" | "minimum_should_match" | "boost" => {}
-            "must_not" => {
-                return Err(OpenSearchError::new(
-                    StatusCode::BAD_REQUEST,
-                    "parsing_exception",
-                    "`bool.must_not` is not implemented yet",
-                ));
-            }
+            "must" | "filter" | "must_not" | "should" | "minimum_should_match" | "boost" => {}
             unknown => {
                 return Err(OpenSearchError::new(
                     StatusCode::BAD_REQUEST,
@@ -3608,15 +3612,16 @@ fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
 
     let must = parse_bool_clause_bucket(object, "must")?;
     let filter = parse_bool_clause_bucket(object, "filter")?;
+    let must_not = parse_bool_clause_bucket(object, "must_not")?;
     let should = parse_bool_clause_bucket(object, "should")?;
 
     // Each bucket-key is optional individually but at least one must be
     // present, otherwise the body is empty and the request is malformed.
-    if must.is_empty() && filter.is_empty() && should.is_empty() {
+    if must.is_empty() && filter.is_empty() && must_not.is_empty() && should.is_empty() {
         return Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
-            "bool query must contain at least one of `must`, `filter`, or `should`",
+            "bool query must contain at least one of `must`, `filter`, `must_not`, or `should`",
         ));
     }
 
@@ -3625,7 +3630,7 @@ fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         None => {
             // ES 7.x rule: when the only non-empty bucket is `should`,
             // MSM defaults to 1; otherwise it defaults to 0.
-            if must.is_empty() && filter.is_empty() && !should.is_empty() {
+            if must.is_empty() && filter.is_empty() && must_not.is_empty() && !should.is_empty() {
                 1
             } else {
                 0
@@ -3641,6 +3646,7 @@ fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     Ok(SearchQuery::Bool {
         must,
         filter,
+        must_not,
         should,
         minimum_should_match,
         boost,
@@ -4993,6 +4999,7 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
         SearchQuery::Bool {
             must,
             filter,
+            must_not,
             should,
             minimum_should_match,
             ..
@@ -5002,6 +5009,9 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
                 return false;
             }
             if !filter.iter().all(|q| query_matches(q, source, mapping)) {
+                return false;
+            }
+            if must_not.iter().any(|q| query_matches(q, source, mapping)) {
                 return false;
             }
             // `should` clauses: count matches and compare against MSM.
@@ -5799,11 +5809,13 @@ fn highlight_spans_for_query(text: &str, query: &SearchQuery, field: &str) -> Ve
         SearchQuery::Bool {
             must,
             filter,
+            must_not,
             should,
             ..
         } => must
             .iter()
             .chain(filter.iter())
+            .chain(must_not.iter())
             .chain(should.iter())
             .flat_map(|clause| highlight_spans_for_query(text, clause, field))
             .collect(),
