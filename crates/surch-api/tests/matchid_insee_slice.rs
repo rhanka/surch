@@ -31,10 +31,8 @@ use serde_json::Value;
 use surch_api::app_router;
 use tower::ServiceExt;
 
-const MAPPING_BODY: &str =
-    include_str!("../../../tests/matchid_compat/deces/mapping.json");
-const SLICE_GZ: &[u8] =
-    include_bytes!("../../../tests/matchid_compat/deces/slice-10000.ndjson.gz");
+const MAPPING_BODY: &str = include_str!("../../../tests/matchid_compat/deces/mapping.json");
+const SLICE_GZ: &[u8] = include_bytes!("../../../tests/matchid_compat/deces/slice-10000.ndjson.gz");
 
 const INDEX_NAME: &str = "deces";
 
@@ -63,8 +61,7 @@ fn matchid_insee_slice_b2_v1_loads_and_serves_match_query() {
     // against accidental synthetic-namespace reuse (`deces_NNNNN`)
     // when the slice is regenerated.
     let first_action = slice.lines().next().expect("first line");
-    let first_action_json: Value =
-        serde_json::from_str(first_action).expect("first action parses");
+    let first_action_json: Value = serde_json::from_str(first_action).expect("first action parses");
     let first_id = first_action_json
         .pointer("/index/_id")
         .and_then(Value::as_str)
@@ -85,12 +82,8 @@ fn matchid_insee_slice_b2_v1_loads_and_serves_match_query() {
     ));
     assert_eq!(create_status, StatusCode::OK.as_u16(), "create index OK");
 
-    let (bulk_status, bulk_body) = runtime.block_on(execute(
-        router.clone(),
-        Method::POST,
-        "/_bulk",
-        slice,
-    ));
+    let (bulk_status, bulk_body) =
+        runtime.block_on(execute(router.clone(), Method::POST, "/_bulk", slice));
     assert_eq!(
         bulk_status,
         StatusCode::OK.as_u16(),
@@ -146,12 +139,7 @@ fn matchid_insee_slice_b2_v1_loads_and_serves_match_query() {
     );
 }
 
-async fn execute(
-    router: Router,
-    method: Method,
-    path: &str,
-    body: String,
-) -> (u16, Option<Value>) {
+async fn execute(router: Router, method: Method, path: &str, body: String) -> (u16, Option<Value>) {
     let response = router
         .oneshot(
             Request::builder()

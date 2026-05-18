@@ -177,10 +177,11 @@ impl FsRepository {
                 key: tmp.display().to_string(),
                 source,
             })?;
-            file.write_all(bytes).map_err(|source| RepositoryError::Io {
-                key: tmp.display().to_string(),
-                source,
-            })?;
+            file.write_all(bytes)
+                .map_err(|source| RepositoryError::Io {
+                    key: tmp.display().to_string(),
+                    source,
+                })?;
             file.sync_all().map_err(|source| RepositoryError::Io {
                 key: tmp.display().to_string(),
                 source,
@@ -448,11 +449,11 @@ impl DedicatedRuntime {
                 source,
             })?;
 
-        let handle = handle_rx
-            .recv()
-            .map_err(|_| RepositoryError::InvalidConfig(
+        let handle = handle_rx.recv().map_err(|_| {
+            RepositoryError::InvalidConfig(
                 "failed to receive S3 runtime handle from background thread".to_owned(),
-            ))?;
+            )
+        })?;
 
         Ok(Self {
             handle,
@@ -550,10 +551,9 @@ async fn build_s3_client(config: &S3RepositoryConfig) -> aws_sdk_s3::Client {
                 .unwrap_or_else(|| "us-east-1".to_owned()),
         ));
 
-    if let (Some(access_key), Some(secret_key)) = (
-        config.access_key.as_deref(),
-        config.secret_key.as_deref(),
-    ) {
+    if let (Some(access_key), Some(secret_key)) =
+        (config.access_key.as_deref(), config.secret_key.as_deref())
+    {
         let credentials = Credentials::new(
             access_key,
             secret_key,
@@ -607,12 +607,7 @@ impl SnapshotRepository for S3Repository {
         let client = self.client.clone();
         let key_for_err = key.to_owned();
         self.runtime.handle().block_on(async move {
-            let response = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&full)
-                .send()
-                .await;
+            let response = client.get_object().bucket(&bucket).key(&full).send().await;
             match response {
                 Ok(output) => {
                     let aggregated = output
@@ -620,7 +615,7 @@ impl SnapshotRepository for S3Repository {
                         .collect()
                         .await
                         .map_err(|error| s3_error_to_repository(&full, error))?;
-                    Ok(Bytes::from(aggregated.into_bytes()))
+                    Ok(aggregated.into_bytes())
                 }
                 Err(error) => {
                     let service_err = error.into_service_error();
@@ -654,44 +649,46 @@ impl SnapshotRepository for S3Repository {
         let bucket = self.config.bucket.clone();
         let client = self.client.clone();
         let prefix_clone = full_prefix.clone();
-        self.runtime.handle().block_on(async move {
-            let mut out: Vec<String> = Vec::new();
-            let mut continuation_token: Option<String> = None;
-            loop {
-                let mut req = client.list_objects_v2().bucket(&bucket);
-                if !prefix_clone.is_empty() {
-                    req = req.prefix(&prefix_clone);
-                }
-                if let Some(token) = continuation_token.as_deref() {
-                    req = req.continuation_token(token);
-                }
-                let output = req
-                    .send()
-                    .await
-                    .map_err(|error| s3_error_to_repository(&prefix_clone, error.into_service_error()))?;
-                for obj in output.contents() {
-                    if let Some(k) = obj.key() {
-                        out.push(k.to_owned());
+        self.runtime
+            .handle()
+            .block_on(async move {
+                let mut out: Vec<String> = Vec::new();
+                let mut continuation_token: Option<String> = None;
+                loop {
+                    let mut req = client.list_objects_v2().bucket(&bucket);
+                    if !prefix_clone.is_empty() {
+                        req = req.prefix(&prefix_clone);
                     }
-                }
-                if output.is_truncated().unwrap_or(false) {
-                    continuation_token = output.next_continuation_token().map(str::to_owned);
-                    if continuation_token.is_none() {
+                    if let Some(token) = continuation_token.as_deref() {
+                        req = req.continuation_token(token);
+                    }
+                    let output = req.send().await.map_err(|error| {
+                        s3_error_to_repository(&prefix_clone, error.into_service_error())
+                    })?;
+                    for obj in output.contents() {
+                        if let Some(k) = obj.key() {
+                            out.push(k.to_owned());
+                        }
+                    }
+                    if output.is_truncated().unwrap_or(false) {
+                        continuation_token = output.next_continuation_token().map(str::to_owned);
+                        if continuation_token.is_none() {
+                            break;
+                        }
+                    } else {
                         break;
                     }
-                } else {
-                    break;
                 }
-            }
-            Ok(out)
-        }).map(|raw: Vec<String>| {
-            let mut stripped: Vec<String> = raw
-                .into_iter()
-                .map(|k| self.strip_prefix(&k).to_owned())
-                .collect();
-            stripped.sort();
-            stripped
-        })
+                Ok(out)
+            })
+            .map(|raw: Vec<String>| {
+                let mut stripped: Vec<String> = raw
+                    .into_iter()
+                    .map(|k| self.strip_prefix(&k).to_owned())
+                    .collect();
+                stripped.sort();
+                stripped
+            })
     }
 
     fn delete_object(&self, key: &str) -> RepositoryResult<()> {
@@ -711,7 +708,11 @@ impl SnapshotRepository for S3Repository {
                     let service_err = error.into_service_error();
                     // `DeleteObject` returns 204 for missing keys on AWS;
                     // some backends instead return 404. Normalise both.
-                    if service_err.to_string().to_ascii_lowercase().contains("nosuchkey") {
+                    if service_err
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .contains("nosuchkey")
+                    {
                         RepositoryError::NotFound { key: key_for_err }
                     } else {
                         s3_error_to_repository(&full, service_err)
@@ -754,13 +755,7 @@ impl SnapshotRepository for S3Repository {
         let bucket = self.config.bucket.clone();
         let client = self.client.clone();
         self.runtime.handle().block_on(async move {
-            match client
-                .head_object()
-                .bucket(&bucket)
-                .key(&full)
-                .send()
-                .await
-            {
+            match client.head_object().bucket(&bucket).key(&full).send().await {
                 Ok(output) => Ok(output.e_tag().map(str::to_owned)),
                 Err(error) => {
                     let service_err = error.into_service_error();
@@ -780,15 +775,27 @@ impl SnapshotRepository for S3Repository {
 
     fn settings(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        map.insert("bucket".to_owned(), serde_json::Value::String(self.config.bucket.clone()));
+        map.insert(
+            "bucket".to_owned(),
+            serde_json::Value::String(self.config.bucket.clone()),
+        );
         if let Some(region) = &self.config.region {
-            map.insert("region".to_owned(), serde_json::Value::String(region.clone()));
+            map.insert(
+                "region".to_owned(),
+                serde_json::Value::String(region.clone()),
+            );
         }
         if let Some(endpoint) = &self.config.endpoint {
-            map.insert("endpoint".to_owned(), serde_json::Value::String(endpoint.clone()));
+            map.insert(
+                "endpoint".to_owned(),
+                serde_json::Value::String(endpoint.clone()),
+            );
         }
         if let Some(base_path) = &self.config.base_path {
-            map.insert("base_path".to_owned(), serde_json::Value::String(base_path.clone()));
+            map.insert(
+                "base_path".to_owned(),
+                serde_json::Value::String(base_path.clone()),
+            );
         }
         // Credentials are never echoed back — clients listing the
         // repository have no business seeing them, mirroring the ES
@@ -845,7 +852,8 @@ mod tests {
     fn fs_repository_round_trip() {
         let dir = tempdir();
         let repo = FsRepository::new(dir.clone()).unwrap();
-        repo.put_object("foo", Bytes::from_static(b"hello")).unwrap();
+        repo.put_object("foo", Bytes::from_static(b"hello"))
+            .unwrap();
         let bytes = repo.get_object("foo").unwrap();
         assert_eq!(bytes.as_ref(), b"hello");
     }

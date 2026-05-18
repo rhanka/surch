@@ -274,10 +274,7 @@ async fn snapshot_delete_then_get_returns_404() {
     bulk_index(
         &router,
         "idx",
-        &[(
-            "doc-1".into(),
-            json!({ "title": "alpha", "category": "x" }),
-        )],
+        &[("doc-1".into(), json!({ "title": "alpha", "category": "x" }))],
     )
     .await;
 
@@ -429,10 +426,7 @@ async fn double_take_with_same_name_is_rejected() {
     bulk_index(
         &router,
         "idx",
-        &[(
-            "doc-1".into(),
-            json!({ "title": "alpha", "category": "x" }),
-        )],
+        &[("doc-1".into(), json!({ "title": "alpha", "category": "x" }))],
     )
     .await;
 

@@ -146,12 +146,7 @@ pub fn restore_index_tarball_for_es_snapshot(
             parsed.manifest.format_version, SNAPSHOT_FORMAT_VERSION
         ));
     }
-    state.create_index(
-        index,
-        Some(parsed.mapping),
-        parsed.settings,
-        parsed.aliases,
-    );
+    state.create_index(index, Some(parsed.mapping), parsed.settings, parsed.aliases);
     for (id, source) in parsed.documents {
         state.index_document(index, &id, source);
     }

@@ -164,8 +164,8 @@ fn bench_encode_postings(c: &mut Criterion) {
             &(corpus, freqs),
             |b, (ids, fr)| {
                 b.iter(|| {
-                    let encoded = encode_postings_doc_id_freq(black_box(ids), black_box(fr))
-                        .expect("encode");
+                    let encoded =
+                        encode_postings_doc_id_freq(black_box(ids), black_box(fr)).expect("encode");
                     black_box(encoded);
                 });
             },

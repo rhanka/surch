@@ -55,11 +55,38 @@ const CORPUS_SIZE: usize = 100;
 /// the BAN / SciFact token distribution: a handful of dense head
 /// terms (every doc), a long tail of rare ones.
 const VOCAB: &[&str] = &[
-    "rust", "data", "search", "engine", "score", "index", "query", "match",
-    "term", "field", "document", "vector", "memory", "block", "posting",
-    "codec", "delta", "varint", "snapshot", "compress", "encode", "decode",
-    "byte", "cursor", "frame", "reference", "lucene", "tantivy", "fst",
-    "trie", "table", "list",
+    "rust",
+    "data",
+    "search",
+    "engine",
+    "score",
+    "index",
+    "query",
+    "match",
+    "term",
+    "field",
+    "document",
+    "vector",
+    "memory",
+    "block",
+    "posting",
+    "codec",
+    "delta",
+    "varint",
+    "snapshot",
+    "compress",
+    "encode",
+    "decode",
+    "byte",
+    "cursor",
+    "frame",
+    "reference",
+    "lucene",
+    "tantivy",
+    "fst",
+    "trie",
+    "table",
+    "list",
 ];
 
 /// Deterministic SplitMix64 — same generator family as
@@ -215,12 +242,9 @@ fn parse_for_payload(bytes: &[u8]) -> Vec<(String, String, Vec<u32>, Vec<u32>)> 
             .expect("term bytes are valid utf-8")
             .to_owned();
         pos += term_len;
-        let body_len = u32::from_le_bytes([
-            bytes[pos],
-            bytes[pos + 1],
-            bytes[pos + 2],
-            bytes[pos + 3],
-        ]) as usize;
+        let body_len =
+            u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
         pos += 4;
         let (doc_ids, freqs) = decode_postings_doc_id_freq(&bytes[pos..pos + body_len])
             .expect("body was just produced by encode_postings_doc_id_freq");
@@ -243,12 +267,9 @@ fn streaming_visit(bytes: &[u8]) -> u64 {
         pos += 2 + field_len;
         let term_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
         pos += 2 + term_len;
-        let body_len = u32::from_le_bytes([
-            bytes[pos],
-            bytes[pos + 1],
-            bytes[pos + 2],
-            bytes[pos + 3],
-        ]) as usize;
+        let body_len =
+            u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
         pos += 4;
         let mut cursor = DocIdDeltaCursor::new(&bytes[pos..pos + body_len])
             .expect("cursor accepts well-formed body");

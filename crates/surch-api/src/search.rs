@@ -1326,7 +1326,7 @@ fn compute_composite_aggregation(
             // tracked in A12.4 phase 3.
             let scalar = match value {
                 Value::Array(items) => items.iter().find(|v| !matches!(v, Value::Null)),
-                other if matches!(other, Value::Null) => None,
+                Value::Null => None,
                 other => Some(other),
             };
             let Some(scalar) = scalar else {
@@ -2251,8 +2251,7 @@ fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>)
             // ES 7.x gauss: exp( - distance^2 * ln(1/decay) / scale^2 ).
             // No offset in MVP.
             let sigma_sq = scale_days * scale_days;
-            let factor = (-distance * distance * (1.0_f64 / *decay).ln() / sigma_sq).exp();
-            factor
+            (-distance * distance * (1.0_f64 / *decay).ln() / sigma_sq).exp()
         }
     }
 }
@@ -4338,7 +4337,7 @@ fn parse_gauss_decay_function(value: &Value) -> Result<ScoringFunction, OpenSear
             ),
         )
     })?;
-    if !(scale_days > 0.0) {
+    if scale_days <= 0.0 || scale_days.is_nan() {
         return Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",

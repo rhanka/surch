@@ -86,11 +86,7 @@ fn from_service_error(error: SnapshotServiceError) -> axum::response::Response {
             "repository_exception",
             format!("repository type [{kind}] is not supported (only `fs` and `s3` are wired in)"),
         ),
-        BadRequest(message) => err(
-            StatusCode::BAD_REQUEST,
-            "snapshot_exception",
-            message,
-        ),
+        BadRequest(message) => err(StatusCode::BAD_REQUEST, "snapshot_exception", message),
         IndexMissing { ref name } => err(
             StatusCode::NOT_FOUND,
             "index_not_found_exception",
@@ -264,13 +260,14 @@ pub async fn register_repository_handler(
 }
 
 /// `GET /_snapshot` and `GET /_snapshot/{repository}`.
-pub async fn list_repositories_handler(
-    State(state): State<SnapshotAppState>,
-) -> impl IntoResponse {
+pub async fn list_repositories_handler(State(state): State<SnapshotAppState>) -> impl IntoResponse {
     let mut body = serde_json::Map::new();
     for (name, repo) in state.registry.list() {
-        if let Some(Value::Object(map)) =
-            repository_metadata_response(&name, repo.as_ref()).as_object().cloned().map(Value::Object).as_ref()
+        if let Some(Value::Object(map)) = repository_metadata_response(&name, repo.as_ref())
+            .as_object()
+            .cloned()
+            .map(Value::Object)
+            .as_ref()
         {
             for (k, v) in map {
                 body.insert(k.clone(), v.clone());
@@ -440,7 +437,11 @@ pub async fn restore_snapshot_handler(
         );
     };
     let indices = parse_indices_value(request.indices.as_ref());
-    let selector = if indices.is_empty() { None } else { Some(indices.as_slice()) };
+    let selector = if indices.is_empty() {
+        None
+    } else {
+        Some(indices.as_slice())
+    };
     match service::restore_snapshot(repo.as_ref(), &repo_name, &snap_name, selector, &state.app) {
         Ok(restored) => Json(json!({
             "snapshot": {

@@ -1660,9 +1660,24 @@ async fn prefix_query_text_with_index_prefixes_still_wins_over_keyword_path() {
     // sure the `Text + index_prefixes` priority did not flip.
     let router = app_router();
     create_keyword_dates_index(&router).await;
-    index_product(&router, "id-1", r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19620115"}"#).await;
-    index_product(&router, "id-2", r#"{"NOM":"DUPRE","DATE_NAISSANCE":"19710405"}"#).await;
-    index_product(&router, "id-3", r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19621231"}"#).await;
+    index_product(
+        &router,
+        "id-1",
+        r#"{"NOM":"DUPONT","DATE_NAISSANCE":"19620115"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "id-2",
+        r#"{"NOM":"DUPRE","DATE_NAISSANCE":"19710405"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "id-3",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19621231"}"#,
+    )
+    .await;
 
     let body = search_with_body(
         &router,
@@ -1697,9 +1712,7 @@ async fn prefix_query_rejects_empty_value_with_400() {
                 .method(Method::POST)
                 .uri("/products/_search")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    r#"{"query":{"prefix":{"DATE_NAISSANCE":""}}}"#,
-                ))
+                .body(Body::from(r#"{"query":{"prefix":{"DATE_NAISSANCE":""}}}"#))
                 .expect("request should build"),
         )
         .await
@@ -4292,9 +4305,7 @@ async fn search_router_a12_4_phase2_composite_mixed_sources_round_trips_after_cu
     assert_eq!(buckets[0]["key"]["birthDate"], "19620201");
     assert_eq!(buckets[0]["doc_count"], 1);
     assert!(
-        body["aggregations"]["by_pair"]
-            .get("after_key")
-            .is_none(),
+        body["aggregations"]["by_pair"].get("after_key").is_none(),
         "end-of-stream → after_key omitted",
     );
 }

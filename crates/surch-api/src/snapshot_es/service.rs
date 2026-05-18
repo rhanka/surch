@@ -229,11 +229,12 @@ pub fn create_snapshot(
     // `crate::snapshot::build_tarball` output so the on-the-wire shape
     // stays consistent with `_surch/snapshot/export`.
     for index in &resolved {
-        let metadata = state.index_metadata(index).ok_or_else(|| {
-            SnapshotServiceError::IndexMissing {
-                name: index.clone(),
-            }
-        })?;
+        let metadata =
+            state
+                .index_metadata(index)
+                .ok_or_else(|| SnapshotServiceError::IndexMissing {
+                    name: index.clone(),
+                })?;
         let documents = state.documents(index);
 
         // Per-index per-snapshot metadata blob — read by clients via
@@ -255,7 +256,10 @@ pub fn create_snapshot(
             doc_count: documents.len() as u64,
         };
         let meta_key = format!("indices/{idx_uuid}/meta-{snap_uuid}.dat");
-        repo.put_object(&meta_key, Bytes::from(serde_json::to_vec_pretty(&index_meta)?))?;
+        repo.put_object(
+            &meta_key,
+            Bytes::from(serde_json::to_vec_pretty(&index_meta)?),
+        )?;
 
         // The snapshot payload itself: a Surch tarball, byte-for-byte
         // identical to `_surch/snapshot/export` output (so client tools
@@ -367,10 +371,7 @@ pub fn delete_snapshot(
         if let Some(idx_entry) = manifest.indices.get(index) {
             let idx_uuid = &idx_entry.uuid;
             let _ = repo.delete_object(&format!("indices/{idx_uuid}/meta-{}.dat", entry.uuid));
-            let _ = repo.delete_object(&format!(
-                "indices/{idx_uuid}/__snap-{}.dat",
-                entry.uuid
-            ));
+            let _ = repo.delete_object(&format!("indices/{idx_uuid}/__snap-{}.dat", entry.uuid));
         }
     }
     let _ = repo.delete_object(&format!("meta-{}.dat", entry.uuid));
