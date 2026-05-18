@@ -16,10 +16,18 @@ Ils ne remplacent pas le suivi persistant du repo. Pour Surch:
 - `AGENTS.md` definit les regles de pilotage, reporting et coordination
   multi-agents
 - `PLAN.md` porte l'etat global vivant par tracks A-E
-- les plans detailles par branche, lorsqu'ils existent, decomposent le
-  travail executable en cases a cocher
+- `plan/*.md` porte les plans detailles par branche / ligne de travail
+  en cases a cocher
 - les specs/plans Superpowers restent utiles pour une feature bornee,
   mais ne sont pas la source du reporting global dans le temps
+
+Regle pratique:
+
+- Superpowers decide comment conduire une tache locale (debug, TDD,
+  plan d'implementation, verification)
+- `PLAN.md` et `plan/*.md` disent ou en est le repo dans le temps
+- quand les deux existent, un agent suit Superpowers pour executer, puis
+  met a jour les plans Surch pour rendre l'avancement redemarrable
 
 ## Role du Conductor
 
@@ -51,6 +59,47 @@ Regles:
 - chaque task a un `track_id` principal unique
 - un meme changement peut toucher plusieurs tracks, mais son owner et
   son reporting principal doivent rester clairs
+
+## Suivi persistant des plans
+
+Le suivi officiel du repo est compose de deux niveaux:
+
+1. `PLAN.md`: plan global vivant, par tracks A-E, avec une synthese de
+   chaque branche active ou terminee.
+2. `plan/<branch>.md`: plan detaille d'une branche ou ligne de travail,
+   en lots et cases a cocher.
+
+Regles:
+
+- tout item executable doit etre une case a cocher `- [ ]` ou `- [x]`
+- `PLAN.md` ne doit pas contenir de longs plans d'implementation; il
+  pointe vers les plans detailles
+- un plan detaille doit contenir: finalite, track principal, branche,
+  ownership, scope/hors scope, lots, gates, preuves, statut de merge
+- les docs de design ou d'ops (`docs/**`) peuvent servir de preuves ou
+  de contexte, mais ne sont pas la source du suivi courant
+- quand un commit change l'etat d'une branche, mettre a jour le plan de
+  branche et, si le statut global change, `PLAN.md`
+- ne pas donner un `% reste` si le plan de reference est stale; d'abord
+  proposer ou faire l'actualisation du plan
+
+Calcul du `% reste`:
+
+- base par defaut: cases executables ouvertes dans `PLAN.md` pour le
+  track concerne, completees par le plan de branche cite
+- formule: `unchecked_leaf_tasks / total_leaf_tasks`
+- ne pas compter les titres de lots si leurs sous-taches sont listees
+- arrondir a 5% pres et prefixer `~` si le plan contient encore des
+  items a decomposer
+
+Compatibilite Codex / Claude:
+
+- ne pas referencer un outil propre a une plateforme dans la regle
+  canonique
+- les agents peuvent utiliser leurs outils natifs pour lire, modifier,
+  tester et committer, mais le resultat attendu dans le repo reste le
+  meme: plans a jour, preuves citees, statut redemarrable
+- ne pas creer de `CLAUDE.md` ou `CODEX.md`; cette guidance reste ici
 
 ## Subagents d'implementation
 

@@ -1,42 +1,20 @@
-# Superpowers Framing Rules
+# Superpowers Compatibility Notes
 
-## Goal
+Canonical active guidance is now `AGENTS.md`.
 
-Ensure generic helper skills do not override Surch project governance.
+Superpowers are execution helpers for local work:
 
-## Priority
+- brainstorming and design clarification
+- TDD and systematic debugging
+- implementation plans for bounded features
+- verification before completion
 
-For Surch execution:
-- repo rules and parity tickets win over generic skill workflow preferences
-- skills are helpers, not project owners
+They do not replace Surch persistent tracking:
 
-## Hard Boundaries
+- `PLAN.md` is the global status source
+- `plan/*.md` files are branch/lane execution trackers
+- user-facing reporting follows `AGENTS.md`
 
-No skill may:
-- move specs out of `spec/`
-- replace `PLAN.md`, `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`, or the parity ledger with another planning layout
-- bypass allowed and forbidden path boundaries
-- bypass verification gates
-- replace parity tickets with ad hoc notes
-
-## Explicit Conflict Examples
-
-If a skill suggests any of the following, Surch rules override it:
-- saving specs under `docs/superpowers/specs/` instead of `spec/`
-- using an hourly checkpoint system as the primary orchestration model
-- forcing a documentation structure that conflicts with the portage ticket ledger
-- delaying concrete execution after the next action is already known
-
-## Allowed Use Of Skills
-
-Skills may help with:
-- brainstorming design tradeoffs
-- writing plans
-- debugging
-- verification reminders
-
-But their outputs must be normalized back into Surch repo structure.
-
-## Conductor Rule
-
-If a skill and the repo disagree, the conductor follows repo rules and documents the normalized result in the appropriate project file.
+If a Superpowers workflow suggests a different persistent layout, the
+agent should execute the useful local method and then normalize the
+result back into `AGENTS.md`, `PLAN.md`, and the relevant `plan/*.md`.

@@ -6,9 +6,11 @@ The previous prototype has been archived under `archive/legacy-prototype/`. The 
 
 ## Current Status
 
+- Agentic governance: `AGENTS.md`
 - Planning baseline: `PLAN.md`
-- Integral portage spec: `spec/SPEC_INTEGRAL_OPENSEARCH_LUCENE_PORTAGE.md`
-- Autonomous execution plan: `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
+- Branch/lane plans: `plan/*.md`
+- Historical portage execution plan:
+  `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
 - Upstream references and graphify reports: `docs/portage/`
 
 Compatibility is not claimed until golden tests prove it against the pinned OpenSearch and Lucene references.

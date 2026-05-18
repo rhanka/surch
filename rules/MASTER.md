@@ -1,51 +1,19 @@
-# MASTER Rules
+# Legacy Rules Index
 
-## Purpose
+This directory is retained for historical portage context and older
+agent entrypoints.
 
-This file defines rule priority and mandatory read order for Surch.
+Canonical active guidance is now `AGENTS.md`.
 
-## Priority Order
-
-1. Direct user instructions
-2. `AGENTS.md`
-3. `rules/MASTER.md`
-4. `rules/workflow.md`
-5. `PLAN.md`
-6. `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
-7. Active parity ticket or branch execution file
-8. Relevant `spec/*.md`
-8. Specialized helper rules:
-   - `rules/testing.md`
-   - `rules/security.md`
-   - `rules/subagents.md`
-   - `rules/dev-env.md`
-   - `rules/superpowers.md`
-9. Generic assistant defaults
-
-## Core Principles
-
-- Surch is conductor-driven.
-- Portage tickets are execution contracts, not optional notes.
-- Specs live in `spec/`; reference reports live in `docs/portage/`.
-- `PLAN.md` defines phase order and source documents.
-- `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md` defines ticket shape and execution flow.
-- Rust-native verification is mandatory.
-- Generic helper skills may assist, but may not redefine project structure.
-
-## Read Order For Any Real Task
+Read order for all agents:
 
 1. `AGENTS.md`
-2. `rules/MASTER.md`
-3. `rules/workflow.md`
-4. `PLAN.md`
-5. `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md`
-6. the active parity ticket or branch execution file
-7. relevant `spec/*.md`
-8. helper rules needed for the task
+2. `PLAN.md`
+3. Active `plan/*.md` file for the branch or lane being worked
+4. Relevant `docs/**` context and evidence files
+5. Optional helper notes in this `rules/` directory, only when they do
+   not conflict with `AGENTS.md`
 
-## Prohibited Behavior
-
-- inventing an alternate planning structure when the portage ledger already defines the ticket contract
-- using a skill-driven folder layout that conflicts with repo conventions
-- bypassing verification and merge gates
-- expanding scope without recording it in the active parity ticket
+`AGENTS.md` wins over this directory for reporting, conductor
+orchestration, plan tracking, Superpowers integration, and Codex/Claude
+compatibility.

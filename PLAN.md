@@ -1,164 +1,137 @@
-# Surch Conductor Plan
+# Surch Global Plan
 
 Updated: 2026-05-18
 
-This is the live conductor plan for Surch. Official tracking runs on
-five tracks:
+This is the live conductor plan for Surch. It tracks the repo by the
+official tracks A-E and points to branch-level plans under `plan/`.
 
-- Track A: perf / optimisation
-- Track B: test automation / perf reporting
-- Track C: ops / packaging / snapshots
-- Track D: matchID
-- Track E: infra K8s / poc-k8s
+Rules for maintaining this file are in `AGENTS.md`. This file is the
+global status source; branch files carry executable detail.
 
-The old phase plan from 2026-05-04 remains useful as an architecture
-reference, but it is no longer the primary day-to-day tracking format.
+## Tracking Rules
 
-Official work branches:
+- [x] Track reporting follows A-E:
+  - A: perf / optimisation
+  - B: test automation / perf reporting
+  - C: ops / packaging / snapshots
+  - D: matchID
+  - E: infra K8s / poc-k8s
+- [x] Branch-level plans live under `plan/*.md`.
+- [x] `% reste` is derived from unchecked leaf checkboxes in this file
+  plus the referenced branch plan when finer detail exists.
+- [ ] Keep this file updated whenever a branch status, merge status, or
+  delivery gate changes.
 
-- `wp/a-optim`
-- `wp/b-test-auto`
-- `wp/c-ops`
-- `wp/d-matchid`
+## Branch Index
 
-Track E currently lives on `main` through CI and `deploy/k8s/` changes
-until a dedicated infra branch is needed.
+- [x] `main`: current integration branch.
+- [x] `wp/a-optim`: Track A long branch, head `30a7b32`;
+  detailed plan: `plan/wp-a-optim.md`.
+- [ ] `wp/b-test-auto`: Track B long branch, head `65fc759`;
+  detailed plan: `plan/wp-b-test-auto.md`.
+- [ ] `wp/c-ops`: Track C long branch, head `8d0ba97`;
+  detailed plan: `plan/wp-c-ops.md`.
+- [ ] `wp/d-matchid`: Track D long branch, head `d5c6da0`;
+  detailed plan: `plan/wp-d-matchid.md`.
+- [ ] `main` infra lane: Track E lives on `main` for now;
+  detailed plan: `plan/main-infra.md`.
 
-## Fait
+## Track A - Perf / Optimisation
 
-### Track A - perf / optimisation
+Reste estime: ~70% (5 open / 7 leaf tasks).
 
-- `main` already carries the first hot-path wins: top-K collection,
-  lazy `_source` hydration, WAND / Block-Max WAND, search cache, and
-  shared stored fields.
-- The current optimisation branch is `wp/a-optim` with its worktree in
-  `.worktrees/wp-a`.
-- The published paired baseline against OpenSearch lives in
+- [x] Land first hot-path wins on `main`: top-K collection, lazy
+  `_source` hydration, WAND / Block-Max WAND, search cache, shared
+  stored fields.
+- [x] Publish paired OpenSearch baseline in
   `docs/ops/bench-reports/2026-05-16-vs-os-2.17.1/README.md`.
+- [x] Add codec block metadata helper:
+  `6f56fd2` on `main`, `30a7b32` on `wp/a-optim`.
+- [ ] Wire the FoR postings codec metadata into the runtime engine path.
+- [ ] Add skip lists on top of the codec path.
+- [ ] Add the next Block-Max WAND step on top of block metadata.
+- [ ] Finish the FST term dictionary path and refresh memory baselines.
 
-### Track B - test automation / perf reporting
+## Track B - Test Automation / Perf Reporting
 
-- Bench plumbing already exists: `scripts/bench/run-pair.sh`,
-  `scripts/bench/rss-sample.sh`, `make bench-*`, `make report`,
-  `crates/surch-demo/src/bin/artillery_bench.rs`, and
-  `crates/surch-demo/src/bin/bench_report.rs`.
-- JSON artefacts are expected under `target/bench-reports/<sha>/`.
-- Promoted paired baselines already exist for:
-  - SciFact: `NDCG@10 0.6576` vs OpenSearch `0.6537`,
-    `Recall@10 0.8100` vs `0.8033`
-  - BAN Paris 25k: `p50 0 ms`, `p95 20 ms`, `max 20 ms`
-    vs OpenSearch `20 / 108 / 108 ms`
+Reste estime: ~55% (4 open / 7 leaf tasks).
 
-### Track C - ops / packaging / snapshots
+- [x] Bench plumbing exists:
+  `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
+  `make bench-*`, `make report`, `artillery_bench`, `bench_report`.
+- [x] Promoted paired SciFact baseline exists:
+  `NDCG@10 0.6576` vs OpenSearch `0.6537`,
+  `Recall@10 0.8100` vs `0.8033`.
+- [x] Promoted BAN Paris 25k baseline exists:
+  Surch `p50 0 ms`, `p95 20 ms`, `max 20 ms` vs OpenSearch
+  `20 / 108 / 108 ms`.
+- [x] `ec31e69` emits `summary.md` plus stable `summary.json`
+  (`surch.bench.summary.v1`); `6a1fe89` fixes rustfmt.
+- [ ] Promote `summary.json` as the official comparable benchmark
+  contract across report artefacts.
+- [ ] Add paired RSS reporting for Surch vs OpenSearch.
+- [ ] Promote official paired reports for INSEE, artillery,
+  TREC-COVID, and mMARCO-fr.
 
-- Docker, Helm, release, signing, and SBOM work is already landed.
-- Snapshot and SLM work is already started on `wp/c-ops`; the SLM policy
-  API is merged on `main`.
-- `ci` and `ci-k8s` are the current automation anchors for this track.
+## Track C - Ops / Packaging / Snapshots
 
-### Track D - matchID
+Reste estime: ~65% (6 open / 9 leaf tasks).
 
-- The intake flow exists under `docs/wp-d-matchid/incoming/`,
+- [x] Docker, Helm, release, signing, and SBOM work landed.
+- [x] Snapshot and SLM work started on `wp/c-ops`.
+- [x] SLM policy API merged on `main`.
+- [x] `0a4ca02` refreshes snapshot/packaging plans against repo state.
+- [x] `b14ca94` replaces stale `_pending_` workpackage rows with
+  shipped SHAs.
+- [ ] Finish snapshot REST coverage.
+- [ ] Run and document S3/MinIO end-to-end snapshot coverage.
+- [ ] Finish restore coverage.
+- [ ] Finish SLM retention.
+- [ ] Keep release verification reproducible from CI artefacts.
+- [ ] Preserve a minimal path to inspect failing release/snapshot runs.
+
+## Track D - matchID
+
+Reste estime: ~30% (2 open / 7 leaf tasks).
+
+- [x] Intake flow exists under `docs/wp-d-matchid/incoming/`,
   `decisions/`, and `gap-analysis.md`.
-- Replay fixtures already exist under `tests/matchid_compat/`.
-- Actual implementation is ahead of the stale doc on several points:
-  A6, A12, B1, and A13 have already moved.
+- [x] Replay fixtures exist under `tests/matchid_compat/`.
+- [x] `3cdac1f` implements `bool.must_not`.
+- [x] `e532a08` syncs gap-analysis with A3 and B1 replay state.
+- [x] B1 replay executes all 30 requests against Surch HEAD.
+- [ ] Refresh OpenSearch / ES-7.x oracle fixtures so replay
+  expectations come from OpenSearch, not Surch.
+- [ ] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the oracle
+  replay and document remaining parity gaps.
 
-### Track E - infra K8s / poc-k8s
+## Track E - Infra K8s / poc-k8s
 
-- The infra surface already exists in `.github/workflows/ci-k8s.yml`,
+Reste estime: ~60% (4 open / 7 leaf tasks).
+
+- [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
-- Recent fixes on `main` hardened burst-bench failure handling and PVC
-  bootstrap for K8s jobs.
+- [x] Recent `main` fixes hardened burst-bench failure handling and PVC
+  bootstrap.
+- [x] `23e60b8` makes `ci-k8s` fail fast when the expected GHCR image
+  is missing.
+- [x] `ci-k8s` run `26038117579` failed in 16s instead of the prior
+  30m timeout pattern; `ci` run `26038398172` was green.
+- [ ] Make `ci-k8s` the standard heavy-run target for burst and
+  large-corpus checks.
+- [ ] Repair the GHCR image handoff so `ndcg-gate` runs the benchmark
+  after the fail-fast preflight succeeds.
+- [ ] Always publish run diagnostics and artefacts on failure.
+- [ ] Turn `make bench-k8s` into a real entry point.
 
-## A faire
+## Delivery Finalities
 
-### Track A - perf / optimisation
-
-- Wire the live FoR postings codec into the engine path.
-- Add skip lists and the next Block-Max WAND step on top of the codec.
-- Finish the FST term dictionary path and keep memory baselines current.
-
-### Track B - test automation / perf reporting
-
-- Unify every benchmark output into one comparable JSON schema.
-- Add paired RSS reporting for Surch vs OpenSearch.
-- Promote official paired reports for INSEE and artillery, not only PoC
-  notes.
-- Measure and report TREC-COVID and mMARCO-fr instead of keeping only
-  targets.
-
-### Track C - ops / packaging / snapshots
-
-- Finish snapshot REST coverage, S3 e2e, restore, and SLM retention.
-- Keep release verification reproducible from CI artefacts.
-- Preserve a minimal path to inspect failing release and snapshot runs.
-
-### Track D - matchID
-
-- Fix A3 first: `bool.must_not` must no longer be ignored silently.
-- Refresh OpenSearch-oracle fixtures so replay expectations come from
-  OpenSearch, not from Surch itself.
-- Bring `docs/wp-d-matchid/gap-analysis.md` back in sync with the code.
-
-### Track E - infra K8s / poc-k8s
-
-- Make `ci-k8s` the standard heavy-run target for burst and large-corpus
-  checks.
-- Always publish run diagnostics and artefacts on failure.
-- Turn `make bench-k8s` into a real entry point instead of a placeholder.
-
-## Attendus
-
-### Track A - perf / optimisation
-
-- Every major hot-path change must report before/after metrics.
-- Minimum acceptance gate for merges to `main`:
-  - SciFact `NDCG@10 >= 0.65`
-  - explicit non-regression on Rue Payenne
-
-### Track B - test automation / perf reporting
-
-- Every meaningful perf advance must produce a replayable benchmark
-  report.
-- The minimal recurring report must state:
-  - latency `p50 / p95 / p99 / max`
-  - ingestion throughput (`docs/s` or indexed corpus duration)
-  - RSS peak and final
-  - `NDCG@10`
-  - `Recall@10`
-  - SLO verdict (`pass` / `fail`)
-  - OpenSearch baseline comparison when available
-- Heavy perf runs should prefer CI / K8s over local execution.
-
-### Track C - ops / packaging / snapshots
-
-- Snapshot, packaging, and release work must be reported with the exact
-  CI or K8s run ids and produced artefacts.
-- CI must fail closed on broken snapshot or release paths.
-
-### Track D - matchID
-
-- Every matchID status must say which replay or fixture was exercised,
-  what was compared to OpenSearch, and what remains partial.
-- A replay that passes only against Surch-generated expectations is not
-  sufficient to declare parity.
-
-### Track E - infra K8s / poc-k8s
-
-- K8s jobs are expected to emit diagnostics, pod logs, and artefacts
-  even on failure.
-- Cost and timeout guardrails must stay inside the workflows and helper
-  scripts, not only in oral process.
-
-### Reporting format for all tracks
-
-- User-facing status and restart reports must use exactly three
-  top-level sections:
-  - `Fait`
-  - `A faire`
-  - `Attendus`
-- Each section is multi-track and must cover Track A through Track E,
-  even if a track only says `RAS`.
-- Do not use wide Markdown tables for status reports; prefer short
-  bullets with paths, SHAs, run ids, and verdicts inline.
+- [ ] Track A finality: measurable search/index performance gains
+  without quality regression.
+- [ ] Track B finality: replayable, comparable benchmark reporting with
+  explicit SLO verdicts.
+- [ ] Track C finality: release and snapshot paths verified end to end.
+- [ ] Track D finality: matchID parity proven against OpenSearch /
+  ES-7.x, not only Surch HEAD.
+- [ ] Track E finality: `ci-k8s` is a reliable heavy-benchmark target
+  with preserved diagnostics.
