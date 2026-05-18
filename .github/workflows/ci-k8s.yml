@@ -81,7 +81,14 @@ jobs:
       - name: Resolve Job name
         id: jobname
         run: |
-          JOB_NAME=$(grep -m1 '^  name:' "target/k8s/${{ inputs.job }}.yaml" | awk '{print $2}')
+          JOB_NAME=$(awk '
+            /^kind:[[:space:]]*Job[[:space:]]*$/ { in_job=1; next }
+            in_job && /^  name:/ { print $2; exit }
+          ' "target/k8s/${{ inputs.job }}.yaml")
+          if [ -z "$JOB_NAME" ]; then
+            echo "::error::Could not resolve Job metadata.name from rendered manifest."
+            exit 1
+          fi
           echo "name=$JOB_NAME" >> "$GITHUB_OUTPUT"
           echo "Job name resolved: $JOB_NAME"
 
@@ -90,11 +97,19 @@ jobs:
           set -eu
           missing=0
           pvcs="$(awk '/claimName:/ { print $2 }' "target/k8s/${{ inputs.job }}.yaml" | sort -u)"
+          declared_pvcs="$(awk '
+            /^kind:[[:space:]]*PersistentVolumeClaim[[:space:]]*$/ { in_pvc=1; next }
+            in_pvc && /^  name:/ { print $2; in_pvc=0 }
+          ' "target/k8s/${{ inputs.job }}.yaml" | sort -u)"
           if [ -z "$pvcs" ]; then
             echo "No PVC dependencies declared by ${{ inputs.job }}."
             exit 0
           fi
           for pvc in $pvcs; do
+            if printf '%s\n' "$declared_pvcs" | grep -qx "$pvc"; then
+              echo "PVC declared in manifest: $pvc"
+              continue
+            fi
             if kubectl -n "$SCW_NAMESPACE" get pvc "$pvc" >/dev/null 2>&1; then
               echo "PVC present: $pvc"
             else

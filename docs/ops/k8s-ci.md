@@ -56,10 +56,13 @@ Cluster prerequisites:
 - the `surch` namespace exists with quotas applied;
 - the `burst` pool exists with the taint + nodeSelector contract;
 - `KUBE_CONFIG_DATA` is set in GitHub secrets;
-- the three PVCs are bound: `surch-corpus-beir`,
-  `surch-corpus-insee`, `surch-scratch`;
 - the Surch image tag `ghcr.io/rhanka/surch:sha-<short_sha>` exists and
   is pullable by the cluster.
+
+`00-init-corpora` declares the three PVCs it needs:
+`surch-corpus-beir` (5 Gi), `surch-corpus-insee` (2 Gi), and
+`surch-scratch` (5 Gi). Run it before `ndcg-gate` or `insee-bench` so
+those recurring Jobs can mount the corpus PVCs read-only.
 
 ## Reading results
 
