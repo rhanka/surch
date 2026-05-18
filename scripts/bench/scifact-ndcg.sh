@@ -4,18 +4,27 @@
 #
 # Indexes SciFact corpus, runs all 300 test queries, computes NDCG@10
 # per query, averages, compares with Lucene/Anserini baseline 0.688.
-set -u
+set -euo pipefail
 LABEL="${1:?label}"
 OUT="${2:?out}"
 URL="${3:?url}"
 INDEX="scifact"
 BEIR_ROOT="${BEIR_DIR:-/home/antoinefa/src/surch/target/beir}"
 DATA="$BEIR_ROOT/scifact"
-NDJSON="$DATA/corpus.ndjson"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-if [ ! -s "$NDJSON" ]; then
+for required in "$DATA/corpus.jsonl" "$DATA/queries.jsonl" "$DATA/qrels/test.tsv"; do
+  if [ ! -s "$required" ]; then
+    echo "missing SciFact input: $required" >&2
+    exit 1
+  fi
+done
+
+if [ -s "$DATA/corpus.ndjson" ]; then
+  NDJSON="$DATA/corpus.ndjson"
+else
+  NDJSON="$TMP/corpus.ndjson"
   # Convert corpus.jsonl -> bulk NDJSON (index action + source)
   jq -rc --arg idx "$INDEX" '[
     {"index":{"_id":._id,"_index":$idx}},

@@ -141,7 +141,7 @@ Reste estime: ~20% (2 open / 9 leaf tasks).
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~11% (2 open / 18 leaf tasks).
+Reste estime: ~9% (2 open / 22 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -179,8 +179,23 @@ Reste estime: ~11% (2 open / 18 leaf tasks).
 - [x] `.dockerignore` now re-includes only
   `scripts/bench/scifact-ndcg.sh` from the ignored scripts tree, so the
   bench-driver stage can copy the K8s SciFact gate script.
+- [x] `docker-build` run `26064128510` published both runtime and
+  bench-driver images for `6a493e0`.
+- [x] `ci-k8s` run `26064198159` proved the published GHCR runtime and
+  bench-driver images are pullable by K8s, and `ndcg-driver` reached
+  benchmark execution then exited `0` after reaching the report-write
+  path.
+- [x] The next K8s blocker is diagnosed: regular engine sidecars kept
+  the Pod running after the driver completed, so the Job timed out at
+  30 min despite benchmark execution.
+- [x] `scifact-ndcg.sh` now uses a writable temporary bulk NDJSON when
+  the BEIR corpus mount is read-only and fails closed on shell, `jq`, or
+  `curl` errors.
 - [x] `ndcg-gate` and `insee-bench` use the bench driver tag for
   scripts/tools while keeping `surch-api` on the runtime image.
+- [x] `ndcg-gate` and `insee-bench` now declare Surch and the reference
+  engine as restartable init-container sidecars, so the Job can complete
+  when the benchmark driver exits.
 - [x] The reference engine sidecar declares its own `1000:1000`
   security context instead of inheriting the Surch runtime user.
 - [x] `make bench-k8s` prints both the runtime and bench driver image
@@ -192,8 +207,10 @@ Reste estime: ~11% (2 open / 18 leaf tasks).
   `ndcg-gate` and `insee-bench`.
 - [x] Move the reference engine sidecar to a compatible per-container
   security context.
-- [ ] Verify on GitHub Actions that a published GHCR image reaches
+- [x] Verify on GitHub Actions that a published GHCR image reaches
   `ndcg-gate` benchmark execution after the runtime fixes.
+- [ ] Verify on GitHub Actions that the restartable sidecar manifests
+  report Job `Complete=True`.
 - [x] Turn `make bench-k8s` into a real entry point.
 
 ## Delivery Finalities

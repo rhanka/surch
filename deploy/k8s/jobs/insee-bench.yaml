@@ -1,9 +1,11 @@
 # Surch — paired bench Surch vs OpenSearch on INSEE Deces (~1.3M docs).
 #
-# Three containers in the same Pod, all on localhost:
+# One driver container plus two restartable init-container sidecars in
+# the same Pod, all on localhost:
 #   surch              ghcr.io/rhanka/surch:sha-${SURCH_SHA} (port 7700)
 #   opensearch         opensearchproject/opensearch:2.17.1  (port 9200)
-#   artillery-runner   ghcr.io/rhanka/surch:sha-${SURCH_SHA} (runs artillery_bench)
+#   artillery-runner   ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}
+#                      (runs artillery_bench)
 #
 # Output under `/reports/`:
 #   * `art-surch.json` / `art-os.json` — `surch.bench.artillery.v1`
@@ -65,9 +67,10 @@ spec:
             claimName: surch-scratch
         - name: reports
           emptyDir: { sizeLimit: 128Mi }
-      containers:
+      initContainers:
         # --- Engine #1: Surch -----------------------------------------
         - name: surch
+          restartPolicy: Always
           image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
           ports:
@@ -83,6 +86,7 @@ spec:
             - { name: scratch, mountPath: /var/surch, subPath: surch-data }
         # --- Engine #2: OpenSearch ------------------------------------
         - name: opensearch
+          restartPolicy: Always
           image: opensearchproject/opensearch:2.17.1
           imagePullPolicy: IfNotPresent
           ports:
@@ -102,6 +106,7 @@ spec:
             runAsGroup: 1000
           volumeMounts:
             - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data }
+      containers:
         # --- Driver: artillery_bench Rust harness ---------------------
         - name: artillery-runner
           image: ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}

@@ -52,6 +52,11 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   (`ErrImagePull` / `ImagePullBackOff` / container config errors /
   `StartError`), non-zero container exits, or a 30 min timeout fail the
   workflow.
+- `ndcg-gate` and `insee-bench` run Surch and the reference engine as
+  restartable init-container sidecars (`restartPolicy: Always`). The
+  benchmark driver is the only regular container, so the Job can report
+  `Complete=True` after the driver exits successfully instead of hanging
+  on long-lived engine sidecars.
 
 ## Manual run
 
@@ -156,6 +161,17 @@ Current repo response:
   green but failed the first bench-driver push because `.dockerignore`
   still excluded `scripts/bench/scifact-ndcg.sh`; the Docker context now
   re-includes only that script from the ignored scripts tree.
+- `ci-k8s` run `26064198159` proved both GHCR images are pullable by
+  K8s and the `ndcg-driver` reaches benchmark execution. The driver
+  exited `0` after reaching the report-write path, but the Job still
+  failed at 30 min because the engine containers were regular sidecars
+  and kept the Pod running. The manifests now use restartable
+  init-container sidecars so the next run can complete when the driver
+  exits.
+- The same run also exposed that `scifact-ndcg.sh` tried to write a
+  generated `corpus.ndjson` into the read-only BEIR PVC and did not fail
+  closed on later HTTP errors. The script now generates that file under
+  `mktemp` when needed and uses `set -euo pipefail`.
 
 ## Cost guardrails
 
@@ -169,9 +185,10 @@ DEV1-L node-hour ~0.08€; a 30 min run costs ~0.04€. That leaves a 50x
 margin against the 2€ ceiling. Idle quota at rest = 0 (no Deployment,
 no CronJob ; only `workflow_dispatch` triggers it).
 
-The CI gate is implemented as a single short-lived Pod with sidecars
-(Surch + OpenSearch + driver). When the Job's TTL elapses, the
-namespace returns to its 500m / 512Mi quota baseline.
+The CI gate is implemented as a single short-lived Pod with restartable
+engine sidecars (Surch + OpenSearch) and one benchmark driver. When the
+Job's TTL elapses, the namespace returns to its 500m / 512Mi quota
+baseline.
 
 ## Files in this repo
 
@@ -191,6 +208,14 @@ namespace returns to its 500m / 512Mi quota baseline.
   `bench-sha-<full_sha>` driver image for `/bin/sh`, `wget`,
   `scifact-ndcg.sh`, `artillery_bench`, and `bench_report`; the
   distroless runtime image remains reserved for `surch-api`.
+- Engine sidecars are declared under `initContainers` with
+  `restartPolicy: Always`; this relies on Kubernetes restartable
+  sidecars. If a cluster rejects that field, the manifest fails at
+  `kubectl apply` instead of timing out during the benchmark.
+- `scifact-ndcg.sh` must treat the BEIR PVC as read-only. It may read a
+  prebuilt `corpus.ndjson` from the dataset, otherwise it writes the
+  generated bulk file to a temporary directory inside the driver
+  container.
 - The reference engine sidecar now declares its own `1000:1000`
   security context instead of inheriting the Surch runtime user's
   `65532:65532` pod default.
