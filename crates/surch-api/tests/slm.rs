@@ -6,12 +6,31 @@ use serde_json::{json, Value};
 use surch_api::app_router;
 use tower::ServiceExt;
 
+fn tempdir(label: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "surch-slm-{}-{}-{}",
+        label,
+        std::process::id(),
+        nanos,
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir creation");
+    dir
+}
+
 async fn read_json(response: axum::response::Response<Body>) -> (StatusCode, Value) {
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body should be readable");
-    let json = serde_json::from_slice(&body).expect("response body should be json");
+    let json = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).expect("response body should be json")
+    };
     (status, json)
 }
 
@@ -165,4 +184,48 @@ async fn slm_execute_missing_repository_returns_controlled_error_and_records_fai
         executions[0]["error"],
         json!("repository [missing-repo] missing")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slm_execute_retention_prunes_old_successful_snapshots_by_max_count() {
+    let router = app_router();
+    let repo_dir = tempdir("retention-max-count");
+
+    let (status, body) = request(
+        &router,
+        Method::PUT,
+        "/_snapshot/local",
+        Some(json!({
+            "type": "fs",
+            "settings": { "location": repo_dir.display().to_string() }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "put repo body: {body}");
+
+    let mut first = valid_policy("local");
+    first["name"] = json!("daily-old");
+    first["config"]["indices"] = json!([]);
+    first["retention"] = json!({ "max_count": 1 });
+    let (status, body) = request(&router, Method::PUT, "/_slm/policy/daily", Some(first)).await;
+    assert_eq!(status, StatusCode::OK, "put first policy body: {body}");
+    let (status, body) = request(&router, Method::POST, "/_slm/policy/daily/_execute", None).await;
+    assert_eq!(status, StatusCode::OK, "execute first body: {body}");
+
+    let mut second = valid_policy("local");
+    second["name"] = json!("daily-new");
+    second["config"]["indices"] = json!([]);
+    second["retention"] = json!({ "max_count": 1 });
+    let (status, body) = request(&router, Method::PUT, "/_slm/policy/daily", Some(second)).await;
+    assert_eq!(status, StatusCode::OK, "put second policy body: {body}");
+    let (status, body) = request(&router, Method::POST, "/_slm/policy/daily/_execute", None).await;
+    assert_eq!(status, StatusCode::OK, "execute second body: {body}");
+
+    let (status, body) = request(&router, Method::GET, "/_snapshot/local/daily-old", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["type"], json!("snapshot_missing_exception"));
+
+    let (status, body) = request(&router, Method::GET, "/_snapshot/local/daily-new", None).await;
+    assert_eq!(status, StatusCode::OK, "new snapshot body: {body}");
+    assert_eq!(body["snapshots"][0]["snapshot"], json!("daily-new"));
 }

@@ -27,7 +27,7 @@ use super::policy::{
     expand_name_pattern, SlmExecution, SlmExecutionState, SlmPolicy, SlmPolicyRegistry,
 };
 use crate::snapshot_es::service::{
-    create_snapshot, RegisteredRepository, SnapshotRepositoryRegistry,
+    create_snapshot, delete_snapshot, RegisteredRepository, SnapshotRepositoryRegistry,
 };
 use crate::state::AppState;
 
@@ -215,6 +215,9 @@ pub(crate) async fn execute_policy(
     };
 
     policies.record_execution(&policy.name, exec.clone());
+    if exec.state == SlmExecutionState::Success {
+        enforce_max_count_retention(policy, repositories, policies);
+    }
     exec
 }
 
@@ -222,3 +225,42 @@ pub(crate) async fn execute_policy(
 // exercised by the public surface.
 #[allow(dead_code)]
 fn _force_registered_repository_alive(_r: RegisteredRepository) {}
+
+fn enforce_max_count_retention(
+    policy: &SlmPolicy,
+    repositories: &SnapshotRepositoryRegistry,
+    policies: &SlmPolicyRegistry,
+) {
+    let Some(retention) = &policy.retention else {
+        return;
+    };
+    let Some(max_count) = retention.max_count.map(|n| n as usize) else {
+        return;
+    };
+    let min_count = retention.min_count.unwrap_or(0) as usize;
+    let keep_count = max_count.max(min_count);
+    let successful = policies
+        .executions(&policy.name)
+        .into_iter()
+        .filter(|e| e.state == SlmExecutionState::Success)
+        .collect::<Vec<_>>();
+    if successful.len() <= keep_count {
+        return;
+    }
+    let Some(repo) = repositories.get(&policy.repository) else {
+        return;
+    };
+    for execution in successful.iter().take(successful.len() - keep_count) {
+        if let Err(error) =
+            delete_snapshot(repo.as_ref(), &policy.repository, &execution.snapshot_name)
+        {
+            tracing::warn!(
+                policy = %policy.name,
+                repository = %policy.repository,
+                snapshot = %execution.snapshot_name,
+                error = %error,
+                "slm: failed to prune snapshot during retention",
+            );
+        }
+    }
+}
