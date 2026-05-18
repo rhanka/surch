@@ -8,9 +8,9 @@
 //! Skipped entries carry a `skip` field referencing the active gap
 //! (e.g. `gap-A4` for scroll, `gap-A6` for `prefix + index_prefixes`).
 //! They are not executed; they document the workload the future
-//! parser-side gap closure must unblock. As of 2026-05-16 (A6 phase 3)
-//! the manifest contains 0 skipped entries — kept here defensively so a
-//! future skip is still validated against an A-series gap label.
+//! parser-side gap closure must unblock. As of 2026-05-18, the manifest
+//! carries 1 skipped entry for gap-A3 (`bool.must_not`) and all other
+//! entries execute against Surch HEAD.
 
 use axum::{
     body::{to_bytes, Body},
@@ -288,7 +288,7 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
         executed >= 3,
         "matchID v0 acceptance: at least 3 replay entries must execute against Surch (executed={executed}, skipped={skipped})"
     );
-    // The fixture is committed with the documented split: 30 executed + 0 skipped.
+    // The fixture is committed with the documented split: 29 executed + 1 skipped.
     // B1 phase 2 lifted the 3 scroll skips (gap-A4) by asserting the initial
     // `?scroll=1m` response carries a non-empty `_scroll_id`; the follow-up
     // `POST /_search/scroll` lifecycle is covered by
@@ -297,12 +297,14 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
     // `index_prefixes` postings on NOM/PRENOMS. A6 phase 3 (2026-05-16) lifted the
     // last skip (`prefix_date_naissance_short`, gap-A6) via an FST range-scan
     // iterator on the term dictionary (see
-    // `surch_index::DocumentIndex::term_prefix_doc_ids`).
+    // `surch_index::DocumentIndex::term_prefix_doc_ids`). The remaining skip
+    // is `adv_bool_must_not_sexe` (gap-A3) until `bool.must_not` is executed
+    // instead of rejected explicitly.
     assert_eq!(executed + skipped, 30);
-    assert_eq!(skipped, 0, "expected 0 skipped entries against Surch HEAD");
+    assert_eq!(skipped, 1, "expected 1 skipped entry against Surch HEAD");
     assert_eq!(
-        executed, 30,
-        "expected 30 executed entries against Surch HEAD"
+        executed, 29,
+        "expected 29 executed entries against Surch HEAD"
     );
 }
 

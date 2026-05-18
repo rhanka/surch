@@ -1401,7 +1401,7 @@ fn compute_composite_aggregation(
         .take(size)
         .map(|(_, values, doc_count)| {
             let mut key_obj = serde_json::Map::new();
-            for (source, value) in sources.iter().zip(values.into_iter()) {
+            for (source, value) in sources.iter().zip(values) {
                 key_obj.insert(source.name.clone(), value);
             }
             AggBucket {
