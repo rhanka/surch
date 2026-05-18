@@ -50,6 +50,7 @@ jobs:
           IMAGE_SHA="${GITHUB_SHA}"
           echo "sha=$IMAGE_SHA" >> "$GITHUB_OUTPUT"
           echo "image=${GHCR_IMAGE}:sha-${IMAGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "bench_image=${GHCR_IMAGE}:bench-sha-${IMAGE_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Verify GHCR image exists
         run: |
@@ -62,14 +63,24 @@ jobs:
             echo "::error::Could not acquire a GHCR pull token for ${IMAGE_REPO}."
             exit 1
           fi
-          if ! curl -fsSI \
-            -H "Authorization: Bearer $TOKEN" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-            "https://ghcr.io/v2/${IMAGE_REPO}/manifests/${IMAGE_TAG}" >/dev/null; then
-            echo "::error title=Missing GHCR image::Expected ${GHCR_IMAGE}:${IMAGE_TAG}. Build it first with: gh workflow run docker-build.yml --ref ${GITHUB_REF_NAME}. Then rerun: gh workflow run ci-k8s.yml --ref ${GITHUB_REF_NAME} -f job=${{ inputs.job }}"
-            exit 1
-          fi
-          echo "Verified image tag ${GHCR_IMAGE}:${IMAGE_TAG}"
+          check_image_tag() {
+            tag="$1"
+            label="$2"
+            if ! curl -fsSI \
+              -H "Authorization: Bearer $TOKEN" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${IMAGE_REPO}/manifests/${tag}" >/dev/null; then
+              echo "::error title=Missing GHCR ${label} image::Expected ${GHCR_IMAGE}:${tag}. Build it first with: gh workflow run docker-build.yml --ref ${GITHUB_REF_NAME}. Then rerun: gh workflow run ci-k8s.yml --ref ${GITHUB_REF_NAME} -f job=${{ inputs.job }}"
+              exit 1
+            fi
+            echo "Verified ${label} image tag ${GHCR_IMAGE}:${tag}"
+          }
+          check_image_tag "$IMAGE_TAG" "runtime"
+          case "${{ inputs.job }}" in
+            ndcg-gate|insee-bench)
+              check_image_tag "bench-${IMAGE_TAG}" "bench driver"
+              ;;
+          esac
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -291,6 +302,7 @@ jobs:
             echo "- Kubernetes Job: \`$JOB_NAME\`"
             echo "- Namespace: \`$SCW_NAMESPACE\`"
             echo "- Image: \`${{ steps.image.outputs.image }}\`"
+            echo "- Bench driver image: \`${{ steps.image.outputs.bench_image }}\`"
             echo "- Artifact: \`$ARTIFACT_NAME\`"
             echo
             echo "## Job conditions"

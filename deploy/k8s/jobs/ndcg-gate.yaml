@@ -92,12 +92,16 @@ spec:
           resources:
             requests: { cpu: 250m, memory: 256Mi }
             limits:   { cpu: 1200m, memory: 1536Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
           # OpenSearch 2.x requires a writable scratch dir for its data path.
           volumeMounts:
             - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data }
         # --- Driver: scifact-ndcg.sh against both engines -------------
         - name: ndcg-driver
-          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
+          image: ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
           env:
             - { name: SURCH_URL,      value: "http://127.0.0.1:7700" }
@@ -108,9 +112,9 @@ spec:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 512Mi }
           command: ["/bin/sh", "-c"]
-          # The Surch image bundles scripts/bench/scifact-ndcg.sh; this
-          # driver waits for both engines, runs the gate, and exits with
-          # the script's own status. CI reads /reports/bench.json.
+          # The bench driver image bundles scripts/bench/scifact-ndcg.sh;
+          # this driver waits for both engines, runs the gate, and exits
+          # with the script's own status. CI reads /reports/bench.json.
           args:
             - |
               set -eu

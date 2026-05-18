@@ -141,7 +141,7 @@ Reste estime: ~20% (2 open / 9 leaf tasks).
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~31% (4 open / 13 leaf tasks).
+Reste estime: ~15% (2 open / 16 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -170,16 +170,25 @@ Reste estime: ~31% (4 open / 13 leaf tasks).
   Surch runtime image cannot run `/bin/sh` as a benchmark driver, and
   the reference engine sidecar needs a compatible per-container security
   context.
+- [x] Docker build now publishes a separate shell-capable benchmark
+  driver tag `bench-sha-<full commit SHA>` next to the distroless
+  runtime tag.
+- [x] `ndcg-gate` and `insee-bench` use the bench driver tag for
+  scripts/tools while keeping `surch-api` on the runtime image.
+- [x] The reference engine sidecar declares its own `1000:1000`
+  security context instead of inheriting the Surch runtime user.
+- [x] `make bench-k8s` prints both the runtime and bench driver image
+  tags before dispatch.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
 - [x] Always publish run diagnostics and artefacts on failure.
-- [ ] Provide a shell-capable benchmark driver image/stage for
+- [x] Provide a shell-capable benchmark driver image/stage for
   `ndcg-gate` and `insee-bench`.
-- [ ] Move the reference engine sidecar to a compatible per-container
+- [x] Move the reference engine sidecar to a compatible per-container
   security context.
 - [ ] Verify on GitHub Actions that a published GHCR image reaches
   `ndcg-gate` benchmark execution after the runtime fixes.
-- [ ] Turn `make bench-k8s` into a real entry point.
+- [x] Turn `make bench-k8s` into a real entry point.
 
 ## Delivery Finalities
 

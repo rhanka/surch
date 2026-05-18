@@ -14,8 +14,8 @@ Status: active infra lane; merge state below is the source of truth
 
 - [x] Delivered scope:
   `.github/workflows/ci-k8s.yml`, `docs/ops/k8s-ci.md`.
-- [ ] Next scope: K8s runtime contract for benchmark drivers, reference
-  engine security context, and `make bench-k8s` entry point.
+- [ ] Next scope: prove the fixed K8s runtime contract on GitHub
+  Actions and promote `ci-k8s` as the heavy-run target.
 - [x] Image handoff issue fixed locally for next commit:
   `ci-k8s.yml`, `docker-build.yml`, and `release.yml` use
   `ghcr.io/rhanka/surch:sha-<full commit SHA>`.
@@ -40,6 +40,15 @@ Status: active infra lane; merge state below is the source of truth
 - [x] Wait loop now fails early on pod phase `Failed`, terminal
   waiting / terminated reasons, and non-zero container exits instead of
   relying only on Job conditions.
+- [x] Docker build publishes a shell-capable benchmark driver image as
+  `ghcr.io/rhanka/surch:bench-sha-<full commit SHA>` while keeping the
+  default runtime image distroless.
+- [x] `ndcg-gate` and `insee-bench` use the bench driver image for
+  shell/scripts/tools; the Surch sidecar keeps the runtime image.
+- [x] The reference engine sidecar now has a per-container `1000:1000`
+  security context.
+- [x] `make bench-k8s` prints the runtime and bench driver tags before
+  dispatch.
 - [x] Verification run recorded: `ci-k8s` `26038117579` failed in 16s
   on missing image, replacing 30m timeout pattern.
 - [x] `main` CI after latest integration was green: `26038398172`.
@@ -77,7 +86,7 @@ Status: active infra lane; merge state below is the source of truth
     trigger `docker-build.yml` for the same ref, then rerun `ci-k8s`.
   - [x] Keep the missing-image preflight fail-fast.
   - [x] Commit main: `5c25463`.
-  - [ ] Gate 1: missing image fails fast with actionable message.
+  - [x] Gate 1: missing image fails fast with actionable message.
   - [x] Gate 2a: existing image reaches pod startup instead of image
     pull failure; run `26058595173`.
   - [ ] Gate 2b: existing image reaches benchmark execution after the
@@ -90,12 +99,14 @@ Status: active infra lane; merge state below is the source of truth
     `26058595173` uploaded
     `k8s-bench-ndcg-gate-236980c600a60c40a8f28e2c433558c59ec5d5f7`.
   - [x] Make the wait loop fail early on terminal pod/container states.
-  - [ ] Provide a shell-capable benchmark driver image/stage for
+  - [x] Provide a shell-capable benchmark driver image/stage for
     `ndcg-gate` and `insee-bench`.
-  - [ ] Move the reference engine sidecar to a compatible per-container
+  - [x] Move the reference engine sidecar to a compatible per-container
     security context.
+  - [x] Make `bench-k8s` print the runtime and bench driver image
+    contracts before dispatch.
   - [ ] Make `ci-k8s` the standard burst / large-corpus path.
-  - [ ] Turn `make bench-k8s` into a real entry point.
+  - [x] Turn `make bench-k8s` into a real entry point.
 
 - [ ] Lot N - Closure
   - [ ] Update this plan and `PLAN.md`.

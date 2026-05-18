@@ -96,11 +96,15 @@ spec:
           resources:
             requests: { cpu: 250m, memory: 256Mi }
             limits:   { cpu: 1200m, memory: 1536Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
           volumeMounts:
             - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data }
         # --- Driver: artillery_bench Rust harness ---------------------
         - name: artillery-runner
-          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
+          image: ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
           env:
             - { name: SURCH_URL,      value: "http://127.0.0.1:7700" }
@@ -120,8 +124,8 @@ spec:
               until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
               until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
               mkdir -p "$REPORTS_DIR"
-              # The Surch image ships artillery_bench in /usr/local/bin
-              # (built in release mode; see Dockerfile builder stage).
+              # The bench driver image ships artillery_bench and
+              # bench_report in /usr/local/bin.
               /usr/local/bin/artillery_bench \
                 --url "$SURCH_URL" --index "deces_insee" \
                 --names "$INSEE_DIR/artillery_names.txt" \

@@ -9,7 +9,8 @@ LABEL="${1:?label}"
 OUT="${2:?out}"
 URL="${3:?url}"
 INDEX="scifact"
-DATA="/home/antoinefa/src/surch/target/beir/scifact"
+BEIR_ROOT="${BEIR_DIR:-/home/antoinefa/src/surch/target/beir}"
+DATA="$BEIR_ROOT/scifact"
 NDJSON="$DATA/corpus.ndjson"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

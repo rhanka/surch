@@ -33,13 +33,17 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   The workflow also publishes a GitHub Actions step summary and stores
   the same Markdown recap as `<job>.gha-summary.md` inside the artifact.
 - Before `kubectl apply`, `ci-k8s` now verifies that the expected GHCR
-  tag already exists. A missing `ghcr.io/rhanka/surch:sha-<full_sha>`
-  image fails immediately with the matching `docker-build.yml` command
-  instead of burning the full 30 min Job budget.
+  tags already exist. A missing runtime
+  `ghcr.io/rhanka/surch:sha-<full_sha>` image, or a missing benchmark
+  driver `ghcr.io/rhanka/surch:bench-sha-<full_sha>` image for
+  `ndcg-gate` / `insee-bench`, fails immediately with the matching
+  `docker-build.yml` command instead of burning the full 30 min Job
+  budget.
 - The workflow renders manifests with `envsubst '${SURCH_SHA}'` only, so
   shell variables inside the Job scripts stay intact. Job manifests must
-  use `ghcr.io/rhanka/surch:sha-${SURCH_SHA}`, matching the
-  `docker-build.yml` long-SHA tag contract.
+  use `ghcr.io/rhanka/surch:sha-${SURCH_SHA}` for the runtime and
+  `ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}` for benchmark drivers,
+  matching the `docker-build.yml` long-SHA tag contract.
 - PVC dependencies declared by `claimName:` are checked before `kubectl
   apply`, so a missing corpus volume fails in seconds instead of waiting
   for the Job deadline.
@@ -71,8 +75,11 @@ Cluster prerequisites:
 - the `burst` pool exists with the taint + nodeSelector contract;
 - `KUBE_CONFIG_DATA` is set in GitHub secrets;
 - the Surch image tag `ghcr.io/rhanka/surch:sha-<full_sha>` exists and
-  is pullable by the cluster. `ci-k8s` does not build or publish that
-  image; it only verifies the tag before dispatching the K8s Job.
+  is pullable by the cluster;
+- for `ndcg-gate` and `insee-bench`, the bench driver image tag
+  `ghcr.io/rhanka/surch:bench-sha-<full_sha>` also exists and is
+  pullable. `ci-k8s` does not build or publish these images; it only
+  verifies the tags before dispatching the K8s Job.
 
 `make bench-k8s` prints the exact image tag expected for `K8S_REF` and
 the remediation command before it dispatches `ci-k8s`. It also prints
@@ -137,6 +144,15 @@ The relevant root causes in the artifact are:
   it now prints per-container waiting / terminated / last-terminated
   reasons and fails on terminal states before the Job deadline.
 
+Current repo response:
+
+- `docker-build.yml` publishes `bench-sha-<full_sha>` from the
+  `bench-driver` Dockerfile stage.
+- `ndcg-gate` and `insee-bench` use that driver image for shell and
+  benchmark tooling.
+- The reference engine sidecar overrides the pod default with a
+  `1000:1000` security context.
+
 ## Cost guardrails
 
 | Knob                  | Value | Where enforced                                                |
@@ -167,14 +183,13 @@ namespace returns to its 500m / 512Mi quota baseline.
 - `00-init-corpora` is the first smoke target to run. It uses a Python
   image so download, zip extraction, and matchID CSV validation do not
   depend on optional shell tools.
-- `ndcg-gate` and `insee-bench` still depend on the Surch runtime image
-  shipping the driver tools they call (`/bin/sh`, `wget`,
-  `scifact-ndcg.sh`, `artillery_bench`, `bench_report`). Until the image
-  contract is updated, the next functional fix is to provide a dedicated
-  shell-capable bench driver image or stage instead of using the
-  distroless runtime image as a driver.
-- The reference engine sidecar needs its own security context rather
-  than inheriting the Surch runtime user's `65532:65532` pod default.
+- `ndcg-gate` and `insee-bench` use the dedicated
+  `bench-sha-<full_sha>` driver image for `/bin/sh`, `wget`,
+  `scifact-ndcg.sh`, `artillery_bench`, and `bench_report`; the
+  distroless runtime image remains reserved for `surch-api`.
+- The reference engine sidecar now declares its own `1000:1000`
+  security context instead of inheriting the Surch runtime user's
+  `65532:65532` pod default.
 - A missing GHCR tag is treated as a workflow precondition failure, not
   as a 30 min benchmark timeout. When that happens, inspect the image
   publication workflow before re-running `ci-k8s`.

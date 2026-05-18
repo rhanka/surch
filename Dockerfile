@@ -1,6 +1,7 @@
 # Surch — multi-stage Dockerfile.
-# Stage 1 (builder): pin a slim Rust toolchain and produce a release binary.
-# Stage 2 (runtime): distroless cc-debian12 so the final image stays under
+# Stage 1 (builder): pin a slim Rust toolchain and produce release binaries.
+# Stage 2 (bench-driver): shell-capable CI/K8s benchmark tools.
+# Stage 3 (runtime): distroless cc-debian12 so the final image stays under
 # ~30 MB compressed and exposes a non-root user out of the box.
 #
 # Build:
@@ -31,9 +32,38 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY tests ./tests
 
-# Build the API binary in release mode; LTO + strip are already configured
-# in the workspace Cargo.toml.
-RUN cargo build --release --locked -p surch-api
+# Build release binaries; LTO + strip are already configured in the
+# workspace Cargo.toml. The distroless runtime only copies `surch-api`,
+# while the K8s benchmark driver copies the reporting binaries below.
+RUN cargo build --release --locked -p surch-api -p surch-demo --bins
+
+# Bench driver stage: used only by K8s Jobs that need `/bin/sh`, curl,
+# wget, jq, awk, and the benchmark/reporting tools. Keeping it separate
+# preserves the small distroless runtime image for the actual API server.
+FROM debian:bookworm-slim AS bench-driver
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash \
+      ca-certificates \
+      curl \
+      gawk \
+      jq \
+      libssl3 \
+      wget \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/src/surch/target/release/artillery_bench /usr/local/bin/artillery_bench
+COPY --from=builder /usr/src/surch/target/release/bench_report /usr/local/bin/bench_report
+COPY scripts/bench/scifact-ndcg.sh /usr/local/bin/scifact-ndcg.sh
+
+RUN chmod 0755 \
+      /usr/local/bin/artillery_bench \
+      /usr/local/bin/bench_report \
+      /usr/local/bin/scifact-ndcg.sh
+
+USER 65532:65532
+WORKDIR /work
 
 # Runtime stage: distroless gives us /etc/ssl/certs, /etc/passwd, and a
 # `nonroot` user (uid 65532). No shell, no package manager, no surface.
