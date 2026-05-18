@@ -2607,6 +2607,84 @@ async fn bool_filter_accepts_object_shorthand() {
 }
 
 #[tokio::test]
+async fn bool_rejects_must_not_when_combined_with_supported_buckets() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"bool":{"must":[{"match_all":{}}],"must_not":[{"term":{"category":"b"}}]}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert_eq!(
+        body["error"]["reason"],
+        "`bool.must_not` is not implemented yet"
+    );
+}
+
+#[tokio::test]
+async fn bool_rejects_must_not_only_with_explicit_error() {
+    let router = app_router();
+    let create_index = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(create_index.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":{"bool":{"must_not":[{"term":{"category":"b"}}]}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["error"]["type"], "parsing_exception");
+    assert_eq!(
+        body["error"]["reason"],
+        "`bool.must_not` is not implemented yet"
+    );
+}
+
+#[tokio::test]
 async fn match_query_rejects_unknown_operator_with_opensearch_error() {
     let router = app_router();
     let create_index = router

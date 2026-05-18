@@ -3586,6 +3586,26 @@ fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         )
     })?;
 
+    for key in object.keys() {
+        match key.as_str() {
+            "must" | "filter" | "should" | "minimum_should_match" | "boost" => {}
+            "must_not" => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    "`bool.must_not` is not implemented yet",
+                ));
+            }
+            unknown => {
+                return Err(OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("unsupported bool query field `{unknown}`"),
+                ));
+            }
+        }
+    }
+
     let must = parse_bool_clause_bucket(object, "must")?;
     let filter = parse_bool_clause_bucket(object, "filter")?;
     let should = parse_bool_clause_bucket(object, "should")?;
