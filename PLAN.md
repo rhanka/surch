@@ -71,7 +71,7 @@ Reste estime: ~30% (5 open / 18 leaf tasks).
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~35% (3 open / 9 leaf tasks).
+Reste estime: ~30% (3 open / 10 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -90,6 +90,9 @@ Reste estime: ~35% (3 open / 9 leaf tasks).
 - [x] BAN HTTP Surch/Elasticsearch reports now emit
   `surch.bench.ban_http.v1` and are rendered by `bench_report` into
   human Markdown plus `summary.json`.
+- [x] BAN HTTP CLI now presents the paired path as Surch/Elasticsearch:
+  `--elasticsearch-url` is the documented flag and `--opensearch-url`
+  remains only a legacy alias.
 - [ ] Ensure remaining benchmark producers can feed the summary
   contract.
 - [ ] Add paired RSS reporting for Surch vs Elasticsearch.
@@ -138,7 +141,7 @@ Reste estime: ~20% (2 open / 9 leaf tasks).
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~40% (4 open / 10 leaf tasks).
+Reste estime: ~31% (4 open / 13 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -157,11 +160,25 @@ Reste estime: ~40% (4 open / 10 leaf tasks).
 - [x] K8s Job manifests now consume the same `sha-<full commit SHA>`
   image tag that `docker-build.yml`, `ci-k8s.yml`, and `make bench-k8s`
   verify before dispatch.
+- [x] `ci-k8s` run `26058595173` proved the image tag reaches K8s and
+  uploaded
+  `k8s-bench-ndcg-gate-236980c600a60c40a8f28e2c433558c59ec5d5f7`.
+- [x] `ci-k8s` wait logic now fails early on pod phase `Failed`,
+  terminal container waiting / terminated reasons, and non-zero
+  container exits.
+- [x] Runtime blockers from `26058595173` are diagnosed: the distroless
+  Surch runtime image cannot run `/bin/sh` as a benchmark driver, and
+  the reference engine sidecar needs a compatible per-container security
+  context.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
-- [ ] Verify on GitHub Actions that missing-image preflight still fails
-  fast and that an existing GHCR image reaches `ndcg-gate` execution.
-- [ ] Always publish run diagnostics and artefacts on failure.
+- [x] Always publish run diagnostics and artefacts on failure.
+- [ ] Provide a shell-capable benchmark driver image/stage for
+  `ndcg-gate` and `insee-bench`.
+- [ ] Move the reference engine sidecar to a compatible per-container
+  security context.
+- [ ] Verify on GitHub Actions that a published GHCR image reaches
+  `ndcg-gate` benchmark execution after the runtime fixes.
 - [ ] Turn `make bench-k8s` into a real entry point.
 
 ## Delivery Finalities

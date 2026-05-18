@@ -66,7 +66,7 @@ fn ban_bench_prints_reproducible_latency_summary_and_guardrails() {
     assert!(stdout.contains("oracle: tests/opensearch_compat/oracle/replays/ban_tiny_search.json"));
     assert!(stdout.contains("runtime: Surch in-process axum router"));
     assert!(stdout.contains("guardrails:"));
-    assert!(stdout.contains("no OpenSearch ratio"));
+    assert!(stdout.contains("no Elasticsearch ratio"));
     assert!(stdout.contains("same host/build only"));
 
     for operation in [
@@ -105,11 +105,11 @@ fn ban_compare_plan_prints_guardrails_without_running_engines() {
     assert!(stdout.contains("Surch BAN compare plan"));
     assert!(stdout.contains("dataset: ban_tiny"));
     assert!(stdout.contains("documents: 3"));
-    assert!(stdout.contains("OpenSearch over HTTP"));
+    assert!(stdout.contains("Elasticsearch over HTTP"));
     assert!(stdout.contains("Surch in-process"));
     assert!(stdout.contains("no global ratio"));
     assert!(stdout.contains("oracle required"));
-    assert!(stdout.contains("does not start OpenSearch"));
+    assert!(stdout.contains("does not start Elasticsearch"));
 }
 
 #[test]
@@ -129,6 +129,7 @@ fn ban_http_bench_help_describes_dry_run_command() {
     assert!(stdout.contains("Surch BAN HTTP bench"));
     assert!(stdout.contains("usage: surch-demo ban-http-bench [OPTIONS]"));
     assert!(stdout.contains("--surch-url URL"));
+    assert!(stdout.contains("--elasticsearch-url URL"));
     assert!(stdout.contains("--opensearch-url URL"));
     assert!(stdout.contains("--index NAME"));
     assert!(stdout.contains("--iterations N"));
@@ -138,6 +139,8 @@ fn ban_http_bench_help_describes_dry_run_command() {
     assert!(stdout.contains("--report PATH"));
     assert!(stdout.contains("--timeout-seconds N"));
     assert!(stdout.contains("--dry-run"));
+    assert!(stdout.contains("Elasticsearch HTTP base URL"));
+    assert!(stdout.contains("legacy alias for --elasticsearch-url"));
     assert!(stdout.contains("executes a symmetric HTTP benchmark unless --dry-run is supplied"));
 }
 
@@ -148,7 +151,7 @@ fn ban_http_bench_prints_structured_dry_run_plan() {
             "ban-http-bench",
             "--surch-url",
             "http://127.0.0.1:7700",
-            "--opensearch-url",
+            "--elasticsearch-url",
             "http://127.0.0.1:9200",
             "--index",
             "ban_ci",
@@ -186,7 +189,8 @@ fn ban_http_bench_prints_structured_dry_run_plan() {
     assert!(stdout.contains("warmup: 2"));
     assert!(stdout.contains("timeout_seconds: 45"));
     assert!(stdout.contains("surch_url: http://127.0.0.1:7700"));
-    assert!(stdout.contains("opensearch_url: http://127.0.0.1:9200"));
+    assert!(stdout.contains("elasticsearch_url: http://127.0.0.1:9200"));
+    assert!(!stdout.contains("opensearch_url:"));
     assert!(stdout.contains("oracle: tests/opensearch_compat/oracle/replays/ban_tiny_search.json"));
     assert!(stdout.contains("report: target/ban-http-bench.json"));
     assert!(stdout.contains("operations:"));
@@ -198,6 +202,7 @@ fn ban_http_bench_prints_structured_dry_run_plan() {
     assert!(stdout.contains("  - search_ban_tiny_by_address_fields"));
     assert!(stdout.contains("  - future_fuzzy_label_typo"));
     assert!(stdout.contains("guardrail: dry-run mode sends no HTTP requests"));
+    assert!(stdout.contains("guardrail: does not start Elasticsearch, Docker, or a Surch server"));
 }
 
 #[test]
@@ -221,6 +226,31 @@ fn ban_http_bench_prints_default_artifact_paths() {
     assert!(stdout.contains("report: <none>"));
     assert!(stdout.contains("mode: dry-run"));
     assert!(stdout.contains("guardrail: dry-run mode sends no HTTP requests"));
+    assert!(stdout.contains("elasticsearch_url: http://127.0.0.1:9200"));
+    assert!(!stdout.contains("opensearch_url:"));
+}
+
+#[test]
+fn ban_http_bench_accepts_legacy_opensearch_url_alias() {
+    let output = Command::new(env!("CARGO_BIN_EXE_surch-demo"))
+        .args([
+            "ban-http-bench",
+            "--opensearch-url",
+            "http://127.0.0.1:19200",
+            "--dry-run",
+        ])
+        .output()
+        .expect("surch-demo binary should run");
+
+    assert!(
+        output.status.success(),
+        "ban-http-bench should accept the legacy alias: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("elasticsearch_url: http://127.0.0.1:19200"));
+    assert!(!stdout.contains("opensearch_url:"));
 }
 
 #[test]
@@ -230,7 +260,7 @@ fn ban_http_bench_attempts_http_execution_by_default() {
             "ban-http-bench",
             "--surch-url",
             "http://127.0.0.1:1",
-            "--opensearch-url",
+            "--elasticsearch-url",
             "http://127.0.0.1:1",
             "--iterations",
             "1",

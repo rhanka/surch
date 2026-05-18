@@ -24,7 +24,7 @@ const BAN_TINY_DOCUMENTS: u64 = 3;
 const SINGLE_HIT_COUNT: u64 = 1;
 const DEFAULT_BENCH_ITERATIONS: usize = 1_000;
 const DEFAULT_HTTP_BENCH_SURCH_URL: &str = "http://127.0.0.1:7700";
-const DEFAULT_HTTP_BENCH_OPENSEARCH_URL: &str = "http://127.0.0.1:9200";
+const DEFAULT_HTTP_BENCH_ELASTICSEARCH_URL: &str = "http://127.0.0.1:9200";
 const DEFAULT_HTTP_BENCH_INDEX: &str = "ban_tiny";
 const DEFAULT_HTTP_BENCH_DATASET: &str =
     "tests/opensearch_compat/oracle/datasets/ban/ban_tiny.ndjson";
@@ -218,7 +218,7 @@ async fn run_ban_bench(iterations: usize) -> Result<(), CliError> {
     print_metric(&fuzzy_metric);
     println!("guardrails:");
     println!("  - Surch in-process axum router only; no HTTP server is started");
-    println!("  - no OpenSearch ratio; this harness does not run OpenSearch");
+    println!("  - no Elasticsearch ratio; this harness does not run Elasticsearch");
     println!("  - compare only on the same host/build only");
     println!("  - responses are validated against BAN tiny oracle counts and top hit ids");
 
@@ -472,7 +472,7 @@ fn parse_bench_iterations(mut args: impl Iterator<Item = String>) -> Result<usiz
 #[derive(Debug)]
 struct BanHttpBenchPlan {
     surch_url: String,
-    opensearch_url: String,
+    elasticsearch_url: String,
     index: String,
     iterations: usize,
     dataset: String,
@@ -487,7 +487,7 @@ impl Default for BanHttpBenchPlan {
     fn default() -> Self {
         Self {
             surch_url: DEFAULT_HTTP_BENCH_SURCH_URL.to_owned(),
-            opensearch_url: DEFAULT_HTTP_BENCH_OPENSEARCH_URL.to_owned(),
+            elasticsearch_url: DEFAULT_HTTP_BENCH_ELASTICSEARCH_URL.to_owned(),
             index: DEFAULT_HTTP_BENCH_INDEX.to_owned(),
             iterations: DEFAULT_BENCH_ITERATIONS,
             dataset: DEFAULT_HTTP_BENCH_DATASET.to_owned(),
@@ -519,10 +519,15 @@ fn parse_ban_http_bench_args(
                 validate_http_url("--surch-url", &value)?;
                 plan.surch_url = value;
             }
+            "--elasticsearch-url" => {
+                let value = option_value(&mut args, "--elasticsearch-url")?;
+                validate_http_url("--elasticsearch-url", &value)?;
+                plan.elasticsearch_url = value;
+            }
             "--opensearch-url" => {
                 let value = option_value(&mut args, "--opensearch-url")?;
                 validate_http_url("--opensearch-url", &value)?;
-                plan.opensearch_url = value;
+                plan.elasticsearch_url = value;
             }
             "--index" => {
                 let value = option_value(&mut args, "--index")?;
@@ -570,11 +575,11 @@ async fn run_ban_http_bench(plan: BanHttpBenchPlan) -> Result<(), CliError> {
     let dataset = BulkDataset::load(&plan.dataset, &plan.index)?;
     let oracle = load_oracle_requests(&plan.oracle, &plan.index)?;
     let surch = HttpEndpoint::parse(&plan.surch_url)?;
-    let opensearch = HttpEndpoint::parse(&plan.opensearch_url)?;
+    let elasticsearch = HttpEndpoint::parse(&plan.elasticsearch_url)?;
 
     let surch_report = run_engine_http_bench("surch", &surch, &plan, &dataset, &oracle)?;
     let elasticsearch_report =
-        run_engine_http_bench("elasticsearch", &opensearch, &plan, &dataset, &oracle)?;
+        run_engine_http_bench("elasticsearch", &elasticsearch, &plan, &dataset, &oracle)?;
     let reports = vec![surch_report, elasticsearch_report];
 
     print_ban_http_bench_result(&plan, &dataset, &reports);
@@ -1745,14 +1750,14 @@ fn print_ban_compare_plan() {
     println!("dataset: ban_tiny");
     println!("documents: {BAN_TINY_DOCUMENTS}");
     println!("oracle required: {BAN_TINY_ORACLE}");
-    println!("OpenSearch over HTTP: measure only after healthcheck and index reset");
+    println!("Elasticsearch over HTTP: measure only after healthcheck and index reset");
     println!("Surch in-process: current smoke path; label separately from HTTP runtimes");
     println!("operations: create index, bulk ingest, refresh, count, match, bool, fuzzy");
     println!("metrics: ingest duration, docs/s, min, p50, p95, p99, max, errors, top hit id");
     println!(
-        "guardrail: no global ratio until Surch and OpenSearch use symmetric HTTP engine paths"
+        "guardrail: no global ratio until Surch and Elasticsearch use symmetric HTTP engine paths"
     );
-    println!("guardrail: does not start OpenSearch, Docker, or a Surch server");
+    println!("guardrail: does not start Elasticsearch, Docker, or a Surch server");
 }
 
 fn print_ban_http_bench_help() {
@@ -1764,8 +1769,9 @@ fn print_ban_http_bench_help() {
         "  --surch-url URL        Surch HTTP base URL (default: {DEFAULT_HTTP_BENCH_SURCH_URL})"
     );
     println!(
-        "  --opensearch-url URL   OpenSearch HTTP base URL (default: {DEFAULT_HTTP_BENCH_OPENSEARCH_URL})"
+        "  --elasticsearch-url URL Elasticsearch HTTP base URL (default: {DEFAULT_HTTP_BENCH_ELASTICSEARCH_URL})"
     );
+    println!("  --opensearch-url URL   legacy alias for --elasticsearch-url");
     println!("  --index NAME           target index name (default: {DEFAULT_HTTP_BENCH_INDEX})");
     println!("  --iterations N         requests per measured operation (default: {DEFAULT_BENCH_ITERATIONS})");
     println!(
@@ -1795,7 +1801,7 @@ fn print_ban_http_bench_plan(plan: &BanHttpBenchPlan) -> Result<(), CliError> {
     println!("warmup: {}", plan.warmup);
     println!("timeout_seconds: {}", plan.timeout_seconds);
     println!("surch_url: {}", plan.surch_url);
-    println!("opensearch_url: {}", plan.opensearch_url);
+    println!("elasticsearch_url: {}", plan.elasticsearch_url);
     println!("oracle: {}", plan.oracle);
     match &plan.report {
         Some(report) => println!("report: {report}"),
@@ -1810,7 +1816,7 @@ fn print_ban_http_bench_plan(plan: &BanHttpBenchPlan) -> Result<(), CliError> {
     }
     println!("metrics: status, latency_us, docs, bytes, hits_total, top_hit_id, error_count");
     println!("guardrail: dry-run mode sends no HTTP requests");
-    println!("guardrail: does not start OpenSearch, Docker, or a Surch server");
+    println!("guardrail: does not start Elasticsearch, Docker, or a Surch server");
     println!("guardrail: compare only on the same host/build only");
     Ok(())
 }
@@ -1905,7 +1911,7 @@ mod tests {
     fn ban_http_bench_report_json_serializes_metadata_engines_and_guardrails() {
         let plan = BanHttpBenchPlan {
             surch_url: "http://127.0.0.1:7700".to_owned(),
-            opensearch_url: "http://127.0.0.1:9200".to_owned(),
+            elasticsearch_url: "http://127.0.0.1:9200".to_owned(),
             index: "ban_ci".to_owned(),
             iterations: 2,
             dataset: "tests/fixtures/ban.ndjson".to_owned(),

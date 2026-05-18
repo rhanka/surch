@@ -446,16 +446,16 @@ fn normalize_engine_name(name: &str) -> String {
     }
 }
 
-/// Best-effort engine detection from URL (port 7700 = surch, 9200 = OS),
+/// Best-effort engine detection from URL (port 7700 = surch, 9200 = Elasticsearch),
 /// falling back to the filename stem.
 fn engine_from_url_or_stem(url: &str, stem: &str) -> String {
     if url.contains(":7700") {
         return "surch".to_owned();
     }
     if url.contains(":9200") {
-        return "opensearch".to_owned();
+        return "elasticsearch".to_owned();
     }
-    engine_from_stem(stem)
+    normalize_engine_name(&engine_from_stem(stem))
 }
 
 fn engine_from_stem(stem: &str) -> String {
@@ -716,7 +716,7 @@ fn render_markdown(
     // Pair section (optional, informational only).
     if !current.pair.is_empty() {
         out.push_str(&format!("## Pair envelopes ({SCHEMA_PAIR})\n\n"));
-        out.push_str("| Workload | Surch output | OS output |\n");
+        out.push_str("| Workload | Surch output | Elasticsearch output |\n");
         out.push_str("|---|---|---|\n");
         for row in &current.pair {
             out.push_str(&format!(
@@ -983,14 +983,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn engine_from_url_detects_surch_and_opensearch() {
+    fn engine_from_url_detects_surch_and_elasticsearch() {
         assert_eq!(
             engine_from_url_or_stem("http://127.0.0.1:7700", "art"),
             "surch"
         );
         assert_eq!(
             engine_from_url_or_stem("http://127.0.0.1:9200", "art"),
-            "opensearch"
+            "elasticsearch"
         );
     }
 

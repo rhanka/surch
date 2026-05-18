@@ -40,6 +40,9 @@ Status: active branch exists; latest branch head `65fc759`
 - [x] Promotion output merged to `main`: `bd00e9e`.
 - [x] BAN HTTP Surch/Elasticsearch producer is wired into
   `bench_report` via `surch.bench.ban_http.v1`.
+- [x] BAN HTTP CLI presents the paired path as Surch/Elasticsearch:
+  `--elasticsearch-url` is the documented flag; `--opensearch-url`
+  remains a legacy alias only.
 - [ ] `wp/b-test-auto` contains the next branch-specific delivery.
 
 ## Lots
@@ -75,6 +78,9 @@ Status: active branch exists; latest branch head `65fc759`
   - [x] Add `surch.bench.ban_http.v1` to `surch-demo ban-http-bench`.
   - [x] Render BAN HTTP Surch/Elasticsearch rows in human Markdown and
     `summary.json`.
+  - [x] Align the CLI help, dry-run plan, and guardrails on
+    Surch/Elasticsearch wording while preserving `--opensearch-url` as
+    a legacy alias.
   - [x] Gate: user can compare Surch/Elasticsearch BAN HTTP p50 / p95 /
     p99 / max, errors, docs/s and bytes/s in Markdown.
   - [ ] Ensure remaining benchmark producers can feed the summary

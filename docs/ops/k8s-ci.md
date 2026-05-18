@@ -1,6 +1,6 @@
 # Surch — K8s burst CI/CD
 
-Date: 2026-05-17
+Date: 2026-05-18
 Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
 
 ## Architecture
@@ -44,9 +44,10 @@ Status: manual `workflow_dispatch` gate, fail-closed reporting enabled.
   apply`, so a missing corpus volume fails in seconds instead of waiting
   for the Job deadline.
 - Job status is fail-closed: `Complete=True` passes; `Failed=True`,
-  `FailureTarget=True`, terminal pod startup errors
-  (`ErrImagePull` / `ImagePullBackOff` / container config errors), or a
-  30 min timeout fail the workflow.
+  `FailureTarget=True`, pod phase `Failed`, terminal pod startup errors
+  (`ErrImagePull` / `ImagePullBackOff` / container config errors /
+  `StartError`), non-zero container exits, or a 30 min timeout fail the
+  workflow.
 
 ## Manual run
 
@@ -116,6 +117,26 @@ GHA uploads an artifact named `k8s-bench-<job>-<sha>`. It contains:
   - `insee-bench.summary.md`, `insee-bench.art-surch.json`,
     `insee-bench.art-os.json`
 
+## Latest diagnostics
+
+`ci-k8s` run `26058595173` proved the image handoff is now correct for
+`ghcr.io/rhanka/surch:sha-236980c600a60c40a8f28e2c433558c59ec5d5f7`,
+then failed inside `ndcg-gate` before the benchmark driver could run.
+The uploaded artifact is
+`k8s-bench-ndcg-gate-236980c600a60c40a8f28e2c433558c59ec5d5f7`.
+
+The relevant root causes in the artifact are:
+
+- `ndcg-driver` used the Surch distroless runtime image with
+  `command: ["/bin/sh", "-c"]`; the image has no `/bin/sh`, so the
+  container hit a `StartError`.
+- The reference engine sidecar exited with code `126` because the
+  pod-level non-root security context forced an incompatible user for
+  its entrypoint.
+- The previous wait loop did not surface those pod states early enough;
+  it now prints per-container waiting / terminated / last-terminated
+  reasons and fails on terminal states before the Job deadline.
+
 ## Cost guardrails
 
 | Knob                  | Value | Where enforced                                                |
@@ -149,8 +170,11 @@ namespace returns to its 500m / 512Mi quota baseline.
 - `ndcg-gate` and `insee-bench` still depend on the Surch runtime image
   shipping the driver tools they call (`/bin/sh`, `wget`,
   `scifact-ndcg.sh`, `artillery_bench`, `bench_report`). Until the image
-  contract is updated, failures from those Jobs should be diagnosed from
-  the uploaded describe/events/log artifacts.
+  contract is updated, the next functional fix is to provide a dedicated
+  shell-capable bench driver image or stage instead of using the
+  distroless runtime image as a driver.
+- The reference engine sidecar needs its own security context rather
+  than inheriting the Surch runtime user's `65532:65532` pod default.
 - A missing GHCR tag is treated as a workflow precondition failure, not
   as a 30 min benchmark timeout. When that happens, inspect the image
   publication workflow before re-running `ci-k8s`.

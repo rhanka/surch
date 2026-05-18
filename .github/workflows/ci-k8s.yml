@@ -168,12 +168,24 @@ jobs:
             fi
 
             pod_states="$(kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" \
-              -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.name}{":"}{if .state.waiting}{.state.waiting.reason}{end}{if .state.terminated}{.state.terminated.reason}{end}{","}{end}{"\n"}{end}' 2>/dev/null || true)"
+              -o jsonpath='{range .items[*]}{.metadata.name}{"|phase="}{.status.phase}{"|"}{range .status.containerStatuses[*]}{.name}{":waiting="}{.state.waiting.reason}{";terminated="}{.state.terminated.reason}{";exit="}{.state.terminated.exitCode}{";last="}{.lastState.terminated.reason}{";last_exit="}{.lastState.terminated.exitCode}{","}{end}{"\n"}{end}' 2>/dev/null || true)"
             if [ -n "$pod_states" ]; then
               printf '%s\n' "$pod_states"
             fi
-            if printf '%s\n' "$pod_states" | grep -Eq ':(ErrImagePull|ImagePullBackOff|InvalidImageName|CreateContainerConfigError|CreateContainerError|RunContainerError|ContainerCannotRun|StartError)(,|$)'; then
-              echo "::error::Kubernetes pod for Job $JOB_NAME hit a terminal container startup error."
+            if printf '%s\n' "$pod_states" | grep -Eq '\|phase=Failed\|'; then
+              echo "::error::Kubernetes pod for Job $JOB_NAME reached phase=Failed."
+              kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true
+              kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
+              exit 1
+            fi
+            if printf '%s\n' "$pod_states" | grep -Eq '(waiting=|terminated=|last=)(ErrImagePull|ImagePullBackOff|InvalidImageName|CreateContainerConfigError|CreateContainerError|RunContainerError|ContainerCannotRun|StartError|CrashLoopBackOff|Error|OOMKilled)'; then
+              echo "::error::Kubernetes pod for Job $JOB_NAME hit a terminal container error."
+              kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true
+              kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
+              exit 1
+            fi
+            if printf '%s\n' "$pod_states" | grep -Eq '(^|[;,])exit=([1-9][0-9]*)([;,]|$)'; then
+              echo "::error::Kubernetes pod for Job $JOB_NAME has a container with non-zero exit code."
               kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true
               kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
               exit 1

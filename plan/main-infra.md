@@ -14,8 +14,8 @@ Status: active infra lane; merge state below is the source of truth
 
 - [x] Delivered scope:
   `.github/workflows/ci-k8s.yml`, `docs/ops/k8s-ci.md`.
-- [ ] Next scope: image production / consumption handoff and
-  `make bench-k8s` entry point.
+- [ ] Next scope: K8s runtime contract for benchmark drivers, reference
+  engine security context, and `make bench-k8s` entry point.
 - [x] Image handoff issue fixed locally for next commit:
   `ci-k8s.yml`, `docker-build.yml`, and `release.yml` use
   `ghcr.io/rhanka/surch:sha-<full commit SHA>`.
@@ -34,12 +34,21 @@ Status: active infra lane; merge state below is the source of truth
   dependency MSRV.
 - [x] K8s Job manifests consume the `sha-<full commit SHA>` GHCR tag
   that `docker-build.yml` actually publishes.
+- [x] `ci-k8s` run `26058595173` proved the GHCR image handoff for
+  `sha-236980c600a60c40a8f28e2c433558c59ec5d5f7` and preserved the
+  failure artifact.
+- [x] Wait loop now fails early on pod phase `Failed`, terminal
+  waiting / terminated reasons, and non-zero container exits instead of
+  relying only on Job conditions.
 - [x] Verification run recorded: `ci-k8s` `26038117579` failed in 16s
   on missing image, replacing 30m timeout pattern.
 - [x] `main` CI after latest integration was green: `26038398172`.
 - [ ] `ci-k8s` heavy run reaches actual `ndcg-gate` benchmark.
   - [x] Diagnose image contract mismatch between GHCR preflight and
     rendered Job manifests.
+  - [x] Diagnose next runtime blockers: Surch distroless driver image
+    has no `/bin/sh`; reference engine entrypoint exits under the
+    pod-level `65532:65532` security context.
 
 ## Lots
 
@@ -69,13 +78,23 @@ Status: active infra lane; merge state below is the source of truth
   - [x] Keep the missing-image preflight fail-fast.
   - [x] Commit main: `5c25463`.
   - [ ] Gate 1: missing image fails fast with actionable message.
-  - [ ] Gate 2: existing image reaches benchmark execution.
+  - [x] Gate 2a: existing image reaches pod startup instead of image
+    pull failure; run `26058595173`.
+  - [ ] Gate 2b: existing image reaches benchmark execution after the
+    driver/security-context runtime fixes.
 
 - [ ] Lot 3 - Heavy-run standardisation
   - [x] Keep Docker builder MSRV aligned with locked dependencies before
     dispatching `ci-k8s`.
+  - [x] Preserve diagnostics and artefacts on failure; run
+    `26058595173` uploaded
+    `k8s-bench-ndcg-gate-236980c600a60c40a8f28e2c433558c59ec5d5f7`.
+  - [x] Make the wait loop fail early on terminal pod/container states.
+  - [ ] Provide a shell-capable benchmark driver image/stage for
+    `ndcg-gate` and `insee-bench`.
+  - [ ] Move the reference engine sidecar to a compatible per-container
+    security context.
   - [ ] Make `ci-k8s` the standard burst / large-corpus path.
-  - [ ] Ensure diagnostics and artefacts are preserved on failure.
   - [ ] Turn `make bench-k8s` into a real entry point.
 
 - [ ] Lot N - Closure
