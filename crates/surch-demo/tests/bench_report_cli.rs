@@ -4,12 +4,12 @@
 //! argument parsing, JSON ingestion, Markdown rendering, and the
 //! SLO/regression exit-code contract end-to-end.
 
+use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
 };
-use serde_json::Value;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_bench_report")
