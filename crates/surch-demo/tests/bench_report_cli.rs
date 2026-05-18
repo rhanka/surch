@@ -47,6 +47,18 @@ fn help_prints_usage_and_schemas() {
     assert!(stdout.contains("--baseline"), "missing --baseline flag");
     assert!(stdout.contains("--output"), "missing --output flag");
     assert!(
+        stdout.contains("--promote-dir"),
+        "missing --promote-dir flag"
+    );
+    assert!(
+        stdout.contains("Human readers use summary.md or promoted README.md"),
+        "help should direct humans to Markdown"
+    );
+    assert!(
+        stdout.contains("Agents and CI validate summary.json"),
+        "help should direct agents/CI to JSON"
+    );
+    assert!(
         stdout.contains("surch.bench.artillery.v1"),
         "missing artillery schema in help"
     );
@@ -58,6 +70,80 @@ fn help_prints_usage_and_schemas() {
         stdout.contains("surch.bench.pair.v1"),
         "missing pair schema in help"
     );
+}
+
+#[test]
+fn promote_dir_writes_readme_and_machine_summary_json() {
+    let dir = unique_dir("promote-src");
+    let promote_dir = unique_dir("promote-dst");
+    write_json(
+        &dir,
+        "art-surch.json",
+        r#"{
+            "schema": "surch.bench.artillery.v1",
+            "url": "http://127.0.0.1:7700",
+            "index": "deces_25k",
+            "global": {
+                "issued": 1000, "errors": 0,
+                "p50_ms": 4.0, "p95_ms": 50.0, "p99_ms": 80.0, "max_ms": 120.0
+            }
+        }"#,
+    );
+
+    let output = Command::new(bin())
+        .args([
+            "--dir",
+            dir.to_str().unwrap(),
+            "--promote-dir",
+            promote_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bench_report binary should run");
+    assert!(
+        output.status.success(),
+        "promotion should exit 0: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let readme = fs::read_to_string(promote_dir.join("README.md")).expect("README.md exists");
+    assert!(readme.starts_with("# Surch bench summary "));
+    assert!(readme.contains("## SLO checks"));
+
+    let json: Value = serde_json::from_str(
+        &fs::read_to_string(promote_dir.join("summary.json")).expect("summary.json exists"),
+    )
+    .expect("summary.json valid json");
+    assert_eq!(json["schema"], "surch.bench.summary.v1");
+    assert_eq!(json["verdict"]["exit_ok"], true);
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&promote_dir);
+}
+
+#[test]
+fn output_and_promote_dir_are_mutually_exclusive() {
+    let dir = unique_dir("promote-conflict");
+    let output = Command::new(bin())
+        .args([
+            "--dir",
+            dir.to_str().unwrap(),
+            "--output",
+            dir.join("summary.md").to_str().unwrap(),
+            "--promote-dir",
+            dir.join("promoted").to_str().unwrap(),
+        ])
+        .output()
+        .expect("bench_report binary should run");
+    assert!(
+        !output.status.success(),
+        "--output and --promote-dir should be rejected together"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf-8");
+    assert!(
+        stderr.contains("--output and --promote-dir are mutually exclusive"),
+        "unexpected stderr: {stderr}"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

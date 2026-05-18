@@ -11,9 +11,11 @@
 //!   bench_report --dir target/bench-reports/<sha>
 //!                [--baseline target/bench-reports/<other_sha>]
 //!                [--output target/bench-reports/<sha>/summary.md]
+//!                [--promote-dir docs/ops/bench-reports/<date>-<context>]
 //!
 //! Output:
 //!   * Markdown summary at `--output` (or `<DIR>/summary.md`)
+//!   * Promoted human report at `<promote-dir>/README.md`
 //!   * Stable JSON summary next to it (`summary.json`)
 //!
 //! Exit code:
@@ -97,15 +99,12 @@ fn run() -> Result<bool, CliError> {
         &regression_results,
     );
 
-    let output_path = plan
-        .output
-        .clone()
-        .unwrap_or_else(|| plan.dir.join("summary.md"));
+    let output_path = plan.output_path();
+    let json_output_path = plan.json_output_path();
     let slo_ok = slo_results.iter().all(|check| check.passed);
     let regression_ok = regression_results.iter().all(|check| check.passed);
     write_output(&output_path, &markdown)?;
     println!("wrote {}", output_path.display());
-    let json_output_path = output_path.with_extension("json");
     let json_summary = render_json_summary(
         &sha,
         baseline_sha.as_deref(),
@@ -125,12 +124,34 @@ struct Plan {
     dir: PathBuf,
     baseline: Option<PathBuf>,
     output: Option<PathBuf>,
+    promote_dir: Option<PathBuf>,
+}
+
+impl Plan {
+    fn output_path(&self) -> PathBuf {
+        match (&self.output, &self.promote_dir) {
+            (Some(path), None) => path.clone(),
+            (None, Some(dir)) => dir.join("README.md"),
+            (None, None) => self.dir.join("summary.md"),
+            (Some(_), Some(_)) => unreachable!("parse_args rejects output/promote_dir conflict"),
+        }
+    }
+
+    fn json_output_path(&self) -> PathBuf {
+        match (&self.output, &self.promote_dir) {
+            (Some(path), None) => path.with_extension("json"),
+            (None, Some(dir)) => dir.join("summary.json"),
+            (None, None) => self.dir.join("summary.json"),
+            (Some(_), Some(_)) => unreachable!("parse_args rejects output/promote_dir conflict"),
+        }
+    }
 }
 
 fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
     let mut dir: Option<PathBuf> = None;
     let mut baseline: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut promote_dir: Option<PathBuf> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -138,10 +159,19 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
             "--dir" => dir = Some(PathBuf::from(required(&mut iter, "--dir")?)),
             "--baseline" => baseline = Some(PathBuf::from(required(&mut iter, "--baseline")?)),
             "--output" => output = Some(PathBuf::from(required(&mut iter, "--output")?)),
+            "--promote-dir" => {
+                promote_dir = Some(PathBuf::from(required(&mut iter, "--promote-dir")?));
+            }
             other => {
                 return Err(CliError::Usage(format!("unknown option `{other}`")));
             }
         }
+    }
+
+    if output.is_some() && promote_dir.is_some() {
+        return Err(CliError::Usage(
+            "--output and --promote-dir are mutually exclusive".to_owned(),
+        ));
     }
 
     let dir = dir.ok_or_else(|| CliError::Usage("missing required --dir".to_owned()))?;
@@ -149,6 +179,7 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
         dir,
         baseline,
         output,
+        promote_dir,
     })
 }
 
@@ -781,12 +812,18 @@ fn print_help() {
     println!();
     println!("USAGE:");
     println!("  bench_report --dir <DIR> [--baseline <DIR>] [--output <FILE>]");
+    println!("  bench_report --dir <DIR> [--baseline <DIR>] --promote-dir <DIR>");
     println!();
     println!("OPTIONS:");
     println!("  --dir <DIR>         directory containing *.json reports to aggregate (required)");
     println!("  --baseline <DIR>    optional baseline directory for regression detection");
     println!("  --output <FILE>     output Markdown path (default: <DIR>/summary.md)");
+    println!("  --promote-dir <DIR> write promoted README.md and summary.json under <DIR>");
     println!("  -h, --help          print this help");
+    println!();
+    println!("REPORT CONTRACT:");
+    println!("  Human readers use summary.md or promoted README.md.");
+    println!("  Agents and CI validate summary.json.");
     println!();
     println!("RECOGNISED SCHEMAS:");
     println!("  {SCHEMA_ARTILLERY}");
