@@ -328,7 +328,11 @@ async fn mock_object_handler(
             match guard.get(&full) {
                 Some(bytes) => {
                     let etag = etag_of(bytes);
-                    (StatusCode::OK, [(header::ETAG, etag.as_str())], Body::empty())
+                    (
+                        StatusCode::OK,
+                        [(header::ETAG, etag.as_str())],
+                        Body::empty(),
+                    )
                         .into_response()
                 }
                 None => (StatusCode::NOT_FOUND, Body::empty()).into_response(),
@@ -445,7 +449,10 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
         .expect("PUT _snapshot/cloud");
     let status = resp.status();
     let body = resp.text().await.expect("body");
-    assert!(status.is_success(), "register s3 repo failed: {status} {body}");
+    assert!(
+        status.is_success(),
+        "register s3 repo failed: {status} {body}"
+    );
 
     // 2. Create the `source` index with a minimal mapping.
     let resp = client
