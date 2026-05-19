@@ -35,6 +35,13 @@ spec:
         app.kubernetes.io/component: b1-oracle-gate
     spec:
       restartPolicy: Never
+      # fsGroup lets the Elasticsearch container (runAsUser 1000)
+      # write its data directory inside the scratch PVC subPath.
+      # Without it, the first ES boot dies with
+      # `AccessDeniedException: /usr/share/elasticsearch/data/nodes`.
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       tolerations:
         - key: pool
           operator: Equal
