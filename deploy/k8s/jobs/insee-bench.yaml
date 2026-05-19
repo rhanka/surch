@@ -129,15 +129,40 @@ spec:
               until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
               until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
               mkdir -p "$REPORTS_DIR"
+              # Bootstrap the `deces` index on both engines with the
+              # INSEE 10k mapping + bulk-load slice baked into this
+              # image. The slice NDJSON carries `_index: "deces"` in
+              # every action header, so artillery_bench targets the
+              # same index name below.
+              bootstrap_engine() {
+                url="$1"; label="$2"
+                echo "bootstrap $label: PUT /deces"
+                curl -fsS -X PUT "$url/deces" \
+                  -H 'Content-Type: application/json' \
+                  --data-binary @/usr/local/share/deces/mapping.json \
+                  > "$REPORTS_DIR/bootstrap-$label.put.json"
+                echo "bootstrap $label: POST /_bulk (10k docs)"
+                gunzip -c /usr/local/share/deces/slice-10000.ndjson.gz \
+                  | curl -fsS -X POST "$url/_bulk" \
+                      -H 'Content-Type: application/x-ndjson' \
+                      --data-binary @- \
+                      > "$REPORTS_DIR/bootstrap-$label.bulk.json"
+                # Refresh so newly indexed docs are searchable before
+                # the load phase starts.
+                curl -fsS -X POST "$url/deces/_refresh" \
+                  > "$REPORTS_DIR/bootstrap-$label.refresh.json"
+              }
+              bootstrap_engine "$SURCH_URL" surch
+              bootstrap_engine "$OPENSEARCH_URL" opensearch
               # The bench driver image ships artillery_bench and
               # bench_report in /usr/local/bin.
               /usr/local/bin/artillery_bench \
-                --url "$SURCH_URL" --index "deces_insee" \
+                --url "$SURCH_URL" --index "deces" \
                 --names "$INSEE_DIR/artillery_names.txt" \
                 --workers "$ART_WORKERS" --phases "$ART_PHASES" \
                 --report "$REPORTS_DIR/art-surch.json"
               /usr/local/bin/artillery_bench \
-                --url "$OPENSEARCH_URL" --index "deces_insee" \
+                --url "$OPENSEARCH_URL" --index "deces" \
                 --names "$INSEE_DIR/artillery_names.txt" \
                 --workers "$ART_WORKERS" --phases "$ART_PHASES" \
                 --report "$REPORTS_DIR/art-os.json"

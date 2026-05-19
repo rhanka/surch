@@ -59,10 +59,19 @@ COPY --from=builder /usr/src/surch/target/release/artillery_bench /usr/local/bin
 COPY --from=builder /usr/src/surch/target/release/bench_report /usr/local/bin/bench_report
 COPY scripts/bench/scifact-ndcg.sh /usr/local/bin/scifact-ndcg.sh
 
+# INSEE 10k fixture (mapping + gzipped NDJSON bulk payload). Shipped
+# inside the bench-driver image so insee-bench K8s Jobs can bootstrap
+# the `deces` index on both engines before driving artillery_bench.
+COPY tests/matchid_compat/deces/mapping.json /usr/local/share/deces/mapping.json
+COPY tests/matchid_compat/deces/slice-10000.ndjson.gz /usr/local/share/deces/slice-10000.ndjson.gz
+
 RUN chmod 0755 \
       /usr/local/bin/artillery_bench \
       /usr/local/bin/bench_report \
-      /usr/local/bin/scifact-ndcg.sh
+      /usr/local/bin/scifact-ndcg.sh \
+ && chmod 0644 \
+      /usr/local/share/deces/mapping.json \
+      /usr/local/share/deces/slice-10000.ndjson.gz
 
 USER 65532:65532
 WORKDIR /work
