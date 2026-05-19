@@ -7,6 +7,7 @@
 //!   * `surch.bench.ban_http.v1`  — produced by `surch-demo ban-http-bench`
 //!   * `surch.bench.rss.v1`       — produced by `scripts/bench/rss-sample.sh`
 //!   * `surch.bench.pair.v1`      — produced by `scripts/bench/run-pair.sh`
+//!   * BEIR `.out` text reports    — produced by `scripts/bench/*-ndcg.sh`
 //!
 //! CLI:
 //!   bench_report --dir target/bench-reports/<sha>
@@ -52,6 +53,8 @@ const SLO_ARTILLERY_P95_MS: f64 = 200.0;
 const SLO_ARTILLERY_MAX_MS: f64 = 500.0;
 const SLO_ARTILLERY_ERROR_RATE_PCT: f64 = 1.0;
 const SLO_RSS_PEAK_MB: f64 = 1024.0;
+const SLO_SCIFACT_NDCG_10: f64 = 0.65;
+const SLO_TREC_COVID_NDCG_10: f64 = 0.55;
 
 const REGRESSION_P95_PCT: f64 = 15.0;
 const REGRESSION_RSS_PCT: f64 = 25.0;
@@ -201,6 +204,7 @@ fn required<I: Iterator<Item = String>>(
 struct Aggregate {
     artillery: Vec<ArtilleryRow>,
     ban_http: Vec<BanHttpRow>,
+    beir: Vec<BeirRow>,
     rss: Vec<RssRow>,
     pair: Vec<PairRow>,
     unknown_files: Vec<String>,
@@ -235,6 +239,18 @@ struct BanHttpRow {
 }
 
 #[derive(Debug, Clone)]
+struct BeirRow {
+    engine: String,
+    workload: String,
+    ndcg_10: f64,
+    recall_10: f64,
+    queries_processed: u64,
+    total_queries: u64,
+    bulk_ms: f64,
+    lucene_baseline_ndcg_10: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
 struct RssRow {
     label: String,
     engine: String,
@@ -266,7 +282,12 @@ fn load_directory(dir: &Path) -> Result<Aggregate, CliError> {
         .map_err(|e| CliError::Io(format!("read_dir {}: {e}", dir.display())))?
         .filter_map(|res| res.ok().map(|entry| entry.path()))
         .filter(|path| path.is_file())
-        .filter(|path| matches!(path.extension().and_then(|s| s.to_str()), Some("json")))
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("json" | "out")
+            )
+        })
         .collect();
     entries.sort();
 
@@ -284,6 +305,15 @@ fn load_directory(dir: &Path) -> Result<Aggregate, CliError> {
                 continue;
             }
         };
+        if matches!(path.extension().and_then(|s| s.to_str()), Some("out")) {
+            if let Some(row) = parse_beir_text_output(&raw, &stem) {
+                agg.beir.push(row);
+            } else {
+                agg.unknown_files
+                    .push(format!("{}: unrecognised text report", path.display()));
+            }
+            continue;
+        }
         let value: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(_) => {
@@ -342,6 +372,8 @@ fn load_directory(dir: &Path) -> Result<Aggregate, CliError> {
         .sort_by(|a, b| a.engine.cmp(&b.engine).then(a.workload.cmp(&b.workload)));
     agg.ban_http
         .sort_by(|a, b| a.engine.cmp(&b.engine).then(a.operation.cmp(&b.operation)));
+    agg.beir
+        .sort_by(|a, b| a.engine.cmp(&b.engine).then(a.workload.cmp(&b.workload)));
     agg.rss
         .sort_by(|a, b| a.engine.cmp(&b.engine).then(a.workload.cmp(&b.workload)));
     agg.pair.sort_by(|a, b| a.workload.cmp(&b.workload));
@@ -406,6 +438,80 @@ fn parse_ban_http(value: &Value) -> Option<Vec<BanHttpRow>> {
     Some(rows)
 }
 
+fn parse_beir_text_output(raw: &str, stem: &str) -> Option<BeirRow> {
+    let mut engine: Option<String> = None;
+    let mut workload: Option<String> = None;
+    let mut bulk_ms: Option<f64> = None;
+    let mut queries_processed: Option<u64> = None;
+    let mut total_queries: Option<u64> = None;
+    let mut ndcg_10: Option<f64> = None;
+    let mut recall_10: Option<f64> = None;
+    let mut lucene_baseline_ndcg_10: Option<f64> = None;
+
+    for line in raw.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("## ") {
+            let mut tokens = rest.split_whitespace();
+            if let Some(name) = tokens.next() {
+                if let Some(base) = name.strip_suffix("-ndcg") {
+                    workload = Some(base.to_owned());
+                }
+            }
+            for token in tokens {
+                if let Some(label) = token.strip_prefix("label=") {
+                    engine = Some(normalize_engine_name(label));
+                }
+            }
+            continue;
+        }
+
+        if line.starts_with("url=") {
+            if let Some(value) = key_value_token(line, "bulk_ms") {
+                bulk_ms = value.parse().ok();
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("queries_processed=") {
+            let mut parts = rest.split_whitespace();
+            queries_processed = parts.next().and_then(|value| value.parse().ok());
+            if let Some((_, after)) = line.split_once("(out of ") {
+                total_queries = after
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse().ok());
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("NDCG@10 = ") {
+            ndcg_10 = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            if let Some((_, after)) = rest.split_once("baseline:") {
+                lucene_baseline_ndcg_10 = after
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse().ok());
+            }
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("Recall@10 = ") {
+            recall_10 = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        }
+    }
+
+    Some(BeirRow {
+        engine: engine.unwrap_or_else(|| normalize_engine_name(&engine_from_stem(stem))),
+        workload: workload.unwrap_or_else(|| workload_from_stem(stem)),
+        ndcg_10: ndcg_10?,
+        recall_10: recall_10?,
+        queries_processed: queries_processed?,
+        total_queries: total_queries?,
+        bulk_ms: bulk_ms?,
+        lucene_baseline_ndcg_10,
+    })
+}
+
 fn parse_rss(value: &Value, stem: &str) -> Option<RssRow> {
     let peak_mb = value.get("peak_mb").and_then(|v| v.as_f64())?;
     let final_mb = value.get("final_mb").and_then(|v| v.as_f64())?;
@@ -444,6 +550,12 @@ fn normalize_engine_name(name: &str) -> String {
         "es" | "os" | "opensearch" => "elasticsearch".to_owned(),
         other => other.to_owned(),
     }
+}
+
+fn key_value_token<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(&prefix))
 }
 
 /// Best-effort engine detection from URL (port 7700 = surch, 9200 = Elasticsearch),
@@ -562,7 +674,31 @@ fn evaluate_slo(agg: &Aggregate) -> Vec<SloCheck> {
             });
         }
     }
+    for row in &agg.beir {
+        if let Some(target) = beir_ndcg_target(&row.workload) {
+            let passed = row.ndcg_10 >= target;
+            checks.push(SloCheck {
+                name: format!(
+                    "BEIR NDCG@10 ≥ {:.2} [{} / {}]",
+                    target, row.engine, row.workload
+                ),
+                detail: format!(
+                    "observed NDCG@10 = {:.4}, Recall@10 = {:.4}",
+                    row.ndcg_10, row.recall_10
+                ),
+                passed,
+            });
+        }
+    }
     checks
+}
+
+fn beir_ndcg_target(workload: &str) -> Option<f64> {
+    match workload {
+        "scifact" => Some(SLO_SCIFACT_NDCG_10),
+        "trec-covid" => Some(SLO_TREC_COVID_NDCG_10),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -692,6 +828,30 @@ fn render_markdown(
                 row.errors,
                 format_optional_rate(row.docs_per_second),
                 format_optional_rate(row.bytes_per_second),
+            ));
+        }
+    }
+    out.push('\n');
+
+    // BEIR section.
+    out.push_str("## BEIR retrieval results\n\n");
+    out.push_str("| Engine | Workload | NDCG@10 | Recall@10 | processed | total | bulk ms | Lucene baseline NDCG@10 |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---:|---:|\n");
+    if current.beir.is_empty() {
+        out.push_str("| _no data_ |  |  |  |  |  |  |  |\n");
+    } else {
+        for row in &current.beir {
+            out.push_str(&format!(
+                "| {} | {} | {:.4} | {:.4} | {} | {} | {:.1} | {} |\n",
+                row.engine,
+                row.workload,
+                row.ndcg_10,
+                row.recall_10,
+                row.queries_processed,
+                row.total_queries,
+                row.bulk_ms,
+                row.lucene_baseline_ndcg_10
+                    .map_or_else(|| "-".to_owned(), |value| format!("{value:.4}")),
             ));
         }
     }
@@ -832,6 +992,22 @@ fn render_json_summary(
             })
         })
         .collect();
+    let beir: Vec<Value> = current
+        .beir
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "engine": row.engine,
+                "workload": row.workload,
+                "ndcg_10": row.ndcg_10,
+                "recall_10": row.recall_10,
+                "queries_processed": row.queries_processed,
+                "total_queries": row.total_queries,
+                "bulk_ms": row.bulk_ms,
+                "lucene_baseline_ndcg_10": row.lucene_baseline_ndcg_10,
+            })
+        })
+        .collect();
     let pair: Vec<Value> = current
         .pair
         .iter()
@@ -871,6 +1047,7 @@ fn render_json_summary(
         "generated_at": generated_at,
         "artillery": artillery,
         "ban_http": ban_http,
+        "beir": beir,
         "rss": rss,
         "pair": pair,
         "slo_checks": slo_checks,
@@ -943,6 +1120,7 @@ fn print_help() {
     println!("  {SCHEMA_BAN_HTTP}");
     println!("  {SCHEMA_RSS}");
     println!("  {SCHEMA_PAIR}");
+    println!("  BEIR .out text reports from scripts/bench/*-ndcg.sh");
     println!("  {SCHEMA_SUMMARY} (written as summary.json)");
     println!();
     println!("SLO THRESHOLDS:");
@@ -950,6 +1128,8 @@ fn print_help() {
     println!("  artillery max ≤ {SLO_ARTILLERY_MAX_MS} ms");
     println!("  artillery error rate ≤ {SLO_ARTILLERY_ERROR_RATE_PCT} %");
     println!("  RSS peak ≤ {SLO_RSS_PEAK_MB} MB (artillery INSEE 25k)");
+    println!("  SciFact NDCG@10 ≥ {SLO_SCIFACT_NDCG_10}");
+    println!("  TREC-COVID NDCG@10 ≥ {SLO_TREC_COVID_NDCG_10}");
     println!();
     println!("REGRESSION THRESHOLDS vs --baseline:");
     println!("  p95 +{REGRESSION_P95_PCT} %");
@@ -1075,6 +1255,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_beir_text_output_extracts_quality_metrics() {
+        let row = parse_beir_text_output(
+            r#"## scifact-ndcg label=surch  2026-05-18T12:00:00Z
+url=http://127.0.0.1:7700 bulk_ms=1234.5
+queries_processed=300 (out of 300 unique test qids)
+NDCG@10 = 0.6576 (Lucene/Anserini baseline: 0.688)
+Recall@10 = 0.8100
+"#,
+            "scifact-surch",
+        )
+        .expect("BEIR text output should parse");
+        assert_eq!(row.engine, "surch");
+        assert_eq!(row.workload, "scifact");
+        assert_eq!(row.queries_processed, 300);
+        assert_eq!(row.total_queries, 300);
+        assert_eq!(row.bulk_ms, 1234.5);
+        assert_eq!(row.ndcg_10, 0.6576);
+        assert_eq!(row.recall_10, 0.8100);
+        assert_eq!(row.lucene_baseline_ndcg_10, Some(0.688));
+    }
+
+    #[test]
     fn evaluate_slo_flags_high_p95() {
         let agg = Aggregate {
             artillery: vec![ArtilleryRow {
@@ -1101,6 +1303,29 @@ mod tests {
             .find(|c| c.name.starts_with("artillery max"))
             .expect("max check should exist");
         assert!(max.passed, "max=450 within 500 ms SLO");
+    }
+
+    #[test]
+    fn evaluate_slo_flags_beir_ndcg_regression() {
+        let agg = Aggregate {
+            beir: vec![BeirRow {
+                engine: "surch".into(),
+                workload: "scifact".into(),
+                ndcg_10: 0.60,
+                recall_10: 0.80,
+                queries_processed: 300,
+                total_queries: 300,
+                bulk_ms: 1000.0,
+                lucene_baseline_ndcg_10: Some(0.688),
+            }],
+            ..Aggregate::default()
+        };
+        let checks = evaluate_slo(&agg);
+        let ndcg = checks
+            .iter()
+            .find(|c| c.name.starts_with("BEIR NDCG@10"))
+            .expect("BEIR NDCG check should exist");
+        assert!(!ndcg.passed, "SciFact NDCG below 0.65 should fail");
     }
 
     #[test]

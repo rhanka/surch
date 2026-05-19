@@ -30,6 +30,10 @@ fn write_json(dir: &Path, name: &str, body: &str) {
     fs::write(dir.join(name), body).expect("write fixture json");
 }
 
+fn write_text(dir: &Path, name: &str, body: &str) {
+    fs::write(dir.join(name), body).expect("write fixture text");
+}
+
 #[test]
 fn help_prints_usage_and_schemas() {
     let output = Command::new(bin())
@@ -325,6 +329,67 @@ fn summary_contains_tables_for_known_schemas() {
     assert_eq!(json["ban_http"][1]["engine"], "surch");
     assert_eq!(json["rss"][0]["peak_mb"], 512.0);
     assert_eq!(json["pair"][0]["workload"], "insee25k");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn beir_ndcg_outputs_feed_markdown_and_json_summary() {
+    let dir = unique_dir("beir-out");
+    let json_path = dir.join("summary.json");
+    write_text(
+        &dir,
+        "scifact-surch.out",
+        r#"## scifact-ndcg label=surch  2026-05-18T12:00:00Z
+url=http://127.0.0.1:7700 bulk_ms=1234.5
+queries_processed=300 (out of 300 unique test qids)
+NDCG@10 = 0.6576 (Lucene/Anserini baseline: 0.688)
+Recall@10 = 0.8100
+"#,
+    );
+    write_text(
+        &dir,
+        "trec-covid-es.out",
+        r#"## trec-covid-ndcg label=elasticsearch  2026-05-18T12:01:00Z
+url=http://127.0.0.1:9200 bulk_ms=9876.5
+queries_processed=50 (out of 50 unique test qids)
+NDCG@10 = 0.5950 (Lucene/Anserini baseline: 0.595)
+Recall@10 = 0.0570
+"#,
+    );
+
+    let out_path = dir.join("summary.md");
+    let output = Command::new(bin())
+        .args([
+            "--dir",
+            dir.to_str().unwrap(),
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("bench_report binary should run");
+    assert!(
+        output.status.success(),
+        "BEIR fixture should pass quality gates; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let md = fs::read_to_string(&out_path).expect("summary.md");
+    assert!(md.contains("## BEIR retrieval results"));
+    assert!(md.contains("| surch | scifact | 0.6576 | 0.8100 | 300 | 300 | 1234.5 | 0.6880 |"));
+    assert!(
+        md.contains("| elasticsearch | trec-covid | 0.5950 | 0.0570 | 50 | 50 | 9876.5 | 0.5950 |")
+    );
+    assert!(md.contains("BEIR NDCG@10"));
+
+    let json: Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).expect("summary.json should exist"))
+            .expect("summary.json valid json");
+    assert_eq!(json["beir"][0]["engine"], "elasticsearch");
+    assert_eq!(json["beir"][0]["workload"], "trec-covid");
+    assert_eq!(json["beir"][1]["engine"], "surch");
+    assert_eq!(json["beir"][1]["workload"], "scifact");
+    assert_eq!(json["beir"][1]["ndcg_10"], 0.6576);
+    assert_eq!(json["beir"][1]["recall_10"], 0.8100);
     let _ = fs::remove_dir_all(&dir);
 }
 
