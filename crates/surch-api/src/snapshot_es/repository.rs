@@ -588,16 +588,18 @@ impl SnapshotRepository for S3Repository {
         let full = self.full_key(key)?;
         let bucket = self.config.bucket.clone();
         let client = self.client.clone();
-        self.runtime.handle().block_on(async move {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(&full)
-                .body(bytes.to_vec().into())
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|error| s3_error_to_repository(&full, error.into_service_error()))
+        tokio::task::block_in_place(|| {
+            self.runtime.handle().block_on(async move {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&full)
+                    .body(bytes.to_vec().into())
+                    .send()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| s3_error_to_repository(&full, error.into_service_error()))
+            })
         })
     }
 
@@ -606,26 +608,28 @@ impl SnapshotRepository for S3Repository {
         let bucket = self.config.bucket.clone();
         let client = self.client.clone();
         let key_for_err = key.to_owned();
-        self.runtime.handle().block_on(async move {
-            let response = client.get_object().bucket(&bucket).key(&full).send().await;
-            match response {
-                Ok(output) => {
-                    let aggregated = output
-                        .body
-                        .collect()
-                        .await
-                        .map_err(|error| s3_error_to_repository(&full, error))?;
-                    Ok(aggregated.into_bytes())
-                }
-                Err(error) => {
-                    let service_err = error.into_service_error();
-                    if service_err.is_no_such_key() {
-                        Err(RepositoryError::NotFound { key: key_for_err })
-                    } else {
-                        Err(s3_error_to_repository(&full, service_err))
+        tokio::task::block_in_place(|| {
+            self.runtime.handle().block_on(async move {
+                let response = client.get_object().bucket(&bucket).key(&full).send().await;
+                match response {
+                    Ok(output) => {
+                        let aggregated = output
+                            .body
+                            .collect()
+                            .await
+                            .map_err(|error| s3_error_to_repository(&full, error))?;
+                        Ok(aggregated.into_bytes())
+                    }
+                    Err(error) => {
+                        let service_err = error.into_service_error();
+                        if service_err.is_no_such_key() {
+                            Err(RepositoryError::NotFound { key: key_for_err })
+                        } else {
+                            Err(s3_error_to_repository(&full, service_err))
+                        }
                     }
                 }
-            }
+            })
         })
     }
 
@@ -649,9 +653,8 @@ impl SnapshotRepository for S3Repository {
         let bucket = self.config.bucket.clone();
         let client = self.client.clone();
         let prefix_clone = full_prefix.clone();
-        self.runtime
-            .handle()
-            .block_on(async move {
+        tokio::task::block_in_place(|| {
+            self.runtime.handle().block_on(async move {
                 let mut out: Vec<String> = Vec::new();
                 let mut continuation_token: Option<String> = None;
                 loop {
@@ -681,14 +684,15 @@ impl SnapshotRepository for S3Repository {
                 }
                 Ok(out)
             })
-            .map(|raw: Vec<String>| {
-                let mut stripped: Vec<String> = raw
-                    .into_iter()
-                    .map(|k| self.strip_prefix(&k).to_owned())
-                    .collect();
-                stripped.sort();
-                stripped
-            })
+        })
+        .map(|raw: Vec<String>| {
+            let mut stripped: Vec<String> = raw
+                .into_iter()
+                .map(|k| self.strip_prefix(&k).to_owned())
+                .collect();
+            stripped.sort();
+            stripped
+        })
     }
 
     fn delete_object(&self, key: &str) -> RepositoryResult<()> {
@@ -696,28 +700,30 @@ impl SnapshotRepository for S3Repository {
         let bucket = self.config.bucket.clone();
         let client = self.client.clone();
         let key_for_err = key.to_owned();
-        self.runtime.handle().block_on(async move {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(&full)
-                .send()
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    let service_err = error.into_service_error();
-                    // `DeleteObject` returns 204 for missing keys on AWS;
-                    // some backends instead return 404. Normalise both.
-                    if service_err
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains("nosuchkey")
-                    {
-                        RepositoryError::NotFound { key: key_for_err }
-                    } else {
-                        s3_error_to_repository(&full, service_err)
-                    }
-                })
+        tokio::task::block_in_place(|| {
+            self.runtime.handle().block_on(async move {
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&full)
+                    .send()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        let service_err = error.into_service_error();
+                        // `DeleteObject` returns 204 for missing keys on AWS;
+                        // some backends instead return 404. Normalise both.
+                        if service_err
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("nosuchkey")
+                        {
+                            RepositoryError::NotFound { key: key_for_err }
+                        } else {
+                            s3_error_to_repository(&full, service_err)
+                        }
+                    })
+            })
         })
     }
 
@@ -754,18 +760,20 @@ impl SnapshotRepository for S3Repository {
         let full = self.full_key(key)?;
         let bucket = self.config.bucket.clone();
         let client = self.client.clone();
-        self.runtime.handle().block_on(async move {
-            match client.head_object().bucket(&bucket).key(&full).send().await {
-                Ok(output) => Ok(output.e_tag().map(str::to_owned)),
-                Err(error) => {
-                    let service_err = error.into_service_error();
-                    if service_err.is_not_found() {
-                        Ok(None)
-                    } else {
-                        Err(s3_error_to_repository(&full, service_err))
+        tokio::task::block_in_place(|| {
+            self.runtime.handle().block_on(async move {
+                match client.head_object().bucket(&bucket).key(&full).send().await {
+                    Ok(output) => Ok(output.e_tag().map(str::to_owned)),
+                    Err(error) => {
+                        let service_err = error.into_service_error();
+                        if service_err.is_not_found() {
+                            Ok(None)
+                        } else {
+                            Err(s3_error_to_repository(&full, service_err))
+                        }
                     }
                 }
-            }
+            })
         })
     }
 
