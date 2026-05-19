@@ -101,6 +101,32 @@ is hydrated from matchID's stable examples fixtures:
 It intentionally avoids the live INSEE public endpoints, which are not a
 reliable CI dependency.
 
+### Scratch PVC lifecycle between bench runs
+
+`surch-scratch` is shared between `ndcg-gate` (subPath `opensearch-data`
+/ `surch-data`) and `insee-bench` (same subPaths). Both Jobs treat the
+scratch volume as an **engine working directory**, not a corpus cache.
+Engine state (`indices/`, translog, segment files) survives across
+Jobs by design — re-creating an OpenSearch single-node cluster is
+slow, and the per-engine `_data/` graph is what allocates shards
+fastest on the next run.
+
+What does NOT survive cleanly:
+
+- The user-level indices created by a previous bench run (`deces`,
+  `scifact`, `trec-covid`). These are now best-effort `DELETE`d at
+  the start of each Job's bootstrap script (`bootstrap_engine` in
+  `insee-bench.yaml`), so a YELLOW cluster's stale primary shards
+  cannot 400 the next bulk POST. The K8s manifest is the source of
+  truth for that cleanup contract — do not rely on the PVC being
+  empty.
+- The OpenSearch security / observability built-in indices
+  (`.opensearch-*`) accumulate every run and contribute to OS's
+  shard-per-node soft cap (1000 default). If a Job pod starts
+  failing with `shards limit exceeded`, the simplest reset is to
+  rerun `00-init-corpora` with the `--force` rendering branch (TODO:
+  add a corpora-init mode that wipes scratch as well).
+
 ## Reading results
 
 ```bash
