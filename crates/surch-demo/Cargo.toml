@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 surch-api = { path = "../surch-api" }
+matchid-replay = { path = "../matchid-replay" }
 axum = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -19,3 +20,10 @@ http-body-util = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+flate2 = { workspace = true }
+# B1 phase 3: the `b1_oracle` bin POSTs against an external ES 7.x cluster
+# and the local Surch HTTP surface. Pinned to the same minor/features as
+# `crates/surch-api`'s dev-dep so `cargo-deny` / lockfile sees a single
+# resolved version. `rustls-tls` keeps the binary OpenSSL-free for the
+# eventual K8s smoke job.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
