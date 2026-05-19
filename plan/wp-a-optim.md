@@ -71,9 +71,10 @@ Status: active, pushed; latest branch head `30a7b32`
     `surch-codec::postings_block::FOR_BLOCK_SIZE`.
   - [x] Add a focused test proving index block metas follow the codec
     block size.
-  - [ ] Wire encoded FoR payload metadata into search execution without
+  - [x] Wire encoded FoR payload metadata into search execution without
     changing ranking semantics.
   - [x] Gate: `cargo test -p surch-index --test postings`.
+  - [x] Gate: `cargo test -p surch-search --test execution`.
   - [x] Commit main: `2da9249`.
 
 - [ ] Lot 3 - Perf proof

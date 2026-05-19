@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
-use surch_index::postings::{PostingsBuilder, TermDictionary};
+use surch_index::postings::{PostingsBuilder, TermDictionary, BLOCK_SIZE};
 use surch_search::collector::ScoreDoc;
 use surch_search::execution::{
     BooleanQueryExecutionError, BooleanQueryExecutor, TermQueryExecutionError, TermQueryExecutor,
     TermQueryStats,
 };
 use surch_search::query::{BooleanQuery, Query, TermQuery};
+use surch_search::scoring::{bm25_score, Bm25Config};
 
 const EPSILON: f64 = 0.000_001;
 
@@ -137,6 +138,68 @@ fn term_query_executor_classic_fixture_matches_body_search_order() {
         assert_eq!(actual.doc_id, expected.doc_id);
         assert_close(actual.score, expected.score);
     }
+}
+
+#[test]
+fn term_query_executor_uses_for_block_metadata_doc_freq_without_changing_scores() {
+    let mut builder = PostingsBuilder::new();
+    let total_docs = BLOCK_SIZE + 3;
+    for doc_id in 0..total_docs {
+        builder
+            .add("body", "runtime", doc_id as u32, vec![0])
+            .expect("runtime posting");
+    }
+    let dictionary = builder.build();
+    let metadata_doc_freq = dictionary
+        .block_metas("body", "runtime")
+        .expect("runtime block metas")
+        .iter()
+        .map(|meta| meta.posting_count as u64)
+        .sum::<u64>();
+    assert_eq!(metadata_doc_freq, total_docs as u64);
+
+    let stats = TermQueryStats::new(
+        total_docs as u64,
+        1.0,
+        (0..total_docs).map(|doc_id| (doc_id as u32, 1)).collect(),
+    )
+    .expect("valid stats");
+    let executor = TermQueryExecutor::new(&dictionary, stats);
+    let query = TermQuery::new("body", "runtime").expect("valid query");
+
+    let top_docs = executor.execute(&query, 3).expect("term execution");
+
+    let expected_score = bm25_score(
+        Bm25Config::default(),
+        total_docs as u64,
+        metadata_doc_freq,
+        1,
+        1,
+        1.0,
+    )
+    .expect("expected score");
+    assert_eq!(top_docs.total_hits, total_docs);
+    assert_eq!(
+        top_docs
+            .score_docs
+            .iter()
+            .map(|score_doc| score_doc.doc_id)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    for score_doc in &top_docs.score_docs {
+        assert_close(score_doc.score, expected_score);
+    }
+
+    let execution_source = include_str!("../src/execution.rs");
+    assert!(
+        execution_source.contains("postings_with_block_metas"),
+        "TermQueryExecutor must request the runtime postings + FoR block metadata view"
+    );
+    assert!(
+        execution_source.contains("doc_freq_from_block_metas"),
+        "TermQueryExecutor must use FoR block metadata for doc_freq"
+    );
 }
 
 #[test]

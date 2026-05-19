@@ -223,6 +223,7 @@ fn term_dictionary_block_metas_match_postings_chunks() {
     );
 
     for (chunk, meta) in postings.chunks(BLOCK_SIZE).zip(metas.iter()) {
+        assert_eq!(meta.posting_count, chunk.len());
         assert_eq!(meta.min_doc_id, chunk.first().expect("chunk").doc_id);
         assert_eq!(meta.max_doc_id, chunk.last().expect("chunk").doc_id);
         // Single-position postings -> freq 1 everywhere.
@@ -275,15 +276,46 @@ fn term_dictionary_block_metas_follow_codec_block_size() {
         .collect::<Vec<_>>();
     assert_eq!(chunk_lengths, vec![FOR_BLOCK_SIZE, FOR_BLOCK_SIZE, 17]);
     assert_eq!(metas.len(), chunk_lengths.len());
+    assert_eq!(metas[0].posting_count, FOR_BLOCK_SIZE);
     assert_eq!(metas[0].min_doc_id, 0);
     assert_eq!(metas[0].max_doc_id, (FOR_BLOCK_SIZE - 1) as u32);
     assert_eq!(metas[0].max_term_freq, 1);
+    assert_eq!(metas[1].posting_count, FOR_BLOCK_SIZE);
     assert_eq!(metas[1].min_doc_id, FOR_BLOCK_SIZE as u32);
     assert_eq!(metas[1].max_doc_id, (FOR_BLOCK_SIZE * 2 - 1) as u32);
     assert_eq!(metas[1].max_term_freq, 4);
+    assert_eq!(metas[2].posting_count, 17);
     assert_eq!(metas[2].min_doc_id, (FOR_BLOCK_SIZE * 2) as u32);
     assert_eq!(metas[2].max_doc_id, (total_docs - 1) as u32);
     assert_eq!(metas[2].max_term_freq, 1);
+}
+
+#[test]
+fn term_dictionary_runtime_postings_exposes_for_block_metadata() {
+    let mut builder = PostingsBuilder::new();
+    let total_docs = BLOCK_SIZE * 2 + 9;
+    for doc_id in 0..total_docs {
+        builder
+            .add("body", "runtime", doc_id as u32, vec![0])
+            .expect("runtime posting");
+    }
+
+    let dictionary = builder.build();
+    let runtime_postings = dictionary
+        .postings_with_block_metas("body", "runtime")
+        .expect("runtime postings");
+
+    assert_eq!(runtime_postings.postings().len(), total_docs);
+    assert_eq!(runtime_postings.block_metas().len(), 3);
+    assert_eq!(runtime_postings.doc_freq_from_block_metas(), total_docs);
+    assert_eq!(
+        runtime_postings
+            .block_metas()
+            .iter()
+            .map(|meta| meta.posting_count)
+            .collect::<Vec<_>>(),
+        vec![BLOCK_SIZE, BLOCK_SIZE, 9]
+    );
 }
 
 #[test]

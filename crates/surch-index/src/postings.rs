@@ -48,6 +48,8 @@ impl Posting {
 /// and last entry of the chunk).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockMeta {
+    /// Number of postings described by this block.
+    pub posting_count: usize,
     /// Greatest term_freq inside this block of up to [`BLOCK_SIZE`] postings.
     pub max_term_freq: u32,
     /// Smallest `doc_id` inside this block (so callers can range-skip).
@@ -70,6 +72,7 @@ fn build_block_metas(postings: &[Posting]) -> Vec<BlockMeta> {
             let max_doc_id = chunk.last().expect("chunk is non-empty").doc_id;
             let max_term_freq = chunk.iter().map(|p| p.freq).max().unwrap_or(0);
             BlockMeta {
+                posting_count: chunk.len(),
                 max_term_freq,
                 min_doc_id,
                 max_doc_id,
@@ -199,6 +202,14 @@ impl FieldPostings {
         self.block_metas.get(idx).map(Vec::as_slice)
     }
 
+    fn lookup_with_block_metas(&self, term: &str) -> Option<PostingsList<'_>> {
+        let idx = self.fst.get(term.as_bytes())? as usize;
+        Some(PostingsList {
+            postings: self.postings.get(idx)?.as_slice(),
+            block_metas: self.block_metas.get(idx)?.as_slice(),
+        })
+    }
+
     fn sorted_terms(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.postings.len());
         let mut stream = self.fst.stream().into_stream();
@@ -291,6 +302,15 @@ impl TermDictionary {
             })
     }
 
+    /// Runtime view for a term's postings and its FoR-aligned block
+    /// metadata. Search execution should prefer this over separate
+    /// lookups so the postings payload and metadata stay tied together.
+    pub fn postings_with_block_metas(&self, field: &str, term: &str) -> Option<PostingsList<'_>> {
+        self.fields
+            .get(field)
+            .and_then(|field_postings| field_postings.lookup_with_block_metas(term))
+    }
+
     /// Pre-computed per-block stats for the given `(field, term)` pair,
     /// aligned with `postings(field, term)`'s `Vec::chunks(BLOCK_SIZE)`.
     /// Returns `None` if the field or the term is unknown. The slice is
@@ -361,5 +381,25 @@ impl<'a> Iterator for PostingsEnum<'a> {
         let posting = self.postings.get(self.position);
         self.position += usize::from(posting.is_some());
         posting
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PostingsList<'a> {
+    postings: &'a [Posting],
+    block_metas: &'a [BlockMeta],
+}
+
+impl<'a> PostingsList<'a> {
+    pub fn postings(&self) -> &'a [Posting] {
+        self.postings
+    }
+
+    pub fn block_metas(&self) -> &'a [BlockMeta] {
+        self.block_metas
+    }
+
+    pub fn doc_freq_from_block_metas(&self) -> usize {
+        self.block_metas.iter().map(|meta| meta.posting_count).sum()
     }
 }

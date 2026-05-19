@@ -104,19 +104,25 @@ impl<'a> TermQueryExecutor<'a> {
         query: &TermQuery,
         size: usize,
     ) -> Result<TopDocs, TermQueryExecutionError> {
-        let postings = self
-            .dictionary
-            .postings(&query.field, &query.value)
-            .map(|postings| postings.collect::<Vec<_>>())
-            .unwrap_or_default();
-        let doc_freq = postings.len() as u64;
         let mut collector = TopDocsCollector::new(size)?;
+        let Some(postings) = self
+            .dictionary
+            .postings_with_block_metas(&query.field, &query.value)
+        else {
+            return Ok(collector.finish());
+        };
+        let doc_freq = postings.doc_freq_from_block_metas() as u64;
+        debug_assert_eq!(
+            doc_freq,
+            postings.postings().len() as u64,
+            "FoR block metadata doc_freq must stay aligned with postings"
+        );
 
         if doc_freq == 0 {
             return Ok(collector.finish());
         }
 
-        for posting in postings {
+        for posting in postings.postings() {
             let doc_len = self
                 .stats
                 .doc_len_by_doc_id
