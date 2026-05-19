@@ -42,6 +42,7 @@ tower = { workspace = true, features = ["util"] }
 tar = { workspace = true }
 flate2 = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Criterion bench harness: measures the in-process scoring hot path
 # (no axum, no HTTP) so iterative search-side optimisations can be
