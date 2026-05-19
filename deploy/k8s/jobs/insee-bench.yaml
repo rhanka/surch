@@ -136,11 +136,30 @@ spec:
               # same index name below.
               bootstrap_engine() {
                 url="$1"; label="$2"
+                # The scratch PVC persists across ndcg-gate / insee-bench
+                # runs, so OpenSearch / Surch boot with whatever indices
+                # the previous job left behind (e.g. `scifact`,
+                # `.opensearch-*` security indices). Drop the working
+                # set before re-creating it, otherwise the bulk POST
+                # below can 400 against a partially-allocated `deces`
+                # index in a YELLOW cluster.
+                curl -fsS -o /dev/null -X DELETE "$url/deces" 2>/dev/null || true
+                # OpenSearch only — wait for cluster to become at least
+                # YELLOW (single-node has no replicas) before we ask it
+                # to ingest a brand new index.
+                curl -fsS -o /dev/null \
+                  "$url/_cluster/health?wait_for_status=yellow&timeout=30s" \
+                  2>/dev/null || true
                 echo "bootstrap $label: PUT /deces"
                 curl -fsS -X PUT "$url/deces" \
                   -H 'Content-Type: application/json' \
                   --data-binary @/usr/local/share/deces/mapping.json \
                   > "$REPORTS_DIR/bootstrap-$label.put.json"
+                # Wait for the freshly-PUT `deces` index to have its
+                # primary shard active before we bulk-load against it.
+                curl -fsS -o /dev/null \
+                  "$url/_cluster/health/deces?wait_for_status=yellow&wait_for_active_shards=1&timeout=30s" \
+                  2>/dev/null || true
                 echo "bootstrap $label: POST /_bulk (10k docs)"
                 gunzip -c /usr/local/share/deces/slice-10000.ndjson.gz \
                   | curl -fsS -X POST "$url/_bulk" \
