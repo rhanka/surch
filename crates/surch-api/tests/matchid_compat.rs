@@ -16,7 +16,6 @@ use axum::{
     http::{Method, Request, StatusCode},
     Router,
 };
-use serde::Deserialize;
 use serde_json::Value;
 use std::{fs, path::PathBuf};
 use surch_api::app_router;
@@ -24,50 +23,24 @@ use tower::ServiceExt;
 
 const MAPPING_BODY: &str = include_str!("../../../tests/matchid_compat/deces/mapping.json");
 const SLICE_NDJSON: &str = include_str!("../../../tests/matchid_compat/deces/slice-1000.ndjson");
-const REPLAY_JSON: &str = include_str!("../../../tests/matchid_compat/replays/deces_v1.json");
 
 const INDEX_NAME: &str = "deces";
+const DECES_V1_REPLAY: &str = "../../tests/matchid_compat/replays/deces_v1.json";
 const DECES_V1_ORACLE_RUNBOOK: &str = "../../tests/matchid_compat/oracle/deces_v1.md";
 const DECES_V1_ORACLE_SCRIPT: &str = "../../scripts/matchid/deces_v1_elasticsearch_oracle.py";
 
-#[derive(Debug, Deserialize)]
-struct ReplayFile {
-    name: String,
-    dataset: String,
-    requests: Vec<ReplayEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReplayEntry {
-    name: String,
-    request: ReplayRequest,
-    expected: Option<ReplayExpected>,
-    #[serde(default)]
-    skip: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReplayRequest {
-    method: String,
-    path: String,
-    #[serde(default)]
-    body: Option<Value>,
-    #[serde(default)]
-    body_ndjson: Option<Vec<Value>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReplayExpected {
-    #[serde(rename = "hits.total.value")]
-    total_value: u64,
-    #[serde(rename = "hits.hits[0]._id")]
-    top_id: Option<String>,
+fn deces_v1_replay_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DECES_V1_REPLAY)
 }
 
 #[test]
 fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
-    let manifest: ReplayFile =
-        serde_json::from_str(REPLAY_JSON).expect("replay manifest must parse");
+    let manifest = matchid_replay::load_replay(
+        deces_v1_replay_path()
+            .to_str()
+            .expect("replay path is utf-8"),
+    )
+    .expect("replay manifest must parse");
     assert_eq!(manifest.name, "deces_v1");
     assert_eq!(manifest.dataset, "deces");
     assert_eq!(
@@ -312,8 +285,12 @@ fn matchid_replay_deces_v1_executes_all_non_skipped_requests() {
 
 #[test]
 fn matchid_deces_v1_oracle_runbook_is_actionable() {
-    let manifest: ReplayFile =
-        serde_json::from_str(REPLAY_JSON).expect("replay manifest must parse");
+    let manifest = matchid_replay::load_replay(
+        deces_v1_replay_path()
+            .to_str()
+            .expect("replay path is utf-8"),
+    )
+    .expect("replay manifest must parse");
 
     let runbook_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(DECES_V1_ORACLE_RUNBOOK);
     let runbook = fs::read_to_string(&runbook_path).unwrap_or_else(|err| {

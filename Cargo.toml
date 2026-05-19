@@ -10,6 +10,7 @@ members = [
     "crates/opensearch-oracle",
     "crates/portage-ledger",
     "crates/surch-demo",
+    "crates/matchid-replay",
 ]
 resolver = "2"
 
@@ -58,8 +59,13 @@ http = "1"
 # the build picks up only the runtime/region/credentials machinery we
 # actually need (no STS / SSO / IMDS by default — static creds + a
 # region + an optional endpoint URL cover S3 / R2 / MinIO / GCS).
-aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+# `default-https-client` re-adds the smithy hyper+rustls connector
+# explicitly; without it every PutObject / GetObject fails with
+# `ConnectorError: No HTTP client was available to send this request`,
+# which masquerades as a generic "unhandled error" in the snapshot
+# I/O layer.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 aws-credential-types = { version = "1", default-features = false }
 aws-smithy-runtime-api = { version = "1", default-features = false }
 

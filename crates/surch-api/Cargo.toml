@@ -37,6 +37,7 @@ aws-credential-types = { workspace = true }
 
 [dev-dependencies]
 opensearch-oracle = { path = "../opensearch-oracle" }
+matchid-replay = { path = "../matchid-replay" }
 surch-codec = { path = "../surch-codec" }
 tower = { workspace = true, features = ["util"] }
 tar = { workspace = true }
