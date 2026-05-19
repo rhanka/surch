@@ -418,13 +418,21 @@ async fn spawn_surch_api() -> String {
 /// `tokio::task::block_in_place` from inside the axum handler, which
 /// panics on a current-thread runtime.
 ///
-/// Ignored: the axum mock S3 served below does not yet emit the
-/// `x-amz-checksum-*` response headers that aws-sdk-s3 1.x validates by
-/// default under `BehaviorVersion::latest()`. The PUT/GET/LIST/DELETE
-/// plumbing is otherwise complete and reused by future cloud-snapshot
-/// e2e variants; revisit once we wire request-checksum negotiation or
-/// swap the mock for a MinIO testcontainer.
-#[ignore = "mock S3 lacks aws-sdk-s3 checksum negotiation; tracked under Track C follow-up"]
+/// The mock S3 server does not implement the AWS Flexible Checksums
+/// response contract (`x-amz-checksum-*` / `x-amz-sdk-checksum-algorithm`
+/// trailer headers). We therefore configure the repository client to
+/// only run checksum logic `WhenRequired` instead of the default
+/// `WhenSupported`, via the test-only `disable_request_checksum`
+/// repository setting. Prod paths against MinIO / R2 / real S3 leave
+/// this flag false (default) and keep full Flexible Checksums.
+///
+/// Ignored: even with checksum negotiation disabled, the mock still
+/// returns "I/O error on `index-0`" on the first PUT — likely another
+/// AWS SDK 1.x response-validation gap (Content-MD5, MD5 of body,
+/// or LocationConstraint XML stanza) that the axum mock does not yet
+/// emit. Tracked under Track C; revisit by swapping the mock for a
+/// MinIO testcontainer (real S3 wire contract).
+#[ignore = "mock S3 still fails post-checksum-bypass; tracked under Track C follow-up"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
     let (mock_url, mock) = spawn_mock_s3().await;
@@ -442,6 +450,7 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
                 "endpoint": mock_url,
                 "access_key": "minioadmin",
                 "secret_key": "minioadmin",
+                "disable_request_checksum": true,
             }
         }))
         .send()

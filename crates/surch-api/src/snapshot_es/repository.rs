@@ -377,6 +377,14 @@ pub struct S3RepositoryConfig {
     /// prefix (`{prefix}/index-0`, `{prefix}/snap-{uuid}.dat`, …).
     /// Empty prefix → repository owns the whole bucket.
     pub base_path: Option<String>,
+    /// Test-only escape hatch: when true, the underlying `aws-sdk-s3`
+    /// client is configured with `RequestChecksumCalculation::WhenRequired`
+    /// and `ResponseChecksumValidation::WhenRequired` instead of the
+    /// default `WhenSupported`. This is needed by mock-S3 fixtures that
+    /// do not yet implement the AWS Flexible Checksums response
+    /// contract; prod paths against MinIO / R2 / real S3 keep the
+    /// default (full validation).
+    pub disable_request_checksum: bool,
 }
 
 /// S3-backed implementation of [`SnapshotRepository`].
@@ -550,6 +558,16 @@ async fn build_s3_client(config: &S3RepositoryConfig) -> aws_sdk_s3::Client {
                 .clone()
                 .unwrap_or_else(|| "us-east-1".to_owned()),
         ));
+
+    if config.disable_request_checksum {
+        builder = builder
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            );
+    }
 
     if let (Some(access_key), Some(secret_key)) =
         (config.access_key.as_deref(), config.secret_key.as_deref())

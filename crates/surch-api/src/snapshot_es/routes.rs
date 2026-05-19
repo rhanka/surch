@@ -224,6 +224,19 @@ pub async fn register_repository_handler(
                     .get("base_path")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                // Test-only escape hatch: `disable_request_checksum`
+                // (or its alias `_disable_request_checksum`) drops the
+                // AWS Flexible Checksums request layer so the in-process
+                // mock-S3 fixture in `tests/snapshot_s3.rs` can speak
+                // SigV4 without re-implementing CRC32/SHA256 response
+                // contracts. Real S3 / MinIO / R2 configs leave this
+                // false (default).
+                disable_request_checksum: body
+                    .settings
+                    .get("disable_request_checksum")
+                    .or_else(|| body.settings.get("_disable_request_checksum"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             };
             // The S3 client is built eagerly inside `S3Repository::new`
             // so misconfiguration surfaces here (and not on the first
