@@ -7,13 +7,17 @@
 # Job exits non-zero on the first behavioural divergence so the gate
 # is also a structural-parity witness over time.
 #
-# Memory budget keeps the pod inside the current 3 GiB Scaleway
-# tenant quota:
-#   Surch (init)         512 Mi limit
-#   Elasticsearch (init) 1536 Mi limit (-Xms1g -Xmx1g)
-#   b1_oracle-driver     384 Mi limit
-#   total                ~2.4 GiB
-# Anything above this needs the same quota bump as TREC-COVID ndcg-gate.
+# Memory budget keeps the pod inside the current Scaleway tenant
+# quota — `requests.memory` cap = 512 Mi, `limits.memory` cap = 3 GiB.
+# Container requests stay deliberately low (kubelet only blocks pod
+# admission on the requests sum) while limits remain sized for the
+# real working set:
+#   Surch (init)         req 64Mi  / limit 512Mi
+#   Elasticsearch (init) req 256Mi / limit 1536Mi (-Xms1g -Xmx1g)
+#   b1_oracle-driver     req 64Mi  / limit 384Mi
+#   total requests       384Mi   (fits 512Mi cap)
+#   total limits         ~2.4 GiB (fits 3 GiB cap)
+# Anything above either cap needs a quota bump on poc-k8s.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -57,7 +61,7 @@ spec:
             - { name: SURCH_PORT, value: "7700" }
             - { name: RUST_LOG,   value: "warn" }
           resources:
-            requests: { cpu: 150m, memory: 128Mi }
+            requests: { cpu: 50m, memory: 64Mi }
             limits:   { cpu: 800m, memory: 512Mi }
           volumeMounts:
             - { name: scratch, mountPath: /var/surch, subPath: surch-b1-oracle }
@@ -74,7 +78,7 @@ spec:
             - { name: ES_JAVA_OPTS,                value: "-Xms1g -Xmx1g" }
             - { name: bootstrap.memory_lock,       value: "false" }
           resources:
-            requests: { cpu: 250m, memory: 768Mi }
+            requests: { cpu: 100m, memory: 256Mi }
             limits:   { cpu: 1200m, memory: 1536Mi }
           securityContext:
             runAsNonRoot: true
@@ -92,7 +96,7 @@ spec:
             - { name: ES_URL,    value: "http://127.0.0.1:9200" }
             - { name: REPORTS_DIR, value: "/reports" }
           resources:
-            requests: { cpu: 100m, memory: 128Mi }
+            requests: { cpu: 50m, memory: 64Mi }
             limits:   { cpu: 500m, memory: 384Mi }
           command: ["/bin/sh", "-c"]
           args:
