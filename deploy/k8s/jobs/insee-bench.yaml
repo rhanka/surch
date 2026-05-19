@@ -154,6 +154,22 @@ spec:
               }
               bootstrap_engine "$SURCH_URL" surch
               bootstrap_engine "$OPENSEARCH_URL" opensearch
+              # Warm up both engines so JVM JIT + page caches are hot
+              # before artillery_bench measures cold-start outliers
+              # (OpenSearch phase-1 max would otherwise spike above
+              # SLO_ARTILLERY_MAX_MS = 500 ms).
+              warmup_engine() {
+                url="$1"; label="$2"
+                echo "warmup $label: 50 match_all hits"
+                for i in $(seq 1 50); do
+                  curl -fsS -o /dev/null -X POST "$url/deces/_search" \
+                    -H 'Content-Type: application/json' \
+                    -d '{"query":{"match_all":{}},"size":5}' \
+                    || true
+                done
+              }
+              warmup_engine "$SURCH_URL" surch
+              warmup_engine "$OPENSEARCH_URL" opensearch
               # The bench driver image ships artillery_bench and
               # bench_report in /usr/local/bin.
               /usr/local/bin/artillery_bench \
