@@ -57,6 +57,7 @@ RUN apt-get update \
 
 COPY --from=builder /usr/src/surch/target/release/artillery_bench /usr/local/bin/artillery_bench
 COPY --from=builder /usr/src/surch/target/release/bench_report /usr/local/bin/bench_report
+COPY --from=builder /usr/src/surch/target/release/b1_oracle /usr/local/bin/b1_oracle
 COPY scripts/bench/scifact-ndcg.sh /usr/local/bin/scifact-ndcg.sh
 COPY scripts/bench/trec-covid-ndcg.sh /usr/local/bin/trec-covid-ndcg.sh
 
@@ -65,15 +66,20 @@ COPY scripts/bench/trec-covid-ndcg.sh /usr/local/bin/trec-covid-ndcg.sh
 # the `deces` index on both engines before driving artillery_bench.
 COPY tests/matchid_compat/deces/mapping.json /usr/local/share/deces/mapping.json
 COPY tests/matchid_compat/deces/slice-10000.ndjson.gz /usr/local/share/deces/slice-10000.ndjson.gz
+# matchID v1 replay fixture used by b1_oracle (Phase 3 ES-7.x
+# cross-check).
+COPY tests/matchid_compat/replays/deces_v1.json /usr/local/share/deces/replays/deces_v1.json
 
 RUN chmod 0755 \
       /usr/local/bin/artillery_bench \
       /usr/local/bin/bench_report \
+      /usr/local/bin/b1_oracle \
       /usr/local/bin/scifact-ndcg.sh \
       /usr/local/bin/trec-covid-ndcg.sh \
  && chmod 0644 \
       /usr/local/share/deces/mapping.json \
-      /usr/local/share/deces/slice-10000.ndjson.gz
+      /usr/local/share/deces/slice-10000.ndjson.gz \
+      /usr/local/share/deces/replays/deces_v1.json
 
 USER 65532:65532
 WORKDIR /work
