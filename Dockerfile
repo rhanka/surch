@@ -58,6 +58,7 @@ RUN apt-get update \
 COPY --from=builder /usr/src/surch/target/release/artillery_bench /usr/local/bin/artillery_bench
 COPY --from=builder /usr/src/surch/target/release/bench_report /usr/local/bin/bench_report
 COPY scripts/bench/scifact-ndcg.sh /usr/local/bin/scifact-ndcg.sh
+COPY scripts/bench/trec-covid-ndcg.sh /usr/local/bin/trec-covid-ndcg.sh
 
 # INSEE 10k fixture (mapping + gzipped NDJSON bulk payload). Shipped
 # inside the bench-driver image so insee-bench K8s Jobs can bootstrap
@@ -69,6 +70,7 @@ RUN chmod 0755 \
       /usr/local/bin/artillery_bench \
       /usr/local/bin/bench_report \
       /usr/local/bin/scifact-ndcg.sh \
+      /usr/local/bin/trec-covid-ndcg.sh \
  && chmod 0644 \
       /usr/local/share/deces/mapping.json \
       /usr/local/share/deces/slice-10000.ndjson.gz

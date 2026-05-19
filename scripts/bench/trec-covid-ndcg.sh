@@ -12,17 +12,19 @@ LABEL="${1:?label}"
 OUT="${2:?out}"
 URL="${3:?url}"
 INDEX="trec-covid"
-BEIR_ROOT="/home/antoinefa/src/surch/target/beir"
+BEIR_ROOT="${BEIR_DIR:-/home/antoinefa/src/surch/target/beir}"
 DATA="$BEIR_ROOT/trec-covid"
 ARCHIVE_URL="https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-covid.zip"
 ARCHIVE="$BEIR_ROOT/trec-covid.zip"
-NDJSON="$DATA/corpus.ndjson"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# -- Step 1: download + extract dataset (idempotent) ------------------------
-mkdir -p "$BEIR_ROOT"
+# -- Step 1: ensure dataset is present (auto-download for local dev only) --
+# In K8s the corpus is pre-hydrated on a read-only PVC by 00-init-corpora,
+# so we skip the download branch entirely when the three required inputs
+# already exist under $DATA.
 if [ ! -s "$DATA/corpus.jsonl" ] || [ ! -s "$DATA/queries.jsonl" ] || [ ! -s "$DATA/qrels/test.tsv" ]; then
+  mkdir -p "$BEIR_ROOT"
   if [ ! -s "$ARCHIVE" ]; then
     echo "[trec-covid] downloading $ARCHIVE_URL (~200 MB) ..." >&2
     curl -fSL --retry 3 -o "$ARCHIVE" "$ARCHIVE_URL"
@@ -32,7 +34,13 @@ if [ ! -s "$DATA/corpus.jsonl" ] || [ ! -s "$DATA/queries.jsonl" ] || [ ! -s "$D
 fi
 
 # -- Step 2: convert corpus.jsonl -> bulk NDJSON (idempotent) ---------------
-if [ ! -s "$NDJSON" ]; then
+# Prefer a pre-converted $DATA/corpus.ndjson when present (local dev cache);
+# otherwise materialize into the scratch $TMP dir so this script works on a
+# read-only BEIR mount (the K8s gate case).
+if [ -s "$DATA/corpus.ndjson" ]; then
+  NDJSON="$DATA/corpus.ndjson"
+else
+  NDJSON="$TMP/corpus.ndjson"
   jq -rc --arg idx "$INDEX" '[
     {"index":{"_id":._id,"_index":$idx}},
     {"id":._id,"title":.title,"text":.text}

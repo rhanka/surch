@@ -1,20 +1,22 @@
-# Surch — SciFact NDCG@10 parity gate.
+# Surch — BEIR NDCG@10 parity gate (SciFact + TREC-COVID).
 #
 # Spins up a single Pod with two restartable init-container sidecars
-# (surch + opensearch) and a driver container that runs
-# `scripts/bench/scifact-ndcg.sh` against both engines, then emits a
-# human summary, text outputs, and a JSON index to /reports.
+# (surch + opensearch) and a driver container that runs both
+# `scripts/bench/scifact-ndcg.sh` and `scripts/bench/trec-covid-ndcg.sh`
+# against both engines, then emits a human summary, text outputs, and a
+# JSON index to /reports.
 #
 # The Pod-anti-affinity story stays simple here: both engines are local
-# to the Pod, talking over localhost. Resource envelope is tuned to fit
-# the tenant ResourceQuota (requests.cpu=500m, limits.cpu=2500m,
-# requests.memory=512Mi, limits.memory=3Gi) declared in poc-k8s:
+# to the Pod, talking over localhost. Resource envelope (post TREC-COVID
+# bump — corpus is 171 k docs and the OS heap needs ~2 GiB to keep up):
 #   surch       cpu  150m req /  800m lim ; mem 128Mi req /  512Mi lim
-#   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 1536Mi lim  (JVM Xmx=1g)
-#   driver      cpu  100m req /  500m lim ; mem 128Mi req /  512Mi lim
+#   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 4096Mi lim  (JVM Xmx=2g)
+#   driver      cpu  100m req /  500m lim ; mem 128Mi req / 1024Mi lim
 #   ---------------------------------------------------------------
-#   total       cpu  500m req / 2500m lim ; mem 512Mi req / 2560Mi lim
-# Fits a DEV1-L (2 vCPU / 4 GiB) burst node with Kapsule overhead.
+#   total       cpu  500m req / 2500m lim ; mem 512Mi req / 5632Mi lim
+# Requires the tenant ResourceQuota in poc-k8s to allow limits.memory>=6Gi
+# (the previous 3Gi cap covered SciFact only). Runs on the DEV1-XL (4 vCPU /
+# 8 GiB) burst node — DEV1-L is no longer enough.
 #
 # `${SURCH_SHA}` is substituted by the GHA workflow via envsubst and
 # rendered into the docker-build.yml tag format: `sha-<full commit SHA>`.
@@ -90,11 +92,11 @@ spec:
             - { name: discovery.type,                     value: "single-node" }
             - { name: DISABLE_SECURITY_PLUGIN,            value: "true" }
             - { name: DISABLE_INSTALL_DEMO_CONFIG,        value: "true" }
-            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms1g -Xmx1g" }
+            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms2g -Xmx2g" }
             - { name: bootstrap.memory_lock,              value: "false" }
           resources:
             requests: { cpu: 250m, memory: 256Mi }
-            limits:   { cpu: 1200m, memory: 1536Mi }
+            limits:   { cpu: 1200m, memory: 4Gi }
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
@@ -114,12 +116,13 @@ spec:
             - { name: REPORTS_DIR,    value: "/reports" }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
-            limits:   { cpu: 500m, memory: 512Mi }
+            limits:   { cpu: 500m, memory: 1Gi }
           command: ["/bin/sh", "-c"]
-          # The bench driver image bundles scripts/bench/scifact-ndcg.sh;
-          # this driver waits for both engines, runs the gate, and exits
-          # with the script's own status. CI reads /reports/summary.md
-          # and /reports/bench.json.
+          # The bench driver image bundles scripts/bench/{scifact,trec-covid}-ndcg.sh;
+          # this driver waits for both engines, runs both BEIR gates against
+          # Surch and OpenSearch, and exits with the last script's status.
+          # CI reads /reports/summary.md and /reports/bench.json; the
+          # `*-ndcg.out` files are aggregated by `bench_report --dir`.
           args:
             - |
               set -eu
@@ -128,19 +131,27 @@ spec:
               until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=30s" >/dev/null 2>&1; do sleep 1; done
               echo "Both engines healthy."
               mkdir -p "$REPORTS_DIR"
-              /usr/local/bin/scifact-ndcg.sh "ndcg-surch-k8s" "$REPORTS_DIR/scifact-surch.out" "$SURCH_URL"
-              /usr/local/bin/scifact-ndcg.sh "ndcg-os-k8s"    "$REPORTS_DIR/scifact-os.out"    "$OPENSEARCH_URL"
+              /usr/local/bin/scifact-ndcg.sh   "ndcg-surch-k8s" "$REPORTS_DIR/scifact-surch.out"    "$SURCH_URL"
+              /usr/local/bin/scifact-ndcg.sh   "ndcg-os-k8s"    "$REPORTS_DIR/scifact-os.out"       "$OPENSEARCH_URL"
+              /usr/local/bin/trec-covid-ndcg.sh "ndcg-surch-k8s" "$REPORTS_DIR/trec-covid-surch.out" "$SURCH_URL"
+              /usr/local/bin/trec-covid-ndcg.sh "ndcg-os-k8s"    "$REPORTS_DIR/trec-covid-os.out"    "$OPENSEARCH_URL"
               {
-                echo "# SciFact NDCG gate"
+                echo "# BEIR NDCG gate"
                 echo
-                echo "## Surch"
+                echo "## SciFact / Surch"
                 cat "$REPORTS_DIR/scifact-surch.out"
                 echo
-                echo "## OpenSearch"
+                echo "## SciFact / OpenSearch"
                 cat "$REPORTS_DIR/scifact-os.out"
+                echo
+                echo "## TREC-COVID / Surch"
+                cat "$REPORTS_DIR/trec-covid-surch.out"
+                echo
+                echo "## TREC-COVID / OpenSearch"
+                cat "$REPORTS_DIR/trec-covid-os.out"
               } > "$REPORTS_DIR/summary.md"
               cat > "$REPORTS_DIR/bench.json" <<EOF
-              {"schema":"surch.bench.ndcg_gate.v1","surch_out":"$REPORTS_DIR/scifact-surch.out","opensearch_out":"$REPORTS_DIR/scifact-os.out"}
+              {"schema":"surch.bench.ndcg_gate.v1","scifact_surch_out":"$REPORTS_DIR/scifact-surch.out","scifact_opensearch_out":"$REPORTS_DIR/scifact-os.out","trec_covid_surch_out":"$REPORTS_DIR/trec-covid-surch.out","trec_covid_opensearch_out":"$REPORTS_DIR/trec-covid-os.out"}
               EOF
               echo "BEGIN_SURCH_K8S_SUMMARY"
               cat "$REPORTS_DIR/summary.md"
