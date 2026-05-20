@@ -116,16 +116,28 @@ spec:
               # The bench-driver image ships the INSEE 10k slice
               # under /usr/local/share/deces/ and the mapping.json
               # alongside it. b1_oracle picks them up via flags.
+              # b1_oracle exits non-zero on divergences but the JSON
+              # report is always written. Capture the exit code so we
+              # can still cat the report into the driver log + the GHA
+              # step summary, then re-raise it as the container exit
+              # code so the workflow gate honours the divergence
+              # signal.
+              ORACLE_RC=0
               /usr/local/bin/b1_oracle \
                 --url-surch "$SURCH_URL" \
                 --url-es "$ES_URL" \
                 --mapping /usr/local/share/deces/mapping.json \
                 --slice /usr/local/share/deces/slice-10000.ndjson.gz \
                 --replay /usr/local/share/deces/replays/deces_v1.json \
-                --out "$REPORTS_DIR/b1-oracle.json"
+                --out "$REPORTS_DIR/b1-oracle.json" || ORACLE_RC=$?
               echo "BEGIN_SURCH_K8S_B1_ORACLE"
-              cat "$REPORTS_DIR/b1-oracle.json"
+              if [ -s "$REPORTS_DIR/b1-oracle.json" ]; then
+                cat "$REPORTS_DIR/b1-oracle.json"
+              else
+                echo '{"error":"b1-oracle.json missing"}'
+              fi
               echo "END_SURCH_K8S_B1_ORACLE"
-              echo "b1-oracle-gate complete."
+              echo "b1-oracle-gate complete (oracle exit=$ORACLE_RC)."
+              exit "$ORACLE_RC"
           volumeMounts:
             - { name: reports, mountPath: /reports }
