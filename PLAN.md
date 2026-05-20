@@ -86,7 +86,7 @@ axis-by-axis performance state is now tracked in
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~30% (3 open / 10 leaf tasks).
+Reste estime: ~25% (2 open / 10 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -108,15 +108,17 @@ Reste estime: ~30% (3 open / 10 leaf tasks).
 - [x] BAN HTTP CLI now presents the paired path as Surch/Elasticsearch:
   `--elasticsearch-url` is the documented flag and `--opensearch-url`
   remains only a legacy alias.
-- [ ] Ensure remaining benchmark producers can feed the summary
-  contract.
+- [x] BEIR `ndcg-gate` now emits a promoted diagnostic report:
+  `docs/ops/bench-reports/2026-05-20-ndcg-gate-K8s/`
+  from GHA run `26157480132`.
 - [ ] Add paired RSS reporting for Surch vs Elasticsearch.
-- [ ] Promote official Elasticsearch/Surch paired reports for INSEE,
-  artillery,
-  TREC-COVID, and mMARCO-fr.
-- [ ] Dispatch the quota-unblocked TREC-COVID `ndcg-gate` K8s run and
-  promote its report if green (`poc-k8s` live quota now
-  `1500m/1Gi`, `4500m/6Gi`).
+- [ ] Diagnose the TREC-COVID quality blocker before making it an
+  acceptance gate: Surch completed all 50 qids but returned
+  `NDCG@10=0.0000`, `Recall@10=0.0000` while OpenSearch returned
+  `NDCG@10=0.1141`, `Recall@10=0.0026`.
+- [x] Quota-unblocked `ndcg-gate` was dispatched and promoted
+  (`poc-k8s` live quota `1500m/1Gi`, `4500m/6Gi`; run
+  `26157480132`).
 
 ## Track C - Ops / Packaging / Snapshots
 
