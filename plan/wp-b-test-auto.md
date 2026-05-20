@@ -4,10 +4,11 @@ Track principal: B - test automation / perf reporting
 Branch: `wp/b-test-auto`
 Worktree: `.worktrees/wp-b`
 Owner: conductor / benchmark automation owner
-Status: Lot 3 + Lot N closed on `main` for everything except the
-TREC-COVID K8s baseline. The Scaleway tenant-quota bump is now applied
-live; the remaining step is to dispatch `ndcg-gate`, promote the
-TREC-COVID report, and record the run id. Long branch
+Status: Lot 3 + Lot N closed on `main` for the summary/reporting
+contract and promoted INSEE/SciFact/BAN evidence. The quota-unblocked
+K8s `ndcg-gate` run passed at the workflow level and is promoted as a
+diagnostic report, but TREC-COVID remains a quality blocker:
+Surch NDCG@10/Recall@10 were both `0.0000`. Long branch
 `wp/b-test-auto` head `65fc759` kept for history.
 
 ## Finality
@@ -21,8 +22,8 @@ TREC-COVID report, and record the run id. Long branch
   and `crates/surch-demo/tests/`.
 - [x] Delivered promotion scope on `main`: `--promote-dir` in
   `bench_report` and CLI tests.
-- [ ] Next allowed scope: producer coverage and promoted benchmark
-  report publication.
+- [ ] Next allowed scope: TREC-COVID diagnosis and paired RSS
+  reporting.
 - [x] Human-facing report surface:
   `target/bench-reports/<sha>/summary.md` for local runs and
   `docs/ops/bench-reports/<date>-<context>/README.md` for promoted
@@ -101,13 +102,19 @@ TREC-COVID report, and record the run id. Long branch
     `2026-05-19-insee-10k-k8s/artillery-runner.log`. The paired
     before/after capture went under
     `2026-05-20-A-lot3-paired-K8s/`.
-  - [ ] Add TREC-COVID and mMARCO-fr measurement entries
-    — TREC-COVID K8s extension is wired (`a993bc8`), and the
-    Scaleway quota bump from `poc-k8s` HEAD `980d58d` is applied live:
-    `requests.cpu=1500m`, `requests.memory=1Gi`, `limits.cpu=4500m`,
-    `limits.memory=6Gi`, `PVC=3/3`, `pods=0/5`. Next step:
-    dispatch `ndcg-gate` and promote the TREC-COVID report if green.
-    mMARCO-fr is out of scope for this plan.
+  - [x] Add TREC-COVID measurement entry
+    — TREC-COVID K8s extension is wired (`a993bc8`), the Scaleway quota
+    bump from `poc-k8s` HEAD `980d58d` is applied live
+    (`requests.cpu=1500m`, `requests.memory=1Gi`, `limits.cpu=4500m`,
+    `limits.memory=6Gi`, `PVC=3/3`, `pods=5`), and `ndcg-gate` GHA run
+    `26157480132` completed successfully on
+    `69240116599e8e86f629f13f3d7611d73ff1a07d`.
+    Promoted diagnostic report:
+    `docs/ops/bench-reports/2026-05-20-ndcg-gate-K8s/`.
+    Verdict: SciFact remains green, but TREC-COVID is a quality blocker
+    (`Surch NDCG@10=0.0000`, `Recall@10=0.0000`; OpenSearch
+    `NDCG@10=0.1141`, `Recall@10=0.0026`). mMARCO-fr is out of scope
+    for this plan.
   - [x] Gate: human can read the promoted Markdown without opening
     JSON — every report under `docs/ops/bench-reports/` carries a
     self-contained README.
@@ -119,7 +126,8 @@ TREC-COVID report, and record the run id. Long branch
     `2026-05-19-insee-10k-k8s/` (run `26101404966`),
     `2026-05-20-b1-oracle-K8s/` (run `26136585015`),
     `2026-05-20-A-lot3-paired-K8s/` (run `26151880297` paired with
-    `26101404966`).
+    `26101404966`),
+    `2026-05-20-ndcg-gate-K8s/` (run `26157480132`).
   - [x] Push branch/main and record final SHA: `04af736` aggregator
     + `3006fae` baseline INSEE promo on `main`. The TREC-COVID
     promo will record its own SHA + run id when the quota apply
