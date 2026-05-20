@@ -15,6 +15,9 @@ need a fresh run.
   OpenSearch 2.17.1, INSEE 10k matchID-style artillery scenario.
 - `docs/ops/bench-reports/2026-05-20-A-lot3-paired-K8s/README.md`:
   before/after K8s perf proof for the FoR block metadata search wiring.
+- `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/README.md`:
+  current-main K8s replay kickoff for the cumulative per-algorithm
+  proof line.
 - `docs/ops/memory-capacity.md`: current RAM capacity model and stats
   endpoint contract.
 
@@ -71,6 +74,7 @@ the proof state:
 | `b8ed2bc` + merge `7caf339` memory metrics and stats endpoint | Observability | Tested API surface, not a perf win | Use this endpoint as evidence source for future RSS/memory rows |
 | `651e22a`, `4e9405a`, `c5f3155`, `b680232`, `b8ed2bc` | RAM / memory model | Capacity model exists; individual RSS wins are not fully paired against OpenSearch | Future memory claims must include peak/final RSS from the same harness and same pod/host shape |
 | `df3b0aa` plus supporting index/codec commits `6f56fd2`, `2da9249` | Search latency | Proven by `2026-05-20-A-lot3-paired-K8s` | This is the only current isolated before/after Track A perf proof with K8s run ids |
+| `466693f` current-main replay anchor | Search latency / SLO | Proven by `2026-05-20-A-replay-current-main-insee-K8s` | Surch `2.0/3.7/5.4/36.8 ms` p50/p95/p99/max vs OpenSearch `4.5/9.7/18.2/362.8 ms`; 0 errors on both engines; RSS not captured |
 | Future Track A commits | Any perf axis | Must update this ledger in the same PR/commit sequence as the optimisation proof | Required fields: axis, workload, Surch numbers, OpenSearch/Elasticsearch reference where relevant, delta, run id/artifact path, and missing proof |
 
 ## Replay backlog for historical algorithms
@@ -101,8 +105,10 @@ Kickoff trace, 2026-05-20:
 - First current-main K8s replay dispatch:
   `gh workflow run ci-k8s.yml --ref main -f job=insee-bench` created
   `ci-k8s` run `26193166785` on `main`
-  (`466693f55e1a3cd8b007e058be07584251986ecb`). Verdict and promoted
-  artifacts are pending.
+  (`466693f55e1a3cd8b007e058be07584251986ecb`). Verdict: PASS, artifact
+  `k8s-bench-insee-bench-466693f55e1a3cd8b007e058be07584251986ecb`
+  (`7123081611`), promoted report
+  `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
 
 Minimum replay set:
 

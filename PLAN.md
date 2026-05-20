@@ -81,6 +81,11 @@ axis-by-axis performance state is now tracked in
   `docs/ops/bench-reports/track-a-performance-ledger.md` summarizes
   search latency, bulk, quality, RSS/memory, disk, and SLO axes with
   deltas and missing proof called out explicitly.
+- [x] Start the cumulative non-rewrite Track A replay line:
+  `perf-replay/wp-a-algo-ledger` commit `2100976` creates
+  `plan/perf-replay-wp-a-algo-ledger.md`; K8s run `26193166785`
+  promoted the first current-main replay report under
+  `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
 - [ ] Keep future Track A optimisation commits tied to a promoted perf
   report and an update to the Track A performance ledger.
 

@@ -6,7 +6,8 @@ Worktree: `/home/antoinefa/src/surch`
 Owner: `#1/#2 worker Track A`
 Status: started on 2026-05-20; local branch only, not pushed. First
 current-main K8s replay was dispatched as `ci-k8s` run `26193166785`;
-verdict and promoted artifacts are pending.
+verdict PASS, promoted report:
+`docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
 
 ## Finality
 
@@ -41,8 +42,9 @@ verdict and promoted artifacts are pending.
 - [x] Local branch created from `origin/main`:
   `466693f55e1a3cd8b007e058be07584251986ecb`.
 - [ ] Branch pushed to origin.
-- [ ] Replay reports committed.
-- [ ] Ledger updated from completed replay artifacts.
+- [x] Current-main replay report committed.
+- [x] Ledger updated from the current-main replay artifact.
+- [ ] Historical replay reports committed.
 - [ ] Main integration requested by conductor.
 
 ## Replay Points
@@ -57,7 +59,7 @@ as remote branch heads or tags today.
 | A-replay-1 top-K / lazy hydration | `71ceb2755ad33d4cc1b8d8da0003ae876edc228f` | ledger head `3157afbae0f2d37ac3d92462f08b92f6b6dee317`; TopN point `5081cc74a961c2fe67eec9c7fee8bbc3df86019b` / merge `eaff76cbbbefca55fb6d498f342f0e31e553cfa9` | reachable through `origin/main`, no dedicated remote ref | GHCR tags missing; no `docker-build.yml` / `ci-k8s.yml` at these SHAs, so direct workflow dispatch is blocked |
 | A-replay-2 WAND family | `3157afbae0f2d37ac3d92462f08b92f6b6dee317` | `e38bf916a0f197e0bb4f63e50ee9efc10cf3c704` | reachable through `origin/main`, no dedicated remote ref | GHCR tags missing; no `docker-build.yml` / `ci-k8s.yml` at these SHAs, so direct workflow dispatch is blocked |
 | A-replay-3 memory layout | `65fc7599946a2e5e1d81b989a1fb6606fc2d7a21` | `7caf3397970d9a183ebc5bc7631cb2e9f0aaea5c` | baseline is `origin/wp/b-test-auto`; head reachable through `origin/main`, no dedicated head ref | GHCR tags missing; baseline has workflow files, head lacks `docker-build.yml`; direct paired dispatch is blocked |
-| Current cumulative smoke | `69240116599e8e86f629f13f3d7611d73ff1a07d` | `466693f55e1a3cd8b007e058be07584251986ecb` | `origin/main` | `docker-build` run `26188578411` succeeded and both images exist; `insee-bench` run `26193166785` dispatched |
+| Current cumulative smoke | `69240116599e8e86f629f13f3d7611d73ff1a07d` | `466693f55e1a3cd8b007e058be07584251986ecb` | `origin/main` | `insee-bench` run `26193166785` PASS; promoted report `2026-05-20-A-replay-current-main-insee-K8s` |
 
 The A-replay-1 row in the existing ledger is non-linear as written:
 `3157afb` is an ancestor of `5081cc7`, so `71ceb275 -> 3157afb`
@@ -83,7 +85,7 @@ facts instead of editing old history.
   - [x] Record that historical GHCR tags are missing except the
     existing FoR anchor `c01b0a2`.
 
-- [ ] Lot 2 - First dispatchable K8s run
+- [x] Lot 2 - First dispatchable K8s run
   - [x] Wait for `docker-build` `26188578411` to finish.
   - [x] Recheck GHCR tags:
     `ghcr.io/rhanka/surch:sha-466693f55e1a3cd8b007e058be07584251986ecb`
@@ -95,7 +97,10 @@ facts instead of editing old history.
   - [x] Record this session's dispatch blocker: sandboxed `gh` returned
     `error connecting to api.github.com`; out-of-sandbox dispatch
     approval timed out twice before a later approved dispatch succeeded.
-  - [ ] Record the verdict and diagnostic if it fails.
+  - [x] Record verdict: PASS, `SuccessCriteriaMet=True`,
+    `Complete=True`, artifact `7123081611`.
+  - [x] Promote report:
+    `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
 
 - [ ] Lot 3 - Historical replay enablement
   - [ ] For each replay point, choose a non-rewrite remote ref strategy:
@@ -110,10 +115,10 @@ facts instead of editing old history.
 
 - [x] Read-only gates completed: git state, worktrees, plans, workflow
   surfaces, GHCR tag checks.
-- [ ] K8s gate: `ci-k8s.yml` `job=insee-bench` on first image-ready ref.
+- [x] K8s gate: `ci-k8s.yml` `job=insee-bench` on first image-ready ref.
 - [ ] Quality gate where search ranking changes are compared:
   `ci-k8s.yml` `job=ndcg-gate`.
-- [ ] Report gate: human `README.md` or `summary.md` promoted with
+- [x] Report gate: human `README.md` or `summary.md` promoted with
   p50 / p95 / p99 / max, errors, SLO verdict, and quality/RSS fields
   when available.
 
@@ -129,4 +134,4 @@ facts instead of editing old history.
 - [x] GHCR manifest checks showed current main runtime and bench-driver
   tags present after `docker-build` `26188578411`.
 - [x] First K8s replay run id recorded: `26193166785`.
-- [ ] First K8s replay verdict recorded.
+- [x] First K8s replay verdict recorded: PASS.

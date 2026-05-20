@@ -132,7 +132,7 @@ closure.
   - [x] Dispatch the first image-ready `ci-k8s` replay run and record
     its run id: `insee-bench` run `26193166785` on `main`
     `466693f55e1a3cd8b007e058be07584251986ecb`.
-  - [ ] Promote the `26193166785` result and update this follow-up
-    once the run finishes.
+  - [x] Promote the `26193166785` result:
+    `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
   - [ ] Promote A-replay-1 through A-replay-3 reports and update the
     Track A performance ledger rows.
