@@ -44,6 +44,12 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Real S3 wire-contract tests: MinIO testcontainer replaces the
+# in-process axum mock for the `_snapshot/s3` round-trip. The mock
+# could not speak AWS Flexible Checksums + STREAMING-UNSIGNED-PAYLOAD-
+# TRAILER + ListObjectsV2 XML schema; MinIO does.
+testcontainers = { version = "0.27", default-features = false }
+testcontainers-modules = { version = "0.15", features = ["minio"] }
 
 # Criterion bench harness: measures the in-process scoring hot path
 # (no axum, no HTTP) so iterative search-side optimisations can be

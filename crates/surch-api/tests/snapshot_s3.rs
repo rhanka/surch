@@ -10,33 +10,32 @@
 //!    - Direct `S3Repository::new` rejects an empty bucket eagerly with
 //!      `InvalidConfig` (no deferred AWS round trip).
 //!
-//! 2. A full snapshot / restore round trip against a local axum mock
-//!    that speaks just enough S3 (path-style, no SigV4 verification)
-//!    to back `S3Repository`. The Surch API itself is bound to a real
-//!    TCP socket via `axum::serve` and driven with `reqwest`, mirroring
-//!    how an OpenSearch client calls a deployed instance — this catches
-//!    "cannot start a runtime from within a runtime" panics that the
-//!    `oneshot` shape masks because it never exercises the multi-thread
-//!    runtime contract `block_in_place` relies on.
+//! 2. A full snapshot / restore round trip against a real MinIO S3
+//!    backend running inside a `testcontainers` Docker container. The
+//!    Surch API itself is bound to a real TCP socket via `axum::serve`
+//!    and driven with `reqwest`, mirroring how an OpenSearch client
+//!    calls a deployed instance. The MinIO container speaks the real
+//!    AWS S3 wire contract (Flexible Checksums, STREAMING-UNSIGNED-
+//!    PAYLOAD-TRAILER, ListObjectsV2 XML schema, conditional writes),
+//!    which the previous in-process axum mock could not.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 
-use axum::{
-    body::{to_bytes, Body},
-    extract::{Path as AxumPath, Query, State as AxumState},
-    http::{header, HeaderMap, Method, Request, StatusCode},
-    response::IntoResponse,
-    routing::{any, get},
-    Router,
-};
+use aws_sdk_s3::config::{Credentials, Region};
 use serde_json::{json, Value};
 use surch_api::{
     app_router,
     snapshot_es::{S3Repository, S3RepositoryConfig},
 };
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::minio::MinIO;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
+
+use axum::{
+    body::{to_bytes, Body},
+    http::{header, Method, Request, StatusCode},
+};
 
 async fn read_json(response: axum::response::Response<Body>) -> (StatusCode, Value) {
     let status = response.status();
@@ -184,217 +183,27 @@ async fn s3_repository_new_rejects_empty_bucket() {
 }
 
 // -------------------------------------------------------------------
-// Mock S3 (axum, path-style, no SigV4 verification)
+// MinIO testcontainer + Surch API e2e
 // -------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-struct MockS3 {
-    /// `{bucket}/{key}` -> bytes.
-    objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-}
-
-impl MockS3 {
-    fn full_key(bucket: &str, key: &str) -> String {
-        format!("{bucket}/{key}")
+/// Returns true if the local environment can spin a Docker container
+/// (the testcontainers crate needs a reachable Docker socket). In CI
+/// the workflow always exports `CI=true` and Docker is provided by
+/// the runner, so the test is mandatory there. On a developer box
+/// without Docker, the test short-circuits with a `println!` rather
+/// than failing — keeps `cargo test` green on minimal environments.
+fn docker_socket_present() -> bool {
+    if Path::new("/var/run/docker.sock").exists() {
+        return true;
     }
-
-    fn keys(&self) -> Vec<String> {
-        let guard = self.objects.lock().expect("mock s3 mutex");
-        let mut out: Vec<String> = guard.keys().cloned().collect();
-        out.sort();
-        out
+    if let Ok(host) = std::env::var("DOCKER_HOST") {
+        // tcp:// / unix:// / npipe:// — any explicit override means
+        // the user has set up Docker access by hand.
+        if !host.trim().is_empty() {
+            return true;
+        }
     }
-}
-
-#[derive(serde::Deserialize)]
-struct ListQuery {
-    #[serde(rename = "list-type")]
-    list_type: Option<String>,
-    prefix: Option<String>,
-    #[serde(rename = "continuation-token")]
-    _continuation_token: Option<String>,
-}
-
-async fn mock_bucket_handler(
-    AxumState(state): AxumState<MockS3>,
-    AxumPath(bucket): AxumPath<String>,
-    Query(query): Query<ListQuery>,
-    method: Method,
-    _headers: HeaderMap,
-    _body: axum::body::Bytes,
-) -> axum::response::Response {
-    if method == Method::GET && query.list_type.as_deref() == Some("2") {
-        let prefix = query.prefix.clone().unwrap_or_default();
-        let guard = state.objects.lock().expect("mock s3 mutex");
-        let mut keys: Vec<String> = guard
-            .keys()
-            .filter_map(|k| k.strip_prefix(&format!("{bucket}/")).map(str::to_owned))
-            .filter(|k| k.starts_with(&prefix))
-            .collect();
-        keys.sort();
-        drop(guard);
-        let mut xml = String::new();
-        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-        xml.push_str("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
-        xml.push_str(&format!("<Name>{bucket}</Name>"));
-        xml.push_str(&format!(
-            "<Prefix>{}</Prefix>",
-            html_escape::encode_safe(&prefix)
-        ));
-        xml.push_str("<KeyCount>");
-        xml.push_str(&keys.len().to_string());
-        xml.push_str("</KeyCount>");
-        xml.push_str("<MaxKeys>1000</MaxKeys>");
-        xml.push_str("<IsTruncated>false</IsTruncated>");
-        for k in &keys {
-            xml.push_str("<Contents>");
-            xml.push_str(&format!("<Key>{}</Key>", html_escape::encode_safe(k)));
-            xml.push_str("<Size>0</Size>");
-            xml.push_str("</Contents>");
-        }
-        xml.push_str("</ListBucketResult>");
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/xml")],
-            xml,
-        )
-            .into_response();
-    }
-    (StatusCode::BAD_REQUEST, "unsupported bucket op").into_response()
-}
-
-fn etag_of(bytes: &[u8]) -> String {
-    // MD5 hex inside quotes — the AWS SDK doesn't actually verify
-    // the value, it only forwards it back through `e_tag()`.
-    let digest = md5_of(bytes);
-    format!("\"{digest}\"")
-}
-
-fn md5_of(bytes: &[u8]) -> String {
-    // 16-byte FNV-ish digest, hex-encoded. Real MD5 is not needed —
-    // the mock just has to surface a deterministic ETag per body.
-    let mut state: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        state ^= *b as u64;
-        state = state.wrapping_mul(0x100_0000_01b3);
-    }
-    format!("{state:032x}")
-}
-
-async fn mock_object_handler(
-    AxumState(state): AxumState<MockS3>,
-    AxumPath((bucket, key)): AxumPath<(String, String)>,
-    method: Method,
-    _headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    let full = MockS3::full_key(&bucket, &key);
-    match method {
-        Method::PUT => {
-            let bytes = body.to_vec();
-            let etag = etag_of(&bytes);
-            state
-                .objects
-                .lock()
-                .expect("mock s3 mutex")
-                .insert(full, bytes);
-            (
-                StatusCode::OK,
-                [(header::ETAG, etag.as_str())],
-                Body::empty(),
-            )
-                .into_response()
-        }
-        Method::GET => {
-            let guard = state.objects.lock().expect("mock s3 mutex");
-            match guard.get(&full).cloned() {
-                Some(bytes) => {
-                    let etag = etag_of(&bytes);
-                    (
-                        StatusCode::OK,
-                        [
-                            (header::ETAG, etag.as_str()),
-                            (header::CONTENT_TYPE, "application/octet-stream"),
-                        ],
-                        bytes,
-                    )
-                        .into_response()
-                }
-                None => no_such_key(&key),
-            }
-        }
-        Method::HEAD => {
-            let guard = state.objects.lock().expect("mock s3 mutex");
-            match guard.get(&full) {
-                Some(bytes) => {
-                    let etag = etag_of(bytes);
-                    (
-                        StatusCode::OK,
-                        [(header::ETAG, etag.as_str())],
-                        Body::empty(),
-                    )
-                        .into_response()
-                }
-                None => (StatusCode::NOT_FOUND, Body::empty()).into_response(),
-            }
-        }
-        Method::DELETE => {
-            state.objects.lock().expect("mock s3 mutex").remove(&full);
-            (StatusCode::NO_CONTENT, Body::empty()).into_response()
-        }
-        _ => (StatusCode::METHOD_NOT_ALLOWED, "unsupported").into_response(),
-    }
-}
-
-fn no_such_key(key: &str) -> axum::response::Response {
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><Key>{}</Key></Error>",
-        html_escape::encode_safe(key)
-    );
-    (
-        StatusCode::NOT_FOUND,
-        [(header::CONTENT_TYPE, "application/xml")],
-        xml,
-    )
-        .into_response()
-}
-
-// Tiny inline html-escape (avoid adding a crate just for `<`/`>`).
-mod html_escape {
-    pub fn encode_safe(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for c in s.chars() {
-            match c {
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                '&' => out.push_str("&amp;"),
-                '"' => out.push_str("&quot;"),
-                _ => out.push(c),
-            }
-        }
-        out
-    }
-}
-
-async fn spawn_mock_s3() -> (String, MockS3) {
-    let state = MockS3::default();
-    let app = Router::new()
-        .route(
-            "/:bucket/*key",
-            any(mock_object_handler).with_state(state.clone()),
-        )
-        .route(
-            "/:bucket",
-            get(mock_bucket_handler).with_state(state.clone()),
-        );
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("mock s3 bind");
-    let addr = listener.local_addr().expect("mock s3 addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("mock s3 serve");
-    });
-    (format!("http://{addr}"), state)
+    false
 }
 
 async fn spawn_surch_api() -> String {
@@ -409,37 +218,73 @@ async fn spawn_surch_api() -> String {
     format!("http://{addr}")
 }
 
-/// End-to-end: register an s3 repository pointing at an in-process
-/// mock, index 24 documents, take a snapshot, verify the mock now
-/// holds the root manifest + payload blob, delete the index, restore
-/// the snapshot, and search the restored index.
+/// End-to-end: register an s3 repository pointing at a MinIO
+/// testcontainer, index 24 documents, take a snapshot, verify the
+/// MinIO bucket now holds the root manifest + payload blob, delete
+/// the index, restore the snapshot, and search the restored index.
 ///
 /// Multi-thread runtime is required: `S3Repository` calls
 /// `tokio::task::block_in_place` from inside the axum handler, which
 /// panics on a current-thread runtime.
 ///
-/// The mock S3 server does not implement the AWS Flexible Checksums
-/// response contract (`x-amz-checksum-*` / `x-amz-sdk-checksum-algorithm`
-/// trailer headers). We therefore configure the repository client to
-/// only run checksum logic `WhenRequired` instead of the default
-/// `WhenSupported`, via the test-only `disable_request_checksum`
-/// repository setting. Prod paths against MinIO / R2 / real S3 leave
-/// this flag false (default) and keep full Flexible Checksums.
-///
-/// Ignored: even with `default-https-client` wired and request /
-/// response checksums disabled, the round-trip still hangs in the
-/// `_snapshot/cloud/snap-s3` PUT — the axum mock S3 likely needs
-/// proper `STREAMING-UNSIGNED-PAYLOAD-TRAILER` body handling or
-/// multipart upload negotiation. Swapping the in-process mock for a
-/// MinIO testcontainer is the path forward (real S3 wire contract).
-#[ignore = "mock S3 round-trip hangs end-to-end despite https client fix; needs MinIO testcontainer"]
+/// Unlike the previous in-process axum mock, MinIO speaks the full
+/// AWS S3 wire contract — Flexible Checksums, STREAMING-UNSIGNED-
+/// PAYLOAD-TRAILER, ListObjectsV2 XML, conditional writes — so we
+/// keep `disable_request_checksum: false` (default) and exercise the
+/// real production path the SDK takes against AWS / R2 / MinIO.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
-    let (mock_url, mock) = spawn_mock_s3().await;
+    if !docker_socket_present() && std::env::var("CI").is_err() {
+        println!("Docker socket not present and CI unset; skipping MinIO testcontainer test");
+        return;
+    }
+
+    // 1. Spin up MinIO. The `testcontainers_modules::minio::MinIO`
+    //    image defaults to `minioadmin` / `minioadmin` and exposes
+    //    port 9000 inside the container. `get_host_port_ipv4(9000)`
+    //    returns the random host port Docker mapped it onto.
+    let minio = MinIO::default()
+        .start()
+        .await
+        .expect("MinIO container should start");
+    let host = minio
+        .get_host()
+        .await
+        .expect("MinIO host should be reachable");
+    let port = minio
+        .get_host_port_ipv4(9000)
+        .await
+        .expect("MinIO 9000 should be mapped to host");
+    let endpoint = format!("http://{host}:{port}");
+
+    // 2. Pre-create the `surch-snapshots` bucket via the AWS SDK
+    //    directly. The snapshot repository code only does
+    //    `PutObject`/`GetObject`/`ListObjectsV2`; bucket creation is
+    //    out of scope for `S3Repository`.
+    let sdk_cfg = aws_sdk_s3::Config::builder()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(
+            "minioadmin",
+            "minioadmin",
+            None,
+            None,
+            "surch-snapshot-test",
+        ))
+        .endpoint_url(&endpoint)
+        .force_path_style(true)
+        .build();
+    let s3 = aws_sdk_s3::Client::from_conf(sdk_cfg);
+    s3.create_bucket()
+        .bucket("surch-snapshots")
+        .send()
+        .await
+        .expect("MinIO create_bucket(surch-snapshots)");
+
     let api_url = spawn_surch_api().await;
     let client = reqwest::Client::new();
 
-    // 1. Register the s3 repository.
+    // 3. Register the s3 repository against the live MinIO endpoint.
     let resp = client
         .put(format!("{api_url}/_snapshot/cloud"))
         .json(&json!({
@@ -447,10 +292,9 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
             "settings": {
                 "bucket": "surch-snapshots",
                 "region": "us-east-1",
-                "endpoint": mock_url,
+                "endpoint": endpoint,
                 "access_key": "minioadmin",
                 "secret_key": "minioadmin",
-                "disable_request_checksum": true,
             }
         }))
         .send()
@@ -463,7 +307,7 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
         "register s3 repo failed: {status} {body}"
     );
 
-    // 2. Create the `source` index with a minimal mapping.
+    // 4. Create the `source` index with a minimal mapping.
     let resp = client
         .put(format!("{api_url}/source"))
         .json(&json!({
@@ -479,7 +323,7 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
         .expect("PUT /source");
     assert!(resp.status().is_success(), "create index failed");
 
-    // 3. Bulk-index 24 docs; every third doc is `category=science`.
+    // 5. Bulk-index 24 docs; every third doc is `category=science`.
     let mut ndjson = String::new();
     for id in 0..24 {
         ndjson.push_str(&format!(
@@ -507,7 +351,7 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
         .expect("POST _refresh");
     assert!(resp.status().is_success());
 
-    // 4. Take a snapshot of `source`.
+    // 6. Take a snapshot of `source`.
     let resp = client
         .put(format!("{api_url}/_snapshot/cloud/snap-s3"))
         .json(&json!({ "indices": "source" }))
@@ -526,19 +370,30 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
         "snapshot state should be SUCCESS, got {snap_body}"
     );
 
-    // 5. The mock must have received the root manifest + at least one
-    //    payload blob.
-    let keys = mock.keys();
+    // 7. MinIO must now hold the root manifest + at least one
+    //    payload blob. ListObjectsV2 the bucket and check.
+    let listed = s3
+        .list_objects_v2()
+        .bucket("surch-snapshots")
+        .send()
+        .await
+        .expect("MinIO list_objects_v2");
+    let keys: Vec<String> = listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_owned))
+        .collect();
     assert!(
-        keys.iter().any(|k| k.ends_with("/index-0")),
-        "mock should contain a root manifest key, got {keys:?}"
+        keys.iter()
+            .any(|k| k.ends_with("/index-0") || k == "index-0"),
+        "MinIO should contain a root manifest key, got {keys:?}"
     );
     assert!(
         keys.iter().any(|k| k.ends_with(".dat")),
-        "mock should contain at least one .dat payload, got {keys:?}"
+        "MinIO should contain at least one .dat payload, got {keys:?}"
     );
 
-    // 6. Drop `source` and restore from the snapshot.
+    // 8. Drop `source` and restore from the snapshot.
     let resp = client
         .delete(format!("{api_url}/source"))
         .send()
@@ -556,7 +411,7 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
     let body = resp.text().await.expect("restore body");
     assert!(status.is_success(), "restore failed: {status} {body}");
 
-    // 7. After restore, search must surface all 24 alpha docs and the
+    // 9. After restore, search must surface all 24 alpha docs and the
     //    8 science docs.
     let resp = client
         .post(format!("{api_url}/source/_search"))
