@@ -1,6 +1,6 @@
 # Surch Global Plan
 
-Updated: 2026-05-18
+Updated: 2026-05-20
 
 This is the live conductor plan for Surch. It tracks the repo by the
 official tracks A-E and points to branch-level plans under `plan/`.
@@ -120,7 +120,7 @@ Reste estime: ~30% (3 open / 10 leaf tasks).
 
 ## Track C - Ops / Packaging / Snapshots
 
-Reste estime: ~50% (6 open / 12 leaf tasks).
+Reste estime: ~35% (4 open / 12 leaf tasks).
 
 - [x] Docker, Helm, release, signing, and SBOM work landed.
 - [x] Snapshot and SLM work started on `wp/c-ops`.
@@ -130,16 +130,22 @@ Reste estime: ~50% (6 open / 12 leaf tasks).
   shipped SHAs.
 - [x] `92a8ed9` covers and implements SLM `retention.max_count`
   pruning for successful snapshots.
+- [x] S3/MinIO snapshot/restore e2e coverage landed on `main`:
+  `b929dff` swaps the mock for MinIO and `d409cf3` bounds container
+  startup.
+- [x] The MinIO e2e test now bounds each Docker/S3/API step with named
+  timeouts, so a stuck CI run fails with the blocked step instead of
+  hiding inside `cargo test --workspace`.
 - [ ] Finish snapshot REST coverage.
-- [ ] Run and document S3/MinIO end-to-end snapshot coverage.
 - [ ] Finish restore coverage.
 - [ ] Finish remaining SLM retention behavior beyond `max_count`.
 - [ ] Keep release verification reproducible from CI artefacts.
-- [ ] Preserve a minimal path to inspect failing release/snapshot runs.
+- [x] Preserve a minimal path to inspect failing snapshot runs.
 
 ## Track D - matchID
 
-Reste estime: ~20% (2 open / 9 leaf tasks).
+Reste estime: ~0% for the closed B1 oracle phase. Phase 4 widening is
+deferred to a follow-up plan when scoped.
 
 - [x] Intake flow exists under `docs/wp-d-matchid/incoming/`,
   `decisions/`, and `gap-analysis.md`.
@@ -152,10 +158,12 @@ Reste estime: ~20% (2 open / 9 leaf tasks).
 - [x] The `deces_v1` Elasticsearch oracle gate is now an executable
   script with a local `--dry-run`, so the external run no longer depends
   on copying Python out of Markdown.
-- [ ] Execute the Elasticsearch 7.x oracle gate and refresh fixture
-  expectations from that reference, not Surch.
-- [ ] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the oracle
-  replay and document remaining parity gaps.
+- [x] Execute the Elasticsearch 7.x oracle gate and refresh fixture
+  expectations from that reference, not Surch:
+  `ci-k8s` run `26136585015` passed with 0 / 30 unexpected divergences.
+- [x] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the oracle
+  replay and document remaining parity gaps through the B1 oracle
+  closure. Phase 4 widening is deferred to a follow-up plan.
 
 ## Track E - Infra K8s / poc-k8s
 

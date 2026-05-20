@@ -57,7 +57,8 @@ Status: active branch exists; latest branch head `2625edd`
     tests in the same file stay enabled.
   - [x] Record exact commands and artefacts: `b929dff` (mock S3 →
     MinIO testcontainer swap) + `d409cf3` (90 s start timeout for
-    CI safety).
+    CI safety) + this delivery (named 30 s timeouts around each
+    Docker/S3/API step so CI exposes the blocked operation).
   - [x] Gate: reproducible e2e run — landed on `main`; CI exercises
     the path when Docker is available on the runner, devs without
     Docker keep `cargo test` green via the short-circuit.
@@ -68,7 +69,9 @@ Status: active branch exists; latest branch head `2625edd`
   - [x] Cover and implement SLM `retention.max_count` pruning for
     successful snapshots.
   - [ ] Finish remaining SLM retention behavior beyond `max_count`.
-  - [ ] Preserve diagnostics for failure cases.
+  - [x] Preserve diagnostics for snapshot failure cases: the MinIO e2e
+    test now names the step that fails or times out instead of leaving
+    the workspace `cargo test` job open-ended.
 
 - [ ] Lot 4 - Release verification
   - [ ] Reproduce release verification from CI artefacts.

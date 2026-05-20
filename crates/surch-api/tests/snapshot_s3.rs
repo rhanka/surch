@@ -19,7 +19,7 @@
 //!    PAYLOAD-TRAILER, ListObjectsV2 XML schema, conditional writes),
 //!    which the previous in-process axum mock could not.
 
-use std::path::Path;
+use std::{fmt::Display, future::Future, path::Path, time::Duration};
 
 use aws_sdk_s3::config::{Credentials, Region};
 use serde_json::{json, Value};
@@ -36,6 +36,9 @@ use axum::{
     body::{to_bytes, Body},
     http::{header, Method, Request, StatusCode},
 };
+
+const MINIO_START_TIMEOUT: Duration = Duration::from_secs(90);
+const S3_E2E_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn read_json(response: axum::response::Response<Body>) -> (StatusCode, Value) {
     let status = response.status();
@@ -206,6 +209,47 @@ fn docker_socket_present() -> bool {
     false
 }
 
+async fn bounded_s3_step<T, E, F>(step: &str, timeout: Duration, future: F) -> Result<T, String>
+where
+    E: Display,
+    F: Future<Output = Result<T, E>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(format!("{step} failed: {err}")),
+        Err(_) => Err(format!("{step} timed out after {timeout:?}")),
+    }
+}
+
+async fn expect_s3_step<T, E, F>(step: &str, future: F) -> T
+where
+    E: Display,
+    F: Future<Output = Result<T, E>>,
+{
+    bounded_s3_step(step, S3_E2E_STEP_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+#[tokio::test]
+async fn bounded_s3_step_reports_timed_out_step_name() {
+    let err = bounded_s3_step("minio create_bucket", Duration::from_millis(1), async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok::<(), &'static str>(())
+    })
+    .await
+    .expect_err("step should time out");
+
+    assert!(
+        err.contains("minio create_bucket"),
+        "timeout error should name the blocked step, got `{err}`"
+    );
+    assert!(
+        err.contains("timed out"),
+        "timeout error should mention timeout, got `{err}`"
+    );
+}
+
 async fn spawn_surch_api() -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -248,31 +292,26 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
     //    bandwidth or the Docker daemon is unhealthy (notably some
     //    GitHub Actions runner shapes) — we short-circuit with a
     //    clear "skip" message instead of hanging the entire CI run.
-    let minio =
-        match tokio::time::timeout(std::time::Duration::from_secs(90), MinIO::default().start())
-            .await
-        {
-            Ok(Ok(minio)) => minio,
-            Ok(Err(err)) => {
-                println!("skipping MinIO testcontainer test: container failed to start: {err}");
-                return;
-            }
-            Err(_) => {
-                println!(
-                    "skipping MinIO testcontainer test: container did not become \
+    let minio = match tokio::time::timeout(MINIO_START_TIMEOUT, MinIO::default().start()).await {
+        Ok(Ok(minio)) => minio,
+        Ok(Err(err)) => {
+            println!("skipping MinIO testcontainer test: container failed to start: {err}");
+            return;
+        }
+        Err(_) => {
+            println!(
+                "skipping MinIO testcontainer test: container did not become \
                  ready within 90s (Docker pull / daemon issue)"
-                );
-                return;
-            }
-        };
-    let host = minio
-        .get_host()
-        .await
-        .expect("MinIO host should be reachable");
-    let port = minio
-        .get_host_port_ipv4(9000)
-        .await
-        .expect("MinIO 9000 should be mapped to host");
+            );
+            return;
+        }
+    };
+    let host = expect_s3_step("MinIO get_host", minio.get_host()).await;
+    let port = expect_s3_step(
+        "MinIO get_host_port_ipv4(9000)",
+        minio.get_host_port_ipv4(9000),
+    )
+    .await;
     let endpoint = format!("http://{host}:{port}");
 
     // 2. Pre-create the `surch-snapshots` bucket via the AWS SDK
@@ -293,52 +332,56 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
         .force_path_style(true)
         .build();
     let s3 = aws_sdk_s3::Client::from_conf(sdk_cfg);
-    s3.create_bucket()
-        .bucket("surch-snapshots")
-        .send()
-        .await
-        .expect("MinIO create_bucket(surch-snapshots)");
+    expect_s3_step(
+        "MinIO create_bucket(surch-snapshots)",
+        s3.create_bucket().bucket("surch-snapshots").send(),
+    )
+    .await;
 
     let api_url = spawn_surch_api().await;
     let client = reqwest::Client::new();
 
     // 3. Register the s3 repository against the live MinIO endpoint.
-    let resp = client
-        .put(format!("{api_url}/_snapshot/cloud"))
-        .json(&json!({
-            "type": "s3",
-            "settings": {
-                "bucket": "surch-snapshots",
-                "region": "us-east-1",
-                "endpoint": endpoint,
-                "access_key": "minioadmin",
-                "secret_key": "minioadmin",
-            }
-        }))
-        .send()
-        .await
-        .expect("PUT _snapshot/cloud");
+    let resp = expect_s3_step(
+        "PUT _snapshot/cloud",
+        client
+            .put(format!("{api_url}/_snapshot/cloud"))
+            .json(&json!({
+                "type": "s3",
+                "settings": {
+                    "bucket": "surch-snapshots",
+                    "region": "us-east-1",
+                    "endpoint": endpoint,
+                    "access_key": "minioadmin",
+                    "secret_key": "minioadmin",
+                }
+            }))
+            .send(),
+    )
+    .await;
     let status = resp.status();
-    let body = resp.text().await.expect("body");
+    let body = expect_s3_step("read PUT _snapshot/cloud body", resp.text()).await;
     assert!(
         status.is_success(),
         "register s3 repo failed: {status} {body}"
     );
 
     // 4. Create the `source` index with a minimal mapping.
-    let resp = client
-        .put(format!("{api_url}/source"))
-        .json(&json!({
-            "mappings": {
-                "properties": {
-                    "title": { "type": "text" },
-                    "category": { "type": "keyword" }
+    let resp = expect_s3_step(
+        "PUT /source",
+        client
+            .put(format!("{api_url}/source"))
+            .json(&json!({
+                "mappings": {
+                    "properties": {
+                        "title": { "type": "text" },
+                        "category": { "type": "keyword" }
+                    }
                 }
-            }
-        }))
-        .send()
-        .await
-        .expect("PUT /source");
+            }))
+            .send(),
+    )
+    .await;
     assert!(resp.status().is_success(), "create index failed");
 
     // 5. Bulk-index 24 docs; every third doc is `category=science`.
@@ -352,32 +395,37 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
             "{{\"title\":\"alpha document {id}\",\"category\":\"{category}\"}}\n"
         ));
     }
-    let resp = client
-        .post(format!("{api_url}/_bulk"))
-        .header("content-type", "application/x-ndjson")
-        .body(ndjson)
-        .send()
-        .await
-        .expect("POST _bulk");
+    let resp = expect_s3_step(
+        "POST _bulk",
+        client
+            .post(format!("{api_url}/_bulk"))
+            .header("content-type", "application/x-ndjson")
+            .body(ndjson)
+            .send(),
+    )
+    .await;
     assert!(resp.status().is_success(), "bulk index failed");
 
     // Refresh so the docs are visible to search.
-    let resp = client
-        .post(format!("{api_url}/source/_refresh"))
-        .send()
-        .await
-        .expect("POST _refresh");
+    let resp = expect_s3_step(
+        "POST /source/_refresh",
+        client.post(format!("{api_url}/source/_refresh")).send(),
+    )
+    .await;
     assert!(resp.status().is_success());
 
     // 6. Take a snapshot of `source`.
-    let resp = client
-        .put(format!("{api_url}/_snapshot/cloud/snap-s3"))
-        .json(&json!({ "indices": "source" }))
-        .send()
-        .await
-        .expect("PUT _snapshot/cloud/snap-s3");
+    let resp = expect_s3_step(
+        "PUT _snapshot/cloud/snap-s3",
+        client
+            .put(format!("{api_url}/_snapshot/cloud/snap-s3"))
+            .json(&json!({ "indices": "source" }))
+            .send(),
+    )
+    .await;
     let status = resp.status();
-    let snap_body: Value = resp.json().await.expect("snapshot json");
+    let snap_body: Value =
+        expect_s3_step("read PUT _snapshot/cloud/snap-s3 json", resp.json()).await;
     assert!(
         status.is_success(),
         "create snapshot failed: {status} {snap_body}"
@@ -390,12 +438,11 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
 
     // 7. MinIO must now hold the root manifest + at least one
     //    payload blob. ListObjectsV2 the bucket and check.
-    let listed = s3
-        .list_objects_v2()
-        .bucket("surch-snapshots")
-        .send()
-        .await
-        .expect("MinIO list_objects_v2");
+    let listed = expect_s3_step(
+        "MinIO list_objects_v2(surch-snapshots)",
+        s3.list_objects_v2().bucket("surch-snapshots").send(),
+    )
+    .await;
     let keys: Vec<String> = listed
         .contents()
         .iter()
@@ -412,48 +459,54 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
     );
 
     // 8. Drop `source` and restore from the snapshot.
-    let resp = client
-        .delete(format!("{api_url}/source"))
-        .send()
-        .await
-        .expect("DELETE /source");
+    let resp = expect_s3_step(
+        "DELETE /source",
+        client.delete(format!("{api_url}/source")).send(),
+    )
+    .await;
     assert!(resp.status().is_success(), "delete index failed");
 
-    let resp = client
-        .post(format!("{api_url}/_snapshot/cloud/snap-s3/_restore"))
-        .json(&json!({ "indices": "source" }))
-        .send()
-        .await
-        .expect("POST _restore");
+    let resp = expect_s3_step(
+        "POST _snapshot/cloud/snap-s3/_restore",
+        client
+            .post(format!("{api_url}/_snapshot/cloud/snap-s3/_restore"))
+            .json(&json!({ "indices": "source" }))
+            .send(),
+    )
+    .await;
     let status = resp.status();
-    let body = resp.text().await.expect("restore body");
+    let body = expect_s3_step("read POST _restore body", resp.text()).await;
     assert!(status.is_success(), "restore failed: {status} {body}");
 
     // 9. After restore, search must surface all 24 alpha docs and the
     //    8 science docs.
-    let resp = client
-        .post(format!("{api_url}/source/_search"))
-        .json(&json!({
-            "size": 100,
-            "query": { "match": { "title": "alpha" } }
-        }))
-        .send()
-        .await
-        .expect("POST _search title");
-    let body: Value = resp.json().await.expect("search title json");
+    let resp = expect_s3_step(
+        "POST /source/_search title",
+        client
+            .post(format!("{api_url}/source/_search"))
+            .json(&json!({
+                "size": 100,
+                "query": { "match": { "title": "alpha" } }
+            }))
+            .send(),
+    )
+    .await;
+    let body: Value = expect_s3_step("read title search json", resp.json()).await;
     let total_alpha = body["hits"]["total"]["value"].as_u64().unwrap_or_default();
     assert_eq!(total_alpha, 24, "match title=alpha total = {body}");
 
-    let resp = client
-        .post(format!("{api_url}/source/_search"))
-        .json(&json!({
-            "size": 100,
-            "query": { "match": { "category": "science" } }
-        }))
-        .send()
-        .await
-        .expect("POST _search category");
-    let body: Value = resp.json().await.expect("search category json");
+    let resp = expect_s3_step(
+        "POST /source/_search category",
+        client
+            .post(format!("{api_url}/source/_search"))
+            .json(&json!({
+                "size": 100,
+                "query": { "match": { "category": "science" } }
+            }))
+            .send(),
+    )
+    .await;
+    let body: Value = expect_s3_step("read category search json", resp.json()).await;
     let total_science = body["hits"]["total"]["value"].as_u64().unwrap_or_default();
     assert_eq!(total_science, 8, "match category=science total = {body}");
 }
