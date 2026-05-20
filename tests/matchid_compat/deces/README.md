@@ -40,8 +40,10 @@ over public-domain field-value pools — see
 `tools/gen_deces_slice.awk`. No real INSEE record is present in this
 file; it carries no PII and no Open Licence redistribution
 constraint. It is byte-stable and remains the source of truth for the
-B1 replay until the Elasticsearch 8.6.1 oracle cross-check (B1 phase 3) replaces
-the captured expectations.
+B1 replay. The Elasticsearch 8.6.1 oracle gate now cross-checks this
+same fixture for Track D B1 closure; a future `deces_v2` replay can
+move frozen expectations onto the real INSEE slice when that scope is
+opened.
 
 ### Real INSEE slice (`slice-10000.ndjson.gz`)
 

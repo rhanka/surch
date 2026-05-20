@@ -66,8 +66,8 @@ COPY scripts/bench/trec-covid-ndcg.sh /usr/local/bin/trec-covid-ndcg.sh
 # the `deces` index on both engines before driving artillery_bench.
 COPY tests/matchid_compat/deces/mapping.json /usr/local/share/deces/mapping.json
 COPY tests/matchid_compat/deces/slice-10000.ndjson.gz /usr/local/share/deces/slice-10000.ndjson.gz
-# matchID v1 replay fixture used by b1_oracle (Phase 3 ES-7.x
-# cross-check).
+# matchID v1 replay fixture used by the Elasticsearch 8.6.1 b1_oracle
+# gate.
 COPY tests/matchid_compat/replays/deces_v1.json /usr/local/share/deces/replays/deces_v1.json
 
 RUN chmod 0755 \

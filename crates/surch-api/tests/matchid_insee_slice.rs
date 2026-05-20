@@ -15,8 +15,8 @@
 //! per-request `hits.total.value` and `hits.hits[0]._id` expectations
 //! are bound to the AWK-generated documents and would need a full
 //! re-capture to track a different corpus. This INSEE slice is the
-//! "real-data smoke" complement; the deces_v2 replay (gated on the
-//! poc-k8s ES-7.x oracle cross-check) will replace this test with
+//! "real-data smoke" complement; the deces_v2 replay (scoped after the
+//! Elasticsearch 8.6.1 B1 oracle proof) will replace this test with
 //! frozen expectations.
 
 use std::io::Read;
