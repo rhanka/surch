@@ -88,6 +88,8 @@ Status: active infra lane; merge state below is the source of truth
 - [x] Verification run recorded: `ci-k8s` `26038117579` failed in 16s
   on missing image, replacing 30m timeout pattern.
 - [x] `main` CI after latest integration was green: `26038398172`.
+- [x] `ci` cargo-test job now has `timeout-minutes: 20` after run
+  `26193965044` exposed an open-ended testcontainer hang.
 - [x] `ci-k8s` heavy run reports Job `Complete=True`.
   - [x] Diagnose image contract mismatch between GHCR preflight and
     rendered Job manifests.
@@ -157,6 +159,8 @@ Status: active infra lane; merge state below is the source of truth
   - [x] Make `ndcg-gate` publish a human benchmark summary into the
     uploaded artifact even when post-completion `kubectl cp` cannot
     read `/reports` from the terminated driver container.
+  - [x] Make default `ci` fail-closed with a 20 minute cargo-test
+    timeout.
   - [x] Apply the Surch tenant ResourceQuota bump required by the
     TREC-COVID `ndcg-gate` path: live quota now allows
     `limits.memory=6Gi` instead of the previous `3Gi`.

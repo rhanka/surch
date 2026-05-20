@@ -53,6 +53,7 @@ jobs:
   test:
     name: cargo test
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

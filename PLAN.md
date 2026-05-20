@@ -140,9 +140,9 @@ Reste estime: ~35% (4 open / 12 leaf tasks).
 - [x] S3/MinIO snapshot/restore e2e coverage landed on `main`:
   `b929dff` swaps the mock for MinIO and `d409cf3` bounds container
   startup.
-- [x] The MinIO e2e test now bounds each Docker/S3/API step with named
-  timeouts, so a stuck CI run fails with the blocked step instead of
-  hiding inside `cargo test --workspace`.
+- [x] The MinIO e2e test now requires `SURCH_MINIO_E2E=1` plus Docker;
+  default `cargo test --workspace` skips the testcontainer path after
+  GitHub run `26193965044` showed runner-side MinIO startup could hang.
 - [ ] Finish snapshot REST coverage.
 - [ ] Finish restore coverage.
 - [ ] Finish remaining SLM retention behavior beyond `max_count`.
@@ -218,6 +218,8 @@ Reste estime: ~4% (1 open / 25 leaf tasks).
   bench-driver stage can copy the K8s SciFact gate script.
 - [x] `docker-build` run `26064128510` published both runtime and
   bench-driver images for `6a493e0`.
+- [x] `ci` cargo-test job is now fail-closed with `timeout-minutes: 20`
+  after run `26193965044` exposed an open-ended testcontainer hang.
 - [x] `ci-k8s` run `26064198159` proved the published GHCR runtime and
   bench-driver images are pullable by K8s, and `ndcg-driver` reached
   benchmark execution then exited `0` after reaching the report-write

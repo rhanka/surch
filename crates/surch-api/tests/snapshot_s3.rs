@@ -17,7 +17,9 @@
 //!    calls a deployed instance. The MinIO container speaks the real
 //!    AWS S3 wire contract (Flexible Checksums, STREAMING-UNSIGNED-
 //!    PAYLOAD-TRAILER, ListObjectsV2 XML schema, conditional writes),
-//!    which the previous in-process axum mock could not.
+//!    which the previous in-process axum mock could not. This path is
+//!    opt-in via `SURCH_MINIO_E2E=1` so the default workspace test
+//!    suite stays bounded on shared CI runners.
 
 use std::{fmt::Display, future::Future, path::Path, time::Duration};
 
@@ -190,11 +192,7 @@ async fn s3_repository_new_rejects_empty_bucket() {
 // -------------------------------------------------------------------
 
 /// Returns true if the local environment can spin a Docker container
-/// (the testcontainers crate needs a reachable Docker socket). In CI
-/// the workflow always exports `CI=true` and Docker is provided by
-/// the runner, so the test is mandatory there. On a developer box
-/// without Docker, the test short-circuits with a `println!` rather
-/// than failing — keeps `cargo test` green on minimal environments.
+/// (the testcontainers crate needs a reachable Docker socket).
 fn docker_socket_present() -> bool {
     if Path::new("/var/run/docker.sock").exists() {
         return true;
@@ -207,6 +205,33 @@ fn docker_socket_present() -> bool {
         }
     }
     false
+}
+
+fn minio_e2e_requested_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn minio_e2e_enabled() -> bool {
+    minio_e2e_requested_value(std::env::var("SURCH_MINIO_E2E").ok().as_deref())
+        && docker_socket_present()
+}
+
+#[test]
+fn minio_e2e_is_opt_in() {
+    assert!(!minio_e2e_requested_value(None));
+    assert!(!minio_e2e_requested_value(Some("")));
+    assert!(!minio_e2e_requested_value(Some("0")));
+    assert!(!minio_e2e_requested_value(Some("false")));
+}
+
+#[test]
+fn minio_e2e_accepts_truthy_opt_in_values() {
+    assert!(minio_e2e_requested_value(Some("1")));
+    assert!(minio_e2e_requested_value(Some("true")));
+    assert!(minio_e2e_requested_value(Some("yes")));
 }
 
 async fn bounded_s3_step<T, E, F>(step: &str, timeout: Duration, future: F) -> Result<T, String>
@@ -278,8 +303,11 @@ async fn spawn_surch_api() -> String {
 /// real production path the SDK takes against AWS / R2 / MinIO.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
-    if !docker_socket_present() {
-        println!("Docker socket not present; skipping MinIO testcontainer test");
+    if !minio_e2e_enabled() {
+        println!(
+            "SURCH_MINIO_E2E=1 and Docker socket are required; \
+             skipping MinIO testcontainer test"
+        );
         return;
     }
 
