@@ -5,8 +5,9 @@ Branch: `wp/b-test-auto`
 Worktree: `.worktrees/wp-b`
 Owner: conductor / benchmark automation owner
 Status: Lot 3 + Lot N closed on `main` for everything except the
-TREC-COVID K8s baseline (the manifest is wired but waits on the
-Scaleway tenant-quota apply tracked under Track E). Long branch
+TREC-COVID K8s baseline. The Scaleway tenant-quota bump is now applied
+live; the remaining step is to dispatch `ndcg-gate`, promote the
+TREC-COVID report, and record the run id. Long branch
 `wp/b-test-auto` head `65fc759` kept for history.
 
 ## Finality
@@ -101,9 +102,11 @@ Scaleway tenant-quota apply tracked under Track E). Long branch
     before/after capture went under
     `2026-05-20-A-lot3-paired-K8s/`.
   - [ ] Add TREC-COVID and mMARCO-fr measurement entries
-    — TREC-COVID K8s extension is wired (`a993bc8`) but blocked on
-    the Scaleway `limits.memory: 3 Gi` quota cap; will land as
-    soon as `poc-k8s` HEAD `980d58d` is applied to the cluster.
+    — TREC-COVID K8s extension is wired (`a993bc8`), and the
+    Scaleway quota bump from `poc-k8s` HEAD `980d58d` is applied live:
+    `requests.cpu=1500m`, `requests.memory=1Gi`, `limits.cpu=4500m`,
+    `limits.memory=6Gi`, `PVC=3/3`, `pods=0/5`. Next step:
+    dispatch `ndcg-gate` and promote the TREC-COVID report if green.
     mMARCO-fr is out of scope for this plan.
   - [x] Gate: human can read the promoted Markdown without opening
     JSON — every report under `docs/ops/bench-reports/` carries a

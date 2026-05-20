@@ -43,7 +43,9 @@ global status source; branch files carry executable detail.
 Status: **closed** on `main` at `c5980ad` (2026-05-20). Lot 3 paired
 K8s perf-proof shows Surch hot path -21/-22/-12/-30 % p50/p95/p99/max
 vs pre-FoR `c01b0a2`; runbook + numbers under
-`docs/ops/bench-reports/2026-05-20-A-lot3-paired-K8s/`.
+`docs/ops/bench-reports/2026-05-20-A-lot3-paired-K8s/`. The durable
+axis-by-axis performance state is now tracked in
+`docs/ops/bench-reports/track-a-performance-ledger.md`.
 
 - [x] Land scalar top-K finalization: `5081cc7`.
 - [x] Land lazy `_source` hydration for scored top-K: `3157afb`.
@@ -75,7 +77,12 @@ vs pre-FoR `c01b0a2`; runbook + numbers under
   path.
 - [ ] (deferred to a follow-up plan) Next Block-Max WAND step on top
   of encoded block metadata.
-- [ ] Record a current perf + quality guardrail for the complete hot path.
+- [x] Record a current perf + quality guardrail for the complete hot path:
+  `docs/ops/bench-reports/track-a-performance-ledger.md` summarizes
+  search latency, bulk, quality, RSS/memory, disk, and SLO axes with
+  deltas and missing proof called out explicitly.
+- [ ] Keep future Track A optimisation commits tied to a promoted perf
+  report and an update to the Track A performance ledger.
 
 ## Track B - Test Automation / Perf Reporting
 
@@ -107,6 +114,9 @@ Reste estime: ~30% (3 open / 10 leaf tasks).
 - [ ] Promote official Elasticsearch/Surch paired reports for INSEE,
   artillery,
   TREC-COVID, and mMARCO-fr.
+- [ ] Dispatch the quota-unblocked TREC-COVID `ndcg-gate` K8s run and
+  promote its report if green (`poc-k8s` live quota now
+  `1500m/1Gi`, `4500m/6Gi`).
 
 ## Track C - Ops / Packaging / Snapshots
 
@@ -224,6 +234,9 @@ Reste estime: ~4% (1 open / 25 leaf tasks).
   containing `ndcg-gate.summary.md` and `ndcg-gate.bench.json`.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
+- [x] Apply the Surch tenant quota bump from `poc-k8s` HEAD `980d58d`
+  to the live cluster: quota now reads `requests.cpu=1500m`,
+  `requests.memory=1Gi`, `limits.cpu=4500m`, `limits.memory=6Gi`.
 - [x] Always publish run diagnostics and artefacts on failure.
 - [x] Provide a shell-capable benchmark driver image/stage for
   `ndcg-gate` and `insee-bench`.

@@ -24,6 +24,9 @@ Status: active infra lane; merge state below is the source of truth
   preflight.
 - [x] Evidence source: GitHub Actions runs, pod diagnostics, and
   workflow artefacts.
+- [x] Surch tenant quota bump applied live from `poc-k8s` HEAD
+  `980d58d`: `requests.cpu=1500m`, `requests.memory=1Gi`,
+  `limits.cpu=4500m`, `limits.memory=6Gi`, `PVC=3/3`, `pods=0/5`.
 
 ## Merge State
 
@@ -154,6 +157,9 @@ Status: active infra lane; merge state below is the source of truth
   - [x] Make `ndcg-gate` publish a human benchmark summary into the
     uploaded artifact even when post-completion `kubectl cp` cannot
     read `/reports` from the terminated driver container.
+  - [x] Apply the Surch tenant ResourceQuota bump required by the
+    TREC-COVID `ndcg-gate` path: live quota now allows
+    `limits.memory=6Gi` instead of the previous `3Gi`.
   - [ ] Make `ci-k8s` the standard burst / large-corpus path.
   - [x] Turn `make bench-k8s` into a real entry point.
 

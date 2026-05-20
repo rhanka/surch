@@ -11,6 +11,10 @@ perf-proof landed in `c5980ad` on 2026-05-20)
 
 - [ ] Deliver measurable search/index performance gains without quality
   regression.
+- [x] Maintain an axis-by-axis performance ledger for Track A under
+  `docs/ops/bench-reports/track-a-performance-ledger.md`.
+- [ ] For future Track A progress, commit the performance proof and the
+  ledger update in the same delivery slice.
 
 ## Scope
 
@@ -35,6 +39,10 @@ perf-proof landed in `c5980ad` on 2026-05-20)
 - [x] Runtime perf gate recorded after engine integration:
   `2026-05-20-A-lot3-paired-K8s/` (-21 % p50, -22 % p95, -12 % p99,
   -30 % max on Surch hot path vs pre-FoR `c01b0a2`).
+- [x] Axis ledger recorded:
+  `docs/ops/bench-reports/track-a-performance-ledger.md` lists Surch vs
+  OpenSearch deltas, before/after FoR deltas, and the missing RSS/disk
+  proof that must not be claimed yet.
 
 ## Lots
 
