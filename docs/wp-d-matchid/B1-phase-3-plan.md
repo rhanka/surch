@@ -1,14 +1,14 @@
-# B1 phase 3 — ES-7.x oracle cross-check (plan)
+# B1 phase 3 — Elasticsearch 8.6.1 oracle cross-check (plan)
 
 Tracked under `docs/wp-d-matchid/gap-analysis.md` row `B1`. The current
 status there is:
 
-> implemented (30 requests executed on Surch HEAD; ES-7.x oracle
-> cross-check still pending)
+> implemented (30 requests executed on Surch HEAD; Elasticsearch 8.6.1
+> oracle cross-check still pending)
 
 Phase 3 closes that note by running the deterministic
 `tests/matchid_compat/replays/deces_v1.json` fixture against **both**
-Surch and Elasticsearch 7.17, on the **same** INSEE 10k slice, and
+Surch and Elasticsearch 8.6.1, on the **same** INSEE 10k slice, and
 asserting structural parity on the response shapes Surch's tests
 already pin against Surch HEAD.
 
@@ -17,7 +17,7 @@ already pin against Surch HEAD.
 - Same 30-request fixture, same `tests/matchid_compat/deces/mapping.json`,
   same `tests/matchid_compat/deces/slice-10000.ndjson.gz` bulk-load on
   both engines. No request text translation: matchID wire shapes are
-  Elasticsearch 7.x compatible by construction.
+  Elasticsearch 8.6.1 compatible by construction.
 - Compare per-request:
   - `hits.total.value` and `hits.total.relation`
   - `hits.hits[0]._id` (when the request expects ranking)
@@ -30,8 +30,8 @@ already pin against Surch HEAD.
 ## Deliverables
 
 1. **Manifest** `deploy/k8s/jobs/b1-oracle-gate.yaml`:
-   - Two init engines: Surch (current image) + Elasticsearch 7.17.18
-     (image `docker.elastic.co/elasticsearch/elasticsearch:7.17.18`,
+   - Two init engines: Surch (current image) + Elasticsearch 8.6.1
+     (image `docker.elastic.co/elasticsearch/elasticsearch:8.6.1`,
      `discovery.type=single-node`, `xpack.security.enabled=false`,
      `ES_JAVA_OPTS=-Xms1g -Xmx1g`).
    - One driver `b1-oracle-driver` (Surch bench-driver image):
@@ -58,7 +58,7 @@ already pin against Surch HEAD.
 
 ## Risk + ordering
 
-- ES 7.17 startup is ~30 s on this pod shape; bulk-loading 10k INSEE
+- Elasticsearch 8.6.1 startup is ~30 s on this pod shape; bulk-loading 10k INSEE
   docs is ~10 s. Total cold-start budget should fit in the 30 min
   K8s job cap with comfortable headroom.
 - `b1_oracle` is the only **new** runtime code; everything else is

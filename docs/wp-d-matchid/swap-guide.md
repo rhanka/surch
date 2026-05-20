@@ -1,7 +1,7 @@
-# Swap guide — OpenSearch → Surch for deces-backend
+# Swap guide — Elasticsearch 8.6.1 → Surch for deces-backend
 
 Operational playbook for the matchID team to migrate `deces-backend`
-reads from OpenSearch 2.17.1 to Surch.
+reads from Elasticsearch 8.6.1 to Surch.
 
 **Pre-production state today (2026-05-15)**: Surch is **not yet ready**
 for a matchID swap. See `docs/wp-d-matchid/gap-analysis.md` for the
@@ -22,7 +22,7 @@ production matchID dataset.
 - Every row in `gap-analysis.md` reads `implemented`.
 - `tests/matchid_compat/replays/deces_v1.json` (gap B1) carries at
   least 30 representative searches, all green, and the expectations
-  are cross-checked against OpenSearch 2.17.1 (not just against
+  are cross-checked against Elasticsearch 8.6.1 (not just against
   Surch HEAD).
 - The INSEE slice (gap B2) is the real INSEE `deces-2020-m01.txt.gz`
   10 k extract, not the synthetic AWK-seeded slice.
@@ -50,7 +50,7 @@ Single-node Surch, on the same VM shape as the production OS node:
 
 ### 1.4 deces-backend client compatibility
 
-- `deces-backend` already targets the ES 7.x wire shape
+- `deces-backend` already targets the Elasticsearch 8.6.1 wire shape
   (`hits.total.{value,relation}`); no client change is needed once
   A14 lands. Confirm by reading `runRequest.ts:19-50` in the
   matchID repo.
@@ -67,8 +67,8 @@ matchID points its `ES_HOST` / `ELASTIC_URL` environment variable at
 the Surch node and restarts the `deces-backend` container.
 
 ```bash
-# Today, against OpenSearch
-export ELASTIC_URL=http://opensearch:9200
+# Today, against Elasticsearch
+export ELASTIC_URL=http://elasticsearch:9200
 
 # After the flip, against Surch
 export ELASTIC_URL=http://surch:9200
@@ -79,11 +79,11 @@ row in `gap-analysis.md` is not `implemented`, abort the swap.
 
 **Cutover window**: ≤ 10 minutes — restart `deces-backend`, confirm
 the artillery scenario passes against the new endpoint, confirm the
-30-query replay fixture matches OS 2.17 expectations, then declare
+30-query replay fixture matches Elasticsearch 8.6.1 expectations, then declare
 the swap complete.
 
-**Keep OS hot for the quarantine window**: ≥ 7 days after the flip.
-During quarantine, both Surch and OS run in parallel; matchID
+**Keep Elasticsearch hot for the quarantine window**: ≥ 7 days after the flip.
+During quarantine, both Surch and Elasticsearch run in parallel; matchID
 operators can flip the env var back at any time without data loss.
 
 ### Shadow mode / incremental swap — explicitly out of scope

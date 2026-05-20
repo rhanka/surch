@@ -15,8 +15,8 @@ records scope and acceptance.
 ### Batch — 2026-05-15-deces-backend-dsl-inventory (authoritative)
 
 - Intake: `incoming/2026-05-15-deces-backend-dsl-inventory.md`
-- Scope: every OpenSearch DSL primitive emitted by `deces-backend`
-  against ES 7.x today (wire shapes copy-pasted verbatim from
+- Scope: every Elasticsearch DSL primitive emitted by `deces-backend`
+  against Elasticsearch 8.6.1 today (wire shapes copy-pasted verbatim from
   `matchID/packages/deces-backend/src/{queries,buildRequest,runRequest}.ts`
   and from `deces_index.yml`).
 - Workloads covered: advanced UI search, block-match (`msearch`),
@@ -47,7 +47,8 @@ records scope and acceptance.
   drop-in replacement.
 
 Note: an earlier `dsl-translation-matrix.md` was retired because the
-Surch wire shape is identical to ES 7.x by design; the matrix was a
+Surch wire shape is identical to the matchID Elasticsearch 8.6.1 target
+by design; the matrix was a
 copy of `gap-analysis.md` columns under a misleading name.
 
 ## Active gaps
@@ -69,7 +70,7 @@ Numbered ids — stable, used in commit subjects and PR titles.
 | **A11** | `min_score` top-level body filter | wp/d-matchid |
 | **A12** | Aggregations: `terms`, `date_histogram`, `composite` + `after_key`, `cardinality` | wp/d-matchid |
 | **A13** | Mapping primitives: `edge_ngram` tokenizer + analyzer, `normalizer` (lowercase + asciifolding), `index_prefixes`, `geo_point`, `date` with `format` | wp/d-matchid |
-| **A14** | Response shape parity: `hits.total.{value,relation}` (ES 7.x), `_scroll_id`, `aggregations.*` buckets | wp/d-matchid |
+| **A14** | Response shape parity: `hits.total.{value,relation}` (Elasticsearch 8.6.1), `_scroll_id`, `aggregations.*` buckets | wp/d-matchid |
 | **A15** | `_msearch` inner-query DSL parity (NDJSON already exposed) | wp/d-matchid |
 | **B1** | matchID replay fixture under `tests/matchid_compat/` | wp/b-test-auto |
 | **B2** | INSEE 10k slice frozen fixture under `tests/matchid_compat/deces/` | wp/b-test-auto |
@@ -84,7 +85,7 @@ replay first :
 3. **A8** — `match_all`
 4. **A11** — `min_score`
 5. **A9 + A10** — `from`/`size`/`sort`
-6. **A14** — ES-7.x `hits.total.value/relation` shape
+6. **A14** — Elasticsearch `hits.total.value/relation` shape
 7. **B1** — first replay fixture (30 representative searches)
 8. **A6** — `prefix` query (incl. `index_prefixes` mapping)
 9. **A7** — `range` on date with `format: yyyyMMdd`

@@ -21,7 +21,7 @@ http = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
-# B1 phase 3: the `b1_oracle` bin POSTs against an external ES 7.x cluster
+# B1 phase 3: the `b1_oracle` bin POSTs against an external ES 8.6.1 cluster
 # and the local Surch HTTP surface. Pinned to the same minor/features as
 # `crates/surch-api`'s dev-dep so `cargo-deny` / lockfile sees a single
 # resolved version. `rustls-tls` keeps the binary OpenSSL-free for the

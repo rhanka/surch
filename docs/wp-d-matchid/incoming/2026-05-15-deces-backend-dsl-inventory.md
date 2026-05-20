@@ -1,7 +1,7 @@
 # 2026-05-15 — deces-backend query-DSL inventory
 
 > Intake batch: enumerate every OpenSearch DSL primitive that the
-> `deces-backend` workload emits today against Elasticsearch 7.x and
+> `deces-backend` workload emits today against Elasticsearch 8.6.1 and
 > that Surch does not yet implement. One batch on purpose — the Surch
 > maintainers can split into focused intake files when scheduling.
 > Wire shapes below are copy-pasted verbatim from
@@ -38,7 +38,7 @@
   `index_prefixes`). Bulk runtime errors on `_scroll`, `_msearch`,
   and composite/cardinality/date_histogram aggregations.
 
-## 2. OpenSearch wire shapes (verbatim, deces-backend → ES 7.x)
+## 2. Elasticsearch wire shapes (verbatim, deces-backend → Elasticsearch 8.6.1)
 
 ### 2.1 `bool` compound query (everywhere)
 
@@ -290,7 +290,7 @@ mappings:
 
 deces-backend reads:
 
-- `hits.total.value` and `hits.total.relation` (ES 7.x shape, not
+- `hits.total.value` and `hits.total.relation` (Elasticsearch 8 shape, not
   the bare integer of ES 6.x).
 - `hits.hits[]._source.*` — all `_source` fields requested in 2.8.
 - `hits.hits[]._score` — used to rank and to apply `min_score`.
@@ -317,10 +317,10 @@ For each primitive in §2:
    `tests/matchid_compat/` slice + a frozen 10k-row sample of
    INSEE deces 2020-m01 we can publish under
    `tests/matchid_compat/deces/`), the top-10 hit-IDs returned by
-   Surch match the top-10 of ES 7.x for a curated query set of
+   Surch match the top-10 of Elasticsearch 8.6.1 for a curated query set of
    ~30 representative searches (advanced + block + fullText + UI +
    bulk-match). Ties allowed within the same `_score` bucket.
-3. **Ranking budget** — NDCG@10 vs ES 7.x baseline ≥ **0.85** on
+3. **Ranking budget** — NDCG@10 vs Elasticsearch 8.6.1 baseline ≥ **0.85** on
    the curated set. We will accept that fuzzy/BM25 differences
    shuffle the bottom of the page; the head must stay intact.
 4. **Throughput budget** — single-node Surch sustains the artillery

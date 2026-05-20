@@ -65,7 +65,7 @@ Surch HEAD via:
 cargo test -p surch-api matchid_replay_deces_v1_executes_all_non_skipped_requests --test matchid_compat
 ```
 
-The external Elasticsearch 7.x oracle gate is documented in
+The external Elasticsearch 8.6.1 oracle gate is documented in
 `tests/matchid_compat/oracle/deces_v1.md`. Run it against a clean reference
 node with `ELASTICSEARCH_URL` set; it loads
 `tests/matchid_compat/deces/mapping.json`, bulks

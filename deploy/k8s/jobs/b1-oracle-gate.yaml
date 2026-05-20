@@ -1,6 +1,6 @@
-# B1 Phase 3 — matchID ES-7.x oracle cross-check Job (per
+# B1 Phase 3 — matchID Elasticsearch 8.6.1 oracle cross-check Job (per
 # `docs/wp-d-matchid/B1-phase-3-plan.md`). Runs Surch + Elasticsearch
-# 7.17.18 side by side in one Pod, bootstraps the `deces` index on
+# 8.6.1 side by side in one Pod, bootstraps the `deces` index on
 # both engines with the INSEE 10k slice, then drives the
 # `tests/matchid_compat/replays/deces_v1.json` replay against both
 # via the `b1_oracle` binary baked into the bench-driver image. The
@@ -8,15 +8,15 @@
 # is also a structural-parity witness over time.
 #
 # Memory budget keeps the pod inside the current Scaleway tenant
-# quota — `requests.memory` cap = 512 Mi, `limits.memory` cap = 3 GiB.
+# quota — `requests.memory` cap = 1 GiB, `limits.memory` cap = 6 GiB.
 # Container requests stay deliberately low (kubelet only blocks pod
 # admission on the requests sum) while limits remain sized for the
 # real working set:
 #   Surch (init)         req 64Mi  / limit 512Mi
 #   Elasticsearch (init) req 256Mi / limit 1536Mi (-Xms1g -Xmx1g)
 #   b1_oracle-driver     req 64Mi  / limit 384Mi
-#   total requests       384Mi   (fits 512Mi cap)
-#   total limits         ~2.4 GiB (fits 3 GiB cap)
+#   total requests       384Mi   (fits 1 GiB cap)
+#   total limits         ~2.4 GiB (fits 6 GiB cap)
 # Anything above either cap needs a quota bump on poc-k8s.
 apiVersion: batch/v1
 kind: Job
@@ -72,10 +72,10 @@ spec:
             limits:   { cpu: 800m, memory: 512Mi }
           volumeMounts:
             - { name: scratch, mountPath: /var/surch, subPath: surch-b1-oracle }
-        # --- Engine #2: Elasticsearch 7.17 oracle -------------
+        # --- Engine #2: Elasticsearch 8.6.1 oracle ------------
         - name: elasticsearch
           restartPolicy: Always
-          image: docker.elastic.co/elasticsearch/elasticsearch:7.17.18
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.6.1
           imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 9200, name: es-http }

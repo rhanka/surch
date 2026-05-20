@@ -1,7 +1,7 @@
 # deces_v1 Elasticsearch Oracle Gate
 
 This runbook turns the committed `deces_v1` replay into an explicit
-Elasticsearch 7.x gate. It is intentionally human-readable:
+Elasticsearch 8.6.1 gate. It is intentionally human-readable:
 the run produces `summary.md` and exits non-zero on any mismatch, so the
 user does not need to inspect raw JSON.
 
@@ -36,7 +36,7 @@ identity, and response shape.
 
 Prerequisites:
 
-- A clean Elasticsearch 7.x node is running.
+- A clean Elasticsearch 8.6.1 node is running.
 - `ELASTICSEARCH_URL` points at that node, for example
   `http://127.0.0.1:9200`.
 - Python 3 is available.

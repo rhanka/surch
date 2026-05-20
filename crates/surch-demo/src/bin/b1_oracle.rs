@@ -1,8 +1,8 @@
-//! B1 phase 3 — Surch ↔ Elasticsearch 7.x oracle cross-check driver.
+//! B1 phase 3 — Surch ↔ Elasticsearch 8.6.1 oracle cross-check driver.
 //!
 //! Replays the curated matchID manifest at
 //! `tests/matchid_compat/replays/deces_v1.json` against BOTH engines (a
-//! running Surch HTTP API and a running Elasticsearch 7.x cluster),
+//! running Surch HTTP API and a running Elasticsearch 8.6.1 cluster),
 //! captures four diff axes per request, and emits a
 //! `surch.bench.b1_oracle.v1` envelope under
 //! `target/bench-reports/b1-oracle.json`.
@@ -69,7 +69,7 @@ const SCHEMA: &str = "surch.bench.b1_oracle.v1";
 const DEFAULT_INDEX: &str = "deces";
 
 /// Names of replay requests whose Surch implementation is intentionally
-/// partial vs ES 7.x today. Divergences on these entries are recorded
+/// partial vs Elasticsearch 8.6.1 today. Divergences on these entries are recorded
 /// in the envelope but excluded from `divergence_count_unexpected` so
 /// the exit gate stays meaningful while the underlying gaps remain open.
 ///
@@ -77,7 +77,7 @@ const DEFAULT_INDEX: &str = "deces";
 ///   * gap-A2  — `geo_bounding_box` (no geo type in Surch today)
 ///   * gap-A5  — non-date `function_score` decay functions
 ///   * gap-A10 — sort on a `text`-mapped field. Surch's phase-1 alias
-///     transparently falls back to the term dictionary; ES 7.17 strictly
+///     transparently falls back to the term dictionary; Elasticsearch 8.6.1 strictly
 ///     rejects the shape with `illegal_argument_exception` ("Text fields
 ///     are not optimised for operations that require per-document field
 ///     data like aggregations and sorting…"). The request that exercises
@@ -103,7 +103,7 @@ const DEFAULT_OUT: &str = "target/bench-reports/b1-oracle.json";
 
 /// HTTP timeouts (kept conservative — the K8s smoke job runs both
 /// engines on the same node, so 5s per search is plenty and 30s on
-/// the one-shot bulk covers a cold ES 7.x JVM warmup).
+/// the one-shot bulk covers a cold Elasticsearch 8.6.1 JVM warmup).
 const BULK_TIMEOUT: Duration = Duration::from_secs(30);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -181,7 +181,7 @@ fn print_usage() {
 
 /// Raw HTTP response captured from one engine for one replay entry.
 /// We keep both the parsed JSON body (when parseable) and the raw text
-/// so the report can surface the exact ES 7.x error envelope on non-2xx
+/// so the report can surface the exact Elasticsearch error envelope on non-2xx
 /// responses without losing fidelity.
 #[derive(Debug, Clone)]
 struct EngineResponse {
@@ -409,7 +409,7 @@ async fn bootstrap(
     }
 
     // Bulk-load — gunzip in memory; the slice is ~2 MB so one shot is
-    // fine and avoids the chunked-Transfer-Encoding gotchas of ES 7.x.
+    // fine and avoids chunked-Transfer-Encoding gotchas in Elasticsearch.
     let bulk_body = read_gzipped(slice_path)?;
     let resp = client
         .post(&bulk_url)
@@ -663,7 +663,7 @@ async fn post_search(
         .text()
         .await
         .map_err(|e| format!("read body {url}: {e}"))?;
-    // Best-effort parse: ES 7.x error envelopes are valid JSON, so the
+    // Best-effort parse: Elasticsearch error envelopes are valid JSON, so the
     // common case still gives a structured body for the report.
     let body = serde_json::from_str(&text).unwrap_or(Value::Null);
     Ok(EngineResponse {

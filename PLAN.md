@@ -153,17 +153,18 @@ deferred to a follow-up plan when scoped.
 - [x] `3cdac1f` implements `bool.must_not`.
 - [x] `e532a08` syncs gap-analysis with A3 and B1 replay state.
 - [x] B1 replay executes all 30 requests against Surch HEAD.
-- [x] `e8aca54` documents the `deces_v1` Elasticsearch 7.x oracle
+- [x] `e8aca54` documents the `deces_v1` Elasticsearch oracle
   gate and human `summary.md` output.
 - [x] The `deces_v1` Elasticsearch oracle gate is now an executable
   script with a local `--dry-run`, so the external run no longer depends
   on copying Python out of Markdown.
-- [x] Execute the Elasticsearch 7.x oracle gate and refresh fixture
-  expectations from that reference, not Surch:
-  `ci-k8s` run `26136585015` passed with 0 / 30 unexpected divergences.
-- [x] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the oracle
-  replay and document remaining parity gaps through the B1 oracle
-  closure. Phase 4 widening is deferred to a follow-up plan.
+- [ ] Execute the Elasticsearch 8.6.1 oracle gate and refresh fixture
+  expectations from that reference, not Surch.
+- [ ] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the
+  Elasticsearch 8.6.1 oracle replay and document remaining parity gaps.
+- [x] Historical note: `ci-k8s` run `26136585015` targeted the obsolete
+  pre-correction oracle image; it is no longer the active matchID target
+  and must not be used as final D parity proof.
 
 ## Track E - Infra K8s / poc-k8s
 
@@ -263,7 +264,7 @@ Reste estime: ~4% (1 open / 25 leaf tasks).
 - [ ] Track B finality: replayable, comparable benchmark reporting with
   explicit SLO verdicts.
 - [ ] Track C finality: release and snapshot paths verified end to end.
-- [ ] Track D finality: matchID parity proven against Elasticsearch 7.x,
+- [ ] Track D finality: matchID parity proven against Elasticsearch 8.6.1,
   not only Surch HEAD.
 - [ ] Track E finality: `ci-k8s` is a reliable heavy-benchmark target
   with preserved diagnostics.

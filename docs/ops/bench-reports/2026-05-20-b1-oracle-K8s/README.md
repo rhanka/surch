@@ -1,5 +1,10 @@
 # B1 phase 3 — first oracle cross-check (Surch vs Elasticsearch 7.17)
 
+Status note: this report is historical. The active matchID oracle target
+is Elasticsearch 8.6.1, so this 7.17.18 PASS is not sufficient for
+current Track D closure. Keep it as provenance only and promote a new
+8.6.1 report before claiming matchID parity.
+
 First end-to-end run of `b1-oracle-gate` on the Scaleway burst pool
 that drove the `deces_v1.json` replay against both Surch and a
 single-node Elasticsearch 7.17.18 against the same INSEE 10k slice.

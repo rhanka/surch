@@ -9,7 +9,7 @@ acceptance test (gap `B2`) load into Surch.
 
 ## Files
 
-- `mapping.json` — ES-7.x style `mappings` body derived from the
+- `mapping.json` — Elasticsearch-style `mappings` body derived from the
   `deces_index.yml` excerpt in
   `docs/wp-d-matchid/incoming/2026-05-15-deces-backend-dsl-inventory.md`
   (§2.12). Trimmed to mapping primitives Surch already supports
@@ -40,7 +40,7 @@ over public-domain field-value pools — see
 `tools/gen_deces_slice.awk`. No real INSEE record is present in this
 file; it carries no PII and no Open Licence redistribution
 constraint. It is byte-stable and remains the source of truth for the
-B1 replay until the ES-7.x oracle cross-check (B1 phase 3) replaces
+B1 replay until the Elasticsearch 8.6.1 oracle cross-check (B1 phase 3) replaces
 the captured expectations.
 
 ### Real INSEE slice (`slice-10000.ndjson.gz`)

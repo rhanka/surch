@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay the matchID deces_v1 fixture against Elasticsearch 7.x.
+"""Replay the matchID deces_v1 fixture against Elasticsearch 8.6.1.
 
 The script writes a human-readable summary to
 target/matchid-oracle/deces_v1/summary.md and exits non-zero when any
@@ -29,12 +29,12 @@ DEFAULT_OUT_DIR = ROOT / "target/matchid-oracle/deces_v1"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay deces_v1 against a clean Elasticsearch 7.x node."
+        description="Replay deces_v1 against a clean Elasticsearch 8.6.1 node."
     )
     parser.add_argument(
         "--elasticsearch-url",
         default=os.environ.get("ELASTICSEARCH_URL", "http://127.0.0.1:9200"),
-        help="Elasticsearch 7.x base URL; defaults to ELASTICSEARCH_URL or localhost.",
+        help="Elasticsearch 8.6.1 base URL; defaults to ELASTICSEARCH_URL or localhost.",
     )
     parser.add_argument("--index", default=DEFAULT_INDEX)
     parser.add_argument("--replay", type=Path, default=DEFAULT_REPLAY)
