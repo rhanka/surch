@@ -81,6 +81,29 @@ historical SHAs, promote each report, then append rows here. This avoids
 rewriting already integrated code while producing the cumulative proof
 trail that future releases need.
 
+Kickoff trace, 2026-05-20:
+
+- Local branch `perf-replay/wp-a-algo-ledger` was created from
+  `origin/main` at `466693f55e1a3cd8b007e058be07584251986ecb`; it is
+  not pushed.
+- Detailed replay plan:
+  `plan/perf-replay-wp-a-algo-ledger.md`.
+- Current image gate: `docker-build` run `26188578411` succeeded for
+  `466693f55e1a3cd8b007e058be07584251986ecb`, and both
+  `ghcr.io/rhanka/surch:sha-466693f55e1a3cd8b007e058be07584251986ecb`
+  and
+  `ghcr.io/rhanka/surch:bench-sha-466693f55e1a3cd8b007e058be07584251986ecb`
+  exist.
+- Historical image gate: GHCR tags for the A-replay-1..3 baseline/head
+  SHAs were missing at kickoff. The existing FoR anchor
+  `c01b0a297b73594be2a7f01275cc76e56b82ad08` is the only checked
+  historical SHA with both runtime and bench-driver tags present.
+- First current-main K8s replay dispatch:
+  `gh workflow run ci-k8s.yml --ref main -f job=insee-bench` created
+  `ci-k8s` run `26193166785` on `main`
+  (`466693f55e1a3cd8b007e058be07584251986ecb`). Verdict and promoted
+  artifacts are pending.
+
 Minimum replay set:
 
 | Replay lot | Baseline -> head | Workload | Required proof |

@@ -6,6 +6,9 @@ Worktree: `.worktrees/wp-a`
 Owner: conductor / StorageEngine / SearchEngine depending on slice
 Status: closed, all lots delivered on `main` (Lot 3 paired K8s
 perf-proof landed in `c5980ad` on 2026-05-20)
+Replay follow-up: `plan/perf-replay-wp-a-algo-ledger.md` tracks the
+historical cumulative proof line without reopening the delivered Lot 3
+closure.
 
 ## Finality
 
@@ -118,3 +121,18 @@ perf-proof landed in `c5980ad` on 2026-05-20)
   - [x] Record CI run id and final SHA: `main = c5980ad` at Lot 3
     closure; CI on the head commit tracked in `gh run list --branch
     main --workflow ci`.
+
+- [ ] Follow-up - Historical cumulative replay ledger
+  - [x] Start the non-rewrite replay trace on local branch
+    `perf-replay/wp-a-algo-ledger`.
+  - [x] Create the detailed replay plan:
+    `plan/perf-replay-wp-a-algo-ledger.md`.
+  - [x] Verify current-main GHCR images exist after `docker-build`
+    run `26188578411`.
+  - [x] Dispatch the first image-ready `ci-k8s` replay run and record
+    its run id: `insee-bench` run `26193166785` on `main`
+    `466693f55e1a3cd8b007e058be07584251986ecb`.
+  - [ ] Promote the `26193166785` result and update this follow-up
+    once the run finishes.
+  - [ ] Promote A-replay-1 through A-replay-3 reports and update the
+    Track A performance ledger rows.
