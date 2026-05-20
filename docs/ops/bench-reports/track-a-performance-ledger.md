@@ -18,9 +18,29 @@ need a fresh run.
 - `docs/ops/memory-capacity.md`: current RAM capacity model and stats
   endpoint contract.
 
-The reference engine in these reports is OpenSearch 2.17.1. The Track D
-oracle work is separate and uses Elasticsearch 7.x because matchID needs
-that wire-compatibility baseline.
+The reference engine in these reports is OpenSearch 2.17.1. Track D is
+separate: matchID's active oracle target is Elasticsearch 8.6.1.
+
+## Required proof policy for new Track A algorithms
+
+Every new Track A algorithm delivery must append to this ledger before
+it is called delivered. The row is cumulative and must cite the exact
+commit or range, the workload, the execution environment, the reference
+engine when relevant, run ids, promoted artifacts, and a verdict.
+
+Fast iterative merges are allowed, but the merge must be honest about
+the proof state:
+
+- If the algorithm is merged before the heavy K8s run, add a ledger row
+  with `Proof state = pending K8s replay`, the commit SHA, and the exact
+  replay command or GitHub workflow to run.
+- When the heavy run finishes, commit the promoted report and update the
+  same row instead of replacing history.
+- Do not claim a p50/p95/p99/max, RSS, disk, or quality win unless that
+  axis has a cited artifact.
+- If a later replay covers several historical algorithms, keep the
+  individual rows and cite the shared report in each row that it
+  substantiates.
 
 ## Current axis state
 
@@ -39,10 +59,36 @@ that wire-compatibility baseline.
 
 | Commit / range | Axis | Proof state | Notes |
 | --- | --- | --- | --- |
-| `0dc30ad`, `1b2e380`, `3157afb`, `ed76014`, `d778ee1`, `65ccfbe`, `8757288`, `14b7118`, `e38bf91` | Search latency | Historical effects are listed in `docs/ops/workpackages.md`, but not every commit has an isolated before/after artifact | If a final report needs per-commit attribution, replay from these SHAs in a dedicated branch and promote one report per replay |
+| `5081cc7` scalar top-K finalization | Search latency | Historical only | Needs replay if we want an isolated proof row; current cumulative proof starts later |
+| `3157afb` lazy `_source` hydration | Search latency / allocation pressure | Historical only | Needs replay with hydration-heavy query set and RSS peak/final |
+| `ed76014` MaxScore/WAND OR-match skipping | Search latency | Historical only | Needs isolated replay against the pre-WAND parent and SciFact quality guardrail |
+| `65ccfbe` WAND `multi_match` + postings-builder cleanup | Search latency / RAM | Historical only | Needs replay with `multi_match` workload and RSS peak/final |
+| `e38bf91` Block-Max WAND per-128 contributions | Search latency / quality | Historical only | Needs replay with SciFact NDCG@10 and INSEE/BAN latency |
+| `644f62b` per-index LRU search response cache | Warm search latency | Historical only | Needs cold/warm split report; cache invalidation proof remains in tests |
+| `4e9405a` + merge `f910094` shared stored sources | RAM | Historical only | Needs paired RSS report before any release memory-win language |
+| `c5f3155` + merge `0800f98` FST term dictionary | Prefix / term lookup latency + RAM | Historical only | Needs prefix-heavy report and RSS peak/final |
+| `b680232` + merge `6df877d` per-block stats persisted next to postings | Search latency groundwork | Historical only | Covered indirectly by FoR metadata proof, not isolated |
+| `b8ed2bc` + merge `7caf339` memory metrics and stats endpoint | Observability | Tested API surface, not a perf win | Use this endpoint as evidence source for future RSS/memory rows |
 | `651e22a`, `4e9405a`, `c5f3155`, `b680232`, `b8ed2bc` | RAM / memory model | Capacity model exists; individual RSS wins are not fully paired against OpenSearch | Future memory claims must include peak/final RSS from the same harness and same pod/host shape |
 | `df3b0aa` plus supporting index/codec commits `6f56fd2`, `2da9249` | Search latency | Proven by `2026-05-20-A-lot3-paired-K8s` | This is the only current isolated before/after Track A perf proof with K8s run ids |
 | Future Track A commits | Any perf axis | Must update this ledger in the same PR/commit sequence as the optimisation proof | Required fields: axis, workload, Surch numbers, OpenSearch/Elasticsearch reference where relevant, delta, run id/artifact path, and missing proof |
+
+## Replay backlog for historical algorithms
+
+Preferred replay mode: keep current history, create a dedicated
+`perf-replay/wp-a-algo-ledger` branch, run K8s benchmarks at selected
+historical SHAs, promote each report, then append rows here. This avoids
+rewriting already integrated code while producing the cumulative proof
+trail that future releases need.
+
+Minimum replay set:
+
+| Replay lot | Baseline -> head | Workload | Required proof |
+| --- | --- | --- | --- |
+| A-replay-1 top-K / lazy hydration | parent before `5081cc7` -> `3157afb` | BAN + INSEE smoke | p50/p95/p99/max, errors, docs/s, RSS if available |
+| A-replay-2 WAND family | parent before `ed76014` -> `e38bf91` | SciFact + INSEE | NDCG@10, Recall@10, p50/p95/p99/max |
+| A-replay-3 memory layout | parent before `4e9405a` -> `7caf339` | BAN 25k + INSEE 10k | RSS peak/final, stats endpoint snapshot, latency non-regression |
+| A-replay-4 FoR metadata | pre-FoR `c01b0a2` -> `df3b0aa` / `c5980ad` | INSEE K8s | Already proven by `2026-05-20-A-lot3-paired-K8s`; keep as anchor |
 
 ## Operator verdict
 
