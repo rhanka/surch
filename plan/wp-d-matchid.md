@@ -4,17 +4,18 @@ Track principal: D - matchID
 Branch: `wp/d-matchid`
 Worktree: `.worktrees/wp-d`
 Owner: conductor / SearchEngine / APIServer depending on slice
-Status: Phase 3 harness exists on `main`, but the active oracle target
-is Elasticsearch 8.6.1. The older 2026-05-20 B1 run used the obsolete
-pre-correction oracle image and must be replayed against 8.6.1 before
-Track D parity is called closed. Phase 4 widening
+Status: B1 oracle phase is closed on `main` against Elasticsearch
+8.6.1. `ci-k8s` run `26192816780` passed with 30 requests,
+0 skipped, and 0 divergence; promoted report:
+`docs/ops/bench-reports/2026-05-20-b1-oracle-ES861-K8s/`.
+Phase 4 widening
 (A1/A2/A7/A13 multi-field, date{format}, geo_point, edge_ngram +
 deces_v2 INSEE replay) is deferred to a follow-up plan when scoped.
 Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
 
 ## Finality
 
-- [ ] Prove matchID parity against Elasticsearch 8.6.1, not only against
+- [x] Prove matchID parity against Elasticsearch 8.6.1, not only against
   Surch HEAD.
 
 ## Scope
@@ -30,7 +31,7 @@ Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
   `tests/matchid_compat/oracle/deces_v1.md`,
   `tests/matchid_compat/README.md`,
   `crates/surch-api/tests/matchid_compat.rs`.
-- [ ] Next scope: execute Elasticsearch 8.6.1 oracle and refresh fixture
+- [x] Next scope: execute Elasticsearch 8.6.1 oracle and refresh fixture
   expectations.
 - [x] Evidence source: matchID replay and search integration tests.
 
@@ -48,7 +49,7 @@ Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
   (branch commit `9e0e6b3`).
 - [x] Oracle runbook now points at a replayable script:
   `scripts/matchid/deces_v1_elasticsearch_oracle.py`.
-- [ ] Oracle Elasticsearch 8.6.1 replay executed against a reference
+- [x] Oracle Elasticsearch 8.6.1 replay executed against a reference
   node.
 
 ## Lots
@@ -80,13 +81,13 @@ Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
     `scripts/matchid/deces_v1_elasticsearch_oracle.py`.
   - [x] Add a local `--dry-run` that validates inputs without requiring
     Elasticsearch.
-  - [ ] Replay `tests/matchid_compat/replays/deces_v1.json` against
+  - [x] Replay `tests/matchid_compat/replays/deces_v1.json` against
     Elasticsearch 8.6.1. The K8s `b1-oracle-gate` Job targets image
-    `docker.elastic.co/elasticsearch/elasticsearch:8.6.1`.
-  - [ ] Persist 8.6.1 oracle expectations or documented deltas in a
-    promoted report. Historical note: GHA run `26136585015` targeted
-    the obsolete pre-correction oracle image and is not the current
-    matchID oracle proof.
+    `docker.elastic.co/elasticsearch/elasticsearch:8.6.1`. Run
+    `26192816780` PASS: 30 requests, 0 skipped, 0 divergence.
+  - [x] Persist 8.6.1 oracle expectations or documented deltas in a
+    promoted report:
+    `docs/ops/bench-reports/2026-05-20-b1-oracle-ES861-K8s/`.
 
 - [x] Lot N - Closure
   - [x] Update this plan (this commit) and `PLAN.md` when next
@@ -95,7 +96,9 @@ Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
     crate extract `1fdd428`, b1_oracle binary `fda00e7`, K8s
     manifest `6214fc0` (+ fix-ups `c6031c1` / `c5c8a58` / `04c5d65`
     / `6402427` / `a1b9d1e` / `d9e032e`), promoted historical oracle
-    report `801d047` / `929728f` on `main`. Active closure now requires
-    the Elasticsearch 8.6.1 rerun; Phase 4 widening (A1/A2/A7/A13
-    multi-field + date{format} + geo + edge_ngram, deces_v2 INSEE
-    replay) goes under a follow-up plan when scoped.
+    report `801d047` / `929728f` on `main`; active ES 8.6.1 proof
+    `26192816780` promoted in
+    `docs/ops/bench-reports/2026-05-20-b1-oracle-ES861-K8s/`.
+    Phase 4 widening (A1/A2/A7/A13 multi-field + date{format} + geo +
+    edge_ngram, deces_v2 INSEE replay) goes under a follow-up plan when
+    scoped.

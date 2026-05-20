@@ -160,9 +160,12 @@ deferred to a follow-up plan when scoped.
 - [x] The `deces_v1` Elasticsearch oracle gate is now an executable
   script with a local `--dry-run`, so the external run no longer depends
   on copying Python out of Markdown.
-- [ ] Execute the Elasticsearch 8.6.1 oracle gate and refresh fixture
-  expectations from that reference, not Surch.
-- [ ] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the
+- [x] Execute the Elasticsearch 8.6.1 oracle gate and refresh fixture
+  expectations from that reference, not Surch:
+  `ci-k8s` run `26192816780` PASS, 30 requests, 0 skipped,
+  0 divergence; promoted report
+  `docs/ops/bench-reports/2026-05-20-b1-oracle-ES861-K8s/`.
+- [x] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the
   Elasticsearch 8.6.1 oracle replay and document remaining parity gaps.
 - [x] Historical note: `ci-k8s` run `26136585015` targeted the obsolete
   pre-correction oracle image; it is no longer the active matchID target
