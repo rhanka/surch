@@ -1,33 +1,8 @@
 {
-  "divergence_count": 4,
-  "divergences": [
-    {
-      "axis": "hits.total.value",
-      "es_value": 0,
-      "request_name": "prefix_nom",
-      "surch_value": 26
-    },
-    {
-      "axis": "hits.hits[0]._id",
-      "es_value": null,
-      "request_name": "prefix_nom",
-      "surch_value": "ins_0000222"
-    },
-    {
-      "axis": "hits.total.value",
-      "es_value": 0,
-      "request_name": "prefix_prenoms",
-      "surch_value": 1569
-    },
-    {
-      "axis": "hits.hits[0]._id",
-      "es_value": null,
-      "request_name": "prefix_prenoms",
-      "surch_value": "ins_0000004"
-    }
-  ],
+  "divergence_count": 0,
+  "divergences": [],
   "es_url": "http://127.0.0.1:9200",
-  "generated_at": "2026-05-20T00:43:00Z",
+  "generated_at": "2026-05-20T01:59:37Z",
   "schema": "surch.bench.b1_oracle.v1",
   "skipped_count": 0,
   "surch_url": "http://127.0.0.1:7700",

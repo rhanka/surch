@@ -20,14 +20,36 @@ remains (i.e. not in `KNOWN_PARTIAL_NAMES`).
 - Slice: INSEE Open Licence 2.0 `Deces_2024.csv` first 10 000 rows
   (same fixture as `2026-05-19-insee-10k-k8s/`).
 
-## Verdict
+## Verdict (latest run — GHA 26136585015 on `d9e032e`)
 
 - **Total replay requests**: 30
 - **Skipped via `KNOWN_PARTIAL_NAMES`**: 1 (`sort_nom_desc` — Surch's
   A10 text-sort alias is wider than ES's strict keyword sub-field
   requirement, expected divergence)
-- **Unexpected divergence count**: 4 (across **2** replay entries)
-- Gate result: **FAIL** (exit 1) — divergences listed below.
+- **Unexpected divergence count**: **0** ✅
+- Gate result: **PASS** (exit 0) — full structural parity Surch ↔ ES 7.17.18
+  on the 30-request matchID replay against the same INSEE 10k slice.
+
+Captured envelope (`b1-oracle.json`):
+
+```json
+{
+  "divergence_count": 0,
+  "divergences": [],
+  "generated_at": "2026-05-20T01:59:37Z",
+  "schema": "surch.bench.b1_oracle.v1",
+  "skipped_count": 0,
+  "total_requests": 30
+}
+```
+
+## Verdict history
+
+| Run | SHA | Verdict | Divergences |
+|---|---|---|---|
+| 26133556087 | `a1b9d1e` | FAIL | 4 on `prefix_nom` + `prefix_prenoms` (ES `prefix` query does not run analyser on value; upper-case `DUP`/`JEA` never matched lower-cased tokens) |
+| 26134135609 | `6402427` | FAIL | same 4 (manifest cat-on-divergence fix landed but the replay was not yet patched) |
+| 26136585015 | `d9e032e` | **PASS** | 0 (replay prefix values lower-cased; both engines now agree byte-for-byte on the 30 requests) |
 
 Captured by `driver.log`:
 
