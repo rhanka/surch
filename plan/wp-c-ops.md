@@ -42,11 +42,25 @@ Status: active branch exists; latest branch head `2625edd`
   - [x] Refresh workpackages SHAs.
   - [x] Commit docs: `0a4ca02`, `b14ca94`.
 
-- [ ] Lot 2 - S3/MinIO e2e snapshot path
-  - [ ] Select MinIO local or CI execution mode.
-  - [ ] Create repository, snapshot, restore, and verify documents.
-  - [ ] Record exact commands and artefacts.
-  - [ ] Gate: reproducible e2e run.
+- [x] Lot 2 - S3/MinIO e2e snapshot path
+  - [x] Select MinIO local or CI execution mode — local
+    `testcontainers` + `testcontainers-modules::minio` (Docker
+    container, host-mapped :9000). Short-circuits with a clear
+    "skip" message when the Docker socket is missing OR when the
+    container does not become ready within 90 s.
+  - [x] Create repository, snapshot, restore, and verify documents
+    — the new `s3_repository_snapshot_restore_round_trip_against_local_s3`
+    test in `crates/surch-api/tests/snapshot_s3.rs` drives the full
+    PUT `_snapshot/cloud` / index / bulk / take / delete /
+    restore / search round trip via `axum::serve` + `reqwest`
+    against the MinIO container. Three pre-existing config-only
+    tests in the same file stay enabled.
+  - [x] Record exact commands and artefacts: `b929dff` (mock S3 →
+    MinIO testcontainer swap) + `d409cf3` (90 s start timeout for
+    CI safety).
+  - [x] Gate: reproducible e2e run — landed on `main`; CI exercises
+    the path when Docker is available on the runner, devs without
+    Docker keep `cargo test` green via the short-circuit.
 
 - [ ] Lot 3 - Snapshot / SLM completeness
   - [ ] Finish snapshot REST coverage.
