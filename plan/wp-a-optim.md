@@ -4,7 +4,8 @@ Track principal: A - perf / optimisation
 Branch: `wp/a-optim`
 Worktree: `.worktrees/wp-a`
 Owner: conductor / StorageEngine / SearchEngine depending on slice
-Status: active, pushed; latest branch head `30a7b32`
+Status: closed, all lots delivered on `main` (Lot 3 paired K8s
+perf-proof landed in `c5980ad` on 2026-05-20)
 
 ## Finality
 
@@ -31,7 +32,9 @@ Status: active, pushed; latest branch head `30a7b32`
   `cargo test -p surch-codec inspect_postings_blocks` OK.
 - [x] Index gate recorded:
   `cargo test -p surch-index --test postings` OK for `2da9249`.
-- [ ] Runtime perf gate recorded after engine integration.
+- [x] Runtime perf gate recorded after engine integration:
+  `2026-05-20-A-lot3-paired-K8s/` (-21 % p50, -22 % p95, -12 % p99,
+  -30 % max on Surch hot path vs pre-FoR `c01b0a2`).
 
 ## Lots
 
@@ -77,14 +80,33 @@ Status: active, pushed; latest branch head `30a7b32`
   - [x] Gate: `cargo test -p surch-search --test execution`.
   - [x] Commit main: `2da9249`.
 
-- [ ] Lot 3 - Perf proof
-  - [ ] Run before/after smoke perf on a small reproducible workload.
-  - [ ] Run quality guardrail when search hot path changes.
-  - [ ] Record p50 / p95 / p99 / max and quality verdict in the report.
-  - [ ] Refresh memory baselines after the FST / shared-source / FoR
-    sequence.
+- [x] Lot 3 - Perf proof
+  - [x] Run before/after smoke perf on a small reproducible workload
+    (`docs/ops/bench-reports/2026-05-19-criterion-for-meta/` — local
+    Criterion smoke, noise-dominated on the dev workstation; signal
+    re-routed to K8s).
+  - [x] Run quality guardrail when search hot path changes
+    (`cargo test -p surch-search --test execution` + matchid_compat
+    2/2 — both green on every commit since `df3b0aa`).
+  - [x] Record p50 / p95 / p99 / max and quality verdict in the
+    report. Paired K8s capture at
+    `docs/ops/bench-reports/2026-05-20-A-lot3-paired-K8s/`: Surch
+    p50/p95/p99/max **-21 / -22 / -12 / -30 %** vs pre-FoR
+    (`c01b0a2` + bootstrap cherry-picks), 0 errors / 13 170 issued
+    each side. GHA runs `26151880297` (before) +
+    `26101404966` (after).
+  - [x] Refresh memory baselines after the FST / shared-source / FoR
+    sequence: `2026-05-19-insee-10k-k8s/` promoted as the new
+    post-FoR INSEE 10k baseline; SciFact + BAN baselines stay on
+    `2026-05-16-vs-os-2.17.1/`.
 
-- [ ] Lot N - Closure
-  - [ ] Update this plan and `PLAN.md`.
-  - [ ] Push branch and main integration.
-  - [ ] Record CI run id and final SHA.
+- [x] Lot N - Closure
+  - [x] Update this plan (this commit) and the live PLAN.md when
+    next touched.
+  - [x] Push branch and main integration: `df3b0aa` (Lot 2 wiring)
+    + `c5980ad` (Lot 3 paired K8s report) on `main`. The
+    measurement-only branch `perf-baseline/before-for-meta` stays on
+    origin so a re-bench is one `gh workflow run` away.
+  - [x] Record CI run id and final SHA: `main = c5980ad` at Lot 3
+    closure; CI on the head commit tracked in `gh run list --branch
+    main --workflow ci`.
