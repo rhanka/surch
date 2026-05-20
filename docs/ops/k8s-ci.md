@@ -124,8 +124,11 @@ What does NOT survive cleanly:
   (`.opensearch-*`) accumulate every run and contribute to OS's
   shard-per-node soft cap (1000 default). If a Job pod starts
   failing with `shards limit exceeded`, the simplest reset is to
-  rerun `00-init-corpora` with the `--force` rendering branch (TODO:
-  add a corpora-init mode that wipes scratch as well).
+  rerun `00-init-corpora` with the `INIT_FORCE=1` env override —
+  which wipes `BEIR_DIR`, `INSEE_DIR` AND `SCRATCH_DIR` before
+  re-fetching. Either flip the manifest value to `"1"` for the
+  next dispatch, or `kubectl set env job/init-corpora INIT_FORCE=1`
+  before applying.
 
 ## Reading results
 

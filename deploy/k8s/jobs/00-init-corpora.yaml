@@ -122,6 +122,15 @@ spec:
               value: /data/beir
             - name: INSEE_DIR
               value: /data/insee
+            - name: SCRATCH_DIR
+              value: /data/scratch
+            # INIT_FORCE=1 wipes BEIR_DIR / INSEE_DIR / SCRATCH_DIR
+            # before re-fetching. Use it when the engines have
+            # accumulated stale indices on `surch-scratch` (e.g.
+            # OpenSearch hits its 1000-shard-per-node soft cap after
+            # repeated ndcg-gate / insee-bench runs).
+            - name: INIT_FORCE
+              value: "0"
           command: ["python3", "-c"]
           args:
             - |
@@ -136,6 +145,17 @@ spec:
 
               beir_dir = Path(os.environ["BEIR_DIR"])
               insee_dir = Path(os.environ["INSEE_DIR"])
+              scratch_dir = Path(os.environ.get("SCRATCH_DIR", "/data/scratch"))
+
+              if os.environ.get("INIT_FORCE", "0") == "1":
+                  for target in (beir_dir, insee_dir, scratch_dir):
+                      if target.exists():
+                          print(f"INIT_FORCE=1: wiping {target}", flush=True)
+                          for child in target.iterdir():
+                              if child.is_dir():
+                                  shutil.rmtree(child)
+                              else:
+                                  child.unlink()
 
               def fetch(url, dest, required=True):
                   dest.parent.mkdir(parents=True, exist_ok=True)
