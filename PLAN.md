@@ -26,7 +26,9 @@ global status source; branch files carry executable detail.
 
 - [x] `main`: current integration branch.
 - [x] `wp/a-optim`: Track A long branch, head `30a7b32`;
-  detailed plan: `plan/wp-a-optim.md`.
+  detailed plan: `plan/wp-a-optim.md` (Track A closed on `main` at
+  `c5980ad`, branch kept for history; skip-lists / next Block-Max
+  WAND step deferred to a follow-up plan).
 - [ ] `wp/b-test-auto`: Track B long branch, head `65fc759`;
   detailed plan: `plan/wp-b-test-auto.md`.
 - [ ] `wp/c-ops`: Track C long branch, head `2625edd`;
@@ -38,7 +40,10 @@ global status source; branch files carry executable detail.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~30% (5 open / 18 leaf tasks).
+Status: **closed** on `main` at `c5980ad` (2026-05-20). Lot 3 paired
+K8s perf-proof shows Surch hot path -21/-22/-12/-30 % p50/p95/p99/max
+vs pre-FoR `c01b0a2`; runbook + numbers under
+`docs/ops/bench-reports/2026-05-20-A-lot3-paired-K8s/`.
 
 - [x] Land scalar top-K finalization: `5081cc7`.
 - [x] Land lazy `_source` hydration for scored top-K: `3157afb`.
@@ -61,12 +66,15 @@ Reste estime: ~30% (5 open / 18 leaf tasks).
   `6f56fd2` on `main`, `30a7b32` on `wp/a-optim`.
 - [x] Align `surch-index` block metadata sizing with the codec source of
   truth: `2da9249` makes `BLOCK_SIZE` derive from `FOR_BLOCK_SIZE`.
-- [ ] Finish runtime wiring from encoded FoR postings metadata into the
-  search execution path.
-- [ ] Add skip lists on top of the codec path.
-- [ ] Add the next Block-Max WAND step on top of encoded block metadata.
-- [ ] Refresh memory baselines after the FST / shared-source / FoR
-  sequence.
+- [x] Finish runtime wiring from encoded FoR postings metadata into the
+  search execution path: `df3b0aa`.
+- [x] Refresh memory baselines after the FST / shared-source / FoR
+  sequence: `2026-05-19-insee-10k-k8s/` (post-FoR) +
+  `2026-05-20-A-lot3-paired-K8s/` (paired before/after).
+- [ ] (deferred to a follow-up plan) Skip lists on top of the codec
+  path.
+- [ ] (deferred to a follow-up plan) Next Block-Max WAND step on top
+  of encoded block metadata.
 - [ ] Record a current perf + quality guardrail for the complete hot path.
 
 ## Track B - Test Automation / Perf Reporting
