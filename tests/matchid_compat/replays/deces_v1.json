@@ -557,7 +557,7 @@
         "method": "POST",
         "path": "/deces/_search",
         "body": {
-          "query": { "prefix": { "NOM": "DUP" } },
+          "query": { "prefix": { "NOM": "dup" } },
           "size": 5
         }
       },
@@ -574,7 +574,7 @@
         "method": "POST",
         "path": "/deces/_search",
         "body": {
-          "query": { "prefix": { "PRENOMS": "JEA" } },
+          "query": { "prefix": { "PRENOMS": "jea" } },
           "size": 5
         }
       },
