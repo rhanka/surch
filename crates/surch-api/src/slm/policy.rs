@@ -12,8 +12,7 @@
 //! }
 //! ```
 //!
-//! Retention is parsed and stored but not enforced yet — that pass is
-//! the `C-SLM` phase 2 follow-up.
+//! Retention is parsed and enforced after successful policy executions.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -44,7 +43,7 @@ pub struct SlmPolicy {
     pub repository: String,
     /// Take-config: indices selector + `include_global_state`.
     pub config: SlmConfig,
-    /// Retention policy (accepted-and-stored — pruning is phase 2).
+    /// Retention policy enforced after successful policy executions.
     #[serde(default)]
     pub retention: Option<SlmRetention>,
 }
@@ -61,7 +60,8 @@ pub struct SlmConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlmRetention {
-    /// ES duration string (`"30d"`, `"12h"`). Parsed lazily by phase 2.
+    /// ES duration string (`"30d"`, `"12h"`). Parsed lazily by the
+    /// scheduler retention pass.
     #[serde(default)]
     pub expire_after: Option<String>,
     #[serde(default)]

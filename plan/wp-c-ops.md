@@ -4,7 +4,8 @@ Track principal: C - ops / packaging / snapshots
 Branch: `wp/c-ops`
 Worktree: `.worktrees/wp-c`
 Owner: conductor / APIServer / StorageEngine depending on slice
-Status: active branch exists; latest branch head `2625edd`
+Status: active branch exists; latest branch head `2625edd`. Main carries
+the current functional deliveries; the long branch is kept for history.
 
 ## Finality
 
@@ -15,8 +16,8 @@ Status: active branch exists; latest branch head `2625edd`
 - [x] Delivered docs scope:
   `docs/ops/snapshot-plan.md`, `docs/ops/packaging-plan.md`,
   `docs/ops/workpackages.md`.
-- [ ] Next functional scope: snapshot REST, S3/MinIO e2e, restore,
-  remaining SLM retention, release verification.
+- [ ] Next functional scope: snapshot REST, restore, release
+  verification.
 - [x] Evidence source: release workflow, Helm chart, snapshot/SLM API,
   `ci`, `ci-k8s`, and verification scripts.
 
@@ -27,6 +28,8 @@ Status: active branch exists; latest branch head `2625edd`
 - [x] SLM policy API exists on `main`.
 - [x] SLM `retention.max_count` merged to `main`: `92a8ed9`
   (branch commit `2625edd`).
+- [x] SLM `retention.expire_after` with `min_count` safety merged to
+  `main` in this delivery.
 - [ ] Next functional Track C delivery selected and merged.
 
 ## Lots
@@ -76,7 +79,9 @@ Status: active branch exists; latest branch head `2625edd`
       and an explicit `already exists` reason.
   - [x] Cover and implement SLM `retention.max_count` pruning for
     successful snapshots.
-  - [ ] Finish remaining SLM retention behavior beyond `max_count`.
+  - [x] Finish remaining SLM retention behavior beyond `max_count`:
+    `expire_after` prunes expired successful snapshots, and `min_count`
+    keeps the newest successful snapshots even when they are expired.
   - [x] Preserve diagnostics for snapshot failure cases: the MinIO e2e
     test is opt-in by default after GitHub run `26193965044` proved the
     testcontainer startup path could leave `cargo test` open-ended.
@@ -87,5 +92,5 @@ Status: active branch exists; latest branch head `2625edd`
   - [ ] Keep failing-run inspection path documented.
 
 - [ ] Lot N - Closure
-  - [ ] Update this plan and `PLAN.md`.
+  - [x] Update this plan and `PLAN.md` for SLM expire-after retention.
   - [ ] Push branch/main and record SHA / run ids.

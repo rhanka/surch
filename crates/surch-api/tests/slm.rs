@@ -229,3 +229,58 @@ async fn slm_execute_retention_prunes_old_successful_snapshots_by_max_count() {
     assert_eq!(status, StatusCode::OK, "new snapshot body: {body}");
     assert_eq!(body["snapshots"][0]["snapshot"], json!("daily-new"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slm_execute_retention_prunes_expired_snapshots_but_keeps_min_count() {
+    let router = app_router();
+    let repo_dir = tempdir("retention-expire-after");
+
+    let (status, body) = request(
+        &router,
+        Method::PUT,
+        "/_snapshot/local",
+        Some(json!({
+            "type": "fs",
+            "settings": { "location": repo_dir.display().to_string() }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "put repo body: {body}");
+
+    for name in ["daily-expired-1", "daily-expired-2", "daily-expired-3"] {
+        let mut policy = valid_policy("local");
+        policy["name"] = json!(name);
+        policy["config"]["indices"] = json!([]);
+        policy["retention"] = json!({ "expire_after": "0s", "min_count": 2 });
+
+        let (status, body) =
+            request(&router, Method::PUT, "/_slm/policy/daily", Some(policy)).await;
+        assert_eq!(status, StatusCode::OK, "put policy {name} body: {body}");
+
+        let (status, body) =
+            request(&router, Method::POST, "/_slm/policy/daily/_execute", None).await;
+        assert_eq!(status, StatusCode::OK, "execute {name} body: {body}");
+    }
+
+    let (status, body) = request(
+        &router,
+        Method::GET,
+        "/_snapshot/local/daily-expired-1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["type"], json!("snapshot_missing_exception"));
+
+    for name in ["daily-expired-2", "daily-expired-3"] {
+        let (status, body) = request(
+            &router,
+            Method::GET,
+            &format!("/_snapshot/local/{name}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "snapshot {name} body: {body}");
+        assert_eq!(body["snapshots"][0]["snapshot"], json!(name));
+    }
+}

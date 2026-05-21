@@ -173,7 +173,7 @@ Reste estime: ~25% (2 open / 10 leaf tasks).
 
 ## Track C - Ops / Packaging / Snapshots
 
-Reste estime: ~30% (4 open / 13 leaf tasks).
+Reste estime: ~25% (3 open / 13 leaf tasks).
 
 - [x] Docker, Helm, release, signing, and SBOM work landed.
 - [x] Snapshot and SLM work started on `wp/c-ops`.
@@ -183,6 +183,8 @@ Reste estime: ~30% (4 open / 13 leaf tasks).
   shipped SHAs.
 - [x] `92a8ed9` covers and implements SLM `retention.max_count`
   pruning for successful snapshots.
+- [x] SLM `retention.expire_after` now prunes expired successful
+  snapshots while `min_count` preserves the newest snapshots.
 - [x] S3/MinIO snapshot/restore e2e coverage landed on `main`:
   `b929dff` swaps the mock for MinIO and `d409cf3` bounds container
   startup.
@@ -197,7 +199,7 @@ Reste estime: ~30% (4 open / 13 leaf tasks).
   - [x] `POST /_snapshot/{repo}/{snap}/_restore` refuses to restore over
     an existing live index with `400 snapshot_exception` and an explicit
     `already exists` reason.
-- [ ] Finish remaining SLM retention behavior beyond `max_count`.
+- [x] Finish remaining SLM retention behavior beyond `max_count`.
 - [ ] Keep release verification reproducible from CI artefacts.
 - [x] Preserve a minimal path to inspect failing snapshot runs.
 

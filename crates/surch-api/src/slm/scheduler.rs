@@ -16,6 +16,7 @@
 //! tests use this to verify that `DELETE /_slm/policy/{id}` plus
 //! shutdown leaves no orphan tokio task.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,8 @@ use super::policy::{
     expand_name_pattern, SlmExecution, SlmExecutionState, SlmPolicy, SlmPolicyRegistry,
 };
 use crate::snapshot_es::service::{
-    create_snapshot, delete_snapshot, RegisteredRepository, SnapshotRepositoryRegistry,
+    create_snapshot, delete_snapshot, list_snapshots, RegisteredRepository,
+    SnapshotRepositoryRegistry,
 };
 use crate::state::AppState;
 
@@ -234,33 +236,85 @@ fn enforce_max_count_retention(
     let Some(retention) = &policy.retention else {
         return;
     };
-    let Some(max_count) = retention.max_count.map(|n| n as usize) else {
+    let min_count = retention.min_count.unwrap_or(0) as usize;
+    let Some(repo) = repositories.get(&policy.repository) else {
         return;
     };
-    let min_count = retention.min_count.unwrap_or(0) as usize;
-    let keep_count = max_count.max(min_count);
+    let existing_snapshots = match list_snapshots(repo.as_ref()) {
+        Ok(snapshots) => snapshots
+            .into_iter()
+            .map(|snapshot| snapshot.name)
+            .collect::<BTreeSet<_>>(),
+        Err(error) => {
+            tracing::warn!(
+                policy = %policy.name,
+                repository = %policy.repository,
+                error = %error,
+                "slm: failed to list snapshots before retention",
+            );
+            return;
+        }
+    };
     let successful = policies
         .executions(&policy.name)
         .into_iter()
         .filter(|e| e.state == SlmExecutionState::Success)
+        .filter(|e| existing_snapshots.contains(&e.snapshot_name))
         .collect::<Vec<_>>();
-    if successful.len() <= keep_count {
-        return;
+    let mut prune = BTreeSet::new();
+
+    if let Some(max_count) = retention.max_count.map(|n| n as usize) {
+        let keep_count = max_count.max(min_count);
+        if successful.len() > keep_count {
+            for execution in successful.iter().take(successful.len() - keep_count) {
+                prune.insert(execution.snapshot_name.clone());
+            }
+        }
     }
-    let Some(repo) = repositories.get(&policy.repository) else {
-        return;
-    };
-    for execution in successful.iter().take(successful.len() - keep_count) {
-        if let Err(error) =
-            delete_snapshot(repo.as_ref(), &policy.repository, &execution.snapshot_name)
-        {
+
+    if let Some(expire_after_millis) = retention
+        .expire_after
+        .as_deref()
+        .and_then(parse_retention_duration_millis)
+    {
+        let cutoff = Utc::now().timestamp_millis() - expire_after_millis;
+        let eligible_count = successful.len().saturating_sub(min_count);
+        for execution in successful.iter().take(eligible_count) {
+            if execution.finished_at_millis <= cutoff {
+                prune.insert(execution.snapshot_name.clone());
+            }
+        }
+    }
+
+    for snapshot_name in prune {
+        if let Err(error) = delete_snapshot(repo.as_ref(), &policy.repository, &snapshot_name) {
             tracing::warn!(
                 policy = %policy.name,
                 repository = %policy.repository,
-                snapshot = %execution.snapshot_name,
+                snapshot = %snapshot_name,
                 error = %error,
                 "slm: failed to prune snapshot during retention",
             );
         }
     }
+}
+
+fn parse_retention_duration_millis(value: &str) -> Option<i64> {
+    let value = value.trim();
+    for (suffix, multiplier) in [
+        ("ms", 1_i64),
+        ("s", 1_000),
+        ("m", 60_000),
+        ("h", 3_600_000),
+        ("d", 86_400_000),
+    ] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            let quantity = number.parse::<i64>().ok()?;
+            if quantity < 0 {
+                return None;
+            }
+            return quantity.checked_mul(multiplier);
+        }
+    }
+    None
 }

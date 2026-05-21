@@ -19,10 +19,9 @@
 //! - The scheduler is a single background `tokio::task` that wakes up
 //!   every 30 seconds (configurable per-test via
 //!   [`scheduler::SchedulerConfig::tick_interval`]) and executes every
-//!   policy whose `next_fire` instant has elapsed. Retention math
-//!   (`expire_after`, `min_count`, `max_count`) is not enforced yet —
-//!   the field is accepted-and-stored so the wire surface is
-//!   compatible, but the trim pass is deferred to `C-SLM` phase 2.
+//!   policy whose `next_fire` instant has elapsed. Retention enforces
+//!   `max_count` and `expire_after`, while `min_count` protects the
+//!   newest successful snapshots from pruning.
 //!
 //! Wire shape (mirrors ES 7.17 / OS 2.x):
 //!
