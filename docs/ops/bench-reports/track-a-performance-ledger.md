@@ -18,6 +18,9 @@ need a fresh run.
 - `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/README.md`:
   current-main K8s replay kickoff for the cumulative per-algorithm
   proof line.
+- `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/README.md`:
+  post-wait-loop-fix current-main K8s replay repetition `1/3`, with
+  live pod monitoring samples promoted next to the benchmark summary.
 - `docs/ops/memory-capacity.md`: current RAM capacity model and stats
   endpoint contract.
 
@@ -97,6 +100,7 @@ the proof state:
 | `651e22a`, `4e9405a`, `c5f3155`, `b680232`, `b8ed2bc` | RAM / memory model | Capacity model exists; individual RSS wins are not fully paired against OpenSearch | Future memory claims must include peak/final RSS from the same harness and same pod/host shape |
 | `df3b0aa` plus supporting index/codec commits `6f56fd2`, `2da9249` | Search latency | Proven by `2026-05-20-A-lot3-paired-K8s` | This is the only current isolated before/after Track A perf proof with K8s run ids |
 | `466693f` current-main replay anchor | Search latency / SLO | Proven by `2026-05-20-A-replay-current-main-insee-K8s` | Surch `2.0/3.7/5.4/36.8 ms` p50/p95/p99/max vs OpenSearch `4.5/9.7/18.2/362.8 ms`; 0 errors on both engines; RSS not captured |
+| `ac558e6` current-main replay repetition | Search latency / SLO / K8s monitoring | Repetition `1/3` accepted by `2026-05-21-A-replay-current-main-insee-K8s-rep1` | `ci-k8s` run `26202012197`, artifact `7126271947`; Surch `1.9/3.5/5.0/25.0 ms` vs OpenSearch `4.5/9.3/16.3/354.1 ms`; 0 errors; live pod max samples Surch `91m/77Mi`, OpenSearch `1200m/1476Mi`; RSS still not captured |
 | Future Track A commits | Any perf axis | Must update this ledger in the same PR/commit sequence as the optimisation proof | Required fields: axis, workload, Surch numbers, OpenSearch/Elasticsearch reference where relevant, delta, run id/artifact path, and missing proof |
 
 ## Replay backlog for historical algorithms
@@ -138,6 +142,18 @@ Kickoff trace, 2026-05-20:
   `k8s-bench-insee-bench-466693f55e1a3cd8b007e058be07584251986ecb`
   (`7123081611`), promoted report
   `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
+- First post-fix repeated current-main K8s replay:
+  `make bench-k8s K8S_JOB=insee-bench K8S_REF=main` created
+  `ci-k8s` run `26202012197` on `main`
+  (`ac558e6d08c7566f8cbc0b96c56a5b943eb1ae79`). Verdict: PASS,
+  artifact
+  `k8s-bench-insee-bench-ac558e6d08c7566f8cbc0b96c56a5b943eb1ae79`
+  (`7126271947`), digest
+  `sha256:274ed630818f02fa12cfdc85c76112d2dc6db472d1fe947b11cf8edfdeb75994`,
+  promoted report
+  `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
+  This counts as `1/3` for the current-main repeated run group, not as a
+  final verdict.
 
 Minimum replay set:
 

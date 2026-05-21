@@ -114,6 +114,14 @@ axis-by-axis performance state is now tracked in
 - [x] Preserve failed/invalid replay attempts in the trace: K8s runs
   `26200481514` and `26201223312` are documented as diagnostics only
   and do not count toward the required 3/3 final repetitions.
+- [x] Promote the first post-wait-loop-fix current-main repetition:
+  `ci-k8s` run `26202012197` on
+  `ac558e6d08c7566f8cbc0b96c56a5b943eb1ae79`, artifact
+  `7126271947`, report
+  `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
+- [ ] Finish two more repetitions for the same `ac558e6` image tags, or
+  explicitly start a new repeated group for the newer `main` SHA now
+  that `origin/main` has advanced.
 - [ ] Keep future Track A optimisation commits tied to a promoted perf
   report and an update to the Track A performance ledger.
 

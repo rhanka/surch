@@ -4,10 +4,14 @@ Track principal: A - perf / optimisation
 Branch: `perf-replay/wp-a-algo-ledger`
 Worktree: `/home/antoinefa/src/surch`
 Owner: `#1/#2 worker Track A`
-Status: started on 2026-05-20; local branch only, not pushed. First
-current-main K8s replay was dispatched as `ci-k8s` run `26193166785`;
-verdict PASS, promoted report:
+Status: started on 2026-05-20. First current-main K8s replay was
+dispatched as `ci-k8s` run `26193166785`; verdict PASS, promoted
+report:
 `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
+Post-wait-loop-fix repetition `1/3` for the same current-main INSEE
+group is `ci-k8s` run `26202012197`, artifact `7126271947`, promoted
+under
+`docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
 
 ## Finality
 
@@ -59,7 +63,8 @@ as remote branch heads or tags today.
 | A-replay-1 top-K / lazy hydration | `71ceb2755ad33d4cc1b8d8da0003ae876edc228f` | ledger head `3157afbae0f2d37ac3d92462f08b92f6b6dee317`; TopN point `5081cc74a961c2fe67eec9c7fee8bbc3df86019b` / merge `eaff76cbbbefca55fb6d498f342f0e31e553cfa9` | reachable through `origin/main`, no dedicated remote ref | GHCR tags missing; no `docker-build.yml` / `ci-k8s.yml` at these SHAs, so direct workflow dispatch is blocked |
 | A-replay-2 WAND family | `3157afbae0f2d37ac3d92462f08b92f6b6dee317` | `e38bf916a0f197e0bb4f63e50ee9efc10cf3c704` | reachable through `origin/main`, no dedicated remote ref | GHCR tags missing; no `docker-build.yml` / `ci-k8s.yml` at these SHAs, so direct workflow dispatch is blocked |
 | A-replay-3 memory layout | `65fc7599946a2e5e1d81b989a1fb6606fc2d7a21` | `7caf3397970d9a183ebc5bc7631cb2e9f0aaea5c` | baseline is `origin/wp/b-test-auto`; head reachable through `origin/main`, no dedicated head ref | GHCR tags missing; baseline has workflow files, head lacks `docker-build.yml`; direct paired dispatch is blocked |
-| Current cumulative smoke | `69240116599e8e86f629f13f3d7611d73ff1a07d` | `466693f55e1a3cd8b007e058be07584251986ecb` | `origin/main` | `insee-bench` run `26193166785` PASS; promoted report `2026-05-20-A-replay-current-main-insee-K8s` |
+| Current cumulative smoke | `69240116599e8e86f629f13f3d7611d73ff1a07d` | `466693f55e1a3cd8b007e058be07584251986ecb` | reachable through `origin/main` history, no dedicated stable ref | `insee-bench` run `26193166785` PASS; promoted report `2026-05-20-A-replay-current-main-insee-K8s` |
+| Current-main repeated group | `ac558e6d08c7566f8cbc0b96c56a5b943eb1ae79` | same SHA | reachable through `origin/main` history, no dedicated stable ref | `insee-bench` run `26202012197` PASS and promoted as repetition `1/3`; two more repetitions on the same image tags, or a documented new SHA group, required before final verdict |
 
 The A-replay-1 row in the existing ledger is non-linear as written:
 `3157afb` is an ancestor of `5081cc7`, so `71ceb275 -> 3157afb`
@@ -129,6 +134,18 @@ Required artifact set per replay group:
   `docs/ops/bench-reports/track-a-performance-ledger.md` that cite the
   promoted report and explicitly mark missing RSS if Track B has not
   landed the RSS producer yet.
+
+Current-main repeated run group:
+
+- [x] Repetition 1/3: `ci-k8s` run `26202012197`, artifact
+  `7126271947`, promoted report
+  `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
+- [ ] Repetition 2/3: rerun against the same `ac558e6` SHA/image tags
+  through a stable replay ref, or document why a newer SHA starts a new
+  group.
+- [ ] Repetition 3/3: same workload/ref/image set as repetition 1.
+- [ ] Aggregate the three repetitions with median/IQR or
+  min/median/max and update the Track A ledger.
 
 Reference strategy, without history rewrite:
 
@@ -207,6 +224,11 @@ Track B coordination:
     mark RSS explicitly missing in A reports and ledger rows.
   - [ ] Promote `summary.md` / benchmark artifacts and update the
     ledger rows in place.
+  - [x] Promote first post-fix current-main repeated K8s run:
+    `26202012197`, artifact `7126271947`, report
+    `2026-05-21-A-replay-current-main-insee-K8s-rep1`.
+  - [ ] Run repetitions 2/3 and 3/3 for the current-main group before
+    publishing a final repeated-run verdict.
 
 ## Gates
 
