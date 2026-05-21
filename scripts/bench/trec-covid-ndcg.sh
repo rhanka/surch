@@ -7,7 +7,7 @@
 # averages, compares with Lucene/Anserini baseline 0.595.
 #
 # Idempotent: downloads the BEIR archive to target/beir/ the first time only.
-set -u
+set -euo pipefail
 LABEL="${1:?label}"
 OUT="${2:?out}"
 URL="${3:?url}"
@@ -17,6 +17,7 @@ DATA="$BEIR_ROOT/trec-covid"
 ARCHIVE_URL="https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/trec-covid.zip"
 ARCHIVE="$BEIR_ROOT/trec-covid.zip"
 TMP=$(mktemp -d)
+TREC_COVID_BULK_CHUNK_SIZE="${TREC_COVID_BULK_CHUNK_SIZE:-8m}"
 trap 'rm -rf "$TMP"' EXIT
 
 # -- Step 1: ensure dataset is present (auto-download for local dev only) --
@@ -52,10 +53,11 @@ curl -fsS -X DELETE "$URL/$INDEX" >/dev/null 2>&1 || true
 curl -fsS -X PUT "$URL/$INDEX" -H 'Content-Type: application/json' \
   -d '{"mappings":{"properties":{"title":{"type":"text"},"text":{"type":"text"}}}}' >/dev/null
 
-# Bulk ingest. TREC-COVID is ~200 MB; ship it in 25 MB chunks so we stay below
-# any reasonable HTTP body cap.
+# Bulk ingest. TREC-COVID is ~200 MB; ship it in chunks below Surch's
+# 16 MiB `_bulk` body cap. Keep the size operator-visible so K8s can override
+# it without editing the script.
 t0=$(date +%s.%N)
-split -C 25m -d -a 4 "$NDJSON" "$TMP/bulk."
+split -C "$TREC_COVID_BULK_CHUNK_SIZE" -d -a 4 "$NDJSON" "$TMP/bulk."
 for chunk in "$TMP"/bulk.*; do
   # Ensure each chunk ends on a newline (split -C already respects line boundaries)
   curl -fsS -X POST "$URL/_bulk" -H 'Content-Type: application/x-ndjson' \
