@@ -67,6 +67,83 @@ isolates lazy hydration while TopN scalar finalization needs the
 additional `5081cc7` or `eaff76c` replay point. The trace keeps both
 facts instead of editing old history.
 
+## Replay proof protocol
+
+The replay line is a performance proof, not a one-off smoke. Each
+A-replay-1..3 point must use the same K8s harness family that produces
+the promoted `ci-k8s` reports, with enough repeated measurements and
+environment evidence to make the comparison meaningful.
+
+- [ ] Run every accepted replay point in K8s, not as a local perf proof.
+- [ ] Execute at least 3 successful repetitions of the same workload for
+  each compared ref before publishing a final verdict.
+- [ ] Keep each repetition as a separate `ci-k8s` run id and artifact;
+  do not collapse reruns into a single undocumented number.
+- [ ] Record the exact runtime image and bench-driver image tags:
+  `ghcr.io/rhanka/surch:sha-<full_sha>` and
+  `ghcr.io/rhanka/surch:bench-sha-<full_sha>`.
+- [ ] Record cluster and pod shape for every replay group: namespace,
+  node pool, node type when visible, quota/limit range, pod requests and
+  limits, activeDeadlineSeconds, mounted PVCs, and corpus generation
+  source.
+- [ ] Capture cluster monitoring around each run group: Job conditions,
+  pod phases, container restarts, `kubectl describe job`, pod describe,
+  namespace events, and node/pod resource snapshots when available.
+- [ ] Publish aggregate run statistics for Surch and the reference
+  engine: p50 / p95 / p99 / max per repetition, then median and IQR
+  across the three repetitions. If IQR cannot be computed from the
+  report shape, publish min / median / max and state that limitation.
+- [ ] Keep SLO verdicts fail-closed: any repetition with benchmark
+  errors, missing artifact, failed Job condition, missing config
+  evidence, or untracked image tag makes the replay group `invalid`
+  until rerun.
+- [ ] For search-ranking-sensitive changes, pair the latency replay with
+  `ndcg-gate` or a promoted quality artifact; report NDCG@10 and
+  Recall@10 beside latency before claiming the optimisation safe.
+- [ ] Do not claim RSS peak/final in A reports until Track B has wired
+  paired RSS capture into the same K8s replay artifact.
+
+Required artifact set per replay group:
+
+- [ ] One human report directory under
+  `docs/ops/bench-reports/<date>-A-replay-<n>-<context>-K8s/`.
+- [ ] A `README.md` or `summary.md` that lists all repetition run ids,
+  artifact ids, refs, image tags, pod requests/limits, cluster quota,
+  workload size, SLO verdict, and aggregation method.
+- [ ] Raw diagnostics from each run preserved through the GitHub
+  artifact: GHA summary, Job YAML, Job describe, pod describe, events,
+  driver logs, benchmark summary, and machine JSON when produced.
+- [ ] Ledger updates in
+  `docs/ops/bench-reports/track-a-performance-ledger.md` that cite the
+  promoted report and explicitly mark missing RSS if Track B has not
+  landed the RSS producer yet.
+
+Reference strategy, without history rewrite:
+
+- [ ] Prefer durable replay refs such as
+  `perf-replay/a-replay-<n>-base` and
+  `perf-replay/a-replay-<n>-head` that point at the selected historical
+  code plus the minimum benchmark harness plumbing needed for K8s.
+- [ ] If a historical SHA lacks `docker-build.yml`, `ci-k8s.yml`, or K8s
+  manifests, create a modern replay branch that preserves the historical
+  application code and cherry-picks only harness/CI plumbing; document
+  the harness delta in the promoted report.
+- [ ] Do not amend, rebase, or replace historical Track A commits to
+  make them dispatchable.
+- [ ] Build and verify the runtime and bench-driver GHCR tags for every
+  selected replay ref before dispatching the three K8s repetitions.
+
+Track B coordination:
+
+- [ ] Treat paired RSS peak/final as a Track B prerequisite for any
+  memory-win claim in A-replay-3.
+- [ ] When RSS lands, include Surch and Elasticsearch/OpenSearch peak
+  RSS, final RSS, sampling interval, process selection method, and pod
+  memory limit in the same promoted A replay report.
+- [ ] Until that lands, A-replay reports must say `RSS: not captured by
+  current harness` and keep the verdict limited to latency, SLO, quality,
+  and indexing axes actually measured.
+
 ## Lots
 
 - [x] Lot 0 - Intake and safety checks
@@ -108,6 +185,14 @@ facts instead of editing old history.
     cherry-picks only K8s harness plumbing around the historical code.
   - [ ] Build missing runtime and bench-driver images for the selected
     refs before dispatching K8s.
+  - [ ] Run at least 3 successful K8s repetitions per selected replay
+    ref and workload before publishing a final A-replay verdict.
+  - [ ] Capture cluster/pod/image configuration and monitoring
+    diagnostics for each replay group.
+  - [ ] Aggregate repeated latency with median and IQR, or
+    min/median/max when IQR is not derivable from the artifacts.
+  - [ ] Coordinate with Track B before claiming RSS peak/final; otherwise
+    mark RSS explicitly missing in A reports and ledger rows.
   - [ ] Promote `summary.md` / benchmark artifacts and update the
     ledger rows in place.
 
@@ -121,6 +206,12 @@ facts instead of editing old history.
 - [x] Report gate: human `README.md` or `summary.md` promoted with
   p50 / p95 / p99 / max, errors, SLO verdict, and quality/RSS fields
   when available.
+- [ ] Repeatability gate: at least 3 successful K8s repetitions are
+  cited for every final A-replay-1..3 verdict.
+- [ ] Environment gate: cluster, pod, image, quota, PVC, and monitoring
+  diagnostics are cited in the promoted replay report.
+- [ ] Significance gate: repeated runs are summarized as median/IQR or
+  min/median/max and any outlier or failed repetition is called out.
 
 ## Proofs
 

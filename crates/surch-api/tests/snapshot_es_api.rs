@@ -254,6 +254,56 @@ async fn snapshot_take_and_get_reports_success() {
 }
 
 #[tokio::test]
+async fn snapshot_get_all_returns_every_snapshot_in_repository() {
+    let router = app_router();
+    let dir = tempdir("get-all");
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local",
+        json!({
+            "type": "fs",
+            "settings": { "location": dir.display().to_string() }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = put(&router, "/idx", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    bulk_index(
+        &router,
+        "idx",
+        &[("doc-1".into(), json!({ "title": "alpha", "category": "x" }))],
+    )
+    .await;
+
+    let (status, body) = put(
+        &router,
+        "/_snapshot/local/snap-a",
+        json!({ "indices": "idx" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "snap-a take body: {body}");
+
+    let (status, body) = put(
+        &router,
+        "/_snapshot/local/snap-b",
+        json!({ "indices": "idx" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "snap-b take body: {body}");
+
+    let (status, body) = get(&router, "/_snapshot/local/_all").await;
+    assert_eq!(status, StatusCode::OK, "get all body: {body}");
+    assert_eq!(body["snapshots"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["snapshots"][0]["snapshot"], json!("snap-a"));
+    assert_eq!(body["snapshots"][0]["state"], json!("SUCCESS"));
+    assert_eq!(body["snapshots"][1]["snapshot"], json!("snap-b"));
+    assert_eq!(body["snapshots"][1]["state"], json!("SUCCESS"));
+}
+
+#[tokio::test]
 async fn snapshot_delete_then_get_returns_404() {
     let router = app_router();
     let dir = tempdir("delete");

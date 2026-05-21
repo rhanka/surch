@@ -160,6 +160,65 @@ GHA uploads an artifact named `k8s-bench-<job>-<sha>`. It contains:
   workflow also reconstructs benchmark summaries from marked driver logs
   after Job completion.
 
+## Performance replay protocol
+
+Track A replay reports use K8s as the authoritative performance
+environment. Local runs are useful for smoke/debug only; they do not
+close A-replay verdicts.
+
+Minimum run policy for A-replay-1..3:
+
+- [ ] Dispatch the benchmark through `ci-k8s.yml` or `make bench-k8s`.
+- [ ] Run at least 3 successful repetitions of the same job, workload,
+  ref, runtime image, and bench-driver image before publishing a final
+  verdict.
+- [ ] Keep each repetition as its own GitHub Actions run id and artifact
+  id.
+- [ ] Repeat the same policy for both sides of a baseline/head
+  comparison.
+- [ ] Treat any failed K8s Job, benchmark error, missing report, missing
+  image evidence, or missing diagnostics as an invalid repetition.
+
+Configuration to record in the promoted report:
+
+- [ ] Git ref and full commit SHA under test.
+- [ ] Runtime image:
+  `ghcr.io/rhanka/surch:sha-<full_sha>`.
+- [ ] Bench-driver image:
+  `ghcr.io/rhanka/surch:bench-sha-<full_sha>`.
+- [ ] Reference engine image/version.
+- [ ] Namespace, node pool, node selector, tolerations, and node type
+  when visible from diagnostics.
+- [ ] Namespace quota and limit range at dispatch time.
+- [ ] Pod requests/limits, `activeDeadlineSeconds`, mounted PVC names,
+  and corpus source/size.
+- [ ] Workflow run id, artifact id, Job name, and report directory.
+
+Cluster monitoring evidence to preserve:
+
+- [ ] `kubectl describe job -n surch <job>`.
+- [ ] Job conditions and rendered Job YAML.
+- [ ] Pod list, pod describe, container restart counts, and previous logs
+  when present.
+- [ ] Namespace events sorted by timestamp and Job-scoped events.
+- [ ] Driver logs plus reconstructed benchmark summary.
+- [ ] Node/pod CPU and memory snapshots when the cluster metrics API is
+  available; if metrics are unavailable, state that explicitly.
+
+Aggregation expected in promoted reports:
+
+- [ ] Per repetition: Surch and reference p50 / p95 / p99 / max, errors,
+  throughput when produced, and SLO verdict.
+- [ ] Across repetitions: median and IQR for each latency axis.
+- [ ] If the available artifact shape cannot support IQR, publish
+  min/median/max and state that the report lacks enough raw samples for
+  IQR.
+- [ ] For ranking-sensitive Track A changes, cite `ndcg-gate` or another
+  promoted quality artifact with NDCG@10 and Recall@10.
+- [ ] For memory claims, cite Track B paired RSS peak/final from the same
+  run group. Until that producer exists, write
+  `RSS: not captured by current harness`.
+
 ## Latest diagnostics
 
 `ci-k8s` run `26058595173` proved the image handoff is now correct for

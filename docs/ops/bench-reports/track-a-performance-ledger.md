@@ -44,6 +44,28 @@ the proof state:
 - If a later replay covers several historical algorithms, keep the
   individual rows and cite the shared report in each row that it
   substantiates.
+- For final Track A replay verdicts, K8s is mandatory. Local runs can
+  diagnose, but they do not close A-replay-1..3.
+- A final A replay must include at least 3 successful repetitions of the
+  same K8s workload for each compared ref. The promoted report must list
+  every run id and artifact id.
+- The report must document the measurement environment: runtime image
+  tag, bench-driver image tag, namespace, node pool, pod requests and
+  limits, quota/limit range, PVCs, corpus source, activeDeadlineSeconds,
+  and reference engine version.
+- The report must preserve cluster monitoring evidence: Job conditions,
+  Job describe, pod describe, events, container restarts, driver logs,
+  and node/pod resource snapshots when the cluster exposes them.
+- Repeated runs must be summarized as median and IQR across repetitions;
+  if the available artifact shape cannot support IQR, publish
+  min/median/max and state that limitation.
+- A replay group is invalid until rerun if any repetition has benchmark
+  errors, missing diagnostics, missing image/config evidence, a failed
+  K8s condition, or a missing SLO verdict.
+- RSS peak/final remains a Track B reporting prerequisite. Until the
+  RSS producer is wired into the same K8s artifacts, A rows must say
+  `RSS: not captured by current harness` instead of implying a memory
+  win.
 
 ## Current axis state
 
@@ -85,6 +107,13 @@ historical SHAs, promote each report, then append rows here. This avoids
 rewriting already integrated code while producing the cumulative proof
 trail that future releases need.
 
+Replay refs are allowed to add current benchmark harness plumbing around
+historical application code, but they must not rewrite historical Track A
+commits. When a selected SHA lacks the current GitHub Actions, Docker, or
+K8s surfaces, create durable replay refs for the baseline/head pair,
+document the harness-only delta, build both GHCR tags, and then dispatch
+the repeated K8s runs from those refs.
+
 Kickoff trace, 2026-05-20:
 
 - Local branch `perf-replay/wp-a-algo-ledger` was created from
@@ -118,6 +147,20 @@ Minimum replay set:
 | A-replay-2 WAND family | parent before `ed76014` -> `e38bf91` | SciFact + INSEE | NDCG@10, Recall@10, p50/p95/p99/max |
 | A-replay-3 memory layout | parent before `4e9405a` -> `7caf339` | BAN 25k + INSEE 10k | RSS peak/final, stats endpoint snapshot, latency non-regression |
 | A-replay-4 FoR metadata | pre-FoR `c01b0a2` -> `df3b0aa` / `c5980ad` | INSEE K8s | Already proven by `2026-05-20-A-lot3-paired-K8s`; keep as anchor |
+
+Minimum repeated-run proof for A-replay-1..3:
+
+- [ ] Dispatch at least 3 successful K8s repetitions per baseline ref.
+- [ ] Dispatch at least 3 successful K8s repetitions per head ref.
+- [ ] Promote one human report directory per replay lot with all run ids,
+  artifact ids, image tags, cluster/pod config, monitoring diagnostics,
+  and aggregation method.
+- [ ] Record Surch and reference p50 / p95 / p99 / max for each
+  repetition and the cross-run median/IQR or min/median/max.
+- [ ] Add NDCG@10 and Recall@10 for A-replay-2 or any replay that moves
+  ranking-sensitive search execution.
+- [ ] Add RSS peak/final only after Track B emits paired RSS in the same
+  run artifacts; otherwise mark RSS explicitly missing.
 
 ## Operator verdict
 

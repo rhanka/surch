@@ -388,16 +388,21 @@ pub async fn get_snapshot_handler(
             format!("repository [{repo_name}] missing"),
         );
     };
-    match service::get_snapshot(repo.as_ref(), &repo_name, &snap_name) {
-        Ok(entry) => Json(json!({
-            "snapshots": [{
+    let entries = if snap_name == "_all" {
+        service::list_snapshots(repo.as_ref())
+    } else {
+        service::get_snapshot(repo.as_ref(), &repo_name, &snap_name).map(|entry| vec![entry])
+    };
+    match entries {
+        Ok(entries) => Json(json!({
+            "snapshots": entries.into_iter().map(|entry| json!({
                 "snapshot": entry.name,
                 "uuid": entry.uuid,
                 "state": entry.state.as_str(),
                 "indices": entry.indices,
                 "start_time_in_millis": entry.start_time_millis,
                 "end_time_in_millis": entry.end_time_millis,
-            }]
+            })).collect::<Vec<_>>()
         }))
         .into_response(),
         Err(error) => from_service_error(error),

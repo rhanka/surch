@@ -67,6 +67,9 @@ Status: active branch exists; latest branch head `2625edd`
 
 - [ ] Lot 3 - Snapshot / SLM completeness
   - [ ] Finish snapshot REST coverage.
+    - [x] Cover `GET /_snapshot/{repo}/_all` in the fs/tower REST
+      suite and return the same `snapshots: [...]` envelope as unitary
+      snapshot GETs.
   - [ ] Finish restore coverage.
   - [x] Cover and implement SLM `retention.max_count` pruning for
     successful snapshots.

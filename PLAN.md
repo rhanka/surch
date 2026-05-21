@@ -22,6 +22,26 @@ global status source; branch files carry executable detail.
 - [ ] Keep this file updated whenever a branch status, merge status, or
   delivery gate changes.
 
+## Conductor Iteration Contract
+
+This section answers the operational problem observed on 2026-05-20:
+single-threaded status loops advanced too little per user turn.
+
+- [ ] At the start of each non-trivial iteration, select a batch with at
+  least two independent executable leaves when the worktree allows it.
+- [ ] Dispatch up to four parallel agents only when ownership is
+  disjoint; keep immediate blocker work local to the conductor.
+- [ ] Give every dispatched agent an explicit leaf target expected to
+  close at least one checkbox in a branch plan, or to unblock a run that
+  closes one.
+- [ ] Before final reporting, integrate agent output, run the relevant
+  gates, and update the branch plan plus this file if the global state
+  changed.
+- [ ] If an active thread cannot advance by roughly 10% of its cited
+  branch plan in one iteration, report the blocker as a concrete
+  missing artefact, run, approval, or dependency instead of returning a
+  soft status.
+
 ## Branch Index
 
 - [x] `main`: current integration branch.
@@ -86,6 +106,11 @@ axis-by-axis performance state is now tracked in
   `plan/perf-replay-wp-a-algo-ledger.md`; K8s run `26193166785`
   promoted the first current-main replay report under
   `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
+- [x] Define the required Track A replay proof protocol: K8s is
+  mandatory for final replay verdicts, each compared ref needs at least
+  three successful repetitions, and promoted reports must preserve image
+  tags, pod/cluster configuration, monitoring diagnostics, run ids,
+  artifacts, and repeated-run aggregation.
 - [ ] Keep future Track A optimisation commits tied to a promoted perf
   report and an update to the Track A performance ledger.
 
@@ -117,6 +142,8 @@ Reste estime: ~25% (2 open / 10 leaf tasks).
   `docs/ops/bench-reports/2026-05-20-ndcg-gate-K8s/`
   from GHA run `26157480132`.
 - [ ] Add paired RSS reporting for Surch vs Elasticsearch.
+  - [ ] Wire RSS peak/final into the K8s Track A replay artifact family
+    before any A-replay memory-layout report claims a memory win.
 - [ ] Diagnose the TREC-COVID quality blocker before making it an
   acceptance gate: Surch completed all 50 qids but returned
   `NDCG@10=0.0000`, `Recall@10=0.0000` while OpenSearch returned
@@ -144,6 +171,9 @@ Reste estime: ~35% (4 open / 12 leaf tasks).
   default `cargo test --workspace` skips the testcontainer path after
   GitHub run `26193965044` showed runner-side MinIO startup could hang.
 - [ ] Finish snapshot REST coverage.
+  - [x] `GET /_snapshot/{repo}/_all` lists every snapshot in the
+    repository using the same `snapshots: [...]` envelope as
+    unitary snapshot GETs.
 - [ ] Finish restore coverage.
 - [ ] Finish remaining SLM retention behavior beyond `max_count`.
 - [ ] Keep release verification reproducible from CI artefacts.

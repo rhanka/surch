@@ -24,6 +24,9 @@ Surch NDCG@10/Recall@10 were both `0.0000`. Long branch
   `bench_report` and CLI tests.
 - [ ] Next allowed scope: TREC-COVID diagnosis and paired RSS
   reporting.
+- [ ] Track A replay integration: paired RSS reporting must be available
+  in the same K8s artifact family before A-replay-3 or any memory-layout
+  replay claims RSS peak/final.
 - [x] Human-facing report surface:
   `target/bench-reports/<sha>/summary.md` for local runs and
   `docs/ops/bench-reports/<date>-<context>/README.md` for promoted
@@ -93,6 +96,15 @@ Surch NDCG@10/Recall@10 were both `0.0000`. Long branch
     adds the BEIR `.out` parser to `bench_report`.
   - [ ] Add paired RSS reporting for Surch vs Elasticsearch
     (deferred — not on the matchID critical path).
+  - [ ] Expose RSS peak/final in K8s Track A replay reports when wired:
+    sampling interval, process selection method, pod memory limit,
+    Surch RSS peak/final, and Elasticsearch/OpenSearch RSS peak/final
+    must be rendered in human Markdown and emitted in the stable machine
+    summary.
+  - [ ] Coordinate RSS with `plan/perf-replay-wp-a-algo-ledger.md`:
+    until this lands, A reports must state
+    `RSS: not captured by current harness` and must not claim a memory
+    win.
   - [x] Promote INSEE report:
     `docs/ops/bench-reports/2026-05-19-insee-10k-k8s/README.md`
     (Surch p50/p95/p99/max = 1.9/3.6/6.9/17.9 ms, 0/13170 errors,

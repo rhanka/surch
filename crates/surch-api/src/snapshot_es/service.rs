@@ -350,6 +350,12 @@ pub fn get_snapshot(
         })
 }
 
+/// `GET /_snapshot/{repository}/_all`.
+pub fn list_snapshots(repo: &dyn SnapshotRepository) -> ServiceResult<Vec<SnapshotEntry>> {
+    let (manifest, _etag) = load_or_init_manifest(repo)?;
+    Ok(manifest.snapshots)
+}
+
 /// `DELETE /_snapshot/{repository}/{snapshot}`.
 pub fn delete_snapshot(
     repo: &dyn SnapshotRepository,
