@@ -26,7 +26,11 @@ Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
   `crates/surch-api/tests/matchid_compat.rs`,
   `tests/matchid_compat/replays/deces_v1.json`.
 - [x] Delivered doc scope:
-  `docs/wp-d-matchid/gap-analysis.md`.
+  `docs/wp-d-matchid/gap-analysis.md`,
+  `docs/wp-d-matchid/README.md`,
+  `docs/wp-d-matchid/swap-guide.md`,
+  `docs/wp-d-matchid/B1-phase-3-plan.md`,
+  `docs/wp-d-matchid/decisions/2026-05-15-surch-derived-preliminary.md`.
 - [x] Delivered oracle runbook scope:
   `tests/matchid_compat/oracle/deces_v1.md`,
   `tests/matchid_compat/README.md`,
@@ -102,3 +106,7 @@ Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
     Phase 4 widening (A1/A2/A7/A13 multi-field + date{format} + geo +
     edge_ngram, deces_v2 INSEE replay) goes under a follow-up plan when
     scoped.
+  - [x] Clean active matchID docs so the swap guide, intake README,
+    B1 phase plan, and preliminary decision all name Elasticsearch 8.6.1
+    as the active oracle. OpenSearch 2.17 is kept only as historical or
+    client-compat context.

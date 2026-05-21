@@ -9,6 +9,11 @@ Intake file: `docs/wp-d-matchid/incoming/2026-05-15-surch-derived-preliminary.md
 file. The Surch-side requirements file is provisional; every clause
 remains negotiable when matchID confirms.
 
+Supersession note: the B1 oracle target is now Elasticsearch 8.6.1, not
+the provisional OpenSearch 2.17 baseline used before the matchID
+Elasticsearch oracle was available. Active proof: `ci-k8s` run
+`26192816780`, 30 requests, 0 skipped, 0 divergence.
+
 ## Triage
 
 | § from incoming/ | Surch status today | Decision |
@@ -20,7 +25,7 @@ remains negotiable when matchID confirms.
 | 2.5 — term filters | `term` shipped; `bool.filter` ↔ `bool.must` semantics need a documented mapping | **gap-A3** : add `bool.filter` (does not score) and `bool.should` / `minimum_should_match` |
 | 2.6 — scroll API | **not implemented** (`/_search?scroll=1m` + `/_search/scroll`) | **gap-A4** : stateful scroll context with TTL eviction |
 | 3 — `_source` shape | matched by INSEE NDJSON we already ingest | n/a |
-| 4 — acceptance criteria | artillery harness lands JSON since wp/b round 3; matchID replay fixture missing | **gap-B1** : `tests/matchid_compat/replays/deces_v1.json` with 100 deterministic top-hit IDs captured from OS 2.17 |
+| 4 — acceptance criteria | artillery harness lands JSON since wp/b round 3; matchID replay fixture missing | **gap-B1** : `tests/matchid_compat/replays/deces_v1.json` with deterministic top-hit IDs now cross-checked against Elasticsearch 8.6.1; the original OpenSearch 2.17 capture was provisional |
 | 5 — out of scope | mirrored in `docs/wp-d-matchid/SPEC.md` § "Out-of-scope reminders" | n/a |
 
 ## Implementation order
@@ -32,9 +37,10 @@ By increasing risk / cost :
 2. **A1 — `fuzzy` inside `match` object form** (0.5 d). Extra
    `serde_json::Value` branch; the fuzziness `Damerau-Levenshtein`
    logic already exists in `surch-search`.
-3. **B1 — matchID replay fixture** (1 d). Captures 100 deterministic
-   queries against OS 2.17 and bakes the expected top-hit ids;
-   gated by A3 + A1.
+3. **B1 — matchID replay fixture** (1 d). Captures deterministic
+   queries and bakes the expected top-hit ids; active oracle proof is
+   Elasticsearch 8.6.1 via `ci-k8s` run `26192816780`, gated by A3 +
+   A1.
 4. **A4 — scroll API** (3 d). Needs a `scroll_id → cursor` table on
    `AppState` with TTL, plus `POST /_search/scroll` route, plus the
    `?scroll=1m` form on `_search`.

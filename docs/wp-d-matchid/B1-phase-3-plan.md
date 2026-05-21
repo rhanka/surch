@@ -1,12 +1,15 @@
-# B1 phase 3 — Elasticsearch 8.6.1 oracle cross-check (plan)
+# B1 phase 3 — Elasticsearch 8.6.1 oracle cross-check (closed)
 
 Tracked under `docs/wp-d-matchid/gap-analysis.md` row `B1`. The current
 status there is:
 
-> implemented (30 requests executed on Surch HEAD; Elasticsearch 8.6.1
-> oracle cross-check still pending)
+> implemented; Elasticsearch 8.6.1 oracle PASS
 
-Phase 3 closes that note by running the deterministic
+Phase 3 closed on `main` with `ci-k8s` run `26192816780`: 30 requests,
+0 skipped, 0 divergence, oracle exit 0, promoted report
+`docs/ops/bench-reports/2026-05-20-b1-oracle-ES861-K8s/`.
+
+Phase 3 closed the original pending note by running the deterministic
 `tests/matchid_compat/replays/deces_v1.json` fixture against **both**
 Surch and Elasticsearch 8.6.1, on the **same** INSEE 10k slice, and
 asserting structural parity on the response shapes Surch's tests
@@ -79,11 +82,11 @@ already pin against Surch HEAD.
   `gap-analysis.md`; Phase 3 explicitly skips them rather than logging
   expected divergences.
 
-## When to start
+## Completion gate
 
-- ndcg-gate K8s green with TREC-COVID extension (run `26116693319` or
-  successor).
-- insee-bench K8s green on `df3b0aa`+ (already true:
-  `2026-05-19-insee-10k-k8s/`).
-- Some bandwidth: this is ~2-3 commits worth of work plus an image
-  rebuild.
+- [x] ndcg-gate K8s green with TREC-COVID extension predecessor
+  recorded.
+- [x] insee-bench K8s green on `df3b0aa`+:
+  `2026-05-19-insee-10k-k8s/`.
+- [x] Elasticsearch 8.6.1 oracle gate executed:
+  `ci-k8s` run `26192816780`, 30 requests, 0 skipped, 0 divergence.

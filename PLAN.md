@@ -224,6 +224,9 @@ deferred to a follow-up plan when scoped.
   `docs/ops/bench-reports/2026-05-20-b1-oracle-ES861-K8s/`.
 - [x] Keep `docs/wp-d-matchid/gap-analysis.md` in sync with the
   Elasticsearch 8.6.1 oracle replay and document remaining parity gaps.
+- [x] Clean the active matchID docs so B1 and the swap guide point at
+  Elasticsearch 8.6.1 as the live oracle; OpenSearch 2.17 remains only
+  historical/client-compat context.
 - [x] Historical note: `ci-k8s` run `26136585015` targeted the obsolete
   pre-correction oracle image; it is no longer the active matchID target
   and must not be used as final D parity proof.

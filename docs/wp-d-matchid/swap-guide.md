@@ -36,15 +36,17 @@ production matchID dataset.
 
 ### 1.3 Hardware budget
 
-Single-node Surch, on the same VM shape as the production OS node:
+Single-node Surch, on the same VM shape as the production
+Elasticsearch 8.6.1 node:
 
 - **vCPU**: ≥ 4 (matches the artillery rehearsal budget).
 - **RAM**: ≥ 32 GB (≥ 24 GB for Surch heap + page cache for the
   posting lists, ≥ 4 GB reserved for the kernel).
 - **Disk**: raw-index size ≈ 1.6 × `_source` bytes for the INSEE
   `deces` corpus (≈ 8 GB / 25 M docs after compression, vs ≈ 14 GB
-  for an OS 2.17 index of the same corpus). Add 1.2 × headroom for
-  the `index_prefixes` fan-out once A13 ships.
+  for the previous OpenSearch 2.17 sizing estimate of the same corpus).
+  Re-measure the Elasticsearch 8.6.1 index before capacity sign-off.
+  Add 1.2 × headroom for the `index_prefixes` fan-out once A13 ships.
 - **Network**: loopback or same-AZ — Surch does not currently
   support cross-cluster reads (out of scope for WP-D).
 
@@ -89,7 +91,8 @@ operators can flip the env var back at any time without data loss.
 ### Shadow mode / incremental swap — explicitly out of scope
 
 Earlier drafts of this guide proposed a shadow-mode strategy
-(double-write to OS + Surch, log divergence, gradually shift traffic)
+(double-write to Elasticsearch 8.6.1 + Surch, log divergence, gradually
+shift traffic)
 and an incremental-by-workload strategy (bulk-match first, then
 interactive, then autocomplete, etc.). Both are **withdrawn**:
 
@@ -108,15 +111,16 @@ matchID changes that decision, this guide is amended.
 
 **TTR ≤ 5 min**:
 
-1. Flip `ELASTIC_URL` back to the OS cluster (kept warm during the
-   quarantine window).
+1. Flip `ELASTIC_URL` back to the Elasticsearch 8.6.1 cluster (kept
+   warm during the quarantine window).
 2. Restart `deces-backend`.
-3. Confirm OS is serving traffic via `_cluster/health`.
+3. Confirm Elasticsearch is serving traffic via `_cluster/health`.
 
-If the quarantine window is over and OS has been decommissioned, the
-rollback path is to re-deploy OS from its last snapshot — far slower
-(hours), and assumes matchID retains its OS snapshots. **Do not
-decommission OS before ≥ 30 days of green Surch operation.**
+If the quarantine window is over and Elasticsearch has been
+decommissioned, the rollback path is to re-deploy Elasticsearch from its
+last snapshot — far slower (hours), and assumes matchID retains its
+Elasticsearch snapshots. **Do not decommission Elasticsearch before
+≥ 30 days of green Surch operation.**
 
 ## 4. Minimum observability
 
@@ -152,16 +156,17 @@ the local `tracing_subscriber` stays installed.
 
 - [ ] Every row in `docs/wp-d-matchid/gap-analysis.md` reads
   `implemented` or `declined`.
-- [ ] B1 replay fixture is green against OS 2.17.1 expectations,
-  not just Surch HEAD.
+- [ ] B1 replay fixture is green against Elasticsearch 8.6.1
+  expectations, not just Surch HEAD. Current proof:
+  `ci-k8s` run `26192816780`, 30 requests, 0 skipped, 0 divergence.
 - [ ] B2 INSEE slice is the real INSEE `deces-2020-m01.txt.gz`
   10 k extract.
 - [ ] The artillery scenario from
   `docs/wp-d-matchid/incoming/2026-05-15-deces-backend-dsl-inventory.md`
   §4 passes on the candidate Surch version with p95 ≤ 200 ms /
   max ≤ 500 ms / errors ≤ 1 %.
-- [ ] OS cluster is hot and reachable for a ≥ 7 day quarantine
-  rollback.
+- [ ] Elasticsearch 8.6.1 cluster is hot and reachable for a ≥ 7 day
+  quarantine rollback.
 - [ ] Prometheus scrape job for Surch is wired and producing series.
 - [ ] matchID team has the runbook for §3 rollback memorised /
   pinned in the on-call channel.

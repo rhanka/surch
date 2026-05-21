@@ -42,8 +42,9 @@ A useful intake file in `incoming/` answers, in order:
 
 1. **Workload context** — which matchID code path triggers this query,
    what real users are doing, what error they hit today against Surch.
-2. **OpenSearch wire shape** — the actual JSON body and URL parameters
-   matchID sends, copy-pasted from production logs after PII redaction.
+2. **Elasticsearch 8.6.1 wire shape** — the actual JSON body and URL
+   parameters matchID sends, copy-pasted from production logs after PII
+   redaction.
 3. **Expected response** — the JSON Surch must return so matchID code
    keeps working without change. Include the relevant `_source`
    fields, `_score` semantics, and `hits.total` shape.
