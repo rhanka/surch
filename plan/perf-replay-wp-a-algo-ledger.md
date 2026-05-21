@@ -97,6 +97,11 @@ environment evidence to make the comparison meaningful.
   errors, missing artifact, failed Job condition, missing config
   evidence, or untracked image tag makes the replay group `invalid`
   until rerun.
+- [ ] Do not count `ci-k8s` run `26200481514` as one of the final
+  repeated A-replay proofs: it is a useful K8s smoke with a passing
+  benchmark, but the pod metrics were unavailable post-completion and
+  node metrics were forbidden for the workflow service account. Count
+  only repetitions produced after live top sampling is present.
 - [ ] For search-ranking-sensitive changes, pair the latency replay with
   `ndcg-gate` or a promoted quality artifact; report NDCG@10 and
   Recall@10 beside latency before claiming the optimisation safe.

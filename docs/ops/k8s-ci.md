@@ -154,6 +154,9 @@ GHA uploads an artifact named `k8s-bench-<job>-<sha>`. It contains:
   error if unavailable;
 - `<job>.nodes.top.txt` from `kubectl top nodes`, or the metrics API
   error if unavailable;
+- `<job>.pods.top.samples.txt` and `<job>.nodes.top.samples.txt`, sampled
+  during the wait loop every ~10 s so completed Pods do not erase the
+  only metrics window;
 - `<job>.events.txt` and `<job>.job.events.txt`;
 - `<job>.job.log`;
 - per-pod/per-container logs, including `*.previous.log` when present;
@@ -208,9 +211,17 @@ Cluster monitoring evidence to preserve:
 - [ ] Namespace events sorted by timestamp and Job-scoped events.
 - [ ] Driver logs plus reconstructed benchmark summary.
 - [ ] Node/pod CPU and memory snapshots when the cluster metrics API is
-  available via `<job>.pods.top.txt` and `<job>.nodes.top.txt`; if
-  metrics are unavailable, those files preserve the `kubectl top` error
-  instead of failing the workflow.
+  available via `<job>.pods.top.samples.txt`,
+  `<job>.nodes.top.samples.txt`, `<job>.pods.top.txt`, and
+  `<job>.nodes.top.txt`; if metrics are unavailable, those files
+  preserve the `kubectl top` error instead of failing the workflow.
+
+Operational note from `ci-k8s` run `26200481514`: the benchmark itself
+passed, but post-completion `kubectl top pods` was too late for pod
+metrics and `kubectl top nodes` was forbidden for the workflow service
+account. Treat that run as a K8s smoke proof, not as one of the final
+three repeated Track A performance proofs. The live wait-loop samples
+above are required before counting new repetitions.
 
 Aggregation expected in promoted reports:
 

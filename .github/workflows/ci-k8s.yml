@@ -161,8 +161,11 @@ jobs:
       - name: Wait for Job completion (30 min cap)
         run: |
           set -eu
+          mkdir -p target/bench-reports/k8s
           JOB_NAME="${{ steps.jobname.outputs.name }}"
           JOB_LABEL="app.kubernetes.io/component=${{ inputs.job }}"
+          POD_TOP_SAMPLES="target/bench-reports/k8s/${{ inputs.job }}.pods.top.samples.txt"
+          NODE_TOP_SAMPLES="target/bench-reports/k8s/${{ inputs.job }}.nodes.top.samples.txt"
           deadline=$((SECONDS + 1800))
           while [ "$SECONDS" -le "$deadline" ]; do
             conditions="$(kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" \
@@ -202,6 +205,14 @@ jobs:
               kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
               exit 1
             fi
+            {
+              echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+              kubectl -n "$SCW_NAMESPACE" top pods -l "$JOB_LABEL" --containers
+            } >> "$POD_TOP_SAMPLES" 2>&1 || true
+            {
+              echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+              kubectl top nodes
+            } >> "$NODE_TOP_SAMPLES" 2>&1 || true
             kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" -o wide || true
             sleep 10
           done

@@ -211,7 +211,7 @@ deferred to a follow-up plan when scoped.
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~4% (1 open / 25 leaf tasks).
+Reste estime: ~4% (1 open / 26 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -286,6 +286,9 @@ Reste estime: ~4% (1 open / 25 leaf tasks).
   `SuccessCriteriaMet=True`, `Complete=True`, and artifact
   `k8s-bench-ndcg-gate-09d1f15dedb3e176ae6a9d5f89ef49100496776f`
   containing `ndcg-gate.summary.md` and `ndcg-gate.bench.json`.
+- [x] `ci-k8s` now samples `kubectl top` during the wait loop after run
+  `26200481514` showed post-completion pod metrics can be unavailable;
+  that run is a K8s smoke, not a final A-replay repetition.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
 - [x] Apply the Surch tenant quota bump from `poc-k8s` HEAD `980d58d`

@@ -163,6 +163,10 @@ Status: active infra lane; merge state below is the source of truth
     `ci-k8s` artifact with `<job>.pods.top.txt` and
     `<job>.nodes.top.txt`; metrics API errors are captured in the files
     without changing the Job verdict.
+  - [x] Add wait-loop Kubernetes metrics samples with
+    `<job>.pods.top.samples.txt` and `<job>.nodes.top.samples.txt` after
+    `ci-k8s` run `26200481514` showed post-completion top snapshots can
+    be too late for completed Pods.
   - [x] Make default `ci` fail-closed with a 20 minute cargo-test
     timeout.
   - [x] Apply the Surch tenant ResourceQuota bump required by the
