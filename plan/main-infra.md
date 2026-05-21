@@ -167,6 +167,18 @@ Status: active infra lane; merge state below is the source of truth
     `<job>.pods.top.samples.txt` and `<job>.nodes.top.samples.txt` after
     `ci-k8s` run `26200481514` showed post-completion top snapshots can
     be too late for completed Pods.
+  - [x] Diagnose `ci-k8s` run `26201223312`: `insee-bench` produced a
+    benchmark summary, live pod samples, and final
+    `SuccessCriteriaMet=True` / `Complete=True`, but the wait loop
+    false-failed on expected restartable init-container sidecar exits
+    after the driver exited `0`.
+  - [x] When a Job pod reaches `phase=Succeeded`, wait for
+    `condition=complete` before evaluating terminal sidecar exits, so
+    fail-closed startup/runtime checks remain active without masking a
+    successful Job.
+  - [ ] Re-run `insee-bench` after the sidecar-completion wait-loop fix
+    and count the run only if it uploads the benchmark summary, Job
+    conditions, pod diagnostics, and live pod metrics samples.
   - [x] Make default `ci` fail-closed with a 20 minute cargo-test
     timeout.
   - [x] Apply the Surch tenant ResourceQuota bump required by the

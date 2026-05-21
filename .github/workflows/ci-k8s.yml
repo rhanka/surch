@@ -187,6 +187,14 @@ jobs:
             if [ -n "$pod_states" ]; then
               printf '%s\n' "$pod_states"
             fi
+            if printf '%s\n' "$pod_states" | grep -Eq '\|phase=Succeeded\|'; then
+              if kubectl -n "$SCW_NAMESPACE" wait \
+                --for=condition=complete "job/$JOB_NAME" \
+                --timeout=30s >/dev/null 2>&1; then
+                echo "Kubernetes Job $JOB_NAME completed after pod reached phase=Succeeded."
+                exit 0
+              fi
+            fi
             if printf '%s\n' "$pod_states" | grep -Eq '\|phase=Failed\|'; then
               echo "::error::Kubernetes pod for Job $JOB_NAME reached phase=Failed."
               kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true

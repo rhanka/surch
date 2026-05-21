@@ -111,6 +111,9 @@ axis-by-axis performance state is now tracked in
   three successful repetitions, and promoted reports must preserve image
   tags, pod/cluster configuration, monitoring diagnostics, run ids,
   artifacts, and repeated-run aggregation.
+- [x] Preserve failed/invalid replay attempts in the trace: K8s runs
+  `26200481514` and `26201223312` are documented as diagnostics only
+  and do not count toward the required 3/3 final repetitions.
 - [ ] Keep future Track A optimisation commits tied to a promoted perf
   report and an update to the Track A performance ledger.
 
@@ -211,7 +214,7 @@ deferred to a follow-up plan when scoped.
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~4% (1 open / 26 leaf tasks).
+Reste estime: ~7% (2 open / 28 leaf tasks).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -289,6 +292,17 @@ Reste estime: ~4% (1 open / 26 leaf tasks).
 - [x] `ci-k8s` now samples `kubectl top` during the wait loop after run
   `26200481514` showed post-completion pod metrics can be unavailable;
   that run is a K8s smoke, not a final A-replay repetition.
+- [x] `ci-k8s` run `26201223312` diagnosed the next wait-loop edge:
+  `insee-bench` produced a benchmark summary, live pod samples, and
+  final `SuccessCriteriaMet=True` / `Complete=True`, but the workflow
+  false-failed on expected restartable init-container sidecar exits
+  after the benchmark driver exited `0`.
+- [x] When a Job pod reaches `phase=Succeeded`, `ci-k8s` now waits for
+  `condition=complete` before evaluating terminal sidecar exits, keeping
+  the early failure checks without masking a successful Job.
+- [ ] Re-run `insee-bench` after the sidecar-completion wait-loop fix
+  and count it only if the artifact includes summary, Job conditions,
+  pod diagnostics, and live pod metrics samples.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
 - [x] Apply the Surch tenant quota bump from `poc-k8s` HEAD `980d58d`

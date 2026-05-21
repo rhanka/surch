@@ -223,6 +223,18 @@ account. Treat that run as a K8s smoke proof, not as one of the final
 three repeated Track A performance proofs. The live wait-loop samples
 above are required before counting new repetitions.
 
+Operational note from `ci-k8s` run `26201223312`: the benchmark summary
+and live pod metric samples were captured, and the final Job conditions
+were `SuccessCriteriaMet=True` and `Complete=True`, but the workflow
+failed before reporting success. Root cause: after the benchmark driver
+exited `0`, Kubernetes stopped the restartable init-container sidecars
+and reported expected exits (`surch` 137, OpenSearch 143) while the Pod
+was already `Succeeded`; the wait loop evaluated those exits before the
+Job `Complete=True` condition was visible. Treat the run as diagnostics
+only, not as one of the three final Track A repetitions. The wait loop
+now waits for `condition=complete` when a Job pod reaches
+`phase=Succeeded` before evaluating terminal sidecar exits.
+
 Aggregation expected in promoted reports:
 
 - [ ] Per repetition: Surch and reference p50 / p95 / p99 / max, errors,

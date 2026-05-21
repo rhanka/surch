@@ -102,6 +102,13 @@ environment evidence to make the comparison meaningful.
   benchmark, but the pod metrics were unavailable post-completion and
   node metrics were forbidden for the workflow service account. Count
   only repetitions produced after live top sampling is present.
+- [ ] Do not count `ci-k8s` run `26201223312` as one of the final
+  repeated A-replay proofs: it captured a benchmark summary and live pod
+  samples, but the workflow false-failed before success reporting because
+  expected restartable init-container sidecar exits were treated as
+  terminal after the benchmark driver completed. Count only repetitions
+  produced after the wait-loop sidecar-completion fix is merged and
+  re-run.
 - [ ] For search-ranking-sensitive changes, pair the latency replay with
   `ndcg-gate` or a promoted quality artifact; report NDCG@10 and
   Recall@10 beside latency before claiming the optimisation safe.
