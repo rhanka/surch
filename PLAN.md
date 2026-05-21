@@ -148,9 +148,17 @@ Reste estime: ~25% (2 open / 10 leaf tasks).
   - [ ] Wire RSS peak/final into the K8s Track A replay artifact family
     before any A-replay memory-layout report claims a memory win.
 - [ ] Diagnose the TREC-COVID quality blocker before making it an
-  acceptance gate: Surch completed all 50 qids but returned
-  `NDCG@10=0.0000`, `Recall@10=0.0000` while OpenSearch returned
-  `NDCG@10=0.1141`, `Recall@10=0.0026`.
+  acceptance gate.
+  - [x] `61a13f8` makes the TREC-COVID script fail closed on HTTP
+    errors and keeps bulk chunks below Surch's 16 MiB request cap; old
+    run `26157480132` was a false green with hidden 413/400 curl
+    failures.
+  - [x] Rerun `26202629281` on `61a13f8` failed closed as intended:
+    no 413 remained, but a remaining HTTP 400 stopped the gate before a
+    summary could be published.
+  - [ ] Run the instrumented `ndcg-gate` scripts and use the emitted
+    operation label plus response body to isolate and fix the remaining
+    400.
 - [x] Quota-unblocked `ndcg-gate` was dispatched and promoted
   (`poc-k8s` live quota `1500m/1Gi`, `4500m/6Gi`; run
   `26157480132`).

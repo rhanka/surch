@@ -14,6 +14,43 @@ DATA="$BEIR_ROOT/scifact"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+SCRIPT_NAME="${0##*/}"
+
+http_request() {
+  local label="${1:?label}"
+  local method="${2:?method}"
+  local url="${3:?url}"
+  shift 3
+
+  local response_file
+  response_file=$(mktemp "$TMP/http-response.XXXXXX")
+  local status
+  local curl_rc=0
+  status=$(curl -sS -o "$response_file" -w '%{http_code}' -X "$method" "$@" "$url") || curl_rc=$?
+
+  if [ "$curl_rc" -ne 0 ]; then
+    echo "[$SCRIPT_NAME] curl failed during $label: $method $url (exit $curl_rc)" >&2
+    if [ -s "$response_file" ]; then
+      echo "[$SCRIPT_NAME] response body:" >&2
+      sed -n '1,40p' "$response_file" >&2
+    fi
+    return "$curl_rc"
+  fi
+
+  if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+    echo "[$SCRIPT_NAME] HTTP $status during $label: $method $url" >&2
+    if [ -s "$response_file" ]; then
+      echo "[$SCRIPT_NAME] response body:" >&2
+      sed -n '1,40p' "$response_file" >&2
+    else
+      echo "[$SCRIPT_NAME] response body: <empty>" >&2
+    fi
+    return 22
+  fi
+
+  cat "$response_file"
+}
+
 for required in "$DATA/corpus.jsonl" "$DATA/queries.jsonl" "$DATA/qrels/test.tsv"; do
   if [ ! -s "$required" ]; then
     echo "missing SciFact input: $required" >&2
@@ -33,13 +70,13 @@ else
 fi
 
 curl -fsS -X DELETE "$URL/$INDEX" >/dev/null 2>&1 || true
-curl -fsS -X PUT "$URL/$INDEX" -H 'Content-Type: application/json' \
+http_request "create index $INDEX" PUT "$URL/$INDEX" -H 'Content-Type: application/json' \
   -d '{"mappings":{"properties":{"title":{"type":"text"},"text":{"type":"text"}}}}' >/dev/null
 t0=$(date +%s.%N)
-curl -fsS -X POST "$URL/_bulk" -H 'Content-Type: application/x-ndjson' --data-binary "@$NDJSON" >/dev/null
+http_request "bulk ingest $INDEX" POST "$URL/_bulk" -H 'Content-Type: application/x-ndjson' --data-binary "@$NDJSON" >/dev/null
 t1=$(date +%s.%N)
 bulk_ms=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", (b-a)*1000 }')
-curl -fsS -X POST "$URL/$INDEX/_refresh" >/dev/null
+http_request "refresh $INDEX" POST "$URL/$INDEX/_refresh" >/dev/null
 
 # Extract test query ids and their relevant doc ids from qrels
 # Format: query-id<TAB>corpus-id<TAB>score
@@ -62,7 +99,7 @@ while read -r qid; do
   # Escape for JSON
   qjson=$(printf '%s' "$qtext" | jq -Rsa . | sed 's/^"//;s/"$//')
   body=$(printf '{"query":{"multi_match":{"query":"%s","fields":["title","text"]}},"size":10,"track_total_hits":false}' "$qjson")
-  resp=$(curl -fsS -X POST "$URL/$INDEX/_search" -H 'Content-Type: application/json' --data "$body")
+  resp=$(http_request "search $INDEX qid=$qid" POST "$URL/$INDEX/_search" -H 'Content-Type: application/json' --data "$body")
   # Top hit ids in rank order
   top10=$(jq -r '.hits.hits[]._id' <<<"$resp")
   if [ -z "$top10" ]; then

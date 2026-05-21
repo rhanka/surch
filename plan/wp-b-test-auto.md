@@ -6,15 +6,20 @@ Worktree: `.worktrees/wp-b`
 Owner: conductor / benchmark automation owner
 Status: Lot 3 + Lot N closed on `main` for the summary/reporting
 contract and promoted INSEE/SciFact/BAN evidence. The quota-unblocked
-K8s `ndcg-gate` run passed at the workflow level and is promoted as a
-diagnostic report, but TREC-COVID remains a quality blocker:
-Surch NDCG@10/Recall@10 were both `0.0000`. Long branch
-`wp/b-test-auto` head `65fc759` kept for history.
+K8s `ndcg-gate` run `26157480132` passed at the workflow level and is
+promoted as a diagnostic report, but it was a false green for
+TREC-COVID: hidden curl 413/400 failures produced
+`NDCG@10=0.0000` / `Recall@10=0.0000`. Commit `61a13f8` makes those
+HTTP errors fail closed; rerun `26202629281` confirms the 413 is gone
+and leaves one HTTP 400 to isolate with instrumented script logs. Long
+branch `wp/b-test-auto` head `65fc759` kept for history.
 
 ## Finality
 
 - [ ] Deliver replayable, comparable benchmark reporting with explicit
   SLO verdicts.
+  - [ ] Turn the current TREC-COVID diagnostic into a real acceptance
+    gate after the remaining HTTP 400 is root-caused and fixed.
 
 ## Scope
 
@@ -52,6 +57,10 @@ Surch NDCG@10/Recall@10 were both `0.0000`. Long branch
   `--elasticsearch-url` is the documented flag; `--opensearch-url`
   remains a legacy alias only.
 - [ ] `wp/b-test-auto` contains the next branch-specific delivery.
+  - [x] Main contains the TREC-COVID fail-closed safety fix:
+    `61a13f8`.
+  - [ ] Main contains the final TREC-COVID quality fix and promoted
+    passing rerun.
 
 ## Lots
 
@@ -144,3 +153,23 @@ Surch NDCG@10/Recall@10 were both `0.0000`. Long branch
     + `3006fae` baseline INSEE promo on `main`. The TREC-COVID
     promo will record its own SHA + run id when the quota apply
     unblocks it.
+
+- [ ] Lot 4 - TREC-COVID fail-closed diagnosis
+  - [x] Root-cause the old false green: run `26157480132` had hidden
+    `curl` 413/400 failures and still produced a TREC-COVID report with
+    zero quality.
+  - [x] Keep TREC-COVID bulk chunks below Surch's 16 MiB body cap:
+    `TREC_COVID_BULK_CHUNK_SIZE=8m`.
+  - [x] Make `trec-covid-ndcg.sh` fail closed with
+    `set -euo pipefail`; commit `61a13f8`.
+  - [x] Re-run K8s `ndcg-gate` after the fail-closed fix:
+    run `26202629281` failed on one remaining HTTP 400 and published no
+    summary, which is the intended failure mode until the request is
+    valid.
+  - [x] Add script-level HTTP diagnostics for SciFact and TREC-COVID:
+    failed requests now print operation label, method, URL, status, and
+    response body.
+  - [ ] Re-run `ndcg-gate` with the diagnostic scripts and capture the
+    exact failing operation and response body.
+  - [ ] Fix the root cause of that HTTP 400, then promote a passing
+    report before treating TREC-COVID as an acceptance gate.
