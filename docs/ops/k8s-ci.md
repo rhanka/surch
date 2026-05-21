@@ -149,6 +149,11 @@ GHA uploads an artifact named `k8s-bench-<job>-<sha>`. It contains:
 - `<job>.job.describe.txt` and `<job>.job.yaml`;
 - `<job>.job.conditions.txt`;
 - `<job>.pods.txt` and `<job>.pods.describe.txt`;
+- `<job>.pods.top.txt` from `kubectl top pods -l
+  app.kubernetes.io/component=<job> --containers`, or the metrics API
+  error if unavailable;
+- `<job>.nodes.top.txt` from `kubectl top nodes`, or the metrics API
+  error if unavailable;
 - `<job>.events.txt` and `<job>.job.events.txt`;
 - `<job>.job.log`;
 - per-pod/per-container logs, including `*.previous.log` when present;
@@ -203,7 +208,9 @@ Cluster monitoring evidence to preserve:
 - [ ] Namespace events sorted by timestamp and Job-scoped events.
 - [ ] Driver logs plus reconstructed benchmark summary.
 - [ ] Node/pod CPU and memory snapshots when the cluster metrics API is
-  available; if metrics are unavailable, state that explicitly.
+  available via `<job>.pods.top.txt` and `<job>.nodes.top.txt`; if
+  metrics are unavailable, those files preserve the `kubectl top` error
+  instead of failing the workflow.
 
 Aggregation expected in promoted reports:
 

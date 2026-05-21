@@ -439,6 +439,54 @@ async fn snapshot_restore_round_trip_brings_docs_back() {
 }
 
 #[tokio::test]
+async fn snapshot_restore_over_existing_index_returns_snapshot_exception() {
+    let router = app_router();
+    let dir = tempdir("restore-conflict");
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local",
+        json!({
+            "type": "fs",
+            "settings": { "location": dir.display().to_string() }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = put(&router, "/source", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    bulk_index(
+        &router,
+        "source",
+        &[("doc-1".into(), json!({ "title": "alpha" }))],
+    )
+    .await;
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local/snap-conflict",
+        json!({ "indices": "source" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post(
+        &router,
+        "/_snapshot/local/snap-conflict/_restore",
+        json!({ "indices": "source" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["type"], json!("snapshot_exception"));
+    let reason = body["error"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("cannot restore index [source]") && reason.contains("already exists"),
+        "reason should explain the existing-index restore conflict, got `{reason}`"
+    );
+}
+
+#[tokio::test]
 async fn snapshot_take_when_repository_missing_returns_404() {
     let router = app_router();
 

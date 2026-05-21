@@ -154,7 +154,7 @@ Reste estime: ~25% (2 open / 10 leaf tasks).
 
 ## Track C - Ops / Packaging / Snapshots
 
-Reste estime: ~35% (4 open / 12 leaf tasks).
+Reste estime: ~30% (4 open / 13 leaf tasks).
 
 - [x] Docker, Helm, release, signing, and SBOM work landed.
 - [x] Snapshot and SLM work started on `wp/c-ops`.
@@ -175,6 +175,9 @@ Reste estime: ~35% (4 open / 12 leaf tasks).
     repository using the same `snapshots: [...]` envelope as
     unitary snapshot GETs.
 - [ ] Finish restore coverage.
+  - [x] `POST /_snapshot/{repo}/{snap}/_restore` refuses to restore over
+    an existing live index with `400 snapshot_exception` and an explicit
+    `already exists` reason.
 - [ ] Finish remaining SLM retention behavior beyond `max_count`.
 - [ ] Keep release verification reproducible from CI artefacts.
 - [x] Preserve a minimal path to inspect failing snapshot runs.

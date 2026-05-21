@@ -159,6 +159,10 @@ Status: active infra lane; merge state below is the source of truth
   - [x] Make `ndcg-gate` publish a human benchmark summary into the
     uploaded artifact even when post-completion `kubectl cp` cannot
     read `/reports` from the terminated driver container.
+  - [x] Preserve best-effort Kubernetes metrics snapshots in the
+    `ci-k8s` artifact with `<job>.pods.top.txt` and
+    `<job>.nodes.top.txt`; metrics API errors are captured in the files
+    without changing the Job verdict.
   - [x] Make default `ci` fail-closed with a 20 minute cargo-test
     timeout.
   - [x] Apply the Surch tenant ResourceQuota bump required by the

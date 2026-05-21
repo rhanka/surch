@@ -71,6 +71,9 @@ Status: active branch exists; latest branch head `2625edd`
       suite and return the same `snapshots: [...]` envelope as unitary
       snapshot GETs.
   - [ ] Finish restore coverage.
+    - [x] Cover `POST /_snapshot/{repo}/{snap}/_restore` refusing to
+      restore over an existing live index with `400 snapshot_exception`
+      and an explicit `already exists` reason.
   - [x] Cover and implement SLM `retention.max_count` pruning for
     successful snapshots.
   - [ ] Finish remaining SLM retention behavior beyond `max_count`.

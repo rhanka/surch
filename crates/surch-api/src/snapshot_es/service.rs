@@ -419,7 +419,7 @@ pub fn restore_snapshot(
     for index in &wanted {
         if state.index_exists(index) {
             return Err(SnapshotServiceError::BadRequest(format!(
-                "cannot restore index [{index}] over an existing one"
+                "cannot restore index [{index}] because it already exists"
             )));
         }
         let idx_uuid = &manifest

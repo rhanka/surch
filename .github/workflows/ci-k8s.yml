@@ -233,6 +233,10 @@ jobs:
           kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" \
             -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' \
             > "$OUT_DIR/${{ inputs.job }}.job.conditions.txt" 2>&1 || true
+          kubectl -n "$SCW_NAMESPACE" top pods -l "$JOB_LABEL" --containers \
+            > "$OUT_DIR/${{ inputs.job }}.pods.top.txt" 2>&1 || true
+          kubectl top nodes \
+            > "$OUT_DIR/${{ inputs.job }}.nodes.top.txt" 2>&1 || true
 
           REPORT_CONTAINER=""
           REPORT_FILES=""
