@@ -197,11 +197,22 @@ branch `wp/b-test-auto` head `65fc759` kept for history.
     bump did not buy throughput. The variance in peak RSS (2645 vs
     2964 MiB) on the same 3 GiB cap indicates the corpus does not
     fit reliably in 3 GiB.
-  - [ ] Next decision required: voie (a) is exhausted at the current
-    Surch architecture (single-threaded bulk + sub-linear but variable
-    memory growth). Either (b) defer TREC-COVID full corpus until the
-    Track A memory-layout follow-up lands, keeping SciFact as the only
-    BEIR gate; or (c) reduce the TREC-COVID corpus to the relevant-docs
-    pool (~5 k from qrels) plus a sampled distractor set, and document
-    that the gate measures cross-engine NDCG@10 on the reduced corpus,
-    not the Anserini full-corpus baseline.
+  - [x] Quota bump path (poc-k8s `aaa6b9b` + surch `2d286c8`): tenant
+    `limits.memory` 6Gi -> 7Gi, Surch container limit 3Gi -> 4Gi
+    while OS and driver stay at 2Gi+1Gi. Run `26300123587` failed in
+    17m47s with OOM at chunk 19 of ~21 (Surch peak 3961 MiB under the
+    new 4 GiB cap). Growth rate is ~+200 MiB per 8 MiB NDJSON chunk
+    (~25x in-memory bloat over raw input), so the full 171 k corpus
+    needs roughly 4.5-5 GiB reliably. Going to 5 GiB Surch would push
+    the tenant quota past the DEV1-XL safe envelope (8 GiB node, ~1 GiB
+    reserved for kubelet + system pods), so the pragmatic ceiling at
+    the current Surch architecture is somewhere between chunk 19 and
+    21 out of ~21.
+  - [ ] Final decision required after the quota path closed: either
+    (b) treat the full 171 k TREC-COVID corpus as a documented Surch
+    memory limit pending the Track A memory-layout follow-up and keep
+    SciFact as the only BEIR acceptance gate; or (c) reduce the
+    TREC-COVID corpus to the qrels-relevant pool plus a sampled
+    distractor set (~5 k docs) and document that the gate measures
+    cross-engine NDCG@10 on the reduced corpus instead of the Anserini
+    full-corpus baseline.
