@@ -93,10 +93,55 @@ http_request "create index $INDEX" PUT "$URL/$INDEX" -H 'Content-Type: applicati
 # Bulk ingest. TREC-COVID is ~200 MB; ship it in chunks below Surch's
 # 16 MiB `_bulk` body cap. Keep the size operator-visible so K8s can override
 # it without editing the script.
+#
+# Pair-aware chunking: every NDJSON _bulk line comes as (action, source) pairs.
+# Plain `split -C` cuts on line boundaries but ignores pair boundaries, which
+# leaves a stranded `index` action at the end of one chunk and breaks the next
+# `_bulk` POST with `missing source line after \`index\` action`. We chunk in
+# awk by accumulating bytes only at pair boundaries.
+parse_size_to_bytes() {
+  local raw="${1:?size}"
+  case "$raw" in
+    *[kK])  printf '%s' "$(( ${raw%[kK]} * 1024 ))" ;;
+    *[mM])  printf '%s' "$(( ${raw%[mM]} * 1024 * 1024 ))" ;;
+    *[gG])  printf '%s' "$(( ${raw%[gG]} * 1024 * 1024 * 1024 ))" ;;
+    *[0-9]) printf '%s' "$raw" ;;
+    *)
+      echo "[$SCRIPT_NAME] invalid TREC_COVID_BULK_CHUNK_SIZE='$raw'" >&2
+      return 2
+      ;;
+  esac
+}
 t0=$(date +%s.%N)
-split -C "$TREC_COVID_BULK_CHUNK_SIZE" -d -a 4 "$NDJSON" "$TMP/bulk."
+chunk_max_bytes=$(parse_size_to_bytes "$TREC_COVID_BULK_CHUNK_SIZE")
+awk -v out="$TMP/bulk" -v maxb="$chunk_max_bytes" '
+  BEGIN { i = 0; sz = 0; cf = sprintf("%s.%04d", out, i); action = "" }
+  {
+    if (NR % 2 == 1) { action = $0; next }
+    pair = length(action) + 1 + length($0) + 1
+    if (sz + pair > maxb && sz > 0) {
+      close(cf); i++
+      cf = sprintf("%s.%04d", out, i); sz = 0
+    }
+    print action > cf
+    print $0 > cf
+    sz += pair
+  }
+  END {
+    if (NR % 2 == 1) {
+      printf "[trec-covid-ndcg.sh] odd line count in %s (NR=%d) — unpaired action\n", FILENAME, NR > "/dev/stderr"
+      exit 2
+    }
+    if (cf != "") close(cf)
+  }
+' "$NDJSON"
 for chunk in "$TMP"/bulk.*; do
-  # Ensure each chunk ends on a newline (split -C already respects line boundaries)
+  # Defence-in-depth: each chunk must have an even line count (action+source pairs).
+  chunk_lines=$(wc -l < "$chunk")
+  if [ "$(( chunk_lines % 2 ))" -ne 0 ]; then
+    echo "[$SCRIPT_NAME] $(basename "$chunk") has $chunk_lines lines (odd) — refusing to POST" >&2
+    exit 22
+  fi
   http_request "bulk ingest $INDEX chunk $(basename "$chunk")" POST "$URL/_bulk" -H 'Content-Type: application/x-ndjson' \
     --data-binary "@$chunk" >/dev/null
 done
