@@ -8,23 +8,23 @@
 #
 # The Pod-anti-affinity story stays simple here: both engines are local
 # to the Pod, talking over localhost. Resource envelope (post TREC-COVID
-# bumps — corpus is 171 k docs; earlier 512Mi/2Gi/3Gi Surch limits all
-# OOM'd before the corpus finished. Run 26285164167 OOM'd at chunk 14
-# under Surch=3Gi (peak 2964 MiB, run-to-run variance +319 MiB).
-# poc-k8s tenant quota was raised to limits.memory=7Gi to give the
-# ndcg-gate Job real headroom; Surch now gets 4Gi which leaves margin
-# above the 2964 MiB observed peak, and the OS+driver stay at 3Gi
-# combined to fit the 7 GiB tenant cap. The 800m-only effective Surch
-# CPU is a separate single-thread bulk-path bottleneck that needs a
-# code-level fix on the Track A side, not more cores):
-#   surch       cpu  150m req / 2000m lim ; mem 256Mi req / 4096Mi lim
+# 2026-05-22 chain — 512Mi/2Gi/3Gi/4Gi Surch limits each OOM'd before
+# the 171 k corpus finished; run 26300123587 under Surch=4Gi peaked at
+# 3961 MiB and OOM'd at chunk 19 of ~21. Going to Surch=7Gi gives
+# ~3 GiB headroom above the observed peak for run-to-run variance.
+# Requires the poc-k8s burst pool to be DEV1-XL (12 GiB) and the
+# tenant ResourceQuota to be `limits.memory=10Gi`. The 800m-only
+# effective Surch CPU is a separate single-thread bulk-path bottleneck
+# that still needs a code-level fix on the Track A side, not more
+# cores):
+#   surch       cpu  150m req / 2000m lim ; mem 256Mi req / 7168Mi lim
 #   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 2048Mi lim  (JVM Xmx=1g)
 #   driver      cpu  100m req /  500m lim ; mem 128Mi req / 1024Mi lim
 #   ---------------------------------------------------------------
-#   total       cpu  500m req / 3700m lim ; mem 640Mi req / 7168Mi lim
-# Requires the tenant ResourceQuota in poc-k8s to allow limits.memory>=6Gi
-# (the previous 3Gi cap covered SciFact only). Runs on the DEV1-XL (4 vCPU /
-# 8 GiB) burst node — DEV1-L is no longer enough.
+#   total       cpu  500m req / 3700m lim ; mem 640Mi req / 10240Mi lim
+# Requires the tenant ResourceQuota in poc-k8s to allow
+# limits.memory>=10Gi. Runs on the DEV1-XL (4 vCPU / 12 GiB) burst
+# node — DEV1-L is no longer enough.
 #
 # `${SURCH_SHA}` is substituted by the GHA workflow via envsubst and
 # rendered into the docker-build.yml tag format: `sha-<full commit SHA>`.
@@ -86,7 +86,7 @@ spec:
             - { name: RUST_LOG,   value: "warn" }
           resources:
             requests: { cpu: 150m, memory: 256Mi }
-            limits:   { cpu: 2000m, memory: 4Gi }
+            limits:   { cpu: 2000m, memory: 7Gi }
           volumeMounts:
             - { name: scratch, mountPath: /var/surch }
         # --- Engine sidecar #2: OpenSearch baseline -------------------
