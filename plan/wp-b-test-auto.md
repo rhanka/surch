@@ -187,12 +187,21 @@ branch `wp/b-test-auto` head `65fc759` kept for history.
     cap) but run `26267979042` hit the 30-min `activeDeadlineSeconds`
     cap with TREC-COVID still indexing. SciFact passed end-to-end on
     every run (NDCG@10=0.6576 vs OS 0.6537, parity preserved).
-  - [ ] Decision required before promoting TREC-COVID as an acceptance
-    gate: either (a) extend `ndcg-gate` `activeDeadlineSeconds` to
-    3600 plus the workflow wait deadline plus bump Surch CPU limit to
-    finish the 171 k corpus in one run, accepting the doubled cost
-    cap per gate execution; or (b) treat the full 171 k TREC-COVID
-    corpus as a Surch memory-and-throughput limit pending the deferred
-    Track A memory-layout follow-up, and keep SciFact as the only BEIR
-    gate for now. The diagnosis above is the prerequisite for either
-    path.
+  - [x] Voie (a) attempted (`3a2687f`): activeDeadlineSeconds=3600,
+    workflow wait derived from SCW_MAX_DURATION_MIN=60, Surch CPU
+    800m -> 2000m. Run `26285164167` failed in 12m29s with OOM at
+    chunk 14 (Surch peak 2964 MiB under the 3 GiB cap, variance
+    +319 MiB vs the previous 3 GiB run). The pod live-top samples
+    showed Surch CPU plateau at 1000m even with the 2000m limit, so
+    the bulk ingestion path is effectively single-threaded; the CPU
+    bump did not buy throughput. The variance in peak RSS (2645 vs
+    2964 MiB) on the same 3 GiB cap indicates the corpus does not
+    fit reliably in 3 GiB.
+  - [ ] Next decision required: voie (a) is exhausted at the current
+    Surch architecture (single-threaded bulk + sub-linear but variable
+    memory growth). Either (b) defer TREC-COVID full corpus until the
+    Track A memory-layout follow-up lands, keeping SciFact as the only
+    BEIR gate; or (c) reduce the TREC-COVID corpus to the relevant-docs
+    pool (~5 k from qrels) plus a sampled distractor set, and document
+    that the gate measures cross-engine NDCG@10 on the reduced corpus,
+    not the Anserini full-corpus baseline.
