@@ -8,11 +8,13 @@
 #
 # The Pod-anti-affinity story stays simple here: both engines are local
 # to the Pod, talking over localhost. Resource envelope (post TREC-COVID
-# bump — corpus is 171 k docs; the previous 512Mi Surch limit OOM'd at
-# the 4th 8 MiB bulk chunk on ci-k8s run 26266507485 because Surch keeps
-# the indexed corpus in memory):
-#   surch       cpu  150m req /  800m lim ; mem 256Mi req / 2048Mi lim
-#   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 3072Mi lim  (JVM Xmx=1.5g)
+# bumps — corpus is 171 k docs; the previous 512Mi/2Gi Surch limits OOM'd
+# at chunks 3 and 16 respectively on ci-k8s runs 26266507485 and
+# 26267363245. At 85 k docs ingested Surch peaked at 1962 MiB. Sub-linear
+# scaling → ~3 GiB for the full 171 k corpus, so target Surch=3Gi / OS=2Gi
+# Xmx=1g to fit the 6 GiB tenant quota):
+#   surch       cpu  150m req /  800m lim ; mem 256Mi req / 3072Mi lim
+#   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 2048Mi lim  (JVM Xmx=1g)
 #   driver      cpu  100m req /  500m lim ; mem 128Mi req / 1024Mi lim
 #   ---------------------------------------------------------------
 #   total       cpu  500m req / 2500m lim ; mem 640Mi req / 6144Mi lim
@@ -80,7 +82,7 @@ spec:
             - { name: RUST_LOG,   value: "warn" }
           resources:
             requests: { cpu: 150m, memory: 256Mi }
-            limits:   { cpu: 800m, memory: 2Gi }
+            limits:   { cpu: 800m, memory: 3Gi }
           volumeMounts:
             - { name: scratch, mountPath: /var/surch }
         # --- Engine sidecar #2: OpenSearch baseline -------------------
@@ -94,11 +96,11 @@ spec:
             - { name: discovery.type,                     value: "single-node" }
             - { name: DISABLE_SECURITY_PLUGIN,            value: "true" }
             - { name: DISABLE_INSTALL_DEMO_CONFIG,        value: "true" }
-            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms1500m -Xmx1500m" }
+            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms1g -Xmx1g" }
             - { name: bootstrap.memory_lock,              value: "false" }
           resources:
             requests: { cpu: 250m, memory: 256Mi }
-            limits:   { cpu: 1200m, memory: 3Gi }
+            limits:   { cpu: 1200m, memory: 2Gi }
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
