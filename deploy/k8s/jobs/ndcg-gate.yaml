@@ -8,12 +8,14 @@
 #
 # The Pod-anti-affinity story stays simple here: both engines are local
 # to the Pod, talking over localhost. Resource envelope (post TREC-COVID
-# bump — corpus is 171 k docs and the OS heap needs ~2 GiB to keep up):
-#   surch       cpu  150m req /  800m lim ; mem 128Mi req /  512Mi lim
-#   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 4096Mi lim  (JVM Xmx=2g)
+# bump — corpus is 171 k docs; the previous 512Mi Surch limit OOM'd at
+# the 4th 8 MiB bulk chunk on ci-k8s run 26266507485 because Surch keeps
+# the indexed corpus in memory):
+#   surch       cpu  150m req /  800m lim ; mem 256Mi req / 2048Mi lim
+#   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 3072Mi lim  (JVM Xmx=1.5g)
 #   driver      cpu  100m req /  500m lim ; mem 128Mi req / 1024Mi lim
 #   ---------------------------------------------------------------
-#   total       cpu  500m req / 2500m lim ; mem 512Mi req / 5632Mi lim
+#   total       cpu  500m req / 2500m lim ; mem 640Mi req / 6144Mi lim
 # Requires the tenant ResourceQuota in poc-k8s to allow limits.memory>=6Gi
 # (the previous 3Gi cap covered SciFact only). Runs on the DEV1-XL (4 vCPU /
 # 8 GiB) burst node — DEV1-L is no longer enough.
@@ -77,8 +79,8 @@ spec:
             - { name: SURCH_PORT, value: "7700" }
             - { name: RUST_LOG,   value: "warn" }
           resources:
-            requests: { cpu: 150m, memory: 128Mi }
-            limits:   { cpu: 800m, memory: 512Mi }
+            requests: { cpu: 150m, memory: 256Mi }
+            limits:   { cpu: 800m, memory: 2Gi }
           volumeMounts:
             - { name: scratch, mountPath: /var/surch }
         # --- Engine sidecar #2: OpenSearch baseline -------------------
@@ -92,11 +94,11 @@ spec:
             - { name: discovery.type,                     value: "single-node" }
             - { name: DISABLE_SECURITY_PLUGIN,            value: "true" }
             - { name: DISABLE_INSTALL_DEMO_CONFIG,        value: "true" }
-            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms2g -Xmx2g" }
+            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms1500m -Xmx1500m" }
             - { name: bootstrap.memory_lock,              value: "false" }
           resources:
             requests: { cpu: 250m, memory: 256Mi }
-            limits:   { cpu: 1200m, memory: 4Gi }
+            limits:   { cpu: 1200m, memory: 3Gi }
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000

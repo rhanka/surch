@@ -1,0 +1,244 @@
+Name:             insee-bench-v2ggq
+Namespace:        surch
+Priority:         0
+Service Account:  surch
+Node:             scw-poc-burst-c1f70bea719b428797bdd6485188061c/172.16.0.4
+Start Time:       Fri, 22 May 2026 03:28:10 +0000
+Labels:           app.kubernetes.io/component=insee-bench
+                  app.kubernetes.io/name=surch
+                  app.kubernetes.io/part-of=surch-ci
+                  batch.kubernetes.io/controller-uid=9ba8cb00-b1bf-48c6-8281-eb6587dda981
+                  batch.kubernetes.io/job-name=insee-bench
+                  controller-uid=9ba8cb00-b1bf-48c6-8281-eb6587dda981
+                  job-name=insee-bench
+                  topology.kubernetes.io/region=fr-par
+                  topology.kubernetes.io/zone=fr-par-2
+Annotations:      <none>
+Status:           Succeeded
+IP:               100.64.3.6
+IPs:
+  IP:           100.64.3.6
+Controlled By:  Job/insee-bench
+Init Containers:
+  surch:
+    Container ID:   containerd://2a7a3939faaff8bebebe9fd8628f9e9f60750b5010ac362d2f9fe8dddc64031f
+    Image:          ghcr.io/rhanka/surch:sha-5a93ee331e3e779d851681c136d191c6d89c63a3
+    Image ID:       ghcr.io/rhanka/surch@sha256:c49ac32114a2f15e61d372fb06045cf7c1fd60c2f31aa77bf5aa0433b18542d4
+    Port:           7700/TCP
+    Host Port:      0/TCP
+    State:          Terminated
+      Reason:       Error
+      Exit Code:    137
+      Started:      Fri, 22 May 2026 03:28:22 +0000
+      Finished:     Fri, 22 May 2026 03:43:19 +0000
+    Ready:          False
+    Restart Count:  0
+    Limits:
+      cpu:     800m
+      memory:  512Mi
+    Requests:
+      cpu:     150m
+      memory:  128Mi
+    Environment:
+      SURCH_HOST:  127.0.0.1
+      SURCH_PORT:  7700
+      RUST_LOG:    warn
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-4zct8 (ro)
+      /var/surch from scratch (rw,path="surch-data")
+  opensearch:
+    Container ID:   containerd://ea19d81d65ba03439d4d69e1f2377d7a4c4f08ebaec0e1de7b449fe91bc4397e
+    Image:          opensearchproject/opensearch:2.17.1
+    Image ID:       docker.io/opensearchproject/opensearch@sha256:1193b7c29c5d63028523728243cc4da047ac49f697a8f8105e5aeee2f89bcc4c
+    Port:           9200/TCP
+    Host Port:      0/TCP
+    State:          Terminated
+      Reason:       Error
+      Exit Code:    143
+      Started:      Fri, 22 May 2026 03:28:23 +0000
+      Finished:     Fri, 22 May 2026 03:42:49 +0000
+    Ready:          False
+    Restart Count:  0
+    Limits:
+      cpu:     1200m
+      memory:  1536Mi
+    Requests:
+      cpu:     250m
+      memory:  256Mi
+    Environment:
+      discovery.type:               single-node
+      DISABLE_SECURITY_PLUGIN:      true
+      DISABLE_INSTALL_DEMO_CONFIG:  true
+      OPENSEARCH_JAVA_OPTS:         -Xms1g -Xmx1g
+      bootstrap.memory_lock:        false
+    Mounts:
+      /usr/share/opensearch/data from scratch (rw,path="opensearch-data")
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-4zct8 (ro)
+Containers:
+  artillery-runner:
+    Container ID:  containerd://255449263e328e8d3db118eeecd8cf97497d70b5fe26ef43eca6afb119792933
+    Image:         ghcr.io/rhanka/surch:bench-sha-5a93ee331e3e779d851681c136d191c6d89c63a3
+    Image ID:      ghcr.io/rhanka/surch@sha256:6d280c663626ff5b95ebd8f2935ce4c080644ec239ae2a46091eba986b82547b
+    Port:          <none>
+    Host Port:     <none>
+    Command:
+      /bin/sh
+      -c
+    Args:
+      set -eu
+      echo "Waiting for both engines..."
+      until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+      until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
+      mkdir -p "$REPORTS_DIR"
+      # Bootstrap the `deces` index on both engines with the
+      # INSEE 10k mapping + bulk-load slice baked into this
+      # image. The slice NDJSON carries `_index: "deces"` in
+      # every action header, so artillery_bench targets the
+      # same index name below.
+      bootstrap_engine() {
+        url="$1"; label="$2"
+        # The scratch PVC persists across ndcg-gate / insee-bench
+        # runs, so OpenSearch / Surch boot with whatever indices
+        # the previous job left behind (e.g. `scifact`,
+        # `.opensearch-*` security indices). Drop the working
+        # set before re-creating it, otherwise the bulk POST
+        # below can 400 against a partially-allocated `deces`
+        # index in a YELLOW cluster.
+        curl -fsS -o /dev/null -X DELETE "$url/deces" 2>/dev/null || true
+        # OpenSearch only — wait for cluster to become at least
+        # YELLOW (single-node has no replicas) before we ask it
+        # to ingest a brand new index.
+        curl -fsS -o /dev/null \
+          "$url/_cluster/health?wait_for_status=yellow&timeout=30s" \
+          2>/dev/null || true
+        echo "bootstrap $label: PUT /deces"
+        curl -fsS -X PUT "$url/deces" \
+          -H 'Content-Type: application/json' \
+          --data-binary @/usr/local/share/deces/mapping.json \
+          > "$REPORTS_DIR/bootstrap-$label.put.json"
+        # Wait for the freshly-PUT `deces` index to have its
+        # primary shard active before we bulk-load against it.
+        curl -fsS -o /dev/null \
+          "$url/_cluster/health/deces?wait_for_status=yellow&wait_for_active_shards=1&timeout=30s" \
+          2>/dev/null || true
+        echo "bootstrap $label: POST /_bulk (10k docs)"
+        gunzip -c /usr/local/share/deces/slice-10000.ndjson.gz \
+          | curl -fsS -X POST "$url/_bulk" \
+              -H 'Content-Type: application/x-ndjson' \
+              --data-binary @- \
+              > "$REPORTS_DIR/bootstrap-$label.bulk.json"
+        # Refresh so newly indexed docs are searchable before
+        # the load phase starts.
+        curl -fsS -X POST "$url/deces/_refresh" \
+          > "$REPORTS_DIR/bootstrap-$label.refresh.json"
+      }
+      bootstrap_engine "$SURCH_URL" surch
+      bootstrap_engine "$OPENSEARCH_URL" opensearch
+      # Warm up both engines so JVM JIT + page caches are hot
+      # before artillery_bench measures cold-start outliers
+      # (OpenSearch phase-1 max would otherwise spike above
+      # SLO_ARTILLERY_MAX_MS = 500 ms).
+      warmup_engine() {
+        url="$1"; label="$2"
+        echo "warmup $label: 50 match_all hits"
+        for i in $(seq 1 50); do
+          curl -fsS -o /dev/null -X POST "$url/deces/_search" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":{"match_all":{}},"size":5}' \
+            || true
+        done
+      }
+      warmup_engine "$SURCH_URL" surch
+      warmup_engine "$OPENSEARCH_URL" opensearch
+      # The bench driver image ships artillery_bench and
+      # bench_report in /usr/local/bin.
+      /usr/local/bin/artillery_bench \
+        --url "$SURCH_URL" --index "deces" \
+        --names "$INSEE_DIR/artillery_names.txt" \
+        --workers "$ART_WORKERS" --phases "$ART_PHASES" \
+        --report "$REPORTS_DIR/art-surch.json"
+      /usr/local/bin/artillery_bench \
+        --url "$OPENSEARCH_URL" --index "deces" \
+        --names "$INSEE_DIR/artillery_names.txt" \
+        --workers "$ART_WORKERS" --phases "$ART_PHASES" \
+        --report "$REPORTS_DIR/art-os.json"
+      /usr/local/bin/bench_report \
+        --dir "$REPORTS_DIR" \
+        --output "$REPORTS_DIR/summary.md"
+      echo "BEGIN_SURCH_K8S_SUMMARY"
+      cat "$REPORTS_DIR/summary.md"
+      echo "END_SURCH_K8S_SUMMARY"
+      echo "insee-bench complete."
+      
+    State:          Terminated
+      Reason:       Completed
+      Exit Code:    0
+      Started:      Fri, 22 May 2026 03:28:24 +0000
+      Finished:     Fri, 22 May 2026 03:42:48 +0000
+    Ready:          False
+    Restart Count:  0
+    Limits:
+      cpu:     500m
+      memory:  512Mi
+    Requests:
+      cpu:     100m
+      memory:  128Mi
+    Environment:
+      SURCH_URL:       http://127.0.0.1:7700
+      OPENSEARCH_URL:  http://127.0.0.1:9200
+      INSEE_DIR:       /data/insee
+      REPORTS_DIR:     /reports
+      ART_PHASES:      2:30,2:30,5:30,10:30,20:30,50:240
+      ART_WORKERS:     8
+    Mounts:
+      /data/insee from insee (ro)
+      /reports from reports (rw)
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-4zct8 (ro)
+Conditions:
+  Type                        Status
+  PodReadyToStartContainers   False 
+  Initialized                 True 
+  Ready                       False 
+  ContainersReady             False 
+  PodScheduled                True 
+Volumes:
+  insee:
+    Type:       PersistentVolumeClaim (a reference to a PersistentVolumeClaim in the same namespace)
+    ClaimName:  surch-corpus-insee
+    ReadOnly:   true
+  scratch:
+    Type:       PersistentVolumeClaim (a reference to a PersistentVolumeClaim in the same namespace)
+    ClaimName:  surch-scratch
+    ReadOnly:   false
+  reports:
+    Type:       EmptyDir (a temporary directory that shares a pod's lifetime)
+    Medium:     
+    SizeLimit:  128Mi
+  kube-api-access-4zct8:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    ConfigMapOptional:       <nil>
+    DownwardAPI:             true
+QoS Class:                   Burstable
+Node-Selectors:              k8s.scaleway.com/pool-name=burst
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+                             pool=burst:NoSchedule
+Events:
+  Type    Reason                  Age   From                     Message
+  ----    ------                  ----  ----                     -------
+  Normal  Scheduled               15m   default-scheduler        Successfully assigned surch/insee-bench-v2ggq to scw-poc-burst-c1f70bea719b428797bdd6485188061c
+  Normal  SuccessfulAttachVolume  15m   attachdetach-controller  AttachVolume.Attach succeeded for volume "pvc-dc11e83b-50cb-4c1f-91ca-5ab6a86d362a"
+  Normal  SuccessfulAttachVolume  15m   attachdetach-controller  AttachVolume.Attach succeeded for volume "pvc-5c15bb9f-0a1b-40d2-8bab-8573d3dc7654"
+  Normal  Pulled                  15m   kubelet                  Container image "ghcr.io/rhanka/surch:sha-5a93ee331e3e779d851681c136d191c6d89c63a3" already present on machine and can be accessed by the pod
+  Normal  Created                 15m   kubelet                  Container created
+  Normal  Started                 15m   kubelet                  Container started
+  Normal  Pulled                  15m   kubelet                  Container image "opensearchproject/opensearch:2.17.1" already present on machine and can be accessed by the pod
+  Normal  Created                 15m   kubelet                  Container created
+  Normal  Started                 15m   kubelet                  Container started
+  Normal  Pulled                  15m   kubelet                  Container image "ghcr.io/rhanka/surch:bench-sha-5a93ee331e3e779d851681c136d191c6d89c63a3" already present on machine and can be accessed by the pod
+  Normal  Created                 15m   kubelet                  Container created
+  Normal  Started                 15m   kubelet                  Container started
+  Normal  Killing                 46s   kubelet                  Stopping container surch
+  Normal  Killing                 46s   kubelet                  Stopping container opensearch
