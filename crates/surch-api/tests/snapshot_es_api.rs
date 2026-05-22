@@ -504,6 +504,185 @@ async fn snapshot_take_when_repository_missing_returns_404() {
 }
 
 #[tokio::test]
+async fn verify_known_repository_returns_local_node() {
+    let router = app_router();
+    let dir = tempdir("verify-ok");
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local",
+        json!({
+            "type": "fs",
+            "settings": { "location": dir.display().to_string() }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = post(&router, "/_snapshot/local/_verify", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "verify body: {body}");
+    assert_eq!(body["nodes"]["local"]["name"], json!("surch"));
+
+    let (status, body) = get(&router, "/_snapshot/local/_verify").await;
+    assert_eq!(status, StatusCode::OK, "verify GET body: {body}");
+    assert_eq!(body["nodes"]["local"]["name"], json!("surch"));
+}
+
+#[tokio::test]
+async fn verify_unknown_repository_returns_404() {
+    let router = app_router();
+    let (status, body) = post(&router, "/_snapshot/missing/_verify", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "verify body: {body}");
+    assert_eq!(body["error"]["type"], json!("repository_missing_exception"));
+}
+
+#[tokio::test]
+async fn snapshot_status_global_is_empty_for_synchronous_takes() {
+    let router = app_router();
+    let dir = tempdir("status-global");
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local",
+        json!({
+            "type": "fs",
+            "settings": { "location": dir.display().to_string() }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get(&router, "/_snapshot/_status").await;
+    assert_eq!(status, StatusCode::OK, "global status body: {body}");
+    assert_eq!(body, json!({ "snapshots": [] }));
+
+    let (status, body) = get(&router, "/_snapshot/local/_status").await;
+    assert_eq!(status, StatusCode::OK, "repo status body: {body}");
+    assert_eq!(body, json!({ "snapshots": [] }));
+}
+
+#[tokio::test]
+async fn snapshot_status_repo_unknown_repository_returns_404() {
+    let router = app_router();
+    let (status, body) = get(&router, "/_snapshot/missing/_status").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["error"]["type"], json!("repository_missing_exception"));
+}
+
+#[tokio::test]
+async fn snapshot_status_one_returns_success_shape_for_terminal_take() {
+    let router = app_router();
+    let dir = tempdir("status-one");
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local",
+        json!({
+            "type": "fs",
+            "settings": { "location": dir.display().to_string() }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = put(&router, "/idx", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    bulk_index(
+        &router,
+        "idx",
+        &[("d1".into(), json!({ "title": "alpha", "category": "x" }))],
+    )
+    .await;
+
+    let (status, body) = put(
+        &router,
+        "/_snapshot/local/snap-1",
+        json!({ "indices": "idx" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "take body: {body}");
+
+    let (status, body) = get(&router, "/_snapshot/local/snap-1/_status").await;
+    assert_eq!(status, StatusCode::OK, "status body: {body}");
+    let snap = &body["snapshots"][0];
+    assert_eq!(snap["snapshot"], json!("snap-1"));
+    assert_eq!(snap["repository"], json!("local"));
+    assert_eq!(snap["state"], json!("SUCCESS"));
+    assert_eq!(snap["shards_stats"]["total"], json!(1));
+    assert_eq!(snap["shards_stats"]["done"], json!(1));
+    assert_eq!(snap["shards_stats"]["failed"], json!(0));
+    assert!(
+        snap["indices"]["idx"].is_object(),
+        "indices entry missing: {body}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_status_one_all_returns_every_snapshot() {
+    let router = app_router();
+    let dir = tempdir("status-all");
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local",
+        json!({
+            "type": "fs",
+            "settings": { "location": dir.display().to_string() }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = put(&router, "/idx", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    bulk_index(
+        &router,
+        "idx",
+        &[("d1".into(), json!({ "title": "alpha", "category": "x" }))],
+    )
+    .await;
+
+    for name in ["snap-a", "snap-b"] {
+        let (status, body) = put(
+            &router,
+            &format!("/_snapshot/local/{name}"),
+            json!({ "indices": "idx" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name} body: {body}");
+    }
+
+    let (status, body) = get(&router, "/_snapshot/local/_all/_status").await;
+    assert_eq!(status, StatusCode::OK, "status _all body: {body}");
+    assert_eq!(
+        body["snapshots"].as_array().map(Vec::len),
+        Some(2),
+        "expected two snapshots, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_status_one_missing_snapshot_returns_404() {
+    let router = app_router();
+    let dir = tempdir("status-missing");
+
+    let (status, _) = put(
+        &router,
+        "/_snapshot/local",
+        json!({
+            "type": "fs",
+            "settings": { "location": dir.display().to_string() }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get(&router, "/_snapshot/local/never-taken/_status").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_eq!(body["error"]["type"], json!("snapshot_missing_exception"));
+}
+
+#[tokio::test]
 async fn double_take_with_same_name_is_rejected() {
     let router = app_router();
     let dir = tempdir("double");

@@ -193,11 +193,20 @@ Reste estime: ~25% (3 open / 13 leaf tasks).
 - [x] The MinIO e2e test now requires `SURCH_MINIO_E2E=1` plus Docker;
   default `cargo test --workspace` skips the testcontainer path after
   GitHub run `26193965044` showed runner-side MinIO startup could hang.
-- [ ] Finish snapshot REST coverage.
+- [x] Finish snapshot REST coverage.
   - [x] `GET /_snapshot/{repo}/_all` lists every snapshot in the
     repository using the same `snapshots: [...]` envelope as
     unitary snapshot GETs.
-- [ ] Finish restore coverage.
+  - [x] `POST|GET /_snapshot/{repo}/_verify` round-trips a probe
+    blob and returns the ES `{"nodes":{"local":{"name":"surch"}}}`
+    envelope.
+  - [x] `GET /_snapshot/_status` and `GET /_snapshot/{repo}/_status`
+    return the ES `{"snapshots": []}` empty envelope (synchronous
+    take model, no in-flight snapshots).
+  - [x] `GET /_snapshot/{repo}/{snap}/_status` and
+    `GET /_snapshot/{repo}/_all/_status` emit the ES per-snapshot
+    `state` + `shards_stats` + per-index `indices` envelope.
+- [x] Finish restore coverage.
   - [x] `POST /_snapshot/{repo}/{snap}/_restore` refuses to restore over
     an existing live index with `400 snapshot_exception` and an explicit
     `already exists` reason.

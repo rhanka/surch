@@ -477,6 +477,193 @@ pub async fn restore_snapshot_handler(
     }
 }
 
+/// `POST /_snapshot/{repository}/_verify` (also `GET`).
+///
+/// ES uses this to validate that the repository is reachable from every
+/// master-eligible node. Surch is single-node so the response simply
+/// names the local node; reachability is proven by writing a transient
+/// probe blob and reading it back through the repository trait.
+pub async fn verify_repository_handler(
+    State(state): State<SnapshotAppState>,
+    Path(repo_name): Path<String>,
+) -> impl IntoResponse {
+    let Some(repo) = state.registry.get(&repo_name) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "repository_missing_exception",
+            format!("repository [{repo_name}] missing"),
+        );
+    };
+    let probe_key = format!("verify-{}.dat", now_nanos());
+    let probe = b"surch-snapshot-verify".as_slice();
+    if let Err(error) = repo.put_object(&probe_key, axum::body::Bytes::from_static(probe)) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "repository_verification_exception",
+            format!("repository [{repo_name}] write probe failed: {error}"),
+        );
+    }
+    let echo = match repo.get_object(&probe_key) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // Best-effort cleanup on the failure path.
+            let _ = repo.delete_object(&probe_key);
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "repository_verification_exception",
+                format!("repository [{repo_name}] read probe failed: {error}"),
+            );
+        }
+    };
+    let _ = repo.delete_object(&probe_key);
+    if echo.as_ref() != probe {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "repository_verification_exception",
+            format!("repository [{repo_name}] probe contents mismatched"),
+        );
+    }
+    Json(json!({
+        "nodes": {
+            "local": { "name": "surch" }
+        }
+    }))
+    .into_response()
+}
+
+/// Build the per-snapshot ES `_status` envelope from a `SnapshotEntry`.
+///
+/// Surch takes are synchronous: a `SUCCESS` entry maps to a `done == total`
+/// shard summary with one logical shard per snapshotted index.
+fn snapshot_status_envelope(repo: &str, entry: &super::SnapshotEntry) -> Value {
+    let total = entry.indices.len().max(1) as u64;
+    let done = if matches!(entry.state, super::SnapshotState::Success) {
+        total
+    } else {
+        0
+    };
+    let failed = match entry.state {
+        super::SnapshotState::Failed => total,
+        _ => 0,
+    };
+    let duration_ms = entry
+        .end_time_millis
+        .saturating_sub(entry.start_time_millis)
+        .max(0);
+    let mut indices = serde_json::Map::new();
+    for name in &entry.indices {
+        indices.insert(
+            name.clone(),
+            json!({
+                "shards_stats": {
+                    "initializing": 0,
+                    "started": 0,
+                    "finalizing": 0,
+                    "done": if matches!(entry.state, super::SnapshotState::Success) { 1 } else { 0 },
+                    "failed": if matches!(entry.state, super::SnapshotState::Failed) { 1 } else { 0 },
+                    "total": 1,
+                },
+                "stats": {
+                    "incremental": { "file_count": 0, "size_in_bytes": 0 },
+                    "total":       { "file_count": 0, "size_in_bytes": 0 },
+                    "start_time_in_millis": entry.start_time_millis,
+                    "time_in_millis": duration_ms,
+                },
+                "shards": {}
+            }),
+        );
+    }
+    json!({
+        "snapshot": entry.name,
+        "repository": repo,
+        "uuid": entry.uuid,
+        "state": entry.state.as_str(),
+        "include_global_state": false,
+        "shards_stats": {
+            "initializing": 0,
+            "started": 0,
+            "finalizing": 0,
+            "done": done,
+            "failed": failed,
+            "total": total,
+        },
+        "stats": {
+            "incremental": { "file_count": 0, "size_in_bytes": 0 },
+            "total":       { "file_count": 0, "size_in_bytes": 0 },
+            "start_time_in_millis": entry.start_time_millis,
+            "time_in_millis": duration_ms,
+        },
+        "indices": Value::Object(indices),
+    })
+}
+
+/// `GET /_snapshot/_status`.
+///
+/// ES returns only currently running snapshots. Surch takes are
+/// synchronous so this is always the empty envelope; clients that poll
+/// here are kept compatible without paying the cost of walking every
+/// repository.
+pub async fn snapshot_status_all_handler(
+    State(_state): State<SnapshotAppState>,
+) -> impl IntoResponse {
+    Json(json!({ "snapshots": [] })).into_response()
+}
+
+/// `GET /_snapshot/{repository}/_status`.
+///
+/// Same semantics as `_snapshot/_status` scoped to one repository — only
+/// running snapshots, which is always empty for Surch's synchronous
+/// take. Returns 404 if the repository name is unknown.
+pub async fn snapshot_status_repo_handler(
+    State(state): State<SnapshotAppState>,
+    Path(repo_name): Path<String>,
+) -> impl IntoResponse {
+    if state.registry.get(&repo_name).is_none() {
+        return err(
+            StatusCode::NOT_FOUND,
+            "repository_missing_exception",
+            format!("repository [{repo_name}] missing"),
+        );
+    }
+    Json(json!({ "snapshots": [] })).into_response()
+}
+
+/// `GET /_snapshot/{repository}/{snapshot}/_status`.
+pub async fn snapshot_status_one_handler(
+    State(state): State<SnapshotAppState>,
+    Path((repo_name, snap_name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let Some(repo) = state.registry.get(&repo_name) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "repository_missing_exception",
+            format!("repository [{repo_name}] missing"),
+        );
+    };
+    let entries = if snap_name == "_all" {
+        service::list_snapshots(repo.as_ref())
+    } else {
+        service::get_snapshot(repo.as_ref(), &repo_name, &snap_name).map(|entry| vec![entry])
+    };
+    match entries {
+        Ok(entries) => Json(json!({
+            "snapshots": entries
+                .iter()
+                .map(|e| snapshot_status_envelope(&repo_name, e))
+                .collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => from_service_error(error),
+    }
+}
+
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 // Silence the dead-code lint on `RegisteredRepository` when only the
 // constructor branch is exercised by the public API surface.
 #[allow(dead_code)]

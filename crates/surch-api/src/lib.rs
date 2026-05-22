@@ -110,10 +110,23 @@ pub fn app_router_with_state(shared: AppRouterState) -> Router {
             get(snapshot_es::routes::list_repositories_handler),
         )
         .route(
+            "/_snapshot/_status",
+            get(snapshot_es::routes::snapshot_status_all_handler),
+        )
+        .route(
             "/_snapshot/:repository",
             get(snapshot_es::routes::get_repository_handler)
                 .put(snapshot_es::routes::register_repository_handler)
                 .delete(snapshot_es::routes::delete_repository_handler),
+        )
+        .route(
+            "/_snapshot/:repository/_verify",
+            post(snapshot_es::routes::verify_repository_handler)
+                .get(snapshot_es::routes::verify_repository_handler),
+        )
+        .route(
+            "/_snapshot/:repository/_status",
+            get(snapshot_es::routes::snapshot_status_repo_handler),
         )
         .route(
             "/_snapshot/:repository/:snapshot",
@@ -124,6 +137,10 @@ pub fn app_router_with_state(shared: AppRouterState) -> Router {
         .route(
             "/_snapshot/:repository/:snapshot/_restore",
             post(snapshot_es::routes::restore_snapshot_handler),
+        )
+        .route(
+            "/_snapshot/:repository/:snapshot/_status",
+            get(snapshot_es::routes::snapshot_status_one_handler),
         )
         .with_state(snapshot_state);
 

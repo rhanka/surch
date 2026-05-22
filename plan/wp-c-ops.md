@@ -69,11 +69,25 @@ the current functional deliveries; the long branch is kept for history.
     explicit `SURCH_MINIO_E2E=1` runs.
 
 - [ ] Lot 3 - Snapshot / SLM completeness
-  - [ ] Finish snapshot REST coverage.
+  - [x] Finish snapshot REST coverage.
     - [x] Cover `GET /_snapshot/{repo}/_all` in the fs/tower REST
       suite and return the same `snapshots: [...]` envelope as unitary
       snapshot GETs.
-  - [ ] Finish restore coverage.
+    - [x] Cover `POST|GET /_snapshot/{repo}/_verify` against the repo
+      registry: 200 with `{"nodes":{"local":{"name":"surch"}}}` on a
+      registered repository (round-trips a probe blob through the
+      `SnapshotRepository` trait), 404 `repository_missing_exception`
+      otherwise.
+    - [x] Cover `GET /_snapshot/_status` and
+      `GET /_snapshot/{repo}/_status` as ES-compatible empty
+      `{"snapshots": []}` (synchronous take model: no in-flight
+      snapshots), 404 on unknown repo.
+    - [x] Cover `GET /_snapshot/{repo}/{snap}/_status` and
+      `GET /_snapshot/{repo}/_all/_status`: emit per-snapshot
+      envelope with `state`, `repository`, `uuid`, `shards_stats`
+      and per-index entries; 404 `snapshot_missing_exception` on
+      unknown snapshot.
+  - [x] Finish restore coverage.
     - [x] Cover `POST /_snapshot/{repo}/{snap}/_restore` refusing to
       restore over an existing live index with `400 snapshot_exception`
       and an explicit `already exists` reason.
