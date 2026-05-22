@@ -21,6 +21,9 @@ need a fresh run.
 - `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/README.md`:
   post-wait-loop-fix current-main K8s replay repetition `1/3`, with
   live pod monitoring samples promoted next to the benchmark summary.
+- `docs/ops/bench-reports/2026-05-21-A-replay-current-main-61a13f-insee-K8s/README.md`:
+  stable-ref current-main K8s replay repeated group, 3 successful
+  `insee-bench` repetitions on SHA `61a13f8`.
 - `docs/ops/memory-capacity.md`: current RAM capacity model and stats
   endpoint contract.
 
@@ -74,7 +77,7 @@ the proof state:
 
 | Axis | Current proof | Surch vs OpenSearch state | Delta / verdict | Missing proof |
 | --- | --- | --- | --- | --- |
-| Search latency, matchID INSEE 10k | K8s run `26101404966` | Surch p50/p95/p99/max `1.9/3.6/6.9/17.9 ms` vs OpenSearch `3.8/9.9/20.8/135.3 ms` | Surch is `2.0x/2.7x/3.0x/7.5x` faster; 0 errors on both engines | Repeat run distribution if we need confidence intervals, not just one green proof |
+| Search latency, matchID INSEE 10k | K8s repeated group `2026-05-21-A-replay-current-main-61a13f-insee-K8s` | Median Surch p50/p95/p99/max `2.1/3.6/5.0/22.0 ms` vs OpenSearch `3.9/9.3/16.7/225.6 ms`; min/median/max in the promoted report | Surch median is `1.9x/2.6x/3.3x/10.3x` faster; 0 errors on both engines in all 3 runs; SLO PASS | RSS peak/final is not captured by the current K8s harness |
 | FoR metadata wiring | K8s before run `26151880297` vs after run `26101404966` | Surch before `2.4/4.6/7.8/25.6 ms`; after `1.9/3.6/6.9/17.9 ms` | Surch hot path improved `-21%/-22%/-12%/-30%` p50/p95/p99/max | Bulk timing and RSS are not isolated for this commit |
 | BAN Paris 25k latency | Local report `2026-05-16-vs-os-2.17.1` | Surch `took` p50 sub-ms, p95 `20 ms`, max `20 ms`; OpenSearch p50 `20 ms`, p95 `108 ms`, max `108 ms` | Surch is `>20x` faster at p50 and `5.4x` faster at p95/max | Needs K8s rerun if this becomes a release gate |
 | Bulk indexing | Local report `2026-05-16-vs-os-2.17.1` plus K8s `ndcg-gate` run `26157480132` | Local SciFact: Surch `3.545 s`, OpenSearch `17.612 s`; local BAN 25k: Surch `17.882 s`, OpenSearch `21.707 s`; K8s SciFact: Surch `4.098 s`, OpenSearch `12.088 s`; K8s TREC-COVID: Surch `5.116 s`, OpenSearch `28.711 s` | Surch is faster in all cited bulk captures (`3.0x` to `5.6x` on the K8s BEIR run) | No current bulk-only run with paired RSS after the FoR/FST/source-sharing sequence |
@@ -101,6 +104,7 @@ the proof state:
 | `df3b0aa` plus supporting index/codec commits `6f56fd2`, `2da9249` | Search latency | Proven by `2026-05-20-A-lot3-paired-K8s` | This is the only current isolated before/after Track A perf proof with K8s run ids |
 | `466693f` current-main replay anchor | Search latency / SLO | Proven by `2026-05-20-A-replay-current-main-insee-K8s` | Surch `2.0/3.7/5.4/36.8 ms` p50/p95/p99/max vs OpenSearch `4.5/9.7/18.2/362.8 ms`; 0 errors on both engines; RSS not captured |
 | `ac558e6` current-main replay repetition | Search latency / SLO / K8s monitoring | Repetition `1/3` accepted by `2026-05-21-A-replay-current-main-insee-K8s-rep1` | `ci-k8s` run `26202012197`, artifact `7126271947`; Surch `1.9/3.5/5.0/25.0 ms` vs OpenSearch `4.5/9.3/16.3/354.1 ms`; 0 errors; live pod max samples Surch `91m/77Mi`, OpenSearch `1200m/1476Mi`; RSS still not captured |
+| `61a13f8` stable current-main repeated group | Search latency / SLO / K8s monitoring | Proven by `2026-05-21-A-replay-current-main-61a13f-insee-K8s` | 3 K8s runs `26202652997`, `26203320060`, `26204062094`; artifact ids `7126549971`, `7126727126`, `7126979242`; median Surch `2.1/3.6/5.0/22.0 ms` vs OpenSearch `3.9/9.3/16.7/225.6 ms`; 0 errors throughout; pod samples captured; RSS still not captured |
 | Future Track A commits | Any perf axis | Must update this ledger in the same PR/commit sequence as the optimisation proof | Required fields: axis, workload, Surch numbers, OpenSearch/Elasticsearch reference where relevant, delta, run id/artifact path, and missing proof |
 
 ## Replay backlog for historical algorithms
@@ -154,6 +158,15 @@ Kickoff trace, 2026-05-20:
   `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
   This counts as `1/3` for the current-main repeated run group, not as a
   final verdict.
+- Stable-ref current-main repeated K8s replay:
+  `perf-replay/current-main-61a13f` pins
+  `61a13f871f810c98379375f2c94a10bbc696ac6e`. Runs `26202652997`,
+  `26203320060`, and `26204062094` all passed with
+  `SuccessCriteriaMet=True` and `Complete=True`; artifacts
+  `7126549971`, `7126727126`, and `7126979242` are promoted under
+  `docs/ops/bench-reports/2026-05-21-A-replay-current-main-61a13f-insee-K8s/`.
+  This closes the first final repeated current-main Track A replay
+  verdict.
 
 Minimum replay set:
 
@@ -182,7 +195,8 @@ Minimum repeated-run proof for A-replay-1..3:
 
 - Track A has enough evidence to say the current Surch hot path is
   faster than OpenSearch 2.17.1 on the promoted SciFact, BAN 25k, and
-  INSEE 10k captures.
+  INSEE 10k captures. The INSEE 10k current-main claim now has a
+  repeated 3-run K8s group on stable SHA `61a13f8`.
 - Track A does not yet have a complete per-commit attribution report for
   every historical optimisation. The durable per-commit proof starts at
   the FoR metadata wiring report unless we replay older SHAs.

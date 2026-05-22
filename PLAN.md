@@ -1,6 +1,6 @@
 # Surch Global Plan
 
-Updated: 2026-05-20
+Updated: 2026-05-21
 
 This is the live conductor plan for Surch. It tracks the repo by the
 official tracks A-E and points to branch-level plans under `plan/`.
@@ -119,9 +119,11 @@ axis-by-axis performance state is now tracked in
   `ac558e6d08c7566f8cbc0b96c56a5b943eb1ae79`, artifact
   `7126271947`, report
   `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
-- [ ] Finish two more repetitions for the same `ac558e6` image tags, or
-  explicitly start a new repeated group for the newer `main` SHA now
-  that `origin/main` has advanced.
+- [x] Close the stable current-main repeated group on
+  `61a13f871f810c98379375f2c94a10bbc696ac6e`: K8s runs
+  `26202652997`, `26203320060`, and `26204062094` passed with
+  artifacts `7126549971`, `7126727126`, and `7126979242`; report
+  `docs/ops/bench-reports/2026-05-21-A-replay-current-main-61a13f-insee-K8s/`.
 - [ ] Keep future Track A optimisation commits tied to a promoted perf
   report and an update to the Track A performance ledger.
 
@@ -321,9 +323,12 @@ Reste estime: ~7% (2 open / 28 leaf tasks).
 - [x] When a Job pod reaches `phase=Succeeded`, `ci-k8s` now waits for
   `condition=complete` before evaluating terminal sidecar exits, keeping
   the early failure checks without masking a successful Job.
-- [ ] Re-run `insee-bench` after the sidecar-completion wait-loop fix
-  and count it only if the artifact includes summary, Job conditions,
-  pod diagnostics, and live pod metrics samples.
+- [x] Re-run `insee-bench` after the sidecar-completion wait-loop fix:
+  runs `26202012197`, `26202652997`, `26203320060`, and `26204062094`
+  uploaded benchmark summaries, Job conditions, pod diagnostics, and
+  live pod metrics samples; `26202012197` is a single-repeat
+  diagnostic, and the final repeated Track A group is the stable
+  `61a13f8` triplet.
 - [ ] Make `ci-k8s` the standard heavy-run target for burst and
   large-corpus checks.
 - [x] Apply the Surch tenant quota bump from `poc-k8s` HEAD `980d58d`

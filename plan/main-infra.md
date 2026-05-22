@@ -176,9 +176,13 @@ Status: active infra lane; merge state below is the source of truth
     `condition=complete` before evaluating terminal sidecar exits, so
     fail-closed startup/runtime checks remain active without masking a
     successful Job.
-  - [ ] Re-run `insee-bench` after the sidecar-completion wait-loop fix
+  - [x] Re-run `insee-bench` after the sidecar-completion wait-loop fix
     and count the run only if it uploads the benchmark summary, Job
-    conditions, pod diagnostics, and live pod metrics samples.
+    conditions, pod diagnostics, and live pod metrics samples. Runs
+    `26202012197`, `26202652997`, `26203320060`, and `26204062094`
+    passed with summaries, Job conditions, pod diagnostics, and live pod
+    metrics samples; the final repeated Track A proof is the stable
+    `61a13f8` triplet.
   - [x] Make default `ci` fail-closed with a 20 minute cargo-test
     timeout.
   - [x] Apply the Surch tenant ResourceQuota bump required by the

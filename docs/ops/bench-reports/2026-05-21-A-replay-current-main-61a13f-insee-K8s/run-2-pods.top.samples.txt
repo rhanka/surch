@@ -1,0 +1,333 @@
+=== 2026-05-21T03:17:04Z ===
+error: metrics not available yet
+=== 2026-05-21T03:17:17Z ===
+error: metrics not available yet
+=== 2026-05-21T03:17:31Z ===
+error: metrics not available yet
+=== 2026-05-21T03:17:45Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   15m          0Mi
+insee-bench-mtwrt   opensearch         1191m        1164Mi
+insee-bench-mtwrt   surch              0m           1Mi
+=== 2026-05-21T03:17:58Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   11m          0Mi
+insee-bench-mtwrt   opensearch         1201m        1254Mi
+insee-bench-mtwrt   surch              1m           1Mi
+=== 2026-05-21T03:18:12Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   13m          0Mi
+insee-bench-mtwrt   opensearch         1198m        1299Mi
+insee-bench-mtwrt   surch              0m           1Mi
+=== 2026-05-21T03:18:25Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   13m          1Mi
+insee-bench-mtwrt   opensearch         1196m        1370Mi
+insee-bench-mtwrt   surch              0m           1Mi
+=== 2026-05-21T03:18:38Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   13m          1Mi
+insee-bench-mtwrt   opensearch         1141m        1432Mi
+insee-bench-mtwrt   surch              51m          77Mi
+=== 2026-05-21T03:18:51Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   13m          1Mi
+insee-bench-mtwrt   opensearch         1141m        1432Mi
+insee-bench-mtwrt   surch              51m          77Mi
+=== 2026-05-21T03:19:05Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   111m         2Mi
+insee-bench-mtwrt   opensearch         767m         1445Mi
+insee-bench-mtwrt   surch              5m           77Mi
+=== 2026-05-21T03:19:18Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         48m          1446Mi
+insee-bench-mtwrt   surch              4m           77Mi
+=== 2026-05-21T03:19:31Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         26m          1447Mi
+insee-bench-mtwrt   surch              5m           77Mi
+=== 2026-05-21T03:19:44Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         26m          1447Mi
+insee-bench-mtwrt   surch              4m           77Mi
+=== 2026-05-21T03:19:57Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         18m          1447Mi
+insee-bench-mtwrt   surch              6m           77Mi
+=== 2026-05-21T03:20:10Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   3m           2Mi
+insee-bench-mtwrt   opensearch         33m          1447Mi
+insee-bench-mtwrt   surch              9m           77Mi
+=== 2026-05-21T03:20:23Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   4m           2Mi
+insee-bench-mtwrt   opensearch         33m          1447Mi
+insee-bench-mtwrt   surch              14m          77Mi
+=== 2026-05-21T03:20:36Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   4m           2Mi
+insee-bench-mtwrt   opensearch         33m          1447Mi
+insee-bench-mtwrt   surch              14m          77Mi
+=== 2026-05-21T03:20:49Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   7m           3Mi
+insee-bench-mtwrt   opensearch         31m          1447Mi
+insee-bench-mtwrt   surch              19m          77Mi
+=== 2026-05-21T03:21:02Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   9m           2Mi
+insee-bench-mtwrt   opensearch         39m          1447Mi
+insee-bench-mtwrt   surch              28m          77Mi
+=== 2026-05-21T03:21:15Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   12m          2Mi
+insee-bench-mtwrt   opensearch         19m          1447Mi
+insee-bench-mtwrt   surch              34m          77Mi
+=== 2026-05-21T03:21:28Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   17m          3Mi
+insee-bench-mtwrt   opensearch         16m          1448Mi
+insee-bench-mtwrt   surch              53m          77Mi
+=== 2026-05-21T03:21:42Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   25m          3Mi
+insee-bench-mtwrt   opensearch         23m          1448Mi
+insee-bench-mtwrt   surch              87m          77Mi
+=== 2026-05-21T03:21:55Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         29m          1448Mi
+insee-bench-mtwrt   surch              85m          77Mi
+=== 2026-05-21T03:22:09Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         29m          1448Mi
+insee-bench-mtwrt   surch              91m          77Mi
+=== 2026-05-21T03:22:22Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         29m          1448Mi
+insee-bench-mtwrt   surch              91m          77Mi
+=== 2026-05-21T03:22:35Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         21m          1448Mi
+insee-bench-mtwrt   surch              84m          77Mi
+=== 2026-05-21T03:22:48Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   27m          4Mi
+insee-bench-mtwrt   opensearch         27m          1448Mi
+insee-bench-mtwrt   surch              93m          77Mi
+=== 2026-05-21T03:23:02Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   25m          4Mi
+insee-bench-mtwrt   opensearch         14m          1448Mi
+insee-bench-mtwrt   surch              88m          77Mi
+=== 2026-05-21T03:23:15Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         19m          1448Mi
+insee-bench-mtwrt   surch              85m          77Mi
+=== 2026-05-21T03:23:28Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         18m          1448Mi
+insee-bench-mtwrt   surch              90m          77Mi
+=== 2026-05-21T03:23:41Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         28m          1448Mi
+insee-bench-mtwrt   surch              84m          77Mi
+=== 2026-05-21T03:23:54Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         26m          1448Mi
+insee-bench-mtwrt   surch              88m          77Mi
+=== 2026-05-21T03:24:07Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         26m          1448Mi
+insee-bench-mtwrt   surch              88m          77Mi
+=== 2026-05-21T03:24:20Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         43m          1448Mi
+insee-bench-mtwrt   surch              88m          77Mi
+=== 2026-05-21T03:24:33Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         18m          1448Mi
+insee-bench-mtwrt   surch              88m          77Mi
+=== 2026-05-21T03:24:47Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         28m          1448Mi
+insee-bench-mtwrt   surch              89m          77Mi
+=== 2026-05-21T03:24:59Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         20m          1448Mi
+insee-bench-mtwrt   surch              91m          77Mi
+=== 2026-05-21T03:25:12Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   27m          4Mi
+insee-bench-mtwrt   opensearch         21m          1448Mi
+insee-bench-mtwrt   surch              91m          77Mi
+=== 2026-05-21T03:25:25Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   8m           2Mi
+insee-bench-mtwrt   opensearch         107m         1450Mi
+insee-bench-mtwrt   surch              62m          77Mi
+=== 2026-05-21T03:25:38Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         108m         1451Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:25:52Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         108m         1451Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:26:06Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         82m          1453Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:26:19Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   2m           2Mi
+insee-bench-mtwrt   opensearch         95m          1453Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:26:32Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   3m           2Mi
+insee-bench-mtwrt   opensearch         114m         1456Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:26:45Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   4m           2Mi
+insee-bench-mtwrt   opensearch         138m         1457Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:26:58Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   4m           2Mi
+insee-bench-mtwrt   opensearch         225m         1461Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:27:11Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   6m           2Mi
+insee-bench-mtwrt   opensearch         295m         1466Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:27:24Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   8m           2Mi
+insee-bench-mtwrt   opensearch         278m         1465Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:27:37Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   11m          3Mi
+insee-bench-mtwrt   opensearch         292m         1470Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:27:50Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   11m          3Mi
+insee-bench-mtwrt   opensearch         292m         1470Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:28:04Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   19m          3Mi
+insee-bench-mtwrt   opensearch         521m         1473Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:28:17Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   25m          3Mi
+insee-bench-mtwrt   opensearch         420m         1473Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:28:30Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         538m         1474Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:28:43Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   24m          3Mi
+insee-bench-mtwrt   opensearch         312m         1474Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:28:56Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   25m          3Mi
+insee-bench-mtwrt   opensearch         251m         1475Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:29:09Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         464m         1475Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:29:23Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         195m         1475Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:29:36Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          3Mi
+insee-bench-mtwrt   opensearch         195m         1475Mi
+insee-bench-mtwrt   surch              0m           77Mi
+=== 2026-05-21T03:29:48Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   24m          4Mi
+insee-bench-mtwrt   opensearch         359m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:30:02Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   23m          4Mi
+insee-bench-mtwrt   opensearch         285m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:30:15Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   25m          4Mi
+insee-bench-mtwrt   opensearch         181m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:30:28Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   27m          4Mi
+insee-bench-mtwrt   opensearch         227m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:30:41Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   27m          4Mi
+insee-bench-mtwrt   opensearch         204m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:30:54Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          4Mi
+insee-bench-mtwrt   opensearch         174m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:31:07Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          4Mi
+insee-bench-mtwrt   opensearch         174m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:31:20Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   24m          4Mi
+insee-bench-mtwrt   opensearch         246m         1476Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:31:33Z ===
+POD                 NAME               CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   artillery-runner   26m          4Mi
+insee-bench-mtwrt   opensearch         222m         1474Mi
+insee-bench-mtwrt   surch              1m           77Mi
+=== 2026-05-21T03:31:46Z ===
+POD                 NAME         CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   opensearch   222m         1474Mi
+insee-bench-mtwrt   surch        0m           77Mi
+=== 2026-05-21T03:31:59Z ===
+POD                 NAME    CPU(cores)   MEMORY(bytes)
+insee-bench-mtwrt   surch   1m           77Mi

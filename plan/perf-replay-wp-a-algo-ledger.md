@@ -8,10 +8,11 @@ Status: started on 2026-05-20. First current-main K8s replay was
 dispatched as `ci-k8s` run `26193166785`; verdict PASS, promoted
 report:
 `docs/ops/bench-reports/2026-05-20-A-replay-current-main-insee-K8s/`.
-Post-wait-loop-fix repetition `1/3` for the same current-main INSEE
-group is `ci-k8s` run `26202012197`, artifact `7126271947`, promoted
+The stable current-main repeated INSEE group is now closed on
+`61a13f871f810c98379375f2c94a10bbc696ac6e`: `ci-k8s` runs
+`26202652997`, `26203320060`, and `26204062094` passed and are promoted
 under
-`docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
+`docs/ops/bench-reports/2026-05-21-A-replay-current-main-61a13f-insee-K8s/`.
 
 ## Finality
 
@@ -64,7 +65,8 @@ as remote branch heads or tags today.
 | A-replay-2 WAND family | `3157afbae0f2d37ac3d92462f08b92f6b6dee317` | `e38bf916a0f197e0bb4f63e50ee9efc10cf3c704` | reachable through `origin/main`, no dedicated remote ref | GHCR tags missing; no `docker-build.yml` / `ci-k8s.yml` at these SHAs, so direct workflow dispatch is blocked |
 | A-replay-3 memory layout | `65fc7599946a2e5e1d81b989a1fb6606fc2d7a21` | `7caf3397970d9a183ebc5bc7631cb2e9f0aaea5c` | baseline is `origin/wp/b-test-auto`; head reachable through `origin/main`, no dedicated head ref | GHCR tags missing; baseline has workflow files, head lacks `docker-build.yml`; direct paired dispatch is blocked |
 | Current cumulative smoke | `69240116599e8e86f629f13f3d7611d73ff1a07d` | `466693f55e1a3cd8b007e058be07584251986ecb` | reachable through `origin/main` history, no dedicated stable ref | `insee-bench` run `26193166785` PASS; promoted report `2026-05-20-A-replay-current-main-insee-K8s` |
-| Current-main repeated group | `ac558e6d08c7566f8cbc0b96c56a5b943eb1ae79` | same SHA | reachable through `origin/main` history, no dedicated stable ref | `insee-bench` run `26202012197` PASS and promoted as repetition `1/3`; two more repetitions on the same image tags, or a documented new SHA group, required before final verdict |
+| Current-main repeated group (superseded single repetition) | `ac558e6d08c7566f8cbc0b96c56a5b943eb1ae79` | same SHA | reachable through `origin/main` history, no dedicated stable ref | `insee-bench` run `26202012197` PASS and promoted as a single diagnostic repetition; not final because `main` advanced before the 3-run group closed |
+| Current-main repeated group (stable ref) | `61a13f871f810c98379375f2c94a10bbc696ac6e` | same SHA | `perf-replay/current-main-61a13f` | `insee-bench` runs `26202652997`, `26203320060`, and `26204062094` PASS; promoted report `2026-05-21-A-replay-current-main-61a13f-insee-K8s` closes the first final repeated current-main verdict |
 
 The A-replay-1 row in the existing ledger is non-linear as written:
 `3157afb` is an ancestor of `5081cc7`, so `71ceb275 -> 3157afb`
@@ -137,15 +139,17 @@ Required artifact set per replay group:
 
 Current-main repeated run group:
 
-- [x] Repetition 1/3: `ci-k8s` run `26202012197`, artifact
+- [x] Superseded single repetition: `ci-k8s` run `26202012197`, artifact
   `7126271947`, promoted report
   `docs/ops/bench-reports/2026-05-21-A-replay-current-main-insee-K8s-rep1/`.
-- [ ] Repetition 2/3: rerun against the same `ac558e6` SHA/image tags
-  through a stable replay ref, or document why a newer SHA starts a new
-  group.
-- [ ] Repetition 3/3: same workload/ref/image set as repetition 1.
-- [ ] Aggregate the three repetitions with median/IQR or
-  min/median/max and update the Track A ledger.
+- [x] Stable group repetition 1/3: `ci-k8s` run `26202652997`,
+  artifact `7126549971`, SHA `61a13f8`.
+- [x] Stable group repetition 2/3: `ci-k8s` run `26203320060`,
+  artifact `7126727126`, SHA `61a13f8`.
+- [x] Stable group repetition 3/3: `ci-k8s` run `26204062094`,
+  artifact `7126979242`, SHA `61a13f8`.
+- [x] Aggregate the three repetitions with min/median/max and update
+  the Track A ledger.
 
 Reference strategy, without history rewrite:
 
@@ -222,12 +226,12 @@ Track B coordination:
     min/median/max when IQR is not derivable from the artifacts.
   - [ ] Coordinate with Track B before claiming RSS peak/final; otherwise
     mark RSS explicitly missing in A reports and ledger rows.
-  - [ ] Promote `summary.md` / benchmark artifacts and update the
-    ledger rows in place.
+  - [x] Promote `summary.md` / benchmark artifacts and update the
+    ledger rows in place for the stable current-main repeated group.
   - [x] Promote first post-fix current-main repeated K8s run:
     `26202012197`, artifact `7126271947`, report
     `2026-05-21-A-replay-current-main-insee-K8s-rep1`.
-  - [ ] Run repetitions 2/3 and 3/3 for the current-main group before
+  - [x] Run repetitions 2/3 and 3/3 for the current-main group before
     publishing a final repeated-run verdict.
 
 ## Gates
@@ -246,6 +250,9 @@ Track B coordination:
   diagnostics are cited in the promoted replay report.
 - [ ] Significance gate: repeated runs are summarized as median/IQR or
   min/median/max and any outlier or failed repetition is called out.
+- [x] Current-main repeated gate: stable SHA `61a13f8` has 3 successful
+  K8s repetitions, image/config evidence, pod metrics, and min/median/max
+  in the promoted report.
 
 ## Proofs
 

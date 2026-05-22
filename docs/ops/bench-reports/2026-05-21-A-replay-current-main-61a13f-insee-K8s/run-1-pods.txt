@@ -1,0 +1,2 @@
+NAME                READY   STATUS      RESTARTS   AGE   IP            NODE                                             NOMINATED NODE   READINESS GATES
+insee-bench-f7hhd   0/3     Completed   0          15m   100.64.3.71   scw-poc-burst-c1f70bea719b428797bdd6485188061c   <none>           <none>
