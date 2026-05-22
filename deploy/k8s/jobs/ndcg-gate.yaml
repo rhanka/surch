@@ -11,13 +11,17 @@
 # bumps — corpus is 171 k docs; the previous 512Mi/2Gi Surch limits OOM'd
 # at chunks 3 and 16 respectively on ci-k8s runs 26266507485 and
 # 26267363245. At 85 k docs ingested Surch peaked at 1962 MiB. Sub-linear
-# scaling → ~3 GiB for the full 171 k corpus, so target Surch=3Gi / OS=2Gi
-# Xmx=1g to fit the 6 GiB tenant quota):
-#   surch       cpu  150m req /  800m lim ; mem 256Mi req / 3072Mi lim
+# scaling → ~3 GiB for the full 171 k corpus. Run 26267979042 confirmed
+# no OOM under Surch=3Gi but the 30-min activeDeadlineSeconds capped
+# TREC-COVID mid-indexing. Bumping Surch CPU to 2000m and the
+# activeDeadlineSeconds + workflow wait to 3600s gives the 171 k corpus
+# room to finish end-to-end while staying under the 6 GiB tenant quota
+# and the 4500m CPU tenant quota):
+#   surch       cpu  150m req / 2000m lim ; mem 256Mi req / 3072Mi lim
 #   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 2048Mi lim  (JVM Xmx=1g)
 #   driver      cpu  100m req /  500m lim ; mem 128Mi req / 1024Mi lim
 #   ---------------------------------------------------------------
-#   total       cpu  500m req / 2500m lim ; mem 640Mi req / 6144Mi lim
+#   total       cpu  500m req / 3700m lim ; mem 640Mi req / 6144Mi lim
 # Requires the tenant ResourceQuota in poc-k8s to allow limits.memory>=6Gi
 # (the previous 3Gi cap covered SciFact only). Runs on the DEV1-XL (4 vCPU /
 # 8 GiB) burst node — DEV1-L is no longer enough.
@@ -36,7 +40,7 @@ metadata:
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 3600
-  activeDeadlineSeconds: 1800
+  activeDeadlineSeconds: 3600
   template:
     metadata:
       labels:
@@ -82,7 +86,7 @@ spec:
             - { name: RUST_LOG,   value: "warn" }
           resources:
             requests: { cpu: 150m, memory: 256Mi }
-            limits:   { cpu: 800m, memory: 3Gi }
+            limits:   { cpu: 2000m, memory: 3Gi }
           volumeMounts:
             - { name: scratch, mountPath: /var/surch }
         # --- Engine sidecar #2: OpenSearch baseline -------------------
