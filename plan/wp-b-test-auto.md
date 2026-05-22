@@ -169,7 +169,30 @@ branch `wp/b-test-auto` head `65fc759` kept for history.
   - [x] Add script-level HTTP diagnostics for SciFact and TREC-COVID:
     failed requests now print operation label, method, URL, status, and
     response body.
-  - [ ] Re-run `ndcg-gate` with the diagnostic scripts and capture the
-    exact failing operation and response body.
-  - [ ] Fix the root cause of that HTTP 400, then promote a passing
-    report before treating TREC-COVID as an acceptance gate.
+  - [x] Re-run `ndcg-gate` with the diagnostic scripts and capture the
+    exact failing operation and response body: run `26203362568`
+    surfaced `missing source line after \`index\` action at line 10363`
+    on chunk `bulk.0000`, caused by `split -C` cutting between an
+    `index` action and its source line.
+  - [x] Fix the chunker to be pair-aware (`ff0d31c`): rewrite the
+    bulk chunker in awk to accumulate bytes only at NDJSON pair
+    boundaries, with a defensive even-line check per chunk. Run
+    `26266507485` confirmed the HTTP 400 chain is fixed (chunks
+    0..2 ingested cleanly).
+  - [x] Diagnose the next layer of failure: run `26266507485` revealed
+    Surch OOM at chunk 3 under 512 MiB cap; bump in `5cdc5da` to
+    Surch=2Gi / OS=3Gi Xmx=1.5g pushed the OOM to chunk 16 of ~21 in
+    run `26267363245`; second bump in `3bda81a` to Surch=3Gi / OS=2Gi
+    Xmx=1g eliminated the OOM (peak Surch RSS 2645 MiB under the 3 GiB
+    cap) but run `26267979042` hit the 30-min `activeDeadlineSeconds`
+    cap with TREC-COVID still indexing. SciFact passed end-to-end on
+    every run (NDCG@10=0.6576 vs OS 0.6537, parity preserved).
+  - [ ] Decision required before promoting TREC-COVID as an acceptance
+    gate: either (a) extend `ndcg-gate` `activeDeadlineSeconds` to
+    3600 plus the workflow wait deadline plus bump Surch CPU limit to
+    finish the 171 k corpus in one run, accepting the doubled cost
+    cap per gate execution; or (b) treat the full 171 k TREC-COVID
+    corpus as a Surch memory-and-throughput limit pending the deferred
+    Track A memory-layout follow-up, and keep SciFact as the only BEIR
+    gate for now. The diagnosis above is the prerequisite for either
+    path.
