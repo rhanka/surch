@@ -132,24 +132,36 @@ spec:
               until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
               mkdir -p "$REPORTS_DIR"
               RSS_SAMPLE_SECONDS="${RSS_SAMPLE_SECONDS:-420}"
-              # shareProcessNamespace=true exposes sibling container PIDs in
-              # /proc; the bench-driver image is procps-less so we scan
-              # /proc/<pid>/cmdline directly (NUL-separated, hence `tr`).
+              # shareProcessNamespace=true exposes sibling container PIDs
+              # in /proc; the bench-driver image is procps-less so we scan
+              # /proc/<pid>/cmdline directly. We match the basename of
+              # argv[0] (not the whole cmdline) to avoid false positives on
+              # the driver `sh -c "<script>"` whose cmdline embeds the
+              # script body. An optional content substring is required when
+              # the engine binary is generic (e.g. `java` for OpenSearch).
               start_rss_sample() {
                 label="$1"
-                pattern="$2"
-                output="$3"
-                pid_file="$4"
+                binary="$2"
+                content="$3"
+                output="$4"
+                pid_file="$5"
                 pid=""
                 for d in /proc/[0-9]*; do
                   [ -r "$d/cmdline" ] || continue
-                  if tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q "$pattern"; then
-                    pid="${d#/proc/}"
-                    break
+                  argv0="$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -n 1)"
+                  [ -n "$argv0" ] || continue
+                  case "${argv0##*/}" in
+                    "$binary") ;;
+                    *) continue ;;
+                  esac
+                  if [ -n "$content" ]; then
+                    tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q "$content" || continue
                   fi
+                  pid="${d#/proc/}"
+                  break
                 done
                 if [ -z "$pid" ]; then
-                  echo "WARN: cannot start RSS sample for $label (pattern: $pattern)"
+                  echo "WARN: cannot start RSS sample for $label (binary: $binary, content: $content)"
                   return 0
                 fi
                 /usr/local/bin/rss-sample.sh "$pid" "$RSS_SAMPLE_SECONDS" "$output" \
@@ -171,8 +183,8 @@ spec:
               # image. The slice NDJSON carries `_index: "deces"` in
               # every action header, so artillery_bench targets the
               # same index name below.
-              start_rss_sample "surch" "surch-api" "$REPORTS_DIR/rss-art-surch.json" "$REPORTS_DIR/.rss-surch.pid"
-              start_rss_sample "opensearch" "org.opensearch.bootstrap" "$REPORTS_DIR/rss-art-os.json" "$REPORTS_DIR/.rss-os.pid"
+              start_rss_sample "surch"      "surch-api" ""                         "$REPORTS_DIR/rss-art-surch.json" "$REPORTS_DIR/.rss-surch.pid"
+              start_rss_sample "opensearch" "java"      "org.opensearch.bootstrap" "$REPORTS_DIR/rss-art-os.json"    "$REPORTS_DIR/.rss-os.pid"
               bootstrap_engine() {
                 url="$1"; label="$2"
                 # The scratch PVC persists across ndcg-gate / insee-bench
