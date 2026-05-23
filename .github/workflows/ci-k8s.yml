@@ -269,11 +269,11 @@ jobs:
           case "${{ inputs.job }}" in
             ndcg-gate)
               REPORT_CONTAINER="ndcg-driver"
-              REPORT_FILES="summary.md bench.json scifact-surch.out scifact-os.out"
+              REPORT_FILES="summary.md bench.json scifact-surch.out scifact-os.out rss-ndcg-surch.json rss-ndcg-os.json"
               ;;
             insee-bench)
               REPORT_CONTAINER="artillery-runner"
-              REPORT_FILES="summary.md art-surch.json art-os.json"
+              REPORT_FILES="summary.md art-surch.json art-os.json rss-art-surch.json rss-art-os.json"
               ;;
             b1-oracle-gate)
               REPORT_CONTAINER="b1-oracle-driver"
@@ -308,6 +308,36 @@ jobs:
           # report files once the benchmark driver has terminated. Driver logs
           # are still available after Job completion, so keep a log-backed
           # summary fallback for the GitHub step summary and artifact.
+          # Reconstruct each rss-*.json envelope from the driver log
+          # `BEGIN_SURCH_K8S_RSS_FILE:<name>` / `END_SURCH_K8S_RSS_FILE:<name>`
+          # markers when the emptyDir /reports volume is gone after driver
+          # termination. The driver-log path is set per-job below.
+          reconstruct_rss_from_log() {
+            DRIVER_LOG_ARG="$1"
+            shift
+            if [ -z "$DRIVER_LOG_ARG" ]; then
+              return 0
+            fi
+            for FNAME in "$@"; do
+              DEST="$OUT_DIR/${{ inputs.job }}.$FNAME"
+              if [ -s "$DEST" ]; then
+                continue
+              fi
+              BEGIN_MARK="BEGIN_SURCH_K8S_RSS_FILE:$FNAME"
+              END_MARK="END_SURCH_K8S_RSS_FILE:$FNAME"
+              awk -v begin="$BEGIN_MARK" -v end="$END_MARK" '
+                index($0, begin) > 0 { capture=1; next }
+                index($0, end)   > 0 { capture=0 }
+                capture { print }
+              ' "$DRIVER_LOG_ARG" > "$DEST.tmp" || true
+              if [ -s "$DEST.tmp" ]; then
+                mv "$DEST.tmp" "$DEST"
+              else
+                rm -f "$DEST.tmp"
+              fi
+            done
+          }
+
           case "${{ inputs.job }}" in
             ndcg-gate)
               SUMMARY_FILE="$OUT_DIR/${{ inputs.job }}.summary.md"
@@ -337,6 +367,8 @@ jobs:
                   rm -f "$BENCH_FILE.tmp"
                 fi
               fi
+              reconstruct_rss_from_log "$DRIVER_LOG" \
+                rss-ndcg-surch.json rss-ndcg-os.json
               ;;
             insee-bench)
               SUMMARY_FILE="$OUT_DIR/${{ inputs.job }}.summary.md"
@@ -353,6 +385,8 @@ jobs:
                   rm -f "$SUMMARY_FILE.tmp"
                 fi
               fi
+              reconstruct_rss_from_log "$DRIVER_LOG" \
+                rss-art-surch.json rss-art-os.json
               ;;
           esac
 
