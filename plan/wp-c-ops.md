@@ -4,8 +4,9 @@ Track principal: C - ops / packaging / snapshots
 Branch: `wp/c-ops`
 Worktree: `.worktrees/wp-c`
 Owner: conductor / APIServer / StorageEngine depending on slice
-Status: active branch exists; latest branch head `2625edd`. Main carries
-the current functional deliveries; the long branch is kept for history.
+Status: Lots 1-3 closed on `main`; only Lot 4 (release verification
+reproducible from CI artefacts) remains, kept in backlog without a
+committed timeline. Long branch head `2625edd` kept for history.
 
 ## Finality
 
@@ -68,7 +69,7 @@ the current functional deliveries; the long branch is kept for history.
     keeps `cargo test` bounded and the MinIO path is available through
     explicit `SURCH_MINIO_E2E=1` runs.
 
-- [ ] Lot 3 - Snapshot / SLM completeness
+- [x] Lot 3 - Snapshot / SLM completeness
   - [x] Finish snapshot REST coverage.
     - [x] Cover `GET /_snapshot/{repo}/_all` in the fs/tower REST
       suite and return the same `snapshots: [...]` envelope as unitary

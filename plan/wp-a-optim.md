@@ -4,11 +4,12 @@ Track principal: A - perf / optimisation
 Branch: `wp/a-optim`
 Worktree: `.worktrees/wp-a`
 Owner: conductor / StorageEngine / SearchEngine depending on slice
-Status: closed, all lots delivered on `main` (Lot 3 paired K8s
-perf-proof landed in `c5980ad` on 2026-05-20)
-Replay follow-up: `plan/perf-replay-wp-a-algo-ledger.md` tracks the
-historical cumulative proof line without reopening the delivered Lot 3
-closure.
+Status: closed, all delivered lots on `main` (Lot 3 paired K8s
+perf-proof landed in `c5980ad` on 2026-05-20). This file is now
+historical: the active perf forward queue lives in
+`plan/wp-a-perf-followups.md` (TREC-COVID bulk scaling, skip lists,
+next Block-Max WAND step) and the cumulative historical proof line
+lives in `plan/perf-replay-wp-a-algo-ledger.md`.
 
 ## Finality
 

@@ -8,10 +8,13 @@ Status: B1 oracle phase is closed on `main` against Elasticsearch
 8.6.1. `ci-k8s` run `26192816780` passed with 30 requests,
 0 skipped, and 0 divergence; promoted report:
 `docs/ops/bench-reports/2026-05-20-b1-oracle-ES861-K8s/`.
-Phase 4 widening
-(A1/A2/A7/A13 multi-field, date{format}, geo_point, edge_ngram +
-deces_v2 INSEE replay) is deferred to a follow-up plan when scoped.
-Long branch `wp/d-matchid` head `9e0e6b3` kept for history.
+
+Phase 4 widening (A1/A2/A5/A6/A7/A10/A12/A13 multi-field + date
+runtime + geo + edge_ngram + composite, plus deces_v2 INSEE replay)
+is **listed but inactive** in `plan/wp-d-matchid-phase4.md`. The
+8 lots / ~28 leaves are scoped but await a separate scope decision
+before any execution slot is reserved. Long branch `wp/d-matchid`
+head `9e0e6b3` kept for history.
 
 ## Finality
 

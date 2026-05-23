@@ -46,9 +46,12 @@ single-threaded status loops advanced too little per user turn.
 
 - [x] `main`: current integration branch.
 - [x] `wp/a-optim`: Track A long branch, head `30a7b32`;
-  detailed plan: `plan/wp-a-optim.md` (Track A closed on `main` at
-  `c5980ad`, branch kept for history; skip-lists / next Block-Max
-  WAND step deferred to a follow-up plan).
+  delivered lots tracked in `plan/wp-a-optim.md` (closed at `c5980ad`,
+  branch kept for history). Track A perf is **rouvert** for follow-ups
+  in `plan/wp-a-perf-followups.md`: TREC-COVID bulk scaling, skip
+  lists on the codec path, next Block-Max WAND step, and the
+  historical A-replay-1/2/3 line (delegated to
+  `plan/perf-replay-wp-a-algo-ledger.md`).
 - [ ] `wp/b-test-auto`: Track B long branch, head `65fc759`;
   detailed plan: `plan/wp-b-test-auto.md`.
 - [ ] `wp/c-ops`: Track C long branch, head `2625edd`;
@@ -60,12 +63,17 @@ single-threaded status loops advanced too little per user turn.
 
 ## Track A - Perf / Optimisation
 
-Status: **closed** on `main` at `c5980ad` (2026-05-20). Lot 3 paired
-K8s perf-proof shows Surch hot path -21/-22/-12/-30 % p50/p95/p99/max
-vs pre-FoR `c01b0a2`; runbook + numbers under
+Reste estime: ~25% (4 follow-ups / 18 leaf tasks, delivered lots
+closed on `main` at `c5980ad`).
+
+Lot 3 paired K8s perf-proof shows Surch hot path -21/-22/-12/-30 %
+p50/p95/p99/max vs pre-FoR `c01b0a2`; runbook + numbers under
 `docs/ops/bench-reports/2026-05-20-A-lot3-paired-K8s/`. The durable
-axis-by-axis performance state is now tracked in
-`docs/ops/bench-reports/track-a-performance-ledger.md`.
+axis-by-axis performance state is tracked in
+`docs/ops/bench-reports/track-a-performance-ledger.md`. Active
+follow-ups live in `plan/wp-a-perf-followups.md`; the cumulative
+historical replay line lives in
+`plan/perf-replay-wp-a-algo-ledger.md`.
 
 - [x] Land scalar top-K finalization: `5081cc7`.
 - [x] Land lazy `_source` hydration for scored top-K: `3157afb`.
@@ -93,10 +101,16 @@ axis-by-axis performance state is now tracked in
 - [x] Refresh memory baselines after the FST / shared-source / FoR
   sequence: `2026-05-19-insee-10k-k8s/` (post-FoR) +
   `2026-05-20-A-lot3-paired-K8s/` (paired before/after).
-- [ ] (deferred to a follow-up plan) Skip lists on top of the codec
-  path.
-- [ ] (deferred to a follow-up plan) Next Block-Max WAND step on top
-  of encoded block metadata.
+- [ ] Follow-up Lot 1 — TREC-COVID bulk scaling
+  (`plan/wp-a-perf-followups.md`). New target after the
+  `2026-05-22-ndcg-gate-7Gi-K8s/` promo exposed Surch bulk `13.9x`
+  slower than OpenSearch on the full 171 k corpus.
+- [ ] Follow-up Lot 2 — Skip lists on top of the codec FoR path
+  (`plan/wp-a-perf-followups.md`).
+- [ ] Follow-up Lot 3 — Next Block-Max WAND step on encoded block
+  metadata (`plan/wp-a-perf-followups.md`).
+- [ ] Follow-up Lot 4 — Historical A-replay-1/2/3 promotion, owned by
+  `plan/perf-replay-wp-a-algo-ledger.md`.
 - [x] Record a current perf + quality guardrail for the complete hot path:
   `docs/ops/bench-reports/track-a-performance-ledger.md` summarizes
   search latency, bulk, quality, RSS/memory, disk, and SLO axes with
@@ -191,7 +205,9 @@ Reste estime: ~3% (0 hard blocker, 1 bonus replay leaf / 11 leaf tasks).
 
 ## Track C - Ops / Packaging / Snapshots
 
-Reste estime: ~25% (3 open / 13 leaf tasks).
+Reste estime: ~8% (1 leaf / 13 leaf tasks). Lots 1-3 closed on
+`main`; only Lot 4 (release verification reproducible from CI
+artefacts) remains, kept in backlog without a committed timeline.
 
 - [x] Docker, Helm, release, signing, and SBOM work landed.
 - [x] Snapshot and SLM work started on `wp/c-ops`.
@@ -232,8 +248,13 @@ Reste estime: ~25% (3 open / 13 leaf tasks).
 
 ## Track D - matchID
 
-Reste estime: ~0% for the closed B1 oracle phase. Phase 4 widening is
-deferred to a follow-up plan when scoped.
+Reste estime: B1 oracle phase closed at 0%. Phase 4 widening
+(`plan/wp-d-matchid-phase4.md`) is **listed but inactive**: 8 lots /
+~28 leaves scoped (A10 write-time fan-out, A1/A13 multi-field +
+edge_ngram, A7 runtime dates, A2 geo widening, A5 scoring widening,
+A6/A13 keyword-prefix, A12 composite, B2 deces_v2). Re-activation is
+a separate scope decision; until then the leaf count is tracked in
+that file, not aggregated here.
 
 - [x] Intake flow exists under `docs/wp-d-matchid/incoming/`,
   `decisions/`, and `gap-analysis.md`.
@@ -262,7 +283,12 @@ deferred to a follow-up plan when scoped.
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~7% (2 open / 28 leaf tasks).
+Reste estime: ~3% (1 leaf / 28 leaf tasks). The remaining leaf is
+"make `ci-k8s` the standard burst / large-corpus path"; closure is
+conditioned on the bonus `ndcg-gate` replay on `b9faefe` (RSS
+sampler wired) that also lifts Track B's last leaf and the
+`RSS: not captured by current harness` line in
+`docs/ops/bench-reports/track-a-performance-ledger.md`.
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -381,3 +407,13 @@ Reste estime: ~7% (2 open / 28 leaf tasks).
   not only Surch HEAD.
 - [ ] Track E finality: `ci-k8s` is a reliable heavy-benchmark target
   with preserved diagnostics.
+
+## Hors-track maintenance
+
+- [ ] Dependabot demo deps: 4 moderate alerts on
+  `demo/package-lock.json` (Svelte / @sveltejs/kit / svelte / cookie,
+  all `scope: development`). The Surch crates carry no open alert.
+  Fix as an isolated commit on `demo/`, not a Track A-E item.
+- [x] Legacy `plan/00_AUTONOMOUS_PORTAGE_EXECUTION.md` (dated
+  2026-05-04, predates the A-E track split) archived under
+  `archive/plan/`.

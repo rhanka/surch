@@ -188,7 +188,12 @@ Status: active infra lane; merge state below is the source of truth
   - [x] Apply the Surch tenant ResourceQuota bump required by the
     TREC-COVID `ndcg-gate` path: live quota now allows
     `limits.memory=6Gi` instead of the previous `3Gi`.
-  - [ ] Make `ci-k8s` the standard burst / large-corpus path.
+  - [ ] Make `ci-k8s` the standard burst / large-corpus path. Closure
+    is conditioned on the bonus `ndcg-gate` replay on `b9faefe` (RSS
+    sampler wired) that will simultaneously close Track B's remaining
+    leaf and lift the `RSS: not captured by current harness` line in
+    the Track A ledger. No new infra change is gated on Track E
+    beyond that replay promo.
   - [x] Turn `make bench-k8s` into a real entry point.
 
 - [x] Lot N - Closure

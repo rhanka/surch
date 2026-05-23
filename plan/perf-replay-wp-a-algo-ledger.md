@@ -14,6 +14,12 @@ The stable current-main repeated INSEE group is now closed on
 under
 `docs/ops/bench-reports/2026-05-21-A-replay-current-main-61a13f-insee-K8s/`.
 
+Scope coordination: this file owns A-replay-1/2/3 (historical
+cumulative proof) and is referenced by
+`plan/wp-a-perf-followups.md` Lot 4. Forward perf work (TREC-COVID
+bulk scaling, skip lists, next Block-Max WAND step) is **not** here;
+it lives in `plan/wp-a-perf-followups.md`.
+
 ## Finality
 
 - [x] Start a cumulative replay trace from the live Track A ledger.
