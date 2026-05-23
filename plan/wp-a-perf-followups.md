@@ -132,11 +132,12 @@ surface, so direct workflow dispatch is not yet possible.
 
 ## Coordination
 
-- Track B owns the RSS sampling wiring (`b9faefe`). The bonus
-  `ndcg-gate` replay on `b9faefe` will produce the first
-  `surch.bench.rss.v1` envelopes; once promoted, this file's Lots 1
-  and 3 can cite real RSS deltas instead of relying on
-  `kubectl top`.
-- Track E gating: the same `b9faefe` replay closes Track E's
-  remaining leaf. No additional infra dependency is expected for
+- Track B owns the RSS sampling wiring. The first paired
+  `surch.bench.rss.v1` envelopes are now live in
+  `docs/ops/bench-reports/2026-05-23-ndcg-gate-7Gi-RSS-K8s/`
+  (Surch peak `4802 MiB / 7 GiB`, OpenSearch peak
+  `1395 MiB / 2 GiB`), so Lots 1 and 3 can cite real paired RSS
+  deltas directly rather than relying on `kubectl top`.
+- Track E is closed: the `ndcg-gate` K8s harness is the standard
+  heavy-run target. No additional infra dependency is expected for
   Lots 1-3 on the current image surface.

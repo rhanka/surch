@@ -28,6 +28,11 @@ need a fresh run.
   first `ndcg-gate` run that ingests the full 171 k TREC-COVID corpus
   end-to-end on SHA `d9cac15` (Surch 7 GiB cap); supersedes the false
   green from `2026-05-20-ndcg-gate-K8s` for the TREC-COVID rows.
+- `docs/ops/bench-reports/2026-05-23-ndcg-gate-7Gi-RSS-K8s/README.md`:
+  first `ndcg-gate` run carrying a paired `surch.bench.rss.v1` RSS
+  envelope on SHA `137b352` (after the `argv[0]`-basename PID fix and
+  driver-log marker reconstruction); supersedes the 2026-05-22 report
+  for the `Memory / RSS` ledger row.
 - `docs/ops/memory-capacity.md`: current RAM capacity model and stats
   endpoint contract.
 
@@ -72,9 +77,15 @@ the proof state:
 - A replay group is invalid until rerun if any repetition has benchmark
   errors, missing diagnostics, missing image/config evidence, a failed
   K8s condition, or a missing SLO verdict.
-- RSS peak/final remains a Track B reporting prerequisite. Track B is now
-  wired in the replay jobs; for rows without a replay rerun carrying RSS,
-  A rows must keep `RSS: not captured by current harness`.
+- RSS peak/final is now reportable on K8s `ndcg-gate` and
+  `insee-bench` jobs: Track B wires `rss-sample.sh` against the
+  argv[0]-resolved engine PIDs, the driver streams each envelope
+  between `BEGIN_SURCH_K8S_RSS_FILE:<name>` / `END_…` markers, and
+  `ci-k8s.yml` reconstructs `rss-{ndcg,art}-{surch,os}.json` into the
+  artifact directory. Rows that have not yet been replayed with this
+  harness keep `RSS: not captured by current harness`; rows that
+  cite `2026-05-23-ndcg-gate-7Gi-RSS-K8s` may quote the paired RSS
+  numbers directly.
 
 ## Current axis state
 
@@ -83,9 +94,9 @@ the proof state:
 | Search latency, matchID INSEE 10k | K8s repeated group `2026-05-21-A-replay-current-main-61a13f-insee-K8s` | Median Surch p50/p95/p99/max `2.1/3.6/5.0/22.0 ms` vs OpenSearch `3.9/9.3/16.7/225.6 ms`; min/median/max in the promoted report | Surch median is `1.9x/2.6x/3.3x/10.3x` faster; 0 errors on both engines in all 3 runs; SLO PASS | RSS peak/final is not captured by the current K8s harness |
 | FoR metadata wiring | K8s before run `26151880297` vs after run `26101404966` | Surch before `2.4/4.6/7.8/25.6 ms`; after `1.9/3.6/6.9/17.9 ms` | Surch hot path improved `-21%/-22%/-12%/-30%` p50/p95/p99/max | Bulk timing and RSS are not isolated for this commit |
 | BAN Paris 25k latency | Local report `2026-05-16-vs-os-2.17.1` | Surch `took` p50 sub-ms, p95 `20 ms`, max `20 ms`; OpenSearch p50 `20 ms`, p95 `108 ms`, max `108 ms` | Surch is `>20x` faster at p50 and `5.4x` faster at p95/max | Needs K8s rerun if this becomes a release gate |
-| Bulk indexing | Local report `2026-05-16-vs-os-2.17.1` plus K8s `ndcg-gate` run `26304471549` (full 171 k TREC-COVID, Surch 7 GiB cap) | Local SciFact: Surch `3.545 s`, OpenSearch `17.612 s`; local BAN 25k: Surch `17.882 s`, OpenSearch `21.707 s`; K8s SciFact: Surch `3.662 s`, OpenSearch `7.843 s` (Surch `2.1x` faster); K8s TREC-COVID full corpus: Surch `1001.95 s`, OpenSearch `72.27 s` (OpenSearch `13.9x` faster) | Surch wins SciFact bulk; OpenSearch wins TREC-COVID bulk by `13.9x` on the full 171 k corpus — Surch ingest scaling for long-text/large-corpus shapes is the next target | No current bulk-only run with paired RSS after the FoR/FST/source-sharing sequence; `b9faefe` wires the RSS sampler but no `ndcg-gate` has run on it yet |
-| Quality guardrail | Local SciFact report `2026-05-16-vs-os-2.17.1` plus K8s `ndcg-gate` run `26304471549` (full 171 k TREC-COVID, Surch 7 GiB cap) | SciFact: Surch NDCG@10 `0.6576`, Recall@10 `0.8100` vs OpenSearch `0.6537` / `0.8033` (Surch `+0.6%` / `+0.8%`). TREC-COVID full corpus: Surch NDCG@10 `0.4750`, Recall@10 `0.0132` vs OpenSearch `0.4902` / `0.0132` (Surch `-3.1%` NDCG@10, Recall@10 tied) | SciFact floor `NDCG@10 >= 0.65` held; TREC-COVID is now a real cross-engine BEIR baseline (false-green retired) with Surch trailing OpenSearch by `0.0152` NDCG@10 | Diagnose the Surch TREC-COVID NDCG@10 gap before claiming a BEIR quality win; SciFact stays the active acceptance gate |
-| RSS / memory | `docs/ops/memory-capacity.md` + K8s pod limits | Model says BAN 25k is about `85 MB`; INSEE 1.3M projects to about `4.5 GB`; K8s INSEE 10k pod cap was Surch `512Mi` | Capacity model exists, but it is not a Surch-vs-OpenSearch RSS delta | Add paired RSS reporting under Track B and promote a report with peak/final RSS |
+| Bulk indexing | Local report `2026-05-16-vs-os-2.17.1` plus K8s `ndcg-gate` runs `26304471549` (`d9cac15`) and `26340177506` (`137b352`, paired RSS) | Local SciFact: Surch `3.545 s`, OpenSearch `17.612 s`; local BAN 25k: Surch `17.882 s`, OpenSearch `21.707 s`; K8s SciFact `d9cac15`: Surch `3.662 s`, OpenSearch `7.843 s` (Surch `2.1x` faster); K8s SciFact `137b352`: Surch `3.290 s`, OpenSearch `11.376 s` (Surch `3.5x` faster); K8s TREC-COVID `d9cac15`: Surch `1001.95 s`, OpenSearch `72.27 s` (OpenSearch `13.9x` faster); K8s TREC-COVID `137b352`: Surch `1112.52 s`, OpenSearch `93.80 s` (OpenSearch `11.9x` faster) | Surch wins SciFact bulk in both runs; OpenSearch wins TREC-COVID bulk by `11.9–13.9x` on the full 171 k corpus — Surch ingest scaling for long-text/large-corpus shapes is `plan/wp-a-perf-followups.md` Lot 1 | First paired RSS now available on `137b352`; further bulk profiling pending Lot 1 |
+| Quality guardrail | Local SciFact report `2026-05-16-vs-os-2.17.1` plus K8s `ndcg-gate` runs `26304471549` (`d9cac15`) and `26340177506` (`137b352`) | SciFact: Surch NDCG@10 `0.6576`, Recall@10 `0.8100` vs OpenSearch `0.6537` / `0.8033` (Surch `+0.6%` / `+0.8%`, identical across the two runs). TREC-COVID full corpus: Surch NDCG@10 `0.4750`, Recall@10 `0.0132` vs OpenSearch `0.4902` / `0.0132` (Surch `-3.1%` NDCG@10, Recall@10 tied, identical across the two runs) | SciFact floor `NDCG@10 >= 0.65` held; TREC-COVID is a reproducible cross-engine BEIR baseline with Surch trailing OpenSearch by `0.0152` NDCG@10 | Diagnose the Surch TREC-COVID NDCG@10 gap before claiming a BEIR quality win; SciFact stays the active acceptance gate |
+| RSS / memory | `docs/ops/memory-capacity.md` + K8s pod limits + K8s `ndcg-gate` run `26340177506` (`137b352`, paired RSS) | Capacity model: BAN 25k ~85 MB, INSEE 1.3M ~4.5 GB. K8s BEIR full 171 k TREC-COVID paired sampling (1 Hz, 1200 s): Surch peak `4802 MiB` under 7 GiB cap (70 %) vs OpenSearch peak `1395 MiB` under 2 GiB cap (70 %); Surch full-corpus footprint is `~3.4x` OpenSearch peak | Surch fits comfortably under the 7 GiB cap; the model is now backed by paired K8s evidence on a real cross-engine BEIR workload | Sampling window ends with TREC-COVID still in flight, so the post-ingest decay is not captured; INSEE-side replay still needs a paired RSS rerun |
 | Disk / encoded format | Track A delivered codec/FoR metadata groundwork | No production on-disk postings format is shipped yet | Disk delta is not claimable today | Defer to the follow-up codec/disk-format plan; do not report a disk win until measured |
 | Error-rate / SLO | K8s run `26101404966` and local SciFact/BAN reports | INSEE 10k: both engines `0/13170` errors; p95 SLO `<= 200 ms`, max SLO `<= 500 ms` | PASS for Surch and OpenSearch; Surch has much larger headroom | Keep this in every promoted perf report |
 

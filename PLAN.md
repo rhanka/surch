@@ -143,7 +143,8 @@ historical replay line lives in
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~3% (0 hard blocker, 1 bonus replay leaf / 11 leaf tasks).
+Reste estime: 0% (Lot 4 closed; bonus paired-RSS replay closed via
+`docs/ops/bench-reports/2026-05-23-ndcg-gate-7Gi-RSS-K8s/`).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -283,12 +284,9 @@ that file, not aggregated here.
 
 ## Track E - Infra K8s / poc-k8s
 
-Reste estime: ~3% (1 leaf / 28 leaf tasks). The remaining leaf is
-"make `ci-k8s` the standard burst / large-corpus path"; closure is
-conditioned on the bonus `ndcg-gate` replay on `b9faefe` (RSS
-sampler wired) that also lifts Track B's last leaf and the
-`RSS: not captured by current harness` line in
-`docs/ops/bench-reports/track-a-performance-ledger.md`.
+Reste estime: 0% (closure leaf met by the paired-RSS `ndcg-gate`
+run promoted as
+`docs/ops/bench-reports/2026-05-23-ndcg-gate-7Gi-RSS-K8s/`).
 
 - [x] Infra surface exists in `.github/workflows/ci-k8s.yml`,
   `deploy/k8s/jobs/`, and `docs/ops/k8s-ci.md`.
@@ -380,8 +378,13 @@ sampler wired) that also lifts Track B's last leaf and the
   live pod metrics samples; `26202012197` is a single-repeat
   diagnostic, and the final repeated Track A group is the stable
   `61a13f8` triplet.
-- [ ] Make `ci-k8s` the standard heavy-run target for burst and
-  large-corpus checks.
+- [x] `ci-k8s` is now the standard heavy-run target: the paired
+  `ndcg-gate` run promoted as
+  `docs/ops/bench-reports/2026-05-23-ndcg-gate-7Gi-RSS-K8s/`
+  produces summary, bench JSON, paired RSS envelopes
+  (`surch.bench.rss.v1`), Job conditions, pod describe, live metrics
+  samples, and cluster events in a single artifact reconstructed
+  from driver-log markers after Job completion.
 - [x] Apply the Surch tenant quota bump from `poc-k8s` HEAD `980d58d`
   to the live cluster: quota now reads `requests.cpu=1500m`,
   `requests.memory=1Gi`, `limits.cpu=4500m`, `limits.memory=6Gi`.

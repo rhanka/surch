@@ -232,9 +232,10 @@ Long branch `wp/b-test-auto` head `65fc759` kept for history.
     a real cross-engine BEIR baseline: Surch `NDCG@10 0.4750` vs
     OpenSearch `0.4902` (`-3.1%`), Recall@10 tied at `0.0132`;
     SciFact remains the active acceptance gate.
-  - [ ] Bonus: replay `ndcg-gate` on `b9faefe` (RSS wiring) to
-    produce the first paired RSS artefact set for SciFact +
-    TREC-COVID (`rss-ndcg-{surch,os}.json` from
-    `surch.bench.rss.v1`) so the Track A replay ledger can drop
-    `RSS: not captured by current harness` for the corresponding
-    rows.
+  - [x] Bonus replay closed: K8s `ndcg-gate` run `26340177506` on
+    `137b352` produces a first paired `surch.bench.rss.v1` envelope
+    for Surch (`peak 4802 MiB / 7 GiB cap`) and OpenSearch
+    (`peak 1395 MiB / 2 GiB cap`); promoted as
+    `docs/ops/bench-reports/2026-05-23-ndcg-gate-7Gi-RSS-K8s/`.
+    The Track A ledger Memory / RSS row now cites paired RSS
+    evidence directly.
