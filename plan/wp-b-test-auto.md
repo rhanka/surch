@@ -6,21 +6,27 @@ Worktree: `.worktrees/wp-b`
 Owner: conductor / benchmark automation owner
 Status: Lot 3 + Lot N closed on `main` for the summary/reporting
 contract and promoted INSEE/SciFact/BAN evidence. TREC-COVID Lot 4
-chain: false green (`26157480132`) -> fail-closed `61a13f8` exposes
-`413`/`400` -> pair-aware chunker `ff0d31c` clears the HTTP 400 chain
--> OOM walked from 512 MiB to 4 GiB (chunks 3 -> 16 -> 19 of ~21)
--> node pool upgrade + Surch container `7Gi` cap `d9cac15` finally
-ingests the full 171 k corpus end-to-end (`ndcg-gate` run
-`26304471549` SUCCESS, artifact `7167929039`). Pending: promote that
-artifact + replay `b9faefe` for the first paired RSS TREC-COVID set.
+**closed** on `main`: false green (`26157480132`) -> fail-closed
+`61a13f8` exposes `413`/`400` -> pair-aware chunker `ff0d31c` clears
+the HTTP 400 chain -> OOM walked from 512 MiB to 4 GiB (chunks 3 ->
+16 -> 19 of ~21) -> node pool upgrade + Surch container `7Gi` cap
+`d9cac15` ingests the full 171 k corpus end-to-end (`ndcg-gate` run
+`26304471549`, artifact `7167929039`) -> promoted as
+`docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/` with Track A
+ledger cross-link. Real cross-engine BEIR baseline: Surch
+`NDCG@10 0.4750` vs OpenSearch `0.4902`, Recall@10 tied at `0.0132`.
+Bonus remaining: replay `b9faefe` for the first paired RSS BEIR set.
 Long branch `wp/b-test-auto` head `65fc759` kept for history.
 
 ## Finality
 
 - [ ] Deliver replayable, comparable benchmark reporting with explicit
   SLO verdicts.
-  - [ ] Turn the current TREC-COVID diagnostic into a real acceptance
-    gate after the remaining HTTP 400 is root-caused and fixed.
+  - [x] TREC-COVID is now a real cross-engine BEIR result on K8s, not
+    a diagnostic. Acceptance gate remains SciFact for now (Surch
+    `+0.6%` NDCG@10 vs OpenSearch); TREC-COVID stays informational
+    until the Surch `-3.1%` NDCG@10 and `13.9x` bulk-ingest gap are
+    addressed in a future Track A scaling delivery.
 
 ## Scope
 
@@ -218,12 +224,17 @@ Long branch `wp/b-test-auto` head `65fc759` kept for history.
     34 KiB). The full 171 k TREC-COVID corpus now fits under the new
     7 GiB Surch cap without OOM, so the (b)/(c) decision becomes
     moot.
-  - [ ] Promote the `d9cac15` `ndcg-gate` artifact as
-    `docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/` and update
-    the Track A performance ledger row for TREC-COVID quality; this
-    closes Track B Lot 4.
-  - [ ] Replay `ndcg-gate` on `b9faefe` (RSS wiring) to produce the
-    first paired RSS artefact set for TREC-COVID
-    (`rss-ndcg-{surch,os}.json` from `surch.bench.rss.v1`) so the
-    Track A replay ledger can drop `RSS: not captured by current
-    harness` for the corresponding row.
+  - [x] Promoted `docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/`
+    with cross-engine SciFact + TREC-COVID numbers, `kubectl top`
+    memory peak (Surch `5274 MiB` under the `7Gi` cap, OpenSearch
+    `1475 MiB` under the `2Gi` cap), and Track A ledger cross-links
+    on the Bulk indexing + Quality guardrail rows. TREC-COVID is now
+    a real cross-engine BEIR baseline: Surch `NDCG@10 0.4750` vs
+    OpenSearch `0.4902` (`-3.1%`), Recall@10 tied at `0.0132`;
+    SciFact remains the active acceptance gate.
+  - [ ] Bonus: replay `ndcg-gate` on `b9faefe` (RSS wiring) to
+    produce the first paired RSS artefact set for SciFact +
+    TREC-COVID (`rss-ndcg-{surch,os}.json` from
+    `surch.bench.rss.v1`) so the Track A replay ledger can drop
+    `RSS: not captured by current harness` for the corresponding
+    rows.

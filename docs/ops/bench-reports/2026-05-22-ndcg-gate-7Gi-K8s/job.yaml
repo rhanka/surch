@@ -1,0 +1,221 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"batch/v1","kind":"Job","metadata":{"annotations":{},"labels":{"app.kubernetes.io/component":"ndcg-gate","app.kubernetes.io/name":"surch","app.kubernetes.io/part-of":"surch-ci"},"name":"ndcg-gate","namespace":"surch"},"spec":{"activeDeadlineSeconds":3600,"backoffLimit":0,"template":{"metadata":{"labels":{"app.kubernetes.io/component":"ndcg-gate","app.kubernetes.io/name":"surch","app.kubernetes.io/part-of":"surch-ci"}},"spec":{"containers":[{"args":["set -eu\necho \"Waiting for Surch + OpenSearch...\"\nuntil wget -qO- \"$SURCH_URL/\" \u003e/dev/null 2\u003e\u00261; do sleep 0.5; done\nuntil wget -qO- \"$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow\u0026timeout=30s\" \u003e/dev/null 2\u003e\u00261; do sleep 1; done\necho \"Both engines healthy.\"\nmkdir -p \"$REPORTS_DIR\"\n/usr/local/bin/scifact-ndcg.sh   \"ndcg-surch-k8s\" \"$REPORTS_DIR/scifact-surch.out\"    \"$SURCH_URL\"\n/usr/local/bin/scifact-ndcg.sh   \"ndcg-os-k8s\"    \"$REPORTS_DIR/scifact-os.out\"       \"$OPENSEARCH_URL\"\n/usr/local/bin/trec-covid-ndcg.sh \"ndcg-surch-k8s\" \"$REPORTS_DIR/trec-covid-surch.out\" \"$SURCH_URL\"\n/usr/local/bin/trec-covid-ndcg.sh \"ndcg-os-k8s\"    \"$REPORTS_DIR/trec-covid-os.out\"    \"$OPENSEARCH_URL\"\n{\n  echo \"# BEIR NDCG gate\"\n  echo\n  echo \"## SciFact / Surch\"\n  cat \"$REPORTS_DIR/scifact-surch.out\"\n  echo\n  echo \"## SciFact / OpenSearch\"\n  cat \"$REPORTS_DIR/scifact-os.out\"\n  echo\n  echo \"## TREC-COVID / Surch\"\n  cat \"$REPORTS_DIR/trec-covid-surch.out\"\n  echo\n  echo \"## TREC-COVID / OpenSearch\"\n  cat \"$REPORTS_DIR/trec-covid-os.out\"\n} \u003e \"$REPORTS_DIR/summary.md\"\ncat \u003e \"$REPORTS_DIR/bench.json\" \u003c\u003cEOF\n{\"schema\":\"surch.bench.ndcg_gate.v1\",\"scifact_surch_out\":\"$REPORTS_DIR/scifact-surch.out\",\"scifact_opensearch_out\":\"$REPORTS_DIR/scifact-os.out\",\"trec_covid_surch_out\":\"$REPORTS_DIR/trec-covid-surch.out\",\"trec_covid_opensearch_out\":\"$REPORTS_DIR/trec-covid-os.out\"}\nEOF\necho \"BEGIN_SURCH_K8S_SUMMARY\"\ncat \"$REPORTS_DIR/summary.md\"\necho \"END_SURCH_K8S_SUMMARY\"\necho \"BEGIN_SURCH_K8S_BENCH_JSON\"\ncat \"$REPORTS_DIR/bench.json\"\necho \"END_SURCH_K8S_BENCH_JSON\"\necho \"ndcg-gate complete.\"\n"],"command":["/bin/sh","-c"],"env":[{"name":"SURCH_URL","value":"http://127.0.0.1:7700"},{"name":"OPENSEARCH_URL","value":"http://127.0.0.1:9200"},{"name":"BEIR_DIR","value":"/data/beir"},{"name":"REPORTS_DIR","value":"/reports"}],"image":"ghcr.io/rhanka/surch:bench-sha-d9cac15b3b62f405c4bc52c30764f6b1db357a73","imagePullPolicy":"IfNotPresent","name":"ndcg-driver","resources":{"limits":{"cpu":"500m","memory":"1Gi"},"requests":{"cpu":"100m","memory":"128Mi"}},"volumeMounts":[{"mountPath":"/data/beir","name":"beir","readOnly":true},{"mountPath":"/reports","name":"reports"}]}],"initContainers":[{"env":[{"name":"SURCH_HOST","value":"127.0.0.1"},{"name":"SURCH_PORT","value":"7700"},{"name":"RUST_LOG","value":"warn"}],"image":"ghcr.io/rhanka/surch:sha-d9cac15b3b62f405c4bc52c30764f6b1db357a73","imagePullPolicy":"IfNotPresent","name":"surch","ports":[{"containerPort":7700,"name":"surch-http"}],"resources":{"limits":{"cpu":"2000m","memory":"7Gi"},"requests":{"cpu":"150m","memory":"256Mi"}},"restartPolicy":"Always","volumeMounts":[{"mountPath":"/var/surch","name":"scratch"}]},{"env":[{"name":"discovery.type","value":"single-node"},{"name":"DISABLE_SECURITY_PLUGIN","value":"true"},{"name":"DISABLE_INSTALL_DEMO_CONFIG","value":"true"},{"name":"OPENSEARCH_JAVA_OPTS","value":"-Xms1g -Xmx1g"},{"name":"bootstrap.memory_lock","value":"false"}],"image":"opensearchproject/opensearch:2.17.1","imagePullPolicy":"IfNotPresent","name":"opensearch","ports":[{"containerPort":9200,"name":"os-http"}],"resources":{"limits":{"cpu":"1200m","memory":"2Gi"},"requests":{"cpu":"250m","memory":"256Mi"}},"restartPolicy":"Always","securityContext":{"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000},"volumeMounts":[{"mountPath":"/usr/share/opensearch/data","name":"scratch","subPath":"opensearch-data"}]}],"nodeSelector":{"k8s.scaleway.com/pool-name":"burst"},"restartPolicy":"Never","securityContext":{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532},"serviceAccountName":"surch","tolerations":[{"effect":"NoSchedule","key":"pool","operator":"Equal","value":"burst"}],"volumes":[{"name":"beir","persistentVolumeClaim":{"claimName":"surch-corpus-beir","readOnly":true}},{"name":"scratch","persistentVolumeClaim":{"claimName":"surch-scratch"}},{"emptyDir":{"sizeLimit":"64Mi"},"name":"reports"}]}},"ttlSecondsAfterFinished":3600}}
+  creationTimestamp: "2026-05-22T18:14:37Z"
+  generation: 1
+  labels:
+    app.kubernetes.io/component: ndcg-gate
+    app.kubernetes.io/name: surch
+    app.kubernetes.io/part-of: surch-ci
+  name: ndcg-gate
+  namespace: surch
+  resourceVersion: "45270160798"
+  uid: 6d466a21-bf2d-4c33-bc67-455241edaa8f
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 0
+  completionMode: NonIndexed
+  completions: 1
+  manualSelector: false
+  parallelism: 1
+  podReplacementPolicy: TerminatingOrFailed
+  selector:
+    matchLabels:
+      batch.kubernetes.io/controller-uid: 6d466a21-bf2d-4c33-bc67-455241edaa8f
+  suspend: false
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: ndcg-gate
+        app.kubernetes.io/name: surch
+        app.kubernetes.io/part-of: surch-ci
+        batch.kubernetes.io/controller-uid: 6d466a21-bf2d-4c33-bc67-455241edaa8f
+        batch.kubernetes.io/job-name: ndcg-gate
+        controller-uid: 6d466a21-bf2d-4c33-bc67-455241edaa8f
+        job-name: ndcg-gate
+    spec:
+      containers:
+      - args:
+        - |
+          set -eu
+          echo "Waiting for Surch + OpenSearch..."
+          until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+          until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=30s" >/dev/null 2>&1; do sleep 1; done
+          echo "Both engines healthy."
+          mkdir -p "$REPORTS_DIR"
+          /usr/local/bin/scifact-ndcg.sh   "ndcg-surch-k8s" "$REPORTS_DIR/scifact-surch.out"    "$SURCH_URL"
+          /usr/local/bin/scifact-ndcg.sh   "ndcg-os-k8s"    "$REPORTS_DIR/scifact-os.out"       "$OPENSEARCH_URL"
+          /usr/local/bin/trec-covid-ndcg.sh "ndcg-surch-k8s" "$REPORTS_DIR/trec-covid-surch.out" "$SURCH_URL"
+          /usr/local/bin/trec-covid-ndcg.sh "ndcg-os-k8s"    "$REPORTS_DIR/trec-covid-os.out"    "$OPENSEARCH_URL"
+          {
+            echo "# BEIR NDCG gate"
+            echo
+            echo "## SciFact / Surch"
+            cat "$REPORTS_DIR/scifact-surch.out"
+            echo
+            echo "## SciFact / OpenSearch"
+            cat "$REPORTS_DIR/scifact-os.out"
+            echo
+            echo "## TREC-COVID / Surch"
+            cat "$REPORTS_DIR/trec-covid-surch.out"
+            echo
+            echo "## TREC-COVID / OpenSearch"
+            cat "$REPORTS_DIR/trec-covid-os.out"
+          } > "$REPORTS_DIR/summary.md"
+          cat > "$REPORTS_DIR/bench.json" <<EOF
+          {"schema":"surch.bench.ndcg_gate.v1","scifact_surch_out":"$REPORTS_DIR/scifact-surch.out","scifact_opensearch_out":"$REPORTS_DIR/scifact-os.out","trec_covid_surch_out":"$REPORTS_DIR/trec-covid-surch.out","trec_covid_opensearch_out":"$REPORTS_DIR/trec-covid-os.out"}
+          EOF
+          echo "BEGIN_SURCH_K8S_SUMMARY"
+          cat "$REPORTS_DIR/summary.md"
+          echo "END_SURCH_K8S_SUMMARY"
+          echo "BEGIN_SURCH_K8S_BENCH_JSON"
+          cat "$REPORTS_DIR/bench.json"
+          echo "END_SURCH_K8S_BENCH_JSON"
+          echo "ndcg-gate complete."
+        command:
+        - /bin/sh
+        - -c
+        env:
+        - name: SURCH_URL
+          value: http://127.0.0.1:7700
+        - name: OPENSEARCH_URL
+          value: http://127.0.0.1:9200
+        - name: BEIR_DIR
+          value: /data/beir
+        - name: REPORTS_DIR
+          value: /reports
+        image: ghcr.io/rhanka/surch:bench-sha-d9cac15b3b62f405c4bc52c30764f6b1db357a73
+        imagePullPolicy: IfNotPresent
+        name: ndcg-driver
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /data/beir
+          name: beir
+          readOnly: true
+        - mountPath: /reports
+          name: reports
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - env:
+        - name: SURCH_HOST
+          value: 127.0.0.1
+        - name: SURCH_PORT
+          value: "7700"
+        - name: RUST_LOG
+          value: warn
+        image: ghcr.io/rhanka/surch:sha-d9cac15b3b62f405c4bc52c30764f6b1db357a73
+        imagePullPolicy: IfNotPresent
+        name: surch
+        ports:
+        - containerPort: 7700
+          name: surch-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: "2"
+            memory: 7Gi
+          requests:
+            cpu: 150m
+            memory: 256Mi
+        restartPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/surch
+          name: scratch
+      - env:
+        - name: discovery.type
+          value: single-node
+        - name: DISABLE_SECURITY_PLUGIN
+          value: "true"
+        - name: DISABLE_INSTALL_DEMO_CONFIG
+          value: "true"
+        - name: OPENSEARCH_JAVA_OPTS
+          value: -Xms1g -Xmx1g
+        - name: bootstrap.memory_lock
+          value: "false"
+        image: opensearchproject/opensearch:2.17.1
+        imagePullPolicy: IfNotPresent
+        name: opensearch
+        ports:
+        - containerPort: 9200
+          name: os-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 1200m
+            memory: 2Gi
+          requests:
+            cpu: 250m
+            memory: 256Mi
+        restartPolicy: Always
+        securityContext:
+          runAsGroup: 1000
+          runAsNonRoot: true
+          runAsUser: 1000
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/share/opensearch/data
+          name: scratch
+          subPath: opensearch-data
+      nodeSelector:
+        k8s.scaleway.com/pool-name: burst
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+      serviceAccount: surch
+      serviceAccountName: surch
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: pool
+        operator: Equal
+        value: burst
+      volumes:
+      - name: beir
+        persistentVolumeClaim:
+          claimName: surch-corpus-beir
+          readOnly: true
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: surch-scratch
+      - emptyDir:
+          sizeLimit: 64Mi
+        name: reports
+  ttlSecondsAfterFinished: 3600
+status:
+  completionTime: "2026-05-22T18:44:14Z"
+  conditions:
+  - lastProbeTime: "2026-05-22T18:44:14Z"
+    lastTransitionTime: "2026-05-22T18:44:14Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: SuccessCriteriaMet
+  - lastProbeTime: "2026-05-22T18:44:14Z"
+    lastTransitionTime: "2026-05-22T18:44:14Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: Complete
+  ready: 0
+  startTime: "2026-05-22T18:14:37Z"
+  succeeded: 1
+  terminating: 0
+  uncountedTerminatedPods: {}

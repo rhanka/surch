@@ -129,7 +129,7 @@ axis-by-axis performance state is now tracked in
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~5% (1 open leaf + promo backlog / 11 leaf tasks).
+Reste estime: ~3% (0 hard blocker, 1 bonus replay leaf / 11 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -157,7 +157,7 @@ Reste estime: ~5% (1 open leaf + promo backlog / 11 leaf tasks).
 - [x] Add paired RSS reporting for Surch vs Elasticsearch.
   - [x] Wire RSS peak/final into the K8s Track A replay artifact family
     before any A-replay memory-layout report claims a memory win.
-- [ ] Diagnose the TREC-COVID quality blocker before making it an
+- [x] Diagnose the TREC-COVID quality blocker before making it an
   acceptance gate.
   - [x] `61a13f8` makes the TREC-COVID script fail closed on HTTP
     errors and keeps bulk chunks below Surch's 16 MiB request cap; old
@@ -176,10 +176,15 @@ Reste estime: ~5% (1 open leaf + promo backlog / 11 leaf tasks).
     upgrade + Surch `7Gi` container cap in `d9cac15`: `ndcg-gate`
     run `26304471549` ingests the full 171 k corpus end-to-end in
     ~30 min (`conclusion=success`, artifact `7167929039`).
-  - [ ] Promote the `d9cac15` `ndcg-gate` artifact to
-    `docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/` and
-    cross-link it from the Track A performance ledger TREC-COVID
-    row; closes Track B Lot 4 once promoted.
+  - [x] Promoted `docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/`
+    with the full SciFact + TREC-COVID cross-engine numbers and
+    cross-linked the Track A performance ledger Bulk + Quality rows.
+    TREC-COVID is now a real cross-engine baseline (Surch NDCG@10
+    `0.4750` vs OpenSearch `0.4902`, Surch trails by `-3.1%`),
+    SciFact stays the active acceptance gate.
+- [ ] Bonus: replay `ndcg-gate` on `b9faefe` (RSS sampler wired) to
+  drop `RSS: not captured by current harness` from the Track A
+  ledger SciFact / TREC-COVID rows.
 - [x] Quota-unblocked `ndcg-gate` was dispatched and promoted
   (`poc-k8s` live quota `1500m/1Gi`, `4500m/6Gi`; run
   `26157480132`).
