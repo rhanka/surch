@@ -5,14 +5,15 @@ Branch: `wp/b-test-auto`
 Worktree: `.worktrees/wp-b`
 Owner: conductor / benchmark automation owner
 Status: Lot 3 + Lot N closed on `main` for the summary/reporting
-contract and promoted INSEE/SciFact/BAN evidence. The quota-unblocked
-K8s `ndcg-gate` run `26157480132` passed at the workflow level and is
-promoted as a diagnostic report, but it was a false green for
-TREC-COVID: hidden curl 413/400 failures produced
-`NDCG@10=0.0000` / `Recall@10=0.0000`. Commit `61a13f8` makes those
-HTTP errors fail closed; rerun `26202629281` confirms the 413 is gone
-and leaves one HTTP 400 to isolate with instrumented script logs. Long
-branch `wp/b-test-auto` head `65fc759` kept for history.
+contract and promoted INSEE/SciFact/BAN evidence. TREC-COVID Lot 4
+chain: false green (`26157480132`) -> fail-closed `61a13f8` exposes
+`413`/`400` -> pair-aware chunker `ff0d31c` clears the HTTP 400 chain
+-> OOM walked from 512 MiB to 4 GiB (chunks 3 -> 16 -> 19 of ~21)
+-> node pool upgrade + Surch container `7Gi` cap `d9cac15` finally
+ingests the full 171 k corpus end-to-end (`ndcg-gate` run
+`26304471549` SUCCESS, artifact `7167929039`). Pending: promote that
+artifact + replay `b9faefe` for the first paired RSS TREC-COVID set.
+Long branch `wp/b-test-auto` head `65fc759` kept for history.
 
 ## Finality
 
@@ -207,11 +208,22 @@ branch `wp/b-test-auto` head `65fc759` kept for history.
     reserved for kubelet + system pods), so the pragmatic ceiling at
     the current Surch architecture is somewhere between chunk 19 and
     21 out of ~21.
-  - [ ] Final decision required after the quota path closed: either
-    (b) treat the full 171 k TREC-COVID corpus as a documented Surch
-    memory limit pending the Track A memory-layout follow-up and keep
-    SciFact as the only BEIR acceptance gate; or (c) reduce the
-    TREC-COVID corpus to the qrels-relevant pool plus a sampled
-    distractor set (~5 k docs) and document that the gate measures
-    cross-engine NDCG@10 on the reduced corpus instead of the Anserini
-    full-corpus baseline.
+  - [x] Voie (a) reopened by the node pool upgrade: commit `d9cac15`
+    bumps the Surch container limit `4Gi -> 7Gi` (tenant headroom now
+    safe for the +200 MiB/chunk growth observed at 4 GiB). Run
+    `26304471549` on `d9cac15` completed `ndcg-gate` end-to-end in
+    ~30 min (18:14:26Z -> 18:44:37Z UTC, `conclusion=success`),
+    artifact `7167929039`
+    (`k8s-bench-ndcg-gate-d9cac15b3b62f405c4bc52c30764f6b1db357a73`,
+    34 KiB). The full 171 k TREC-COVID corpus now fits under the new
+    7 GiB Surch cap without OOM, so the (b)/(c) decision becomes
+    moot.
+  - [ ] Promote the `d9cac15` `ndcg-gate` artifact as
+    `docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/` and update
+    the Track A performance ledger row for TREC-COVID quality; this
+    closes Track B Lot 4.
+  - [ ] Replay `ndcg-gate` on `b9faefe` (RSS wiring) to produce the
+    first paired RSS artefact set for TREC-COVID
+    (`rss-ndcg-{surch,os}.json` from `surch.bench.rss.v1`) so the
+    Track A replay ledger can drop `RSS: not captured by current
+    harness` for the corresponding row.

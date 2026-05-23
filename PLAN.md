@@ -129,7 +129,7 @@ axis-by-axis performance state is now tracked in
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~10% (1 open / 11 leaf tasks).
+Reste estime: ~5% (1 open leaf + promo backlog / 11 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -166,9 +166,20 @@ Reste estime: ~10% (1 open / 11 leaf tasks).
   - [x] Rerun `26202629281` on `61a13f8` failed closed as intended:
     no 413 remained, but a remaining HTTP 400 stopped the gate before a
     summary could be published.
-  - [ ] Run the instrumented `ndcg-gate` scripts and use the emitted
-    operation label plus response body to isolate and fix the remaining
-    400.
+  - [x] Instrumented `ndcg-gate` run `26203362568` isolated
+    `missing source line after \`index\` action` on chunk `bulk.0000`
+    (split-by-byte cut between an `index` action and its source);
+    `ff0d31c` rewrites the bulk chunker in awk on pair boundaries and
+    `26266507485` confirms the HTTP 400 chain is fixed.
+  - [x] Memory ceiling walked from 512 MiB to 4 GiB (OOM moved
+    chunk 3 -> 16 -> 19 of ~21) then resolved by the node pool
+    upgrade + Surch `7Gi` container cap in `d9cac15`: `ndcg-gate`
+    run `26304471549` ingests the full 171 k corpus end-to-end in
+    ~30 min (`conclusion=success`, artifact `7167929039`).
+  - [ ] Promote the `d9cac15` `ndcg-gate` artifact to
+    `docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/` and
+    cross-link it from the Track A performance ledger TREC-COVID
+    row; closes Track B Lot 4 once promoted.
 - [x] Quota-unblocked `ndcg-gate` was dispatched and promoted
   (`poc-k8s` live quota `1500m/1Gi`, `4500m/6Gi`; run
   `26157480132`).
