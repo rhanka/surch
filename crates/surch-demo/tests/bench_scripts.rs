@@ -38,8 +38,12 @@ fn trec_covid_bulk_chunk_size_stays_below_surch_body_limit() {
         "default TREC-COVID bulk chunk size must stay below Surch's 16 MiB body cap"
     );
     assert!(
-        script.contains(r#"split -C "$TREC_COVID_BULK_CHUNK_SIZE""#),
-        "bulk splitting should use the guarded TREC_COVID_BULK_CHUNK_SIZE knob"
+        script.contains(r#"chunk_max_bytes=$(parse_size_to_bytes "$TREC_COVID_BULK_CHUNK_SIZE")"#),
+        "bulk splitting should parse the guarded TREC_COVID_BULK_CHUNK_SIZE knob into bytes"
+    );
+    assert!(
+        script.contains(r#"awk -v out="$TMP/bulk" -v maxb="$chunk_max_bytes""#),
+        "bulk splitting should use a pair-aware awk chunker keyed on chunk_max_bytes"
     );
 }
 
