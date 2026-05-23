@@ -58,6 +58,7 @@ RUN apt-get update \
 COPY --from=builder /usr/src/surch/target/release/artillery_bench /usr/local/bin/artillery_bench
 COPY --from=builder /usr/src/surch/target/release/bench_report /usr/local/bin/bench_report
 COPY --from=builder /usr/src/surch/target/release/b1_oracle /usr/local/bin/b1_oracle
+COPY scripts/bench/rss-sample.sh /usr/local/bin/rss-sample.sh
 COPY scripts/bench/scifact-ndcg.sh /usr/local/bin/scifact-ndcg.sh
 COPY scripts/bench/trec-covid-ndcg.sh /usr/local/bin/trec-covid-ndcg.sh
 
@@ -74,6 +75,7 @@ RUN chmod 0755 \
       /usr/local/bin/artillery_bench \
       /usr/local/bin/bench_report \
       /usr/local/bin/b1_oracle \
+      /usr/local/bin/rss-sample.sh \
       /usr/local/bin/scifact-ndcg.sh \
       /usr/local/bin/trec-covid-ndcg.sh \
  && chmod 0644 \

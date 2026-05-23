@@ -57,6 +57,7 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+      shareProcessNamespace: true
       volumes:
         - name: insee
           persistentVolumeClaim:
@@ -118,6 +119,7 @@ spec:
             - { name: REPORTS_DIR,    value: "/reports" }
             - { name: ART_PHASES,     value: "2:30,2:30,5:30,10:30,20:30,50:240" }
             - { name: ART_WORKERS,    value: "8" }
+            - { name: RSS_SAMPLE_SECONDS, value: "420" }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 512Mi }
@@ -129,11 +131,38 @@ spec:
               until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
               until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
               mkdir -p "$REPORTS_DIR"
+              RSS_SAMPLE_SECONDS="${RSS_SAMPLE_SECONDS:-420}"
+              start_rss_sample() {
+                label="$1"
+                pattern="$2"
+                output="$3"
+                pid_file="$4"
+                pid="$(ps -eo pid,command | awk -v p="$pattern" 'index($0, p) { print $1; exit }')"
+                if [ -z "$pid" ]; then
+                  echo "WARN: cannot start RSS sample for $label (pattern: $pattern)"
+                  return 0
+                fi
+                /usr/local/bin/rss-sample.sh "$pid" "$RSS_SAMPLE_SECONDS" "$output" \
+                  > "${output}.sampler.log" 2>&1 &
+                echo $! > "$pid_file"
+              }
+              wait_rss_sample() {
+                pid_file="$1"
+                if [ ! -f "$pid_file" ]; then
+                  return 0
+                fi
+                pid="$(cat "$pid_file" 2>/dev/null || true)"
+                if [ -n "$pid" ]; then
+                  wait "$pid" || true
+                fi
+              }
               # Bootstrap the `deces` index on both engines with the
               # INSEE 10k mapping + bulk-load slice baked into this
               # image. The slice NDJSON carries `_index: "deces"` in
               # every action header, so artillery_bench targets the
               # same index name below.
+              start_rss_sample "surch" "surch-api" "$REPORTS_DIR/rss-art-surch.json" "$REPORTS_DIR/.rss-surch.pid"
+              start_rss_sample "opensearch" "org.opensearch.bootstrap" "$REPORTS_DIR/rss-art-os.json" "$REPORTS_DIR/.rss-os.pid"
               bootstrap_engine() {
                 url="$1"; label="$2"
                 # The scratch PVC persists across ndcg-gate / insee-bench
@@ -204,6 +233,8 @@ spec:
               /usr/local/bin/bench_report \
                 --dir "$REPORTS_DIR" \
                 --output "$REPORTS_DIR/summary.md"
+              wait_rss_sample "$REPORTS_DIR/.rss-surch.pid"
+              wait_rss_sample "$REPORTS_DIR/.rss-os.pid"
               echo "BEGIN_SURCH_K8S_SUMMARY"
               cat "$REPORTS_DIR/summary.md"
               echo "END_SURCH_K8S_SUMMARY"

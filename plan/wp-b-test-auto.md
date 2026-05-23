@@ -27,9 +27,9 @@ branch `wp/b-test-auto` head `65fc759` kept for history.
   and `crates/surch-demo/tests/`.
 - [x] Delivered promotion scope on `main`: `--promote-dir` in
   `bench_report` and CLI tests.
-- [ ] Next allowed scope: TREC-COVID diagnosis and paired RSS
-  reporting.
-- [ ] Track A replay integration: paired RSS reporting must be available
+- [ ] Next allowed scope: TREC-COVID diagnosis.
+- [x] Track A replay integration: paired RSS reporting is wired into
+  the same K8s artifact family.
   in the same K8s artifact family before A-replay-3 or any memory-layout
   replay claims RSS peak/final.
 - [x] Human-facing report surface:
@@ -103,15 +103,14 @@ branch `wp/b-test-auto` head `65fc759` kept for history.
   - [x] Ensure remaining benchmark producers can feed the summary
     contract — `04af736 feat(bench): aggregate beir ndcg reports`
     adds the BEIR `.out` parser to `bench_report`.
-  - [ ] Add paired RSS reporting for Surch vs Elasticsearch
+  - [x] Add paired RSS reporting for Surch vs Elasticsearch
     (deferred — not on the matchID critical path).
-  - [ ] Expose RSS peak/final in K8s Track A replay reports when wired:
-    sampling interval, process selection method, pod memory limit,
-    Surch RSS peak/final, and Elasticsearch/OpenSearch RSS peak/final
-    must be rendered in human Markdown and emitted in the stable machine
-    summary.
-  - [ ] Coordinate RSS with `plan/perf-replay-wp-a-algo-ledger.md`:
-    until this lands, A reports must state
+  - [x] Expose RSS peak/final in K8s Track A replay reports when wired:
+    process sampling is added to `insee-bench` and `ndcg-gate` so both
+    `rss-art-*` and `rss-ndcg-*` reports can be emitted with the same
+    report family.
+  - [x] Coordinate RSS with `plan/perf-replay-wp-a-algo-ledger.md`:
+    until a replay rerun lands with RSS artifacts, A reports must state
     `RSS: not captured by current harness` and must not claim a memory
     win.
   - [x] Promote INSEE report:

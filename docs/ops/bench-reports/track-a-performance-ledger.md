@@ -68,10 +68,9 @@ the proof state:
 - A replay group is invalid until rerun if any repetition has benchmark
   errors, missing diagnostics, missing image/config evidence, a failed
   K8s condition, or a missing SLO verdict.
-- RSS peak/final remains a Track B reporting prerequisite. Until the
-  RSS producer is wired into the same K8s artifacts, A rows must say
-  `RSS: not captured by current harness` instead of implying a memory
-  win.
+- RSS peak/final remains a Track B reporting prerequisite. Track B is now
+  wired in the replay jobs; for rows without a replay rerun carrying RSS,
+  A rows must keep `RSS: not captured by current harness`.
 
 ## Current axis state
 

@@ -129,7 +129,7 @@ axis-by-axis performance state is now tracked in
 
 ## Track B - Test Automation / Perf Reporting
 
-Reste estime: ~25% (2 open / 10 leaf tasks).
+Reste estime: ~10% (1 open / 11 leaf tasks).
 
 - [x] Bench plumbing exists:
   `scripts/bench/run-pair.sh`, `scripts/bench/rss-sample.sh`,
@@ -154,8 +154,8 @@ Reste estime: ~25% (2 open / 10 leaf tasks).
 - [x] BEIR `ndcg-gate` now emits a promoted diagnostic report:
   `docs/ops/bench-reports/2026-05-20-ndcg-gate-K8s/`
   from GHA run `26157480132`.
-- [ ] Add paired RSS reporting for Surch vs Elasticsearch.
-  - [ ] Wire RSS peak/final into the K8s Track A replay artifact family
+- [x] Add paired RSS reporting for Surch vs Elasticsearch.
+  - [x] Wire RSS peak/final into the K8s Track A replay artifact family
     before any A-replay memory-layout report claims a memory win.
 - [ ] Diagnose the TREC-COVID quality blocker before making it an
   acceptance gate.

@@ -119,8 +119,9 @@ environment evidence to make the comparison meaningful.
 - [ ] For search-ranking-sensitive changes, pair the latency replay with
   `ndcg-gate` or a promoted quality artifact; report NDCG@10 and
   Recall@10 beside latency before claiming the optimisation safe.
-- [ ] Do not claim RSS peak/final in A reports until Track B has wired
-  paired RSS capture into the same K8s replay artifact.
+- [x] Track B RSS capture is wired into `insee-bench` and `ndcg-gate`;
+  existing A rows must keep `RSS: not captured by current harness`
+  until a replay rerun with RSS artifacts lands.
 
 Required artifact set per replay group:
 
@@ -170,12 +171,13 @@ Track B coordination:
 
 - [ ] Treat paired RSS peak/final as a Track B prerequisite for any
   memory-win claim in A-replay-3.
-- [ ] When RSS lands, include Surch and Elasticsearch/OpenSearch peak
-  RSS, final RSS, sampling interval, process selection method, and pod
-  memory limit in the same promoted A replay report.
-- [ ] Until that lands, A-replay reports must say `RSS: not captured by
-  current harness` and keep the verdict limited to latency, SLO, quality,
-  and indexing axes actually measured.
+- [ ] Until a replay rerun lands with RSS artifacts, A-replay reports
+  must say `RSS: not captured by current harness` and keep the verdict
+  limited to latency, SLO, quality, and indexing axes actually measured.
+- [ ] When RSS is present for a replay lot, include Surch and
+  Elasticsearch/OpenSearch peak RSS, final RSS, sampling interval,
+  process selection method, and pod memory limit in the same promoted
+  A replay report.
 
 ## Lots
 
@@ -224,8 +226,8 @@ Track B coordination:
     diagnostics for each replay group.
   - [ ] Aggregate repeated latency with median and IQR, or
     min/median/max when IQR is not derivable from the artifacts.
-  - [ ] Coordinate with Track B before claiming RSS peak/final; otherwise
-    mark RSS explicitly missing in A reports and ledger rows.
+- [x] Coordinate with Track B before claiming RSS peak/final; otherwise
+  mark RSS explicitly missing in A reports and ledger rows.
   - [x] Promote `summary.md` / benchmark artifacts and update the
     ledger rows in place for the stable current-main repeated group.
   - [x] Promote first post-fix current-main repeated K8s run:
