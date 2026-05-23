@@ -132,12 +132,22 @@ spec:
               until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
               mkdir -p "$REPORTS_DIR"
               RSS_SAMPLE_SECONDS="${RSS_SAMPLE_SECONDS:-420}"
+              # shareProcessNamespace=true exposes sibling container PIDs in
+              # /proc; the bench-driver image is procps-less so we scan
+              # /proc/<pid>/cmdline directly (NUL-separated, hence `tr`).
               start_rss_sample() {
                 label="$1"
                 pattern="$2"
                 output="$3"
                 pid_file="$4"
-                pid="$(ps -eo pid,command | awk -v p="$pattern" 'index($0, p) { print $1; exit }')"
+                pid=""
+                for d in /proc/[0-9]*; do
+                  [ -r "$d/cmdline" ] || continue
+                  if tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q "$pattern"; then
+                    pid="${d#/proc/}"
+                    break
+                  fi
+                done
                 if [ -z "$pid" ]; then
                   echo "WARN: cannot start RSS sample for $label (pattern: $pattern)"
                   return 0
