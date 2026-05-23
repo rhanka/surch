@@ -60,23 +60,75 @@ exposed Surch bulk at `1001.95 s` on the full 171 k TREC-COVID
 corpus vs OpenSearch at `72.27 s` — OpenSearch is `13.9x` faster on
 the same 8 MiB pair-aware chunks under the same Surch 7 GiB cap.
 SciFact bulk parity is not affected (Surch is `2.1x` faster there).
+Reproduced on `137b352` paired run: `1112.52 s` vs `93.80 s`
+(OpenSearch `11.9x` faster), same ranking, same magnitudes.
 
-- [ ] Reproduce the bulk gap locally with a deterministic
-  `scripts/bench/trec-covid-ndcg.sh` invocation against the same
-  surch-api image, recording wall-clock per-chunk timing and Surch
-  RSS at chunk boundaries.
-- [ ] Profile the dominant Surch bulk cost on the long-text /
-  large-corpus shape: tokenization, FST insertion, postings build,
-  source store, or codec write. Use the existing
-  `GET /_surch/stats` plus a flamegraph / cargo-flamegraph run.
-- [ ] Decide between an algorithmic fix (e.g. amortise the dominant
-  cost) and a documented Surch-side limit (corpus shape boundary).
-  Either path must be a forward delivery; the ledger Bulk row must
-  reflect the chosen verdict.
+**Root cause confirmed by code read** (2026-05-23):
+
+- `crates/surch-api/src/state.rs:919`
+  (`apply_document_writes`) — after every `_bulk` chunk, the touched
+  index calls `IndexData::rebuild_index()`.
+- `crates/surch-api/src/state.rs:220` (`rebuild_index`) does
+  `self.index.clear()` + `add_documents_with_mapping(documents, …)`
+  over **all** `self.documents` (cumulative store), not just the
+  newly upserted ids. This makes the bulk path O(N_cumul) per
+  chunk and overall ~O(N² / chunk_size) over the corpus.
+- TREC-COVID 171 k docs split in ~21 chunks of ~8 MiB each →
+  cumulative re-indexing of roughly 21·22/2 · chunk_size docs
+  ≈ 1.85 M doc-reindexings, matching the observed ~17 min wall
+  clock. SciFact (one chunk, 5 183 docs) does not surface the
+  pathology.
+- `crates/surch-api/src/state.rs:713`
+  (`AppState::refresh_index`) is currently a no-op while the
+  router exposes `POST /:index/_refresh` (handler in
+  `crates/surch-api/src/index.rs:171`), so callers that already
+  refresh after bulk (SciFact, TREC-COVID, INSEE bootstrap, snapshot
+  e2e) do not benefit from any deferred work.
+- `crates/surch-index/src/document_index.rs:110` accepts strictly
+  new doc ids (`DuplicateDocId` on collision, L125) and rebuilds
+  the term dictionary unconditionally at L148 (`self.terms =
+  self.postings_builder.clone().build();`), so a naive incremental
+  add still pays an O(N_terms_cumul) rebuild per call.
+
+**Proposed fix axes** (to arbitrate before implementation):
+
+- (a) Defer rebuild to refresh: replace `rebuild_index()` in
+  `apply_document_writes` with a `dirty` flag on `IndexData`;
+  `refresh_index` becomes the rebuild trigger. Matches OpenSearch
+  semantics. Breaks 2 existing tests (`aliases.rs`,
+  `bulk_router.rs`) that issue `_bulk` then `_search` without an
+  intermediate refresh; those tests should be updated to call
+  `_refresh` (ES-compatible).
+- (b) Same as (a) plus lazy rebuild on the read path: search /
+  count / get-mapping check the `dirty` flag and trigger a
+  rebuild under a write lock if needed, preserving the strict
+  "writes immediately visible" semantics for callers that skip
+  refresh. Heavier locking pattern.
+- (c) Incremental add only: keep eager rebuild semantics but
+  rebuild incrementally — extend `DocumentIndex` with a non-clearing
+  `append_documents` API plus a separate `finalize_postings` /
+  `refresh_terms` step that runs once per chunk instead of per
+  cumulative doc. Largest change, preserves semantics, ~O(N) over
+  the corpus instead of O(N²).
+- (d) Document the corpus-shape limit and keep the eager rebuild;
+  cap TREC-COVID in the gate at a smaller sample (e.g. qrels-only
+  pool + sampled distractors). Lowest engineering cost but the
+  ledger Bulk row stays "OpenSearch wins by `12-14x` on long-text /
+  large-corpus shapes".
+
+- [x] Reproduce the bulk gap on the K8s harness (done: `d9cac15` +
+  `137b352` runs, both promoted under
+  `docs/ops/bench-reports/2026-05-22-ndcg-gate-7Gi-K8s/` and
+  `docs/ops/bench-reports/2026-05-23-ndcg-gate-7Gi-RSS-K8s/`).
+- [x] Identify the dominant cost (done: `rebuild_index` re-indexes
+  the cumulative document store after every `_bulk` chunk; the
+  refresh handler is a no-op).
+- [ ] Arbitrate between (a) / (b) / (c) / (d). User decision
+  pending.
+- [ ] Implement the chosen axis with the matching test surface
+  update.
 - [ ] Re-run K8s `ndcg-gate` on the fix SHA and promote the paired
-  report; ledger Bulk row updated to either "Surch within `Nx` of OS
-  on TREC-COVID" or "Surch documented limit on long-text corpora at
-  `Nx`".
+  report; update the Track A ledger Bulk row accordingly.
 - [ ] Gate: ledger Bulk row no longer flags "Surch ingest scaling
   for large-corpus / long-text shapes is the next target".
 
