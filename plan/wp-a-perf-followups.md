@@ -204,20 +204,26 @@ the steady-state peak around 5.5 GiB, there is no pressure.
 - [x] Allocator parity with Elasticsearch / OpenSearch
   (which both default to jemalloc on Linux since ~7.13) achieved.
 
-### Lot 1.6 — Incremental term dictionary build (next bulk attack)
+### Lot 1.6 — Deferred term dictionary build (CLOSED)
 
 Trigger: after Lot 1, the cumulative `terms.build()` call inside
 `DocumentIndex::add_documents_with_mapping` (rebuilds the whole
-FST from `self.postings_builder` after every `_bulk` POST) is the
-dominant Surch bulk cost on long-text corpora and accounts for
-~95% of the remaining `2.06x` gap to OpenSearch on TREC-COVID.
+FST from `self.postings_builder` after every `_bulk` POST) was the
+dominant Surch bulk cost on long-text corpora.
 
-- [ ] Profile `terms.build()` cost per chunk on a 171 k corpus to
-  confirm it is the bottleneck.
-- [ ] Design an incremental term dictionary update path (FST
-  builder accumulation across chunks; final build on refresh, not
-  per `_bulk`).
-- [ ] Implement + tests + K8s replay + ledger update.
+- [x] Confirmed the bottleneck by code read + the run series.
+- [x] Implemented in `2e4361e`: `add_documents_with_mapping_deferred`
+  sets a `terms_dirty` flag instead of rebuilding the FST;
+  `materialize_terms()` rebuilds lazily iff dirty;
+  `AppState::ensure_terms_ready` materializes at the 7 search /
+  count / lookup / scoring entry points; `finalize_terms_for_refresh`
+  materializes once at `_refresh`. `terms_build_count` instrumentation
+  + test assert the rebuild count stays ~constant across chunks.
+- [x] K8s `ndcg-gate` run `26373579876` on `2e4361e` promoted as
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-lot2-K8s/`.
+  TREC-COVID Surch bulk `139.05 -> 56.38 s`; **Surch now `1.54x`
+  FASTER than OpenSearch** (`86.61 s`). RSS peak `3424 -> 2156 MiB`.
+  NDCG unchanged. Total Lot 1→1.6 speedup `~17.8x` (`1002 -> 56 s`).
 
 ### Lot 2 — Skip lists on the codec FoR path
 
@@ -226,17 +232,19 @@ persists per-block stats next to postings (`b680232 / 6df877d`) and
 ships per-128 Block-Max WAND (`e38bf91`); skip lists on top of the
 encoded block metadata are the next algorithmic layer.
 
-- [ ] Define the on-disk skip list format for FoR-encoded postings,
-  reusing `FOR_BLOCK_SIZE` and the codec block metadata helper
-  introduced in `6f56fd2`.
-- [ ] Add codec-level coverage (`crates/surch-codec/src`) including
-  boundary tests, truncated-tail tests, and a seeded-corpus round
-  trip.
-- [ ] Wire the skip iterator into the search execution path the same
-  way `df3b0aa` wired runtime FoR consumption; gate behind a feature
-  flag if a runtime regression risk is detected.
-- [ ] Promote a paired K8s perf proof and update the Track A ledger
-  Search latency row with the new before/after delta.
+- [x] Skip list format + leapfrog AND landed in `d73c862` (Stream B
+  of the parallel dispatch): `crates/surch-codec/src/postings_block.rs`
+  (+432 lines), `crates/surch-index/src/postings.rs`,
+  `crates/surch-search/src/execution.rs` + tests.
+- [x] Codec + search coverage added (`crates/surch-search/tests/execution.rs`).
+- [x] Compiles + passes the workspace suite with Lot 1.6 (`ci` run
+  `26373423517`). NDCG@10 unchanged on `ndcg-gate` run `26373579876`.
+- [ ] **Quantify the search-latency gain**: `ndcg-gate` (50 queries,
+  no percentiles) does not measure it. Dispatch an `insee-bench`
+  replay on `2e4361e` vs the
+  `2026-05-21-A-replay-current-main-61a13f-insee-K8s/` baseline and
+  update the Track A ledger Search latency row before claiming a
+  search win.
 
 ### Lot 3 — Next Block-Max WAND step
 

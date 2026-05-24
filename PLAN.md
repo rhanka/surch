@@ -63,12 +63,12 @@ single-threaded status loops advanced too little per user turn.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~13% (Lots 1, 1.5, 1.7 closed; 4 follow-up leaves
-remain across Lots 1.6 / 2 / 3 / 4 in
-`plan/wp-a-perf-followups.md`). The jemalloc switch (Lot 1.7)
-also delivered a `-26 %` bulk speedup on TREC-COVID, so the
-remaining Surch / OpenSearch bulk gap is `1.42x` (down from
-`13.9x` pre-Lot-1).
+Reste estime: ~6% (Lots 1, 1.5, 1.6, 1.7 closed; Lot 2 landed,
+its search-latency gain still to be measured via `insee-bench`;
+Lots 3 / 4 open in `plan/wp-a-perf-followups.md`). **Surch now
+ingests the full 171 k TREC-COVID corpus `1.54x` FASTER than
+OpenSearch** (`56 s` vs `87 s`), reversing the `13.9x` OpenSearch
+advantage measured pre-Lot-1 — total `~17.8x` Surch speedup.
 
 Lot 3 paired K8s perf-proof shows Surch hot path -21/-22/-12/-30 %
 p50/p95/p99/max vs pre-FoR `c01b0a2`; runbook + numbers under
@@ -115,10 +115,11 @@ historical replay line lives in
   `_refresh` drops the live `PostingsBuilder`; logical free works
   but system RSS recovers only `268 MiB` (`5859 -> 5591 MiB`) due
   to glibc default allocator inertia — addressed by new Lot 1.7.
-- [ ] Follow-up Lot 1.6 — incremental term dictionary build (next
-  bulk attack; explains `~95%` of the residual `~2x` Surch/OS
-  TREC-COVID bulk gap). Details in
-  `plan/wp-a-perf-followups.md`.
+- [x] Follow-up Lot 1.6 closed by `2e4361e` / promoted as
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-lot2-K8s/`.
+  Deferred FST term-dictionary build off the bulk path: TREC-COVID
+  Surch bulk `139 -> 56 s`, **Surch now `1.54x` faster than
+  OpenSearch**; RSS peak `3424 -> 2156 MiB`. NDCG unchanged.
 - [x] Follow-up Lot 1.7 closed by `b9f6636` / promoted as
   `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.7-jemalloc-K8s/`.
   Switched the Surch global allocator to jemalloc
@@ -127,8 +128,11 @@ historical replay line lives in
   Surch RSS peak `5591 -> 3424 MiB` (`-39 %`), Surch RSS final
   `5591 -> 1382 MiB` (`-75 %`), bulk TREC-COVID
   `189 -> 139 s` (`-26 %` allocator bonus).
-- [ ] Follow-up Lot 2 — Skip lists on top of the codec FoR path
-  (`plan/wp-a-perf-followups.md`).
+- [x] Follow-up Lot 2 — Skip lists on the codec FoR path landed in
+  `d73c862` (leapfrog AND). Compiles + passes the workspace suite
+  with Lot 1.6; NDCG unchanged. Search-latency gain still to be
+  quantified via an `insee-bench` replay (`ndcg-gate` does not
+  measure search percentiles).
 - [ ] Follow-up Lot 3 — Next Block-Max WAND step on encoded block
   metadata (`plan/wp-a-perf-followups.md`).
 - [ ] Follow-up Lot 4 — Historical A-replay-1/2/3 promotion, owned by
