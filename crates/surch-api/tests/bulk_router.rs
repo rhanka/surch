@@ -237,6 +237,102 @@ async fn bulk_router_reports_duplicate_create_as_conflict() {
     );
 }
 
+/// Guards Track A `wp-a-perf-followups.md` Lot 1: sequential `_bulk`
+/// POSTs against the same index must accumulate without re-indexing
+/// the cumulative document store at each chunk. The shape mirrors
+/// `scripts/bench/trec-covid-ndcg.sh` which splits the BEIR corpus
+/// into ~21 chunks and POSTs them one by one before a single
+/// `_refresh`. All previously-ingested docs must remain searchable
+/// after each subsequent chunk lands.
+#[tokio::test]
+async fn bulk_router_accumulates_across_multiple_chunks() {
+    let router = app_router();
+
+    const CHUNKS: usize = 3;
+    const PER_CHUNK: usize = 80;
+
+    for chunk in 0..CHUNKS {
+        let mut ndjson = String::new();
+        for i in 0..PER_CHUNK {
+            let doc_id = chunk * PER_CHUNK + i;
+            // `uniquetermNNN` is a single token per doc and per chunk so a
+            // targeted search can isolate exactly one doc later.
+            ndjson.push_str(&format!(
+                "{{\"index\":{{\"_id\":\"{doc_id}\"}}}}\n{{\"title\":\"uniqueterm{doc_id}\"}}\n"
+            ));
+        }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/catalog/_bulk")
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from(ndjson))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["errors"], false, "chunk {chunk} surfaced errors");
+        assert_eq!(
+            body["items"].as_array().expect("items array").len(),
+            PER_CHUNK,
+            "chunk {chunk} item count"
+        );
+
+        let search_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/catalog/_search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"query":{{"match_all":{{}}}},"size":{}}}"#,
+                        (chunk + 1) * PER_CHUNK
+                    )))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+
+        assert_eq!(search_response.status(), StatusCode::OK);
+        let search_body = response_json(search_response).await;
+        let expected_total = ((chunk + 1) * PER_CHUNK) as u64;
+        assert_eq!(
+            search_body["hits"]["total"]["value"].as_u64(),
+            Some(expected_total),
+            "search after chunk {chunk} should see {expected_total} docs"
+        );
+    }
+
+    // After all chunks, an `_mget` for a doc that landed in the FIRST
+    // chunk must still return its source — guards that the incremental
+    // append path keeps earlier doc state addressable after later
+    // chunks landed.
+    let by_id = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_mget")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"docs":[{"_index":"catalog","_id":"5"}]}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(by_id.status(), StatusCode::OK);
+    let by_id_body = response_json(by_id).await;
+    assert_eq!(by_id_body["docs"][0]["_id"], "5");
+    assert_eq!(by_id_body["docs"][0]["found"], true);
+    assert_eq!(by_id_body["docs"][0]["_source"]["title"], "uniqueterm5");
+}
+
 #[tokio::test]
 async fn bulk_router_rejects_non_object_source_with_parse_error() {
     let response = app_router()

@@ -237,6 +237,42 @@ impl InMemoryIndex {
         self.index.finalize_postings();
     }
 
+    /// Track A `wp-a-perf-followups.md` Lot 1: incremental append path
+    /// used by `apply_document_writes` when a bulk batch only inserts
+    /// fresh doc ids (no update of an existing id, no delete). Skips
+    /// the quadratic `rebuild_index()` over the cumulative document
+    /// store and re-tokenises only the freshly inserted docs.
+    ///
+    /// Caller contract: every `doc_id` in `new_doc_ids` must have just
+    /// been inserted by `upsert_document_deferred` and must not be
+    /// present in the index's `live_docs` yet — otherwise
+    /// `DocumentIndex::add_documents_with_mapping` will reject the
+    /// batch with `DuplicateDocId`. Update and delete paths must keep
+    /// using `rebuild_index()` because the term dictionary cannot
+    /// detach old postings without a full rebuild today.
+    ///
+    /// Unlike `rebuild_index()` this method does not call
+    /// `finalize_postings()`: the postings builder must stay live for
+    /// the next incremental append. The trade-off is an extra builder
+    /// snapshot in RAM until the next full `rebuild_index()` (e.g. on
+    /// `set_mapping`, single-doc PUT/DELETE, or a bulk with updates).
+    fn append_to_index(&mut self, new_doc_ids: &[u32]) {
+        if new_doc_ids.is_empty() {
+            return;
+        }
+        let documents = new_doc_ids
+            .iter()
+            .filter_map(|&doc_id| {
+                let id = self.reverse_document_ids.get(&doc_id)?;
+                let source = self.documents.get(id)?;
+                Some((doc_id, indexed_fields_for_document(source, &self.mapping)))
+            })
+            .collect::<Vec<_>>();
+        let _ = self
+            .index
+            .add_documents_with_mapping(documents, &self.mapping);
+    }
+
     fn set_mapping(&mut self, mapping: IndexMapping) {
         self.mapping = mapping;
         self.rebuild_index();
@@ -850,6 +886,13 @@ impl AppState {
             .write()
             .expect("in-memory API state lock should not be poisoned");
         let mut touched = BTreeSet::new();
+        // Track A `wp-a-perf-followups.md` Lot 1: bulk batches that only
+        // insert fresh doc ids skip the cumulative `rebuild_index()` via
+        // `append_to_index`. Any update of an existing id or any delete
+        // forces the full rebuild because the term dictionary cannot
+        // detach old postings incrementally today.
+        let mut new_doc_ids_per_index: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        let mut needs_full_rebuild: BTreeSet<String> = BTreeSet::new();
         let mut results = Vec::with_capacity(operations.len());
 
         for operation in operations {
@@ -871,8 +914,17 @@ impl AppState {
                         .indices
                         .get_mut(&index)
                         .expect("index must exist after implicit creation");
+                    let was_present = data.has_document(&id);
                     data.upsert_document_deferred(&id, source);
                     touched.insert(index.clone());
+                    if was_present {
+                        needs_full_rebuild.insert(index.clone());
+                    } else if let Some(&doc_id) = data.document_ids.get(&id) {
+                        new_doc_ids_per_index
+                            .entry(index.clone())
+                            .or_default()
+                            .push(doc_id);
+                    }
                     results.push(DocumentWriteResult::Applied { index, id, status });
                 }
                 DocumentWriteOperation::Create { index, id, source } => {
@@ -892,6 +944,12 @@ impl AppState {
                     } else {
                         data.upsert_document_deferred(&id, source);
                         touched.insert(index.clone());
+                        if let Some(&doc_id) = data.document_ids.get(&id) {
+                            new_doc_ids_per_index
+                                .entry(index.clone())
+                                .or_default()
+                                .push(doc_id);
+                        }
                         results.push(DocumentWriteResult::Applied {
                             index,
                             id,
@@ -903,6 +961,7 @@ impl AppState {
                     if let Some(data) = store.indices.get_mut(&index) {
                         if data.delete_document_deferred(&id) {
                             touched.insert(index.clone());
+                            needs_full_rebuild.insert(index.clone());
                         }
                     }
                     results.push(DocumentWriteResult::Applied {
@@ -916,7 +975,16 @@ impl AppState {
 
         for index in &touched {
             if let Some(data) = store.indices.get_mut(index) {
-                data.rebuild_index();
+                if needs_full_rebuild.contains(index) {
+                    data.rebuild_index();
+                } else if let Some(new_ids) = new_doc_ids_per_index.get(index) {
+                    data.append_to_index(new_ids);
+                } else {
+                    // No new docs and no update/delete on this index — nothing
+                    // to do (e.g. a Create that collided with a version
+                    // conflict touched the index entry via implicit creation
+                    // but not its postings).
+                }
             }
         }
         drop(store);
