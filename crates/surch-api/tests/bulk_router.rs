@@ -2,7 +2,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
 };
-use surch_api::app_router;
+use surch_api::{app_router, app_router_with_state, state::AppState, AppRouterState};
 use tower::ServiceExt;
 
 async fn response_json(response: axum::response::Response<Body>) -> serde_json::Value {
@@ -484,4 +484,220 @@ async fn bulk_router_rejects_non_object_source_with_parse_error() {
         .expect("router should respond");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Guards Track A `wp-a-perf-followups.md` Lot 1.6: N sequential
+/// `_bulk` POSTs followed by a single `_refresh` must trigger ONE
+/// FST rebuild — not N. The previous behaviour rebuilt the term
+/// dictionary on every `_bulk` chunk via
+/// `DocumentIndex::add_documents_with_mapping`, which made the bulk
+/// path quadratic on cumulative terms and accounted for most of the
+/// Surch / OpenSearch gap on TREC-COVID. Lot 1.6 defers the rebuild
+/// to the next read-after-write boundary (search or refresh), so
+/// the `terms_build_count` instrumentation can prove the new
+/// schedule.
+#[tokio::test]
+async fn bulk_router_lot1_6_defers_terms_build_across_chunks() {
+    let shared = AppRouterState::default();
+    let app: AppState = shared.app.clone();
+    let router = app_router_with_state(shared);
+
+    const CHUNKS: usize = 5;
+    const PER_CHUNK: usize = 50;
+
+    // Baseline: untouched index has zero rebuilds. We assert the
+    // counter from `AppState::index_terms_build_count`, which is a
+    // per-`InMemoryIndex` counter (no cross-test pollution).
+    assert_eq!(app.index_terms_build_count("catalog"), 0);
+
+    for chunk in 0..CHUNKS {
+        let mut ndjson = String::new();
+        for i in 0..PER_CHUNK {
+            let doc_id = chunk * PER_CHUNK + i;
+            ndjson.push_str(&format!(
+                "{{\"index\":{{\"_id\":\"{doc_id}\"}}}}\n{{\"title\":\"uniqueterm{doc_id}\"}}\n"
+            ));
+        }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/catalog/_bulk")
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from(ndjson))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // After CHUNKS bulks WITHOUT any intervening search or refresh,
+    // the FST has not been rebuilt — the writes are still parked in
+    // the `PostingsBuilder` snapshot.
+    assert_eq!(
+        app.index_terms_build_count("catalog"),
+        0,
+        "deferred build invariant: {CHUNKS} `_bulk` chunks should not rebuild the FST \
+         before the first read-after-write boundary",
+    );
+
+    // A `_refresh` materializes the FST exactly once (via
+    // `IndexData::finalize_terms_for_refresh`) before freeing the
+    // `PostingsBuilder` snapshot.
+    let refresh = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_refresh")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(refresh.status(), StatusCode::OK);
+
+    assert_eq!(
+        app.index_terms_build_count("catalog"),
+        1,
+        "`_refresh` after {CHUNKS} bulks should rebuild the FST exactly once",
+    );
+
+    // A subsequent `_search` does not re-rebuild — `terms_dirty` is
+    // already clear, so `ensure_terms_ready` is a no-op.
+    let search = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"query":{{"match_all":{{}}}},"size":{}}}"#,
+                    CHUNKS * PER_CHUNK
+                )))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(search.status(), StatusCode::OK);
+    let search_body = response_json(search).await;
+    assert_eq!(
+        search_body["hits"]["total"]["value"].as_u64(),
+        Some((CHUNKS * PER_CHUNK) as u64),
+        "every bulked doc must surface in the post-refresh search"
+    );
+    assert_eq!(
+        app.index_terms_build_count("catalog"),
+        1,
+        "a clean search after refresh must not retrigger the FST rebuild",
+    );
+}
+
+/// Guards Track A `wp-a-perf-followups.md` Lot 1.6: when a search
+/// arrives between two `_bulk` POSTs (no `_refresh`), the search
+/// MUST materialize the deferred FST so the new docs are visible.
+/// The second bulk also defers, so a follow-up search materializes
+/// again — but never more than once per quiet→write→read cycle.
+#[tokio::test]
+async fn bulk_router_lot1_6_search_between_bulks_materializes_once_per_cycle() {
+    let shared = AppRouterState::default();
+    let app: AppState = shared.app.clone();
+    let router = app_router_with_state(shared);
+
+    // First bulk → defer.
+    let _ = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"1"}}
+{"title":"alpha"}
+{"index":{"_id":"2"}}
+{"title":"beta"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(app.index_terms_build_count("catalog"), 0);
+
+    // Search → materialize (count = 1).
+    let _ = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match":{"title":"alpha"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(app.index_terms_build_count("catalog"), 1);
+
+    // Quiet second search → no extra materialize.
+    let _ = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match":{"title":"alpha"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(app.index_terms_build_count("catalog"), 1);
+
+    // Second bulk → defer again.
+    let _ = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"3"}}
+{"title":"gamma"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(app.index_terms_build_count("catalog"), 1);
+
+    // Search after second bulk → materialize again (count = 2).
+    let search = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match":{"title":"gamma"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let body = response_json(search).await;
+    assert_eq!(
+        body["hits"]["total"]["value"].as_u64(),
+        Some(1),
+        "post-bulk search must see the freshly-bulked `gamma` doc",
+    );
+    assert_eq!(
+        app.index_terms_build_count("catalog"),
+        2,
+        "second write→read cycle must trigger exactly one extra FST rebuild",
+    );
 }

@@ -237,9 +237,13 @@ impl InMemoryIndex {
                     .map(|doc_id| (*doc_id, indexed_fields_for_document(source, &self.mapping)))
             })
             .collect::<Vec<_>>();
+        // Lot 1.6: defer the FST rebuild. The bulk path then chains
+        // several rebuild/append calls without paying the per-call
+        // build cost; the next `_refresh` or first search will
+        // materialize once via `ensure_terms_ready`.
         let _ = self
             .index
-            .add_documents_with_mapping(documents, &self.mapping);
+            .add_documents_with_mapping_deferred(documents, &self.mapping);
         // Lot 1.5: keep the postings builder live across rebuilds. It is
         // the source of truth for `append_to_index`, and `refresh_index`
         // is now responsible for dropping it via `finalize_postings()`
@@ -288,9 +292,12 @@ impl InMemoryIndex {
                 Some((doc_id, indexed_fields_for_document(source, &self.mapping)))
             })
             .collect::<Vec<_>>();
+        // Lot 1.6: defer the FST rebuild on the bulk hot path. Reads
+        // arriving between two `_bulk` POSTs go through
+        // `AppState::ensure_terms_ready`, which materializes lazily.
         let _ = self
             .index
-            .add_documents_with_mapping(documents, &self.mapping);
+            .add_documents_with_mapping_deferred(documents, &self.mapping);
     }
 
     /// Track A `wp-a-perf-followups.md` Lot 1.5: free the in-memory
@@ -298,10 +305,18 @@ impl InMemoryIndex {
     /// read-mostly via `POST /:index/_refresh`. The next write on the
     /// index falls back to `rebuild_index()` via `append_to_index`'s
     /// finalized-state guard.
+    ///
+    /// Lot 1.6: any writes that landed between the previous refresh
+    /// and this one are still pending in `postings_builder` — they
+    /// have not been folded into `terms` yet because the bulk path
+    /// defers the FST rebuild. We materialize once here so the
+    /// caller's post-refresh searches see every previously-bulked
+    /// doc, then drop the builder.
     fn finalize_terms_for_refresh(&mut self) {
         if self.terms_finalized {
             return;
         }
+        self.index.materialize_terms();
         self.index.finalize_postings();
         self.terms_finalized = true;
     }
@@ -779,6 +794,62 @@ impl AppState {
         clear_memory_gauges(index);
     }
 
+    /// Track A `wp-a-perf-followups.md` Lot 1.6: per-index instrumentation
+    /// for the number of FST rebuilds that have actually run on the
+    /// named index. Returns `0` for an unknown index or one that has
+    /// never been written. Used by the `bulk_router_*` test suite to
+    /// prove that N `_bulk` POSTs no longer trigger N FST rebuilds.
+    pub fn index_terms_build_count(&self, index: &str) -> u64 {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map_or(0, |data| data.index.terms_build_count())
+    }
+
+    /// Track A `wp-a-perf-followups.md` Lot 1.6: lazily rebuild the
+    /// FST term dictionary on the named index iff writes are pending.
+    /// Search entry points on `AppState` (search/match/term/prefix
+    /// lookups, scoring stats) call this before grabbing the read
+    /// lock so the deferred-build invariant in `DocumentIndex` is
+    /// upheld without forcing every read path to take a write lock.
+    ///
+    /// Implementation: fast-path read-lock probes the `terms_dirty`
+    /// flag; slow-path takes the write lock to actually materialize.
+    /// Both paths are cheap when the index is clean. The
+    /// double-checked pattern below is safe because
+    /// `materialize_terms` is idempotent: a racing writer that flips
+    /// the flag while we drop the read lock will see the materialize
+    /// run, and a racing materializer will short-circuit the second
+    /// call as a no-op.
+    pub fn ensure_terms_ready(&self, index: &str) {
+        {
+            let store = self
+                .store
+                .read()
+                .expect("in-memory API state lock should not be poisoned");
+            match store.indices.get(index) {
+                None => return,
+                Some(data) if !data.index.terms_dirty() => return,
+                Some(_) => {}
+            }
+        }
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if let Some(data) = store.indices.get_mut(index) {
+            // `materialize_terms` is idempotent: a racing materializer
+            // that ran while we were upgrading the lock will have
+            // flipped `terms_dirty` back to `false`, and this call
+            // becomes a no-op.
+            data.index.materialize_terms();
+        }
+    }
+
     /// Track A `wp-a-perf-followups.md` Lot 1.5: drop the in-memory
     /// `PostingsBuilder` snapshot on the named index so the long-text
     /// bulk RAM overhead (~1 GiB observed on BEIR TREC-COVID) is
@@ -1044,9 +1115,18 @@ impl AppState {
         drop(store);
         for index in &touched {
             self.invalidate_search_cache(index);
-            // Refresh after the locks are dropped — `refresh_memory_gauges`
-            // re-acquires `store` in read mode.
-            refresh_memory_gauges(self, index);
+            // Lot 1.6: skip `refresh_memory_gauges` between bulk
+            // chunks. Calling it here would force the FST to
+            // materialize after every `_bulk` POST (because the
+            // postings accounting walks the dictionary), which is
+            // exactly the per-chunk rebuild cost this lot is meant
+            // to eliminate. The gauges are refreshed at the next
+            // `/_surch/stats` query, the next `_refresh`, or any
+            // single-doc PUT/DELETE — all of which call
+            // `ensure_terms_ready` and then re-snapshot accurate
+            // numbers. The bench scenario (21 `_bulk` POSTs followed
+            // by one `_refresh`) sees one materialize total instead
+            // of 21.
         }
 
         results
@@ -1380,6 +1460,8 @@ impl AppState {
     }
 
     pub fn documents_for_term(&self, index: &str, field: &str, value: &str) -> Vec<String> {
+        // Lot 1.6: lazy FST rebuild before the read sees `terms`.
+        self.ensure_terms_ready(index);
         let store = self
             .store
             .read()
@@ -1402,6 +1484,9 @@ impl AppState {
         field: &str,
         prefix: &str,
     ) -> Option<Vec<String>> {
+        // Lot 1.6: prefix-hits walks the FST range for keyword/date
+        // fields without `index_prefixes`, so terms must be live.
+        self.ensure_terms_ready(index);
         let store = self
             .store
             .read()
@@ -1419,6 +1504,8 @@ impl AppState {
         value: &str,
         require_all_terms: bool,
     ) -> Vec<String> {
+        // Lot 1.6: match_hits consumes the FST postings.
+        self.ensure_terms_ready(index);
         let store = self
             .store
             .read()
@@ -1435,6 +1522,8 @@ impl AppState {
         value: &str,
         require_all_terms: bool,
     ) -> Vec<u32> {
+        // Lot 1.6: same as `documents_for_match` — consumes FST postings.
+        self.ensure_terms_ready(index);
         let store = self
             .store
             .read()
@@ -1484,6 +1573,9 @@ impl AppState {
     }
 
     pub fn term_scoring_stats(&self, index: &str, field: &str, term: &str) -> TermScoringStats {
+        // Lot 1.6: scoring stats read `block_metas` + `postings` from
+        // the FST; rebuild before snapshotting if writes are pending.
+        self.ensure_terms_ready(index);
         let store = self
             .store
             .read()
@@ -1500,7 +1592,17 @@ impl AppState {
     /// index does not exist. `stored_fields_bytes` is filled here from
     /// the API-owned `_source` documents (which live outside
     /// [`DocumentIndex`]).
+    ///
+    /// Lot 1.6: the postings accounting walks the FST term dictionary,
+    /// so we materialize any pending deferred build before snapshotting.
+    /// Callers on the bulk hot path that don't need accurate gauges
+    /// between writes should skip this method until `_refresh`.
     pub fn index_memory_usage(&self, index: &str) -> Option<MemoryUsage> {
+        // Lot 1.6: rebuild the FST if writes are pending so the
+        // accounting walk does not see a stale snapshot. The
+        // `bulk_router_*` path skips `refresh_memory_gauges` between
+        // chunks for precisely this reason.
+        self.ensure_terms_ready(index);
         let store = self
             .store
             .read()
@@ -1530,6 +1632,8 @@ impl AppState {
     }
 
     pub fn term_matches_count(&self, index: &str, field: &str, value: &str) -> usize {
+        // Lot 1.6: term_hits uses `index.postings(...)`.
+        self.ensure_terms_ready(index);
         let store = self
             .store
             .read()

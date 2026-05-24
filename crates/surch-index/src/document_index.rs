@@ -1,4 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use surch_analysis::{
     Analyzer, KeywordAnalyzer, NormAnalyzer, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer,
@@ -42,6 +46,23 @@ pub struct DocumentIndex {
     /// starting with that prefix. Kept separate from the regular postings so
     /// the BM25 hot path (`doc_freq`, `term_freq`, norms) is unaffected.
     prefix_postings: BTreeMap<String, BTreeMap<String, BTreeSet<u32>>>,
+    /// Track A `wp-a-perf-followups.md` Lot 1.6: deferred-FST-build flag.
+    /// `true` when `postings_builder` has accumulated writes that the
+    /// `terms` FST does not yet reflect. A subsequent
+    /// `materialize_terms()` rebuilds `terms` from the builder and
+    /// clears the flag. Reads of `terms`/`postings`/`block_metas` on a
+    /// dirty index return a stale snapshot, so the caller
+    /// (surch-api `AppState`) is expected to materialize before
+    /// exposing the index to a search request — the bulk-then-search
+    /// `bulk_router_*` tests guard this contract.
+    terms_dirty: bool,
+    /// Track A `wp-a-perf-followups.md` Lot 1.6: per-index instrumentation
+    /// counter incremented every time `materialize_terms` actually rebuilt
+    /// `terms` (i.e. when `terms_dirty` was set). Wrapped in an `Arc` so a
+    /// `Clone` of the index keeps observing the same counter — the
+    /// `bulk_router_*` test snapshots the counter pre-bulk and asserts
+    /// the rebuild count stayed ~constant across many chunks.
+    terms_build_count: Arc<AtomicU64>,
 }
 
 /// Per-field length statistics recorded during analysis for BM25 norms.
@@ -118,6 +139,50 @@ impl DocumentIndex {
         K: Into<String>,
         V: Into<String>,
     {
+        self.add_documents_with_mapping_internal(documents, mapping, /* defer */ false)
+    }
+
+    /// Track A `wp-a-perf-followups.md` Lot 1.6: bulk-path variant of
+    /// [`add_documents_with_mapping`] that does NOT rebuild the FST
+    /// term dictionary. The caller is responsible for invoking
+    /// [`materialize_terms`] before any read of `terms`/`postings`
+    /// that requires post-write visibility.
+    ///
+    /// Used by the bulk write path
+    /// (`surch-api::AppState::apply_document_writes` →
+    /// `IndexData::append_to_index` / `rebuild_index`) so 21
+    /// consecutive `_bulk` POSTs only trigger one cumulative rebuild
+    /// (at the next `_refresh` or first search) instead of 21
+    /// quadratic per-chunk rebuilds. The single-doc and integration
+    /// tests keep using the materializing variant so the existing
+    /// `index.terms()` / `index.postings()` call sites stay correct
+    /// without a materialize call.
+    pub fn add_documents_with_mapping_deferred<D, I, K, V>(
+        &mut self,
+        documents: D,
+        mapping: &IndexMapping,
+    ) -> Result<()>
+    where
+        D: IntoIterator<Item = (u32, I)>,
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.add_documents_with_mapping_internal(documents, mapping, /* defer */ true)
+    }
+
+    fn add_documents_with_mapping_internal<D, I, K, V>(
+        &mut self,
+        documents: D,
+        mapping: &IndexMapping,
+        defer_terms_build: bool,
+    ) -> Result<()>
+    where
+        D: IntoIterator<Item = (u32, I)>,
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
         let mut seen = BTreeSet::new();
         let mut documents = documents
             .into_iter()
@@ -145,9 +210,63 @@ impl DocumentIndex {
             self.add_validated_document(doc_id, fields, mapping)?;
         }
 
-        self.terms = self.postings_builder.clone().build();
+        if defer_terms_build {
+            // Lot 1.6: defer the FST rebuild. Reads of `terms` /
+            // `postings` see the pre-write snapshot until the caller
+            // invokes `materialize_terms()` (e.g. at refresh time, or
+            // right before exposing the index to a search request).
+            // The bulk path used to call
+            // `self.postings_builder.clone().build()` here, which
+            // rebuilt the entire FST from cumulative postings on
+            // every chunk — O(total_terms_so_far) per `_bulk` POST.
+            self.terms_dirty = true;
+        } else {
+            // Legacy path: materialize immediately so direct callers
+            // (single-doc paths and unit tests) can read `terms` /
+            // `postings` without an explicit `materialize_terms()`.
+            self.terms = self.postings_builder.clone().build();
+            self.terms_dirty = false;
+            self.terms_build_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(())
+    }
+
+    /// Track A `wp-a-perf-followups.md` Lot 1.6: rebuild the term
+    /// dictionary FST from the live `PostingsBuilder` snapshot if and
+    /// only if writes have happened since the last rebuild. No-op when
+    /// the index is clean (idempotent), so callers can call it
+    /// liberally at the top of any read path without paying the
+    /// rebuild cost on a quiet index.
+    ///
+    /// Must be called before any read of `terms`/`postings`/`block_metas`
+    /// that requires post-write visibility. The bulk write path in
+    /// `surch-api::AppState::apply_document_writes` skips this call so
+    /// 21 consecutive `_bulk` POSTs only trigger one cumulative
+    /// rebuild — either at `_refresh` (via `finalize_postings`'s
+    /// preamble) or at the first search after the writes.
+    pub fn materialize_terms(&mut self) {
+        if !self.terms_dirty {
+            return;
+        }
+        self.terms = self.postings_builder.clone().build();
+        self.terms_dirty = false;
+        self.terms_build_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lot 1.6: whether `terms` reflects every write seen so far. A
+    /// `true` return means a `materialize_terms()` call is required
+    /// before any read that depends on the post-write FST state.
+    pub fn terms_dirty(&self) -> bool {
+        self.terms_dirty
+    }
+
+    /// Lot 1.6: number of times `materialize_terms` actually rebuilt
+    /// the FST on this index instance. Used by the `bulk_router_*`
+    /// tests to prove that N `_bulk` chunks no longer trigger N FST
+    /// rebuilds. Cheap atomic load; not on any hot path.
+    pub fn terms_build_count(&self) -> u64 {
+        self.terms_build_count.load(Ordering::Relaxed)
     }
 
     /// Drop the internal `PostingsBuilder` state once the caller is done
@@ -161,7 +280,16 @@ impl DocumentIndex {
     /// incremental adds therefore breaks the snapshot semantics — only
     /// callers that follow a `clear()` + batch + finalize lifecycle
     /// should use it.
+    ///
+    /// Lot 1.6: callers MUST `materialize_terms()` first so the FST
+    /// reflects every pending write before the builder is dropped.
+    /// Otherwise the deferred writes are lost.
     pub fn finalize_postings(&mut self) {
+        debug_assert!(
+            !self.terms_dirty,
+            "finalize_postings called while terms_dirty=true — caller must materialize_terms() first \
+             to avoid losing pending writes"
+        );
         self.postings_builder = PostingsBuilder::new();
     }
 
@@ -171,6 +299,12 @@ impl DocumentIndex {
         self.terms = TermDictionary::default();
         self.field_stats.clear();
         self.prefix_postings.clear();
+        // The fresh `TermDictionary::default()` is in sync with the
+        // fresh `PostingsBuilder::new()` (both empty), so the index is
+        // clean as far as the deferred-rebuild contract is concerned.
+        // Keep the per-index counter (an `Arc<AtomicU64>`) untouched
+        // so cumulative diagnostics across rebuilds remain coherent.
+        self.terms_dirty = false;
     }
 
     pub fn doc_ids(&self) -> Vec<u32> {
