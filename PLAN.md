@@ -63,10 +63,12 @@ single-threaded status loops advanced too little per user turn.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~17% (Lots 1 and 1.5 closed; Lot 1.7 newly opened
-for the allocator-side RAM follow-up after Lot 1.5 recovered only
-`268 MiB` out of the `~1 GiB` logically freed. 5 follow-up leaves
-remain across Lots 1.6/1.7/2/3/4 in `plan/wp-a-perf-followups.md`).
+Reste estime: ~13% (Lots 1, 1.5, 1.7 closed; 4 follow-up leaves
+remain across Lots 1.6 / 2 / 3 / 4 in
+`plan/wp-a-perf-followups.md`). The jemalloc switch (Lot 1.7)
+also delivered a `-26 %` bulk speedup on TREC-COVID, so the
+remaining Surch / OpenSearch bulk gap is `1.42x` (down from
+`13.9x` pre-Lot-1).
 
 Lot 3 paired K8s perf-proof shows Surch hot path -21/-22/-12/-30 %
 p50/p95/p99/max vs pre-FoR `c01b0a2`; runbook + numbers under
@@ -117,10 +119,14 @@ historical replay line lives in
   bulk attack; explains `~95%` of the residual `~2x` Surch/OS
   TREC-COVID bulk gap). Details in
   `plan/wp-a-perf-followups.md`.
-- [ ] Follow-up Lot 1.7 — allocator memory return after
-  `_refresh`. Pick between `malloc_trim(0)` (smallest) and a
-  jemalloc switch. Expected effect: Surch RSS peak drops from
-  `5591 MiB` toward `~4800 MiB`.
+- [x] Follow-up Lot 1.7 closed by `b9f6636` / promoted as
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.7-jemalloc-K8s/`.
+  Switched the Surch global allocator to jemalloc
+  (`tikv-jemallocator` 0.6) +
+  `MALLOC_CONF=background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0`.
+  Surch RSS peak `5591 -> 3424 MiB` (`-39 %`), Surch RSS final
+  `5591 -> 1382 MiB` (`-75 %`), bulk TREC-COVID
+  `189 -> 139 s` (`-26 %` allocator bonus).
 - [ ] Follow-up Lot 2 — Skip lists on top of the codec FoR path
   (`plan/wp-a-perf-followups.md`).
 - [ ] Follow-up Lot 3 — Next Block-Max WAND step on encoded block

@@ -185,17 +185,24 @@ heap because the allocator does not call `madvise(MADV_DONTNEED)`
 without memory pressure. With the Surch sidecar's 7 GiB cap and
 the steady-state peak around 5.5 GiB, there is no pressure.
 
-- [ ] Option A: call `libc::malloc_trim(0)` from
-  `AppState::refresh_index` after `finalize_terms_for_refresh()`,
-  guarded by `#[cfg(target_env = "gnu")]`. Smallest patch (~10 LoC).
-- [ ] Option B: switch the Surch binary's global allocator to
-  `jemalloc` via `tikv-jemallocator` and configure aggressive purge
-  thresholds. Larger change but better long-tail behaviour for
-  long-running pods.
-- [ ] Re-run K8s `ndcg-gate` after the chosen option; expected
-  Surch RSS peak drops from `5591 MiB` toward the logical
-  `~4800 MiB` post-refresh.
-- [ ] Track A ledger `RSS / memory` row updated.
+- [x] User chose option B: switch the Surch global allocator to
+  jemalloc via `tikv-jemallocator` 0.6, scoped to
+  `cfg(target_os = "linux")` (runtime image is
+  `gcr.io/distroless/cc-debian12`).
+- [x] `crates/surch-api/src/main.rs` declares the jemalloc global
+  allocator behind `#[cfg(target_os = "linux")]`.
+- [x] Dockerfile builder stage gains `build-essential` to compile
+  the bundled jemalloc C sources.
+- [x] Dockerfile runtime stage sets
+  `MALLOC_CONF=background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0`
+  so the async purge thread returns freed pages immediately.
+- [x] K8s `ndcg-gate` run `26360701909` on `b9f6636` promoted as
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.7-jemalloc-K8s/`.
+  Surch RSS peak `5591 -> 3424 MiB` (`-39 %`), Surch RSS final
+  `5591 -> 1382 MiB` (`-75 %`), Surch TREC-COVID bulk
+  `189 -> 139 s` (`-26 %` allocator bonus). NDCG unchanged.
+- [x] Allocator parity with Elasticsearch / OpenSearch
+  (which both default to jemalloc on Linux since ~7.13) achieved.
 
 ### Lot 1.6 — Incremental term dictionary build (next bulk attack)
 
