@@ -123,14 +123,66 @@ Reproduced on `137b352` paired run: `1112.52 s` vs `93.80 s`
 - [x] Identify the dominant cost (done: `rebuild_index` re-indexes
   the cumulative document store after every `_bulk` chunk; the
   refresh handler is a no-op).
-- [ ] Arbitrate between (a) / (b) / (c) / (d). User decision
-  pending.
-- [ ] Implement the chosen axis with the matching test surface
-  update.
-- [ ] Re-run K8s `ndcg-gate` on the fix SHA and promote the paired
-  report; update the Track A ledger Bulk row accordingly.
-- [ ] Gate: ledger Bulk row no longer flags "Surch ingest scaling
-  for large-corpus / long-text shapes is the next target".
+- [x] User picked axis (c) full incremental refactor of
+  `DocumentIndex`.
+- [x] Implemented in `367acdc`: `IndexData::append_to_index` takes
+  only the freshly inserted doc ids; `apply_document_writes` routes
+  pure-insert bulks to the incremental path and any update/delete
+  bulk to the legacy `rebuild_index`. New test
+  `bulk_router_accumulates_across_multiple_chunks` guards the
+  multi-chunk accumulation.
+- [x] Re-ran K8s `ndcg-gate` and promoted
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-incremental-bulk-K8s/`:
+  Surch TREC-COVID bulk `1001.95 s -> 179.86 s` (`~5.6x` speedup),
+  Surch/OpenSearch ratio `13.9x -> 2.06x`. NDCG@10 and Recall@10
+  unchanged. Track A performance ledger Bulk + RSS rows updated.
+- [x] Gate: ledger Bulk row no longer flags "Surch ingest scaling
+  for large-corpus / long-text shapes is the next target" — it now
+  cites the new run and points at the term-dictionary rebuild as
+  the next attack surface.
+
+### Lot 1.5 — Free the PostingsBuilder snapshot on refresh
+
+Trigger: `2026-05-24-ndcg-gate-incremental-bulk-K8s/` shows Surch
+RSS peak rose from `4802 MiB` (full-rebuild path) to `5859 MiB`
+(incremental path). The delta `~1057 MiB` is the live
+`PostingsBuilder` snapshot kept alive across chunks to allow
+incremental `append_to_index` calls. Once the index is declared
+read-mostly (via `POST /:index/_refresh`), the snapshot is dead
+weight and can be dropped.
+
+- [ ] Make `AppState::refresh_index` (currently a no-op at
+  `crates/surch-api/src/state.rs:713`) call
+  `DocumentIndex::finalize_postings()` to drop the builder.
+- [ ] Track per-`IndexData` finalize state with a `terms_finalized:
+  bool` flag.
+- [ ] In `append_to_index`, if `terms_finalized` is true, fall back
+  to a one-shot `rebuild_index()` before appending so a
+  bulk-after-refresh request preserves old terms.
+- [ ] Remove the unconditional `finalize_postings()` from
+  `rebuild_index()`: post-Lot-1 the builder is the source of truth
+  for further incremental appends; only `refresh_index` should
+  finalize.
+- [ ] New tests: bulk → refresh → search reads correctly; bulk →
+  refresh → bulk → search reads both old and new docs.
+- [ ] Re-run K8s `ndcg-gate` and promote the result; Track A ledger
+  `RSS / memory` row updated with the new Surch peak (expected
+  back near `4802 MiB`).
+
+### Lot 1.6 — Incremental term dictionary build (next bulk attack)
+
+Trigger: after Lot 1, the cumulative `terms.build()` call inside
+`DocumentIndex::add_documents_with_mapping` (rebuilds the whole
+FST from `self.postings_builder` after every `_bulk` POST) is the
+dominant Surch bulk cost on long-text corpora and accounts for
+~95% of the remaining `2.06x` gap to OpenSearch on TREC-COVID.
+
+- [ ] Profile `terms.build()` cost per chunk on a 171 k corpus to
+  confirm it is the bottleneck.
+- [ ] Design an incremental term dictionary update path (FST
+  builder accumulation across chunks; final build on refresh, not
+  per `_bulk`).
+- [ ] Implement + tests + K8s replay + ledger update.
 
 ### Lot 2 — Skip lists on the codec FoR path
 

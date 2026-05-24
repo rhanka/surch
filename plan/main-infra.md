@@ -197,6 +197,15 @@ Status: active infra lane; merge state below is the source of truth
     cluster events in a single artifact rebuilt from driver-log
     markers after Job completion. Track B's last leaf closes in the
     same commit.
+  - [x] Wait-loop now tolerates `exit=143` (SIGTERM) on
+    restartable init container sidecars (`04fde72`): when the
+    bench driver finishes, the kubelet kills Surch + OpenSearch
+    sidecars with SIGTERM as a normal graceful-stop signal. The
+    previous regex flagged any non-zero exit code as a failure and
+    short-circuited the wait loop seconds before the Job reached
+    `Complete=True`. Real failures (exit codes 1, 2, 137=OOMKilled,
+    ...) still fail closed. Confirmed on `ndcg-gate` run
+    `26350556060` (Lot 1 incremental bulk fix proof).
   - [x] Turn `make bench-k8s` into a real entry point.
 
 - [x] Lot N - Closure

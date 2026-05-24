@@ -63,8 +63,10 @@ single-threaded status loops advanced too little per user turn.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~25% (4 follow-ups / 18 leaf tasks, delivered lots
-closed on `main` at `c5980ad`).
+Reste estime: ~20% (Lot 1 closed by `367acdc` /
+`docs/ops/bench-reports/2026-05-24-ndcg-gate-incremental-bulk-K8s/`;
+5 follow-up leaves remain across new Lots 1.5/1.6/2/3/4 in
+`plan/wp-a-perf-followups.md`).
 
 Lot 3 paired K8s perf-proof shows Surch hot path -21/-22/-12/-30 %
 p50/p95/p99/max vs pre-FoR `c01b0a2`; runbook + numbers under
@@ -101,10 +103,19 @@ historical replay line lives in
 - [x] Refresh memory baselines after the FST / shared-source / FoR
   sequence: `2026-05-19-insee-10k-k8s/` (post-FoR) +
   `2026-05-20-A-lot3-paired-K8s/` (paired before/after).
-- [ ] Follow-up Lot 1 — TREC-COVID bulk scaling
-  (`plan/wp-a-perf-followups.md`). New target after the
-  `2026-05-22-ndcg-gate-7Gi-K8s/` promo exposed Surch bulk `13.9x`
-  slower than OpenSearch on the full 171 k corpus.
+- [x] Follow-up Lot 1 — TREC-COVID bulk scaling closed by
+  `367acdc` (incremental `append_to_index`); proof in
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-incremental-bulk-K8s/`,
+  Surch TREC-COVID bulk `1001.95 s -> 179.86 s` (`~5.6x` speedup),
+  Surch/OpenSearch ratio `13.9x slower -> 2.06x slower`.
+- [ ] Follow-up Lot 1.5 — free the live `PostingsBuilder`
+  snapshot on `_refresh` (recovers `~1 GiB` of Surch RSS observed
+  in the 2026-05-24 promo). Details in
+  `plan/wp-a-perf-followups.md`.
+- [ ] Follow-up Lot 1.6 — incremental term dictionary build (next
+  bulk attack; explains `~95%` of the residual `2.06x` Surch/OS
+  TREC-COVID bulk gap). Details in
+  `plan/wp-a-perf-followups.md`.
 - [ ] Follow-up Lot 2 — Skip lists on top of the codec FoR path
   (`plan/wp-a-perf-followups.md`).
 - [ ] Follow-up Lot 3 — Next Block-Max WAND step on encoded block
