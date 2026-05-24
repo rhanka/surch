@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
-use surch_codec::postings_block::FOR_BLOCK_SIZE;
+use surch_codec::postings_block::{
+    BlockSkipCursor, BlockSkipEntry, BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
+};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, PostingsError>;
@@ -401,5 +403,143 @@ impl<'a> PostingsList<'a> {
 
     pub fn doc_freq_from_block_metas(&self) -> usize {
         self.block_metas.iter().map(|meta| meta.posting_count).sum()
+    }
+
+    /// Build a [`BlockSkipList`] (Lot 2: skip lists on the codec FoR
+    /// path) from this term's per-block metadata. Returns `None` when
+    /// the posting list is empty (so callers can short-circuit without
+    /// constructing an empty skip list). Returns `Err(_)` only on a
+    /// programmer-bug-level invariant violation (postings not strictly
+    /// increasing across blocks); these errors should never fire in
+    /// practice because `PostingsBuilder::build()` sorts postings by
+    /// ascending `doc_id` before `build_block_metas` runs.
+    pub fn block_skip_list(
+        &self,
+    ) -> std::result::Result<Option<BlockSkipList>, PostingsBlockError> {
+        if self.block_metas.is_empty() {
+            return Ok(None);
+        }
+        let entries = self
+            .block_metas
+            .iter()
+            .enumerate()
+            .map(|(idx, meta)| BlockSkipEntry {
+                block_index: idx,
+                min_doc_id: meta.min_doc_id,
+                max_doc_id: meta.max_doc_id,
+            });
+        let skip_list = BlockSkipList::from_block_ranges(entries)?;
+        Ok(Some(skip_list))
+    }
+
+    /// Build a leapfrog iterator over this term's postings, driven by
+    /// the codec-level [`BlockSkipList`]. The caller advances through
+    /// the posting list by calling `advance_to(target)`; the iterator
+    /// uses the skip list to jump past whole 128-block chunks whose
+    /// `max_doc_id < target` (Lot 2).
+    ///
+    /// Returns `None` if the posting list is empty (so callers can
+    /// short-circuit without holding a skip list around). The iterator
+    /// is monotonic — subsequent `advance_to` calls must use a
+    /// non-decreasing `target`.
+    pub fn skip_iter(
+        &self,
+    ) -> std::result::Result<Option<PostingsBlockSkipIter<'a>>, PostingsBlockError> {
+        let Some(skip_list) = self.block_skip_list()? else {
+            return Ok(None);
+        };
+        Ok(Some(PostingsBlockSkipIter {
+            postings: self.postings,
+            skip_list,
+            cursor_position: 0,
+            position: 0,
+            blocks_skipped: 0,
+        }))
+    }
+}
+
+/// Iterator over a term's postings that leapfrogs whole 128-block
+/// chunks whenever the caller advances past a block's `max_doc_id`.
+/// Built by [`PostingsList::skip_iter`].
+#[derive(Debug)]
+pub struct PostingsBlockSkipIter<'a> {
+    postings: &'a [Posting],
+    skip_list: BlockSkipList,
+    /// Current bottom-layer cursor position, kept in sync with
+    /// the internal `BlockSkipCursor`. We re-derive a fresh
+    /// `BlockSkipCursor` on every `advance_to` call to keep the
+    /// iterator `'a`-lifetime-free.
+    cursor_position: usize,
+    position: usize,
+    blocks_skipped: usize,
+}
+
+impl<'a> PostingsBlockSkipIter<'a> {
+    /// Number of 128-block chunks the iterator skipped over (relative
+    /// to a naive full walk). Used by tests to assert that the skip
+    /// list is actually doing work.
+    pub fn blocks_skipped(&self) -> usize {
+        self.blocks_skipped
+    }
+
+    /// Advance to the first posting whose `doc_id >= target`. The
+    /// `target` must be non-decreasing across calls. Returns the
+    /// matching posting (or `None` if the iterator is exhausted).
+    /// Calling `advance_to` repeatedly produces postings in strictly
+    /// ascending `doc_id` order, just like `Iterator::next`, but with
+    /// block-level skipping.
+    pub fn advance_to(&mut self, target: u32) -> Option<&'a Posting> {
+        if self.position >= self.postings.len() {
+            return None;
+        }
+
+        // Slow path: use the skip list to leapfrog past whole blocks
+        // whose max_doc_id < target. We only enter the skip-list
+        // codepath when the *current* block cannot contain target
+        // (its max_doc_id < target). For repeated calls inside the
+        // same block, the bottom-layer cursor stays put and we only
+        // pay one comparison per loop iteration.
+        let current_block_idx = self.position / BLOCK_SIZE;
+        let current_block_max = self
+            .skip_list
+            .entries()
+            .get(current_block_idx)
+            .map(|entry| entry.max_doc_id);
+        if current_block_max.is_some_and(|max| max < target) {
+            let mut cursor = BlockSkipCursor::resume(&self.skip_list, self.cursor_position);
+            let landed = cursor.advance_to(target)?;
+            let block_start = landed.block_index * BLOCK_SIZE;
+            if block_start > self.position {
+                self.blocks_skipped += (block_start - self.position) / BLOCK_SIZE;
+                self.position = block_start;
+            }
+            self.cursor_position = cursor.position();
+        }
+
+        // Linear scan from `position` until we find the first posting
+        // whose doc_id >= target. We do not need an upper bound here:
+        // the skip list above already guarantees that the block at
+        // `position` contains a doc_id >= target (or the iterator is
+        // exhausted), so this scan touches O(BLOCK_SIZE) postings
+        // worst case.
+        while self.position < self.postings.len() {
+            let posting = &self.postings[self.position];
+            if posting.doc_id >= target {
+                self.position += 1;
+                return Some(posting);
+            }
+            self.position += 1;
+        }
+        None
+    }
+}
+
+impl<'a> Iterator for PostingsBlockSkipIter<'a> {
+    type Item = &'a Posting;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let posting = self.postings.get(self.position)?;
+        self.position += 1;
+        Some(posting)
     }
 }

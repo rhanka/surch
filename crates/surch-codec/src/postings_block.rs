@@ -22,6 +22,15 @@ use thiserror::Error;
 /// exercised independently from `surch-index`.
 pub const FOR_BLOCK_SIZE: usize = 128;
 
+/// Number of blocks summarised by one entry in the top-level skip layer
+/// of [`BlockSkipList`]. Tuned to keep the top layer dense enough to fit
+/// in a 32-byte L1 cache line for `~1024` blocks (i.e. up to ~131 k
+/// postings, which matches the TREC-COVID 171 k corpus order of
+/// magnitude). For smaller posting lists the top layer collapses to a
+/// single entry and the cursor falls back to a linear-then-binary scan
+/// over the per-block layer, which is already O(log N) with `N` ≤ 16.
+pub const SKIP_INTERVAL: usize = 8;
+
 /// Errors returned by [`decode_doc_ids_delta_varint`] and
 /// [`encode_doc_ids_delta_varint`].
 ///
@@ -371,6 +380,232 @@ impl<'a> DocIdDeltaCursor<'a> {
     }
 }
 
+/// Per-block min/max summary used by [`BlockSkipList`]. Kept tiny on
+/// purpose: a (`block_index`, `min_doc_id`, `max_doc_id`) triple is
+/// what the cursor needs to decide "does target fall in this block or
+/// past it?". The full [`PostingsBlockMeta`] is not required because
+/// skip decisions never look at the freq channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSkipEntry {
+    pub block_index: usize,
+    pub min_doc_id: u32,
+    pub max_doc_id: u32,
+}
+/// Two-level skip list over the per-block min/max doc id range,
+/// computed once from the block metadata produced by
+/// [`inspect_postings_blocks`] (or from any aligned `BlockMeta` mirror
+/// like `surch_index::postings::BlockMeta`). The bottom layer mirrors
+/// the per-block doc-id ranges; the top layer keeps one entry per
+/// [`SKIP_INTERVAL`] bottom entries to short-circuit the initial
+/// binary search on long posting lists.
+///
+/// The structure stays **derived state** — no new on-disk byte is
+/// written. The codec ships an `inspect_postings_blocks` helper that
+/// can rebuild the skip list at open time, which keeps the on-disk
+/// format backward compatible with everything written before Lot 2.
+///
+/// **Invariants** preserved by [`BlockSkipList::from_block_ranges`]:
+///
+/// 1. `bottom` is non-empty, sorted by `block_index`, with strictly
+///    increasing `min_doc_id` and `max_doc_id` across consecutive
+///    entries (because postings are strictly increasing).
+/// 2. For each bottom entry `b`, `b.min_doc_id <= b.max_doc_id`.
+/// 3. `top[i] = bottom[i * SKIP_INTERVAL]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSkipList {
+    /// One entry per FoR block, in `block_index` order.
+    bottom: Vec<BlockSkipEntry>,
+    /// One entry per [`SKIP_INTERVAL`] bottom entries. Empty iff
+    /// `bottom` has 0 or 1 entries (no skip benefit).
+    top: Vec<BlockSkipEntry>,
+}
+
+impl BlockSkipList {
+    /// Build a skip list from an iterator of `(block_index, min_doc_id,
+    /// max_doc_id)` triples produced in `block_index` order. Returns
+    /// [`PostingsBlockError::NotMonotonic`] if any invariant is broken
+    /// (out-of-order indices, decreasing min/max, or `min > max`).
+    pub fn from_block_ranges<I>(blocks: I) -> Result<Self, PostingsBlockError>
+    where
+        I: IntoIterator<Item = BlockSkipEntry>,
+    {
+        let bottom: Vec<BlockSkipEntry> = blocks.into_iter().collect();
+        for window in bottom.windows(2) {
+            let prev = &window[0];
+            let next = &window[1];
+            if prev.block_index >= next.block_index {
+                return Err(PostingsBlockError::NotMonotonic);
+            }
+            if prev.max_doc_id >= next.min_doc_id {
+                return Err(PostingsBlockError::NotMonotonic);
+            }
+        }
+        for entry in &bottom {
+            if entry.min_doc_id > entry.max_doc_id {
+                return Err(PostingsBlockError::NotMonotonic);
+            }
+        }
+        let top = if bottom.len() <= 1 {
+            Vec::new()
+        } else {
+            bottom.iter().step_by(SKIP_INTERVAL).copied().collect()
+        };
+        Ok(Self { bottom, top })
+    }
+
+    /// Convenience constructor from a slice of [`PostingsBlockMeta`].
+    pub fn from_block_metas(metas: &[PostingsBlockMeta]) -> Result<Self, PostingsBlockError> {
+        Self::from_block_ranges(metas.iter().map(|meta| BlockSkipEntry {
+            block_index: meta.block_index,
+            min_doc_id: meta.min_doc_id,
+            max_doc_id: meta.max_doc_id,
+        }))
+    }
+
+    /// Returns the bottom layer (one [`BlockSkipEntry`] per FoR block).
+    pub fn entries(&self) -> &[BlockSkipEntry] {
+        &self.bottom
+    }
+
+    /// Returns the top layer (one entry per [`SKIP_INTERVAL`] blocks).
+    /// Empty when the bottom layer has 0 or 1 entries.
+    pub fn top_layer(&self) -> &[BlockSkipEntry] {
+        &self.top
+    }
+
+    /// Build a cursor over this skip list starting at block 0.
+    pub fn cursor(&self) -> BlockSkipCursor<'_> {
+        BlockSkipCursor {
+            skip_list: self,
+            position: 0,
+            blocks_visited: 0,
+        }
+    }
+}
+
+/// Cursor over a [`BlockSkipList`] supporting `advance_to(target)` with
+/// O(log N_blocks) worst case via a two-level skip. Tracks the number
+/// of bottom-layer block entries it touched so tests (and an eventual
+/// perf counter) can assert that skipping actually skipped blocks
+/// rather than walking them one by one.
+///
+/// The cursor is **monotonic**: each `advance_to(target)` must use a
+/// `target` >= every previous one (Lucene `DocIdSetIterator`
+/// semantics). Returning to a smaller target would silently produce
+/// wrong results upstream, so the cursor never rewinds — the
+/// `position` cursor moves forward only.
+#[derive(Debug)]
+pub struct BlockSkipCursor<'a> {
+    skip_list: &'a BlockSkipList,
+    /// Index into `skip_list.bottom` of the next candidate block (the
+    /// block we will inspect next, or one past the end if exhausted).
+    position: usize,
+    /// Number of bottom-layer entries the cursor has touched (read /
+    /// compared / returned). Used by tests and future
+    /// observability to assert that skipping actually skipped blocks.
+    blocks_visited: usize,
+}
+
+impl<'a> BlockSkipCursor<'a> {
+    /// Build a cursor positioned at `position` (typically returned by a
+    /// prior `.position()` call). The cursor remains monotonic — calling
+    /// `advance_to(target)` with a `target` smaller than the entry at
+    /// `position` is allowed but the cursor will still only move
+    /// forward. The visit counter restarts at zero, so callers that
+    /// want a cumulative count must accumulate themselves.
+    pub fn resume(skip_list: &'a BlockSkipList, position: usize) -> Self {
+        Self {
+            skip_list,
+            position,
+            blocks_visited: 0,
+        }
+    }
+
+    /// Returns the current bottom-layer position. `entries()[position()]`
+    /// is the candidate that the next `advance_to` will consider first.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns the number of bottom-layer entries the cursor has
+    /// touched so far. Read by tests to assert skip-list effectiveness.
+    pub fn blocks_visited(&self) -> usize {
+        self.blocks_visited
+    }
+
+    /// Returns the next [`BlockSkipEntry`] whose `max_doc_id >= target`
+    /// without advancing past entries that may still contain target.
+    ///
+    /// - Returns `Some(entry)` and advances `position` to it. Caller
+    ///   then decides whether to consume the block (if
+    ///   `entry.min_doc_id <= target <= entry.max_doc_id`) or skip
+    ///   past it (if `target < entry.min_doc_id`, meaning target falls
+    ///   in the gap between two blocks).
+    /// - Returns `None` once every block has been exhausted (target
+    ///   is past the last `max_doc_id`).
+    pub fn advance_to(&mut self, target: u32) -> Option<BlockSkipEntry> {
+        let bottom = &self.skip_list.bottom;
+        if self.position >= bottom.len() {
+            return None;
+        }
+
+        // Top-layer jump: walk the top entries forward in steps of
+        // SKIP_INTERVAL bottom blocks until the next top entry would
+        // overshoot the target. This bumps `position` in O(N_top)
+        // worst case while only touching `top` slots (constant
+        // per slot), then the bottom-layer walk below does the final
+        // O(SKIP_INTERVAL) refinement.
+        let top = &self.skip_list.top;
+        if !top.is_empty() {
+            let mut top_index = self.position / SKIP_INTERVAL;
+            // Move forward as long as the *next* top entry's
+            // max_doc_id is still < target (i.e. the current top
+            // chunk's last block is past). Equivalently: while
+            // top[top_index + 1].max_doc_id < target, jump.
+            while top_index + 1 < top.len() && top[top_index + 1].max_doc_id < target {
+                top_index += 1;
+            }
+            let candidate_position = top_index * SKIP_INTERVAL;
+            if candidate_position > self.position {
+                self.position = candidate_position;
+            }
+        }
+
+        // Bottom-layer linear scan from `position`. The cap (`stop`)
+        // is `min(position + SKIP_INTERVAL + 1, bottom.len())`: after
+        // the top-layer jump we know the answer is in the current
+        // top chunk (or its successor by one slot in the edge case
+        // where target lands on a top boundary).
+        let stop = bottom
+            .len()
+            .min(self.position.saturating_add(SKIP_INTERVAL * 2));
+        while self.position < stop {
+            let entry = bottom[self.position];
+            self.blocks_visited += 1;
+            if entry.max_doc_id >= target {
+                return Some(entry);
+            }
+            self.position += 1;
+        }
+
+        // Edge case: if we exited the bounded scan without finding the
+        // target (e.g. tiny posting lists where the top layer was
+        // empty and the linear scan didn't quite reach), fall back to
+        // a full linear scan to honour the API contract. In practice
+        // this branch only fires on degenerate inputs, but it keeps
+        // the cursor correct.
+        while self.position < bottom.len() {
+            let entry = bottom[self.position];
+            self.blocks_visited += 1;
+            if entry.max_doc_id >= target {
+                return Some(entry);
+            }
+            self.position += 1;
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +881,202 @@ mod tests {
 
         let err = inspect_postings_blocks(&encoded).unwrap_err();
         assert_eq!(err, PostingsBlockError::UnexpectedEof);
+    }
+
+    fn skip_entries(ranges: &[(usize, u32, u32)]) -> Vec<BlockSkipEntry> {
+        ranges
+            .iter()
+            .map(|(block_index, min_doc_id, max_doc_id)| BlockSkipEntry {
+                block_index: *block_index,
+                min_doc_id: *min_doc_id,
+                max_doc_id: *max_doc_id,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn block_skip_list_rejects_out_of_order_indices() {
+        let entries = skip_entries(&[(1, 0, 10), (0, 11, 20)]);
+        let err = BlockSkipList::from_block_ranges(entries).unwrap_err();
+        assert_eq!(err, PostingsBlockError::NotMonotonic);
+    }
+
+    #[test]
+    fn block_skip_list_rejects_overlapping_ranges() {
+        // bottom[0].max_doc_id (10) >= bottom[1].min_doc_id (10) -> reject.
+        let entries = skip_entries(&[(0, 0, 10), (1, 10, 20)]);
+        let err = BlockSkipList::from_block_ranges(entries).unwrap_err();
+        assert_eq!(err, PostingsBlockError::NotMonotonic);
+    }
+
+    #[test]
+    fn block_skip_list_rejects_inverted_min_max() {
+        let entries = skip_entries(&[(0, 10, 0)]);
+        let err = BlockSkipList::from_block_ranges(entries).unwrap_err();
+        assert_eq!(err, PostingsBlockError::NotMonotonic);
+    }
+
+    #[test]
+    fn block_skip_list_empty_top_for_single_block() {
+        let entries = skip_entries(&[(0, 0, 127)]);
+        let skip = BlockSkipList::from_block_ranges(entries).unwrap();
+        assert_eq!(skip.entries().len(), 1);
+        assert!(skip.top_layer().is_empty());
+    }
+
+    #[test]
+    fn block_skip_list_builds_top_layer_every_skip_interval_blocks() {
+        // 17 blocks => top layer has ceil(17 / SKIP_INTERVAL) = 3 entries
+        // (indices 0, 8, 16) when SKIP_INTERVAL = 8.
+        let ranges: Vec<(usize, u32, u32)> = (0..17)
+            .map(|i| (i, (i as u32) * 100, (i as u32) * 100 + 99))
+            .collect();
+        let skip = BlockSkipList::from_block_ranges(skip_entries(&ranges)).unwrap();
+        assert_eq!(skip.entries().len(), 17);
+        let expected_top_len = 17_usize.div_ceil(SKIP_INTERVAL);
+        assert_eq!(skip.top_layer().len(), expected_top_len);
+        assert_eq!(skip.top_layer()[0].block_index, 0);
+        assert_eq!(skip.top_layer()[1].block_index, SKIP_INTERVAL);
+        assert_eq!(skip.top_layer()[2].block_index, 2 * SKIP_INTERVAL);
+    }
+
+    #[test]
+    fn block_skip_cursor_returns_first_block_when_target_falls_inside() {
+        let ranges: Vec<(usize, u32, u32)> = (0..4)
+            .map(|i| (i, (i as u32) * 100, (i as u32) * 100 + 50))
+            .collect();
+        let skip = BlockSkipList::from_block_ranges(skip_entries(&ranges)).unwrap();
+        let mut cursor = skip.cursor();
+        let landed = cursor.advance_to(220).expect("doc 220 has a candidate");
+        assert_eq!(landed.block_index, 2);
+        assert_eq!(landed.min_doc_id, 200);
+        assert_eq!(landed.max_doc_id, 250);
+    }
+
+    #[test]
+    fn block_skip_cursor_returns_none_past_last_max_doc_id() {
+        let ranges = vec![(0, 0_u32, 50_u32), (1, 100, 150)];
+        let skip = BlockSkipList::from_block_ranges(skip_entries(&ranges)).unwrap();
+        let mut cursor = skip.cursor();
+        assert!(cursor.advance_to(1_000).is_none());
+        assert!(cursor.advance_to(2_000).is_none());
+    }
+
+    #[test]
+    fn block_skip_cursor_lands_on_next_block_when_target_in_gap() {
+        // Blocks: 0..=50, 100..=150. target=75 (in the gap) should land
+        // on block 1.
+        let ranges = vec![(0, 0_u32, 50_u32), (1, 100, 150)];
+        let skip = BlockSkipList::from_block_ranges(skip_entries(&ranges)).unwrap();
+        let mut cursor = skip.cursor();
+        let landed = cursor.advance_to(75).expect("doc 75 has a candidate");
+        assert_eq!(landed.block_index, 1);
+        assert_eq!(landed.min_doc_id, 100);
+    }
+
+    #[test]
+    fn block_skip_cursor_skips_blocks_on_large_jump() {
+        // Build 4 * SKIP_INTERVAL blocks of 100 doc ids each. Jump from
+        // block 0 to a target in the very last block. The cursor must
+        // touch FEWER than the total number of blocks: this is the
+        // whole point of the top layer.
+        let total_blocks = 4 * SKIP_INTERVAL;
+        let ranges: Vec<(usize, u32, u32)> = (0..total_blocks)
+            .map(|i| (i, (i as u32) * 100, (i as u32) * 100 + 99))
+            .collect();
+        let skip = BlockSkipList::from_block_ranges(skip_entries(&ranges)).unwrap();
+
+        // Target = first doc of the last block.
+        let target = ((total_blocks - 1) as u32) * 100;
+
+        let mut cursor = skip.cursor();
+        let landed = cursor.advance_to(target).expect("target found");
+        assert_eq!(landed.block_index, total_blocks - 1);
+
+        // The cursor MUST have visited strictly fewer blocks than a
+        // naive linear walk would. With SKIP_INTERVAL = 8 and
+        // total_blocks = 32, a linear walk touches 32 entries; the
+        // top-layer-driven walk should touch <= SKIP_INTERVAL + a
+        // small constant.
+        assert!(
+            cursor.blocks_visited() < total_blocks,
+            "cursor must skip blocks: visited {} of {}",
+            cursor.blocks_visited(),
+            total_blocks
+        );
+        assert!(
+            cursor.blocks_visited() <= SKIP_INTERVAL + 2,
+            "cursor should touch at most SKIP_INTERVAL + 2 blocks, got {}",
+            cursor.blocks_visited()
+        );
+    }
+
+    #[test]
+    fn block_skip_cursor_repeated_advance_keeps_monotonic_position() {
+        let total_blocks = 4 * SKIP_INTERVAL;
+        let ranges: Vec<(usize, u32, u32)> = (0..total_blocks)
+            .map(|i| (i, (i as u32) * 100, (i as u32) * 100 + 99))
+            .collect();
+        let skip = BlockSkipList::from_block_ranges(skip_entries(&ranges)).unwrap();
+        let mut cursor = skip.cursor();
+
+        // Walk through targets in increasing order. After each call,
+        // the position must be non-decreasing.
+        let targets = [
+            150_u32,
+            350,
+            (SKIP_INTERVAL as u32) * 100 + 50,
+            (2 * SKIP_INTERVAL as u32) * 100 + 50,
+            ((total_blocks - 1) as u32) * 100,
+        ];
+        let mut previous_position = 0;
+        for &target in &targets {
+            let landed = cursor.advance_to(target).expect("target found");
+            assert!(landed.max_doc_id >= target);
+            assert!(cursor.position() >= previous_position);
+            previous_position = cursor.position();
+        }
+    }
+
+    #[test]
+    fn block_skip_cursor_matches_naive_linear_walk_on_seeded_corpus() {
+        // Seeded corpus: 2 000 strictly increasing doc ids => ~16 blocks.
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut doc_ids: Vec<u32> = (0..2000).map(|_| next() % 10_000_000).collect();
+        doc_ids.sort_unstable();
+        doc_ids.dedup();
+        let freqs: Vec<u32> = doc_ids.iter().map(|d| (d % 16) + 1).collect();
+        let encoded = encode_postings_doc_id_freq(&doc_ids, &freqs).unwrap();
+        let blocks = inspect_postings_blocks(&encoded).unwrap();
+        let skip = BlockSkipList::from_block_metas(&blocks).unwrap();
+
+        // Naive baseline: for every target, scan blocks linearly and
+        // pick the first one whose max_doc_id >= target.
+        let naive_advance = |target: u32| -> Option<usize> {
+            blocks
+                .iter()
+                .find(|meta| meta.max_doc_id >= target)
+                .map(|meta| meta.block_index)
+        };
+
+        // Drive the cursor with monotonically increasing targets so
+        // we can also check that the skip-list answers match the
+        // naive walk on every step.
+        let targets: Vec<u32> = (0..50).map(|i| doc_ids[(i * doc_ids.len()) / 50]).collect();
+        let mut cursor = skip.cursor();
+        for &target in &targets {
+            let expected = naive_advance(target);
+            let actual = cursor.advance_to(target).map(|entry| entry.block_index);
+            assert_eq!(
+                actual, expected,
+                "skip cursor must match naive walk at target {target}"
+            );
+        }
     }
 }

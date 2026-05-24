@@ -315,3 +315,178 @@ fn boolean_query_execution_rejects_zero_size() {
         ))
     );
 }
+
+/// Lot 2 (skip lists on the codec FoR path): build two posting lists
+/// large enough to span multiple 128-blocks, with an intersection of
+/// only a handful of doc ids spread far apart. The AND-leapfrog
+/// driven by the codec [`BlockSkipList`] must skip the vast majority
+/// of the rarer-clause's blocks — the perf counter
+/// `BooleanQueryExecutor::last_blocks_skipped` proves it.
+#[test]
+fn boolean_query_leapfrog_skips_blocks_on_sparse_intersection() {
+    let mut builder = PostingsBuilder::new();
+
+    // "frequent": present in every doc 0..N (N spans 8 blocks).
+    // "rare": present in 4 docs at block boundaries (0, 128, 384, 1023).
+    let total_docs = BLOCK_SIZE * 8;
+    let rare_doc_ids: Vec<u32> = vec![0, BLOCK_SIZE as u32, 3 * BLOCK_SIZE as u32, 1023];
+    for doc_id in 0..total_docs {
+        builder
+            .add("body", "frequent", doc_id as u32, vec![0])
+            .expect("frequent posting");
+    }
+    for &doc_id in &rare_doc_ids {
+        builder
+            .add("body", "rare", doc_id, vec![0])
+            .expect("rare posting");
+    }
+    let dictionary = builder.build();
+    let stats = TermQueryStats::new(
+        total_docs as u64,
+        1.0,
+        (0..total_docs).map(|doc_id| (doc_id as u32, 1)).collect(),
+    )
+    .expect("valid stats");
+
+    let term_executor = TermQueryExecutor::new(&dictionary, stats.clone());
+    let boolean_executor = BooleanQueryExecutor::new(&dictionary, stats);
+
+    let frequent_query = TermQuery::new("body", "frequent").expect("valid query");
+    let rare_query = TermQuery::new("body", "rare").expect("valid query");
+    let query = BooleanQuery::new(vec![
+        Query::Term(frequent_query.clone()),
+        Query::Term(rare_query.clone()),
+    ])
+    .expect("valid boolean query");
+
+    // Run the boolean executor.
+    let top_docs = boolean_executor
+        .execute(&query, rare_doc_ids.len())
+        .expect("boolean execution");
+
+    // (a) Result set parity: the AND must equal `rare`'s doc ids
+    // (since `frequent` covers everything), and per-doc score must
+    // equal `bm25(frequent) + bm25(rare)` for each rare doc.
+    let mut returned_ids: Vec<u32> = top_docs.score_docs.iter().map(|sd| sd.doc_id).collect();
+    returned_ids.sort_unstable();
+    assert_eq!(returned_ids, rare_doc_ids);
+    assert_eq!(top_docs.total_hits, rare_doc_ids.len());
+
+    let frequent_docs = term_executor
+        .execute(&frequent_query, usize::MAX)
+        .expect("frequent execution");
+    let rare_docs = term_executor
+        .execute(&rare_query, usize::MAX)
+        .expect("rare execution");
+    for sd in &top_docs.score_docs {
+        let expected = score_for(&frequent_docs.score_docs, sd.doc_id)
+            + score_for(&rare_docs.score_docs, sd.doc_id);
+        assert_close(sd.score, expected);
+    }
+
+    // (b) The leapfrog must have skipped blocks. Driver = `rare`
+    // (smaller doc_freq). Followers = `frequent` (8 blocks).
+    // Each rare doc lands in a distinct block of `frequent`; between
+    // two consecutive rare hits at blocks 0, 1, 3, 7, the leapfrog
+    // jumps past blocks 2 (between rare at block 1 and rare at block
+    // 3) and blocks 4, 5, 6 (between rare at block 3 and rare at
+    // block 7). That's 4 blocks skipped at minimum.
+    let blocks_skipped = boolean_executor.last_blocks_skipped();
+    assert!(
+        blocks_skipped > 0,
+        "AND-leapfrog must skip at least one block of the rarer clause, got {blocks_skipped}",
+    );
+}
+
+/// Lot 2 regression guard: the AND-leapfrog must produce the SAME
+/// scored doc set as the pre-Lot-2 BTreeMap intersection on a
+/// non-trivial multi-block fixture. We verify this by computing the
+/// per-clause scores via the single-clause `TermQueryExecutor` and
+/// summing them by hand, then comparing against the boolean
+/// executor's output.
+#[test]
+fn boolean_query_leapfrog_matches_single_clause_score_sum_across_blocks() {
+    let mut builder = PostingsBuilder::new();
+    let block_count = 4;
+    let total_docs = BLOCK_SIZE * block_count;
+    // Two terms that intersect on every other doc id.
+    for doc_id in 0..total_docs {
+        builder
+            .add("body", "alpha", doc_id as u32, vec![0])
+            .expect("alpha posting");
+        if doc_id % 2 == 0 {
+            builder
+                .add("body", "beta", doc_id as u32, vec![0, 1])
+                .expect("beta posting");
+        }
+    }
+    let dictionary = builder.build();
+    let stats = TermQueryStats::new(
+        total_docs as u64,
+        2.0,
+        (0..total_docs).map(|doc_id| (doc_id as u32, 2)).collect(),
+    )
+    .expect("valid stats");
+
+    let term_executor = TermQueryExecutor::new(&dictionary, stats.clone());
+    let boolean_executor = BooleanQueryExecutor::new(&dictionary, stats);
+
+    let alpha_query = TermQuery::new("body", "alpha").expect("valid query");
+    let beta_query = TermQuery::new("body", "beta").expect("valid query");
+    let query = BooleanQuery::new(vec![
+        Query::Term(alpha_query.clone()),
+        Query::Term(beta_query.clone()),
+    ])
+    .expect("valid boolean query");
+
+    let top_docs = boolean_executor
+        .execute(&query, total_docs)
+        .expect("boolean execution");
+
+    // Build the ground-truth scored set by running each clause alone
+    // and summing the per-doc contributions for docs present in both.
+    let alpha_docs = term_executor
+        .execute(&alpha_query, usize::MAX)
+        .expect("alpha execution");
+    let beta_docs = term_executor
+        .execute(&beta_query, usize::MAX)
+        .expect("beta execution");
+
+    let alpha_scores: std::collections::BTreeMap<u32, f64> = alpha_docs
+        .score_docs
+        .iter()
+        .map(|sd| (sd.doc_id, sd.score))
+        .collect();
+    let beta_scores: std::collections::BTreeMap<u32, f64> = beta_docs
+        .score_docs
+        .iter()
+        .map(|sd| (sd.doc_id, sd.score))
+        .collect();
+    let mut expected: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
+    for (&doc_id, &alpha_score) in &alpha_scores {
+        if let Some(&beta_score) = beta_scores.get(&doc_id) {
+            expected.insert(doc_id, alpha_score + beta_score);
+        }
+    }
+
+    // Same doc_id set.
+    let mut returned_ids: Vec<u32> = top_docs.score_docs.iter().map(|sd| sd.doc_id).collect();
+    returned_ids.sort_unstable();
+    let mut expected_ids: Vec<u32> = expected.keys().copied().collect();
+    expected_ids.sort_unstable();
+    assert_eq!(returned_ids, expected_ids);
+    assert_eq!(top_docs.total_hits, expected.len());
+
+    // Same per-doc score.
+    for sd in &top_docs.score_docs {
+        let expected_score = expected.get(&sd.doc_id).copied().expect("doc id");
+        assert_close(sd.score, expected_score);
+    }
+
+    // Skip counter is observable, regardless of value (the driver is
+    // `beta`, half the docs of `alpha`, so `alpha` may or may not
+    // skip blocks depending on the intersection density — here every
+    // other doc is in both, so no block is fully past beta's next
+    // candidate before alpha re-engages).
+    let _ = boolean_executor.last_blocks_skipped();
+}

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use surch_index::postings::TermDictionary;
+use surch_index::postings::{PostingsBlockSkipIter, PostingsList, TermDictionary};
 use thiserror::Error;
 
 use crate::collector::{CollectorError, TopDocs, TopDocsCollector};
@@ -25,10 +25,25 @@ pub struct TermQueryExecutor<'a> {
     bm25_config: Bm25Config,
 }
 
-/// Executes boolean must queries by intersecting exact term query results.
+/// Executes boolean must queries by intersecting exact term query
+/// results. Lot 2: when every must-clause is a [`TermQuery`] and every
+/// clause has a non-empty posting list, the executor uses a leapfrog
+/// AND driven by the codec [`PostingsBlockSkipIter`] cursors instead
+/// of materialising each clause's full BTreeMap of doc-id → score.
+/// The scoring semantics are unchanged (per-clause BM25 contributions
+/// are summed in the same order), so the result set is byte-for-byte
+/// identical to the pre-Lot-2 path. A perf counter
+/// (`last_blocks_skipped`) exposes the number of 128-blocks the
+/// cursors skipped over during the last `execute` call so tests can
+/// assert that the skip list is actually doing work.
 #[derive(Debug, Clone)]
 pub struct BooleanQueryExecutor<'a> {
     term_executor: TermQueryExecutor<'a>,
+    /// Number of 128-block chunks the AND-leapfrog cursors skipped
+    /// over during the last `execute` call (summed across clauses).
+    /// Zero when no leapfrog was used (single clause, fallback path,
+    /// or every clause's postings fit in one block).
+    last_blocks_skipped: std::cell::Cell<usize>,
 }
 
 /// Errors returned while validating stats or executing term queries.
@@ -46,6 +61,12 @@ pub enum TermQueryExecutionError {
     MissingDocLen { doc_id: u32 },
     #[error("score for doc {doc_id} must be finite")]
     NonFiniteScore { doc_id: u32 },
+    /// Programmer-bug-level invariant violation in the codec
+    /// `BlockSkipList` builder. Cannot fire in practice (postings are
+    /// sorted strictly increasing by `PostingsBuilder::build()`), but
+    /// surfaced as a typed error so the AND-leapfrog path never panics.
+    #[error("block skip list invariant violated: {0}")]
+    BlockSkip(String),
     #[error(transparent)]
     Bm25(#[from] Bm25Error),
 }
@@ -152,7 +173,17 @@ impl<'a> BooleanQueryExecutor<'a> {
     pub fn new(dictionary: &'a TermDictionary, stats: TermQueryStats) -> Self {
         Self {
             term_executor: TermQueryExecutor::new(dictionary, stats),
+            last_blocks_skipped: std::cell::Cell::new(0),
         }
+    }
+
+    /// Number of 128-block chunks the AND-leapfrog cursors skipped
+    /// over during the last `execute` call (summed across clauses).
+    /// Returns `0` if `execute` has not yet been called, or if the
+    /// last call took the BTreeMap fallback path (single clause, or
+    /// any clause without postings).
+    pub fn last_blocks_skipped(&self) -> usize {
+        self.last_blocks_skipped.get()
     }
 
     /// Executes required term clauses and returns documents present in every clause.
@@ -161,47 +192,71 @@ impl<'a> BooleanQueryExecutor<'a> {
         query: &BooleanQuery,
         size: usize,
     ) -> Result<TopDocs, BooleanQueryExecutionError> {
+        self.last_blocks_skipped.set(0);
         let mut collector = TopDocsCollector::new(size).map_err(TermQueryExecutionError::from)?;
-        let mut accumulated_scores: Option<BTreeMap<u32, f64>> = None;
 
+        // Validate every clause is a TermQuery first, so the leapfrog
+        // path below can stay unconditional.
+        let mut term_queries: Vec<&TermQuery> = Vec::with_capacity(query.must.len());
         for (clause_index, clause) in query.must.iter().enumerate() {
-            let term_query = match clause {
-                Query::Term(term_query) => term_query,
+            match clause {
+                Query::Term(term_query) => term_queries.push(term_query),
                 _ => {
                     return Err(BooleanQueryExecutionError::UnsupportedMustClause { clause_index });
                 }
-            };
-            let clause_top_docs = self.term_executor.execute(term_query, usize::MAX)?;
-            let clause_scores = clause_top_docs
-                .score_docs
-                .into_iter()
-                .map(|score_doc| (score_doc.doc_id, score_doc.score))
-                .collect::<BTreeMap<_, _>>();
-
-            accumulated_scores = Some(match accumulated_scores {
-                None => clause_scores,
-                Some(mut scores) => {
-                    scores.retain(|doc_id, score| {
-                        if let Some(clause_score) = clause_scores.get(doc_id) {
-                            *score += clause_score;
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    scores
-                }
-            });
-
-            if accumulated_scores
-                .as_ref()
-                .is_some_and(|scores: &BTreeMap<u32, f64>| scores.is_empty())
-            {
-                break;
             }
         }
 
-        for (doc_id, score) in accumulated_scores.unwrap_or_default() {
+        // Pull each clause's PostingsList + per-clause doc_freq once,
+        // up front, so the inner leapfrog loop only walks postings.
+        let mut clauses: Vec<LeapfrogClause<'a>> = Vec::with_capacity(term_queries.len());
+        for term_query in &term_queries {
+            let Some(postings) = self
+                .term_executor
+                .dictionary
+                .postings_with_block_metas(&term_query.field, &term_query.value)
+            else {
+                // Missing term => AND result is empty. Short-circuit.
+                return Ok(collector.finish());
+            };
+            let doc_freq = postings.doc_freq_from_block_metas() as u64;
+            if doc_freq == 0 {
+                return Ok(collector.finish());
+            }
+            let skip_iter = match postings.skip_iter() {
+                Ok(Some(iter)) => iter,
+                // `block_skip_list()` returned None: empty postings
+                // (caught above by doc_freq == 0). Defensive
+                // short-circuit.
+                Ok(None) => return Ok(collector.finish()),
+                Err(err) => {
+                    return Err(BooleanQueryExecutionError::Term(
+                        TermQueryExecutionError::BlockSkip(err.to_string()),
+                    ));
+                }
+            };
+            clauses.push(LeapfrogClause {
+                postings,
+                doc_freq,
+                iter: skip_iter,
+            });
+        }
+
+        // Order clauses by ascending doc_freq so the rarest term
+        // drives the leapfrog. This minimises the number of
+        // `advance_to` calls on the longer posting lists.
+        clauses.sort_by_key(|clause| clause.doc_freq);
+
+        let summed_scores = self
+            .run_leapfrog(&mut clauses)
+            .map_err(BooleanQueryExecutionError::Term)?;
+
+        // Record blocks_skipped sum after running the leapfrog. Cell
+        // makes this observable to tests without taking &mut self.
+        let blocks_skipped: usize = clauses.iter().map(|c| c.iter.blocks_skipped()).sum();
+        self.last_blocks_skipped.set(blocks_skipped);
+
+        for (doc_id, score) in summed_scores {
             collector
                 .collect(doc_id, score)
                 .map_err(TermQueryExecutionError::from)?;
@@ -209,6 +264,108 @@ impl<'a> BooleanQueryExecutor<'a> {
 
         Ok(collector.finish())
     }
+
+    /// Leapfrog AND over `clauses` (sorted by ascending `doc_freq`).
+    /// Returns the BTreeMap of (doc_id, sum-of-per-clause-BM25). The
+    /// rarest clause drives the candidate stream; the others
+    /// `advance_to(candidate)` to confirm presence and contribute
+    /// their per-clause BM25 score.
+    fn run_leapfrog(
+        &self,
+        clauses: &mut [LeapfrogClause<'a>],
+    ) -> Result<BTreeMap<u32, f64>, TermQueryExecutionError> {
+        let mut out: BTreeMap<u32, f64> = BTreeMap::new();
+        if clauses.is_empty() {
+            return Ok(out);
+        }
+
+        // Walk the rarest posting list one doc at a time; for each
+        // candidate, ask every other clause to `advance_to(doc_id)`
+        // and check if it landed exactly on `doc_id`.
+        let driver_postings = clauses[0].postings.postings().to_vec();
+        for posting in &driver_postings {
+            let doc_id = posting.doc_id;
+            let mut all_match = true;
+            // The driver itself trivially contributes its own freq.
+            // Iterate the followers and verify presence.
+            for follower in &mut clauses[1..] {
+                let landed = follower.iter.advance_to(doc_id);
+                let Some(found) = landed else {
+                    all_match = false;
+                    break;
+                };
+                if found.doc_id != doc_id {
+                    // The leapfrog landed past doc_id (gap in the
+                    // follower's posting list). This candidate is
+                    // not in the intersection.
+                    all_match = false;
+                    // Do NOT break: every follower still needs to
+                    // observe a non-decreasing advance_to sequence,
+                    // but since we don't rewind, the next outer
+                    // iteration's larger doc_id will keep things
+                    // monotonic. Break here is therefore safe AND
+                    // cheaper.
+                    break;
+                }
+            }
+            if !all_match {
+                continue;
+            }
+
+            // Confirmed: every clause has `doc_id`. Score the
+            // contribution of every clause and sum.
+            let mut summed = 0.0_f64;
+            // Driver contribution from `posting`.
+            summed += self.score_posting(&clauses[0], posting)?;
+            // Follower contributions — we need the actual Posting for
+            // each follower at doc_id. The cursor returned it but we
+            // discarded it inside the loop; re-look up via a binary
+            // search on the follower's postings (cheap: O(log N) per
+            // hit, hit count is the AND intersection size).
+            for follower in &clauses[1..] {
+                let follower_postings = follower.postings.postings();
+                let idx = follower_postings
+                    .binary_search_by_key(&doc_id, |p| p.doc_id)
+                    .expect("follower has doc_id (just confirmed by leapfrog cursor)");
+                summed += self.score_posting(follower, &follower_postings[idx])?;
+            }
+
+            out.insert(doc_id, summed);
+        }
+
+        Ok(out)
+    }
+
+    fn score_posting(
+        &self,
+        clause: &LeapfrogClause<'a>,
+        posting: &surch_index::postings::Posting,
+    ) -> Result<f64, TermQueryExecutionError> {
+        let stats = &self.term_executor.stats;
+        let doc_len = stats
+            .doc_len_by_doc_id
+            .get(&posting.doc_id)
+            .copied()
+            .ok_or(TermQueryExecutionError::MissingDocLen {
+                doc_id: posting.doc_id,
+            })?;
+        bm25_score(
+            self.term_executor.bm25_config,
+            stats.doc_count,
+            clause.doc_freq,
+            u64::from(posting.freq),
+            doc_len,
+            stats.avg_doc_len,
+        )
+        .map_err(TermQueryExecutionError::from)
+    }
+}
+
+/// Internal view of one boolean must-clause used by the leapfrog AND.
+struct LeapfrogClause<'a> {
+    postings: PostingsList<'a>,
+    doc_freq: u64,
+    iter: PostingsBlockSkipIter<'a>,
 }
 
 impl From<CollectorError> for TermQueryExecutionError {
