@@ -228,9 +228,10 @@ Reste estime: 0% (Lot 4 closed; bonus paired-RSS replay closed via
 
 ## Track C - Ops / Packaging / Snapshots
 
-Reste estime: ~8% (1 leaf / 13 leaf tasks). Lots 1-3 closed on
-`main`; only Lot 4 (release verification reproducible from CI
-artefacts) remains, kept in backlog without a committed timeline.
+Reste estime: 0% (Lots 1-4 closed on `main`). Lot 4 (`75a7b35`)
+ships `scripts/verify-release.sh` and `docs/ops/release-verification.md`
+to replay signing + SBOM + image GHCR verification fail-closed
+from a release tag.
 
 - [x] Docker, Helm, release, signing, and SBOM work landed.
 - [x] Snapshot and SLM work started on `wp/c-ops`.
@@ -266,7 +267,10 @@ artefacts) remains, kept in backlog without a committed timeline.
     an existing live index with `400 snapshot_exception` and an explicit
     `already exists` reason.
 - [x] Finish remaining SLM retention behavior beyond `max_count`.
-- [ ] Keep release verification reproducible from CI artefacts.
+- [x] Release verification reproducible from CI artefacts: `75a7b35`
+  ships `scripts/verify-release.sh` (tag-driven, fail-closed) and
+  `docs/ops/release-verification.md` covering sha256 + minisign +
+  cosign + SBOM CycloneDX + image GHCR runtime/bench.
 - [x] Preserve a minimal path to inspect failing snapshot runs.
 
 ## Track D - matchID
@@ -427,7 +431,10 @@ run promoted as
   without quality regression.
 - [ ] Track B finality: replayable, comparable benchmark reporting with
   explicit SLO verdicts.
-- [ ] Track C finality: release and snapshot paths verified end to end.
+- [x] Track C finality: release and snapshot paths verified end to
+  end. Release verifier `scripts/verify-release.sh` shipped in
+  `75a7b35`; snapshot REST + SLM retention + S3/MinIO restore
+  e2e all on `main`.
 - [ ] Track D finality: matchID parity proven against Elasticsearch 8.6.1,
   not only Surch HEAD.
 - [ ] Track E finality: `ci-k8s` is a reliable heavy-benchmark target
