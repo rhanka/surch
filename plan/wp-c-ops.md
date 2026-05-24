@@ -4,9 +4,11 @@ Track principal: C - ops / packaging / snapshots
 Branch: `wp/c-ops`
 Worktree: `.worktrees/wp-c`
 Owner: conductor / APIServer / StorageEngine depending on slice
-Status: Lots 1-3 closed on `main`; only Lot 4 (release verification
-reproducible from CI artefacts) remains, kept in backlog without a
-committed timeline. Long branch head `2625edd` kept for history.
+Status: Lots 1-4 closed on `main`. Lot 4 ships
+`scripts/verify-release.sh <tag>` (full mode, fail-closed) +
+`docs/ops/release-verification.md` (commands, expected output,
+troubleshooting, failing-run inspection). Long branch head `2625edd`
+kept for history.
 
 ## Finality
 
@@ -101,10 +103,23 @@ committed timeline. Long branch head `2625edd` kept for history.
     test is opt-in by default after GitHub run `26193965044` proved the
     testcontainer startup path could leave `cargo test` open-ended.
 
-- [ ] Lot 4 - Release verification
-  - [ ] Reproduce release verification from CI artefacts.
-  - [ ] Record signing/SBOM verification commands and outputs.
-  - [ ] Keep failing-run inspection path documented.
+- [x] Lot 4 - Release verification
+  - [x] Reproduce release verification from CI artefacts —
+    `scripts/verify-release.sh <tag>` now drives the full surface
+    (inventory, download, sha256, minisign, SBOM, cosign signature,
+    cosign CycloneDX attestation, bench image pullability). The
+    legacy `<image-ref>` mode is preserved.
+  - [x] Record signing/SBOM verification commands and outputs —
+    `docs/ops/release-verification.md` documents both modes, the
+    expected stdout, exit codes (0/1/2/3 fail-closed), the per-step
+    dependencies (`gh`, `minisign`, `cosign>=2.4`, `docker`, `jq`,
+    `sha256sum`), env overrides (`SURCH_REPO`, `SURCH_IMAGE`,
+    `SURCH_PUBKEY`, `SURCH_WORKDIR`, `COSIGN_CERT_*`) and the offline
+    reproduction recipe.
+  - [x] Keep failing-run inspection path documented — `gh run list /
+    view --log-failed / download` walkthrough is in the same doc, with
+    the cosign-version pitfall, the surch.pub rotation path, and the
+    bench-image edge case (unsigned by design).
 
 - [ ] Lot N - Closure
   - [x] Update this plan and `PLAN.md` for SLM expire-after retention.

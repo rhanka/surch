@@ -200,10 +200,21 @@ tag and bound to the OCI image:
    sign` signature. End users verify both with `cosign verify` +
    `cosign verify-attestation --type cyclonedx`.
 
-A helper script `scripts/verify-release.sh <image-ref>` runs both
-checks for downstream consumers and prints the top 5 dependencies
-extracted from the verified SBOM payload. Locally, contributors can
-generate the same SBOM offline via `make sbom`.
+A helper script `scripts/verify-release.sh` runs the verification
+checks for downstream consumers. It supports two modes:
+
+- `scripts/verify-release.sh <tag>` (e.g. `v0.1.0`) — full release
+  verification (asset inventory, sha256, minisign, CycloneDX SBOM,
+  cosign signature, cosign attestation, bench image pullability),
+  fail-closed.
+- `scripts/verify-release.sh <image-ref>` — legacy image-only mode
+  (cosign verify + verify-attestation, prints the top 5 SBOM
+  components).
+
+Full usage, expected output, environment overrides and failing-run
+inspection paths live in
+[`docs/ops/release-verification.md`](release-verification.md). Locally,
+contributors can generate the same SBOM offline via `make sbom`.
 
 SPDX support is on the Phase D backlog; CycloneDX is the format
 required by most enterprise procurement flows today, so it is the
