@@ -59,6 +59,15 @@ struct InMemoryIndex {
     mapping: IndexMapping,
     settings: Value,
     index: DocumentIndex,
+    /// Track A `wp-a-perf-followups.md` Lot 1.5: the `_refresh`
+    /// handler drops the in-memory `PostingsBuilder` snapshot via
+    /// `DocumentIndex::finalize_postings()` to recover the ~1 GiB
+    /// it carries on long-text corpora (BEIR TREC-COVID 171 k
+    /// observed). Subsequent `append_to_index` calls cannot extend
+    /// a finalized term dictionary, so they fall back to a one-shot
+    /// `rebuild_index()` to preserve the previously-indexed
+    /// postings. The flag is reset by any rebuild or append.
+    terms_finalized: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -231,10 +240,11 @@ impl InMemoryIndex {
         let _ = self
             .index
             .add_documents_with_mapping(documents, &self.mapping);
-        // Surch always rebuilds from `documents` after a `clear()`, so the
-        // postings builder snapshot inside `DocumentIndex` is now dead
-        // weight (~150 MB on BAN Paris 25k). Drop it.
-        self.index.finalize_postings();
+        // Lot 1.5: keep the postings builder live across rebuilds. It is
+        // the source of truth for `append_to_index`, and `refresh_index`
+        // is now responsible for dropping it via `finalize_postings()`
+        // once the index is declared read-mostly.
+        self.terms_finalized = false;
     }
 
     /// Track A `wp-a-perf-followups.md` Lot 1: incremental append path
@@ -260,6 +270,16 @@ impl InMemoryIndex {
         if new_doc_ids.is_empty() {
             return;
         }
+        if self.terms_finalized {
+            // Lot 1.5: the `PostingsBuilder` snapshot was dropped by a
+            // previous `refresh_index`. We cannot extend a finalized
+            // term dictionary, so fall back to a one-shot full rebuild
+            // that re-populates the builder with every cumulative doc;
+            // subsequent appends within the same bulk batch run
+            // incrementally on top of the now-live builder.
+            self.rebuild_index();
+            return;
+        }
         let documents = new_doc_ids
             .iter()
             .filter_map(|&doc_id| {
@@ -271,6 +291,19 @@ impl InMemoryIndex {
         let _ = self
             .index
             .add_documents_with_mapping(documents, &self.mapping);
+    }
+
+    /// Track A `wp-a-perf-followups.md` Lot 1.5: free the in-memory
+    /// `PostingsBuilder` snapshot once the index is declared
+    /// read-mostly via `POST /:index/_refresh`. The next write on the
+    /// index falls back to `rebuild_index()` via `append_to_index`'s
+    /// finalized-state guard.
+    fn finalize_terms_for_refresh(&mut self) {
+        if self.terms_finalized {
+            return;
+        }
+        self.index.finalize_postings();
+        self.terms_finalized = true;
     }
 
     fn set_mapping(&mut self, mapping: IndexMapping) {
@@ -746,7 +779,28 @@ impl AppState {
         clear_memory_gauges(index);
     }
 
-    pub fn refresh_index(&self, _index: &str) {}
+    /// Track A `wp-a-perf-followups.md` Lot 1.5: drop the in-memory
+    /// `PostingsBuilder` snapshot on the named index so the long-text
+    /// bulk RAM overhead (~1 GiB observed on BEIR TREC-COVID) is
+    /// released once the caller stops writing. A subsequent
+    /// `_bulk`/single-doc write triggers a one-shot `rebuild_index()`
+    /// (via `IndexData::append_to_index`'s finalized-state guard) to
+    /// preserve the previously-indexed postings.
+    pub fn refresh_index(&self, index: &str) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if let Some(data) = store.indices.get_mut(index) {
+            data.finalize_terms_for_refresh();
+        }
+        drop(store);
+        // Match the post-bulk cache + gauge maintenance contract so a
+        // refresh that frees the builder is observable through the
+        // `surch_index_*` Prometheus gauges.
+        self.invalidate_search_cache(index);
+        refresh_memory_gauges(self, index);
+    }
 
     pub fn index_exists(&self, index: &str) -> bool {
         let store = self

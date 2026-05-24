@@ -333,6 +333,138 @@ async fn bulk_router_accumulates_across_multiple_chunks() {
     assert_eq!(by_id_body["docs"][0]["_source"]["title"], "uniqueterm5");
 }
 
+/// Guards Track A `wp-a-perf-followups.md` Lot 1.5: when a caller
+/// issues `_bulk` -> `_refresh` -> `_bulk` -> `_search`, the search
+/// must see BOTH the pre-refresh and post-refresh docs. The refresh
+/// drops the in-memory `PostingsBuilder` snapshot (recovers ~1 GiB
+/// on long-text corpora), so the second bulk falls back to a
+/// one-shot full rebuild that re-includes the earlier docs.
+#[tokio::test]
+async fn bulk_router_bulk_refresh_bulk_search_preserves_old_docs() {
+    let router = app_router();
+
+    // First batch: 3 docs.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"a1"}}
+{"title":"alphaone"}
+{"index":{"_id":"a2"}}
+{"title":"alphatwo"}
+{"index":{"_id":"a3"}}
+{"title":"alphathree"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Refresh: drops the PostingsBuilder snapshot.
+    let refresh = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_refresh")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(refresh.status(), StatusCode::OK);
+
+    // Second batch: 2 fresh docs after refresh.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"b1"}}
+{"title":"betaone"}
+{"index":{"_id":"b2"}}
+{"title":"betatwo"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // match_all sees both batches (cumulative).
+    let search = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match_all":{}},"size":20}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = response_json(search).await;
+    assert_eq!(
+        body["hits"]["total"]["value"].as_u64(),
+        Some(5),
+        "cumulative match_all must see pre-refresh + post-refresh docs"
+    );
+
+    // Targeted search for a pre-refresh term: postings must still be
+    // present after the post-refresh rebuild.
+    let pre_refresh = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match":{"title":"alphatwo"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let pre_body = response_json(pre_refresh).await;
+    assert_eq!(
+        pre_body["hits"]["total"]["value"].as_u64(),
+        Some(1),
+        "pre-refresh unique term must survive the second bulk"
+    );
+    assert_eq!(pre_body["hits"]["hits"][0]["_id"], "a2");
+
+    // Targeted search for a post-refresh term too.
+    let post_refresh = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"match":{"title":"betaone"}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let post_body = response_json(post_refresh).await;
+    assert_eq!(
+        post_body["hits"]["total"]["value"].as_u64(),
+        Some(1),
+        "post-refresh unique term must be searchable"
+    );
+    assert_eq!(post_body["hits"]["hits"][0]["_id"], "b1");
+}
+
 #[tokio::test]
 async fn bulk_router_rejects_non_object_source_with_parse_error() {
     let response = app_router()
