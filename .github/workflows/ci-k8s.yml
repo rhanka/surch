@@ -214,8 +214,31 @@ jobs:
               kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
               exit 1
             fi
-            if printf '%s\n' "$pod_states" | grep -Eq '(^|[;,])exit=([1-9][0-9]*)([;,]|$)'; then
-              echo "::error::Kubernetes pod for Job $JOB_NAME has a container with non-zero exit code."
+            # Treat any container exit code other than 0 or 143 as a
+            # real failure. exit=143 (SIGTERM) is the kubelet asking
+            # the restartable init container sidecars (Surch,
+            # OpenSearch) to stop once the driver finishes; the Job
+            # condition reaches Complete=True shortly after and the
+            # early `Complete=True` check at the top of the loop
+            # picks it up on the next tick. Real crashes still
+            # surface via exit codes 1, 2, 137 (OOMKilled), …
+            if printf '%s\n' "$pod_states" | awk '
+              BEGIN { fail = 0 }
+              {
+                n = split($0, fields, /[;,]/)
+                for (i = 1; i <= n; i++) {
+                  f = fields[i]
+                  if (substr(f, 1, 5) == "exit=") {
+                    code = substr(f, 6) + 0
+                    if (substr(f, 6) != "" && code != 0 && code != 143) {
+                      fail = 1
+                    }
+                  }
+                }
+              }
+              END { exit fail ? 0 : 1 }
+            '; then
+              echo "::error::Kubernetes pod for Job $JOB_NAME has a container with non-zero non-SIGTERM exit code."
               kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true
               kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
               exit 1
