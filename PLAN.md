@@ -63,10 +63,10 @@ single-threaded status loops advanced too little per user turn.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~20% (Lot 1 closed by `367acdc` /
-`docs/ops/bench-reports/2026-05-24-ndcg-gate-incremental-bulk-K8s/`;
-5 follow-up leaves remain across new Lots 1.5/1.6/2/3/4 in
-`plan/wp-a-perf-followups.md`).
+Reste estime: ~17% (Lots 1 and 1.5 closed; Lot 1.7 newly opened
+for the allocator-side RAM follow-up after Lot 1.5 recovered only
+`268 MiB` out of the `~1 GiB` logically freed. 5 follow-up leaves
+remain across Lots 1.6/1.7/2/3/4 in `plan/wp-a-perf-followups.md`).
 
 Lot 3 paired K8s perf-proof shows Surch hot path -21/-22/-12/-30 %
 p50/p95/p99/max vs pre-FoR `c01b0a2`; runbook + numbers under
@@ -108,14 +108,19 @@ historical replay line lives in
   `docs/ops/bench-reports/2026-05-24-ndcg-gate-incremental-bulk-K8s/`,
   Surch TREC-COVID bulk `1001.95 s -> 179.86 s` (`~5.6x` speedup),
   Surch/OpenSearch ratio `13.9x slower -> 2.06x slower`.
-- [ ] Follow-up Lot 1.5 — free the live `PostingsBuilder`
-  snapshot on `_refresh` (recovers `~1 GiB` of Surch RSS observed
-  in the 2026-05-24 promo). Details in
-  `plan/wp-a-perf-followups.md`.
+- [x] Follow-up Lot 1.5 closed by `8a5150f` / promoted as
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.5-ram-K8s/`.
+  `_refresh` drops the live `PostingsBuilder`; logical free works
+  but system RSS recovers only `268 MiB` (`5859 -> 5591 MiB`) due
+  to glibc default allocator inertia — addressed by new Lot 1.7.
 - [ ] Follow-up Lot 1.6 — incremental term dictionary build (next
-  bulk attack; explains `~95%` of the residual `2.06x` Surch/OS
+  bulk attack; explains `~95%` of the residual `~2x` Surch/OS
   TREC-COVID bulk gap). Details in
   `plan/wp-a-perf-followups.md`.
+- [ ] Follow-up Lot 1.7 — allocator memory return after
+  `_refresh`. Pick between `malloc_trim(0)` (smallest) and a
+  jemalloc switch. Expected effect: Surch RSS peak drops from
+  `5591 MiB` toward `~4800 MiB`.
 - [ ] Follow-up Lot 2 — Skip lists on top of the codec FoR path
   (`plan/wp-a-perf-followups.md`).
 - [ ] Follow-up Lot 3 — Next Block-Max WAND step on encoded block

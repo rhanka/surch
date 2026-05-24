@@ -151,23 +151,51 @@ incremental `append_to_index` calls. Once the index is declared
 read-mostly (via `POST /:index/_refresh`), the snapshot is dead
 weight and can be dropped.
 
-- [ ] Make `AppState::refresh_index` (currently a no-op at
+- [x] Made `AppState::refresh_index` (was a no-op at
   `crates/surch-api/src/state.rs:713`) call
-  `DocumentIndex::finalize_postings()` to drop the builder.
-- [ ] Track per-`IndexData` finalize state with a `terms_finalized:
-  bool` flag.
-- [ ] In `append_to_index`, if `terms_finalized` is true, fall back
-  to a one-shot `rebuild_index()` before appending so a
-  bulk-after-refresh request preserves old terms.
-- [ ] Remove the unconditional `finalize_postings()` from
+  `IndexData::finalize_terms_for_refresh` which drops the
+  `PostingsBuilder` via `DocumentIndex::finalize_postings()`.
+- [x] Added `terms_finalized: bool` on `InMemoryIndex` to track the
+  post-refresh state.
+- [x] `IndexData::append_to_index` falls back to a one-shot
+  `rebuild_index()` if `terms_finalized` is true, so a
+  bulk-after-refresh preserves previously-indexed postings.
+- [x] Removed the unconditional `finalize_postings()` from
   `rebuild_index()`: post-Lot-1 the builder is the source of truth
-  for further incremental appends; only `refresh_index` should
-  finalize.
-- [ ] New tests: bulk → refresh → search reads correctly; bulk →
-  refresh → bulk → search reads both old and new docs.
-- [ ] Re-run K8s `ndcg-gate` and promote the result; Track A ledger
-  `RSS / memory` row updated with the new Surch peak (expected
-  back near `4802 MiB`).
+  for further appends; only `refresh_index` finalizes.
+- [x] Test `bulk_router_bulk_refresh_bulk_search_preserves_old_docs`
+  in `crates/surch-api/tests/bulk_router.rs` covers the fallback.
+- [x] K8s `ndcg-gate` run `26359069219` on `01ad77e` promoted as
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.5-ram-K8s/`.
+  Surch RSS peak `5859 -> 5591 MiB` (`-268 MiB`), Lot 1 bulk gain
+  preserved, NDCG@10 unchanged.
+
+**Caveat**: the logical fix works (test passes; sampler shows the
+delta) but the system RSS gain is modest because glibc's default
+allocator keeps freed heap pages mapped without memory pressure.
+Recovering the full `~1 GiB` requires an orthogonal allocator-level
+follow-up (Lot 1.7).
+
+### Lot 1.7 — Allocator memory return after refresh
+
+Trigger: `2026-05-24-ndcg-gate-lot1.5-ram-K8s/` shows Lot 1.5
+recovers only `268 MiB` of the `~1057 MiB` logically freed by
+`finalize_postings()`. The remainder stays mapped in the glibc
+heap because the allocator does not call `madvise(MADV_DONTNEED)`
+without memory pressure. With the Surch sidecar's 7 GiB cap and
+the steady-state peak around 5.5 GiB, there is no pressure.
+
+- [ ] Option A: call `libc::malloc_trim(0)` from
+  `AppState::refresh_index` after `finalize_terms_for_refresh()`,
+  guarded by `#[cfg(target_env = "gnu")]`. Smallest patch (~10 LoC).
+- [ ] Option B: switch the Surch binary's global allocator to
+  `jemalloc` via `tikv-jemallocator` and configure aggressive purge
+  thresholds. Larger change but better long-tail behaviour for
+  long-running pods.
+- [ ] Re-run K8s `ndcg-gate` after the chosen option; expected
+  Surch RSS peak drops from `5591 MiB` toward the logical
+  `~4800 MiB` post-refresh.
+- [ ] Track A ledger `RSS / memory` row updated.
 
 ### Lot 1.6 — Incremental term dictionary build (next bulk attack)
 
