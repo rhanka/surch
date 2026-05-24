@@ -19,9 +19,12 @@ WORKDIR /usr/src/surch
 # Install minimal build deps. `pkg-config` and `libssl-dev` are needed by
 # transitive crates that may link against system OpenSSL during dependency
 # resolution; if Surch eventually switches every dep to rustls we can
-# drop these.
+# drop these. `build-essential` provides `make` + `gcc` required by
+# `tikv-jemalloc-sys` to compile the bundled jemalloc C sources for
+# Track A wp-a-perf-followups.md Lot 1.7.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
+      build-essential \
       pkg-config \
       libssl-dev \
       ca-certificates \
@@ -101,6 +104,15 @@ COPY --from=builder /usr/src/surch/target/release/surch-api /usr/local/bin/surch
 
 USER nonroot:nonroot
 EXPOSE 7700
-ENV SURCH_HOST=0.0.0.0 SURCH_PORT=7700 RUST_LOG=warn
+# `MALLOC_CONF` is read by the jemalloc global allocator wired in
+# `crates/surch-api/src/main.rs` (Track A wp-a-perf-followups.md
+# Lot 1.7): `background_thread:true` enables the async purge thread;
+# `dirty_decay_ms:0` and `muzzy_decay_ms:0` release freed pages to
+# the OS immediately instead of holding them in the heap arenas.
+# Together they let the post-`_refresh` `finalize_postings()` drop
+# show up in RSS within seconds, recovering the ~700 MiB that the
+# glibc default left mapped on the BEIR TREC-COVID 171 k workload.
+ENV SURCH_HOST=0.0.0.0 SURCH_PORT=7700 RUST_LOG=warn \
+    MALLOC_CONF=background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0
 
 ENTRYPOINT ["/usr/local/bin/surch-api"]

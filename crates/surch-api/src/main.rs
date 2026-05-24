@@ -1,5 +1,15 @@
 #![forbid(unsafe_code)]
 
+// Track A wp-a-perf-followups.md Lot 1.7: use jemalloc on Linux so
+// the heap returns freed pages to the OS aggressively (paired with
+// the MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0 in the runtime
+// Dockerfile). Eliminates the ~700 MiB of phantom Surch RSS that
+// the glibc default left mapped after `_refresh` finalized the
+// PostingsBuilder.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::{env, error::Error};
 
 const DEFAULT_HOST: &str = "127.0.0.1";

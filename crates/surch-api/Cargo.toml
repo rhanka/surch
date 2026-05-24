@@ -12,6 +12,17 @@ surch-analysis = { path = "../surch-analysis" }
 surch-index = { path = "../surch-index" }
 surch-search = { path = "../surch-search" }
 surch-types = { path = "../surch-types" }
+# Track A wp-a-perf-followups.md Lot 1.7: jemalloc returns freed
+# heap pages to the OS aggressively when paired with the
+# MALLOC_CONF tuning shipped in the Dockerfile (dirty_decay_ms=0,
+# muzzy_decay_ms=0). The glibc default keeps freed bulk
+# PostingsBuilder pages mapped without memory pressure (run
+# `26359069219`: only 268 MiB recovered out of ~1 GiB freed).
+# Linux-only because tikv-jemalloc-sys does not build on the
+# musl-on-distroless target reliably; the runtime image is
+# `gcr.io/distroless/cc-debian12` (glibc Linux), so this is safe.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
