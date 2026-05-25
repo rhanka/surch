@@ -121,8 +121,37 @@ Atouts méthodo déjà en place :
   citant les optims historiques comme "delivered, mesurées
   cumulativement, isolation déférée" ? Tant que non tranché, le draft
   F5 part sur les lots récents.
-- [ ] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
+- [~] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
   sweep de taille (optionnel pour un premier draft).
+  - [x] **Harness de latence grand corpus livré** : nouveau Job K8s
+    `deploy/k8s/jobs/trec-covid-latency.yaml` (calqué sur
+    `insee-bench.yaml`). Il amorce l'index `trec-covid` complet
+    (171 k docs) sur Surch (7Gi) ET OpenSearch (même enveloppe que
+    `ndcg-gate`, chunks _bulk pair-aware 8 MiB sous le cap 16 MiB),
+    construit un fichier de requêtes artillery à partir des requêtes
+    de test TREC-COVID (`queries.jsonl` filtré par les qids à qrel
+    positif, comme `trec-covid-ndcg.sh`), puis lance `artillery_bench`
+    contre Surch puis OpenSearch (profil de phases
+    `2:30,2:30,5:30,10:30,20:30,50:240`). Émet
+    `surch.bench.artillery.v1` (`art-surch.json` / `art-os.json`) +
+    échantillonnage RSS, mêmes marqueurs `BEGIN_SURCH_K8S_*` que
+    `insee-bench` pour que `bench_report` et le workflow `ci-k8s` les
+    reconstruisent. `artillery_bench` gagne un flag additif
+    `--query-mode insee|trec` (défaut `insee`, comportement inchangé) :
+    en mode `trec` chaque ligne du fichier `--names` est une requête
+    plein-texte, émise en `multi_match` sur `title`/`text` (alternance
+    OR par défaut / `operator:and`) — le régime qui exerce les longues
+    listes de postings / skip-lists que l'INSEE 10k n'atteint pas.
+    `ci-k8s.yml` : `trec-covid-latency` ajouté au choix `job`, au
+    contrôle d'image bench-driver, à `REPORT_FILES` et à la
+    reconstruction des logs (branche calquée sur `insee-bench`).
+    **Dispatch** : `gh workflow run ci-k8s.yml -R rhanka/surch -r
+    <branch> -f job=trec-covid-latency` (nécessite l'image
+    `bench-sha-<SHA>` construite via `docker-build.yml` + le nœud
+    DEV1-XL + ResourceQuota `limits.memory>=10Gi`). Validation CI/K8s
+    (pas de build/test lourd local).
+  - [ ] Reste F4 : BEIR multi-datasets (NFCorpus, FiQA…) + sweep de
+    taille de corpus (courbe de scaling bulk).
 - [~] **F5 — Draft de l'article** : premier draft livré
   `docs/paper/draft.md` (abstract, méthodo, séquence bulk Lot 1→1.6,
   mémoire, latence, qualité, parité matchID, discussion, limitations,

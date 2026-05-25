@@ -26,13 +26,14 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "Job manifest to run (ndcg-gate | insee-bench | b1-oracle-gate | 00-init-corpora)"
+        description: "Job manifest to run (ndcg-gate | insee-bench | trec-covid-latency | b1-oracle-gate | 00-init-corpora)"
         required: true
         default: "ndcg-gate"
         type: choice
         options:
           - ndcg-gate
           - insee-bench
+          - trec-covid-latency
           - b1-oracle-gate
           - 00-init-corpora
 
@@ -85,7 +86,7 @@ jobs:
           }
           check_image_tag "$IMAGE_TAG" "runtime"
           case "${{ inputs.job }}" in
-            ndcg-gate|insee-bench|b1-oracle-gate)
+            ndcg-gate|insee-bench|trec-covid-latency|b1-oracle-gate)
               check_image_tag "bench-${IMAGE_TAG}" "bench driver"
               ;;
           esac
@@ -306,6 +307,10 @@ jobs:
               REPORT_CONTAINER="artillery-runner"
               REPORT_FILES="summary.md art-surch.json art-os.json rss-art-surch.json rss-art-os.json"
               ;;
+            trec-covid-latency)
+              REPORT_CONTAINER="artillery-runner"
+              REPORT_FILES="summary.md art-surch.json art-os.json rss-art-surch.json rss-art-os.json"
+              ;;
             b1-oracle-gate)
               REPORT_CONTAINER="b1-oracle-driver"
               REPORT_FILES="b1-oracle.json"
@@ -402,6 +407,24 @@ jobs:
                 rss-ndcg-surch.json rss-ndcg-os.json
               ;;
             insee-bench)
+              SUMMARY_FILE="$OUT_DIR/${{ inputs.job }}.summary.md"
+              DRIVER_LOG="$(ls "$OUT_DIR"/*.artillery-runner.log 2>/dev/null | head -n 1 || true)"
+              if [ ! -s "$SUMMARY_FILE" ] && [ -n "$DRIVER_LOG" ]; then
+                awk '
+                  /^BEGIN_SURCH_K8S_SUMMARY$/ { capture=1; next }
+                  /^END_SURCH_K8S_SUMMARY$/ { capture=0 }
+                  capture { print }
+                ' "$DRIVER_LOG" > "$SUMMARY_FILE.tmp" || true
+                if [ -s "$SUMMARY_FILE.tmp" ]; then
+                  mv "$SUMMARY_FILE.tmp" "$SUMMARY_FILE"
+                else
+                  rm -f "$SUMMARY_FILE.tmp"
+                fi
+              fi
+              reconstruct_rss_from_log "$DRIVER_LOG" \
+                rss-art-surch.json rss-art-os.json
+              ;;
+            trec-covid-latency)
               SUMMARY_FILE="$OUT_DIR/${{ inputs.job }}.summary.md"
               DRIVER_LOG="$(ls "$OUT_DIR"/*.artillery-runner.log 2>/dev/null | head -n 1 || true)"
               if [ ! -s "$SUMMARY_FILE" ] && [ -n "$DRIVER_LOG" ]; then
