@@ -1,0 +1,340 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"batch/v1","kind":"Job","metadata":{"annotations":{},"labels":{"app.kubernetes.io/component":"insee-bench","app.kubernetes.io/name":"surch","app.kubernetes.io/part-of":"surch-ci"},"name":"insee-bench","namespace":"surch"},"spec":{"activeDeadlineSeconds":1800,"backoffLimit":0,"template":{"metadata":{"labels":{"app.kubernetes.io/component":"insee-bench","app.kubernetes.io/name":"surch","app.kubernetes.io/part-of":"surch-ci"}},"spec":{"containers":[{"args":["set -eu\necho \"Waiting for both engines...\"\nuntil wget -qO- \"$SURCH_URL/\" \u003e/dev/null 2\u003e\u00261; do sleep 0.5; done\nuntil wget -qO- \"$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow\u0026timeout=60s\" \u003e/dev/null 2\u003e\u00261; do sleep 1; done\nmkdir -p \"$REPORTS_DIR\"\nRSS_SAMPLE_SECONDS=\"${RSS_SAMPLE_SECONDS:-420}\"\n# shareProcessNamespace=true exposes sibling container PIDs\n# in /proc; the bench-driver image is procps-less so we scan\n# /proc/\u003cpid\u003e/cmdline directly. We match the basename of\n# argv[0] (not the whole cmdline) to avoid false positives on\n# the driver `sh -c \"\u003cscript\u003e\"` whose cmdline embeds the\n# script body. An optional content substring is required when\n# the engine binary is generic (e.g. `java` for OpenSearch).\nstart_rss_sample() {\n  label=\"$1\"\n  binary=\"$2\"\n  content=\"$3\"\n  output=\"$4\"\n  pid_file=\"$5\"\n  pid=\"\"\n  for d in /proc/[0-9]*; do\n    [ -r \"$d/cmdline\" ] || continue\n    argv0=\"$(tr '\\0' '\\n' \u003c \"$d/cmdline\" 2\u003e/dev/null | head -n 1)\"\n    [ -n \"$argv0\" ] || continue\n    case \"${argv0##*/}\" in\n      \"$binary\") ;;\n      *) continue ;;\n    esac\n    if [ -n \"$content\" ]; then\n      tr '\\0' ' ' \u003c \"$d/cmdline\" 2\u003e/dev/null | grep -q \"$content\" || continue\n    fi\n    pid=\"${d#/proc/}\"\n    break\n  done\n  if [ -z \"$pid\" ]; then\n    echo \"WARN: cannot start RSS sample for $label (binary: $binary, content: $content)\"\n    return 0\n  fi\n  /usr/local/bin/rss-sample.sh \"$pid\" \"$RSS_SAMPLE_SECONDS\" \"$output\" \\\n    \u003e \"${output}.sampler.log\" 2\u003e\u00261 \u0026\n  echo $! \u003e \"$pid_file\"\n}\nwait_rss_sample() {\n  pid_file=\"$1\"\n  if [ ! -f \"$pid_file\" ]; then\n    return 0\n  fi\n  pid=\"$(cat \"$pid_file\" 2\u003e/dev/null || true)\"\n  if [ -n \"$pid\" ]; then\n    wait \"$pid\" || true\n  fi\n}\n# Bootstrap the `deces` index on both engines with the\n# INSEE 10k mapping + bulk-load slice baked into this\n# image. The slice NDJSON carries `_index: \"deces\"` in\n# every action header, so artillery_bench targets the\n# same index name below.\nstart_rss_sample \"surch\"      \"surch-api\" \"\"                         \"$REPORTS_DIR/rss-art-surch.json\" \"$REPORTS_DIR/.rss-surch.pid\"\nstart_rss_sample \"opensearch\" \"java\"      \"org.opensearch.bootstrap\" \"$REPORTS_DIR/rss-art-os.json\"    \"$REPORTS_DIR/.rss-os.pid\"\nbootstrap_engine() {\n  url=\"$1\"; label=\"$2\"\n  # The scratch PVC persists across ndcg-gate / insee-bench\n  # runs, so OpenSearch / Surch boot with whatever indices\n  # the previous job left behind (e.g. `scifact`,\n  # `.opensearch-*` security indices). Drop the working\n  # set before re-creating it, otherwise the bulk POST\n  # below can 400 against a partially-allocated `deces`\n  # index in a YELLOW cluster.\n  curl -fsS -o /dev/null -X DELETE \"$url/deces\" 2\u003e/dev/null || true\n  # OpenSearch only — wait for cluster to become at least\n  # YELLOW (single-node has no replicas) before we ask it\n  # to ingest a brand new index.\n  curl -fsS -o /dev/null \\\n    \"$url/_cluster/health?wait_for_status=yellow\u0026timeout=30s\" \\\n    2\u003e/dev/null || true\n  echo \"bootstrap $label: PUT /deces\"\n  curl -fsS -X PUT \"$url/deces\" \\\n    -H 'Content-Type: application/json' \\\n    --data-binary @/usr/local/share/deces/mapping.json \\\n    \u003e \"$REPORTS_DIR/bootstrap-$label.put.json\"\n  # Wait for the freshly-PUT `deces` index to have its\n  # primary shard active before we bulk-load against it.\n  curl -fsS -o /dev/null \\\n    \"$url/_cluster/health/deces?wait_for_status=yellow\u0026wait_for_active_shards=1\u0026timeout=30s\" \\\n    2\u003e/dev/null || true\n  echo \"bootstrap $label: POST /_bulk (10k docs)\"\n  gunzip -c /usr/local/share/deces/slice-10000.ndjson.gz \\\n    | curl -fsS -X POST \"$url/_bulk\" \\\n        -H 'Content-Type: application/x-ndjson' \\\n        --data-binary @- \\\n        \u003e \"$REPORTS_DIR/bootstrap-$label.bulk.json\"\n  # Refresh so newly indexed docs are searchable before\n  # the load phase starts.\n  curl -fsS -X POST \"$url/deces/_refresh\" \\\n    \u003e \"$REPORTS_DIR/bootstrap-$label.refresh.json\"\n}\nbootstrap_engine \"$SURCH_URL\" surch\nbootstrap_engine \"$OPENSEARCH_URL\" opensearch\n# Warm up both engines so JVM JIT + page caches are hot\n# before artillery_bench measures cold-start outliers\n# (OpenSearch phase-1 max would otherwise spike above\n# SLO_ARTILLERY_MAX_MS = 500 ms).\nwarmup_engine() {\n  url=\"$1\"; label=\"$2\"\n  echo \"warmup $label: 50 match_all hits\"\n  for i in $(seq 1 50); do\n    curl -fsS -o /dev/null -X POST \"$url/deces/_search\" \\\n      -H 'Content-Type: application/json' \\\n      -d '{\"query\":{\"match_all\":{}},\"size\":5}' \\\n      || true\n  done\n}\nwarmup_engine \"$SURCH_URL\" surch\nwarmup_engine \"$OPENSEARCH_URL\" opensearch\n# The bench driver image ships artillery_bench and\n# bench_report in /usr/local/bin.\n/usr/local/bin/artillery_bench \\\n  --url \"$SURCH_URL\" --index \"deces\" \\\n  --names \"$INSEE_DIR/artillery_names.txt\" \\\n  --workers \"$ART_WORKERS\" --phases \"$ART_PHASES\" \\\n  --report \"$REPORTS_DIR/art-surch.json\"\n/usr/local/bin/artillery_bench \\\n  --url \"$OPENSEARCH_URL\" --index \"deces\" \\\n  --names \"$INSEE_DIR/artillery_names.txt\" \\\n  --workers \"$ART_WORKERS\" --phases \"$ART_PHASES\" \\\n  --report \"$REPORTS_DIR/art-os.json\"\n/usr/local/bin/bench_report \\\n  --dir \"$REPORTS_DIR\" \\\n  --output \"$REPORTS_DIR/summary.md\"\nwait_rss_sample \"$REPORTS_DIR/.rss-surch.pid\"\nwait_rss_sample \"$REPORTS_DIR/.rss-os.pid\"\n# Surface each rss-*.json envelope between markers so the\n# ci-k8s workflow can reconstruct them when the emptyDir\n# /reports volume is gone after driver termination.\nfor f in \"$REPORTS_DIR\"/rss-art-*.json; do\n  [ -f \"$f\" ] || continue\n  fname=\"$(basename \"$f\")\"\n  echo \"BEGIN_SURCH_K8S_RSS_FILE:$fname\"\n  cat \"$f\"\n  echo\n  echo \"END_SURCH_K8S_RSS_FILE:$fname\"\ndone\necho \"BEGIN_SURCH_K8S_SUMMARY\"\ncat \"$REPORTS_DIR/summary.md\"\necho \"END_SURCH_K8S_SUMMARY\"\necho \"insee-bench complete.\"\n"],"command":["/bin/sh","-c"],"env":[{"name":"SURCH_URL","value":"http://127.0.0.1:7700"},{"name":"OPENSEARCH_URL","value":"http://127.0.0.1:9200"},{"name":"INSEE_DIR","value":"/data/insee"},{"name":"REPORTS_DIR","value":"/reports"},{"name":"ART_PHASES","value":"2:30,2:30,5:30,10:30,20:30,50:240"},{"name":"ART_WORKERS","value":"8"},{"name":"RSS_SAMPLE_SECONDS","value":"420"}],"image":"ghcr.io/rhanka/surch:bench-sha-0c44b11534d1d18024f0280fb9afb4a01f30b17d","imagePullPolicy":"IfNotPresent","name":"artillery-runner","resources":{"limits":{"cpu":"500m","memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}},"volumeMounts":[{"mountPath":"/data/insee","name":"insee","readOnly":true},{"mountPath":"/reports","name":"reports"}]}],"initContainers":[{"env":[{"name":"SURCH_HOST","value":"127.0.0.1"},{"name":"SURCH_PORT","value":"7700"},{"name":"RUST_LOG","value":"warn"}],"image":"ghcr.io/rhanka/surch:sha-0c44b11534d1d18024f0280fb9afb4a01f30b17d","imagePullPolicy":"IfNotPresent","name":"surch","ports":[{"containerPort":7700,"name":"surch-http"}],"resources":{"limits":{"cpu":"800m","memory":"512Mi"},"requests":{"cpu":"150m","memory":"128Mi"}},"restartPolicy":"Always","volumeMounts":[{"mountPath":"/var/surch","name":"scratch","subPath":"surch-data"}]},{"env":[{"name":"discovery.type","value":"single-node"},{"name":"DISABLE_SECURITY_PLUGIN","value":"true"},{"name":"DISABLE_INSTALL_DEMO_CONFIG","value":"true"},{"name":"OPENSEARCH_JAVA_OPTS","value":"-Xms1g -Xmx1g"},{"name":"bootstrap.memory_lock","value":"false"}],"image":"opensearchproject/opensearch:2.17.1","imagePullPolicy":"IfNotPresent","name":"opensearch","ports":[{"containerPort":9200,"name":"os-http"}],"resources":{"limits":{"cpu":"1200m","memory":"1536Mi"},"requests":{"cpu":"250m","memory":"256Mi"}},"restartPolicy":"Always","securityContext":{"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000},"volumeMounts":[{"mountPath":"/usr/share/opensearch/data","name":"scratch","subPath":"opensearch-data"}]}],"nodeSelector":{"k8s.scaleway.com/pool-name":"burst"},"restartPolicy":"Never","securityContext":{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532},"serviceAccountName":"surch","shareProcessNamespace":true,"tolerations":[{"effect":"NoSchedule","key":"pool","operator":"Equal","value":"burst"}],"volumes":[{"name":"insee","persistentVolumeClaim":{"claimName":"surch-corpus-insee","readOnly":true}},{"name":"scratch","persistentVolumeClaim":{"claimName":"surch-scratch"}},{"emptyDir":{"sizeLimit":"128Mi"},"name":"reports"}]}},"ttlSecondsAfterFinished":3600}}
+  creationTimestamp: "2026-05-25T16:42:35Z"
+  generation: 1
+  labels:
+    app.kubernetes.io/component: insee-bench
+    app.kubernetes.io/name: surch
+    app.kubernetes.io/part-of: surch-ci
+  name: insee-bench
+  namespace: surch
+  resourceVersion: "45346628611"
+  uid: 58c198d1-d16c-46d9-ae87-037c30d732c8
+spec:
+  activeDeadlineSeconds: 1800
+  backoffLimit: 0
+  completionMode: NonIndexed
+  completions: 1
+  manualSelector: false
+  parallelism: 1
+  podReplacementPolicy: TerminatingOrFailed
+  selector:
+    matchLabels:
+      batch.kubernetes.io/controller-uid: 58c198d1-d16c-46d9-ae87-037c30d732c8
+  suspend: false
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: insee-bench
+        app.kubernetes.io/name: surch
+        app.kubernetes.io/part-of: surch-ci
+        batch.kubernetes.io/controller-uid: 58c198d1-d16c-46d9-ae87-037c30d732c8
+        batch.kubernetes.io/job-name: insee-bench
+        controller-uid: 58c198d1-d16c-46d9-ae87-037c30d732c8
+        job-name: insee-bench
+    spec:
+      containers:
+      - args:
+        - |
+          set -eu
+          echo "Waiting for both engines..."
+          until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+          until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
+          mkdir -p "$REPORTS_DIR"
+          RSS_SAMPLE_SECONDS="${RSS_SAMPLE_SECONDS:-420}"
+          # shareProcessNamespace=true exposes sibling container PIDs
+          # in /proc; the bench-driver image is procps-less so we scan
+          # /proc/<pid>/cmdline directly. We match the basename of
+          # argv[0] (not the whole cmdline) to avoid false positives on
+          # the driver `sh -c "<script>"` whose cmdline embeds the
+          # script body. An optional content substring is required when
+          # the engine binary is generic (e.g. `java` for OpenSearch).
+          start_rss_sample() {
+            label="$1"
+            binary="$2"
+            content="$3"
+            output="$4"
+            pid_file="$5"
+            pid=""
+            for d in /proc/[0-9]*; do
+              [ -r "$d/cmdline" ] || continue
+              argv0="$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -n 1)"
+              [ -n "$argv0" ] || continue
+              case "${argv0##*/}" in
+                "$binary") ;;
+                *) continue ;;
+              esac
+              if [ -n "$content" ]; then
+                tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q "$content" || continue
+              fi
+              pid="${d#/proc/}"
+              break
+            done
+            if [ -z "$pid" ]; then
+              echo "WARN: cannot start RSS sample for $label (binary: $binary, content: $content)"
+              return 0
+            fi
+            /usr/local/bin/rss-sample.sh "$pid" "$RSS_SAMPLE_SECONDS" "$output" \
+              > "${output}.sampler.log" 2>&1 &
+            echo $! > "$pid_file"
+          }
+          wait_rss_sample() {
+            pid_file="$1"
+            if [ ! -f "$pid_file" ]; then
+              return 0
+            fi
+            pid="$(cat "$pid_file" 2>/dev/null || true)"
+            if [ -n "$pid" ]; then
+              wait "$pid" || true
+            fi
+          }
+          # Bootstrap the `deces` index on both engines with the
+          # INSEE 10k mapping + bulk-load slice baked into this
+          # image. The slice NDJSON carries `_index: "deces"` in
+          # every action header, so artillery_bench targets the
+          # same index name below.
+          start_rss_sample "surch"      "surch-api" ""                         "$REPORTS_DIR/rss-art-surch.json" "$REPORTS_DIR/.rss-surch.pid"
+          start_rss_sample "opensearch" "java"      "org.opensearch.bootstrap" "$REPORTS_DIR/rss-art-os.json"    "$REPORTS_DIR/.rss-os.pid"
+          bootstrap_engine() {
+            url="$1"; label="$2"
+            # The scratch PVC persists across ndcg-gate / insee-bench
+            # runs, so OpenSearch / Surch boot with whatever indices
+            # the previous job left behind (e.g. `scifact`,
+            # `.opensearch-*` security indices). Drop the working
+            # set before re-creating it, otherwise the bulk POST
+            # below can 400 against a partially-allocated `deces`
+            # index in a YELLOW cluster.
+            curl -fsS -o /dev/null -X DELETE "$url/deces" 2>/dev/null || true
+            # OpenSearch only — wait for cluster to become at least
+            # YELLOW (single-node has no replicas) before we ask it
+            # to ingest a brand new index.
+            curl -fsS -o /dev/null \
+              "$url/_cluster/health?wait_for_status=yellow&timeout=30s" \
+              2>/dev/null || true
+            echo "bootstrap $label: PUT /deces"
+            curl -fsS -X PUT "$url/deces" \
+              -H 'Content-Type: application/json' \
+              --data-binary @/usr/local/share/deces/mapping.json \
+              > "$REPORTS_DIR/bootstrap-$label.put.json"
+            # Wait for the freshly-PUT `deces` index to have its
+            # primary shard active before we bulk-load against it.
+            curl -fsS -o /dev/null \
+              "$url/_cluster/health/deces?wait_for_status=yellow&wait_for_active_shards=1&timeout=30s" \
+              2>/dev/null || true
+            echo "bootstrap $label: POST /_bulk (10k docs)"
+            gunzip -c /usr/local/share/deces/slice-10000.ndjson.gz \
+              | curl -fsS -X POST "$url/_bulk" \
+                  -H 'Content-Type: application/x-ndjson' \
+                  --data-binary @- \
+                  > "$REPORTS_DIR/bootstrap-$label.bulk.json"
+            # Refresh so newly indexed docs are searchable before
+            # the load phase starts.
+            curl -fsS -X POST "$url/deces/_refresh" \
+              > "$REPORTS_DIR/bootstrap-$label.refresh.json"
+          }
+          bootstrap_engine "$SURCH_URL" surch
+          bootstrap_engine "$OPENSEARCH_URL" opensearch
+          # Warm up both engines so JVM JIT + page caches are hot
+          # before artillery_bench measures cold-start outliers
+          # (OpenSearch phase-1 max would otherwise spike above
+          # SLO_ARTILLERY_MAX_MS = 500 ms).
+          warmup_engine() {
+            url="$1"; label="$2"
+            echo "warmup $label: 50 match_all hits"
+            for i in $(seq 1 50); do
+              curl -fsS -o /dev/null -X POST "$url/deces/_search" \
+                -H 'Content-Type: application/json' \
+                -d '{"query":{"match_all":{}},"size":5}' \
+                || true
+            done
+          }
+          warmup_engine "$SURCH_URL" surch
+          warmup_engine "$OPENSEARCH_URL" opensearch
+          # The bench driver image ships artillery_bench and
+          # bench_report in /usr/local/bin.
+          /usr/local/bin/artillery_bench \
+            --url "$SURCH_URL" --index "deces" \
+            --names "$INSEE_DIR/artillery_names.txt" \
+            --workers "$ART_WORKERS" --phases "$ART_PHASES" \
+            --report "$REPORTS_DIR/art-surch.json"
+          /usr/local/bin/artillery_bench \
+            --url "$OPENSEARCH_URL" --index "deces" \
+            --names "$INSEE_DIR/artillery_names.txt" \
+            --workers "$ART_WORKERS" --phases "$ART_PHASES" \
+            --report "$REPORTS_DIR/art-os.json"
+          /usr/local/bin/bench_report \
+            --dir "$REPORTS_DIR" \
+            --output "$REPORTS_DIR/summary.md"
+          wait_rss_sample "$REPORTS_DIR/.rss-surch.pid"
+          wait_rss_sample "$REPORTS_DIR/.rss-os.pid"
+          # Surface each rss-*.json envelope between markers so the
+          # ci-k8s workflow can reconstruct them when the emptyDir
+          # /reports volume is gone after driver termination.
+          for f in "$REPORTS_DIR"/rss-art-*.json; do
+            [ -f "$f" ] || continue
+            fname="$(basename "$f")"
+            echo "BEGIN_SURCH_K8S_RSS_FILE:$fname"
+            cat "$f"
+            echo
+            echo "END_SURCH_K8S_RSS_FILE:$fname"
+          done
+          echo "BEGIN_SURCH_K8S_SUMMARY"
+          cat "$REPORTS_DIR/summary.md"
+          echo "END_SURCH_K8S_SUMMARY"
+          echo "insee-bench complete."
+        command:
+        - /bin/sh
+        - -c
+        env:
+        - name: SURCH_URL
+          value: http://127.0.0.1:7700
+        - name: OPENSEARCH_URL
+          value: http://127.0.0.1:9200
+        - name: INSEE_DIR
+          value: /data/insee
+        - name: REPORTS_DIR
+          value: /reports
+        - name: ART_PHASES
+          value: 2:30,2:30,5:30,10:30,20:30,50:240
+        - name: ART_WORKERS
+          value: "8"
+        - name: RSS_SAMPLE_SECONDS
+          value: "420"
+        image: ghcr.io/rhanka/surch:bench-sha-0c44b11534d1d18024f0280fb9afb4a01f30b17d
+        imagePullPolicy: IfNotPresent
+        name: artillery-runner
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /data/insee
+          name: insee
+          readOnly: true
+        - mountPath: /reports
+          name: reports
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - env:
+        - name: SURCH_HOST
+          value: 127.0.0.1
+        - name: SURCH_PORT
+          value: "7700"
+        - name: RUST_LOG
+          value: warn
+        image: ghcr.io/rhanka/surch:sha-0c44b11534d1d18024f0280fb9afb4a01f30b17d
+        imagePullPolicy: IfNotPresent
+        name: surch
+        ports:
+        - containerPort: 7700
+          name: surch-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 800m
+            memory: 512Mi
+          requests:
+            cpu: 150m
+            memory: 128Mi
+        restartPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/surch
+          name: scratch
+          subPath: surch-data
+      - env:
+        - name: discovery.type
+          value: single-node
+        - name: DISABLE_SECURITY_PLUGIN
+          value: "true"
+        - name: DISABLE_INSTALL_DEMO_CONFIG
+          value: "true"
+        - name: OPENSEARCH_JAVA_OPTS
+          value: -Xms1g -Xmx1g
+        - name: bootstrap.memory_lock
+          value: "false"
+        image: opensearchproject/opensearch:2.17.1
+        imagePullPolicy: IfNotPresent
+        name: opensearch
+        ports:
+        - containerPort: 9200
+          name: os-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 1200m
+            memory: 1536Mi
+          requests:
+            cpu: 250m
+            memory: 256Mi
+        restartPolicy: Always
+        securityContext:
+          runAsGroup: 1000
+          runAsNonRoot: true
+          runAsUser: 1000
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/share/opensearch/data
+          name: scratch
+          subPath: opensearch-data
+      nodeSelector:
+        k8s.scaleway.com/pool-name: burst
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+      serviceAccount: surch
+      serviceAccountName: surch
+      shareProcessNamespace: true
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: pool
+        operator: Equal
+        value: burst
+      volumes:
+      - name: insee
+        persistentVolumeClaim:
+          claimName: surch-corpus-insee
+          readOnly: true
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: surch-scratch
+      - emptyDir:
+          sizeLimit: 128Mi
+        name: reports
+  ttlSecondsAfterFinished: 3600
+status:
+  completionTime: "2026-05-25T16:57:35Z"
+  conditions:
+  - lastProbeTime: "2026-05-25T16:57:35Z"
+    lastTransitionTime: "2026-05-25T16:57:35Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: SuccessCriteriaMet
+  - lastProbeTime: "2026-05-25T16:57:35Z"
+    lastTransitionTime: "2026-05-25T16:57:35Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: Complete
+  ready: 0
+  startTime: "2026-05-25T16:42:35Z"
+  succeeded: 1
+  terminating: 0
+  uncountedTerminatedPods: {}

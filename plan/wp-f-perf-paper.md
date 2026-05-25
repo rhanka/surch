@@ -92,8 +92,14 @@ Atouts méthodo déjà en place :
     vs OS `109.73 s`), RSS pic `2168 MiB ±0.5%`, NDCG bit-stable.
     Tableau de bord Bulk + RSS mis à jour. Ces 3 axes sont
     paper-ready.
-  - [ ] 3 reps insee-bench (latence p50/p95/p99) pour un verdict
-    latence médiane+IQR (axe search encore single-run).
+  - [x] 3 reps insee-bench (latence) sur main, agrégés dans
+    `2026-05-25-F2-insee-3rep-K8s/` : Surch médiane p50/p95/p99/max
+    `1.5/4.1/8.4/40.6 ms` vs OpenSearch `4.0/12.2/26.3/223.1 ms`
+    (Surch `2.7–3.1x` plus rapide, p50 variance nulle, 0 erreur).
+  - **F2 complet pour les charges disponibles** : bulk, RSS,
+    qualité, latence ont tous une médiane+étendue. Reste pour
+    l'article : F3 (historiques) + F4 (charges additionnelles dont
+    harness latence grand corpus).
 - [ ] **F3 — Débloquer + rejouer les historiques** (F-gap-2/3) :
   le gros morceau, dépend de la surface workflow aux anciens SHAs.
 - [ ] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
