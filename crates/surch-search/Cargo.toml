@@ -8,6 +8,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+surch-codec = { path = "../surch-codec" }
 surch-index = { path = "../surch-index" }
 surch-store = { path = "../surch-store" }
 surch-types = { path = "../surch-types" }

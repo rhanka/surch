@@ -4,6 +4,7 @@
 pub mod collector;
 pub mod execution;
 pub mod fuzzy;
+pub mod maxscore;
 pub mod query;
 pub mod scoring;
 
