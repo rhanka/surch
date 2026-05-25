@@ -28,7 +28,8 @@
 //!   * artillery p95 ≤ 200 ms
 //!   * artillery max ≤ 500 ms
 //!   * artillery error rate ≤ 1 %
-//!   * RSS peak ≤ 1024 MB on the artillery INSEE 25k workload
+//!   * Surch RSS peak ≤ 1024 MB on the artillery INSEE workload
+//!     (Surch engine only — the JVM reference engine is exempt)
 //!
 //! Regression thresholds vs `--baseline`:
 //!   * p95 (artillery) regressed by more than 15 %
@@ -660,13 +661,19 @@ fn evaluate_slo(agg: &Aggregate) -> Vec<SloCheck> {
             passed,
         });
     }
-    // RSS peak SLO applies to the INSEE 25k artillery workload if present.
+    // RSS peak SLO is a *Surch* memory target on the artillery INSEE
+    // workload. It must not gate the reference engine: OpenSearch /
+    // Elasticsearch run a JVM with `-Xmx1g`, so their RSS legitimately
+    // exceeds 1 GiB and is irrelevant to Surch's footprint budget.
+    // Reference-engine RSS rows are still rendered in the human report
+    // for comparison, but only the `surch` engine gates the SLO.
     for row in &agg.rss {
-        if row.workload.contains("insee") || row.label.contains("art") {
+        let is_insee_artillery = row.workload.contains("insee") || row.label.contains("art");
+        if is_insee_artillery && row.engine == "surch" {
             let passed = row.peak_mb <= SLO_RSS_PEAK_MB;
             checks.push(SloCheck {
                 name: format!(
-                    "RSS peak ≤ {} MB (artillery on INSEE 25k) [{}]",
+                    "Surch RSS peak ≤ {} MB (artillery on INSEE) [{}]",
                     SLO_RSS_PEAK_MB, row.label
                 ),
                 detail: format!("observed peak = {:.1} MB", row.peak_mb),
@@ -1127,7 +1134,7 @@ fn print_help() {
     println!("  artillery p95 ≤ {SLO_ARTILLERY_P95_MS} ms");
     println!("  artillery max ≤ {SLO_ARTILLERY_MAX_MS} ms");
     println!("  artillery error rate ≤ {SLO_ARTILLERY_ERROR_RATE_PCT} %");
-    println!("  RSS peak ≤ {SLO_RSS_PEAK_MB} MB (artillery INSEE 25k)");
+    println!("  Surch RSS peak ≤ {SLO_RSS_PEAK_MB} MB (artillery INSEE, Surch engine only)");
     println!("  SciFact NDCG@10 ≥ {SLO_SCIFACT_NDCG_10}");
     println!("  TREC-COVID NDCG@10 ≥ {SLO_TREC_COVID_NDCG_10}");
     println!();
@@ -1274,6 +1281,69 @@ Recall@10 = 0.8100
         assert_eq!(row.ndcg_10, 0.6576);
         assert_eq!(row.recall_10, 0.8100);
         assert_eq!(row.lucene_baseline_ndcg_10, Some(0.688));
+    }
+
+    #[test]
+    fn evaluate_slo_rss_gates_surch_only_not_reference_engine() {
+        // Regression guard: once the RSS sampler was wired into
+        // insee-bench, bench_report started seeing rss-art-os.json for
+        // the JVM reference engine, whose `-Xmx1g` heap legitimately
+        // exceeds the 1024 MB Surch SLO. The SLO must gate the `surch`
+        // engine only, otherwise the Job fails closed at teardown.
+        let agg = Aggregate {
+            rss: vec![
+                RssRow {
+                    label: "rss-art-surch".into(),
+                    engine: "surch".into(),
+                    workload: "art".into(),
+                    peak_mb: 300.0, // well under the 1024 MB SLO
+                    final_mb: 280.0,
+                },
+                RssRow {
+                    label: "rss-art-os".into(),
+                    engine: "opensearch".into(),
+                    workload: "art".into(),
+                    peak_mb: 1466.0, // JVM heap > 1024 MB, must NOT gate
+                    final_mb: 1466.0,
+                },
+            ],
+            ..Aggregate::default()
+        };
+        let checks = evaluate_slo(&agg);
+        let rss_checks: Vec<_> = checks
+            .iter()
+            .filter(|c| c.name.contains("RSS peak"))
+            .collect();
+        assert_eq!(
+            rss_checks.len(),
+            1,
+            "only the surch RSS row should produce an SLO check"
+        );
+        assert!(
+            rss_checks[0].name.contains("rss-art-surch"),
+            "the single RSS check must be the surch one"
+        );
+        assert!(rss_checks[0].passed, "surch peak 300 MB is within SLO");
+    }
+
+    #[test]
+    fn evaluate_slo_flags_surch_rss_over_budget() {
+        let agg = Aggregate {
+            rss: vec![RssRow {
+                label: "rss-art-surch".into(),
+                engine: "surch".into(),
+                workload: "art".into(),
+                peak_mb: 1500.0, // breaches the 1024 MB Surch SLO
+                final_mb: 1400.0,
+            }],
+            ..Aggregate::default()
+        };
+        let checks = evaluate_slo(&agg);
+        let rss = checks
+            .iter()
+            .find(|c| c.name.contains("RSS peak"))
+            .expect("surch RSS check should exist");
+        assert!(!rss.passed, "surch peak 1500 MB must fail the SLO");
     }
 
     #[test]
