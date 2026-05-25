@@ -25,9 +25,11 @@
 //!   1 → at least one SLO failed or a regression breached the threshold
 //!
 //! SLO thresholds (matchID v1):
-//!   * artillery p95 ≤ 200 ms
-//!   * artillery max ≤ 500 ms
-//!   * artillery error rate ≤ 1 %
+//!   * Surch artillery p95 ≤ 200 ms (Surch engine only; the JVM
+//!     reference engine's latency is reported but does not gate)
+//!   * Surch artillery max ≤ 500 ms (Surch engine only)
+//!   * artillery error rate ≤ 1 % (both engines — a non-zero rate
+//!     invalidates the comparison)
 //!   * Surch RSS peak ≤ 1024 MB on the artillery INSEE workload
 //!     (Surch engine only — the JVM reference engine is exempt)
 //!
@@ -623,26 +625,37 @@ struct SloCheck {
 fn evaluate_slo(agg: &Aggregate) -> Vec<SloCheck> {
     let mut checks = Vec::new();
     for row in &agg.artillery {
-        let passed = row.p95_ms <= SLO_ARTILLERY_P95_MS;
-        checks.push(SloCheck {
-            name: format!(
-                "artillery p95 ≤ {} ms [{}]",
-                SLO_ARTILLERY_P95_MS, row.label
-            ),
-            detail: format!("observed p95 = {:.1} ms", row.p95_ms),
-            passed,
-        });
+        // The p95 / max latency SLOs are a *Surch* performance budget.
+        // The reference engine (OpenSearch/Elasticsearch) is reported
+        // for comparison but must not gate the Job: on a large corpus
+        // (e.g. trec-covid-latency on 171k) the JVM engine legitimately
+        // exceeds the matchID-tuned 200 ms / 500 ms thresholds, which
+        // would otherwise fail the run. Gate latency on `surch` only.
+        if row.engine == "surch" {
+            let passed = row.p95_ms <= SLO_ARTILLERY_P95_MS;
+            checks.push(SloCheck {
+                name: format!(
+                    "Surch artillery p95 ≤ {} ms [{}]",
+                    SLO_ARTILLERY_P95_MS, row.label
+                ),
+                detail: format!("observed p95 = {:.1} ms", row.p95_ms),
+                passed,
+            });
 
-        let passed = row.max_ms <= SLO_ARTILLERY_MAX_MS;
-        checks.push(SloCheck {
-            name: format!(
-                "artillery max ≤ {} ms [{}]",
-                SLO_ARTILLERY_MAX_MS, row.label
-            ),
-            detail: format!("observed max = {:.1} ms", row.max_ms),
-            passed,
-        });
+            let passed = row.max_ms <= SLO_ARTILLERY_MAX_MS;
+            checks.push(SloCheck {
+                name: format!(
+                    "Surch artillery max ≤ {} ms [{}]",
+                    SLO_ARTILLERY_MAX_MS, row.label
+                ),
+                detail: format!("observed max = {:.1} ms", row.max_ms),
+                passed,
+            });
+        }
 
+        // Error rate gates BOTH engines: a non-zero error rate means the
+        // benchmark run is invalid (the latency comparison is moot), so
+        // it must fail closed regardless of engine.
         let error_rate = if row.issued == 0 {
             0.0
         } else {
@@ -1131,8 +1144,8 @@ fn print_help() {
     println!("  {SCHEMA_SUMMARY} (written as summary.json)");
     println!();
     println!("SLO THRESHOLDS:");
-    println!("  artillery p95 ≤ {SLO_ARTILLERY_P95_MS} ms");
-    println!("  artillery max ≤ {SLO_ARTILLERY_MAX_MS} ms");
+    println!("  Surch artillery p95 ≤ {SLO_ARTILLERY_P95_MS} ms (Surch engine only)");
+    println!("  Surch artillery max ≤ {SLO_ARTILLERY_MAX_MS} ms (Surch engine only)");
     println!("  artillery error rate ≤ {SLO_ARTILLERY_ERROR_RATE_PCT} %");
     println!("  Surch RSS peak ≤ {SLO_RSS_PEAK_MB} MB (artillery INSEE, Surch engine only)");
     println!("  SciFact NDCG@10 ≥ {SLO_SCIFACT_NDCG_10}");
@@ -1347,6 +1360,58 @@ Recall@10 = 0.8100
     }
 
     #[test]
+    fn evaluate_slo_artillery_latency_gates_surch_only() {
+        // Regression guard for trec-covid-latency: on a large corpus the
+        // JVM reference engine legitimately exceeds the 200/500 ms
+        // matchID-tuned thresholds. Its latency must NOT produce an SLO
+        // check (would fail the Job); only Surch's latency gates.
+        let agg = Aggregate {
+            artillery: vec![
+                ArtilleryRow {
+                    label: "art-surch".into(),
+                    engine: "surch".into(),
+                    workload: "trec-covid".into(),
+                    p50_ms: 0.6,
+                    p95_ms: 1.7,
+                    p99_ms: 7.4,
+                    max_ms: 324.8,
+                    issued: 13170,
+                    errors: 0,
+                },
+                ArtilleryRow {
+                    label: "art-os".into(),
+                    engine: "elasticsearch".into(),
+                    workload: "trec-covid".into(),
+                    p50_ms: 207.0,
+                    p95_ms: 592.0, // > 200 ms SLO, must NOT gate
+                    p99_ms: 807.0,
+                    max_ms: 1595.0, // > 500 ms SLO, must NOT gate
+                    issued: 13170,
+                    errors: 0,
+                },
+            ],
+            ..Aggregate::default()
+        };
+        let checks = evaluate_slo(&agg);
+        let latency_checks: Vec<_> = checks
+            .iter()
+            .filter(|c| c.name.contains("artillery p95") || c.name.contains("artillery max"))
+            .collect();
+        // Exactly the two Surch latency checks; none for the reference.
+        assert_eq!(latency_checks.len(), 2, "only surch latency gates");
+        assert!(
+            latency_checks.iter().all(|c| c.name.contains("[art-surch]") && c.passed),
+            "surch latency within SLO, reference engine not gated"
+        );
+        // Error-rate checks still apply to BOTH engines.
+        let err_checks = checks
+            .iter()
+            .filter(|c| c.name.contains("error rate"))
+            .count();
+        assert_eq!(err_checks, 2, "error-rate SLO gates both engines");
+    }
+
+    #[test]
     fn evaluate_slo_flags_high_p95() {
         let agg = Aggregate {
             artillery: vec![ArtilleryRow {
@@ -1365,12 +1430,12 @@ Recall@10 = 0.8100
         let checks = evaluate_slo(&agg);
         let p95 = checks
             .iter()
-            .find(|c| c.name.starts_with("artillery p95"))
+            .find(|c| c.name.starts_with("Surch artillery p95"))
             .expect("p95 check should exist");
         assert!(!p95.passed, "p95=250 should fail");
         let max = checks
             .iter()
-            .find(|c| c.name.starts_with("artillery max"))
+            .find(|c| c.name.starts_with("Surch artillery max"))
             .expect("max check should exist");
         assert!(max.passed, "max=450 within 500 ms SLO");
     }
