@@ -152,6 +152,22 @@ Atouts méthodo déjà en place :
     (pas de build/test lourd local).
   - [ ] Reste F4 : BEIR multi-datasets (NFCorpus, FiQA…) + sweep de
     taille de corpus (courbe de scaling bulk).
+  - **Caveat équivalence (écart latence grand corpus)** : le premier
+    run (26419941882) donne Surch p50 `0.6 ms` / p95 `1.7 ms` vs
+    OpenSearch p50 `207 ms` / p95 `592 ms` sur 171 k (13 170 req,
+    0 erreur des 2 côtés) — soit ~345x à p50. À publier AVEC réserve :
+    `artillery_bench` ne capture que latence + erreurs (drain du body
+    sans parser `hits.total`, cf. `issue_request` l.648-652), donc
+    l'égalité du travail entre moteurs ne se prouve pas depuis
+    l'artefact latence. **Preuve d'équivalence disponible par
+    ailleurs** : la parité NDCG@10 sur TREC-COVID (`0.4750` Surch vs
+    `0.4902` OS) établit que les top-K récupérés sont de qualité
+    équivalente → l'écart de latence reflète bien le saut WAND/MaxScore
+    + skip-lists sur longues listes (régime que l'INSEE 10k n'atteint
+    pas) et l'absence d'overhead JVM, pas un travail dégénéré côté
+    Surch. Durcissement futur : logger `hits.total` par requête dans
+    `artillery_bench` pour assertion directe. Claim à formuler comme
+    single-run illustratif, pas comme mesure multi-rep finale.
 - [~] **F5 — Draft de l'article** : premier draft livré
   `docs/paper/draft.md` (abstract, méthodo, séquence bulk Lot 1→1.6,
   mémoire, latence, qualité, parité matchID, discussion, limitations,
