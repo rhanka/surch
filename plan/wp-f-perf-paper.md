@@ -101,12 +101,34 @@ Atouts méthodo déjà en place :
     l'article : F3 (historiques) + F4 (charges additionnelles dont
     harness latence grand corpus).
 - [ ] **F3 — Débloquer + rejouer les historiques** (F-gap-2/3) :
-  le gros morceau, dépend de la surface workflow aux anciens SHAs.
+  le gros morceau. **Investigation 2026-05-25 (DÉCISION USER
+  requise)** : les SHAs historiques manquent la surface CI/Docker :
+  - `71ceb275`, `5081cc7` : pas de `docker-build.yml` ni `ci-k8s.yml`
+    (Dockerfile présent).
+  - `3157afb`, `e38bf91` : pas de workflows ET pas de Dockerfile.
+  - `65fc759` : a les deux workflows + Dockerfile (replayable).
+  - `7caf339` : `ci-k8s.yml` + Dockerfile, pas de `docker-build.yml`.
+  Porter la surface moderne (docker-build + ci-k8s + Dockerfile +
+  scripts bench) sur ces branches sans réécrire le code applicatif
+  historique est possible (le plan replay l'autorise), MAIS : (a)
+  effort par point (créer une ref, greffer la surface, résoudre les
+  conflits de Cargo.toml/workspace), (b) risque que le code
+  historique ne compile pas avec le toolchain actuel (rustc 1.91.1)
+  ni avec le harness bench actuel. **ROI incertain.**
+  **Décision attendue** : investir F3 (isolation historique complète,
+  plusieurs heures CI + débogage de build) OU écrire l'article sur
+  les seuls lots récents (déjà isolés + multi-rep, histoire forte) en
+  citant les optims historiques comme "delivered, mesurées
+  cumulativement, isolation déférée" ? Tant que non tranché, le draft
+  F5 part sur les lots récents.
 - [ ] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
   sweep de taille (optionnel pour un premier draft).
-- [ ] **F5 — Draft de l'article** : assembler résultats + figures
-  (courbes bulk/latence/RSS par lot) + discussion (Rust pur vs JVM,
-  jemalloc, deferred FST, skip lists).
+- [~] **F5 — Draft de l'article** : premier draft livré
+  `docs/paper/draft.md` (abstract, méthodo, séquence bulk Lot 1→1.6,
+  mémoire, latence, qualité, parité matchID, discussion, limitations,
+  conclusion) sur les lots récents + multi-rep F2. Reste : figures
+  (courbes bulk/latence/RSS par lot), et intégration des historiques
+  si F3 tranché.
 
 ## Verdict de faisabilité (au 2026-05-25)
 
