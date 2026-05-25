@@ -226,6 +226,7 @@ mod tests {
         let usage = document_index_memory_usage(&index);
         assert_eq!(usage.postings_bytes, 0);
         assert_eq!(usage.prefix_postings_bytes, 0);
+        assert_eq!(usage.subfield_values_bytes, 0);
         assert_eq!(usage.term_stats_bytes, 0);
         assert_eq!(usage.field_stats_bytes, 0);
         assert_eq!(usage.total_bytes(), 0);
@@ -276,6 +277,31 @@ mod tests {
 
         let usage = document_index_memory_usage(&index);
         assert!(usage.prefix_postings_bytes > 0, "{:?}", usage);
+    }
+
+    #[test]
+    fn subfield_values_are_counted_when_field_declares_subfields() {
+        // A10: a parent field with a `fields.raw` keyword/normalizer
+        // sub-field fans out at write time, so the side-table is non-empty
+        // and contributes to both `subfield_values_bytes` and the total.
+        let mut subfields = std::collections::BTreeMap::new();
+        subfields.insert(
+            "raw".to_owned(),
+            FieldMapping::new(FieldType::Keyword, None)
+                .with_normalizer(Some(crate::mapping::AnalyzerName::Norm)),
+        );
+        let nom = FieldMapping::new(FieldType::Text, None).with_subfields(subfields);
+        let mut mapping = IndexMapping::new();
+        mapping.set_field_mapping("NOM", nom);
+
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("NOM", "DUPONT")], &mapping)
+            .expect("doc 1");
+
+        let usage = document_index_memory_usage(&index);
+        assert!(usage.subfield_values_bytes > 0, "{usage:?}");
+        assert!(usage.total_bytes() >= usage.subfield_values_bytes);
     }
 
     #[test]

@@ -99,8 +99,13 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
 
 ## Gates (à compléter au fil de l'eau)
 
-- [ ] Lot 0 — A10 write-time fan-out livré et tests
-  `*multi_field*` / `*subfield*` étendus.
+- [x] Lot 0 — A10 write-time fan-out livré côté indexation
+  (`DocumentIndex::index_subfields` / `subfield_terms` /
+  `subfield_values` + `DocumentIndex::subfield_value`), tests
+  `*subfield*` étendus (5 unitaires fan-out + 1 accounting mémoire).
+  Reste : brancher `subfield_value` dans `sort`/`agg` côté query (le
+  read-time alias `lookup_sort_value` reste le fallback durable) — à
+  faire dans le suivi A1/A12.
 - [ ] Lot 1 — A1/A13 multi-field + edge_ngram câblé.
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.

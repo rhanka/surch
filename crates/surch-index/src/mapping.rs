@@ -200,13 +200,14 @@ pub struct FieldMapping {
     /// normalizer: norm } } }`. Wire-shape consumers (`GET
     /// /:index/_mapping`) need every sub-field round-tripped verbatim.
     ///
-    /// Write-time fan-out (indexing each parent value under the
-    /// `parent.subname` path with the sub-field's analyzer/normalizer) is
-    /// **not** wired yet — see gap-analysis A10 "phase 3" note. At
-    /// query time `lookup_sort_value` still aliases `parent.subname` to
-    /// the parent's stored value; when the sub-field carries a
-    /// `normalizer` the alias is normalised on read so `sort: NOM.raw`
-    /// returns the lowercased / asciifolded value matchID expects.
+    /// A10 phase 3 wires the write-time fan-out: at index time
+    /// `DocumentIndex::index_subfields` re-analyzes the parent value with
+    /// each sub-field's own chain and stores it under the `parent.subname`
+    /// path (both as postings and as a per-doc stored projection). At
+    /// query time `lookup_sort_value` still aliases `parent.subname` to the
+    /// parent's stored value and normalises on read; threading the stored
+    /// projection (`DocumentIndex::subfield_value`) into sort/agg is the
+    /// remaining follow-up.
     pub fields: BTreeMap<String, FieldMapping>,
 }
 
@@ -265,24 +266,6 @@ impl FieldMapping {
     pub fn analyzer(&self) -> AnalyzerName {
         self.analyzer
             .unwrap_or_else(|| AnalyzerName::default_for(self.field_type))
-    }
-
-    /// A10: analyzer applied at write time when fanning a parent value
-    /// into this sub-field.
-    ///
-    /// For a `keyword` sub-field declared with a `normalizer` (matchID's
-    /// `NOM.raw: { type: keyword, normalizer: norm }`), the stored token
-    /// must be the whole value lowercased / asciifolded — i.e. produced
-    /// by the normalizer, not the default keyword analyzer. For a
-    /// `text` sub-field the declared (or default) analyzer applies. When
-    /// no `normalizer`/`analyzer` is set this falls back to
-    /// [`Self::analyzer`], so a plain `keyword` sub-field stores the
-    /// untouched value (single keyword token).
-    pub fn effective_analyzer(&self) -> AnalyzerName {
-        if let Some(normalizer) = self.normalizer {
-            return normalizer;
-        }
-        self.analyzer()
     }
 
     pub fn norms_enabled(&self) -> bool {

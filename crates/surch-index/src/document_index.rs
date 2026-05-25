@@ -5,8 +5,8 @@ use std::sync::{
 };
 
 use surch_analysis::{
-    Analyzer, KeywordAnalyzer, NormAnalyzer, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer,
-    WhitespaceAnalyzer,
+    Analyzer, KeywordAnalyzer, NormAnalyzer, Normalizer, SimpleAnalyzer, StandardAnalyzer,
+    StopAnalyzer, WhitespaceAnalyzer,
 };
 use thiserror::Error;
 
@@ -50,8 +50,8 @@ pub struct DocumentIndex {
     /// parent field declares `fields: { <sub>: { … } }` (matchID's
     /// `NOM.raw: { type: keyword, normalizer: norm }`), the parent's source
     /// value is stored here under the qualified `parent.sub` path with the
-    /// sub-field's analyzer/normalizer already applied
-    /// ([`FieldMapping::effective_analyzer`]).
+    /// sub-field's analyzer/normalizer already applied (see
+    /// [`subfield_terms`]).
     ///
     /// Outer key is the qualified field path (`"NOM.raw"`), inner key is the
     /// doc id, value is the normalized token. This is the durable storage
@@ -509,15 +509,22 @@ impl DocumentIndex {
     /// A10 (Phase 4): index the parent `value` under each declared sub-field
     /// of `parent_mapping`.
     ///
-    /// For every `parent.sub` sub-field, the parent's raw source value is
-    /// re-analyzed with the sub-field's
-    /// [`effective_analyzer`](crate::mapping::FieldMapping::effective_analyzer)
-    /// — the `normalizer` for a `keyword` sub-field carrying one (so
-    /// `NOM.raw` stores the lowercased / asciifolded value as a single
-    /// keyword token), the declared analyzer for a `text` sub-field. The
-    /// resulting tokens are added to the regular postings under the
+    /// For every `parent.sub` sub-field the parent's raw source value is
+    /// re-analyzed with the sub-field's own analysis chain (see
+    /// [`subfield_terms`]):
+    ///
+    /// - a `keyword` sub-field carrying a `normalizer` (matchID's
+    ///   `NOM.raw: { type: keyword, normalizer: norm }`) stores the WHOLE
+    ///   value as a single token, lowercased and asciifolded — ES applies
+    ///   a normalizer to the single keyword token, it never tokenizes;
+    /// - a `keyword` sub-field without a normalizer stores the value
+    ///   verbatim as one token;
+    /// - a `text` sub-field is tokenized by its declared (or default)
+    ///   analyzer.
+    ///
+    /// The resulting tokens are added to the regular postings under the
     /// qualified path so `term`/`match` on the sub-field resolves through
-    /// the FST, and the first (lowest-position) token is also recorded in
+    /// the FST, and the lowest-position token is recorded in
     /// `subfield_values` as the per-doc stored projection that sort / agg
     /// read directly.
     fn index_subfields(
@@ -529,8 +536,7 @@ impl DocumentIndex {
     ) -> Result<()> {
         for (sub_name, sub_mapping) in parent_mapping.subfields() {
             let path = format!("{parent}.{sub_name}");
-            let analyzer = sub_mapping.effective_analyzer();
-            let analyzed = analyzed_terms(analyzer, &path, value);
+            let analyzed = subfield_terms(sub_mapping, &path, value);
 
             // Record the stored projection: the term at the lowest position
             // (the whole normalized value for a keyword/normalizer sub-field,
@@ -619,6 +625,46 @@ fn analyzed_terms(
     }
 
     terms
+}
+
+/// A10 (Phase 4): analyze the parent `value` for a multi-field sub-field,
+/// keyed by the qualified `field` path.
+///
+/// Routes the value through the sub-field's analysis chain with ES-faithful
+/// semantics:
+///
+/// - `keyword` + `normalizer`: the WHOLE value as one token, lowercased +
+///   asciifolded via [`Normalizer`]. A normalizer in ES is a char/token
+///   filter chain applied to the single keyword token — it never tokenizes,
+///   so `"Étienne DUPRÉ"` stores `"etienne dupre"`, not `["etienne",
+///   "dupre"]`.
+/// - `keyword` without normalizer: the whole value verbatim as one token
+///   (identity, via [`KeywordAnalyzer`]).
+/// - any other type (e.g. `text`): the declared / default analyzer, which
+///   tokenizes (`analyzed_terms`).
+fn subfield_terms(
+    sub_mapping: &crate::mapping::FieldMapping,
+    field: &str,
+    value: &str,
+) -> BTreeMap<(String, String), Vec<u32>> {
+    if sub_mapping.field_type == FieldType::Keyword {
+        let tokens = match sub_mapping.normalizer {
+            Some(_) => Normalizer.token_stream(value),
+            None => KeywordAnalyzer.token_stream(value),
+        };
+        let mut terms = BTreeMap::<(String, String), Vec<u32>>::new();
+        let mut position = 0_u32;
+        for token in tokens {
+            position += token.position_increment;
+            terms
+                .entry((field.to_owned(), token.term))
+                .or_default()
+                .push(position - 1);
+        }
+        return terms;
+    }
+
+    analyzed_terms(sub_mapping.analyzer(), field, value)
 }
 
 #[cfg(test)]
