@@ -1159,6 +1159,54 @@ impl AppState {
         store.indices.get(index).map(|data| data.mapping.clone())
     }
 
+    /// A10 → A12 (Phase 4): per-document stored projection of a
+    /// multi-field sub-field, keyed by the public `_id`.
+    ///
+    /// Returns `Some(map)` iff `field_path` is a declared multi-field
+    /// sub-field (`parent.sub`) that the write-time fan-out
+    /// ([`DocumentIndex::index_subfields`]) materialised — i.e. when
+    /// [`DocumentIndex::has_subfield_values`] is `true`. Each entry maps a
+    /// public document id to the sub-field's stored value, with the
+    /// sub-field's analyzer/normalizer already applied at index time
+    /// (`NOM.raw` → lowercased + asciifolded keyword token). The map only
+    /// contains documents that actually carried the parent field.
+    ///
+    /// The query side (`sort` / `agg` on `.raw` / `.norm`) uses this to
+    /// read the A10 storage directly instead of re-scanning `_source` via
+    /// `lookup_sort_value` and re-normalising on read. Returns `None` for
+    /// top-level fields and for sub-fields with no stored projection
+    /// (e.g. an index without an explicit multi-field mapping), so the
+    /// caller transparently falls back to the legacy `_source` alias.
+    ///
+    /// Computed once per query (one read-lock acquisition) so the sort
+    /// comparator and the aggregation loop do not re-take the lock per
+    /// document.
+    pub fn subfield_projection(
+        &self,
+        index: &str,
+        field_path: &str,
+    ) -> Option<BTreeMap<String, String>> {
+        // Lot 1.6: the side-table is populated at write time, but a
+        // pending deferred FST build must be materialised so reads see a
+        // consistent post-write snapshot (mirrors the other read paths).
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let data = store.indices.get(index)?;
+        let per_doc = data.index.subfield_values_map().get(field_path)?;
+        let projection = per_doc
+            .iter()
+            .filter_map(|(doc_id, value)| {
+                data.reverse_document_ids
+                    .get(doc_id)
+                    .map(|public_id| (public_id.clone(), value.clone()))
+            })
+            .collect();
+        Some(projection)
+    }
+
     pub fn index_metadata(&self, index: &str) -> Option<IndexMetadata> {
         let store = self
             .store
