@@ -3455,6 +3455,121 @@ async fn search_router_a10_phase2_sort_subfield_without_normalizer_falls_back_to
     assert_eq!(ids, vec!["sku-3", "sku-2", "sku-1"]);
 }
 
+// --- A10 → A12 (Phase 4): sort + agg consume the write-time stored
+// sub-field projection (no `_source` scan, no read-time normalize) ---
+//
+// These tests pin the A12 finality criterion: with `NOM.raw: { type:
+// keyword, normalizer: norm }` declared, the write-time fan-out
+// (`DocumentIndex::index_subfields`) stores the lowercased/asciifolded
+// keyword per doc, and the query side reads THAT instead of aliasing
+// `NOM.raw` back to the parent `_source`. The discriminating signal is
+// that case/diacritic variants of the same name fold to ONE stored
+// value: a `cardinality`/`terms` agg on `NOM.raw` therefore collapses
+// them, which the legacy `lookup_sort_value` alias (verbatim `_source`)
+// could not do.
+
+#[tokio::test]
+async fn search_router_a10_phase4_sort_subfield_uses_stored_projection() {
+    // `NOM.raw` with `normalizer: norm`: the stored projection holds the
+    // whole value lowercased + asciifolded. Sorting ascending on
+    // `NOM.raw` must order by the stored keyword (`elise` < `etienne` <
+    // `zoe`), independent of the original `_source` casing/diacritics.
+    let router = app_router();
+    create_index_with_nom_multi_field(&router).await;
+    index_product(&router, "sku-zoe", r#"{"NOM":"Zoé"}"#).await;
+    index_product(&router, "sku-etienne", r#"{"NOM":"Étienne"}"#).await;
+    index_product(&router, "sku-elise", r#"{"NOM":"ÉLISE"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"sort":[{"NOM.raw":"asc"}],"_source":false}"#,
+    )
+    .await;
+
+    let ids: Vec<String> = body["hits"]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|h| h["_id"].as_str().unwrap().to_string())
+        .collect();
+    // Stored projection order: "elise" < "etienne" < "zoe".
+    assert_eq!(ids, vec!["sku-elise", "sku-etienne", "sku-zoe"]);
+}
+
+#[tokio::test]
+async fn search_router_a10_phase4_cardinality_subfield_uses_stored_projection() {
+    // Three docs whose `NOM` differ only by case/diacritics ("Dupré",
+    // "DUPRE", "dupré") all fold to the single stored keyword "dupre".
+    // A `cardinality` agg on `NOM.raw` must report ONE distinct value,
+    // proving it consumes the A10 storage rather than the verbatim
+    // `_source` (which would report three).
+    let router = app_router();
+    create_index_with_nom_multi_field(&router).await;
+    index_product(&router, "doc-1", r#"{"NOM":"Dupré"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"DUPRE"}"#).await;
+    index_product(&router, "doc-3", r#"{"NOM":"dupré"}"#).await;
+    index_product(&router, "doc-4", r#"{"NOM":"Martin"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"distinct_nom":{"cardinality":{"field":"NOM.raw"}}}}"#,
+    )
+    .await;
+
+    // "dupre" (folded x3) + "martin" = 2 distinct stored values.
+    assert_eq!(body["aggregations"]["distinct_nom"]["value"], 2);
+}
+
+#[tokio::test]
+async fn search_router_a10_phase4_terms_subfield_buckets_stored_projection() {
+    // A `terms` agg on `NOM.raw` must bucket by the stored
+    // lowercased/asciifolded keyword, so the case/diacritic variants of
+    // "Dupré" collapse into one `dupre` bucket with doc_count 3.
+    let router = app_router();
+    create_index_with_nom_multi_field(&router).await;
+    index_product(&router, "doc-1", r#"{"NOM":"Dupré"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"DUPRE"}"#).await;
+    index_product(&router, "doc-3", r#"{"NOM":"dupré"}"#).await;
+    index_product(&router, "doc-4", r#"{"NOM":"Martin"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_nom":{"terms":{"field":"NOM.raw","size":100}}}}"#,
+    )
+    .await;
+
+    let buckets = body["aggregations"]["by_nom"]["buckets"]
+        .as_array()
+        .expect("buckets array");
+    assert_eq!(buckets.len(), 2);
+    // doc_count desc, then key asc tiebreak: "dupre" (3) before "martin" (1).
+    assert_eq!(buckets[0]["key"], "dupre");
+    assert_eq!(buckets[0]["doc_count"], 3);
+    assert_eq!(buckets[1]["key"], "martin");
+    assert_eq!(buckets[1]["doc_count"], 1);
+}
+
+#[tokio::test]
+async fn search_router_a10_phase4_unmapped_subfield_still_aliases_to_parent() {
+    // Regression guard: an index WITHOUT an explicit multi-field mapping
+    // (auto-inferred via `index_product`) has no stored `NOM.raw`
+    // projection, so a `cardinality` on `NOM.raw` must keep falling back
+    // to the parent `_source` alias — counting the verbatim values, NOT
+    // collapsing case. "MARTIN" + "martin" = 2 distinct here.
+    let router = app_router();
+    index_product(&router, "doc-1", r#"{"NOM":"MARTIN"}"#).await;
+    index_product(&router, "doc-2", r#"{"NOM":"martin"}"#).await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"distinct_nom":{"cardinality":{"field":"NOM.raw"}}}}"#,
+    )
+    .await;
+
+    // No stored projection: verbatim `_source` alias keeps both values.
+    assert_eq!(body["aggregations"]["distinct_nom"]["value"], 2);
+}
+
 // --- A5: `function_score` no-op wrapper ---
 //
 // matchID's deces-backend wraps every advanced + block-match in

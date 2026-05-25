@@ -1002,15 +1002,27 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
         }
     }
     let sort_mapping = indices.first().and_then(|index| state.index_mapping(index));
+    // A10 → A12 (Phase 4): resolve, once per query, the write-time
+    // stored projection of every multi-field sub-field referenced by a
+    // sort clause or an aggregation. When a path is a stored sub-field
+    // (`NOM.raw` / `.norm`), sort + agg read the analysed value directly
+    // from this map instead of re-scanning `_source` via
+    // `lookup_sort_value`. Resolved against the first index, mirroring
+    // `sort_mapping`; non-sub-field paths leave the map empty and fall
+    // back to the legacy alias transparently.
+    let subfield_projections =
+        collect_subfield_projections(state, indices.first().map(String::as_str), request);
     sort_scored_documents(
         &mut matched_documents,
         &request.sort,
         scoring_enabled,
         sort_mapping.as_ref(),
+        &subfield_projections,
     );
     let max_score = compute_max_score(&matched_documents, scoring_enabled);
     let total = matched_documents.len() as u64;
-    let aggregations = compute_aggregations(&request.aggs, &matched_documents);
+    let aggregations =
+        compute_aggregations(&request.aggs, &matched_documents, &subfield_projections);
     let hits = paginate_hits(request, &matched_documents, scoring_enabled);
     let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
 
@@ -1024,6 +1036,96 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     response
 }
 
+/// A10 → A12 (Phase 4): per-query cache of write-time stored sub-field
+/// projections, keyed by qualified field path (`"NOM.raw"`). Each inner
+/// map is `public _id -> stored value` (the sub-field's analysed token,
+/// already lowercased/asciifolded for a `.norm`/`.raw` keyword), built
+/// once from [`AppState::subfield_projection`].
+///
+/// A path absent from the map (or whose lookup returned `None`) is NOT a
+/// stored sub-field, so sort/agg fall back to the legacy `_source` alias
+/// via `lookup_sort_value`. This keeps non-mapped indices (the auto-infer
+/// `index_product` tests) on the existing behaviour untouched.
+#[derive(Debug, Default)]
+struct SubfieldProjections {
+    by_field: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl SubfieldProjections {
+    /// Whether `field_path` resolved to a stored sub-field projection.
+    fn is_stored_subfield(&self, field_path: &str) -> bool {
+        self.by_field.contains_key(field_path)
+    }
+
+    /// The stored sub-field value for `(field_path, public_id)` wrapped as
+    /// a JSON string, ready to feed the sort comparator / agg bucketing
+    /// path. Returns `None` when the path is not a stored sub-field or the
+    /// document carried no value for it (the parent field was absent).
+    fn value(&self, field_path: &str, public_id: &str) -> Option<Value> {
+        self.by_field
+            .get(field_path)?
+            .get(public_id)
+            .map(|stored| Value::String(stored.clone()))
+    }
+}
+
+/// A10 → A12 (Phase 4): gather the stored projection for every sub-field
+/// path referenced by the request's `sort` clauses or aggregations.
+///
+/// One [`AppState::subfield_projection`] call per distinct path; paths
+/// that are not stored sub-fields (top-level fields, or sub-fields on an
+/// index without an explicit multi-field mapping) contribute nothing, so
+/// the resulting map only holds the paths the query side should resolve
+/// against the A10 storage.
+fn collect_subfield_projections(
+    state: &AppState,
+    index: Option<&str>,
+    request: &SearchRequest,
+) -> SubfieldProjections {
+    let mut projections = SubfieldProjections::default();
+    let Some(index) = index else {
+        return projections;
+    };
+
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for clause in &request.sort {
+        if clause.field != "_score" {
+            paths.insert(clause.field.as_str());
+        }
+    }
+    for spec in request.aggs.values() {
+        match spec {
+            AggSpec::Terms { field, .. }
+            | AggSpec::DateHistogram { field, .. }
+            | AggSpec::Cardinality { field } => {
+                paths.insert(field.as_str());
+            }
+            AggSpec::Composite { sources, .. } => {
+                for source in sources {
+                    let field = match &source.kind {
+                        CompositeSourceKind::Terms { field } => field,
+                        CompositeSourceKind::DateHistogram { field, .. } => field,
+                    };
+                    paths.insert(field.as_str());
+                }
+            }
+        }
+    }
+
+    for path in paths {
+        // Only dotted paths can be multi-field sub-fields; skip the
+        // top-level field lookups entirely (they always return `None`).
+        if !path.contains('.') {
+            continue;
+        }
+        if let Some(projection) = state.subfield_projection(index, path) {
+            projections.by_field.insert(path.to_owned(), projection);
+        }
+    }
+
+    projections
+}
+
 /// A12.1+A12.2+A12.3+A12.4: dispatch every declared aggregation against
 /// the post-filter matched-document set. Returns `None` when no aggs
 /// are declared so the response stays shape-compatible with zero-agg
@@ -1031,6 +1133,7 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
 fn compute_aggregations(
     specs: &BTreeMap<String, AggSpec>,
     matched_documents: &[ScoredDocument],
+    subfield_projections: &SubfieldProjections,
 ) -> Option<BTreeMap<String, AggResult>> {
     if specs.is_empty() {
         return None;
@@ -1039,7 +1142,7 @@ fn compute_aggregations(
     for (name, spec) in specs {
         let result = match spec {
             AggSpec::Terms { field, size } => {
-                compute_terms_aggregation(matched_documents, field, *size)
+                compute_terms_aggregation(matched_documents, field, *size, subfield_projections)
             }
             AggSpec::DateHistogram {
                 field,
@@ -1050,19 +1153,49 @@ fn compute_aggregations(
                 field,
                 *calendar_interval,
                 format.as_deref(),
+                subfield_projections,
             ),
             AggSpec::Cardinality { field } => {
-                compute_cardinality_aggregation(matched_documents, field)
+                compute_cardinality_aggregation(matched_documents, field, subfield_projections)
             }
             AggSpec::Composite {
                 sources,
                 size,
                 after,
-            } => compute_composite_aggregation(matched_documents, sources, *size, after.as_ref()),
+            } => compute_composite_aggregation(
+                matched_documents,
+                sources,
+                *size,
+                after.as_ref(),
+                subfield_projections,
+            ),
         };
         out.insert(name.clone(), result);
     }
     Some(out)
+}
+
+/// A10 → A12 (Phase 4): resolve a per-document aggregation/sort value for
+/// `field`, preferring the write-time stored sub-field projection over a
+/// `_source` scan.
+///
+/// When `field` is a stored multi-field sub-field (`NOM.raw`/`.norm`), the
+/// value comes straight from the A10 side-table (already analysed with the
+/// sub-field's chain). A document missing the projection on a stored
+/// sub-field yields `None` — its parent field was absent, so it does not
+/// contribute a bucket / distinct value (parity with ES, which skips
+/// docs lacking the field). Otherwise we fall back to the legacy
+/// `lookup_sort_value` alias, cloning the borrowed `_source` value so the
+/// caller owns a uniform [`Value`].
+fn aggregation_value(
+    scored: &ScoredDocument,
+    field: &str,
+    subfield_projections: &SubfieldProjections,
+) -> Option<Value> {
+    if subfield_projections.is_stored_subfield(field) {
+        return subfield_projections.value(field, &scored.doc.id);
+    }
+    lookup_sort_value(&scored.doc.source, field).cloned()
 }
 
 /// A12.1: `terms` aggregation executor. Iterates the matched documents,
@@ -1083,13 +1216,14 @@ fn compute_terms_aggregation(
     matched_documents: &[ScoredDocument],
     field: &str,
     size: usize,
+    subfield_projections: &SubfieldProjections,
 ) -> AggResult {
     let mut counts: BTreeMap<TermsKey, (Value, u64)> = BTreeMap::new();
     for scored in matched_documents {
-        let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
+        let Some(value) = aggregation_value(scored, field, subfield_projections) else {
             continue;
         };
-        match value {
+        match &value {
             Value::Array(items) => {
                 for item in items {
                     record_terms_value(&mut counts, item);
@@ -1140,13 +1274,14 @@ fn compute_date_histogram_aggregation(
     field: &str,
     calendar_interval: CalendarInterval,
     format: Option<&str>,
+    subfield_projections: &SubfieldProjections,
 ) -> AggResult {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     for scored in matched_documents {
-        let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
+        let Some(value) = aggregation_value(scored, field, subfield_projections) else {
             continue;
         };
-        match value {
+        match &value {
             Value::Array(items) => {
                 for item in items {
                     if let Some(bucket_key) = bucket_key_for_date(item, calendar_interval) {
@@ -1246,13 +1381,17 @@ fn week_anchor_monday(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
 /// (same path as terms / sort). MVP: exact count, no HyperLogLog
 /// estimation — matchID's analytics tab consumes the exact value
 /// today.
-fn compute_cardinality_aggregation(matched_documents: &[ScoredDocument], field: &str) -> AggResult {
+fn compute_cardinality_aggregation(
+    matched_documents: &[ScoredDocument],
+    field: &str,
+    subfield_projections: &SubfieldProjections,
+) -> AggResult {
     let mut distinct: BTreeSet<TermsKey> = BTreeSet::new();
     for scored in matched_documents {
-        let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
+        let Some(value) = aggregation_value(scored, field, subfield_projections) else {
             continue;
         };
-        match value {
+        match &value {
             Value::Array(items) => {
                 for item in items {
                     if !matches!(item, Value::Null) {
@@ -1303,6 +1442,7 @@ fn compute_composite_aggregation(
     sources: &[CompositeSource],
     size: usize,
     after: Option<&BTreeMap<String, Value>>,
+    subfield_projections: &SubfieldProjections,
 ) -> AggResult {
     // Collect bucket counts keyed by the composite tuple. Each entry
     // stores both the canonical per-source `Value` (for the response
@@ -1317,7 +1457,10 @@ fn compute_composite_aggregation(
                 CompositeSourceKind::Terms { field } => field,
                 CompositeSourceKind::DateHistogram { field, .. } => field,
             };
-            let Some(value) = lookup_sort_value(&scored.doc.source, field) else {
+            // A10 → A12 (Phase 4): prefer the write-time stored sub-field
+            // projection (owned `Value`); otherwise the legacy `_source`
+            // alias. Bound to a local so `scalar` can borrow from it.
+            let Some(value) = aggregation_value(scored, field, subfield_projections) else {
                 all_present = false;
                 break;
             };
@@ -1327,7 +1470,7 @@ fn compute_composite_aggregation(
             // only emits composite over scalar keyword / date fields,
             // so the trade-off is invisible in practice. Tightening
             // tracked in A12.4 phase 3.
-            let scalar = match value {
+            let scalar = match &value {
                 Value::Array(items) => items.iter().find(|v| !matches!(v, Value::Null)),
                 Value::Null => None,
                 other => Some(other),
@@ -5309,6 +5452,7 @@ fn sort_scored_documents(
     clauses: &[SortClause],
     scoring_enabled: bool,
     mapping: Option<&IndexMapping>,
+    subfield_projections: &SubfieldProjections,
 ) {
     if clauses.is_empty() {
         if scoring_enabled {
@@ -5325,7 +5469,11 @@ fn sort_scored_documents(
     // A10 phase 2: pre-resolve, for each sort clause, the sub-field
     // normalizer (if any) so we apply it once per comparison instead of
     // looking it up on every doc-pair. matchID's `NOM.raw` →
-    // `{ type: keyword, normalizer: norm }` shape lands here.
+    // `{ type: keyword, normalizer: norm }` shape lands here. This is now
+    // only used as the read-time fallback for sub-fields that did NOT get
+    // a write-time stored projection — when A10 storage is present (the
+    // common matchID path), `compare_sort_clause` reads the pre-analysed
+    // value directly and never touches the normalizer.
     let normalizers: Vec<Option<AnalyzerName>> = clauses
         .iter()
         .map(|clause| mapping.and_then(|m| m.subfield_normalizer(&clause.field)))
@@ -5333,7 +5481,8 @@ fn sort_scored_documents(
 
     documents.sort_by(|left, right| {
         for (clause, normalizer) in clauses.iter().zip(normalizers.iter()) {
-            let ordering = compare_sort_clause(left, right, clause, *normalizer);
+            let ordering =
+                compare_sort_clause(left, right, clause, *normalizer, subfield_projections);
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
             }
@@ -5347,15 +5496,31 @@ fn compare_sort_clause(
     right: &ScoredDocument,
     clause: &SortClause,
     normalizer: Option<AnalyzerName>,
+    subfield_projections: &SubfieldProjections,
 ) -> std::cmp::Ordering {
     if clause.field == "_score" {
         return compare_score(left.score, right.score, clause.order);
     }
+
+    // A10 → A12 (Phase 4): when the sort field is a write-time stored
+    // sub-field (`NOM.raw`/`.norm`), compare the analysed value the
+    // fan-out projected at index time — already lowercased/asciifolded
+    // for a keyword + `normalizer` sub-field. No `_source` scan, no
+    // read-time normalisation: the stored projection IS the ES-faithful
+    // sort key. A document missing the projection (parent field absent)
+    // sorts last, same as a missing `_source` value.
+    if subfield_projections.is_stored_subfield(&clause.field) {
+        let left_value = subfield_projections.value(&clause.field, &left.doc.id);
+        let right_value = subfield_projections.value(&clause.field, &right.doc.id);
+        return compare_field(left_value.as_ref(), right_value.as_ref(), clause.order);
+    }
+
     let left_value = lookup_sort_value(&left.doc.source, &clause.field);
     let right_value = lookup_sort_value(&right.doc.source, &clause.field);
-    // A10 phase 2: when the sub-field declares a `normalizer`, apply it
-    // to the parent's stored value at read time. Until write-time fan-out
-    // ships (gap-analysis A10 "phase 3"), this gives matchID the
+    // A10 phase 2 fallback: when the sub-field declares a `normalizer`
+    // but has no write-time stored projection (e.g. an index without an
+    // explicit multi-field mapping), apply the normalizer to the parent's
+    // stored value at read time so matchID still gets the
     // lowercase/asciifold ordering it expects on `NOM.raw`.
     let (left_norm, right_norm) = match normalizer {
         Some(name) => (
