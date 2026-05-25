@@ -116,7 +116,7 @@ historical replay line lives in
   but system RSS recovers only `268 MiB` (`5859 -> 5591 MiB`) due
   to glibc default allocator inertia — addressed by new Lot 1.7.
 - [x] Follow-up Lot 1.6 closed by `2e4361e` / promoted as
-  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-lot2-K8s/`.
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-K8s/`.
   Deferred FST term-dictionary build off the bulk path: TREC-COVID
   Surch bulk `139 -> 56 s`, **Surch now `1.54x` faster than
   OpenSearch**; RSS peak `3424 -> 2156 MiB`. NDCG unchanged.

@@ -57,7 +57,7 @@ need a fresh run.
   Brings Surch under OpenSearch on every memory + every quality
   metric and within `1.42x` on bulk; allocator parity with
   Elasticsearch/OpenSearch achieved.
-- `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-lot2-K8s/README.md`:
+- `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-K8s/README.md`:
   Lot 1.6 (deferred FST term-dictionary build, `2e4361e`) + Lot 2
   (skip lists on FoR postings, `d73c862`) landed together. **Surch
   crosses OpenSearch bulk parity on TREC-COVID**: `139.05 -> 56.38 s`

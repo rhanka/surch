@@ -220,7 +220,7 @@ dominant Surch bulk cost on long-text corpora.
   materializes once at `_refresh`. `terms_build_count` instrumentation
   + test assert the rebuild count stays ~constant across chunks.
 - [x] K8s `ndcg-gate` run `26373579876` on `2e4361e` promoted as
-  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-lot2-K8s/`.
+  `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-K8s/`.
   TREC-COVID Surch bulk `139.05 -> 56.38 s`; **Surch now `1.54x`
   FASTER than OpenSearch** (`86.61 s`). RSS peak `3424 -> 2156 MiB`.
   NDCG unchanged. Total Lot 1→1.6 speedup `~17.8x` (`1002 -> 56 s`).

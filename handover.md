@@ -106,7 +106,7 @@ reporting demandé, (3) les prochaines actions à conduire.
 
 | # | Type | Détail | Next step |
 |---|------|--------|-----------|
-| 1 | Run K8s en cours | `ci-k8s ndcg-gate` run `26373579876` sur `2e4361e` valide Lot 1.6 (bulk) + Lot 2 (search) en un seul run. `ci` workspace déjà vert (run `26373423517`) → A+B compilent + tests OK ensemble. | À la fin : télécharger l'artefact, comparer bulk TREC-COVID + RSS vs baseline jemalloc (`2026-05-24-ndcg-gate-lot1.7-jemalloc-K8s/`), publier `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-lot2-K8s/`, mettre à jour le tableau de bord performance + `plan/wp-a-perf-followups.md` Lots 1.6/2 + `PLAN.md`. |
+| 1 | Run K8s en cours | `ci-k8s ndcg-gate` run `26373579876` sur `2e4361e` valide Lot 1.6 (bulk) + Lot 2 (search) en un seul run. `ci` workspace déjà vert (run `26373423517`) → A+B compilent + tests OK ensemble. | À la fin : télécharger l'artefact, comparer bulk TREC-COVID + RSS vs baseline jemalloc (`2026-05-24-ndcg-gate-lot1.7-jemalloc-K8s/`), publier `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-K8s/`, mettre à jour le tableau de bord performance + `plan/wp-a-perf-followups.md` Lots 1.6/2 + `PLAN.md`. |
 | 2 | Décision user | Prochaine attaque après A+B validés : Lot 3 (Block-Max WAND v2) ou pivot Track D Phase 4 A10 ? | Poser via `AskUserQuestion` quand le run sera vert. |
 | 3 | Ménage worktrees | 3 worktrees d'agents restent `locked` (cf. §4). | `git worktree remove --force` une fois les branches mergées confirmées. |
 
@@ -144,7 +144,7 @@ Attendu :
   par `ndcg-gate` ; pour le voir il faudra un `insee-bench` replay
   (latence artillery) — à considérer comme sous-action.
 
-Puis publier `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-lot2-K8s/`
+Puis publier `docs/ops/bench-reports/2026-05-24-ndcg-gate-lot1.6-K8s/`
 (README + summary + bench.json + rss + job.yaml), mettre à jour :
 - `docs/ops/bench-reports/track-a-performance-ledger.md` (lignes Bulk
   + RSS + une éventuelle ligne search/skip-list).

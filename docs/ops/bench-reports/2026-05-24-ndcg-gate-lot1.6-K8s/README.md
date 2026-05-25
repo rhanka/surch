@@ -1,15 +1,31 @@
-# BEIR NDCG gate - 2026-05-24 (K8s, Surch crosses OpenSearch bulk parity)
+# BEIR NDCG gate - 2026-05-24 (K8s, Lot 1.6 deferred FST build)
 
-First `ndcg-gate` K8s run carrying both Track A Lot 1.6 (deferred FST
-term-dictionary build off the bulk path, `2e4361e`) and Lot 2
-(skip lists on FoR postings + leapfrog AND, `d73c862`). The two lots
-were developed in parallel isolated worktrees and merged together.
+`ndcg-gate` K8s run measuring Track A **Lot 1.6** — deferred FST
+term-dictionary build off the bulk path (`2e4361e`). The run carries
+both Lot 1.6 and Lot 2 (skip lists, `d73c862`) because they merged
+together, but **the bulk gain reported here is attributable to Lot
+1.6 alone**: Lot 2 is a search-side change and is bulk-neutral, as
+proven by the control run on `d73c862` (Lot 2 only) which kept
+TREC-COVID Surch bulk at `157.1 s` ≈ the jemalloc baseline `139 s`
+(see `2026-05-24-ndcg-gate-lot1.7-jemalloc-K8s/`). Lot 2's own
+search-latency gain is measured separately in the Lot 2 report.
 
-**Milestone**: Surch now ingests the full 171 k TREC-COVID corpus
-**faster than OpenSearch** (`56.4 s` vs `86.6 s`, Surch `1.54x`
-faster), reversing the `13.9x` OpenSearch advantage measured before
-Lot 1. NDCG@10 / Recall@10 unchanged. Surch RSS peak also dropped
-again (`3424 -> 2156 MiB`).
+**Milestone**: with Lot 1.6, Surch ingests the full 171 k TREC-COVID
+corpus **faster than OpenSearch** (`56.4 s` vs `86.6 s`, Surch
+`1.54x` faster), reversing the `13.9x` OpenSearch advantage measured
+before Lot 1. NDCG@10 / Recall@10 unchanged. Surch RSS peak also
+dropped (`3424 -> 2156 MiB`).
+
+## Lot 1.6 isolation (control: Lot 2-only `d73c862`)
+
+| Config | SHA | TREC-COVID Surch bulk | Attribution |
+|--------|-----|----------------------:|-------------|
+| jemalloc baseline (no Lot 1.6, no Lot 2) | `b9f6636` | 139.05 s | — |
+| Lot 2 only (skip lists) | `d73c862` | 157.12 s | bulk-neutral (≈ baseline, within run noise) |
+| Lot 1.6 + Lot 2 | `2e4361e` | **56.38 s** | the `157 -> 56 s` drop is **Lot 1.6** |
+
+Lot 2 does not touch the bulk write path, so the deferred FST build
+(Lot 1.6) owns the entire bulk speedup.
 
 ## Provenance
 
