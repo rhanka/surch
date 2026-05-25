@@ -103,9 +103,17 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
   (`DocumentIndex::index_subfields` / `subfield_terms` /
   `subfield_values` + `DocumentIndex::subfield_value`), tests
   `*subfield*` étendus (5 unitaires fan-out + 1 accounting mémoire).
-  Reste : brancher `subfield_value` dans `sort`/`agg` côté query (le
-  read-time alias `lookup_sort_value` reste le fallback durable) — à
-  faire dans le suivi A1/A12.
+- [x] Lot 0b — A10→A12 hinge : `sort`/`agg` côté query consomment le
+  storage A10 (`AppState::subfield_projection` →
+  `DocumentIndex::subfield_value`). `sort: NOM.raw` compare la valeur
+  pré-analysée stockée (plus de normalize au read) ; `terms` /
+  `cardinality` / `date_histogram` / `composite` sur un sous-champ
+  stocké lisent le storage, plus `lookup_sort_value`. L'alias
+  `_source` reste le fallback pour les chemins sans projection stockée
+  (index sans mapping multi-field explicite). Tests
+  `search_router_a10_phase4_*` (sort + cardinality + terms + alias
+  fallback). Ferme le critère A12 « agg.cardinality sur .raw n'utilise
+  pas lookup_sort_value mais le storage ».
 - [ ] Lot 1 — A1/A13 multi-field + edge_ngram câblé.
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
