@@ -93,6 +93,20 @@ attendues" en fin de bloc).**
 - Priorité après F2 : approfondir Track D Phase 4 (A1/A12…) ou
   Objectif F (F3 replays historiques) ? Le loop avance sur F par
   défaut tant que non tranché.
+- **Isolation Lot 3 (MaxScore) sur grand corpus** : le harness F4
+  `trec-covid-latency` permet enfin de mesurer le régime de Lot 3
+  (longues listes), mais il n'existe AUCUN toggle runtime de MaxScore
+  (câblé en dur dans `search.rs:1793/1803`). Pour produire un contrôle
+  « sans Lot 3 » il faut soit (a) ajouter un flag de mesure
+  (env `SURCH_DISABLE_MAXSCORE`) — va à l'encontre de la règle
+  « pas de feature flags », mais isole proprement depuis HEAD ; soit
+  (b) porter le harness F4 (job + `--query-mode trec` + `--rss-peak-mb`)
+  sur le SHA parent de `e293cfc` (plumbing style F3, lourd, risque de
+  build avec le toolchain actuel). **Décision : (a) flag de mesure
+  temporaire, (b) port historique, ou (c) renoncer à l'isolation
+  large-corpus de Lot 3 et le citer comme « livré, neutre sur INSEE,
+  bénéfice grand-corpus non isolé » ?** Le loop avance par défaut sur
+  le multi-rep F4 (sans décision requise) en attendant.
 
 ---
 
