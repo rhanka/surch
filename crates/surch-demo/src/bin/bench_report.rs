@@ -14,6 +14,7 @@
 //!                [--baseline target/bench-reports/<other_sha>]
 //!                [--output target/bench-reports/<sha>/summary.md]
 //!                [--promote-dir docs/ops/bench-reports/<date>-<context>]
+//!                [--rss-peak-mb 1024]
 //!
 //! Output:
 //!   * Markdown summary at `--output` (or `<DIR>/summary.md`)
@@ -30,8 +31,10 @@
 //!   * Surch artillery max ≤ 500 ms (Surch engine only)
 //!   * artillery error rate ≤ 1 % (both engines — a non-zero rate
 //!     invalidates the comparison)
-//!   * Surch RSS peak ≤ 1024 MB on the artillery INSEE workload
-//!     (Surch engine only — the JVM reference engine is exempt)
+//!   * Surch RSS peak ≤ `--rss-peak-mb` MB on the artillery workload
+//!     (default 1024 for INSEE 10k; raise for large-corpus jobs whose
+//!     resident set scales with the corpus. Surch engine only — the JVM
+//!     reference engine is exempt)
 //!
 //! Regression thresholds vs `--baseline`:
 //!   * p95 (artillery) regressed by more than 15 %
@@ -91,7 +94,7 @@ fn run() -> Result<bool, CliError> {
     let sha = infer_sha(&plan.dir);
     let baseline_sha = plan.baseline.as_ref().map(|p| infer_sha(p));
 
-    let slo_results = evaluate_slo(&current);
+    let slo_results = evaluate_slo(&current, plan.rss_peak_mb);
     let regression_results = match &baseline {
         Some(base) => evaluate_regressions(&current, base),
         None => Vec::new(),
@@ -133,6 +136,7 @@ struct Plan {
     baseline: Option<PathBuf>,
     output: Option<PathBuf>,
     promote_dir: Option<PathBuf>,
+    rss_peak_mb: f64,
 }
 
 impl Plan {
@@ -160,6 +164,7 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
     let mut baseline: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut promote_dir: Option<PathBuf> = None;
+    let mut rss_peak_mb: f64 = SLO_RSS_PEAK_MB;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -169,6 +174,12 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
             "--output" => output = Some(PathBuf::from(required(&mut iter, "--output")?)),
             "--promote-dir" => {
                 promote_dir = Some(PathBuf::from(required(&mut iter, "--promote-dir")?));
+            }
+            "--rss-peak-mb" => {
+                let raw = required(&mut iter, "--rss-peak-mb")?;
+                rss_peak_mb = raw
+                    .parse::<f64>()
+                    .map_err(|_| CliError::Usage(format!("invalid --rss-peak-mb value `{raw}`")))?;
             }
             other => {
                 return Err(CliError::Usage(format!("unknown option `{other}`")));
@@ -188,6 +199,7 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
         baseline,
         output,
         promote_dir,
+        rss_peak_mb,
     })
 }
 
@@ -622,7 +634,7 @@ struct SloCheck {
     passed: bool,
 }
 
-fn evaluate_slo(agg: &Aggregate) -> Vec<SloCheck> {
+fn evaluate_slo(agg: &Aggregate, rss_peak_mb: f64) -> Vec<SloCheck> {
     let mut checks = Vec::new();
     for row in &agg.artillery {
         // The p95 / max latency SLOs are a *Surch* performance budget.
@@ -674,20 +686,25 @@ fn evaluate_slo(agg: &Aggregate) -> Vec<SloCheck> {
             passed,
         });
     }
-    // RSS peak SLO is a *Surch* memory target on the artillery INSEE
+    // RSS peak SLO is a *Surch* memory target on the artillery
     // workload. It must not gate the reference engine: OpenSearch /
     // Elasticsearch run a JVM with `-Xmx1g`, so their RSS legitimately
     // exceeds 1 GiB and is irrelevant to Surch's footprint budget.
     // Reference-engine RSS rows are still rendered in the human report
-    // for comparison, but only the `surch` engine gates the SLO.
+    // for comparison, but only the `surch` engine gates the SLO. The
+    // budget `rss_peak_mb` is per-workload (passed via `--rss-peak-mb`):
+    // the INSEE 10k job uses the default 1024 MB, while the 171k
+    // trec-covid-latency job declares a corpus-appropriate budget, since
+    // Surch's resident set scales with the indexed corpus and ~2 GiB is
+    // expected there (not a regression).
     for row in &agg.rss {
-        let is_insee_artillery = row.workload.contains("insee") || row.label.contains("art");
-        if is_insee_artillery && row.engine == "surch" {
-            let passed = row.peak_mb <= SLO_RSS_PEAK_MB;
+        let is_artillery = row.workload.contains("insee") || row.label.contains("art");
+        if is_artillery && row.engine == "surch" {
+            let passed = row.peak_mb <= rss_peak_mb;
             checks.push(SloCheck {
                 name: format!(
-                    "Surch RSS peak ≤ {} MB (artillery on INSEE) [{}]",
-                    SLO_RSS_PEAK_MB, row.label
+                    "Surch RSS peak ≤ {} MB (artillery) [{}]",
+                    rss_peak_mb, row.label
                 ),
                 detail: format!("observed peak = {:.1} MB", row.peak_mb),
                 passed,
@@ -1129,6 +1146,9 @@ fn print_help() {
     println!("  --baseline <DIR>    optional baseline directory for regression detection");
     println!("  --output <FILE>     output Markdown path (default: <DIR>/summary.md)");
     println!("  --promote-dir <DIR> write promoted README.md and summary.json under <DIR>");
+    println!(
+        "  --rss-peak-mb <MB>  Surch RSS peak SLO budget in MB (default {SLO_RSS_PEAK_MB}; raise for large-corpus jobs)"
+    );
     println!("  -h, --help          print this help");
     println!();
     println!("REPORT CONTRACT:");
@@ -1147,7 +1167,9 @@ fn print_help() {
     println!("  Surch artillery p95 ≤ {SLO_ARTILLERY_P95_MS} ms (Surch engine only)");
     println!("  Surch artillery max ≤ {SLO_ARTILLERY_MAX_MS} ms (Surch engine only)");
     println!("  artillery error rate ≤ {SLO_ARTILLERY_ERROR_RATE_PCT} %");
-    println!("  Surch RSS peak ≤ {SLO_RSS_PEAK_MB} MB (artillery INSEE, Surch engine only)");
+    println!(
+        "  Surch RSS peak ≤ {SLO_RSS_PEAK_MB} MB (artillery, Surch only; per-workload via --rss-peak-mb)"
+    );
     println!("  SciFact NDCG@10 ≥ {SLO_SCIFACT_NDCG_10}");
     println!("  TREC-COVID NDCG@10 ≥ {SLO_TREC_COVID_NDCG_10}");
     println!();
@@ -1322,7 +1344,7 @@ Recall@10 = 0.8100
             ],
             ..Aggregate::default()
         };
-        let checks = evaluate_slo(&agg);
+        let checks = evaluate_slo(&agg, SLO_RSS_PEAK_MB);
         let rss_checks: Vec<_> = checks
             .iter()
             .filter(|c| c.name.contains("RSS peak"))
@@ -1351,12 +1373,50 @@ Recall@10 = 0.8100
             }],
             ..Aggregate::default()
         };
-        let checks = evaluate_slo(&agg);
+        let checks = evaluate_slo(&agg, SLO_RSS_PEAK_MB);
         let rss = checks
             .iter()
             .find(|c| c.name.contains("RSS peak"))
             .expect("surch RSS check should exist");
         assert!(!rss.passed, "surch peak 1500 MB must fail the SLO");
+    }
+
+    #[test]
+    fn evaluate_slo_rss_budget_is_per_workload() {
+        // Regression guard for trec-covid-latency: on the 171k corpus
+        // Surch's resident set legitimately reaches ~2.1 GiB, far above
+        // the INSEE 10k default of 1024 MB. The large-corpus job passes a
+        // higher `--rss-peak-mb`; the same peak must pass under that
+        // budget and fail under the default.
+        let agg = Aggregate {
+            rss: vec![RssRow {
+                label: "rss-art-surch".into(),
+                engine: "surch".into(),
+                workload: "art".into(),
+                peak_mb: 2168.0,
+                final_mb: 1400.0,
+            }],
+            ..Aggregate::default()
+        };
+        let under_default = evaluate_slo(&agg, SLO_RSS_PEAK_MB);
+        assert!(
+            !under_default
+                .iter()
+                .find(|c| c.name.contains("RSS peak"))
+                .expect("surch RSS check should exist")
+                .passed,
+            "2168 MB must fail the default 1024 MB budget"
+        );
+        let under_raised = evaluate_slo(&agg, 2560.0);
+        let raised = under_raised
+            .iter()
+            .find(|c| c.name.contains("RSS peak"))
+            .expect("surch RSS check should exist");
+        assert!(raised.passed, "2168 MB must pass a 2560 MB budget");
+        assert!(
+            raised.name.contains("2560"),
+            "the check name must reflect the active budget"
+        );
     }
 
     #[test]
@@ -1392,7 +1452,7 @@ Recall@10 = 0.8100
             ],
             ..Aggregate::default()
         };
-        let checks = evaluate_slo(&agg);
+        let checks = evaluate_slo(&agg, SLO_RSS_PEAK_MB);
         let latency_checks: Vec<_> = checks
             .iter()
             .filter(|c| c.name.contains("artillery p95") || c.name.contains("artillery max"))
@@ -1429,7 +1489,7 @@ Recall@10 = 0.8100
             }],
             ..Aggregate::default()
         };
-        let checks = evaluate_slo(&agg);
+        let checks = evaluate_slo(&agg, SLO_RSS_PEAK_MB);
         let p95 = checks
             .iter()
             .find(|c| c.name.starts_with("Surch artillery p95"))
@@ -1457,7 +1517,7 @@ Recall@10 = 0.8100
             }],
             ..Aggregate::default()
         };
-        let checks = evaluate_slo(&agg);
+        let checks = evaluate_slo(&agg, SLO_RSS_PEAK_MB);
         let ndcg = checks
             .iter()
             .find(|c| c.name.starts_with("BEIR NDCG@10"))
@@ -1547,7 +1607,7 @@ Recall@10 = 0.8100
             }],
             ..Aggregate::default()
         };
-        let slo = evaluate_slo(&agg);
+        let slo = evaluate_slo(&agg, SLO_RSS_PEAK_MB);
         let md = render_markdown(
             "abc1234",
             None,

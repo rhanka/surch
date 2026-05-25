@@ -311,9 +311,16 @@ spec:
                 --names "$WORK/artillery_queries.txt" \
                 --workers "$ART_WORKERS" --phases "$ART_PHASES" \
                 --report "$REPORTS_DIR/art-os.json"
+              # RSS budget is per-workload: on the full 171k corpus Surch's
+              # resident set scales to ~2.1 GiB (documented, not a
+              # regression), well above the INSEE 10k default of 1024 MB.
+              # Declare a corpus-appropriate budget so the latency Job is
+              # gated on Surch latency + error rate, not on a memory
+              # threshold calibrated for a 17x smaller corpus.
               /usr/local/bin/bench_report \
                 --dir "$REPORTS_DIR" \
-                --output "$REPORTS_DIR/summary.md"
+                --output "$REPORTS_DIR/summary.md" \
+                --rss-peak-mb 2560
               wait_rss_sample "$REPORTS_DIR/.rss-surch.pid"
               wait_rss_sample "$REPORTS_DIR/.rss-os.pid"
               # Surface each rss-*.json envelope between markers so the
