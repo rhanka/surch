@@ -239,12 +239,19 @@ encoded block metadata are the next algorithmic layer.
 - [x] Codec + search coverage added (`crates/surch-search/tests/execution.rs`).
 - [x] Compiles + passes the workspace suite with Lot 1.6 (`ci` run
   `26373423517`). NDCG@10 unchanged on `ndcg-gate` run `26373579876`.
-- [ ] **Quantify the search-latency gain**: `ndcg-gate` (50 queries,
-  no percentiles) does not measure it. Dispatch an `insee-bench`
-  replay on `2e4361e` vs the
-  `2026-05-21-A-replay-current-main-61a13f-insee-K8s/` baseline and
-  update the Track A ledger Search latency row before claiming a
-  search win.
+- [x] **Search-latency gain quantified** via a clean paired
+  `insee-bench` isolation, promoted as
+  `docs/ops/bench-reports/2026-05-25-insee-lot2-skiplists-K8s/`:
+  control `b9f6636` (jemalloc, no Lot 2) Surch `1.6/3.9/7.9/68.3 ms`
+  vs Lot 2 `d73c862` Surch `1.6/3.4/6.5/64.1 ms` → skip lists improve
+  the Surch tail `p95 -13% / p99 -18%`, p50 flat. Both runs GREEN
+  (the `bench_report` RSS-SLO fix `e37a864` is on both branches).
+  Caveat: single run per SHA; a 3-rep paired run would tighten the
+  CI (deferred).
+- [x] Side effect: fixed a Track E/B regression — `bench_report`
+  RSS SLO now gates Surch only, not the JVM reference engine
+  (`e37a864`), so insee-bench no longer fails closed at teardown
+  on the OpenSearch >1 GiB heap.
 
 ### Lot 3 — Next Block-Max WAND step
 

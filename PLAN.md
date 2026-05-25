@@ -63,12 +63,14 @@ single-threaded status loops advanced too little per user turn.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~6% (Lots 1, 1.5, 1.6, 1.7 closed; Lot 2 landed,
-its search-latency gain still to be measured via `insee-bench`;
-Lots 3 / 4 open in `plan/wp-a-perf-followups.md`). **Surch now
-ingests the full 171 k TREC-COVID corpus `1.54x` FASTER than
-OpenSearch** (`56 s` vs `87 s`), reversing the `13.9x` OpenSearch
-advantage measured pre-Lot-1 — total `~17.8x` Surch speedup.
+Reste estime: ~3% (Lots 1, 1.5, 1.6, 1.7, 2 closed; Lots 3 / 4
+open in `plan/wp-a-perf-followups.md`). **Surch now ingests the
+full 171 k TREC-COVID corpus `1.54x` FASTER than OpenSearch**
+(`56 s` vs `87 s`), reversing the `13.9x` OpenSearch advantage
+pre-Lot-1 (`~17.8x` Surch bulk speedup), and **Lot 2 skip lists
+improve Surch search-latency tail `p95 -13% / p99 -18%`** on the
+matchID INSEE workload (isolated in
+`2026-05-25-insee-lot2-skiplists-K8s`).
 
 Lot 3 paired K8s perf-proof shows Surch hot path -21/-22/-12/-30 %
 p50/p95/p99/max vs pre-FoR `c01b0a2`; runbook + numbers under
@@ -128,11 +130,12 @@ historical replay line lives in
   Surch RSS peak `5591 -> 3424 MiB` (`-39 %`), Surch RSS final
   `5591 -> 1382 MiB` (`-75 %`), bulk TREC-COVID
   `189 -> 139 s` (`-26 %` allocator bonus).
-- [x] Follow-up Lot 2 — Skip lists on the codec FoR path landed in
-  `d73c862` (leapfrog AND). Compiles + passes the workspace suite
-  with Lot 1.6; NDCG unchanged. Search-latency gain still to be
-  quantified via an `insee-bench` replay (`ndcg-gate` does not
-  measure search percentiles).
+- [x] Follow-up Lot 2 — Skip lists on the codec FoR path
+  (`d73c862`, leapfrog AND). Search-latency gain isolated via a
+  paired `insee-bench` (control `b9f6636` vs `d73c862`, same
+  jemalloc stack) promoted as
+  `docs/ops/bench-reports/2026-05-25-insee-lot2-skiplists-K8s/`:
+  Surch tail `p95 -13% / p99 -18%`, p50 flat, NDCG unchanged.
 - [ ] Follow-up Lot 3 — Next Block-Max WAND step on encoded block
   metadata (`plan/wp-a-perf-followups.md`).
 - [ ] Follow-up Lot 4 — Historical A-replay-1/2/3 promotion, owned by
