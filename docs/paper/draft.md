@@ -23,6 +23,25 @@ while NDCG@10 stays bit-stable and resident memory drops to
 and OpenSearch as sibling containers), with ≥3 repetitions for the
 final claims.
 
+## Results at a glance (3-rep medians, Surch vs OpenSearch 2.17.1)
+
+| Axis | Workload | Surch | OpenSearch | Surch advantage |
+|------|----------|------:|-----------:|----------------:|
+| Bulk index | TREC-COVID 171k | 70.96 s | 109.73 s | **1.55x faster** (non-overlapping) |
+| Bulk index | SciFact 5.2k | 2.09 s | 13.97 s | **6.7x faster** |
+| Search p50 | INSEE 10k | 1.5 ms | 4.0 ms | **2.7x faster** |
+| Search p95 | INSEE 10k | 4.1 ms | 12.2 ms | **3.0x faster** |
+| Search p99 | INSEE 10k | 8.4 ms | 26.3 ms | **3.1x faster** |
+| RSS peak | TREC-COVID 171k | 2168 MiB (±0.5%) | 1467 MiB | 1.48x (Surch heavier) |
+| NDCG@10 | SciFact / TREC-COVID | 0.6576 / 0.4750 | 0.6537 / 0.4902 | parity (bit-stable) |
+| matchID B1 oracle | deces_v1 vs ES 8.6.1 | 30/30, 0 divergence | — | parity preserved |
+
+Surch leads on every speed and latency axis and on SciFact quality;
+it trails OpenSearch only on TREC-COVID NDCG@10 (`-0.0152`) and on
+absolute RSS (a JVM heap is sized for a different regime). Sources:
+`docs/ops/bench-reports/2026-05-25-F2-{ndcg,insee}-3rep-K8s/`,
+`…-b1-oracle-A10-ES861-K8s/`.
+
 ## 1. Introduction
 
 JVM-based search engines (Elasticsearch, OpenSearch) dominate the
@@ -166,8 +185,12 @@ sub-field fan-out (`2026-05-25-b1-oracle-A10-ES861-K8s`).
   FoR/FST, shared sources) is delivered and measured cumulatively
   but not individually K8s-isolated (the historical SHAs predate the
   CI/Docker surface) — F3, scope decision pending.
-- Single node; corpora limited to SciFact / TREC-COVID / INSEE;
-  large-corpus search-latency harness missing (F4).
+- Single node; corpora limited to SciFact / TREC-COVID / INSEE.
+  A large-corpus search-latency harness (`trec-covid-latency` K8s
+  job, F4) has now landed and its first run is in flight — once it
+  reports, Lot 3's block-leapfrog benefit regime (long posting
+  lists) can be measured directly, which the INSEE 10k workload
+  could not exercise.
 
 ## 10. Conclusion
 
