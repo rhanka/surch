@@ -60,6 +60,8 @@ single-threaded status loops advanced too little per user turn.
   detailed plan: `plan/wp-d-matchid.md`.
 - [ ] `main` infra lane: Track E lives on `main` for now;
   detailed plan: `plan/main-infra.md`.
+- [ ] Objective F (scientific perf write-up): lives on `main`;
+  detailed plan: `plan/wp-f-perf-paper.md`.
 
 ## Track A - Perf / Optimisation
 
@@ -432,6 +434,29 @@ run promoted as
   report Job `Complete=True`.
 - [x] Turn `make bench-k8s` into a real entry point.
 
+## Objective F - Scientific perf write-up
+
+Reste estime: ~85% (just opened 2026-05-25). Goal: turn the
+replayed Surch optimisation evaluations into a publishable
+scientific article. Detailed plan + gap analysis:
+`plan/wp-f-perf-paper.md`.
+
+- [x] Feasibility assessed: article is feasible but not yet ready.
+  Recent lots (1, 1.5, 1.6, 1.7, 2) are cleanly K8s-isolated and
+  tell a strong story (Surch beats OpenSearch on bulk + search
+  latency + RAM, quality stable), but all single-run.
+- [ ] F1 — methodology section (`docs/paper/methodology.md`);
+  writable now, the harness + replay protocol already exist.
+- [ ] F2 — 3-rep median+IQR re-runs of the recent lots
+  (ndcg-gate bulk+RSS, insee-bench latency).
+- [ ] F3 — unblock + replay the historical optimisations
+  (top-K, WAND family, FoR/FST, shared sources): owned by
+  `plan/perf-replay-wp-a-algo-ledger.md`, blocked on the missing
+  workflow surface at the historical SHAs.
+- [ ] F4 — additional workloads (BEIR multi-dataset + corpus-size
+  scaling sweep), optional for a first draft.
+- [ ] F5 — assemble the article draft (results, figures, discussion).
+
 ## Delivery Finalities
 
 - [ ] Track A finality: measurable search/index performance gains
@@ -446,6 +471,9 @@ run promoted as
   not only Surch HEAD.
 - [ ] Track E finality: `ci-k8s` is a reliable heavy-benchmark target
   with preserved diagnostics.
+- [ ] Objective F finality: a publishable scientific article on the
+  Surch optimisation programme, backed by multi-rep K8s-isolated
+  measurements for every optimisation claimed.
 
 ## Hors-track maintenance
 
