@@ -700,4 +700,131 @@ mod tests {
         assert!(!index.field_has_prefix_postings("name"));
         assert!(index.prefix_postings("name", "dup").is_none());
     }
+
+    // ---------------------------------------------------------------------
+    // A10 (Phase 4): write-time fan-out of multi-field sub-fields
+    // ---------------------------------------------------------------------
+
+    /// matchID's `NOM: { type: text, analyzer: norm, fields: { raw: {
+    /// type: keyword, normalizer: norm } } }` (intake §2.12).
+    fn nom_multi_field_mapping() -> IndexMapping {
+        let mut subfields = BTreeMap::new();
+        subfields.insert(
+            "raw".to_owned(),
+            FieldMapping::new(FieldType::Keyword, None).with_normalizer(Some(AnalyzerName::Norm)),
+        );
+        let nom =
+            FieldMapping::new(FieldType::Text, Some(AnalyzerName::Norm)).with_subfields(subfields);
+        let mut mapping = IndexMapping::new();
+        mapping.set_field_mapping("NOM", nom);
+        mapping
+    }
+
+    #[test]
+    fn subfield_fanned_out_stores_normalized_keyword_value() {
+        // `NOM.raw` is a keyword sub-field with `normalizer: norm`. The
+        // write-time fan-out must store the whole parent value lowercased
+        // and asciifolded as a single token (parity with ES keyword +
+        // normalizer), NOT the per-word `norm`-analyzer tokens of the
+        // text parent.
+        let mapping = nom_multi_field_mapping();
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("NOM", "Étienne DUPRÉ")], &mapping)
+            .expect("doc 1");
+
+        assert!(index.has_subfield_values("NOM.raw"));
+        // Whole value, lowercased + asciifolded, single keyword token.
+        assert_eq!(index.subfield_value("NOM.raw", 1), Some("etienne dupre"));
+        // The parent field is untouched: no stored projection on "NOM".
+        assert!(!index.has_subfield_values("NOM"));
+        assert!(index.subfield_value("NOM", 1).is_none());
+    }
+
+    #[test]
+    fn subfield_fanned_out_is_searchable_via_postings() {
+        // The fanned-out keyword token is also indexed into the regular
+        // postings under the qualified `NOM.raw` path, so a `term` lookup
+        // on the sub-field resolves through the FST like any other field.
+        let mapping = nom_multi_field_mapping();
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("NOM", "DUPONT")], &mapping)
+            .expect("doc 1");
+        index
+            .add_document_with_mapping(2, [("NOM", "Dupré")], &mapping)
+            .expect("doc 2");
+
+        // `NOM.raw` holds the whole normalized value as one keyword token.
+        let postings = index
+            .postings("NOM.raw", "dupont")
+            .expect("NOM.raw=dupont postings present");
+        let doc_ids: Vec<u32> = postings.into_iter().map(|p| p.doc_id).collect();
+        assert_eq!(doc_ids, vec![1]);
+
+        let postings = index
+            .postings("NOM.raw", "dupre")
+            .expect("NOM.raw=dupre postings present (asciifolded)");
+        let doc_ids: Vec<u32> = postings.into_iter().map(|p| p.doc_id).collect();
+        assert_eq!(doc_ids, vec![2]);
+
+        // The parent text field keeps its own `norm`-analyzed postings.
+        assert!(index.postings("NOM", "dupont").is_some());
+    }
+
+    #[test]
+    fn no_subfield_fan_out_when_field_has_no_subfields() {
+        // A plain text field declares no `fields:` block => the side-table
+        // stays empty and `term` lookups on a fabricated `.raw` path miss.
+        let mut mapping = IndexMapping::new();
+        mapping.set_field_mapping("NOM", FieldMapping::new(FieldType::Text, None));
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("NOM", "DUPONT")], &mapping)
+            .expect("doc 1");
+
+        assert!(!index.has_subfield_values("NOM.raw"));
+        assert!(index.subfield_value("NOM.raw", 1).is_none());
+        assert!(index.subfield_values_map().is_empty());
+        assert!(index.postings("NOM.raw", "dupont").is_none());
+    }
+
+    #[test]
+    fn keyword_subfield_without_normalizer_stores_verbatim_value() {
+        // A keyword sub-field with no `normalizer` stores the untouched
+        // value as a single token (keyword analyzer is identity), so case
+        // and diacritics are preserved.
+        let mut subfields = BTreeMap::new();
+        subfields.insert(
+            "exact".to_owned(),
+            FieldMapping::new(FieldType::Keyword, None),
+        );
+        let nom = FieldMapping::new(FieldType::Text, None).with_subfields(subfields);
+        let mut mapping = IndexMapping::new();
+        mapping.set_field_mapping("NOM", nom);
+
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("NOM", "Dupré Martin")], &mapping)
+            .expect("doc 1");
+
+        assert_eq!(index.subfield_value("NOM.exact", 1), Some("Dupré Martin"));
+    }
+
+    #[test]
+    fn subfield_fan_out_cleared_on_index_clear() {
+        // `clear()` must drop the sub-field side-table so a fresh
+        // generation does not leak the previous projections.
+        let mapping = nom_multi_field_mapping();
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("NOM", "DUPONT")], &mapping)
+            .expect("doc 1");
+        assert!(index.has_subfield_values("NOM.raw"));
+
+        index.clear();
+        assert!(!index.has_subfield_values("NOM.raw"));
+        assert!(index.subfield_value("NOM.raw", 1).is_none());
+        assert!(index.subfield_values_map().is_empty());
+    }
 }
