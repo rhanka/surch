@@ -9,6 +9,12 @@
 //! Query mix mirrors `artillery-replay.sh`: alternating `multi_match`
 //! and `bool.must` shapes against the matchID-style INSEE index, with
 //! random `(PRENOMS, NOM)` pairs drawn from the `--names` TSV file.
+//!
+//! A second query mode (`--query-mode trec`) targets a free-text corpus
+//! (BEIR TREC-COVID): each line of the `--names` file is one full query
+//! string, issued as a `multi_match` over `title`/`text`. This drives
+//! the long-posting-list / skip-list regime that the INSEE 10k corpus
+//! cannot reach. The default mode (`insee`) is unchanged.
 
 use std::{
     env, fmt, fs,
@@ -39,6 +45,35 @@ const DEFAULT_NAMES: &str = "/home/antoinefa/src/surch/target/insee/artillery_na
 const DEFAULT_WORKERS: usize = 8;
 const DEFAULT_PHASES: &str = "2:30,2:30,5:30,10:30,20:30,50:60";
 const REPORT_SCHEMA: &str = "surch.bench.artillery.v1";
+const DEFAULT_QUERY_MODE: QueryMode = QueryMode::Insee;
+
+/// Query shape produced for each request. `Insee` (default) keeps the
+/// historical matchID `(PRENOMS, NOM)` behavior; `Trec` issues a single
+/// `multi_match` over `title`/`text` from one free-text query per line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryMode {
+    Insee,
+    Trec,
+}
+
+impl QueryMode {
+    fn parse(raw: &str) -> Result<Self, CliError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "insee" => Ok(Self::Insee),
+            "trec" => Ok(Self::Trec),
+            other => Err(CliError::Usage(format!(
+                "--query-mode must be `insee` or `trec`, got `{other}`"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Insee => "insee",
+            Self::Trec => "trec",
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -70,6 +105,7 @@ struct Plan {
     workers: usize,
     phases: Vec<Phase>,
     report_path: Option<String>,
+    query_mode: QueryMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +121,7 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
     let mut workers = DEFAULT_WORKERS;
     let mut phases_raw = DEFAULT_PHASES.to_owned();
     let mut report_path: Option<String> = None;
+    let mut query_mode = DEFAULT_QUERY_MODE;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -92,6 +129,9 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
             "--url" => url = required_value(&mut iter, "--url")?,
             "--index" => index = required_value(&mut iter, "--index")?,
             "--names" => names_path = required_value(&mut iter, "--names")?,
+            "--query-mode" => {
+                query_mode = QueryMode::parse(&required_value(&mut iter, "--query-mode")?)?;
+            }
             "--workers" => {
                 let raw = required_value(&mut iter, "--workers")?;
                 workers = raw.parse::<usize>().map_err(|_| {
@@ -130,6 +170,7 @@ fn parse_args(args: Vec<String>) -> Result<Plan, CliError> {
         workers,
         phases,
         report_path,
+        query_mode,
     })
 }
 
@@ -186,13 +227,16 @@ fn parse_phases(raw: &str) -> Result<Vec<Phase>, CliError> {
     Ok(phases)
 }
 
+/// One unit of work drawn at random per request. In `insee` mode it
+/// carries a `(PRENOMS, NOM)` pair; in `trec` mode `nom` is empty and
+/// `prenoms` holds the full free-text query string.
 #[derive(Debug, Clone)]
 struct NameRow {
     prenoms: String,
     nom: String,
 }
 
-fn load_names(path: &str) -> Result<Vec<NameRow>, CliError> {
+fn load_names(path: &str, query_mode: QueryMode) -> Result<Vec<NameRow>, CliError> {
     let content = fs::read_to_string(path)
         .map_err(|error| CliError::Io(format!("failed to read --names `{path}`: {error}")))?;
     let mut rows = Vec::new();
@@ -201,24 +245,45 @@ fn load_names(path: &str) -> Result<Vec<NameRow>, CliError> {
         if line.is_empty() {
             continue;
         }
-        let mut fields = line.split('\t');
-        let prenoms = fields.next().unwrap_or("").trim().to_owned();
-        let nom = fields.next().unwrap_or("").trim().to_owned();
-        if prenoms.is_empty() || nom.is_empty() {
-            continue;
+        match query_mode {
+            QueryMode::Insee => {
+                let mut fields = line.split('\t');
+                let prenoms = fields.next().unwrap_or("").trim().to_owned();
+                let nom = fields.next().unwrap_or("").trim().to_owned();
+                if prenoms.is_empty() || nom.is_empty() {
+                    continue;
+                }
+                rows.push(NameRow { prenoms, nom });
+            }
+            QueryMode::Trec => {
+                // One full free-text query per line; tabs (if any) are
+                // folded to spaces so the whole line is one query string.
+                let query = line.replace('\t', " ");
+                let query = query.trim();
+                if query.is_empty() {
+                    continue;
+                }
+                rows.push(NameRow {
+                    prenoms: query.to_owned(),
+                    nom: String::new(),
+                });
+            }
         }
-        rows.push(NameRow { prenoms, nom });
     }
     if rows.is_empty() {
+        let shape = match query_mode {
+            QueryMode::Insee => "(PRENOMS, NOM)",
+            QueryMode::Trec => "free-text query",
+        };
         return Err(CliError::Io(format!(
-            "--names `{path}` produced zero usable (PRENOMS, NOM) rows"
+            "--names `{path}` produced zero usable {shape} rows"
         )));
     }
     Ok(rows)
 }
 
 async fn execute_plan(plan: Plan) -> Result<(), CliError> {
-    let names = Arc::new(load_names(&plan.names_path)?);
+    let names = Arc::new(load_names(&plan.names_path, plan.query_mode)?);
     let base_uri: Uri = format!("{}/{}/_search", plan.url.trim_end_matches('/'), plan.index)
         .parse()
         .map_err(|error| CliError::Usage(format!("invalid composed URL: {error}")))?;
@@ -235,9 +300,10 @@ async fn execute_plan(plan: Plan) -> Result<(), CliError> {
 
     let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     println!(
-        "artillery_bench: url={} index={} workers={} phases={} names={}",
+        "artillery_bench: url={} index={} mode={} workers={} phases={} names={}",
         plan.url,
         plan.index,
+        plan.query_mode.as_str(),
         plan.workers,
         plan.phases.len(),
         plan.names_path
@@ -254,6 +320,7 @@ async fn execute_plan(plan: Plan) -> Result<(), CliError> {
             phase_index,
             *phase,
             plan.workers,
+            plan.query_mode,
             Arc::clone(&client),
             Arc::clone(&base_uri),
             Arc::clone(&names),
@@ -355,6 +422,7 @@ async fn run_phase(
     phase_index: usize,
     phase: Phase,
     workers: usize,
+    query_mode: QueryMode,
     client: Arc<Client<HttpConnector, Full<Bytes>>>,
     base_uri: Arc<Uri>,
     names: Arc<Vec<NameRow>>,
@@ -410,7 +478,7 @@ async fn run_phase(
         let names = Arc::clone(&names);
         let tx = tx.clone();
         joinset.spawn(async move {
-            run_worker(client, base_uri, names, chunk, tx).await;
+            run_worker(client, base_uri, names, query_mode, chunk, tx).await;
         });
     }
     drop(tx);
@@ -466,12 +534,13 @@ async fn run_worker(
     client: Arc<Client<HttpConnector, Full<Bytes>>>,
     base_uri: Arc<Uri>,
     names: Arc<Vec<NameRow>>,
+    query_mode: QueryMode,
     schedule: Vec<RequestPlan>,
     tx: mpsc::Sender<RequestSample>,
 ) {
     for plan in schedule {
         sleep_until(plan.due).await;
-        let body = build_query_body(&names[plan.name_index], plan.use_bool_must);
+        let body = build_query_body(&names[plan.name_index], query_mode, plan.use_bool_must);
         let sample = issue_request(&client, &base_uri, body).await;
         if tx.send(sample).await.is_err() {
             break;
@@ -481,31 +550,66 @@ async fn run_worker(
     }
 }
 
-fn build_query_body(name: &NameRow, use_bool_must: bool) -> Bytes {
-    let value = if use_bool_must {
-        json!({
-            "query": {
-                "bool": {
-                    "must": [
-                        { "match": { "PRENOMS": name.prenoms } },
-                        { "match": { "NOM": name.nom } }
-                    ]
-                }
-            },
-            "size": 10,
-            "track_total_hits": true
-        })
-    } else {
-        json!({
-            "query": {
-                "multi_match": {
-                    "query": format!("{} {}", name.prenoms, name.nom),
-                    "fields": ["PRENOMS", "NOM"]
-                }
-            },
-            "size": 10,
-            "track_total_hits": true
-        })
+fn build_query_body(name: &NameRow, query_mode: QueryMode, use_bool_must: bool) -> Bytes {
+    let value = match query_mode {
+        QueryMode::Insee => {
+            if use_bool_must {
+                json!({
+                    "query": {
+                        "bool": {
+                            "must": [
+                                { "match": { "PRENOMS": name.prenoms } },
+                                { "match": { "NOM": name.nom } }
+                            ]
+                        }
+                    },
+                    "size": 10,
+                    "track_total_hits": true
+                })
+            } else {
+                json!({
+                    "query": {
+                        "multi_match": {
+                            "query": format!("{} {}", name.prenoms, name.nom),
+                            "fields": ["PRENOMS", "NOM"]
+                        }
+                    },
+                    "size": 10,
+                    "track_total_hits": true
+                })
+            }
+        }
+        QueryMode::Trec => {
+            // `name.prenoms` holds the full free-text query. Both branches
+            // issue a `multi_match` over title/text — the regime that
+            // exercises long posting lists / skip-lists. Odd requests add
+            // `operator:"and"` to vary the conjunction load (which is the
+            // block-leapfrog hot path), even requests use default OR.
+            if use_bool_must {
+                json!({
+                    "query": {
+                        "multi_match": {
+                            "query": name.prenoms,
+                            "fields": ["title", "text"],
+                            "operator": "and"
+                        }
+                    },
+                    "size": 10,
+                    "track_total_hits": true
+                })
+            } else {
+                json!({
+                    "query": {
+                        "multi_match": {
+                            "query": name.prenoms,
+                            "fields": ["title", "text"]
+                        }
+                    },
+                    "size": 10,
+                    "track_total_hits": true
+                })
+            }
+        }
     };
     Bytes::from(serde_json::to_vec(&value).expect("serde_json::to_vec on owned Value cannot fail"))
 }
@@ -576,6 +680,7 @@ fn build_report_json(
         "schema": REPORT_SCHEMA,
         "url": plan.url,
         "index": plan.index,
+        "query_mode": plan.query_mode.as_str(),
         "workers": plan.workers,
         "names_path": plan.names_path,
         "started_at": started_at,
@@ -649,7 +754,11 @@ fn print_help() {
     println!("OPTIONS:");
     println!("  --url URL          HTTP base URL of the target engine (default: {DEFAULT_URL})");
     println!("  --index NAME       target index name (default: {DEFAULT_INDEX})");
-    println!("  --names PATH       TSV of `PRENOMS\\tNOM\\tDATE_NAISSANCE` rows (default: {DEFAULT_NAMES})");
+    println!("  --names PATH       insee: TSV of `PRENOMS\\tNOM` rows; trec: one free-text query per line (default: {DEFAULT_NAMES})");
+    println!(
+        "  --query-mode MODE  `insee` (PRENOMS/NOM) or `trec` (multi_match title/text) (default: {})",
+        DEFAULT_QUERY_MODE.as_str()
+    );
     println!("  --workers N        concurrent tokio workers sharing the keep-alive pool (default: {DEFAULT_WORKERS})");
     println!("  --phases LIST      comma-separated `rps:duration_s` segments (default: {DEFAULT_PHASES})");
     println!("  --report PATH      optional JSON report output path (schema: {REPORT_SCHEMA})");
@@ -738,14 +847,47 @@ mod tests {
             prenoms: "Marie".to_owned(),
             nom: "Dupont".to_owned(),
         };
-        let multi = build_query_body(&name, false);
-        let bool_must = build_query_body(&name, true);
+        let multi = build_query_body(&name, QueryMode::Insee, false);
+        let bool_must = build_query_body(&name, QueryMode::Insee, true);
         let multi_v: serde_json::Value = serde_json::from_slice(&multi).unwrap();
         let bool_v: serde_json::Value = serde_json::from_slice(&bool_must).unwrap();
         assert!(multi_v["query"]["multi_match"].is_object());
         assert!(bool_v["query"]["bool"]["must"].is_array());
         assert_eq!(multi_v["track_total_hits"], serde_json::Value::Bool(true));
         assert_eq!(bool_v["size"], serde_json::Value::from(10));
+    }
+
+    #[test]
+    fn build_query_body_trec_uses_multi_match_over_title_text() {
+        let row = NameRow {
+            prenoms: "coronavirus origin bats".to_owned(),
+            nom: String::new(),
+        };
+        let or_body = build_query_body(&row, QueryMode::Trec, false);
+        let and_body = build_query_body(&row, QueryMode::Trec, true);
+        let or_v: serde_json::Value = serde_json::from_slice(&or_body).unwrap();
+        let and_v: serde_json::Value = serde_json::from_slice(&and_body).unwrap();
+        assert_eq!(
+            or_v["query"]["multi_match"]["query"],
+            json!("coronavirus origin bats")
+        );
+        assert_eq!(
+            or_v["query"]["multi_match"]["fields"],
+            json!(["title", "text"])
+        );
+        assert!(or_v["query"]["multi_match"].get("operator").is_none());
+        assert_eq!(and_v["query"]["multi_match"]["operator"], json!("and"));
+        assert_eq!(and_v["track_total_hits"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn query_mode_parse_accepts_known_modes() {
+        assert_eq!(QueryMode::parse("insee").unwrap(), QueryMode::Insee);
+        assert_eq!(QueryMode::parse("TREC").unwrap(), QueryMode::Trec);
+        assert!(matches!(
+            QueryMode::parse("bogus").unwrap_err(),
+            CliError::Usage(_)
+        ));
     }
 
     #[test]
@@ -760,6 +902,7 @@ mod tests {
                 duration_s: 10,
             }],
             report_path: None,
+            query_mode: QueryMode::Insee,
         };
         let phase_reports = vec![PhaseReport {
             rps: 5,
