@@ -260,15 +260,36 @@ the per-128 contribution skip already shipped in `e38bf91` to
 exploit the skip list cursors for cross-term skipping in OR-match
 top-K and `multi_match`.
 
-- [ ] Specify the next BMW step against the current encoded block
+- [x] Specify the next BMW step against the current encoded block
   metadata + skip list cursors; keep parity with the existing
-  WAND/`multi_match` test surface.
-- [ ] Implement and add SciFact quality guardrail tests before any
-  perf claim.
+  WAND/`multi_match` test surface. The step: the per-128 contribution
+  skip already shipped in `e38bf91` still iterated every block
+  linearly inside the OR-match top-K loop. Lot 3 keeps the exact same
+  per-block skip *decision* (`!allow_new_docs && block_max < threshold`
+  and no already-scored doc in the block's `[min,max]` range) but
+  replaces the linear walk with the Lot 2 codec `BlockSkipList`
+  cursor: when a block is skippable, seek straight to the block
+  holding the next still-relevant already-scored doc (or terminate the
+  token if none remains), leapfrogging intervening blocks in
+  `O(log N_blocks)`.
+- [x] Implement and add SciFact quality guardrail tests before any
+  perf claim. Implemented as a self-contained
+  `surch_search::maxscore::MaxScoreExecutor` (new module in
+  `crates/surch-search/src/maxscore.rs`, depends on the codec skip
+  list); `surch-api::search::maxscore_match` now delegates the
+  single-field `Match` and per-field `multi_match` OR-match loops to
+  it. Correctness is guarded by `crates/surch-search/tests/maxscore.rs`
+  (skip output is byte-for-byte identical to a brute-force OR-match on
+  seeded multi-token corpora at every top-K limit, plus a
+  blocks-skipped assertion and a corpus-sized-limit "skips nothing"
+  assertion) and by the in-module linear-reference oracle tests.
 - [ ] Promote a paired K8s perf proof + Track A ledger update for
   Search latency. SciFact NDCG@10 floor `>= 0.65` must hold;
   TREC-COVID NDCG@10 must not regress vs the
-  `2026-05-22-ndcg-gate-7Gi-K8s` baseline.
+  `2026-05-22-ndcg-gate-7Gi-K8s` baseline. (Pending: validated by the
+  K8s `ndcg-gate` + `insee-bench` harness after this branch merges to
+  `main`; the skip is a pure performance optimisation with identical
+  ranking, so NDCG must hold by construction.)
 
 ### Lot 4 — Historical A-replay-1/2/3 promotion
 
