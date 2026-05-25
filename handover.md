@@ -9,7 +9,43 @@ actions. **Les §2/§3 plus bas datent de `2e4361e` — le bloc
 
 ## Avancement loop 2026-05-25 (autonome, prime sur §2/§3)
 
-Session autonome `/loop` pendant absence user. État à `bec6d75` :
+Session autonome `/loop` pendant absence user. État à `fa9ae0d`.
+**Loop arrêté à la frontière des décisions (voir "Décisions
+attendues" en fin de bloc).**
+
+### Bilan du loop (commits `2e4361e` → `fa9ae0d`)
+- Lot 3 + A10 validés K8s & publiés (Lot 3 latence-neutre honnête ;
+  A10 parité b1-oracle 30/30).
+- 2 fixes infra Track E : `bench_report` SLO RSS Surch-only
+  (`e37a864`) + wait-loop tolère SIGTERM sidecar reason=Error
+  exit=143 (`97e81f3`) → insee-bench teardown fiable.
+- Objectif F : F1 méthodo (`docs/paper/methodology.md`), **F2
+  complet** (bulk+RSS+qualité 3-rep `2026-05-25-F2-ndcg-3rep-K8s` +
+  latence 3-rep `2026-05-25-F2-insee-3rep-K8s`), **F5 premier draft
+  d'article** (`docs/paper/draft.md`), F3 investigué (blocage
+  documenté).
+- Multi-rep paper-ready : bulk TREC-COVID Surch médiane `70.96 s`
+  (non-recouvrant vs OS `109.73 s`), RSS `2168 MiB ±0.5%`, latence
+  Surch `1.5/4.1/8.4/40.6 ms` (2.7–3.1x < OS), NDCG bit-stable.
+- Ménage worktrees + branches temp (`.claude` 1.3G→32K).
+
+### Décisions attendues (le loop est bloqué là-dessus)
+1. **F3 — replays historiques** : les SHAs historiques
+   (71ceb275/5081cc7/3157afb/e38bf91) n'ont pas la surface
+   CI/Docker. Les isoler = greffer le harness moderne sur du code
+   ancien (risque de non-compilation rustc 1.91.1), gros effort ROI
+   incertain. **Investir, OU publier l'article sur les seuls lots
+   récents** (déjà isolés + multi-rep) en citant les historiques
+   comme "delivered, mesurés cumulativement" ?
+2. **F4 — charges additionnelles** : ajouter un harness de latence
+   search **grand corpus** (artillery TREC-COVID-scale) prouverait le
+   régime de bénéfice de Lot 3 (aujourd'hui non mesurable) ; +
+   BEIR multi-dataset + sweep de taille. Priorité ?
+3. **Priorité Track D vs F** : enchaîner Phase 4 matchID (A1/A13,
+   A7, A2, A5, A12 consommant `.raw`/`.norm` d'A10) OU concentrer sur
+   l'article (F3/F4/F5) ?
+
+### (Ancien état au lancement du loop, conservé pour trace)
 
 ### Fait (depuis `2e4361e`)
 - **Lot 3** (Track A, MaxScore block-leapfrog via skip lists Lot 2) :
