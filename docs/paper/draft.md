@@ -178,7 +178,10 @@ and `0.4902/0.0132`. Surch leads on SciFact and trails OpenSearch by
 
 Surch passes the 30-request matchID B1 oracle against Elasticsearch
 8.6.1 with 0 divergence, including after the A10 write-time
-sub-field fan-out (`2026-05-25-b1-oracle-A10-ES861-K8s`).
+sub-field fan-out (`2026-05-25-b1-oracle-A10-ES861-K8s`) and after
+A12, which feeds that projection into sort/aggregation on the read
+path — still `30/30`, 0 divergence
+(`2026-05-25-b1-oracle-A12-ES861-K8s`).
 
 ## 8. Discussion
 

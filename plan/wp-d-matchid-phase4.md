@@ -114,6 +114,9 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
   `search_router_a10_phase4_*` (sort + cardinality + terms + alias
   fallback). Ferme le critère A12 « agg.cardinality sur .raw n'utilise
   pas lookup_sort_value mais le storage ».
+  - [x] **Parité matchID A12 validée en K8s** : b1-oracle 30/30,
+    0 divergence vs Elasticsearch 8.6.1 (GHA `26423292686` @ `9640169`,
+    `2026-05-25-b1-oracle-A12-ES861-K8s/`). A10+A12 parité-neutres.
 - [ ] Lot 1 — A1/A13 multi-field + edge_ngram câblé.
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
