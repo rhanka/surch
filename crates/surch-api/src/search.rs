@@ -12,6 +12,7 @@ use surch_index::mapping::{AnalyzerName, IndexMapping};
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
+use surch_search::maxscore::{MaxScoreExecutor, MaxScoreToken};
 use surch_search::scoring::{bm25_score, Bm25Config};
 
 use crate::{
@@ -1841,8 +1842,6 @@ fn maxscore_match(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    const BLOCK_SIZE: usize = 128;
-
     // Precompute the per-block upper bound contribution for every token
     // (Block-Max WAND, à la Tantivy `BlockWAND` and Lucene block-max
     // postings). Per-block max term frequency is read directly from
@@ -1876,84 +1875,56 @@ fn maxscore_match(
         })
         .collect();
 
-    let mut scored: BTreeMap<u32, f64> = BTreeMap::new();
-    let mut threshold = f64::NEG_INFINITY;
+    // Lot 3: delegate the OR-match MaxScore loop to the surch-search
+    // skip-list executor, which leapfrogs whole 128-blocks via the Lot 2
+    // codec BlockSkipList cursors instead of walking every block
+    // linearly. The skip *decision* is byte-for-byte identical to the
+    // prior linear path (Lot 1), so the scored (doc_id, score) set is
+    // unchanged — only the iteration over skippable blocks is cheaper.
+    // The per-doc BM25 contribution is computed by the closure below,
+    // keeping all scoring specifics (norms, boost, doc_freq) here.
+    let tokens: Vec<MaxScoreToken<'_>> = token_infos
+        .iter()
+        .enumerate()
+        .map(|(token_idx, token)| MaxScoreToken {
+            postings: token.stats.term_freq_by_doc_id.as_slice(),
+            block_max_contribs: block_max_contribs[token_idx].as_slice(),
+            max_contrib: token.max_contrib,
+        })
+        .collect();
 
-    for (token_idx, token) in token_infos.iter().enumerate() {
-        let allow_new_docs = token.max_contrib >= threshold;
-        let token_blocks = &block_max_contribs[token_idx];
-
-        for (block_idx, block) in token
-            .stats
-            .term_freq_by_doc_id
-            .chunks(BLOCK_SIZE)
-            .enumerate()
-        {
-            if block.is_empty() {
-                continue;
-            }
-            let block_max = token_blocks[block_idx];
-
-            // Block-level skip: if the block's tightest upper bound is
-            // below the running threshold AND no doc in this block is
-            // already scored from a rarer token (so we cannot increase
-            // its score either), the whole block contributes nothing
-            // to top-K and can be skipped without touching it.
-            if !allow_new_docs && block_max < threshold {
-                let block_first = block[0].0;
-                let block_last = block[block.len() - 1].0;
-                if scored.range(block_first..=block_last).next().is_none() {
-                    continue;
+    let outcome = MaxScoreExecutor::new(limit)
+        .run(&tokens, |token_idx, doc_id, tf| {
+            let token = &token_infos[token_idx];
+            let doc_len = if norms_enabled {
+                match field_stats.doc_len(doc_id) {
+                    Some(len) if len > 0 => len,
+                    _ => return None,
                 }
-            }
-
-            for (doc_id, tf) in block {
-                if *tf == 0 {
-                    continue;
-                }
-                let in_scored = scored.contains_key(doc_id);
-                if !in_scored && !allow_new_docs {
-                    continue;
-                }
-
-                let doc_len = if norms_enabled {
-                    match field_stats.doc_len(*doc_id) {
-                        Some(len) if len > 0 => len,
-                        _ => continue,
-                    }
-                } else {
-                    1
-                };
-
-                let contrib = match bm25_score(
-                    config,
-                    field_stats.doc_count,
-                    token.stats.doc_freq,
-                    *tf,
-                    doc_len,
-                    avg_doc_len,
-                ) {
-                    Ok(score) => score * token.boost,
-                    Err(_) => continue,
-                };
-
-                let entry = scored.entry(*doc_id).or_insert(0.0);
-                *entry += contrib;
-            }
-        }
-
-        if scored.len() >= limit {
-            let mut values: Vec<f64> = scored.values().copied().collect();
-            let k = values.len() - limit;
-            values.select_nth_unstable_by(k, |a, b| {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            threshold = values[k];
-        }
-    }
+            } else {
+                1
+            };
+            bm25_score(
+                config,
+                field_stats.doc_count,
+                token.stats.doc_freq,
+                tf,
+                doc_len,
+                avg_doc_len,
+            )
+            .ok()
+            .map(|score| score * token.boost)
+        })
+        .ok()?;
 
     let _ = total_hint;
-    Some(scored.into_iter().map(|(id, score)| (score, id)).collect())
+    Some(
+        outcome
+            .scored
+            .into_iter()
+            .map(|(id, score)| (score, id))
+            .collect(),
+    )
 }
 
 fn is_scoring_query(query: &SearchQuery) -> bool {
