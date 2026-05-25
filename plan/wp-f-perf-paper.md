@@ -85,9 +85,15 @@ Atouts méthodo déjà en place :
   livré (système testé, environnement K8s, charges, schémas
   `surch.bench.*`, garde-fous SLO/qualité, contrôles d'équité,
   protocole d'isolation, limitation single-run, reproductibilité).
-- [ ] **F2 — Multi-rep des lots récents** : 3 reps ndcg-gate
-  (bulk+RSS) + 3 reps insee-bench (latence) pour Lots 1.6/1.7/2 ;
-  agréger médiane + IQR ; mettre à jour les rapports.
+- [~] **F2 — Multi-rep des lots récents** (partiel) :
+  - [x] 3 reps ndcg-gate (bulk + RSS + qualité) sur main, agrégés
+    médiane + min/max dans `2026-05-25-F2-ndcg-3rep-K8s/`. Surch
+    TREC-COVID bulk médiane `70.96 s` (distributions non-recouvrantes
+    vs OS `109.73 s`), RSS pic `2168 MiB ±0.5%`, NDCG bit-stable.
+    Tableau de bord Bulk + RSS mis à jour. Ces 3 axes sont
+    paper-ready.
+  - [ ] 3 reps insee-bench (latence p50/p95/p99) pour un verdict
+    latence médiane+IQR (axe search encore single-run).
 - [ ] **F3 — Débloquer + rejouer les historiques** (F-gap-2/3) :
   le gros morceau, dépend de la surface workflow aux anciens SHAs.
 - [ ] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +

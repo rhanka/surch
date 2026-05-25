@@ -461,8 +461,10 @@ scientific article. Detailed plan + gap analysis:
   (system under test, environment, workloads, metric schemas,
   SLO/quality guardrails, fairness controls, isolation protocol,
   the single-run limitation, reproducibility).
-- [ ] F2 — 3-rep median+IQR re-runs of the recent lots
-  (ndcg-gate bulk+RSS, insee-bench latency).
+- [~] F2 — 3-rep re-runs: ndcg-gate (bulk+RSS+quality) DONE,
+  `2026-05-25-F2-ndcg-3rep-K8s/` (Surch TREC-COVID bulk median
+  `70.96 s` non-overlapping vs OS `109.73 s`; RSS `2168 MiB ±0.5%`;
+  NDCG bit-stable). insee-bench latency 3-rep still pending.
 - [ ] F3 — unblock + replay the historical optimisations
   (top-K, WAND family, FoR/FST, shared sources): owned by
   `plan/perf-replay-wp-a-algo-ledger.md`, blocked on the missing
