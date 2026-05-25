@@ -158,8 +158,13 @@ Atouts méthodo déjà en place :
     (p50 → 193 ms à 50 RPS), Surch reste plat. Tableau par phase +
     caveats dans le README. **Débloque la mesure du régime Lot 3**
     (longues listes de postings) qu'INSEE 10k n'atteignait pas.
-  - [ ] Reste F4 : run multi-rep (≥3) du harness latence grand corpus
-    pour un verdict médian ; logger `hits.total` par requête dans
+  - [x] **Multi-rep (3 reps) du harness latence grand corpus publié** :
+    `2026-05-25-F4-trec-covid-latency-3rep-K8s/` (GHA `26422565840`,
+    `26423474877`, `26424070888`). Médianes Surch p50 `0.5 ms` /
+    p95 `1.3 ms` (variance nulle) vs OpenSearch p50 `176.9 ms` /
+    p95 `481.4 ms` (~354x / ~370x), RSS Surch `2123 MB ±0.7%`, 0 erreur
+    toutes reps. Le caveat single-run du landing F4 est levé.
+  - [ ] Reste F4 : logger `hits.total` par requête dans
     `artillery_bench` (assertion d'équivalence in-artefact) ; BEIR
     multi-datasets (NFCorpus, FiQA…) + sweep de taille de corpus.
   - **Caveat équivalence (écart latence grand corpus)** : run vert

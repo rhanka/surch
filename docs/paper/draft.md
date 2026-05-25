@@ -32,6 +32,8 @@ final claims.
 | Search p50 | INSEE 10k | 1.5 ms | 4.0 ms | **2.7x faster** |
 | Search p95 | INSEE 10k | 4.1 ms | 12.2 ms | **3.0x faster** |
 | Search p99 | INSEE 10k | 8.4 ms | 26.3 ms | **3.1x faster** |
+| Search p50 | TREC-COVID 171k | 0.5 ms | 176.9 ms | **~354x faster** |
+| Search p95 | TREC-COVID 171k | 1.3 ms | 481.4 ms | **~370x faster** |
 | RSS peak | TREC-COVID 171k | 2168 MiB (±0.5%) | 1467 MiB | 1.48x (Surch heavier) |
 | NDCG@10 | SciFact / TREC-COVID | 0.6576 / 0.4750 | 0.6537 / 0.4902 | parity (bit-stable) |
 | matchID B1 oracle | deces_v1 vs ES 8.6.1 | 30/30, 0 divergence | — | parity preserved |
@@ -153,18 +155,22 @@ controls:
 ### Large-corpus search latency (F4)
 
 On the full 171k TREC-COVID corpus with real multi-term queries
-(`2026-05-25-F4-trec-covid-latency-K8s`, 13 170 queries, 0 errors
-both engines), steady-state Surch is `p50 0.5 ms / p95 1.3 ms` vs
-OpenSearch `p50 183.8 ms / p95 487.8 ms` — two-to-three orders of
-magnitude faster, and OpenSearch *degrades* under load (p50 climbs
-to `193 ms` at 50 RPS) while Surch stays flat. This is the long
-posting-list regime that INSEE 10k could not reach. Retrieval
-equivalence is established separately by NDCG@10 parity on the same
-corpus (Surch `0.4750` vs OpenSearch `0.4902`), so the gap reflects
-WAND/MaxScore + skip-list early termination and the absence of JVM
-overhead, not a degenerate result set. This is a single run (the
-final claim needs ≥3 reps) and `artillery_bench` does not yet log
-`hits.total`; both are noted as limitations.
+(`2026-05-25-F4-trec-covid-latency-3rep-K8s`, 3 reps, 13 170 queries
+each, 0 errors both engines), Surch median latency is
+`p50 0.5 ms / p95 1.3 ms` (both zero-variance across reps) vs
+OpenSearch `p50 176.9 ms / p95 481.4 ms` — two-to-three orders of
+magnitude faster (`~354x` p50, `~370x` p95), and OpenSearch
+*degrades* under load (p50 climbs to ~190 ms at 50 RPS) while Surch
+stays flat. This is the long posting-list regime that INSEE 10k could
+not reach. Retrieval equivalence is established separately by NDCG@10
+parity on the same corpus (Surch `0.4750` vs OpenSearch `0.4902`), so
+the gap reflects WAND/MaxScore + skip-list early termination and the
+absence of JVM overhead, not a degenerate result set. Surch RSS peak
+here is `~2123 MB` median (`±0.7%`), `~1.5x` the OpenSearch JVM peak —
+the expected footprint at this corpus size. `artillery_bench` does
+not yet log `hits.total`, so the work-equivalence argument rests on
+the NDCG parity rather than an in-artifact hit-count assertion — a
+noted limitation.
 
 ## 6. Quality (non-regression)
 
@@ -205,14 +211,16 @@ path — still `30/30`, 0 divergence
   CI/Docker surface) — F3, scope decision pending.
 - Single node; corpora limited to SciFact / TREC-COVID / INSEE.
   A large-corpus search-latency harness (`trec-covid-latency` K8s
-  job, F4) has now landed and produced its first green run
-  (`2026-05-25-F4-trec-covid-latency-K8s`): Surch is two-to-three
-  orders of magnitude faster than OpenSearch at steady state on the
-  171k corpus. This is single-run and `artillery_bench` does not yet
-  capture per-request `hits.total`, so engine work-equivalence rests
-  on the separately-measured NDCG@10 parity rather than an in-artifact
-  hit-count assertion — a multi-rep run and hit-count logging are the
-  next hardening steps before this figure becomes a headline claim.
+  job, F4) has landed and produced a 3-rep median verdict
+  (`2026-05-25-F4-trec-covid-latency-3rep-K8s`): Surch is two-to-three
+  orders of magnitude faster than OpenSearch on the 171k corpus, with
+  zero-variance p50/p95. `artillery_bench` does not yet capture
+  per-request `hits.total`, so engine work-equivalence rests on the
+  separately-measured NDCG@10 parity rather than an in-artifact
+  hit-count assertion — hit-count logging is the next hardening step.
+  Lot 3's block-leapfrog benefit is now measurable in this regime but
+  its same-stack isolation on the large corpus is still pending (no
+  runtime MaxScore toggle exists; method is a scope decision).
 
 ## 10. Conclusion
 
