@@ -1400,7 +1400,9 @@ Recall@10 = 0.8100
         // Exactly the two Surch latency checks; none for the reference.
         assert_eq!(latency_checks.len(), 2, "only surch latency gates");
         assert!(
-            latency_checks.iter().all(|c| c.name.contains("[art-surch]") && c.passed),
+            latency_checks
+                .iter()
+                .all(|c| c.name.contains("[art-surch]") && c.passed),
             "surch latency within SLO, reference engine not gated"
         );
         // Error-rate checks still apply to BOTH engines.
