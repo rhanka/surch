@@ -47,6 +47,9 @@ pub struct MemoryUsage {
     pub postings_bytes: u64,
     /// A6 prefix side-table: `field -> prefix -> BTreeSet<doc_id>`.
     pub prefix_postings_bytes: u64,
+    /// A10 multi-field side-table: `parent.sub -> doc_id -> stored token`,
+    /// the write-time fan-out projections read by sort / agg on `.raw`.
+    pub subfield_values_bytes: u64,
     /// Stored `_source` payloads — populated by the API layer through
     /// [`stored_fields_bytes_for`]; [`document_index_memory_usage`]
     /// always returns 0 here because the documents live outside
@@ -65,6 +68,7 @@ impl MemoryUsage {
     pub fn total_bytes(&self) -> u64 {
         self.postings_bytes
             .saturating_add(self.prefix_postings_bytes)
+            .saturating_add(self.subfield_values_bytes)
             .saturating_add(self.stored_fields_bytes)
             .saturating_add(self.field_stats_bytes)
             .saturating_add(self.term_stats_bytes)
@@ -85,6 +89,7 @@ pub fn document_index_memory_usage(doc_index: &DocumentIndex) -> MemoryUsage {
     MemoryUsage {
         postings_bytes,
         prefix_postings_bytes: prefix_postings_bytes(doc_index),
+        subfield_values_bytes: subfield_values_bytes(doc_index),
         stored_fields_bytes: 0,
         field_stats_bytes: field_stats_bytes(doc_index),
         term_stats_bytes,
@@ -178,6 +183,20 @@ fn prefix_postings_bytes(doc_index: &DocumentIndex) -> u64 {
             total += prefix.len() as u64;
             total += entry_overhead;
             total += (doc_ids.len() as u64).saturating_mul(size_of::<u32>() as u64);
+        }
+    }
+    total
+}
+
+fn subfield_values_bytes(doc_index: &DocumentIndex) -> u64 {
+    let pair_overhead = (size_of::<u32>() + size_of::<String>()) as u64;
+    let mut total: u64 = 0;
+    for (field, by_doc) in doc_index.subfield_values_map().iter() {
+        total += field.len() as u64;
+        total += size_of::<String>() as u64;
+        for value in by_doc.values() {
+            total += pair_overhead;
+            total += value.len() as u64;
         }
     }
     total

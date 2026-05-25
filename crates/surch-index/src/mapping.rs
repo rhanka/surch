@@ -267,9 +267,43 @@ impl FieldMapping {
             .unwrap_or_else(|| AnalyzerName::default_for(self.field_type))
     }
 
+    /// A10: analyzer applied at write time when fanning a parent value
+    /// into this sub-field.
+    ///
+    /// For a `keyword` sub-field declared with a `normalizer` (matchID's
+    /// `NOM.raw: { type: keyword, normalizer: norm }`), the stored token
+    /// must be the whole value lowercased / asciifolded — i.e. produced
+    /// by the normalizer, not the default keyword analyzer. For a
+    /// `text` sub-field the declared (or default) analyzer applies. When
+    /// no `normalizer`/`analyzer` is set this falls back to
+    /// [`Self::analyzer`], so a plain `keyword` sub-field stores the
+    /// untouched value (single keyword token).
+    pub fn effective_analyzer(&self) -> AnalyzerName {
+        if let Some(normalizer) = self.normalizer {
+            return normalizer;
+        }
+        self.analyzer()
+    }
+
     pub fn norms_enabled(&self) -> bool {
         self.norms
             .unwrap_or_else(|| default_norms_for(self.field_type))
+    }
+
+    /// A10: declared multi-field sub-fields, in lexicographic order.
+    /// Empty for single fields. Each item is `(sub_name, &sub_mapping)`;
+    /// callers build the qualified `parent.sub_name` write path
+    /// themselves.
+    pub fn subfields(&self) -> impl Iterator<Item = (&str, &FieldMapping)> {
+        self.fields
+            .iter()
+            .map(|(name, mapping)| (name.as_str(), mapping))
+    }
+
+    /// A10: whether this field declares at least one sub-field, i.e.
+    /// whether write-time fan-out applies to it.
+    pub fn has_subfields(&self) -> bool {
+        !self.fields.is_empty()
     }
 
     fn as_value(&self) -> Value {

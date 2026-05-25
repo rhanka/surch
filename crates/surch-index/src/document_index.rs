@@ -46,6 +46,23 @@ pub struct DocumentIndex {
     /// starting with that prefix. Kept separate from the regular postings so
     /// the BM25 hot path (`doc_freq`, `term_freq`, norms) is unaffected.
     prefix_postings: BTreeMap<String, BTreeMap<String, BTreeSet<u32>>>,
+    /// A10 (Phase 4): write-time fan-out of multi-field sub-fields. When a
+    /// parent field declares `fields: { <sub>: { … } }` (matchID's
+    /// `NOM.raw: { type: keyword, normalizer: norm }`), the parent's source
+    /// value is stored here under the qualified `parent.sub` path with the
+    /// sub-field's analyzer/normalizer already applied
+    /// ([`FieldMapping::effective_analyzer`]).
+    ///
+    /// Outer key is the qualified field path (`"NOM.raw"`), inner key is the
+    /// doc id, value is the normalized token. This is the durable storage
+    /// the query side (`sort: NOM.raw`, `agg.cardinality` on `.raw`) reads
+    /// directly, instead of aliasing the sub-field path back to the parent's
+    /// `_source` and normalizing on read. Sub-field tokens are ALSO indexed
+    /// into the regular postings (under the same qualified path) so a
+    /// `term`/`match` on the sub-field resolves through the FST like any
+    /// other field. This side-table only holds the per-doc projected value
+    /// for the read paths that need a stored value rather than postings.
+    subfield_values: BTreeMap<String, BTreeMap<u32, String>>,
     /// Track A `wp-a-perf-followups.md` Lot 1.6: deferred-FST-build flag.
     /// `true` when `postings_builder` has accumulated writes that the
     /// `terms` FST does not yet reflect. A subsequent
@@ -299,6 +316,7 @@ impl DocumentIndex {
         self.terms = TermDictionary::default();
         self.field_stats.clear();
         self.prefix_postings.clear();
+        self.subfield_values.clear();
         // The fresh `TermDictionary::default()` is in sync with the
         // fresh `PostingsBuilder::new()` (both empty), so the index is
         // clean as far as the deferred-rebuild contract is concerned.
@@ -429,6 +447,18 @@ impl DocumentIndex {
                 self.index_prefix_terms(doc_id, field, &analyzed_terms, prefixes);
             }
 
+            // A10 (Phase 4): write-time fan-out of declared multi-field
+            // sub-fields. The parent's source value is re-analyzed with each
+            // sub-field's own analyzer/normalizer and indexed under the
+            // qualified `parent.sub` path (both as postings and as a stored
+            // projected value), so sort / agg / composite read the sub-field
+            // directly instead of aliasing back to the parent at read time.
+            if let Some(field_mapping) = field_mapping {
+                if field_mapping.has_subfields() {
+                    self.index_subfields(doc_id, field, value, field_mapping)?;
+                }
+            }
+
             for ((field, term), positions) in analyzed_terms {
                 self.postings_builder.add(field, term, doc_id, positions)?;
             }
@@ -475,6 +505,92 @@ impl DocumentIndex {
             }
         }
     }
+
+    /// A10 (Phase 4): index the parent `value` under each declared sub-field
+    /// of `parent_mapping`.
+    ///
+    /// For every `parent.sub` sub-field, the parent's raw source value is
+    /// re-analyzed with the sub-field's
+    /// [`effective_analyzer`](crate::mapping::FieldMapping::effective_analyzer)
+    /// — the `normalizer` for a `keyword` sub-field carrying one (so
+    /// `NOM.raw` stores the lowercased / asciifolded value as a single
+    /// keyword token), the declared analyzer for a `text` sub-field. The
+    /// resulting tokens are added to the regular postings under the
+    /// qualified path so `term`/`match` on the sub-field resolves through
+    /// the FST, and the first (lowest-position) token is also recorded in
+    /// `subfield_values` as the per-doc stored projection that sort / agg
+    /// read directly.
+    fn index_subfields(
+        &mut self,
+        doc_id: u32,
+        parent: &str,
+        value: &str,
+        parent_mapping: &crate::mapping::FieldMapping,
+    ) -> Result<()> {
+        for (sub_name, sub_mapping) in parent_mapping.subfields() {
+            let path = format!("{parent}.{sub_name}");
+            let analyzer = sub_mapping.effective_analyzer();
+            let analyzed = analyzed_terms(analyzer, &path, value);
+
+            // Record the stored projection: the term at the lowest position
+            // (the whole normalized value for a keyword/normalizer sub-field,
+            // the first token for an analyzed text sub-field). Mirrors the
+            // single value matchID's sort / agg expect on `NOM.raw`.
+            if let Some(stored) = lowest_position_term(&analyzed) {
+                self.subfield_values
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(doc_id, stored);
+            }
+
+            for ((field, term), positions) in analyzed {
+                self.postings_builder.add(field, term, doc_id, positions)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A10 (Phase 4): stored projected value for `(field_path, doc_id)`.
+    ///
+    /// Returns `Some(&str)` when `field_path` is a declared multi-field
+    /// sub-field (`parent.sub`) that was fanned out at write time for this
+    /// doc, with the sub-field's analyzer/normalizer already applied. The
+    /// query side uses this for `sort`/`agg`/`composite` on `.raw`/`.norm`
+    /// without re-normalizing the parent's `_source` on read. Returns `None`
+    /// for top-level fields and for docs missing the sub-field value.
+    pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<&str> {
+        self.subfield_values
+            .get(field_path)?
+            .get(&doc_id)
+            .map(String::as_str)
+    }
+
+    /// A10 (Phase 4): whether `field_path` carries write-time fanned-out
+    /// sub-field projections. Used by the query side to choose between the
+    /// stored sub-field and the legacy `lookup_sort_value` parent alias.
+    pub fn has_subfield_values(&self, field_path: &str) -> bool {
+        self.subfield_values.contains_key(field_path)
+    }
+
+    /// A10 (Phase 4): the full per-doc stored sub-field projection map.
+    /// Empty when no field in the mapping declared sub-fields. Exposed for
+    /// memory accounting and for the query side to enumerate projections.
+    pub fn subfield_values_map(&self) -> &BTreeMap<String, BTreeMap<u32, String>> {
+        &self.subfield_values
+    }
+}
+
+/// A10 (Phase 4): the analyzed term carrying the lowest position increment,
+/// i.e. the first token of the analyzed stream. For a keyword/normalizer
+/// sub-field this is the whole normalized value (single token); for a text
+/// sub-field it is the leading token. `None` when the value analyzed to no
+/// tokens (empty / whitespace-only source).
+fn lowest_position_term(analyzed: &BTreeMap<(String, String), Vec<u32>>) -> Option<String> {
+    analyzed
+        .iter()
+        .filter_map(|((_, term), positions)| positions.iter().min().map(|pos| (*pos, term.clone())))
+        .min_by_key(|(pos, _)| *pos)
+        .map(|(_, term)| term)
 }
 
 fn analyzed_terms(
