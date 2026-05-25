@@ -242,7 +242,7 @@ fn skip_executor_matches_brute_force_on_seeded_multi_token_corpus() {
     let doc_len_by_id: BTreeMap<u32, u64> =
         (0..n_docs).map(|d| (d, (next() % 20) as u64 + 1)).collect();
 
-    let mut make_token = |modulo: u32, n: &mut dyn FnMut() -> u32, boost: f64| {
+    let make_token = |modulo: u32, n: &mut dyn FnMut() -> u32, boost: f64| {
         let postings: Vec<(u32, u64)> = (0..n_docs)
             .filter(|d| d % modulo == 0)
             .map(|d| (d, (n() % 9) as u64 + 1))
