@@ -1,8 +1,62 @@
-# Handover surch — 2026-05-24 (HEAD `2e4361e`)
+# Handover surch — 2026-05-25 (HEAD `bec6d75`)
 
 Document de passation pour Codex. Contient : (1) les règles
-durables à respecter, (2) l'état de chaque track au format de
-reporting demandé, (3) les prochaines actions à conduire.
+durables à respecter, (2) l'état de chaque track, (3) les prochaines
+actions. **Les §2/§3 plus bas datent de `2e4361e` — le bloc
+"Avancement loop 2026-05-25" ci-dessous est l'état à jour et prime.**
+
+---
+
+## Avancement loop 2026-05-25 (autonome, prime sur §2/§3)
+
+Session autonome `/loop` pendant absence user. État à `bec6d75` :
+
+### Fait (depuis `2e4361e`)
+- **Lot 3** (Track A, MaxScore block-leapfrog via skip lists Lot 2) :
+  mergé, correctness prouvée (ranking bit-stable, `ci` vert), mais
+  **latence-neutre sur INSEE 10k** (posting lists trop courtes) →
+  gardé, pas revendiqué comme gain. Rapport
+  `docs/ops/bench-reports/2026-05-25-lot3-bmw-skiplist-K8s/`.
+- **A10** (Track D Phase 4, write-time fan-out `.raw`/`.norm`) :
+  mergé, parité matchID préservée (b1-oracle 30/30, 0 divergence).
+  Rapport `docs/ops/bench-reports/2026-05-25-b1-oracle-A10-ES861-K8s/`.
+  Consommation query-side (sort/agg sur `.raw`) déférée à A1/A12.
+- **Objectif F** ouvert : `plan/wp-f-perf-paper.md` (gap analysis +
+  verdict faisabilité) ; **F1** = `docs/paper/methodology.md` livré.
+- **2 fixes infra Track E** : `bench_report` SLO RSS gate Surch-only
+  (`e37a864`) ; wait-loop ne traite plus SIGTERM sidecar
+  (reason=Error exit=143) comme erreur terminale (`97e81f3`). Les
+  deux débloquent insee-bench (teardown vert).
+- **Lot 1.6 / Lot 2** isolés et publiés (bulk parity crossed + skip
+  lists search `p95 -13% / p99 -18%`).
+- Ménage : worktrees agents + branches temp supprimés (`.claude`
+  1.3G→32K).
+
+### Reste % par track (à jour)
+- **A** ~2% : Lots 1→3 livrés. Reste Lot 4 (replays historiques,
+  bloqué) + (F-gap-4) harness latence grand corpus pour prouver Lot 3.
+- **D** Phase 4 active : A10 fait. Reste A1/A13, A7, A2, A5, A6/A13,
+  A12 (consomme `.raw`/`.norm`), B2.
+- **F** ~75% : F1 fait. Reste F2 (multi-rep médiane+IQR), F3
+  (débloquer replays historiques), F4 (charges + harness latence
+  grand corpus), F5 (draft).
+- **B / C / E** : clos (E : 2 fixes wait-loop/SLO ce cycle).
+
+### Prochaines actions (ordre, toutes autonomes sauf mention)
+1. **F2** — multi-rep (≥3) médiane+IQR des lots récents
+   (ndcg-gate bulk+RSS, insee-bench latence) pour passer du
+   single-run au verdict final. EN COURS de démarrage.
+2. **F4 / harness latence grand corpus** — ajouter un artillery
+   TREC-COVID-scale pour mesurer le régime où Lot 3 aide.
+3. **F3** — débloquer Lot 4 (refs replay aux SHAs historiques +
+   surface CI/K8s) ; gros, possible blocage technique.
+4. **Track D A1/A12** — consommer `.raw`/`.norm` (A10) dans
+   sort/agg ; **décision user souhaitable** sur la priorité D vs F.
+
+### Décisions user en attente (NON bloquantes pour le loop)
+- Priorité après F2 : approfondir Track D Phase 4 (A1/A12…) ou
+  Objectif F (F3 replays historiques) ? Le loop avance sur F par
+  défaut tant que non tranché.
 
 ---
 
