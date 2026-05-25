@@ -1,0 +1,395 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"batch/v1","kind":"Job","metadata":{"annotations":{},"labels":{"app.kubernetes.io/component":"trec-covid-latency","app.kubernetes.io/name":"surch","app.kubernetes.io/part-of":"surch-ci"},"name":"trec-covid-latency","namespace":"surch"},"spec":{"activeDeadlineSeconds":3600,"backoffLimit":0,"template":{"metadata":{"labels":{"app.kubernetes.io/component":"trec-covid-latency","app.kubernetes.io/name":"surch","app.kubernetes.io/part-of":"surch-ci"}},"spec":{"containers":[{"args":["set -eu\necho \"Waiting for both engines...\"\nuntil wget -qO- \"$SURCH_URL/\" \u003e/dev/null 2\u003e\u00261; do sleep 0.5; done\nuntil wget -qO- \"$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow\u0026timeout=60s\" \u003e/dev/null 2\u003e\u00261; do sleep 1; done\nmkdir -p \"$REPORTS_DIR\"\nRSS_SAMPLE_SECONDS=\"${RSS_SAMPLE_SECONDS:-600}\"\nTREC_INDEX=\"${TREC_INDEX:-trec-covid}\"\nDATA=\"$BEIR_DIR/trec-covid\"\nWORK=\"$(mktemp -d)\"\n# shareProcessNamespace=true exposes sibling container PIDs\n# in /proc; the bench-driver image is procps-less so we scan\n# /proc/\u003cpid\u003e/cmdline directly. We match the basename of\n# argv[0] (not the whole cmdline) to avoid false positives on\n# the driver `sh -c \"\u003cscript\u003e\"` whose cmdline embeds the\n# script body. An optional content substring is required when\n# the engine binary is generic (e.g. `java` for OpenSearch).\nstart_rss_sample() {\n  label=\"$1\"\n  binary=\"$2\"\n  content=\"$3\"\n  output=\"$4\"\n  pid_file=\"$5\"\n  pid=\"\"\n  for d in /proc/[0-9]*; do\n    [ -r \"$d/cmdline\" ] || continue\n    argv0=\"$(tr '\\0' '\\n' \u003c \"$d/cmdline\" 2\u003e/dev/null | head -n 1)\"\n    [ -n \"$argv0\" ] || continue\n    case \"${argv0##*/}\" in\n      \"$binary\") ;;\n      *) continue ;;\n    esac\n    if [ -n \"$content\" ]; then\n      tr '\\0' ' ' \u003c \"$d/cmdline\" 2\u003e/dev/null | grep -q \"$content\" || continue\n    fi\n    pid=\"${d#/proc/}\"\n    break\n  done\n  if [ -z \"$pid\" ]; then\n    echo \"WARN: cannot start RSS sample for $label (binary: $binary, content: $content)\"\n    return 0\n  fi\n  /usr/local/bin/rss-sample.sh \"$pid\" \"$RSS_SAMPLE_SECONDS\" \"$output\" \\\n    \u003e \"${output}.sampler.log\" 2\u003e\u00261 \u0026\n  echo $! \u003e \"$pid_file\"\n}\nwait_rss_sample() {\n  pid_file=\"$1\"\n  if [ ! -f \"$pid_file\" ]; then\n    return 0\n  fi\n  pid=\"$(cat \"$pid_file\" 2\u003e/dev/null || true)\"\n  if [ -n \"$pid\" ]; then\n    wait \"$pid\" || true\n  fi\n}\nstart_rss_sample \"surch\"      \"surch-api\" \"\"                         \"$REPORTS_DIR/rss-art-surch.json\" \"$REPORTS_DIR/.rss-surch.pid\"\nstart_rss_sample \"opensearch\" \"java\"      \"org.opensearch.bootstrap\" \"$REPORTS_DIR/rss-art-os.json\"    \"$REPORTS_DIR/.rss-os.pid\"\n# Convert the read-only BEIR corpus.jsonl into _bulk NDJSON\n# in scratch $WORK, once, shared by both engines. Same shape\n# as scripts/bench/trec-covid-ndcg.sh: {id,title,text} docs\n# with `_index` baked into each action header.\nparse_size_to_bytes() {\n  raw=\"${1:?size}\"\n  case \"$raw\" in\n    *[kK])  printf '%s' \"$(( ${raw%[kK]} * 1024 ))\" ;;\n    *[mM])  printf '%s' \"$(( ${raw%[mM]} * 1024 * 1024 ))\" ;;\n    *[gG])  printf '%s' \"$(( ${raw%[gG]} * 1024 * 1024 * 1024 ))\" ;;\n    *[0-9]) printf '%s' \"$raw\" ;;\n    *) echo \"invalid TREC_BULK_CHUNK_SIZE='$raw'\" \u003e\u00262; return 2 ;;\n  esac\n}\nNDJSON=\"$WORK/corpus.ndjson\"\njq -rc --arg idx \"$TREC_INDEX\" '[\n  {\"index\":{\"_id\":._id,\"_index\":$idx}},\n  {\"id\":._id,\"title\":.title,\"text\":.text}\n] | .[] | tostring' \"$DATA/corpus.jsonl\" \u003e \"$NDJSON\"\n# Pair-aware chunking under Surch's 16 MiB `_bulk` cap:\n# accumulate (action, source) pairs and only cut on pair\n# boundaries, otherwise a stranded `index` action breaks the\n# next POST with `missing source line after index action`.\nchunk_max_bytes=\"$(parse_size_to_bytes \"${TREC_BULK_CHUNK_SIZE:-8m}\")\"\nawk -v out=\"$WORK/bulk\" -v maxb=\"$chunk_max_bytes\" '\n  BEGIN { i = 0; sz = 0; cf = sprintf(\"%s.%04d\", out, i); action = \"\" }\n  {\n    if (NR % 2 == 1) { action = $0; next }\n    pair = length(action) + 1 + length($0) + 1\n    if (sz + pair \u003e maxb \u0026\u0026 sz \u003e 0) { close(cf); i++; cf = sprintf(\"%s.%04d\", out, i); sz = 0 }\n    print action \u003e cf\n    print $0 \u003e cf\n    sz += pair\n  }\n  END {\n    if (NR % 2 == 1) { printf \"odd line count (NR=%d) — unpaired action\\n\", NR \u003e \"/dev/stderr\"; exit 2 }\n    if (cf != \"\") close(cf)\n  }\n' \"$NDJSON\"\nbootstrap_engine() {\n  url=\"$1\"; label=\"$2\"\n  # The scratch PVC persists across ndcg-gate / *-bench runs,\n  # so drop the working set before re-creating it; a partial\n  # `trec-covid` in a YELLOW cluster would 400 the bulk POST.\n  curl -fsS -o /dev/null -X DELETE \"$url/$TREC_INDEX\" 2\u003e/dev/null || true\n  curl -fsS -o /dev/null \\\n    \"$url/_cluster/health?wait_for_status=yellow\u0026timeout=30s\" 2\u003e/dev/null || true\n  echo \"bootstrap $label: PUT /$TREC_INDEX\"\n  curl -fsS -X PUT \"$url/$TREC_INDEX\" \\\n    -H 'Content-Type: application/json' \\\n    -d '{\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"},\"text\":{\"type\":\"text\"}}}}' \\\n    \u003e \"$REPORTS_DIR/bootstrap-$label.put.json\"\n  curl -fsS -o /dev/null \\\n    \"$url/_cluster/health/$TREC_INDEX?wait_for_status=yellow\u0026wait_for_active_shards=1\u0026timeout=30s\" \\\n    2\u003e/dev/null || true\n  echo \"bootstrap $label: POST /_bulk (171k docs, chunked)\"\n  for chunk in \"$WORK\"/bulk.*; do\n    lines=\"$(wc -l \u003c \"$chunk\")\"\n    if [ \"$(( lines % 2 ))\" -ne 0 ]; then\n      echo \"$(basename \"$chunk\") has $lines lines (odd) — refusing to POST\" \u003e\u00262\n      exit 22\n    fi\n    curl -fsS -X POST \"$url/_bulk\" \\\n      -H 'Content-Type: application/x-ndjson' \\\n      --data-binary \"@$chunk\" \u003e /dev/null\n  done\n  curl -fsS -X POST \"$url/$TREC_INDEX/_refresh\" \\\n    \u003e \"$REPORTS_DIR/bootstrap-$label.refresh.json\"\n}\nbootstrap_engine \"$SURCH_URL\" surch\nbootstrap_engine \"$OPENSEARCH_URL\" opensearch\n# Build the artillery query-names file: one full TREC-COVID\n# test-query string per line (the real multi-term query text\n# is what stresses the long-posting-list / skip-list regime).\n# Restrict to qids that have a positive qrel so we replay the\n# same evaluated query set as trec-covid-ndcg.sh.\nawk -F'\\t' 'NR\u003e1 \u0026\u0026 $3\u003e0 { print $1 }' \"$DATA/qrels/test.tsv\" | sort -u \u003e \"$WORK/test_qids.txt\"\njq -r '\"\\(._id)\\t\\(.text)\"' \"$DATA/queries.jsonl\" \u003e \"$WORK/queries.tsv\"\nawk -F'\\t' '\n  NR==FNR { keep[$1]=1; next }\n  ($1 in keep) {\n    q=$2\n    for (i=3; i\u003c=NF; i++) q = q \" \" $i\n    gsub(/\\r/, \"\", q)\n    if (q != \"\") print q\n  }\n' \"$WORK/test_qids.txt\" \"$WORK/queries.tsv\" \u003e \"$WORK/artillery_queries.txt\"\necho \"artillery query-names file: $(wc -l \u003c \"$WORK/artillery_queries.txt\") queries\"\n# Warm up both engines so JVM JIT + page caches are hot\n# before artillery_bench measures cold-start outliers.\nwarmup_engine() {\n  url=\"$1\"; label=\"$2\"\n  echo \"warmup $label: 50 match_all hits\"\n  for i in $(seq 1 50); do\n    curl -fsS -o /dev/null -X POST \"$url/$TREC_INDEX/_search\" \\\n      -H 'Content-Type: application/json' \\\n      -d '{\"query\":{\"match_all\":{}},\"size\":5}' || true\n  done\n}\nwarmup_engine \"$SURCH_URL\" surch\nwarmup_engine \"$OPENSEARCH_URL\" opensearch\n# The bench driver image ships artillery_bench + bench_report\n# in /usr/local/bin.\n/usr/local/bin/artillery_bench \\\n  --url \"$SURCH_URL\" --index \"$TREC_INDEX\" --query-mode trec \\\n  --names \"$WORK/artillery_queries.txt\" \\\n  --workers \"$ART_WORKERS\" --phases \"$ART_PHASES\" \\\n  --report \"$REPORTS_DIR/art-surch.json\"\n/usr/local/bin/artillery_bench \\\n  --url \"$OPENSEARCH_URL\" --index \"$TREC_INDEX\" --query-mode trec \\\n  --names \"$WORK/artillery_queries.txt\" \\\n  --workers \"$ART_WORKERS\" --phases \"$ART_PHASES\" \\\n  --report \"$REPORTS_DIR/art-os.json\"\n# RSS budget is per-workload: on the full 171k corpus Surch's\n# resident set scales to ~2.1 GiB (documented, not a\n# regression), well above the INSEE 10k default of 1024 MB.\n# Declare a corpus-appropriate budget so the latency Job is\n# gated on Surch latency + error rate, not on a memory\n# threshold calibrated for a 17x smaller corpus.\n/usr/local/bin/bench_report \\\n  --dir \"$REPORTS_DIR\" \\\n  --output \"$REPORTS_DIR/summary.md\" \\\n  --rss-peak-mb 2560\nwait_rss_sample \"$REPORTS_DIR/.rss-surch.pid\"\nwait_rss_sample \"$REPORTS_DIR/.rss-os.pid\"\n# Surface each rss-*.json envelope between markers so the\n# ci-k8s workflow can reconstruct them when the emptyDir\n# /reports volume is gone after driver termination.\nfor f in \"$REPORTS_DIR\"/rss-art-*.json; do\n  [ -f \"$f\" ] || continue\n  fname=\"$(basename \"$f\")\"\n  echo \"BEGIN_SURCH_K8S_RSS_FILE:$fname\"\n  cat \"$f\"\n  echo\n  echo \"END_SURCH_K8S_RSS_FILE:$fname\"\ndone\necho \"BEGIN_SURCH_K8S_SUMMARY\"\ncat \"$REPORTS_DIR/summary.md\"\necho \"END_SURCH_K8S_SUMMARY\"\necho \"trec-covid-latency complete.\"\n"],"command":["/bin/sh","-c"],"env":[{"name":"SURCH_URL","value":"http://127.0.0.1:7700"},{"name":"OPENSEARCH_URL","value":"http://127.0.0.1:9200"},{"name":"BEIR_DIR","value":"/data/beir"},{"name":"REPORTS_DIR","value":"/reports"},{"name":"TREC_INDEX","value":"trec-covid"},{"name":"TREC_BULK_CHUNK_SIZE","value":"8m"},{"name":"ART_PHASES","value":"2:30,2:30,5:30,10:30,20:30,50:240"},{"name":"ART_WORKERS","value":"8"},{"name":"RSS_SAMPLE_SECONDS","value":"600"}],"image":"ghcr.io/rhanka/surch:bench-sha-9f53ba2309d3ac8df436f083b40cfb9373426d7b","imagePullPolicy":"IfNotPresent","name":"artillery-runner","resources":{"limits":{"cpu":"500m","memory":"1Gi"},"requests":{"cpu":"100m","memory":"128Mi"}},"volumeMounts":[{"mountPath":"/data/beir","name":"beir","readOnly":true},{"mountPath":"/reports","name":"reports"}]}],"initContainers":[{"env":[{"name":"SURCH_HOST","value":"127.0.0.1"},{"name":"SURCH_PORT","value":"7700"},{"name":"RUST_LOG","value":"warn"}],"image":"ghcr.io/rhanka/surch:sha-9f53ba2309d3ac8df436f083b40cfb9373426d7b","imagePullPolicy":"IfNotPresent","name":"surch","ports":[{"containerPort":7700,"name":"surch-http"}],"resources":{"limits":{"cpu":"2000m","memory":"7Gi"},"requests":{"cpu":"150m","memory":"256Mi"}},"restartPolicy":"Always","volumeMounts":[{"mountPath":"/var/surch","name":"scratch","subPath":"surch-data"}]},{"env":[{"name":"discovery.type","value":"single-node"},{"name":"DISABLE_SECURITY_PLUGIN","value":"true"},{"name":"DISABLE_INSTALL_DEMO_CONFIG","value":"true"},{"name":"OPENSEARCH_JAVA_OPTS","value":"-Xms1g -Xmx1g"},{"name":"bootstrap.memory_lock","value":"false"}],"image":"opensearchproject/opensearch:2.17.1","imagePullPolicy":"IfNotPresent","name":"opensearch","ports":[{"containerPort":9200,"name":"os-http"}],"resources":{"limits":{"cpu":"1200m","memory":"2Gi"},"requests":{"cpu":"250m","memory":"256Mi"}},"restartPolicy":"Always","securityContext":{"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000},"volumeMounts":[{"mountPath":"/usr/share/opensearch/data","name":"scratch","subPath":"opensearch-data"}]}],"nodeSelector":{"k8s.scaleway.com/pool-name":"burst"},"restartPolicy":"Never","securityContext":{"fsGroup":65532,"runAsGroup":65532,"runAsNonRoot":true,"runAsUser":65532},"serviceAccountName":"surch","shareProcessNamespace":true,"tolerations":[{"effect":"NoSchedule","key":"pool","operator":"Equal","value":"burst"}],"volumes":[{"name":"beir","persistentVolumeClaim":{"claimName":"surch-corpus-beir","readOnly":true}},{"name":"scratch","persistentVolumeClaim":{"claimName":"surch-scratch"}},{"emptyDir":{"sizeLimit":"128Mi"},"name":"reports"}]}},"ttlSecondsAfterFinished":3600}}
+  creationTimestamp: "2026-05-25T22:39:42Z"
+  generation: 1
+  labels:
+    app.kubernetes.io/component: trec-covid-latency
+    app.kubernetes.io/name: surch
+    app.kubernetes.io/part-of: surch-ci
+  name: trec-covid-latency
+  namespace: surch
+  resourceVersion: "45353316826"
+  uid: 64a15ca4-13b9-4808-99f1-91320a071a04
+spec:
+  activeDeadlineSeconds: 3600
+  backoffLimit: 0
+  completionMode: NonIndexed
+  completions: 1
+  manualSelector: false
+  parallelism: 1
+  podReplacementPolicy: TerminatingOrFailed
+  selector:
+    matchLabels:
+      batch.kubernetes.io/controller-uid: 64a15ca4-13b9-4808-99f1-91320a071a04
+  suspend: false
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: trec-covid-latency
+        app.kubernetes.io/name: surch
+        app.kubernetes.io/part-of: surch-ci
+        batch.kubernetes.io/controller-uid: 64a15ca4-13b9-4808-99f1-91320a071a04
+        batch.kubernetes.io/job-name: trec-covid-latency
+        controller-uid: 64a15ca4-13b9-4808-99f1-91320a071a04
+        job-name: trec-covid-latency
+    spec:
+      containers:
+      - args:
+        - |
+          set -eu
+          echo "Waiting for both engines..."
+          until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+          until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
+          mkdir -p "$REPORTS_DIR"
+          RSS_SAMPLE_SECONDS="${RSS_SAMPLE_SECONDS:-600}"
+          TREC_INDEX="${TREC_INDEX:-trec-covid}"
+          DATA="$BEIR_DIR/trec-covid"
+          WORK="$(mktemp -d)"
+          # shareProcessNamespace=true exposes sibling container PIDs
+          # in /proc; the bench-driver image is procps-less so we scan
+          # /proc/<pid>/cmdline directly. We match the basename of
+          # argv[0] (not the whole cmdline) to avoid false positives on
+          # the driver `sh -c "<script>"` whose cmdline embeds the
+          # script body. An optional content substring is required when
+          # the engine binary is generic (e.g. `java` for OpenSearch).
+          start_rss_sample() {
+            label="$1"
+            binary="$2"
+            content="$3"
+            output="$4"
+            pid_file="$5"
+            pid=""
+            for d in /proc/[0-9]*; do
+              [ -r "$d/cmdline" ] || continue
+              argv0="$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -n 1)"
+              [ -n "$argv0" ] || continue
+              case "${argv0##*/}" in
+                "$binary") ;;
+                *) continue ;;
+              esac
+              if [ -n "$content" ]; then
+                tr '\0' ' ' < "$d/cmdline" 2>/dev/null | grep -q "$content" || continue
+              fi
+              pid="${d#/proc/}"
+              break
+            done
+            if [ -z "$pid" ]; then
+              echo "WARN: cannot start RSS sample for $label (binary: $binary, content: $content)"
+              return 0
+            fi
+            /usr/local/bin/rss-sample.sh "$pid" "$RSS_SAMPLE_SECONDS" "$output" \
+              > "${output}.sampler.log" 2>&1 &
+            echo $! > "$pid_file"
+          }
+          wait_rss_sample() {
+            pid_file="$1"
+            if [ ! -f "$pid_file" ]; then
+              return 0
+            fi
+            pid="$(cat "$pid_file" 2>/dev/null || true)"
+            if [ -n "$pid" ]; then
+              wait "$pid" || true
+            fi
+          }
+          start_rss_sample "surch"      "surch-api" ""                         "$REPORTS_DIR/rss-art-surch.json" "$REPORTS_DIR/.rss-surch.pid"
+          start_rss_sample "opensearch" "java"      "org.opensearch.bootstrap" "$REPORTS_DIR/rss-art-os.json"    "$REPORTS_DIR/.rss-os.pid"
+          # Convert the read-only BEIR corpus.jsonl into _bulk NDJSON
+          # in scratch $WORK, once, shared by both engines. Same shape
+          # as scripts/bench/trec-covid-ndcg.sh: {id,title,text} docs
+          # with `_index` baked into each action header.
+          parse_size_to_bytes() {
+            raw="${1:?size}"
+            case "$raw" in
+              *[kK])  printf '%s' "$(( ${raw%[kK]} * 1024 ))" ;;
+              *[mM])  printf '%s' "$(( ${raw%[mM]} * 1024 * 1024 ))" ;;
+              *[gG])  printf '%s' "$(( ${raw%[gG]} * 1024 * 1024 * 1024 ))" ;;
+              *[0-9]) printf '%s' "$raw" ;;
+              *) echo "invalid TREC_BULK_CHUNK_SIZE='$raw'" >&2; return 2 ;;
+            esac
+          }
+          NDJSON="$WORK/corpus.ndjson"
+          jq -rc --arg idx "$TREC_INDEX" '[
+            {"index":{"_id":._id,"_index":$idx}},
+            {"id":._id,"title":.title,"text":.text}
+          ] | .[] | tostring' "$DATA/corpus.jsonl" > "$NDJSON"
+          # Pair-aware chunking under Surch's 16 MiB `_bulk` cap:
+          # accumulate (action, source) pairs and only cut on pair
+          # boundaries, otherwise a stranded `index` action breaks the
+          # next POST with `missing source line after index action`.
+          chunk_max_bytes="$(parse_size_to_bytes "${TREC_BULK_CHUNK_SIZE:-8m}")"
+          awk -v out="$WORK/bulk" -v maxb="$chunk_max_bytes" '
+            BEGIN { i = 0; sz = 0; cf = sprintf("%s.%04d", out, i); action = "" }
+            {
+              if (NR % 2 == 1) { action = $0; next }
+              pair = length(action) + 1 + length($0) + 1
+              if (sz + pair > maxb && sz > 0) { close(cf); i++; cf = sprintf("%s.%04d", out, i); sz = 0 }
+              print action > cf
+              print $0 > cf
+              sz += pair
+            }
+            END {
+              if (NR % 2 == 1) { printf "odd line count (NR=%d) — unpaired action\n", NR > "/dev/stderr"; exit 2 }
+              if (cf != "") close(cf)
+            }
+          ' "$NDJSON"
+          bootstrap_engine() {
+            url="$1"; label="$2"
+            # The scratch PVC persists across ndcg-gate / *-bench runs,
+            # so drop the working set before re-creating it; a partial
+            # `trec-covid` in a YELLOW cluster would 400 the bulk POST.
+            curl -fsS -o /dev/null -X DELETE "$url/$TREC_INDEX" 2>/dev/null || true
+            curl -fsS -o /dev/null \
+              "$url/_cluster/health?wait_for_status=yellow&timeout=30s" 2>/dev/null || true
+            echo "bootstrap $label: PUT /$TREC_INDEX"
+            curl -fsS -X PUT "$url/$TREC_INDEX" \
+              -H 'Content-Type: application/json' \
+              -d '{"mappings":{"properties":{"title":{"type":"text"},"text":{"type":"text"}}}}' \
+              > "$REPORTS_DIR/bootstrap-$label.put.json"
+            curl -fsS -o /dev/null \
+              "$url/_cluster/health/$TREC_INDEX?wait_for_status=yellow&wait_for_active_shards=1&timeout=30s" \
+              2>/dev/null || true
+            echo "bootstrap $label: POST /_bulk (171k docs, chunked)"
+            for chunk in "$WORK"/bulk.*; do
+              lines="$(wc -l < "$chunk")"
+              if [ "$(( lines % 2 ))" -ne 0 ]; then
+                echo "$(basename "$chunk") has $lines lines (odd) — refusing to POST" >&2
+                exit 22
+              fi
+              curl -fsS -X POST "$url/_bulk" \
+                -H 'Content-Type: application/x-ndjson' \
+                --data-binary "@$chunk" > /dev/null
+            done
+            curl -fsS -X POST "$url/$TREC_INDEX/_refresh" \
+              > "$REPORTS_DIR/bootstrap-$label.refresh.json"
+          }
+          bootstrap_engine "$SURCH_URL" surch
+          bootstrap_engine "$OPENSEARCH_URL" opensearch
+          # Build the artillery query-names file: one full TREC-COVID
+          # test-query string per line (the real multi-term query text
+          # is what stresses the long-posting-list / skip-list regime).
+          # Restrict to qids that have a positive qrel so we replay the
+          # same evaluated query set as trec-covid-ndcg.sh.
+          awk -F'\t' 'NR>1 && $3>0 { print $1 }' "$DATA/qrels/test.tsv" | sort -u > "$WORK/test_qids.txt"
+          jq -r '"\(._id)\t\(.text)"' "$DATA/queries.jsonl" > "$WORK/queries.tsv"
+          awk -F'\t' '
+            NR==FNR { keep[$1]=1; next }
+            ($1 in keep) {
+              q=$2
+              for (i=3; i<=NF; i++) q = q " " $i
+              gsub(/\r/, "", q)
+              if (q != "") print q
+            }
+          ' "$WORK/test_qids.txt" "$WORK/queries.tsv" > "$WORK/artillery_queries.txt"
+          echo "artillery query-names file: $(wc -l < "$WORK/artillery_queries.txt") queries"
+          # Warm up both engines so JVM JIT + page caches are hot
+          # before artillery_bench measures cold-start outliers.
+          warmup_engine() {
+            url="$1"; label="$2"
+            echo "warmup $label: 50 match_all hits"
+            for i in $(seq 1 50); do
+              curl -fsS -o /dev/null -X POST "$url/$TREC_INDEX/_search" \
+                -H 'Content-Type: application/json' \
+                -d '{"query":{"match_all":{}},"size":5}' || true
+            done
+          }
+          warmup_engine "$SURCH_URL" surch
+          warmup_engine "$OPENSEARCH_URL" opensearch
+          # The bench driver image ships artillery_bench + bench_report
+          # in /usr/local/bin.
+          /usr/local/bin/artillery_bench \
+            --url "$SURCH_URL" --index "$TREC_INDEX" --query-mode trec \
+            --names "$WORK/artillery_queries.txt" \
+            --workers "$ART_WORKERS" --phases "$ART_PHASES" \
+            --report "$REPORTS_DIR/art-surch.json"
+          /usr/local/bin/artillery_bench \
+            --url "$OPENSEARCH_URL" --index "$TREC_INDEX" --query-mode trec \
+            --names "$WORK/artillery_queries.txt" \
+            --workers "$ART_WORKERS" --phases "$ART_PHASES" \
+            --report "$REPORTS_DIR/art-os.json"
+          # RSS budget is per-workload: on the full 171k corpus Surch's
+          # resident set scales to ~2.1 GiB (documented, not a
+          # regression), well above the INSEE 10k default of 1024 MB.
+          # Declare a corpus-appropriate budget so the latency Job is
+          # gated on Surch latency + error rate, not on a memory
+          # threshold calibrated for a 17x smaller corpus.
+          /usr/local/bin/bench_report \
+            --dir "$REPORTS_DIR" \
+            --output "$REPORTS_DIR/summary.md" \
+            --rss-peak-mb 2560
+          wait_rss_sample "$REPORTS_DIR/.rss-surch.pid"
+          wait_rss_sample "$REPORTS_DIR/.rss-os.pid"
+          # Surface each rss-*.json envelope between markers so the
+          # ci-k8s workflow can reconstruct them when the emptyDir
+          # /reports volume is gone after driver termination.
+          for f in "$REPORTS_DIR"/rss-art-*.json; do
+            [ -f "$f" ] || continue
+            fname="$(basename "$f")"
+            echo "BEGIN_SURCH_K8S_RSS_FILE:$fname"
+            cat "$f"
+            echo
+            echo "END_SURCH_K8S_RSS_FILE:$fname"
+          done
+          echo "BEGIN_SURCH_K8S_SUMMARY"
+          cat "$REPORTS_DIR/summary.md"
+          echo "END_SURCH_K8S_SUMMARY"
+          echo "trec-covid-latency complete."
+        command:
+        - /bin/sh
+        - -c
+        env:
+        - name: SURCH_URL
+          value: http://127.0.0.1:7700
+        - name: OPENSEARCH_URL
+          value: http://127.0.0.1:9200
+        - name: BEIR_DIR
+          value: /data/beir
+        - name: REPORTS_DIR
+          value: /reports
+        - name: TREC_INDEX
+          value: trec-covid
+        - name: TREC_BULK_CHUNK_SIZE
+          value: 8m
+        - name: ART_PHASES
+          value: 2:30,2:30,5:30,10:30,20:30,50:240
+        - name: ART_WORKERS
+          value: "8"
+        - name: RSS_SAMPLE_SECONDS
+          value: "600"
+        image: ghcr.io/rhanka/surch:bench-sha-9f53ba2309d3ac8df436f083b40cfb9373426d7b
+        imagePullPolicy: IfNotPresent
+        name: artillery-runner
+        resources:
+          limits:
+            cpu: 500m
+            memory: 1Gi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /data/beir
+          name: beir
+          readOnly: true
+        - mountPath: /reports
+          name: reports
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - env:
+        - name: SURCH_HOST
+          value: 127.0.0.1
+        - name: SURCH_PORT
+          value: "7700"
+        - name: RUST_LOG
+          value: warn
+        image: ghcr.io/rhanka/surch:sha-9f53ba2309d3ac8df436f083b40cfb9373426d7b
+        imagePullPolicy: IfNotPresent
+        name: surch
+        ports:
+        - containerPort: 7700
+          name: surch-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: "2"
+            memory: 7Gi
+          requests:
+            cpu: 150m
+            memory: 256Mi
+        restartPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/surch
+          name: scratch
+          subPath: surch-data
+      - env:
+        - name: discovery.type
+          value: single-node
+        - name: DISABLE_SECURITY_PLUGIN
+          value: "true"
+        - name: DISABLE_INSTALL_DEMO_CONFIG
+          value: "true"
+        - name: OPENSEARCH_JAVA_OPTS
+          value: -Xms1g -Xmx1g
+        - name: bootstrap.memory_lock
+          value: "false"
+        image: opensearchproject/opensearch:2.17.1
+        imagePullPolicy: IfNotPresent
+        name: opensearch
+        ports:
+        - containerPort: 9200
+          name: os-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 1200m
+            memory: 2Gi
+          requests:
+            cpu: 250m
+            memory: 256Mi
+        restartPolicy: Always
+        securityContext:
+          runAsGroup: 1000
+          runAsNonRoot: true
+          runAsUser: 1000
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/share/opensearch/data
+          name: scratch
+          subPath: opensearch-data
+      nodeSelector:
+        k8s.scaleway.com/pool-name: burst
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+      serviceAccount: surch
+      serviceAccountName: surch
+      shareProcessNamespace: true
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: pool
+        operator: Equal
+        value: burst
+      volumes:
+      - name: beir
+        persistentVolumeClaim:
+          claimName: surch-corpus-beir
+          readOnly: true
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: surch-scratch
+      - emptyDir:
+          sizeLimit: 128Mi
+        name: reports
+  ttlSecondsAfterFinished: 3600
+status:
+  completionTime: "2026-05-25T23:01:41Z"
+  conditions:
+  - lastProbeTime: "2026-05-25T23:01:41Z"
+    lastTransitionTime: "2026-05-25T23:01:41Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: SuccessCriteriaMet
+  - lastProbeTime: "2026-05-25T23:01:41Z"
+    lastTransitionTime: "2026-05-25T23:01:41Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: Complete
+  ready: 0
+  startTime: "2026-05-25T22:39:42Z"
+  succeeded: 1
+  terminating: 0
+  uncountedTerminatedPods: {}

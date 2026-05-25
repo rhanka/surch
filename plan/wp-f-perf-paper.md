@@ -150,12 +150,22 @@ Atouts méthodo déjà en place :
     `bench-sha-<SHA>` construite via `docker-build.yml` + le nœud
     DEV1-XL + ResourceQuota `limits.memory>=10Gi`). Validation CI/K8s
     (pas de build/test lourd local).
-  - [ ] Reste F4 : BEIR multi-datasets (NFCorpus, FiQA…) + sweep de
-    taille de corpus (courbe de scaling bulk).
-  - **Caveat équivalence (écart latence grand corpus)** : le premier
-    run (26419941882) donne Surch p50 `0.6 ms` / p95 `1.7 ms` vs
-    OpenSearch p50 `207 ms` / p95 `592 ms` sur 171 k (13 170 req,
-    0 erreur des 2 côtés) — soit ~345x à p50. À publier AVEC réserve :
+  - [x] **Premier run vert publié** : `2026-05-25-F4-trec-covid-latency-K8s/`
+    (GHA `26422565840` @ `9f53ba2`, 5 checks SLO PASS). Steady-state
+    Surch p50 `0.5 ms` / p95 `1.3 ms` vs OpenSearch p50 `183.8 ms` /
+    p95 `487.8 ms` sur 171 k (13 170 req, 0 erreur), RSS Surch
+    `2135 MB` ≤ budget `2560 MB`. OpenSearch se dégrade sous charge
+    (p50 → 193 ms à 50 RPS), Surch reste plat. Tableau par phase +
+    caveats dans le README. **Débloque la mesure du régime Lot 3**
+    (longues listes de postings) qu'INSEE 10k n'atteignait pas.
+  - [ ] Reste F4 : run multi-rep (≥3) du harness latence grand corpus
+    pour un verdict médian ; logger `hits.total` par requête dans
+    `artillery_bench` (assertion d'équivalence in-artefact) ; BEIR
+    multi-datasets (NFCorpus, FiQA…) + sweep de taille de corpus.
+  - **Caveat équivalence (écart latence grand corpus)** : run vert
+    `26422565840` donne Surch p50 `0.5 ms` / p95 `1.3 ms` vs
+    OpenSearch p50 `183.8 ms` / p95 `487.8 ms` sur 171 k (13 170 req,
+    0 erreur des 2 côtés) — soit ~368x à p50. À publier AVEC réserve :
     `artillery_bench` ne capture que latence + erreurs (drain du body
     sans parser `hits.total`, cf. `issue_request` l.648-652), donc
     l'égalité du travail entre moteurs ne se prouve pas depuis
