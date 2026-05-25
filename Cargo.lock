@@ -3243,6 +3243,7 @@ dependencies = [
 name = "surch-search"
 version = "0.1.0"
 dependencies = [
+ "surch-codec",
  "surch-index",
  "surch-store",
  "surch-types",
