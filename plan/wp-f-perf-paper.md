@@ -75,10 +75,10 @@ Atouts méthodo déjà en place :
 
 ## Plan F (lots)
 
-- [ ] **F1 — Section méthodologie** : rédiger
-  `docs/paper/methodology.md` (harness K8s, schémas `surch.bench.*`,
-  protocole replay, environnement, équité allocator, garde-fou
-  qualité). Rédigeable MAINTENANT — la méthodo est déjà en place.
+- [x] **F1 — Section méthodologie** : `docs/paper/methodology.md`
+  livré (système testé, environnement K8s, charges, schémas
+  `surch.bench.*`, garde-fous SLO/qualité, contrôles d'équité,
+  protocole d'isolation, limitation single-run, reproductibilité).
 - [ ] **F2 — Multi-rep des lots récents** : 3 reps ndcg-gate
   (bulk+RSS) + 3 reps insee-bench (latence) pour Lots 1.6/1.7/2 ;
   agréger médiane + IQR ; mettre à jour les rapports.

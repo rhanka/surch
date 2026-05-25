@@ -445,8 +445,10 @@ scientific article. Detailed plan + gap analysis:
   Recent lots (1, 1.5, 1.6, 1.7, 2) are cleanly K8s-isolated and
   tell a strong story (Surch beats OpenSearch on bulk + search
   latency + RAM, quality stable), but all single-run.
-- [ ] F1 — methodology section (`docs/paper/methodology.md`);
-  writable now, the harness + replay protocol already exist.
+- [x] F1 — methodology section shipped: `docs/paper/methodology.md`
+  (system under test, environment, workloads, metric schemas,
+  SLO/quality guardrails, fairness controls, isolation protocol,
+  the single-run limitation, reproducibility).
 - [ ] F2 — 3-rep median+IQR re-runs of the recent lots
   (ndcg-gate bulk+RSS, insee-bench latency).
 - [ ] F3 — unblock + replay the historical optimisations
