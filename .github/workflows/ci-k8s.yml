@@ -208,7 +208,15 @@ jobs:
               kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
               exit 1
             fi
-            if printf '%s\n' "$pod_states" | grep -Eq '(waiting=|terminated=|last=)(ErrImagePull|ImagePullBackOff|InvalidImageName|CreateContainerConfigError|CreateContainerError|RunContainerError|ContainerCannotRun|StartError|CrashLoopBackOff|Error|OOMKilled)'; then
+            # Hard terminal reasons that are never legitimate. NOTE the
+            # bare `Error` reason is deliberately excluded: a restartable
+            # init container sidecar (Surch, OpenSearch) that the kubelet
+            # SIGTERMs at Job teardown terminates with reason `Error` and
+            # exit code 143, which is normal. Distinguishing a real crash
+            # (reason `Error`, exit != 143) from a teardown SIGTERM
+            # (reason `Error`, exit == 143) is done by exit code in the
+            # awk pass below, not by the reason string here.
+            if printf '%s\n' "$pod_states" | grep -Eq '(waiting=|terminated=|last=)(ErrImagePull|ImagePullBackOff|InvalidImageName|CreateContainerConfigError|CreateContainerError|RunContainerError|ContainerCannotRun|StartError|CrashLoopBackOff|OOMKilled)'; then
               echo "::error::Kubernetes pod for Job $JOB_NAME hit a terminal container error."
               kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" -o wide || true
               kubectl -n "$SCW_NAMESPACE" describe pods -l "$JOB_LABEL" || true
