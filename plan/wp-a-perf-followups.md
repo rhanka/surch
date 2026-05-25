@@ -283,13 +283,22 @@ top-K and `multi_match`.
   seeded multi-token corpora at every top-K limit, plus a
   blocks-skipped assertion and a corpus-sized-limit "skips nothing"
   assertion) and by the in-module linear-reference oracle tests.
-- [ ] Promote a paired K8s perf proof + Track A ledger update for
-  Search latency. SciFact NDCG@10 floor `>= 0.65` must hold;
-  TREC-COVID NDCG@10 must not regress vs the
-  `2026-05-22-ndcg-gate-7Gi-K8s` baseline. (Pending: validated by the
-  K8s `ndcg-gate` + `insee-bench` harness after this branch merges to
-  `main`; the skip is a pure performance optimisation with identical
-  ranking, so NDCG must hold by construction.)
+- [x] K8s validation done, promoted as
+  `docs/ops/bench-reports/2026-05-25-lot3-bmw-skiplist-K8s/`:
+  - Correctness: `ndcg-gate` run `26397689211` — ranking bit-stable
+    (SciFact `0.6576/0.8100`, TREC-COVID `0.4750/0.0132`), bulk/RSS
+    unchanged. `ci` green (compile + clippy + workspace tests).
+  - Latency: paired `insee-bench` isolation — control `3625fef`
+    (no Lot 3) Surch `1.4/3.7/7.2/47.9 ms` vs treatment `e293cfc`
+    Surch `1.6/4.0/8.1/38.2 ms`. **No measurable gain on INSEE 10k**
+    (within single-run noise): posting lists too short (≤ ~81 blocks)
+    to exercise block-leapfrog.
+  - **Verdict: Lot 3 is correctness-neutral and latency-neutral on
+    the available workload.** It is kept (skip-list-aware MaxScore
+    executor, prerequisite for further WAND work) but NOT claimed as
+    a latency win. Its benefit regime (long posting lists,
+    TREC-COVID-scale OR-match top-K) needs a large-corpus latency
+    harness — promoted to Objective F F-gap-4.
 
 ### Lot 4 — Historical A-replay-1/2/3 promotion
 

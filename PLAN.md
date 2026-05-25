@@ -138,8 +138,13 @@ historical replay line lives in
   jemalloc stack) promoted as
   `docs/ops/bench-reports/2026-05-25-insee-lot2-skiplists-K8s/`:
   Surch tail `p95 -13% / p99 -18%`, p50 flat, NDCG unchanged.
-- [ ] Follow-up Lot 3 — Next Block-Max WAND step on encoded block
-  metadata (`plan/wp-a-perf-followups.md`).
+- [x] Follow-up Lot 3 — Next Block-Max WAND step (MaxScore
+  block-leapfrog via Lot 2 skip lists). Landed + correctness-proven
+  (ranking bit-stable, `ci` green), but **latency-neutral on
+  INSEE 10k** (posting lists too short); promoted as
+  `docs/ops/bench-reports/2026-05-25-lot3-bmw-skiplist-K8s/`. Kept,
+  not claimed as a latency win — benefit regime (large corpora)
+  needs a latency harness (Objective F F-gap-4).
 - [ ] Follow-up Lot 4 — Historical A-replay-1/2/3 promotion, owned by
   `plan/perf-replay-wp-a-algo-ledger.md`.
 - [x] Record a current perf + quality guardrail for the complete hot path:
@@ -284,13 +289,20 @@ from a release tag.
 
 ## Track D - matchID
 
-Reste estime: B1 oracle phase closed at 0%. Phase 4 widening
-(`plan/wp-d-matchid-phase4.md`) is **listed but inactive**: 8 lots /
-~28 leaves scoped (A10 write-time fan-out, A1/A13 multi-field +
-edge_ngram, A7 runtime dates, A2 geo widening, A5 scoring widening,
-A6/A13 keyword-prefix, A12 composite, B2 deces_v2). Re-activation is
-a separate scope decision; until then the leaf count is tracked in
-that file, not aggregated here.
+Reste estime: B1 oracle phase closed. Phase 4 widening
+(`plan/wp-d-matchid-phase4.md`) is now **active**: A10 write-time
+sub-field fan-out landed (`0ea5218`+`3e764d7`+`f9470a5`) and keeps
+matchID parity (b1-oracle `26404122287`: 30/30, 0 divergence,
+promoted as `docs/ops/bench-reports/2026-05-25-b1-oracle-A10-ES861-K8s/`).
+Remaining Phase 4 lots: A1/A13 multi-field + edge_ngram, A7 runtime
+dates, A2 geo widening, A5 scoring widening, A6/A13 keyword-prefix,
+A12 composite (consuming A10's `.raw`/`.norm` in sort/agg), B2
+deces_v2. Tracked in that file.
+
+- [x] A10 write-time sub-field fan-out (`.raw`/`.norm` stored at
+  index time) landed; B1 parity preserved (b1-oracle 30/30). The
+  query-side consumption (sort/agg on `.raw` without source-scan)
+  is the A1/A12 follow-up.
 
 - [x] Intake flow exists under `docs/wp-d-matchid/incoming/`,
   `decisions/`, and `gap-analysis.md`.

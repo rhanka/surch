@@ -1,0 +1,199 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"batch/v1","kind":"Job","metadata":{"annotations":{},"labels":{"app.kubernetes.io/component":"b1-oracle-gate"},"name":"b1-oracle-gate","namespace":"surch"},"spec":{"activeDeadlineSeconds":1800,"backoffLimit":0,"template":{"metadata":{"labels":{"app.kubernetes.io/component":"b1-oracle-gate"}},"spec":{"containers":[{"args":["set -eu\necho \"Waiting for both engines...\"\nuntil wget -qO- \"$SURCH_URL/\" \u003e/dev/null 2\u003e\u00261; do sleep 0.5; done\nuntil wget -qO- \"$ES_URL/_cluster/health?wait_for_status=yellow\u0026timeout=60s\" \u003e/dev/null 2\u003e\u00261; do sleep 1; done\nmkdir -p \"$REPORTS_DIR\"\n# The bench-driver image ships the INSEE 10k slice\n# under /usr/local/share/deces/ and the mapping.json\n# alongside it. b1_oracle picks them up via flags.\n# b1_oracle exits non-zero on divergences but the JSON\n# report is always written. Capture the exit code so we\n# can still cat the report into the driver log + the GHA\n# step summary, then re-raise it as the container exit\n# code so the workflow gate honours the divergence\n# signal.\nORACLE_RC=0\n/usr/local/bin/b1_oracle \\\n  --url-surch \"$SURCH_URL\" \\\n  --url-es \"$ES_URL\" \\\n  --mapping /usr/local/share/deces/mapping.json \\\n  --slice /usr/local/share/deces/slice-10000.ndjson.gz \\\n  --replay /usr/local/share/deces/replays/deces_v1.json \\\n  --out \"$REPORTS_DIR/b1-oracle.json\" || ORACLE_RC=$?\necho \"BEGIN_SURCH_K8S_B1_ORACLE\"\nif [ -s \"$REPORTS_DIR/b1-oracle.json\" ]; then\n  cat \"$REPORTS_DIR/b1-oracle.json\"\nelse\n  echo '{\"error\":\"b1-oracle.json missing\"}'\nfi\necho \"END_SURCH_K8S_B1_ORACLE\"\necho \"b1-oracle-gate complete (oracle exit=$ORACLE_RC).\"\nexit \"$ORACLE_RC\"\n"],"command":["/bin/sh","-c"],"env":[{"name":"SURCH_URL","value":"http://127.0.0.1:7700"},{"name":"ES_URL","value":"http://127.0.0.1:9200"},{"name":"REPORTS_DIR","value":"/reports"}],"image":"ghcr.io/rhanka/surch:bench-sha-e293cfc39a75406b24e7c323da0f6ba4e5d811e7","imagePullPolicy":"IfNotPresent","name":"b1-oracle-driver","resources":{"limits":{"cpu":"500m","memory":"384Mi"},"requests":{"cpu":"50m","memory":"64Mi"}},"volumeMounts":[{"mountPath":"/reports","name":"reports"}]}],"initContainers":[{"env":[{"name":"SURCH_HOST","value":"127.0.0.1"},{"name":"SURCH_PORT","value":"7700"},{"name":"RUST_LOG","value":"warn"}],"image":"ghcr.io/rhanka/surch:sha-e293cfc39a75406b24e7c323da0f6ba4e5d811e7","imagePullPolicy":"IfNotPresent","name":"surch","ports":[{"containerPort":7700,"name":"surch-http"}],"resources":{"limits":{"cpu":"800m","memory":"512Mi"},"requests":{"cpu":"50m","memory":"64Mi"}},"restartPolicy":"Always","volumeMounts":[{"mountPath":"/var/surch","name":"scratch","subPath":"surch-b1-oracle"}]},{"env":[{"name":"discovery.type","value":"single-node"},{"name":"xpack.security.enabled","value":"false"},{"name":"ES_JAVA_OPTS","value":"-Xms1g -Xmx1g"},{"name":"bootstrap.memory_lock","value":"false"}],"image":"docker.elastic.co/elasticsearch/elasticsearch:8.6.1","imagePullPolicy":"IfNotPresent","name":"elasticsearch","ports":[{"containerPort":9200,"name":"es-http"}],"resources":{"limits":{"cpu":"1200m","memory":"1536Mi"},"requests":{"cpu":"100m","memory":"256Mi"}},"restartPolicy":"Always","securityContext":{"runAsGroup":1000,"runAsNonRoot":true,"runAsUser":1000},"volumeMounts":[{"mountPath":"/usr/share/elasticsearch/data","name":"scratch","subPath":"es-b1-oracle"}]}],"nodeSelector":{"k8s.scaleway.com/pool-name":"burst"},"restartPolicy":"Never","securityContext":{"fsGroup":1000,"fsGroupChangePolicy":"OnRootMismatch"},"tolerations":[{"effect":"NoSchedule","key":"pool","operator":"Equal","value":"burst"}],"volumes":[{"name":"scratch","persistentVolumeClaim":{"claimName":"surch-scratch"}},{"emptyDir":{"sizeLimit":"128Mi"},"name":"reports"}]}},"ttlSecondsAfterFinished":3600}}
+  creationTimestamp: "2026-05-25T13:56:02Z"
+  generation: 1
+  labels:
+    app.kubernetes.io/component: b1-oracle-gate
+  name: b1-oracle-gate
+  namespace: surch
+  resourceVersion: "45343343134"
+  uid: f58a22a3-4120-4bc9-8f71-296712ae5365
+spec:
+  activeDeadlineSeconds: 1800
+  backoffLimit: 0
+  completionMode: NonIndexed
+  completions: 1
+  manualSelector: false
+  parallelism: 1
+  podReplacementPolicy: TerminatingOrFailed
+  selector:
+    matchLabels:
+      batch.kubernetes.io/controller-uid: f58a22a3-4120-4bc9-8f71-296712ae5365
+  suspend: false
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: b1-oracle-gate
+        batch.kubernetes.io/controller-uid: f58a22a3-4120-4bc9-8f71-296712ae5365
+        batch.kubernetes.io/job-name: b1-oracle-gate
+        controller-uid: f58a22a3-4120-4bc9-8f71-296712ae5365
+        job-name: b1-oracle-gate
+    spec:
+      containers:
+      - args:
+        - |
+          set -eu
+          echo "Waiting for both engines..."
+          until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+          until wget -qO- "$ES_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
+          mkdir -p "$REPORTS_DIR"
+          # The bench-driver image ships the INSEE 10k slice
+          # under /usr/local/share/deces/ and the mapping.json
+          # alongside it. b1_oracle picks them up via flags.
+          # b1_oracle exits non-zero on divergences but the JSON
+          # report is always written. Capture the exit code so we
+          # can still cat the report into the driver log + the GHA
+          # step summary, then re-raise it as the container exit
+          # code so the workflow gate honours the divergence
+          # signal.
+          ORACLE_RC=0
+          /usr/local/bin/b1_oracle \
+            --url-surch "$SURCH_URL" \
+            --url-es "$ES_URL" \
+            --mapping /usr/local/share/deces/mapping.json \
+            --slice /usr/local/share/deces/slice-10000.ndjson.gz \
+            --replay /usr/local/share/deces/replays/deces_v1.json \
+            --out "$REPORTS_DIR/b1-oracle.json" || ORACLE_RC=$?
+          echo "BEGIN_SURCH_K8S_B1_ORACLE"
+          if [ -s "$REPORTS_DIR/b1-oracle.json" ]; then
+            cat "$REPORTS_DIR/b1-oracle.json"
+          else
+            echo '{"error":"b1-oracle.json missing"}'
+          fi
+          echo "END_SURCH_K8S_B1_ORACLE"
+          echo "b1-oracle-gate complete (oracle exit=$ORACLE_RC)."
+          exit "$ORACLE_RC"
+        command:
+        - /bin/sh
+        - -c
+        env:
+        - name: SURCH_URL
+          value: http://127.0.0.1:7700
+        - name: ES_URL
+          value: http://127.0.0.1:9200
+        - name: REPORTS_DIR
+          value: /reports
+        image: ghcr.io/rhanka/surch:bench-sha-e293cfc39a75406b24e7c323da0f6ba4e5d811e7
+        imagePullPolicy: IfNotPresent
+        name: b1-oracle-driver
+        resources:
+          limits:
+            cpu: 500m
+            memory: 384Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /reports
+          name: reports
+      dnsPolicy: ClusterFirst
+      initContainers:
+      - env:
+        - name: SURCH_HOST
+          value: 127.0.0.1
+        - name: SURCH_PORT
+          value: "7700"
+        - name: RUST_LOG
+          value: warn
+        image: ghcr.io/rhanka/surch:sha-e293cfc39a75406b24e7c323da0f6ba4e5d811e7
+        imagePullPolicy: IfNotPresent
+        name: surch
+        ports:
+        - containerPort: 7700
+          name: surch-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 800m
+            memory: 512Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        restartPolicy: Always
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /var/surch
+          name: scratch
+          subPath: surch-b1-oracle
+      - env:
+        - name: discovery.type
+          value: single-node
+        - name: xpack.security.enabled
+          value: "false"
+        - name: ES_JAVA_OPTS
+          value: -Xms1g -Xmx1g
+        - name: bootstrap.memory_lock
+          value: "false"
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.6.1
+        imagePullPolicy: IfNotPresent
+        name: elasticsearch
+        ports:
+        - containerPort: 9200
+          name: es-http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 1200m
+            memory: 1536Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        restartPolicy: Always
+        securityContext:
+          runAsGroup: 1000
+          runAsNonRoot: true
+          runAsUser: 1000
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /usr/share/elasticsearch/data
+          name: scratch
+          subPath: es-b1-oracle
+      nodeSelector:
+        k8s.scaleway.com/pool-name: burst
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 30
+      tolerations:
+      - effect: NoSchedule
+        key: pool
+        operator: Equal
+        value: burst
+      volumes:
+      - name: scratch
+        persistentVolumeClaim:
+          claimName: surch-scratch
+      - emptyDir:
+          sizeLimit: 128Mi
+        name: reports
+  ttlSecondsAfterFinished: 3600
+status:
+  completionTime: "2026-05-25T13:59:06Z"
+  conditions:
+  - lastProbeTime: "2026-05-25T13:59:06Z"
+    lastTransitionTime: "2026-05-25T13:59:06Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: SuccessCriteriaMet
+  - lastProbeTime: "2026-05-25T13:59:06Z"
+    lastTransitionTime: "2026-05-25T13:59:06Z"
+    message: Reached expected number of succeeded pods
+    reason: CompletionsReached
+    status: "True"
+    type: Complete
+  ready: 0
+  startTime: "2026-05-25T13:56:02Z"
+  succeeded: 1
+  terminating: 0
+  uncountedTerminatedPods: {}

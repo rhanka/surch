@@ -71,7 +71,13 @@ Atouts méthodo déjà en place :
   TREC-COVID + INSEE. Un papier gagnerait à (a) BEIR multi-datasets
   (NFCorpus, FiQA…) pour la généralité qualité, (b) un sweep de
   taille de corpus pour la courbe de scaling bulk (montrer la
-  sortie de la quadraticité).
+  sortie de la quadraticité), (c) **un harness de latence search sur
+  grand corpus** (artillery TREC-COVID-scale). Ce dernier est devenu
+  prioritaire : Lot 3 (MaxScore block-leapfrog) est latence-neutre
+  sur INSEE 10k (`2026-05-25-lot3-bmw-skiplist-K8s/`) faute de
+  posting lists assez longues — son régime de bénéfice n'est
+  mesurable que sur grand corpus, qu'aucun harness de latence ne
+  couvre aujourd'hui (`ndcg-gate` = 50 requêtes sans percentiles).
 
 ## Plan F (lots)
 
