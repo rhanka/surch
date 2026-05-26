@@ -115,12 +115,13 @@ Atouts méthodo déjà en place :
   conflits de Cargo.toml/workspace), (b) risque que le code
   historique ne compile pas avec le toolchain actuel (rustc 1.91.1)
   ni avec le harness bench actuel. **ROI incertain.**
-  **Décision attendue** : investir F3 (isolation historique complète,
-  plusieurs heures CI + débogage de build) OU écrire l'article sur
-  les seuls lots récents (déjà isolés + multi-rep, histoire forte) en
-  citant les optims historiques comme "delivered, mesurées
-  cumulativement, isolation déférée" ? Tant que non tranché, le draft
-  F5 part sur les lots récents.
+  **Décision user 2026-05-25 : OUI, investir F3** (chiffrer les anciennes
+  optimisations une à une). À faire en BACKLOG, après la priorité Track D.
+  Approche : créer des refs durables aux SHAs baseline/head historiques,
+  y greffer la surface CI/K8s actuelle (docker-build + ci-k8s + Dockerfile
+  + scripts bench) SANS réécrire le code applicatif, puis rejouer
+  A-replay-1/2/3. Commencer par les SHAs les plus replayables
+  (`65fc759` a déjà les 2 workflows + Dockerfile).
 - [~] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
   sweep de taille (optionnel pour un premier draft).
   - [x] **Harness de latence grand corpus livré** : nouveau Job K8s
@@ -169,8 +170,12 @@ Atouts méthodo déjà en place :
     requêtes non vides des 2 côtés, volume total apparié à `0.04 %`
     (Surch 7 507 757 vs OpenSearch 7 510 550). Caveat d'équivalence levé
     (addendum dans `2026-05-25-F4-trec-covid-latency-3rep-K8s/`).
-  - [ ] Reste F4 : BEIR multi-datasets (NFCorpus, FiQA…) + sweep de
-    taille de corpus (courbe de scaling bulk).
+  - [ ] Reste F4 : **BEIR multi-datasets (NFCorpus, FiQA…) — décision user
+    2026-05-25 : OUI**. Implique réécrire en shell le téléchargeur de corpus
+    `deploy/k8s/jobs/00-init-corpora.yaml` (actuellement Python, banni), y
+    ajouter NFCorpus + FiQA, scripts NDCG par dataset, seuils SLO
+    `bench_report`, câblage ci-k8s + re-init du PVC. BACKLOG F (après D).
+    Plus : sweep de taille de corpus (courbe de scaling bulk).
   - **Caveat équivalence (écart latence grand corpus)** : run vert
     `26422565840` donne Surch p50 `0.5 ms` / p95 `1.3 ms` vs
     OpenSearch p50 `183.8 ms` / p95 `487.8 ms` sur 171 k (13 170 req,

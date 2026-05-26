@@ -89,10 +89,21 @@ attendues" en fin de bloc).**
 4. **Track D A1/A12** — consommer `.raw`/`.norm` (A10) dans
    sort/agg ; **décision user souhaitable** sur la priorité D vs F.
 
-### Décisions user en attente (NON bloquantes pour le loop)
+### Décisions user — TRANCHÉES le 2026-05-25
+1. **Priorité = Track D Phase 4** (matchID), pas Objectif F.
+2. **Isolation MaxScore grand corpus : NON** — citer comme livré,
+   bénéfice grand corpus, contribution individuelle non chiffrée.
+3. **Anciennes optimisations (replays historiques / F3) : OUI** — greffer
+   l'outillage benchmark actuel sur les vieux SHAs et les chiffrer une à une
+   (backlog, après la priorité D).
+4. **BEIR multi-datasets (NFCorpus/FiQA) : OUI** — réécrire le téléchargeur
+   de corpus en shell (pas de Python) puis ajouter les jeux (backlog F).
+
+Ordre d'exécution : D d'abord (A1/A13), puis F3 + BEIR en backlog F.
+
+### (historique) Décisions initialement en attente
 - Priorité après F2 : approfondir Track D Phase 4 (A1/A12…) ou
-  Objectif F (F3 replays historiques) ? Le loop avance sur F par
-  défaut tant que non tranché.
+  Objectif F (F3 replays historiques) ? → tranché : D.
 - **Isolation Lot 3 (MaxScore) sur grand corpus** : le harness F4
   `trec-covid-latency` permet enfin de mesurer le régime de Lot 3
   (longues listes), mais il n'existe AUCUN toggle runtime de MaxScore

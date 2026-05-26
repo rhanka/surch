@@ -5,8 +5,9 @@
 > in `docs/paper/methodology.md`; every figure cites a promoted K8s
 > report under `docs/ops/bench-reports/`. Scope: the *recent* lot
 > sequence (Lot 1 → Lot 3 + jemalloc), which is cleanly isolated and
-> multi-rep. The historical optimisation isolation (F3) is pending a
-> scope decision; this draft cites those as delivered-but-not-isolated.
+> multi-rep. Isolating the historical optimisation family (F3) is now
+> planned (backlog, after the Track D priority); until then this draft
+> cites those as delivered-but-not-yet-individually-isolated.
 > Plot-ready data for the headline curves (bulk-by-lot, RSS-by-lot,
 > latency-by-corpus) is in `docs/paper/figures/` (CSV + provenance).
 
@@ -220,10 +221,11 @@ path — still `30/30`, 0 divergence
   zero-variance p50/p95. Engine work-equivalence is confirmed both by
   NDCG@10 parity and by an in-artifact hits-equivalence probe (all 50
   queries non-empty on both engines, total matched-doc volume within
-  `0.04 %`). Lot 3's block-leapfrog benefit is now measurable in this
-  regime but its same-stack isolation on the large corpus is still
-  pending (no runtime MaxScore toggle exists; method is a scope
-  decision).
+  `0.04 %`). Lot 3's block-leapfrog benefit is exercised in this regime
+  but its individual same-stack contribution is not separately
+  quantified (by decision): it is reported as delivered and beneficial
+  on large corpora, folded into the cumulative result, rather than
+  isolated against a no-Lot-3 control.
 
 ## 10. Conclusion
 
