@@ -170,16 +170,17 @@ Atouts méthodo déjà en place :
     requêtes non vides des 2 côtés, volume total apparié à `0.04 %`
     (Surch 7 507 757 vs OpenSearch 7 510 550). Caveat d'équivalence levé
     (addendum dans `2026-05-25-F4-trec-covid-latency-3rep-K8s/`).
-  - [~] **BEIR multi-datasets (NFCorpus, FiQA) — EN COURS** (priorité user
+  - [x] **BEIR multi-datasets (NFCorpus, FiQA) — LIVRÉ** (priorité user
     2026-05-26).
     - [x] Init shell additif `deploy/k8s/jobs/00b-init-beir-extra.yaml`
-      (alpine busybox wget+unzip, no-Python, nonroot, idempotent) télécharge
-      NFCorpus + FiQA dans le PVC `surch-corpus-beir` sans toucher l'init
-      Python existant. Câblé dans ci-k8s (`-f job=00b-init-beir-extra`).
-    - [ ] Scripts NDCG NFCorpus/FiQA (calquer `trec-covid-ndcg.sh`, format
-      BEIR uniforme corpus/queries/qrels), seuils SLO `bench_report`, câblage
-      ndcg-gate, run + publication.
-    - [ ] Sweep de taille de corpus (courbe de scaling bulk).
+      (alpine busybox wget+unzip, no-Python, nonroot, idempotent).
+    - [x] Script `beir-ndcg.sh <dataset>` générique + job `beir-extra-ndcg`
+      + câblage ci-k8s + planchers SLO `bench_report` (nfcorpus 0.28, fiqa
+      0.20). Run GHA `26476471207` : **NFCorpus** Surch `0.3033` vs OpenSearch
+      `0.3034` (quasi-identique), **FiQA** `0.2294` vs `0.2389` (~4% sous).
+      Rapport `2026-05-26-F4-beir-nfcorpus-fiqa-K8s/` + draft maj. Qualité
+      Surch validée sur **4 datasets BEIR** (SciFact, TREC-COVID, NFCorpus, FiQA).
+    - [ ] (optionnel) Sweep de taille de corpus (courbe de scaling bulk).
   - **Caveat équivalence (écart latence grand corpus)** : run vert
     `26422565840` donne Surch p50 `0.5 ms` / p95 `1.3 ms` vs
     OpenSearch p50 `183.8 ms` / p95 `487.8 ms` sur 171 k (13 170 req,

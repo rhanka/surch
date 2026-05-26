@@ -61,6 +61,11 @@ const SLO_ARTILLERY_ERROR_RATE_PCT: f64 = 1.0;
 const SLO_RSS_PEAK_MB: f64 = 1024.0;
 const SLO_SCIFACT_NDCG_10: f64 = 0.65;
 const SLO_TREC_COVID_NDCG_10: f64 = 0.55;
+// Regression floors for the extra BEIR datasets, set below the observed
+// Surch actuals (NFCorpus 0.3033, FiQA 0.2294 — run 26476471207) with margin
+// so a quality regression trips the gate without failing on the baseline.
+const SLO_NFCORPUS_NDCG_10: f64 = 0.28;
+const SLO_FIQA_NDCG_10: f64 = 0.20;
 
 const REGRESSION_P95_PCT: f64 = 15.0;
 const REGRESSION_RSS_PCT: f64 = 25.0;
@@ -734,6 +739,8 @@ fn beir_ndcg_target(workload: &str) -> Option<f64> {
     match workload {
         "scifact" => Some(SLO_SCIFACT_NDCG_10),
         "trec-covid" => Some(SLO_TREC_COVID_NDCG_10),
+        "nfcorpus" => Some(SLO_NFCORPUS_NDCG_10),
+        "fiqa" => Some(SLO_FIQA_NDCG_10),
         _ => None,
     }
 }
@@ -1172,6 +1179,8 @@ fn print_help() {
     );
     println!("  SciFact NDCG@10 ≥ {SLO_SCIFACT_NDCG_10}");
     println!("  TREC-COVID NDCG@10 ≥ {SLO_TREC_COVID_NDCG_10}");
+    println!("  NFCorpus NDCG@10 ≥ {SLO_NFCORPUS_NDCG_10}");
+    println!("  FiQA NDCG@10 ≥ {SLO_FIQA_NDCG_10}");
     println!();
     println!("REGRESSION THRESHOLDS vs --baseline:");
     println!("  p95 +{REGRESSION_P95_PCT} %");

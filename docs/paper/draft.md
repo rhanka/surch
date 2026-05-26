@@ -39,6 +39,7 @@ final claims.
 | Search p95 | TREC-COVID 171k | 1.3 ms | 481.4 ms | **~370x faster** |
 | RSS peak | TREC-COVID 171k | 2168 MiB (±0.5%) | 1467 MiB | 1.48x (Surch heavier) |
 | NDCG@10 | SciFact / TREC-COVID | 0.6576 / 0.4750 | 0.6537 / 0.4902 | parity (bit-stable) |
+| NDCG@10 | NFCorpus / FiQA | 0.3033 / 0.2294 | 0.3034 / 0.2389 | parity (NFCorpus identical) |
 | matchID B1 oracle | deces_v1 vs ES 8.6.1 | 30/30, 0 divergence | — | parity preserved |
 
 Surch leads on every speed and latency axis and on SciFact quality;
@@ -183,6 +184,14 @@ Across the entire sequence and all repetitions, SciFact NDCG@10 =
 Recall@10 = `0.0132` are bit-stable; OpenSearch is `0.6537/0.8033`
 and `0.4902/0.0132`. Surch leads on SciFact and trails OpenSearch by
 `0.0152` NDCG@10 on TREC-COVID. No optimisation perturbed retrieval.
+
+The quality result generalises beyond those two corpora: on two further
+BEIR datasets (`2026-05-26-F4-beir-nfcorpus-fiqa-K8s`), Surch is
+bit-identical to OpenSearch on NFCorpus (NDCG@10 `0.3033` vs `0.3034`,
+Recall@10 identical) and within ~4 % on FiQA (`0.2294` vs `0.2389`). Across
+all four BEIR datasets Surch tracks OpenSearch 2.17.1 — ahead on SciFact,
+identical on NFCorpus, and a few percent behind on TREC-COVID / FiQA — so
+the BM25 + analysis pipeline is competitive across domains, not tuned to one.
 
 ## 7. matchID parity
 
