@@ -603,6 +603,13 @@ fn normalized_term_for_field(value: &str, field: &str, mapping: &IndexMapping) -
 }
 
 fn normalized_terms_for_field(value: &str, field: &str, mapping: &IndexMapping) -> Vec<String> {
+    // A1/A13: a field with a custom analyzer or explicit `search_analyzer`
+    // resolves its query tokens against the index analysis settings (e.g. an
+    // edge_ngram autocomplete sub-field searched with `standard`). Every
+    // builtin-only field returns `None` here and keeps the legacy path.
+    if let Some(terms) = mapping.custom_search_terms_for_field(value, field) {
+        return terms;
+    }
     mapping.analyzer(field).terms(value)
 }
 

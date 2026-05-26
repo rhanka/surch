@@ -188,6 +188,15 @@ pub struct FieldMapping {
     /// Mutually exclusive with `analyzer` (a builtin sets `analyzer`, a
     /// custom name sets this).
     pub custom_analyzer: Option<String>,
+    /// Field-level `search_analyzer` (builtin). When set it overrides
+    /// `analyzer` at QUERY time only — the ES pattern for edge_ngram
+    /// autocomplete: index with `edge_ngram`, search with `standard` so the
+    /// query is not itself ngram-expanded. Absent => query uses `analyzer`.
+    pub search_analyzer: Option<AnalyzerName>,
+    /// Raw `search_analyzer` name when it is a non-builtin (resolved against
+    /// [`AnalysisSettings`] at query time). Mutually exclusive with
+    /// `search_analyzer`.
+    pub custom_search_analyzer: Option<String>,
     pub norms: Option<bool>,
     /// Field-level `normalizer` reference for keyword fields. Resolved to a
     /// builtin (`AnalyzerName::Norm`) when the named normalizer matches the
@@ -233,6 +242,8 @@ impl FieldMapping {
             field_type,
             analyzer,
             custom_analyzer: None,
+            search_analyzer: None,
+            custom_search_analyzer: None,
             norms,
             normalizer: None,
             index_prefixes: None,
@@ -245,6 +256,18 @@ impl FieldMapping {
     /// `settings.analysis.analyzer`). See [`FieldMapping::custom_analyzer`].
     pub fn with_custom_analyzer(mut self, custom_analyzer: Option<String>) -> Self {
         self.custom_analyzer = custom_analyzer;
+        self
+    }
+
+    /// Sets the query-time `search_analyzer` (builtin and/or custom name).
+    /// See [`FieldMapping::search_analyzer`].
+    pub fn with_search_analyzer(
+        mut self,
+        search_analyzer: Option<AnalyzerName>,
+        custom_search_analyzer: Option<String>,
+    ) -> Self {
+        self.search_analyzer = search_analyzer;
+        self.custom_search_analyzer = custom_search_analyzer;
         self
     }
 
@@ -319,6 +342,15 @@ impl FieldMapping {
             );
         } else if let Some(custom) = &self.custom_analyzer {
             object.insert("analyzer".to_owned(), Value::String(custom.clone()));
+        }
+
+        if let Some(search_analyzer) = self.search_analyzer {
+            object.insert(
+                "search_analyzer".to_owned(),
+                Value::String(search_analyzer.as_str().to_owned()),
+            );
+        } else if let Some(custom) = &self.custom_search_analyzer {
+            object.insert("search_analyzer".to_owned(), Value::String(custom.clone()));
         }
 
         if let Some(norms) = self.norms {
@@ -528,6 +560,40 @@ impl IndexMapping {
             .get(field)
             .map(|mapping| mapping.analyzer())
             .unwrap_or_else(|| AnalyzerName::default_for(FieldType::Text))
+    }
+
+    /// A1/A13: query-time tokens for `field` when it declares a custom
+    /// analyzer or an explicit `search_analyzer`; `None` otherwise so the
+    /// caller keeps the legacy `analyzer(field).terms(value)` path
+    /// (regression-safe for every field that uses only builtins).
+    ///
+    /// Resolution order mirrors ES: a `search_analyzer` (custom then builtin)
+    /// overrides the index `analyzer` (custom then builtin) at query time.
+    /// Resolves subfield paths (`parent.sub`) via [`Self::resolve_field`]. An
+    /// unresolvable custom name yields empty tokens (no match) rather than
+    /// silently falling back.
+    pub fn custom_search_terms_for_field(&self, value: &str, field: &str) -> Option<Vec<String>> {
+        let mapping = self.resolve_field(field)?;
+        if let Some(name) = &mapping.custom_search_analyzer {
+            return Some(
+                self.analysis
+                    .resolve_analyzer(name)
+                    .map(|resolved| resolved.terms(value))
+                    .unwrap_or_default(),
+            );
+        }
+        if let Some(builtin) = mapping.search_analyzer {
+            return Some(builtin.terms(value));
+        }
+        if let Some(name) = &mapping.custom_analyzer {
+            return Some(
+                self.analysis
+                    .resolve_analyzer(name)
+                    .map(|resolved| resolved.terms(value))
+                    .unwrap_or_default(),
+            );
+        }
+        None
     }
 
     pub fn norms_enabled(&self, field: &str) -> bool {
@@ -830,6 +896,23 @@ fn parse_field_definition(
         None => (None, None),
     };
 
+    // A1/A13: `search_analyzer` overrides `analyzer` at query time. Same
+    // builtin-vs-custom split as `analyzer`.
+    let (search_analyzer, custom_search_analyzer) = match object.get("search_analyzer") {
+        Some(value) => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| MappingError::AnalyzerNotString {
+                    field: field.to_owned(),
+                })?;
+            match AnalyzerName::from_name(value) {
+                Some(builtin) => (Some(builtin), None),
+                None => (None, Some(value.to_owned())),
+            }
+        }
+        None => (None, None),
+    };
+
     let norms = match object.get("norms") {
         Some(value) => Some(
             value
@@ -841,7 +924,12 @@ fn parse_field_definition(
         None => None,
     };
 
-    if field_type != FieldType::Text && (analyzer.is_some() || custom_analyzer.is_some()) {
+    if field_type != FieldType::Text
+        && (analyzer.is_some()
+            || custom_analyzer.is_some()
+            || search_analyzer.is_some()
+            || custom_search_analyzer.is_some())
+    {
         return Err(MappingError::AnalyzerNotSupported {
             field: field.to_owned(),
             field_type: field_type.as_str().to_owned(),
@@ -926,6 +1014,7 @@ fn parse_field_definition(
 
     Ok(FieldMapping::with_norms(field_type, analyzer, norms)
         .with_custom_analyzer(custom_analyzer)
+        .with_search_analyzer(search_analyzer, custom_search_analyzer)
         .with_normalizer(normalizer)
         .with_index_prefixes(index_prefixes)
         .with_date_format(date_format)
@@ -1167,6 +1256,61 @@ mod tests {
     fn resolve_analyzer_unknown_name_is_none() {
         let settings = deces_autocomplete_settings();
         assert_eq!(settings.resolve_analyzer("does_not_exist"), None);
+    }
+
+    fn nom_autocomplete_index_mapping() -> IndexMapping {
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "analyzer": "norm",
+                "fields": {
+                    "autocomplete": {
+                        "type": "text",
+                        "analyzer": "autocomplete_analyzer",
+                        "search_analyzer": "standard"
+                    }
+                }
+            }
+        });
+        let mut mapping = IndexMapping::from_properties_value(&properties).expect("mapping parse");
+        mapping.set_analysis(deces_autocomplete_settings());
+        mapping
+    }
+
+    #[test]
+    fn custom_search_terms_use_search_analyzer_not_edge_ngram() {
+        let mapping = nom_autocomplete_index_mapping();
+        // The autocomplete sub-field indexes edge_ngram prefixes, but its
+        // `search_analyzer: standard` tokenizes the QUERY whole (lowercased),
+        // so "Dupont" -> ["dupont"], NOT the ngram expansion.
+        assert_eq!(
+            mapping.custom_search_terms_for_field("Dupont", "NOM.autocomplete"),
+            Some(vec!["dupont".to_owned()])
+        );
+        // A plain builtin field returns None so the caller keeps the legacy
+        // `analyzer(field).terms()` path (regression-safe).
+        assert_eq!(mapping.custom_search_terms_for_field("Dupont", "NOM"), None);
+    }
+
+    #[test]
+    fn custom_analyzer_without_search_analyzer_uses_index_analyzer_at_query() {
+        // No `search_analyzer` => ES defaults query analysis to the index
+        // analyzer, so the query IS edge_ngram-expanded (the caller must set
+        // search_analyzer to avoid this, as the autocomplete test does).
+        let properties = serde_json::json!({
+            "NOM": {
+                "type": "text",
+                "fields": {
+                    "ac": { "type": "text", "analyzer": "autocomplete_analyzer" }
+                }
+            }
+        });
+        let mut mapping = IndexMapping::from_properties_value(&properties).expect("mapping parse");
+        mapping.set_analysis(deces_autocomplete_settings());
+        assert_eq!(
+            mapping.custom_search_terms_for_field("Dup", "NOM.ac"),
+            Some(vec!["du".to_owned(), "dup".to_owned()])
+        );
     }
 
     #[test]
