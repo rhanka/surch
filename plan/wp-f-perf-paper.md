@@ -120,8 +120,24 @@ Atouts méthodo déjà en place :
   Approche : créer des refs durables aux SHAs baseline/head historiques,
   y greffer la surface CI/K8s actuelle (docker-build + ci-k8s + Dockerfile
   + scripts bench) SANS réécrire le code applicatif, puis rejouer
-  A-replay-1/2/3. Commencer par les SHAs les plus replayables
-  (`65fc759` a déjà les 2 workflows + Dockerfile).
+  A-replay-1/2/3.
+  **BLOCAGE confirmé 2026-05-26 (DÉCISION D'APPROCHE requise)** : greffer
+  juste les WORKFLOWS ne suffit pas. Le Dockerfile/CI moderne construit les
+  binaires bench `artillery_bench`, `bench_report`, `b1_oracle`, `surch` —
+  qui N'EXISTENT PAS dans le code historique (vérifié sur `e38bf91` : pas de
+  ces binaires dans `crates/surch-demo/src/bin`). Donc une greffe minimale
+  ne build pas. Les options réelles, toutes coûteuses :
+  - (a) Greffer toute la surface bench (binaires + scripts) sur le vieux
+    code → cascade de compilation (les binaires bench modernes appellent des
+    APIs absentes des vieux crates) ; effort + ROI très incertains.
+  - (b) Porter chaque vieille optimisation EN AVANT dans l'arbre moderne via
+    un toggle de mesure (env) → archéologie de code par optim + flag de
+    mesure (= l'approche refusée par le user pour l'isolation Lot 3).
+  - (c) Reconstruire l'ancien outillage bench tel quel au SHA → comparaison
+    inter-harness non apples-to-apples.
+  **À trancher : (a), (b), (c), ou DÉFÉRER F3 et citer les optims historiques
+  comme « livrées, mesurées cumulativement, isolation déférée » dans
+  l'article ?** Le naïf « greffe workflows » est exclu.
 - [~] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
   sweep de taille (optionnel pour un premier draft).
   - [x] **Harness de latence grand corpus livré** : nouveau Job K8s
