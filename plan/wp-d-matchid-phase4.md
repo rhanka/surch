@@ -250,7 +250,20 @@ b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
     `geo_polygon_field_matches` (ray-casting point-in-polygon), dispatch +
     bras `query_matches`. Test e2e (quad autour de Paris). **A2 complet**
     (geo_bounding_box + geo_polygon ; geo_distance préexistant).
-- [ ] Lot 4 — A5 scoring widening.
+- [~] Lot 4 — A5 scoring widening.
+  - Déjà présents : `Weight`, `FieldValueFactor`, `GaussDecay` (date).
+  - [ ] Inc.1 — **exp/linear decay** : calquer `GaussDecay` (mêmes params
+    origin/scale/decay/offset, formules ES différentes : exp = `decay^(dist/
+    scale)`, linear = `max(0,(s-dist)/s)` avec `s=scale/(1-decay)`). Ajouter
+    variantes `ExpDecay`/`LinearDecay` (ou un `DecayKind`), bras `combine` +
+    parse. **Parité-sensible** (affecte `_score`) → tester contre ES.
+  - [ ] Inc.2 — **random_score** : nécessite un id de doc stable dans le
+    contexte de scoring (hash field/seed). Vérifier la dispo de l'id.
+  - [ ] **script_score — DÉCISION SCOPE** : nécessite un moteur d'évaluation
+    d'expressions (mini-langage type painless). Sous-système conséquent.
+    **Décision user : construire un évaluateur de script minimal, ou
+    déclarer script_score hors-scope matchID ?** (matchID utilise surtout
+    field_value_factor/decay/weight ; script_score est rare).
 - [ ] Lot 5 — A6/A13 keyword-prefix (optionnel post-A10).
 - [ ] Lot 6 — A12 composite date_histogram + histogram numérique.
 - [ ] Lot 7 — B2 deces_v2 fixture + replay binaire + oracle gate

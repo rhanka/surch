@@ -101,6 +101,26 @@ attendues" en fin de bloc).**
 
 Ordre d'exécution : D d'abord (A1/A13), puis F3 + BEIR en backlog F.
 
+### Track D Phase 4 — avancement (2026-05-26)
+- **A1/A13 (autocomplete edge_ngram multi-field) : CERTIFIÉ parité ES 8.6.1**
+  (b2-oracle 8/8, 0 divergence ; b1-oracle deces_v1 reste 30/30). Gate
+  `b2-oracle-gate` opérationnel.
+- **A7 (dates runtime) : fait** (range conscient des dates + date-math
+  now±N, e2e). matchID garde DATE_NAISSANCE en keyword (placeholders INSEE).
+- **A2 (geo) : fait** (geo_bounding_box + geo_polygon, e2e ; geo_distance
+  préexistant).
+- **A5 (scoring) : reste** — exp/linear decay (calquer gauss, parité-sensible),
+  random_score (id de doc), et **script_score = décision scope** (construire
+  un évaluateur de script ou hors-scope matchID ?).
+- Reste aussi A6 (keyword-prefix side-table, optionnel) + A12 composite/
+  histogram (partiellement couvert).
+
+### Décision scope ouverte (A5)
+- **script_score** : nécessite un moteur d'évaluation d'expressions (mini
+  painless). Sous-système conséquent, peu utilisé par matchID. Construire un
+  évaluateur minimal OU déclarer hors-scope ? (exp/linear decay + random_score
+  sont eux contenus et seront faits sans décision.)
+
 ### (historique) Décisions initialement en attente
 - Priorité après F2 : approfondir Track D Phase 4 (A1/A12…) ou
   Objectif F (F3 replays historiques) ? → tranché : D.
