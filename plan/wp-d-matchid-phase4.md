@@ -214,15 +214,15 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
       préfixe (2/3 chars), prefix accentué, `.raw` normalisé, baseline norm,
       sort sur `.raw`. **Le gate B2 est opérationnel** (ES accepte le mapping
       v2, comparaison live OK).
-    - [ ] **Corriger la divergence** : `bool[match NOM.autocomplete=dup, term
-      SEXE=M]` → ES 11 / Surch 0. Cause : un `match` seul passe par les
-      postings (OK), mais un `bool` re-filtre ses candidats via `query_matches`
-      (scan `_source`), où le sous-champ dérivé `NOM.autocomplete` n'existe pas
-      → 0. Fix : rendre le scan source conscient des sous-champs — analyser la
-      valeur du PARENT avec la chaîne du sous-champ (miroir de `subfield_terms`)
-      dans `field_tokens_for_source` (search.rs) + tokeniser la requête avec le
-      `search_analyzer` du sous-champ. Cross-crate (exposer l'analyse sous-champ
-      depuis surch-index). Puis re-run B2 → 0 divergence attendu.
+    - [x] **Divergence corrigée + parité certifiée** : fix `eeefcaf`
+      (`FieldMapping::analyze_subfield_value` + `field_tokens_for_source`
+      conscient des sous-champs + tokenisation requête `search_analyzer`),
+      test de régression bool. Re-run B2 GHA `26428660584` : **8/8, 0
+      divergence**. **A1/A13 certifié à parité Elasticsearch 8.6.1.**
+
+**→ Lot 1 (A1/A13) COMPLET** : implémenté (résolveur, fan-out index, requête
+search_analyzer, settings au create), validé fonctionnellement (e2e), régression
+b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
 - [ ] Lot 4 — A5 scoring widening.

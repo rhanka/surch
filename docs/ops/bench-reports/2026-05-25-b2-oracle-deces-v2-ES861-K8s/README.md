@@ -6,10 +6,27 @@ index from `mapping_v2.json` (multi-field `.raw` keyword+normalizer and
 Elasticsearch 8.6.1, then replays `deces_v2.json` (8 requests) against both
 and diffs the responses live (`b1_oracle` binary reused as-is).
 
-- GHA run `26427933905` on `main` @ `f62894b`.
-- **7 / 8 requests at parity**, **1 divergence** (see below).
+- First run GHA `26427933905` @ `f62894b`: **7 / 8 at parity, 1 divergence**.
+- Divergence fixed (`eeefcaf`); re-run GHA `26428660584` @ `eeefcaf`:
+  **8 / 8 at parity, 0 divergence — A1/A13 CERTIFIED at parity with
+  Elasticsearch 8.6.1.**
 - ES accepts the deces_v2 mapping (edge_ngram tokenizer + custom analyzers)
-  and Surch indexes/serves it — the gate itself is now operational.
+  and Surch indexes/serves it identically.
+
+## Certification (re-run after fix)
+
+| Metric | first run (`f62894b`) | re-run (`eeefcaf`) |
+|--------|----------------------:|-------------------:|
+| total requests | 8 | 8 |
+| at parity | 7 | **8** |
+| divergences | 1 | **0** |
+| skipped | 0 | 0 |
+
+The fix (`eeefcaf`, see below) made the `_source` scan sub-field-aware, so
+the `bool` combining a derived sub-field `match` with a `term` now matches
+ES. All 8 deces_v2 requests — standalone autocomplete, `.raw` normalizer,
+bool, baseline `norm`, accent folding, sort-on-`.raw` — are bit-identical to
+Elasticsearch 8.6.1.
 
 ## Result
 
