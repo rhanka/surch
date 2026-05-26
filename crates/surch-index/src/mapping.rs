@@ -1,6 +1,6 @@
 use surch_analysis::{
-    Analyzer, KeywordAnalyzer, NormAnalyzer, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer,
-    WhitespaceAnalyzer,
+    asciifold_string, Analyzer, EdgeNgramAnalyzer, KeywordAnalyzer, NormAnalyzer, SimpleAnalyzer,
+    StandardAnalyzer, StopAnalyzer, WhitespaceAnalyzer,
 };
 
 use std::collections::BTreeMap;
@@ -393,6 +393,91 @@ pub struct AnalysisSettings {
     pub tokenizers: BTreeMap<String, EdgeNgramTokenizerDefinition>,
     pub analyzers: BTreeMap<String, AnalyzerDefinition>,
     pub normalizers: BTreeMap<String, NormalizerDefinition>,
+}
+
+impl AnalysisSettings {
+    /// Resolves an analyzer name to a runnable [`ResolvedAnalyzer`].
+    ///
+    /// Builtin names (`standard`, `norm`, …) resolve directly. Otherwise the
+    /// name is looked up in the user-defined `settings.analysis.analyzer`
+    /// block and composed from its tokenizer + filter chain. Only the
+    /// `edge_ngram` tokenizer is supported for custom analyzers today (the
+    /// deces `autocomplete_analyzer` shape: `edge_ngram` tokenizer +
+    /// `[lowercase, asciifolding]` filters); a custom analyzer that
+    /// references any other tokenizer resolves to `None` so callers fall
+    /// back to the field-type default.
+    pub fn resolve_analyzer(&self, name: &str) -> Option<ResolvedAnalyzer> {
+        if let Some(builtin) = AnalyzerName::from_name(name) {
+            return Some(ResolvedAnalyzer::Builtin(builtin));
+        }
+        let definition = self.analyzers.get(name)?;
+        let tokenizer = self.tokenizers.get(&definition.tokenizer)?;
+        let lowercase = definition
+            .filter
+            .iter()
+            .any(|filter| filter.eq_ignore_ascii_case("lowercase"));
+        let asciifold = definition
+            .filter
+            .iter()
+            .any(|filter| filter.eq_ignore_ascii_case("asciifolding"));
+        Some(ResolvedAnalyzer::EdgeNgram {
+            min_gram: tokenizer.min_gram,
+            max_gram: tokenizer.max_gram,
+            lowercase,
+            asciifold,
+        })
+    }
+}
+
+/// A resolved, runnable analyzer: either one of the builtins or a custom
+/// chain composed from `settings.analysis`.
+///
+/// The custom variant currently models the deces `autocomplete_analyzer`
+/// shape: an `edge_ngram` tokenizer followed by optional `lowercase` and
+/// `asciifolding` token filters (applied in that order, matching the Lucene
+/// chain order in `deces_index.yml`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedAnalyzer {
+    Builtin(AnalyzerName),
+    EdgeNgram {
+        min_gram: usize,
+        max_gram: usize,
+        lowercase: bool,
+        asciifold: bool,
+    },
+}
+
+impl ResolvedAnalyzer {
+    /// All terms the analyzer emits for `text`, in emission order.
+    pub fn terms(&self, text: &str) -> Vec<String> {
+        match self {
+            Self::Builtin(name) => name.terms(text),
+            Self::EdgeNgram {
+                min_gram,
+                max_gram,
+                lowercase,
+                asciifold,
+            } => EdgeNgramAnalyzer::new(*min_gram, *max_gram)
+                .token_stream(text)
+                .into_iter()
+                .map(|token| {
+                    let mut term = token.term;
+                    if *lowercase {
+                        term = term.to_lowercase();
+                    }
+                    if *asciifold {
+                        term = asciifold_string(&term);
+                    }
+                    term
+                })
+                .collect(),
+        }
+    }
+
+    /// The first emitted term (or empty string), for single-value projections.
+    pub fn first_term(&self, text: &str) -> String {
+        self.terms(text).into_iter().next().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1000,6 +1085,68 @@ fn is_numeric_string(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deces_autocomplete_settings() -> AnalysisSettings {
+        let value = serde_json::json!({
+            "analysis": {
+                "tokenizer": {
+                    "edge_ngram_tokenizer": {
+                        "type": "edge_ngram",
+                        "min_gram": 2,
+                        "max_gram": 4,
+                        "token_chars": ["letter", "digit"]
+                    }
+                },
+                "analyzer": {
+                    "autocomplete_analyzer": {
+                        "tokenizer": "edge_ngram_tokenizer",
+                        "filter": ["lowercase", "asciifolding"]
+                    }
+                }
+            }
+        });
+        AnalysisSettings::from_index_settings_value(&value).expect("settings parse")
+    }
+
+    #[test]
+    fn resolve_analyzer_returns_builtin_for_known_names() {
+        let settings = AnalysisSettings::default();
+        assert_eq!(
+            settings.resolve_analyzer("standard"),
+            Some(ResolvedAnalyzer::Builtin(AnalyzerName::Standard))
+        );
+        assert_eq!(
+            settings.resolve_analyzer("norm"),
+            Some(ResolvedAnalyzer::Builtin(AnalyzerName::Norm))
+        );
+    }
+
+    #[test]
+    fn resolve_analyzer_composes_custom_edge_ngram_chain() {
+        let settings = deces_autocomplete_settings();
+        let resolved = settings
+            .resolve_analyzer("autocomplete_analyzer")
+            .expect("custom analyzer resolves");
+        assert_eq!(
+            resolved,
+            ResolvedAnalyzer::EdgeNgram {
+                min_gram: 2,
+                max_gram: 4,
+                lowercase: true,
+                asciifold: true,
+            }
+        );
+        // Édgg-ngram prefixes of "Élan" (len 2..=4) then lowercase + asciifold:
+        // "Él"/"Éla"/"Élan" -> "el"/"ela"/"elan".
+        assert_eq!(resolved.terms("Élan"), vec!["el", "ela", "elan"]);
+        assert_eq!(resolved.first_term("Élan"), "el");
+    }
+
+    #[test]
+    fn resolve_analyzer_unknown_name_is_none() {
+        let settings = deces_autocomplete_settings();
+        assert_eq!(settings.resolve_analyzer("does_not_exist"), None);
+    }
 
     #[test]
     fn parses_deces_index_settings_with_edge_ngram_norm_and_normalizer() {
