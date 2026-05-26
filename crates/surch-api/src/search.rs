@@ -4278,13 +4278,13 @@ fn parse_scoring_function_clause(value: &Value) -> Result<ScoringFunctionClause,
                 function = Some(parse_field_value_factor_function(body)?);
             }
             "gauss" => {
-                function = Some(parse_decay_function(body, DecayKind::Gauss, "gauss")?);
+                function = Some(parse_decay_function(body, DecayKind::Gauss)?);
             }
             "exp" => {
-                function = Some(parse_decay_function(body, DecayKind::Exp, "exp")?);
+                function = Some(parse_decay_function(body, DecayKind::Exp)?);
             }
             "linear" => {
-                function = Some(parse_decay_function(body, DecayKind::Linear, "linear")?);
+                function = Some(parse_decay_function(body, DecayKind::Linear)?);
             }
             "script_score" | "random_score" => {
                 return Err(OpenSearchError::new(
