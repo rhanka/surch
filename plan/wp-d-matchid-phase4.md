@@ -187,7 +187,14 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
     (edge_ngram + autocomplete_analyzer + search_analyzer standard) → bulk →
     `match NOM.autocomplete=dup` touche DUPONT, pas MARTIN ni zzz. **CI vert.**
     **A1/A13 fonctionnellement complet de bout en bout.**
-  - [ ] **Inc.4b — fixture deces_v2 + oracle B2** : valider la PARITÉ ES 8.6.1
+  - **Régression confirmée en K8s** : b1-oracle deces_v1 reste 30/30, 0
+    divergence après tous les changements A1/A13 (GHA `26427249349` @ `9d17f75`).
+  - [~] **Inc.4b — fixture deces_v2 + oracle B2** : fixture
+    `tests/matchid_compat/deces/mapping_v2.json` créée (NOM/PRENOMS avec
+    sous-champs `.raw` keyword+norm et `.autocomplete` edge_ngram +
+    `settings.analysis`) et validée e2e via Surch (test
+    `deces_v2_fixture_autocomplete_and_raw_subfields`). Reste : oracle B2 K8s
+    comparant Surch vs ES 8.6.1. Valider la PARITÉ ES 8.6.1
     du nouveau chemin (le e2e prouve la correction interne, pas la parité ES).
     Créer `tests/matchid_compat/deces/mapping_v2.json` + un oracle B2 K8s
     (`b2-oracle-gate.yaml`, binaire oracle réutilisé) comparant Surch vs ES 8.6.1

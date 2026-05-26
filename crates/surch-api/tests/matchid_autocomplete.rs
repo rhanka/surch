@@ -103,6 +103,93 @@ fn edge_ngram_autocomplete_subfield_end_to_end() {
     assert_eq!(total, 0, "match NOM.autocomplete=zzz must hit nothing");
 }
 
+const DECES_V2_MAPPING: &str = include_str!("../../../tests/matchid_compat/deces/mapping_v2.json");
+
+#[test]
+fn deces_v2_fixture_autocomplete_and_raw_subfields() {
+    // Exercises the real `deces_v2` mapping fixture (the one the future B2
+    // ES-parity oracle will replay): NOM/PRENOMS each carry a `.raw`
+    // keyword+normalizer sub-field and a `.autocomplete` edge_ngram
+    // sub-field searched with `standard`.
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let router = app_router();
+    let index = "decesv2";
+
+    let (status, _) = runtime.block_on(execute(
+        router.clone(),
+        Method::PUT,
+        &format!("/{index}"),
+        DECES_V2_MAPPING.to_string(),
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "create deces_v2 OK");
+
+    let bulk = "{\"index\":{\"_id\":\"1\",\"_index\":\"decesv2\"}}\n{\"NOM\":\"DUPONT\",\"PRENOMS\":\"JEAN\"}\n{\"index\":{\"_id\":\"2\",\"_index\":\"decesv2\"}}\n{\"NOM\":\"MARTIN\",\"PRENOMS\":\"PIERRE\"}\n";
+    let (status, body) = runtime.block_on(execute(
+        router.clone(),
+        Method::POST,
+        "/_bulk",
+        bulk.to_string(),
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "bulk OK: {body:?}");
+    assert_eq!(
+        body.as_ref().and_then(|v| v.get("errors")),
+        Some(&Value::Bool(false)),
+        "bulk errors=false"
+    );
+    let (status, _) = runtime.block_on(execute(
+        router.clone(),
+        Method::POST,
+        &format!("/{index}/_refresh"),
+        String::new(),
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "refresh OK");
+
+    // NOM.autocomplete prefix hits only DUPONT.
+    assert_eq!(
+        match_total(&runtime, &router, index, "NOM.autocomplete", "dup"),
+        1,
+        "NOM.autocomplete=dup -> DUPONT"
+    );
+    // PRENOMS.autocomplete prefix hits only JEAN.
+    assert_eq!(
+        match_total(&runtime, &router, index, "PRENOMS.autocomplete", "je"),
+        1,
+        "PRENOMS.autocomplete=je -> JEAN"
+    );
+    // The keyword `.raw` sub-field (normalizer norm) matches the whole
+    // lowercased+folded value, not a prefix.
+    assert_eq!(
+        match_total(&runtime, &router, index, "NOM.raw", "DUPONT"),
+        1,
+        "NOM.raw=DUPONT -> DUPONT (normalized keyword)"
+    );
+}
+
+fn match_total(
+    runtime: &tokio::runtime::Runtime,
+    router: &Router,
+    index: &str,
+    field: &str,
+    value: &str,
+) -> u64 {
+    let body = serde_json::json!({
+        "query": { "match": { field: value } },
+        "size": 5
+    })
+    .to_string();
+    let (status, body) = runtime.block_on(execute(
+        router.clone(),
+        Method::POST,
+        &format!("/{index}/_search"),
+        body,
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "search OK");
+    body.expect("search body")
+        .pointer("/hits/total/value")
+        .and_then(Value::as_u64)
+        .expect("hits.total.value present")
+}
+
 fn autocomplete_hits(runtime: &tokio::runtime::Runtime, router: &Router, prefix: &str) -> u64 {
     let body = serde_json::json!({
         "query": { "match": { "NOM.autocomplete": prefix } },
