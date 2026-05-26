@@ -223,7 +223,22 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
 **→ Lot 1 (A1/A13) COMPLET** : implémenté (résolveur, fan-out index, requête
 search_analyzer, settings au create), validé fonctionnellement (e2e), régression
 b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
-- [ ] Lot 2 — A7 runtime dates.
+- [~] Lot 2 — A7 runtime dates.
+  - [x] **Inc.1** : `range_field_matches` conscient de `FieldType::Date` —
+    parse valeur stockée + bornes en `NaiveDate` via le `format` (yyyyMMdd,
+    epoch_millis, epoch_second) + date-math (`now`, `now-1y/d`, `now+2M`,
+    `now-1w`), comparaison jour ; fallback lex/numérique inchangé pour les
+    non-dates ; `count.rs` threadé. Tests unitaires (helpers, ancre fixe) +
+    test e2e `date_range.rs` (bornes littérales + date-math sur un champ
+    `type:date` propre). CI vert.
+  - **Constat parité** : DATE_NAISSANCE reste `keyword` dans matchID (deces),
+    car le slice INSEE contient des dates placeholder (`19530000`, mois/jour
+    00) qu'ES `type:date` REJETTE au bulk. A7 sert donc le support date
+    **général** OpenSearch (validé par e2e sur dates propres), pas la parité
+    deces. Pour un futur champ date matchID avec placeholders il faudrait
+    `ignore_malformed` (Surch est déjà lenient : date invalide → fallback lex).
+  - [ ] Inc.2 (optionnel) : `ignore_malformed`, formats additionnels, plages
+    epoch_millis numériques.
 - [ ] Lot 3 — A2 geo widening.
 - [ ] Lot 4 — A5 scoring widening.
 - [ ] Lot 5 — A6/A13 keyword-prefix (optionnel post-A10).
