@@ -101,6 +101,26 @@ attendues" en fin de bloc).**
 
 Ordre d'exécution : D d'abord (A1/A13), puis F3 + BEIR en backlog F.
 
+### EN ATTENTE — décision user : rapport perf matchID end-to-end (2026-05-26)
+Le user veut une publication perf matchID via le **vrai** test artillery du
+CI/CD matchID (`deces-backend make test-perf-v1`) sur son corpus défini, avec
+**dataprep**, idéalement sur une **branche matchID où Surch remplace Elastic
+en end-to-end** (flip `ELASTIC_URL` → Surch, cf. `docs/wp-d-matchid/swap-guide.md`).
+matchID est checkouté en `/home/antoinefa/src/matchID` (monorepo
+`matchID/packages/{deces-backend,deces-dataprep}` ; ~8 copies dupliquées
+ailleurs). deces-backend restaure le corpus depuis un **snapshot ES** d'un
+bucket (`fichier-des-personnes-decedees-elasticsearch`). **4 questions posées
+au user (corpus/snapshot accessible ? peuplement Surch = restore snapshot vs
+dataprep ? local docker-compose vs CI ? quel repo/branche ?)** — bloqué tant
+que non répondu. NE PAS toucher l'environnement matchID avant.
+
+### F3 (isolation perf) — EN COURS sur branche `perf-isolation` (jamais mergée main)
+Décision user : isoler via toggles de mesure sur une branche isolée (pas de
+flag en prod). 1er PoC : `SURCH_DISABLE_MAXSCORE` (toggle WAND/MaxScore, lu une
+fois, défaut activé). Branche `perf-isolation` poussée (`6e1846d`) ; run
+trec-covid-latency maxscore-OFF en cours → comparer à la médiane 3-rep
+maxscore-ON (`2026-05-25-F4-trec-covid-latency-3rep-K8s`) pour le delta WAND.
+
 ### Track D Phase 4 — avancement (2026-05-26)
 - **A1/A13 (autocomplete edge_ngram multi-field) : CERTIFIÉ parité ES 8.6.1**
   (b2-oracle 8/8, 0 divergence ; b1-oracle deces_v1 reste 30/30). Gate
