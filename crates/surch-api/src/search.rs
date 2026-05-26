@@ -2589,6 +2589,22 @@ fn bm25_field_score(
 }
 
 fn field_tokens_for_source(source: &Value, field: &str, mapping: &IndexMapping) -> Vec<String> {
+    // A1/A13: a derived sub-field (`parent.sub`, e.g. `NOM.autocomplete` or
+    // `NOM.raw`) does not exist in `_source` — it is materialised only in the
+    // postings at index time. The bool / source-scan match path must analyze
+    // the PARENT value with the sub-field's own chain (mirroring
+    // `DocumentIndex::index_subfields`), otherwise a `match`/`term` on a
+    // sub-field inside a bool always sees zero tokens and fails.
+    if mapping.field(field).is_none() {
+        if let Some((parent, _)) = field.split_once('.') {
+            if let Some(sub_mapping) = mapping.resolve_field(field) {
+                return match field_text(source, parent) {
+                    Some(text) => sub_mapping.analyze_subfield_value(&text, mapping.analysis()),
+                    None => Vec::new(),
+                };
+            }
+        }
+    }
     field_text(source, field)
         .map(|text| mapping.analyzer(field).terms(&text))
         .unwrap_or_default()
@@ -5178,7 +5194,12 @@ fn field_matches_with_mapping(
     operator: MatchOperator,
     mapping: &IndexMapping,
 ) -> bool {
-    let query_tokens = mapping.analyzer(field).terms(query);
+    // A1/A13: a field with a custom analyzer or explicit `search_analyzer`
+    // (e.g. an edge_ngram autocomplete sub-field searched with `standard`)
+    // tokenizes the query through that chain; builtins keep the legacy path.
+    let query_tokens = mapping
+        .custom_search_terms_for_field(query, field)
+        .unwrap_or_else(|| mapping.analyzer(field).terms(query));
     if query_tokens.is_empty() {
         return false;
     }
@@ -5221,7 +5242,9 @@ fn match_phrase_field_matches_with_mapping(
     query: &str,
     mapping: &IndexMapping,
 ) -> bool {
-    let query_tokens = mapping.analyzer(field).terms(query);
+    let query_tokens = mapping
+        .custom_search_terms_for_field(query, field)
+        .unwrap_or_else(|| mapping.analyzer(field).terms(query));
     if query_tokens.is_empty() {
         return false;
     }
@@ -5238,7 +5261,10 @@ fn term_field_matches_with_mapping(
     query: &str,
     mapping: &IndexMapping,
 ) -> bool {
-    let query = mapping.analyzer(field).first_term(query);
+    let query = mapping
+        .custom_search_terms_for_field(query, field)
+        .and_then(|tokens| tokens.into_iter().next())
+        .unwrap_or_else(|| mapping.analyzer(field).first_term(query));
     if query.is_empty() {
         return false;
     }

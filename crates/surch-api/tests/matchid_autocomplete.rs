@@ -123,7 +123,7 @@ fn deces_v2_fixture_autocomplete_and_raw_subfields() {
     ));
     assert_eq!(status, StatusCode::OK.as_u16(), "create deces_v2 OK");
 
-    let bulk = "{\"index\":{\"_id\":\"1\",\"_index\":\"decesv2\"}}\n{\"NOM\":\"DUPONT\",\"PRENOMS\":\"JEAN\"}\n{\"index\":{\"_id\":\"2\",\"_index\":\"decesv2\"}}\n{\"NOM\":\"MARTIN\",\"PRENOMS\":\"PIERRE\"}\n";
+    let bulk = "{\"index\":{\"_id\":\"1\",\"_index\":\"decesv2\"}}\n{\"NOM\":\"DUPONT\",\"PRENOMS\":\"JEAN\",\"SEXE\":\"M\"}\n{\"index\":{\"_id\":\"2\",\"_index\":\"decesv2\"}}\n{\"NOM\":\"MARTIN\",\"PRENOMS\":\"PIERRE\",\"SEXE\":\"F\"}\n";
     let (status, body) = runtime.block_on(execute(
         router.clone(),
         Method::POST,
@@ -163,6 +163,50 @@ fn deces_v2_fixture_autocomplete_and_raw_subfields() {
         1,
         "NOM.raw=DUPONT -> DUPONT (normalized keyword)"
     );
+
+    // Regression guard for the B2 divergence (GHA 26427933905): a bool.must
+    // combining a derived sub-field `match` with a top-level `term` is
+    // re-filtered through the `_source` scan, which previously saw zero
+    // tokens for the index-only `NOM.autocomplete` field and returned 0.
+    let bool_m = bool_must_total(&runtime, &router, index, "dup", "M");
+    assert_eq!(bool_m, 1, "bool[NOM.autocomplete=dup, SEXE=M] -> DUPONT");
+    let bool_f = bool_must_total(&runtime, &router, index, "dup", "F");
+    assert_eq!(
+        bool_f, 0,
+        "bool[NOM.autocomplete=dup, SEXE=F] -> none (DUPONT is M)"
+    );
+}
+
+fn bool_must_total(
+    runtime: &tokio::runtime::Runtime,
+    router: &Router,
+    index: &str,
+    nom_prefix: &str,
+    sexe: &str,
+) -> u64 {
+    let body = serde_json::json!({
+        "query": {
+            "bool": {
+                "must": [
+                    { "match": { "NOM.autocomplete": nom_prefix } },
+                    { "term": { "SEXE": sexe } }
+                ]
+            }
+        },
+        "size": 10
+    })
+    .to_string();
+    let (status, body) = runtime.block_on(execute(
+        router.clone(),
+        Method::POST,
+        &format!("/{index}/_search"),
+        body,
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "search OK");
+    body.expect("search body")
+        .pointer("/hits/total/value")
+        .and_then(Value::as_u64)
+        .expect("hits.total.value present")
 }
 
 fn match_total(

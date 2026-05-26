@@ -1,6 +1,6 @@
 use surch_analysis::{
-    asciifold_string, Analyzer, EdgeNgramAnalyzer, KeywordAnalyzer, NormAnalyzer, SimpleAnalyzer,
-    StandardAnalyzer, StopAnalyzer, WhitespaceAnalyzer,
+    asciifold_string, Analyzer, EdgeNgramAnalyzer, KeywordAnalyzer, NormAnalyzer, Normalizer,
+    SimpleAnalyzer, StandardAnalyzer, StopAnalyzer, WhitespaceAnalyzer,
 };
 
 use std::collections::BTreeMap;
@@ -305,6 +305,35 @@ impl FieldMapping {
     pub fn analyzer(&self) -> AnalyzerName {
         self.analyzer
             .unwrap_or_else(|| AnalyzerName::default_for(self.field_type))
+    }
+
+    /// Index-time terms this mapping produces for `value` **as a sub-field**,
+    /// mirroring `DocumentIndex::index_subfields` exactly so the query-side
+    /// source scan sees the same tokens the postings hold:
+    /// - `keyword` + `normalizer`: the whole value lowercased + asciifolded
+    ///   (single token, via [`Normalizer`]);
+    /// - `keyword` without normalizer: the whole value verbatim
+    ///   (via [`KeywordAnalyzer`]);
+    /// - a custom analyzer (e.g. `edge_ngram`): the resolved chain;
+    /// - otherwise: the field's builtin analyzer.
+    ///
+    /// `analysis` supplies the index `settings.analysis` for resolving custom
+    /// analyzer names. Used by the bool / source-scan match path which cannot
+    /// read a derived sub-field from `_source` (it does not exist there).
+    pub fn analyze_subfield_value(&self, value: &str, analysis: &AnalysisSettings) -> Vec<String> {
+        if self.field_type == FieldType::Keyword {
+            let tokens = match self.normalizer {
+                Some(_) => Normalizer.token_stream(value),
+                None => KeywordAnalyzer.token_stream(value),
+            };
+            return tokens.into_iter().map(|token| token.term).collect();
+        }
+        if let Some(name) = &self.custom_analyzer {
+            if let Some(resolved) = analysis.resolve_analyzer(name) {
+                return resolved.terms(value);
+            }
+        }
+        self.analyzer().terms(value)
     }
 
     pub fn norms_enabled(&self) -> bool {
