@@ -1,0 +1,95 @@
+# Surch — extra BEIR datasets pre-warm Job (NFCorpus + FiQA).
+#
+# Additive to `00-init-corpora` (which seeds SciFact + TREC-COVID): hydrates
+# the SAME `surch-corpus-beir` PVC with two more standard BEIR datasets so
+# the quality-generality claim (Objective F) can be measured beyond
+# SciFact/TREC-COVID. Pure shell (busybox `wget` + `unzip` from the Alpine
+# base image) — no Python, runs as the non-root CI user, no `apk` needed.
+# Idempotent: skips a dataset whose `queries.jsonl` already exists.
+#
+# Datasets (BEIR, public UKP mirror):
+#   nfcorpus (~10 MiB) — medical IR, graded qrels
+#   fiqa     (~50 MiB) — financial QA, binary qrels
+#
+# Dispatch: gh workflow run ci-k8s.yml -f job=00b-init-beir-extra
+# (or apply directly). Run once after 00-init-corpora.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: init-beir-extra
+  namespace: surch
+  labels:
+    app.kubernetes.io/name: surch
+    app.kubernetes.io/component: 00b-init-beir-extra
+    app.kubernetes.io/part-of: surch-ci
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: surch
+        app.kubernetes.io/component: 00b-init-beir-extra
+        app.kubernetes.io/part-of: surch-ci
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: surch
+      nodeSelector:
+        k8s.scaleway.com/pool-name: burst
+      tolerations:
+        - key: pool
+          operator: Equal
+          value: burst
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      volumes:
+        - name: beir
+          persistentVolumeClaim:
+            claimName: surch-corpus-beir
+      containers:
+        - name: fetch
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { cpu: 1000m, memory: 512Mi }
+          env:
+            - { name: BEIR_DIR, value: /data/beir }
+            - { name: BEIR_BASE, value: "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets" }
+          volumeMounts:
+            - { name: beir, mountPath: /data/beir }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p "$BEIR_DIR"
+              fetch_dataset() {
+                name="$1"
+                if [ -f "$BEIR_DIR/$name/queries.jsonl" ]; then
+                  echo "== $name already present, skipping =="
+                  return 0
+                fi
+                echo "== BEIR $name: download + extract =="
+                zip="$BEIR_DIR/$name.zip"
+                wget -q -O "$zip" "$BEIR_BASE/$name.zip"
+                unzip -q -o "$zip" -d "$BEIR_DIR"
+                rm -f "$zip"
+                # Sanity: the standard BEIR layout must be present.
+                for f in corpus.jsonl queries.jsonl qrels/test.tsv; do
+                  if [ ! -f "$BEIR_DIR/$name/$f" ]; then
+                    echo "ERROR: $name missing $f after extract" >&2
+                    exit 1
+                  fi
+                done
+                docs="$(wc -l < "$BEIR_DIR/$name/corpus.jsonl")"
+                queries="$(wc -l < "$BEIR_DIR/$name/queries.jsonl")"
+                echo "  $name: $docs docs, $queries queries"
+              }
+              fetch_dataset nfcorpus
+              fetch_dataset fiqa
+              echo "init-beir-extra complete."

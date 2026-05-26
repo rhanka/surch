@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "Job manifest to run (ndcg-gate | insee-bench | trec-covid-latency | b1-oracle-gate | b2-oracle-gate | 00-init-corpora)"
+        description: "Job manifest to run (ndcg-gate | insee-bench | trec-covid-latency | b1-oracle-gate | b2-oracle-gate | 00-init-corpora | 00b-init-beir-extra)"
         required: true
         default: "ndcg-gate"
         type: choice
@@ -37,6 +37,7 @@ on:
           - b1-oracle-gate
           - b2-oracle-gate
           - 00-init-corpora
+          - 00b-init-beir-extra
 
 env:
   SCW_MAX_COST_EUR: "2"
