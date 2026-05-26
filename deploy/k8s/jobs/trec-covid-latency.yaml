@@ -299,6 +299,38 @@ spec:
               }
               warmup_engine "$SURCH_URL" surch
               warmup_engine "$OPENSEARCH_URL" opensearch
+              # Hits-equivalence probe (UNTIMED — runs before the
+              # artillery phases, so it cannot skew the latency numbers).
+              # Issues each TREC query once to both engines with the same
+              # multi_match body artillery_bench sends in `trec` mode and
+              # records hits.total per engine. This is the in-artifact
+              # work-equivalence evidence the latency report otherwise
+              # lacked: it proves neither engine returns a degenerate
+              # (empty) result set, so the latency gap is real work, not
+              # Surch matching nothing.
+              HITS_TSV="$WORK/hits_eq.tsv"
+              : > "$HITS_TSV"
+              while IFS= read -r q; do
+                [ -n "$q" ] || continue
+                body="$(jq -nc --arg q "$q" '{query:{multi_match:{query:$q,fields:["title","text"]}},size:10,track_total_hits:true}')"
+                sh="$(curl -fsS -X POST "$SURCH_URL/$TREC_INDEX/_search" \
+                  -H 'Content-Type: application/json' -d "$body" \
+                  | jq -r '(.hits.total.value // .hits.total // 0)' 2>/dev/null || echo 0)"
+                oh="$(curl -fsS -X POST "$OPENSEARCH_URL/$TREC_INDEX/_search" \
+                  -H 'Content-Type: application/json' -d "$body" \
+                  | jq -r '(.hits.total.value // .hits.total // 0)' 2>/dev/null || echo 0)"
+                printf '%s\t%s\t%s\n' "${sh:-0}" "${oh:-0}" "$q" >> "$HITS_TSV"
+              done < "$WORK/artillery_queries.txt"
+              echo "BEGIN_SURCH_K8S_TREC_HITS"
+              awk -F'\t' '
+                { n++; ss+=$1; os+=$2
+                  if ($1>0 && $2>0) bn++
+                  if ($1==0) sz++
+                  if ($2==0) oz++ }
+                END {
+                  printf "{\"schema\":\"surch.bench.trec_hits.v1\",\"queries\":%d,\"both_nonzero\":%d,\"surch_zero\":%d,\"os_zero\":%d,\"surch_total_hits\":%d,\"os_total_hits\":%d}\n", n, bn, sz, oz, ss, os
+                }' "$HITS_TSV"
+              echo "END_SURCH_K8S_TREC_HITS"
               # The bench driver image ships artillery_bench + bench_report
               # in /usr/local/bin.
               /usr/local/bin/artillery_bench \
