@@ -1819,28 +1819,38 @@ fn topk_scored_documents(
     // skipped. For BAN-style queries where one query token is rare and
     // the other is common, this collapses scoring work from "all
     // candidates" to "candidates of the rare token(s)".
-    match query {
-        SearchQuery::Match {
-            field,
-            value,
-            operator,
-        } if *operator != MatchOperator::And => {
-            if let Some(scored_pairs) = maxscore_match(field, value, limit, &scoring_context, total)
-            {
-                return finalize_topk(state, index, scored_pairs, total, limit);
+    // PERF-ISOLATION (F3, NOT for main): `SURCH_DISABLE_MAXSCORE=1` skips the
+    // Block-Max WAND / MaxScore top-k path so the slower exhaustive scorer
+    // below runs instead, isolating the WAND family's latency contribution.
+    // The toggle is read ONCE; default (unset) keeps MaxScore enabled, so the
+    // production hot path is unchanged (this branch only exists on the
+    // throwaway `perf-isolation` branch).
+    if maxscore_enabled() {
+        match query {
+            SearchQuery::Match {
+                field,
+                value,
+                operator,
+            } if *operator != MatchOperator::And => {
+                if let Some(scored_pairs) =
+                    maxscore_match(field, value, limit, &scoring_context, total)
+                {
+                    return finalize_topk(state, index, scored_pairs, total, limit);
+                }
             }
-        }
-        SearchQuery::MultiMatch {
-            query: value,
-            fields,
-            operator,
-        } if *operator != MatchOperator::And => {
-            if let Some(scored_pairs) = maxscore_multi_match(fields, value, limit, &scoring_context)
-            {
-                return finalize_topk(state, index, scored_pairs, total, limit);
+            SearchQuery::MultiMatch {
+                query: value,
+                fields,
+                operator,
+            } if *operator != MatchOperator::And => {
+                if let Some(scored_pairs) =
+                    maxscore_multi_match(fields, value, limit, &scoring_context)
+                {
+                    return finalize_topk(state, index, scored_pairs, total, limit);
+                }
             }
+            _ => {}
         }
-        _ => {}
     }
 
     let scored: Vec<(f64, u32)> = candidates
@@ -1893,6 +1903,21 @@ fn finalize_topk(
 }
 
 /// MaxScore-style top-K scoring for a `MultiMatch` over several fields
+/// PERF-ISOLATION ONLY (F3, never merged to main): is the Block-Max WAND /
+/// MaxScore top-k path enabled? Read ONCE from `SURCH_DISABLE_MAXSCORE`
+/// (default: enabled — so the production hot path on main is unchanged).
+/// Setting it to `1`/`true` forces the exhaustive scorer, isolating the WAND
+/// family's latency contribution under the same harness.
+fn maxscore_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SURCH_DISABLE_MAXSCORE")
+            .map(|value| value != "1" && !value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    })
+}
+
 /// (OR semantics across fields and across tokens within each field). The
 /// per-doc score follows the existing fallback semantics: take the max
 /// across fields, then floor at `1e-9`. Each field runs the same
