@@ -304,6 +304,19 @@ pub enum SearchQuery {
         lon: f64,
         distance_meters: f64,
     },
+    /// A2: `geo_bounding_box` filter — matches documents whose `field`
+    /// (`geo_point`) lies inside the axis-aligned box defined by its
+    /// `top_left` / `bottom_right` corners. Non-scoring like `geo_distance`
+    /// (constant `_score = 1.0`; falls into the filter catch-alls).
+    /// Antimeridian-crossing boxes (`left_lon > right_lon`) are not handled
+    /// yet — matchID boxes stay within a single hemisphere.
+    GeoBoundingBox {
+        field: String,
+        top_lat: f64,
+        bottom_lat: f64,
+        left_lon: f64,
+        right_lon: f64,
+    },
 }
 
 /// A5 phase 2: one `function_score.functions[]` entry. Bundles the
@@ -3580,6 +3593,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "multi_match" => parse_multi_match_query(query_body),
         "function_score" => parse_function_score_query(query_body),
         "geo_distance" => parse_geo_distance_query(query_body),
+        "geo_bounding_box" => parse_geo_bounding_box_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -4673,6 +4687,74 @@ fn parse_geo_distance_query(value: &Value) -> Result<SearchQuery, OpenSearchErro
     })
 }
 
+/// Parse a `geo_bounding_box` query body (A2):
+///
+/// ```json
+/// { "geo_bounding_box": { "FIELD": {
+///     "top_left": { "lat": .., "lon": .. },
+///     "bottom_right": { "lat": .., "lon": .. } } } }
+/// ```
+///
+/// The corners accept every `geo_point` form `parse_geo_point_source`
+/// supports (object / `"lat,lon"` / `[lon,lat]`).
+fn parse_geo_bounding_box_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`geo_bounding_box` query body must be an object",
+        )
+    })?;
+    // The pivot field is named freely; skip ES bookkeeping keys.
+    let (field, box_value) = object
+        .iter()
+        .find(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "validation_method" | "ignore_unmapped" | "type" | "_name" | "boost",
+            )
+        })
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "`geo_bounding_box` query must contain a geo_point field",
+            )
+        })?;
+    let box_object = box_value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`geo_bounding_box` field `{field}` must be an object"),
+        )
+    })?;
+    let corner = |name: &str| -> Result<(f64, f64), OpenSearchError> {
+        let raw = box_object.get(name).ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`geo_bounding_box` field `{field}` must contain `{name}`"),
+            )
+        })?;
+        parse_geo_point_source(raw).map_err(|reason| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`geo_bounding_box.{field}.{name}` invalid geo_point: {reason}"),
+            )
+        })
+    };
+    let (top_lat, left_lon) = corner("top_left")?;
+    let (bottom_lat, right_lon) = corner("bottom_right")?;
+    Ok(SearchQuery::GeoBoundingBox {
+        field: field.clone(),
+        top_lat,
+        bottom_lat,
+        left_lon,
+        right_lon,
+    })
+}
+
 /// Parse a `distance` value into metres. matchID emits the string form
 /// `"<number><unit>"` (e.g. `"1km"`); ES also accepts a bare number,
 /// which we treat as metres.
@@ -4860,6 +4942,26 @@ pub fn geo_distance_field_matches(
         return false;
     };
     haversine_distance_meters(target_lat, target_lon, lat, lon) <= distance_meters
+}
+
+/// A2: point-in-box test for `geo_bounding_box`. The box is inclusive on
+/// all four edges (ES semantics). Antimeridian-crossing boxes are out of
+/// scope (see [`SearchQuery::GeoBoundingBox`]).
+pub fn geo_bounding_box_field_matches(
+    source: &Value,
+    field: &str,
+    top_lat: f64,
+    bottom_lat: f64,
+    left_lon: f64,
+    right_lon: f64,
+) -> bool {
+    let Some(point) = source.get(field) else {
+        return false;
+    };
+    let Ok((lat, lon)) = parse_geo_point_source(point) else {
+        return false;
+    };
+    lat <= top_lat && lat >= bottom_lat && lon >= left_lon && lon <= right_lon
 }
 
 /// Parse a `prefix` query body and return `(field, value)`.
@@ -5185,6 +5287,20 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
             lon,
             distance_meters,
         } => geo_distance_field_matches(source, field, *lat, *lon, *distance_meters),
+        SearchQuery::GeoBoundingBox {
+            field,
+            top_lat,
+            bottom_lat,
+            left_lon,
+            right_lon,
+        } => geo_bounding_box_field_matches(
+            source,
+            field,
+            *top_lat,
+            *bottom_lat,
+            *left_lon,
+            *right_lon,
+        ),
     }
 }
 

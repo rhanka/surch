@@ -239,7 +239,13 @@ b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
     `ignore_malformed` (Surch est déjà lenient : date invalide → fallback lex).
   - [ ] Inc.2 (optionnel) : `ignore_malformed`, formats additionnels, plages
     epoch_millis numériques.
-- [ ] Lot 3 — A2 geo widening.
+- [~] Lot 3 — A2 geo widening.
+  - [x] **Inc.1 — geo_bounding_box** : variante `SearchQuery::GeoBoundingBox`,
+    `parse_geo_bounding_box_query` (corners `top_left`/`bottom_right` via
+    `parse_geo_point_source`), `geo_bounding_box_field_matches` (point-in-box
+    inclusif), dispatch + bras `query_matches` ; filtre non-scorant (catch-alls
+    scoring/stats). Test e2e `geo_bounding_box.rs`. Antiméridien hors scope.
+  - [ ] Inc.2 — geo_polygon (point-in-polygon ray-casting).
 - [ ] Lot 4 — A5 scoring widening.
 - [ ] Lot 5 — A6/A13 keyword-prefix (optionnel post-A10).
 - [ ] Lot 6 — A12 composite date_histogram + histogram numérique.
