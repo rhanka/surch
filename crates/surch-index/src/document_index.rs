@@ -10,7 +10,7 @@ use surch_analysis::{
 };
 use thiserror::Error;
 
-use crate::mapping::{AnalyzerName, FieldPrefixes, FieldType, IndexMapping};
+use crate::mapping::{AnalysisSettings, AnalyzerName, FieldPrefixes, FieldType, IndexMapping};
 use crate::postings::{
     BlockMeta, PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum,
 };
@@ -455,7 +455,7 @@ impl DocumentIndex {
             // directly instead of aliasing back to the parent at read time.
             if let Some(field_mapping) = field_mapping {
                 if field_mapping.has_subfields() {
-                    self.index_subfields(doc_id, field, value, field_mapping)?;
+                    self.index_subfields(doc_id, field, value, field_mapping, mapping.analysis())?;
                 }
             }
 
@@ -533,10 +533,11 @@ impl DocumentIndex {
         parent: &str,
         value: &str,
         parent_mapping: &crate::mapping::FieldMapping,
+        analysis: &AnalysisSettings,
     ) -> Result<()> {
         for (sub_name, sub_mapping) in parent_mapping.subfields() {
             let path = format!("{parent}.{sub_name}");
-            let analyzed = subfield_terms(sub_mapping, &path, value);
+            let analyzed = subfield_terms(sub_mapping, &path, value, analysis);
 
             // Record the stored projection: the term at the lowest position
             // (the whole normalized value for a keyword/normalizer sub-field,
@@ -646,6 +647,7 @@ fn subfield_terms(
     sub_mapping: &crate::mapping::FieldMapping,
     field: &str,
     value: &str,
+    analysis: &AnalysisSettings,
 ) -> BTreeMap<(String, String), Vec<u32>> {
     if sub_mapping.field_type == FieldType::Keyword {
         let tokens = match sub_mapping.normalizer {
@@ -662,6 +664,24 @@ fn subfield_terms(
                 .push(position - 1);
         }
         return terms;
+    }
+
+    // A1/A13: a text sub-field may declare a custom analyzer (e.g.
+    // `autocomplete_analyzer` = edge_ngram + lowercase/asciifolding). Resolve
+    // it against the index analysis settings and fan out its emitted terms as
+    // postings. Falls back to the builtin analyzer when the name is unknown
+    // (resolution returns None) so a bad reference degrades gracefully.
+    if let Some(name) = &sub_mapping.custom_analyzer {
+        if let Some(resolved) = analysis.resolve_analyzer(name) {
+            let mut terms = BTreeMap::<(String, String), Vec<u32>>::new();
+            for (position, term) in resolved.terms(value).into_iter().enumerate() {
+                terms
+                    .entry((field.to_owned(), term))
+                    .or_default()
+                    .push(position as u32);
+            }
+            return terms;
+        }
     }
 
     analyzed_terms(sub_mapping.analyzer(), field, value)
@@ -814,6 +834,71 @@ mod tests {
         let doc_ids: Vec<u32> = postings.into_iter().map(|p| p.doc_id).collect();
         assert_eq!(doc_ids, vec![2]);
 
+        // The parent text field keeps its own `norm`-analyzed postings.
+        assert!(index.postings("NOM", "dupont").is_some());
+    }
+
+    /// matchID-style autocomplete sub-field: `NOM: { type: text, fields: {
+    /// autocomplete: { type: text, analyzer: autocomplete_analyzer } } }`
+    /// with `settings.analysis` declaring the edge_ngram tokenizer +
+    /// lowercase/asciifolding chain.
+    fn nom_autocomplete_mapping() -> IndexMapping {
+        let mut subfields = BTreeMap::new();
+        subfields.insert(
+            "autocomplete".to_owned(),
+            FieldMapping::new(FieldType::Text, None)
+                .with_custom_analyzer(Some("autocomplete_analyzer".to_owned())),
+        );
+        let nom =
+            FieldMapping::new(FieldType::Text, Some(AnalyzerName::Norm)).with_subfields(subfields);
+        let mut mapping = IndexMapping::new();
+        mapping.set_field_mapping("NOM", nom);
+        let analysis = IndexMapping::from_index_settings_value(&serde_json::json!({
+            "analysis": {
+                "tokenizer": {
+                    "edge_ngram_tokenizer": {
+                        "type": "edge_ngram",
+                        "min_gram": 2,
+                        "max_gram": 4,
+                        "token_chars": ["letter", "digit"]
+                    }
+                },
+                "analyzer": {
+                    "autocomplete_analyzer": {
+                        "tokenizer": "edge_ngram_tokenizer",
+                        "filter": ["lowercase", "asciifolding"]
+                    }
+                }
+            }
+        }))
+        .expect("analysis settings parse");
+        mapping.set_analysis(analysis);
+        mapping
+    }
+
+    #[test]
+    fn edge_ngram_subfield_fans_out_prefix_postings() {
+        // A1/A13: a text sub-field with a custom `autocomplete_analyzer`
+        // (edge_ngram min 2 / max 4 + lowercase + asciifolding) must index
+        // every prefix of the parent value as postings under the qualified
+        // `NOM.autocomplete` path.
+        let mapping = nom_autocomplete_mapping();
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("NOM", "Dupont")], &mapping)
+            .expect("doc 1");
+
+        // Prefixes of "Dupont" length 2..=4, lowercased + asciifolded.
+        for prefix in ["du", "dup", "dupo"] {
+            let postings = index
+                .postings("NOM.autocomplete", prefix)
+                .unwrap_or_else(|| panic!("NOM.autocomplete={prefix} postings present"));
+            let doc_ids: Vec<u32> = postings.into_iter().map(|p| p.doc_id).collect();
+            assert_eq!(doc_ids, vec![1], "prefix {prefix}");
+        }
+        // max_gram is 4, so length-5/6 prefixes are NOT emitted.
+        assert!(index.postings("NOM.autocomplete", "dupon").is_none());
+        assert!(index.postings("NOM.autocomplete", "dupont").is_none());
         // The parent text field keeps its own `norm`-analyzed postings.
         assert!(index.postings("NOM", "dupont").is_some());
     }

@@ -180,6 +180,14 @@ pub const DEFAULT_DATE_FORMAT: &str = "yyyyMMdd";
 pub struct FieldMapping {
     pub field_type: FieldType,
     pub analyzer: Option<AnalyzerName>,
+    /// Raw `analyzer` name when it is NOT one of the builtins (e.g. a
+    /// user-defined `autocomplete_analyzer` declared in
+    /// `settings.analysis.analyzer`). Kept verbatim so it round-trips in
+    /// `GET _mapping` and resolves at index/query time against the index's
+    /// [`AnalysisSettings`] via [`AnalysisSettings::resolve_analyzer`].
+    /// Mutually exclusive with `analyzer` (a builtin sets `analyzer`, a
+    /// custom name sets this).
+    pub custom_analyzer: Option<String>,
     pub norms: Option<bool>,
     /// Field-level `normalizer` reference for keyword fields. Resolved to a
     /// builtin (`AnalyzerName::Norm`) when the named normalizer matches the
@@ -224,12 +232,20 @@ impl FieldMapping {
         Self {
             field_type,
             analyzer,
+            custom_analyzer: None,
             norms,
             normalizer: None,
             index_prefixes: None,
             date_format: None,
             fields: BTreeMap::new(),
         }
+    }
+
+    /// Sets the raw custom analyzer name (a non-builtin declared in
+    /// `settings.analysis.analyzer`). See [`FieldMapping::custom_analyzer`].
+    pub fn with_custom_analyzer(mut self, custom_analyzer: Option<String>) -> Self {
+        self.custom_analyzer = custom_analyzer;
+        self
     }
 
     pub fn with_normalizer(mut self, normalizer: Option<AnalyzerName>) -> Self {
@@ -301,6 +317,8 @@ impl FieldMapping {
                 "analyzer".to_owned(),
                 Value::String(analyzer.as_str().to_owned()),
             );
+        } else if let Some(custom) = &self.custom_analyzer {
+            object.insert("analyzer".to_owned(), Value::String(custom.clone()));
         }
 
         if let Some(norms) = self.norms {
@@ -793,21 +811,23 @@ fn parse_field_definition(
         }
     })?;
 
-    let analyzer = match object.get("analyzer") {
+    // A1/A13: a non-builtin analyzer name (e.g. `autocomplete_analyzer`) is
+    // accepted and kept verbatim as `custom_analyzer`; it resolves at
+    // index/query time against the index `settings.analysis` block (which
+    // is not in scope here). Builtins still resolve eagerly to `analyzer`.
+    let (analyzer, custom_analyzer) = match object.get("analyzer") {
         Some(value) => {
             let value = value
                 .as_str()
                 .ok_or_else(|| MappingError::AnalyzerNotString {
                     field: field.to_owned(),
                 })?;
-            Some(AnalyzerName::from_name(value).ok_or_else(|| {
-                MappingError::UnsupportedAnalyzer {
-                    field: field.to_owned(),
-                    analyzer: value.to_owned(),
-                }
-            })?)
+            match AnalyzerName::from_name(value) {
+                Some(builtin) => (Some(builtin), None),
+                None => (None, Some(value.to_owned())),
+            }
         }
-        None => None,
+        None => (None, None),
     };
 
     let norms = match object.get("norms") {
@@ -821,7 +841,7 @@ fn parse_field_definition(
         None => None,
     };
 
-    if field_type != FieldType::Text && analyzer.is_some() {
+    if field_type != FieldType::Text && (analyzer.is_some() || custom_analyzer.is_some()) {
         return Err(MappingError::AnalyzerNotSupported {
             field: field.to_owned(),
             field_type: field_type.as_str().to_owned(),
@@ -905,6 +925,7 @@ fn parse_field_definition(
     }
 
     Ok(FieldMapping::with_norms(field_type, analyzer, norms)
+        .with_custom_analyzer(custom_analyzer)
         .with_normalizer(normalizer)
         .with_index_prefixes(index_prefixes)
         .with_date_format(date_format)

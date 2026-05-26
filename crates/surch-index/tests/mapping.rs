@@ -68,15 +68,22 @@ fn index_mapping_infers_numeric_strings_as_keyword_fields() {
 }
 
 #[test]
-fn index_mapping_rejects_unsupported_field_types() {
+fn index_mapping_accepts_custom_analyzer_name() {
+    // A1/A13: a non-builtin analyzer name (e.g. a user-defined
+    // `autocomplete_analyzer`) is accepted and kept verbatim as
+    // `custom_analyzer`; it resolves at index/query time against the index
+    // `settings.analysis` block (not in scope at field-parse time). The
+    // builtin `analyzer` slot stays `None`.
     let properties = serde_json::json!({
-        "title": { "type": "text", "analyzer": "magic" }
+        "title": { "type": "text", "analyzer": "autocomplete_analyzer" }
     });
 
-    let error = IndexMapping::from_properties_value(&properties).expect_err("unsupported analyzer");
-    assert!(
-        matches!(error, MappingError::UnsupportedAnalyzer { .. }),
-        "unexpected mapping error: {error:?}"
+    let mapping = IndexMapping::from_properties_value(&properties).expect("custom analyzer parses");
+    let title = mapping.field("title").expect("title exists");
+    assert_eq!(title.analyzer, None);
+    assert_eq!(
+        title.custom_analyzer.as_deref(),
+        Some("autocomplete_analyzer")
     );
 }
 

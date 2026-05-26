@@ -154,6 +154,30 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
   ou A1/A13 d'abord (régression-safe) puis B2 pour valider.
   **Risque/blast radius** : matchID-critique ; mérite l'arbitrage user
   D-vs-F (voir handover.md) avant d'écrire la glue parité.
+  ### Incréments validés CI (priorité D, en cours 2026-05-25)
+  - [x] **Inc.1 — résolveur** : `AnalysisSettings::resolve_analyzer` →
+    `ResolvedAnalyzer` (builtin ou edge_ngram + filtres), testé. Sans
+    câblage (régression-safe).
+  - [ ] **Inc.2 — modèle + parse + index** (le gros) : aujourd'hui le
+    parseur de champ (`mapping.rs` ~l.803) **rejette** tout analyzer
+    non-builtin (`UnsupportedAnalyzer`) → un mapping `deces_v2` avec
+    `analyzer: autocomplete_analyzer` ne se charge PAS. Donc :
+    1. Changer `FieldMapping.analyzer` (et `normalizer`, `search_analyzer`)
+       pour porter soit un builtin soit un **nom custom** (ex. enum
+       `{Builtin(AnalyzerName), Named(String)}`), et accepter les noms
+       custom au parse (valider contre `settings.analysis.analyzer` quand
+       dispo, sinon différer). Met à jour tous les appelants de
+       `FieldMapping::analyzer() -> AnalyzerName`.
+    2. Threader `&IndexMapping` (ou `&AnalysisSettings`) jusqu'à
+       `index_subfields` → `subfield_terms` (l.530-668 de
+       `document_index.rs`) — `add_documents_with_mapping_internal` a déjà
+       le `&IndexMapping` complet (l.194), il suffit de le passer plus bas.
+    3. `subfield_terms` : pour un sous-champ `text` à analyzer custom,
+       résoudre via `resolve_analyzer` et fan-out les ngrams.
+  - [ ] **Inc.3 — requête + search_analyzer** : `state.rs::normalized_terms_for_field`
+    doit utiliser le `search_analyzer` (défaut standard pour un champ
+    edge_ngram), PAS l'analyzer d'indexation.
+  - [ ] **Inc.4 — fixture deces_v2 + oracle B2** : valider parité ES 8.6.1.
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
 - [ ] Lot 4 — A5 scoring widening.
