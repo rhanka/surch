@@ -1,0 +1,7 @@
+step,sha,surch_rss_peak_mib,surch_rss_final_mib,opensearch_rss_peak_mib,note
+baseline_full_rebuild,137b352,4802,4802,1466,full rebuild per bulk chunk
+lot1_incremental,04fde72,5859,5859,1466,incremental append keeps builder alive
+lot1.5_refresh_finalize,01ad77e,5591,5591,1466,builder dropped on refresh; glibc inertia
+lot1.7_jemalloc,b9f6636,3424,1382,1466,jemalloc aggressive purge
+lot1.6_deferred_fst,2e4361e,2156,1290,1466,deferred FST removes per-chunk builder clone
+final_3rep_median,main,2168,1290,1467,3-rep median peak (range 2159-2180)

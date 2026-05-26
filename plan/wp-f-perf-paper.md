@@ -190,9 +190,14 @@ Atouts méthodo déjà en place :
 - [~] **F5 — Draft de l'article** : premier draft livré
   `docs/paper/draft.md` (abstract, méthodo, séquence bulk Lot 1→1.6,
   mémoire, latence, qualité, parité matchID, discussion, limitations,
-  conclusion) sur les lots récents + multi-rep F2. Reste : figures
-  (courbes bulk/latence/RSS par lot), et intégration des historiques
-  si F3 tranché.
+  conclusion) sur les lots récents + multi-rep F2.
+  - [x] **Données de figures livrées** : `docs/paper/figures/` (CSV
+    plot-ready bulk-by-lot, RSS-by-lot, latency-by-corpus + provenance
+    par SHA/rapport). Référencées dans l'en-tête du draft. Le tracé
+    lui-même (gnuplot/tableur) reste au choix de l'auteur (repo
+    sans Python).
+  - [ ] Reste F5 : rendu graphique des figures + intégration des
+    historiques si F3 tranché.
 
 ## Verdict de faisabilité (au 2026-05-25)
 

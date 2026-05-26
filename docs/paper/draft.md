@@ -7,6 +7,8 @@
 > sequence (Lot 1 → Lot 3 + jemalloc), which is cleanly isolated and
 > multi-rep. The historical optimisation isolation (F3) is pending a
 > scope decision; this draft cites those as delivered-but-not-isolated.
+> Plot-ready data for the headline curves (bulk-by-lot, RSS-by-lot,
+> latency-by-corpus) is in `docs/paper/figures/` (CSV + provenance).
 
 ## Abstract
 

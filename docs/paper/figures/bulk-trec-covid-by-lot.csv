@@ -1,0 +1,7 @@
+step,sha,surch_bulk_s,opensearch_bulk_s,surch_vs_os
+baseline,d9cac15,1001.95,72.27,OS 13.9x faster
+lot1_incremental,04fde72,179.86,87.04,OS 2.06x faster
+lot1.5_refresh_finalize,01ad77e,189.18,98.66,OS 1.92x faster
+lot1.7_jemalloc,b9f6636,139.05,97.83,OS 1.42x faster
+lot1.6_deferred_fst,2e4361e,56.38,86.61,Surch 1.54x faster
+final_3rep_median,main,70.96,109.73,Surch 1.55x faster

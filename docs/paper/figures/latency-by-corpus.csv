@@ -1,0 +1,5 @@
+corpus,engine,p50_ms,p95_ms,p99_ms,max_ms,source_report
+insee_10k,surch,1.5,4.1,8.4,40.6,2026-05-25-F2-insee-3rep-K8s
+insee_10k,opensearch,4.0,12.2,26.3,223.1,2026-05-25-F2-insee-3rep-K8s
+trec_covid_171k,surch,0.5,1.3,5.3,308.4,2026-05-25-F4-trec-covid-latency-3rep-K8s
+trec_covid_171k,opensearch,176.9,481.4,673.1,1282.4,2026-05-25-F4-trec-covid-latency-3rep-K8s
