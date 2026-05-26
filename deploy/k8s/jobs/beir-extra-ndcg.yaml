@@ -1,0 +1,143 @@
+# Surch — extra BEIR NDCG@10 parity gate (NFCorpus + FiQA).
+#
+# Clone of ndcg-gate for the two additional BEIR datasets (Objective F
+# quality generality). Spins up Surch + OpenSearch sidecars and a driver
+# that runs `scripts/bench/beir-ndcg.sh <dataset>` against both engines for
+# nfcorpus and fiqa, then emits a human summary + text outputs to /reports
+# (aggregated by `bench_report --dir`). NFCorpus (~3.6k docs) and FiQA
+# (~57k docs) are far smaller than TREC-COVID, so the envelope is ample.
+#
+# First-run intent: OBSERVE Surch vs OpenSearch NDCG@10/Recall@10 (no SLO
+# floor yet — floors are set after seeing the actuals, like trec-covid).
+# Requires 00b-init-beir-extra to have hydrated the BEIR PVC.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: beir-extra-ndcg
+  namespace: surch
+  labels:
+    app.kubernetes.io/name: surch
+    app.kubernetes.io/component: beir-extra-ndcg
+    app.kubernetes.io/part-of: surch-ci
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: surch
+        app.kubernetes.io/component: beir-extra-ndcg
+        app.kubernetes.io/part-of: surch-ci
+    spec:
+      restartPolicy: Never
+      serviceAccountName: surch
+      nodeSelector:
+        k8s.scaleway.com/pool-name: burst
+      tolerations:
+        - key: pool
+          operator: Equal
+          value: burst
+          effect: NoSchedule
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      shareProcessNamespace: true
+      volumes:
+        - name: beir
+          persistentVolumeClaim:
+            claimName: surch-corpus-beir
+            readOnly: true
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: surch-scratch
+        - name: reports
+          emptyDir: { sizeLimit: 64Mi }
+      initContainers:
+        - name: surch
+          restartPolicy: Always
+          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 7700, name: surch-http }
+          env:
+            - { name: SURCH_HOST, value: "127.0.0.1" }
+            - { name: SURCH_PORT, value: "7700" }
+            - { name: RUST_LOG,   value: "warn" }
+          resources:
+            requests: { cpu: 150m, memory: 256Mi }
+            limits:   { cpu: 2000m, memory: 4Gi }
+          volumeMounts:
+            - { name: scratch, mountPath: /var/surch, subPath: surch-beir-extra }
+        - name: opensearch
+          restartPolicy: Always
+          image: opensearchproject/opensearch:2.17.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 9200, name: os-http }
+          env:
+            - { name: discovery.type,                     value: "single-node" }
+            - { name: DISABLE_SECURITY_PLUGIN,            value: "true" }
+            - { name: DISABLE_INSTALL_DEMO_CONFIG,        value: "true" }
+            - { name: OPENSEARCH_JAVA_OPTS,               value: "-Xms1g -Xmx1g" }
+            - { name: bootstrap.memory_lock,              value: "false" }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: 1200m, memory: 2Gi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data-beir-extra }
+      containers:
+        - name: ndcg-driver
+          image: ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: SURCH_URL,      value: "http://127.0.0.1:7700" }
+            - { name: OPENSEARCH_URL, value: "http://127.0.0.1:9200" }
+            - { name: BEIR_DIR,       value: "/data/beir" }
+            - { name: REPORTS_DIR,    value: "/reports" }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 1Gi }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "Waiting for Surch + OpenSearch..."
+              until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+              until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=30s" >/dev/null 2>&1; do sleep 1; done
+              echo "Both engines healthy."
+              mkdir -p "$REPORTS_DIR"
+              for ds in nfcorpus fiqa; do
+                /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-surch-k8s" "$REPORTS_DIR/$ds-surch.out" "$SURCH_URL"
+                /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-os-k8s"    "$REPORTS_DIR/$ds-os.out"    "$OPENSEARCH_URL"
+              done
+              {
+                echo "# Extra BEIR NDCG gate (NFCorpus + FiQA)"
+                for ds in nfcorpus fiqa; do
+                  echo
+                  echo "## $ds / Surch"
+                  cat "$REPORTS_DIR/$ds-surch.out"
+                  echo
+                  echo "## $ds / OpenSearch"
+                  cat "$REPORTS_DIR/$ds-os.out"
+                done
+              } > "$REPORTS_DIR/summary.md"
+              cat > "$REPORTS_DIR/bench.json" <<EOF
+              {"schema":"surch.bench.ndcg_gate.v1","nfcorpus_surch_out":"$REPORTS_DIR/nfcorpus-surch.out","nfcorpus_opensearch_out":"$REPORTS_DIR/nfcorpus-os.out","fiqa_surch_out":"$REPORTS_DIR/fiqa-surch.out","fiqa_opensearch_out":"$REPORTS_DIR/fiqa-os.out"}
+              EOF
+              echo "BEGIN_SURCH_K8S_SUMMARY"
+              cat "$REPORTS_DIR/summary.md"
+              echo "END_SURCH_K8S_SUMMARY"
+              echo "BEGIN_SURCH_K8S_BENCH_JSON"
+              cat "$REPORTS_DIR/bench.json"
+              echo "END_SURCH_K8S_BENCH_JSON"
+              echo "beir-extra-ndcg complete."
+          volumeMounts:
+            - { name: beir,    mountPath: /data/beir, readOnly: true }
+            - { name: reports, mountPath: /reports }

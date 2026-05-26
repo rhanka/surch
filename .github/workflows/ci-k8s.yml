@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "Job manifest to run (ndcg-gate | insee-bench | trec-covid-latency | b1-oracle-gate | b2-oracle-gate | 00-init-corpora | 00b-init-beir-extra)"
+        description: "Job manifest to run (ndcg-gate | beir-extra-ndcg | insee-bench | trec-covid-latency | b1-oracle-gate | b2-oracle-gate | 00-init-corpora | 00b-init-beir-extra)"
         required: true
         default: "ndcg-gate"
         type: choice
@@ -38,6 +38,7 @@ on:
           - b2-oracle-gate
           - 00-init-corpora
           - 00b-init-beir-extra
+          - beir-extra-ndcg
 
 env:
   SCW_MAX_COST_EUR: "2"
@@ -88,7 +89,7 @@ jobs:
           }
           check_image_tag "$IMAGE_TAG" "runtime"
           case "${{ inputs.job }}" in
-            ndcg-gate|insee-bench|trec-covid-latency|b1-oracle-gate|b2-oracle-gate)
+            ndcg-gate|beir-extra-ndcg|insee-bench|trec-covid-latency|b1-oracle-gate|b2-oracle-gate)
               check_image_tag "bench-${IMAGE_TAG}" "bench driver"
               ;;
           esac
@@ -305,6 +306,10 @@ jobs:
               REPORT_CONTAINER="ndcg-driver"
               REPORT_FILES="summary.md bench.json scifact-surch.out scifact-os.out rss-ndcg-surch.json rss-ndcg-os.json"
               ;;
+            beir-extra-ndcg)
+              REPORT_CONTAINER="ndcg-driver"
+              REPORT_FILES="summary.md bench.json nfcorpus-surch.out nfcorpus-os.out fiqa-surch.out fiqa-os.out"
+              ;;
             insee-bench)
               REPORT_CONTAINER="artillery-runner"
               REPORT_FILES="summary.md art-surch.json art-os.json rss-art-surch.json rss-art-os.json"
@@ -381,7 +386,7 @@ jobs:
           }
 
           case "${{ inputs.job }}" in
-            ndcg-gate)
+            ndcg-gate|beir-extra-ndcg)
               SUMMARY_FILE="$OUT_DIR/${{ inputs.job }}.summary.md"
               DRIVER_LOG="$(ls "$OUT_DIR"/*.ndcg-driver.log 2>/dev/null | head -n 1 || true)"
               if [ ! -s "$SUMMARY_FILE" ] && [ -n "$DRIVER_LOG" ]; then

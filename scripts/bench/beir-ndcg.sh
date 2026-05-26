@@ -192,7 +192,9 @@ avg_ndcg=$(awk -v c="$cum_ndcg" -v n="$processed" 'BEGIN { if (n>0) printf "%.4f
 avg_recall=$(awk -v c="$cum_recall" -v n="$processed" 'BEGIN { if (n>0) printf "%.4f", c/n; else print "n/a" }')
 
 {
-  echo "## beir-ndcg dataset=$DATASET label=$LABEL  $(date -Iseconds)"
+  # Header shape parsed by bench_report::parse_beir_text_output: the first
+  # token before `-ndcg` is the workload, `label=` carries the engine.
+  echo "## $DATASET-ndcg label=$LABEL  $(date -Iseconds)"
   echo "url=$URL bulk_ms=$bulk_ms"
   echo "queries_processed=$processed (out of $total_queries unique test qids)"
   echo "NDCG@10 = $avg_ndcg"
