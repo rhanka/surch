@@ -174,10 +174,24 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
        le `&IndexMapping` complet (l.194), il suffit de le passer plus bas.
     3. `subfield_terms` : pour un sous-champ `text` à analyzer custom,
        résoudre via `resolve_analyzer` et fan-out les ngrams.
-  - [ ] **Inc.3 — requête + search_analyzer** : `state.rs::normalized_terms_for_field`
-    doit utiliser le `search_analyzer` (défaut standard pour un champ
-    edge_ngram), PAS l'analyzer d'indexation.
-  - [ ] **Inc.4 — fixture deces_v2 + oracle B2** : valider parité ES 8.6.1.
+  - [x] **Inc.2 — modèle + parse + index** : `FieldMapping.custom_analyzer`,
+    parseur tolérant aux noms custom, round-trip `_mapping`, fan-out ngrams
+    à l'indexation. CI vert + tests.
+  - [x] **Inc.3 — requête + search_analyzer** : `FieldMapping.search_analyzer`,
+    `IndexMapping::custom_search_terms_for_field` (search_analyzer prioritaire),
+    `normalized_terms_for_field` câblé. CI vert + tests.
+  - [x] **Inc.4a — bout-en-bout via l'API** : le create d'index attache
+    `settings.analysis` au mapping stocké (`merge_mapping_fields` propage
+    désormais l'analysis — bug d'intégration trouvé via le test e2e qui
+    donnait 0 hit). Test e2e `matchid_autocomplete.rs` : PUT deces2
+    (edge_ngram + autocomplete_analyzer + search_analyzer standard) → bulk →
+    `match NOM.autocomplete=dup` touche DUPONT, pas MARTIN ni zzz. **CI vert.**
+    **A1/A13 fonctionnellement complet de bout en bout.**
+  - [ ] **Inc.4b — fixture deces_v2 + oracle B2** : valider la PARITÉ ES 8.6.1
+    du nouveau chemin (le e2e prouve la correction interne, pas la parité ES).
+    Créer `tests/matchid_compat/deces/mapping_v2.json` + un oracle B2 K8s
+    (`b2-oracle-gate.yaml`, binaire oracle réutilisé) comparant Surch vs ES 8.6.1
+    sur des requêtes edge_ngram. Plus lourd (nouveau job K8s + fixture + compat ES).
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
 - [ ] Lot 4 — A5 scoring widening.
