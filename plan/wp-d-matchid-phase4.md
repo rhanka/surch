@@ -118,6 +118,42 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
     0 divergence vs Elasticsearch 8.6.1 (GHA `26423292686` @ `9640169`,
     `2026-05-25-b1-oracle-A12-ES861-K8s/`). A10+A12 parité-neutres.
 - [ ] Lot 1 — A1/A13 multi-field + edge_ngram câblé.
+  ### Plan d'implémentation A1/A13 (cadré 2026-05-25)
+  **État** : le parsing ET l'implémentation existent déjà, seule la glue
+  manque.
+  - Parsing mapping/settings : `crates/surch-index/src/mapping.rs`
+    (`FieldMapping.fields` multi-field l.180-212 ; `AnalysisSettings`,
+    `EdgeNgramTokenizerDefinition`, `AnalyzerDefinition`,
+    `from_index_settings_value()` l.357-682). `token_chars` capturé mais
+    pas appliqué (gap A13).
+  - Analyzers prêts : `crates/surch-analysis/src/lib.rs` — `EdgeNgramAnalyzer`
+    (l.323-371), `NormAnalyzer`, `Normalizer` fonctionnels.
+  - Fan-out A10 : `document_index.rs::index_subfields()` (l.530-557) +
+    `subfield_terms()` (l.645-668) — produit `.raw` (keyword+normalizer)
+    aujourd'hui.
+  **Glue manquante (3 points)** :
+  1. Hook de résolution : `AnalyzerName::from_name()` (mapping.rs l.119-129)
+     ne connaît que 6 builtins. Ajouter une résolution `nom custom →
+     analysis().analyzers[nom] → tokenizer (edge_ngram → bornes min/max) +
+     chaîne de filtres (lowercase/asciifolding)`.
+  2. Index-time : `index_subfields()` / `analyzed_terms()` doivent router
+     un sous-champ `type:text, analyzer:<custom>` vers l'analyzer résolu
+     (génère les ngrams `NOM.autocomplete`).
+  3. Query-time : `state.rs::normalized_terms_for_field()` (l.605-606).
+  **⚠️ Subtilité parité-critique (non relevée par l'explo)** : pour
+  edge_ngram, ES applique l'analyzer ngram **à l'indexation** mais un
+  `search_analyzer` **distinct** (typiquement standard/keyword) **à la
+  requête**. Si on edge-ngram les DEUX côtés, on diverge d'ES (faux
+  positifs). Donc : honorer `search_analyzer` séparément de `analyzer`
+  (parser le champ `search_analyzer` du mapping, défaut = `analyzer` pour
+  les analyzers non-ngram). C'est la condition de parité `match NOM` == ES.
+  **Sécurité régression** : `deces_v1` n'utilise aucun analyzer custom →
+  b1-oracle reste 30/30 quelle que soit l'implémentation. La parité du
+  NOUVEAU chemin edge_ngram n'est validable que via une fixture
+  `deces_v2` + oracle ES (= Lot 7 / B2). Implémenter A1/A13 et B2 ensemble,
+  ou A1/A13 d'abord (régression-safe) puis B2 pour valider.
+  **Risque/blast radius** : matchID-critique ; mérite l'arbitrage user
+  D-vs-F (voir handover.md) avant d'écrire la glue parité.
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
 - [ ] Lot 4 — A5 scoring widening.
