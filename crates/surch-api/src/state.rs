@@ -6,7 +6,7 @@ use std::{
 use serde_json::Value;
 use surch_index::{
     document_index::DocumentIndex,
-    mapping::{FieldMapping, FieldType, IndexMapping},
+    mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, stored_fields_bytes_for, MemoryUsage},
     postings::BlockMeta,
 };
@@ -1808,6 +1808,15 @@ fn snapshot_component_templates(
 fn merge_mapping_fields(target: &mut IndexMapping, source: &IndexMapping) {
     for (field, mapping) in source.fields() {
         target.set_field_mapping(field.to_owned(), mapping.clone());
+    }
+    // A1/A13: carry the `settings.analysis` block (edge_ngram tokenizers,
+    // user-defined analyzers/normalizers) onto the stored mapping so the
+    // custom analyzers its fields reference resolve at index + query time.
+    // Without this the create path dropped analysis and edge_ngram
+    // sub-fields silently fell back to the default analyzer.
+    let analysis = source.analysis();
+    if analysis != &AnalysisSettings::default() {
+        target.set_analysis(analysis.clone());
     }
 }
 
