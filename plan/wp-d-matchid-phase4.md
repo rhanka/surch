@@ -258,8 +258,11 @@ b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
     scale)`, linear = `max(0, 1-dist·(1-decay)/scale)`). Tests e2e exp+linear
     (dates proches mieux classées). Messages d'erreur de parse restent
     génériques « gauss.<field> » (même grammaire). CI à valider.
-  - [ ] Inc.2 — **random_score** : nécessite un id de doc stable dans le
-    contexte de scoring (hash field/seed). Vérifier la dispo de l'id.
+  - [~] Inc.2 — **random_score** : RÉSERVE. La parité bit-à-bit avec ES est
+    **infaisable** (RNG/hash interne ES différent) ; l'implémenter ferait
+    diverger l'oracle, à l'encontre de l'objectif parité. matchID ne l'utilise
+    pas. **Décision : implémenter une version non-parité (documentée) ou
+    déclarer hors-scope ?** Par défaut : hors-scope.
   - [ ] **script_score — DÉCISION SCOPE** : nécessite un moteur d'évaluation
     d'expressions (mini-langage type painless). Sous-système conséquent.
     **Décision user : construire un évaluateur de script minimal, ou

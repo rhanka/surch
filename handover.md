@@ -109,11 +109,19 @@ Ordre d'exécution : D d'abord (A1/A13), puis F3 + BEIR en backlog F.
   now±N, e2e). matchID garde DATE_NAISSANCE en keyword (placeholders INSEE).
 - **A2 (geo) : fait** (geo_bounding_box + geo_polygon, e2e ; geo_distance
   préexistant).
-- **A5 (scoring) : reste** — exp/linear decay (calquer gauss, parité-sensible),
-  random_score (id de doc), et **script_score = décision scope** (construire
-  un évaluateur de script ou hors-scope matchID ?).
+- **A5 (scoring) : decay fait** — exp/linear decay livrés + validés (unifiés
+  en `ScoringFunction::Decay` + `DecayKind`, tests e2e). Restent 2 items
+  décision-gated : **random_score** (parité bit-à-bit ES infaisable, RNG
+  différent ; matchID ne l'utilise pas → défaut hors-scope) et **script_score**
+  (= moteur de script, décision scope).
 - Reste aussi A6 (keyword-prefix side-table, optionnel) + A12 composite/
   histogram (partiellement couvert).
+
+### Bilan Track D Phase 4 (axes query)
+A1/A13 (CERTIFIÉ ES 8.6.1), A7 (dates+date-math), A2 (geo bbox+polygon),
+A5-decay (gauss/exp/linear) : **faits et validés CI**, régression-safe
+(b1-oracle 30/30). Le reste (random_score, script_score, A6) est
+décision/jugement-gated ou optionnel.
 
 ### Décision scope ouverte (A5)
 - **script_score** : nécessite un moteur d'évaluation d'expressions (mini
