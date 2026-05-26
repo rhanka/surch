@@ -1105,7 +1105,7 @@ mod tests {
                 }
             }
         });
-        AnalysisSettings::from_index_settings_value(&value).expect("settings parse")
+        IndexMapping::from_index_settings_value(&value).expect("settings parse")
     }
 
     #[test]
