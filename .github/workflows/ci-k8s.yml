@@ -26,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "Job manifest to run (ndcg-gate | insee-bench | trec-covid-latency | b1-oracle-gate | 00-init-corpora)"
+        description: "Job manifest to run (ndcg-gate | insee-bench | trec-covid-latency | b1-oracle-gate | b2-oracle-gate | 00-init-corpora)"
         required: true
         default: "ndcg-gate"
         type: choice
@@ -35,6 +35,7 @@ on:
           - insee-bench
           - trec-covid-latency
           - b1-oracle-gate
+          - b2-oracle-gate
           - 00-init-corpora
 
 env:
@@ -86,7 +87,7 @@ jobs:
           }
           check_image_tag "$IMAGE_TAG" "runtime"
           case "${{ inputs.job }}" in
-            ndcg-gate|insee-bench|trec-covid-latency|b1-oracle-gate)
+            ndcg-gate|insee-bench|trec-covid-latency|b1-oracle-gate|b2-oracle-gate)
               check_image_tag "bench-${IMAGE_TAG}" "bench driver"
               ;;
           esac
@@ -314,6 +315,10 @@ jobs:
             b1-oracle-gate)
               REPORT_CONTAINER="b1-oracle-driver"
               REPORT_FILES="b1-oracle.json"
+              ;;
+            b2-oracle-gate)
+              REPORT_CONTAINER="b2-oracle-driver"
+              REPORT_FILES="b2-oracle.json"
               ;;
           esac
 

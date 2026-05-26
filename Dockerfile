@@ -73,6 +73,10 @@ COPY tests/matchid_compat/deces/slice-10000.ndjson.gz /usr/local/share/deces/sli
 # matchID v1 replay fixture used by the Elasticsearch 8.6.1 b1_oracle
 # gate.
 COPY tests/matchid_compat/replays/deces_v1.json /usr/local/share/deces/replays/deces_v1.json
+# matchID v2 fixtures (multi-field + edge_ngram autocomplete) used by the
+# Elasticsearch 8.6.1 b2_oracle gate.
+COPY tests/matchid_compat/deces/mapping_v2.json /usr/local/share/deces/mapping_v2.json
+COPY tests/matchid_compat/replays/deces_v2.json /usr/local/share/deces/replays/deces_v2.json
 
 RUN chmod 0755 \
       /usr/local/bin/artillery_bench \
@@ -83,8 +87,10 @@ RUN chmod 0755 \
       /usr/local/bin/trec-covid-ndcg.sh \
  && chmod 0644 \
       /usr/local/share/deces/mapping.json \
+      /usr/local/share/deces/mapping_v2.json \
       /usr/local/share/deces/slice-10000.ndjson.gz \
-      /usr/local/share/deces/replays/deces_v1.json
+      /usr/local/share/deces/replays/deces_v1.json \
+      /usr/local/share/deces/replays/deces_v2.json
 
 USER 65532:65532
 WORKDIR /work

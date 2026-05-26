@@ -1,0 +1,124 @@
+# B2 — matchID Elasticsearch 8.6.1 oracle cross-check for the deces_v2
+# mapping (A1/A13: multi-field `.raw` keyword + `.autocomplete` edge_ngram).
+# Runs Surch + Elasticsearch 8.6.1 side by side in one Pod, bootstraps the
+# `deces` index on both engines from `mapping_v2.json` (settings.analysis +
+# edge_ngram) with the INSEE slice, then drives the
+# `tests/matchid_compat/replays/deces_v2.json` replay against both via the
+# `b1_oracle` binary (reused as-is; it PUTs the full settings+mappings body
+# verbatim to each engine, so ES receives the edge_ngram analysers). The Job
+# exits non-zero on the first behavioural divergence, so it certifies that
+# Surch's edge_ngram / normalizer analysis chains match ES 8.6.1.
+#
+# Same memory budget shape as b1-oracle-gate (fits the poc-k8s quota).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: b2-oracle-gate
+  namespace: surch
+  labels:
+    app.kubernetes.io/component: b2-oracle-gate
+spec:
+  activeDeadlineSeconds: 1800
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: b2-oracle-gate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      tolerations:
+        - key: pool
+          operator: Equal
+          value: burst
+          effect: NoSchedule
+      nodeSelector:
+        k8s.scaleway.com/pool-name: burst
+      volumes:
+        - name: scratch
+          persistentVolumeClaim:
+            claimName: surch-scratch
+        - name: reports
+          emptyDir: { sizeLimit: 128Mi }
+      initContainers:
+        # --- Engine #1: Surch ---------------------------------
+        - name: surch
+          restartPolicy: Always
+          image: ghcr.io/rhanka/surch:sha-${SURCH_SHA}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 7700, name: surch-http }
+          env:
+            - { name: SURCH_HOST, value: "127.0.0.1" }
+            - { name: SURCH_PORT, value: "7700" }
+            - { name: RUST_LOG,   value: "warn" }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 800m, memory: 512Mi }
+          volumeMounts:
+            - { name: scratch, mountPath: /var/surch, subPath: surch-b2-oracle }
+        # --- Engine #2: Elasticsearch 8.6.1 oracle ------------
+        - name: elasticsearch
+          restartPolicy: Always
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.6.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { containerPort: 9200, name: es-http }
+          env:
+            - { name: discovery.type,              value: "single-node" }
+            - { name: xpack.security.enabled,      value: "false" }
+            - { name: ES_JAVA_OPTS,                value: "-Xms1g -Xmx1g" }
+            - { name: bootstrap.memory_lock,       value: "false" }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { cpu: 1200m, memory: 1536Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - { name: scratch, mountPath: /usr/share/elasticsearch/data, subPath: es-b2-oracle }
+      containers:
+        # --- Driver: b1_oracle Rust binary (reused for v2) ----
+        - name: b2-oracle-driver
+          image: ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: SURCH_URL, value: "http://127.0.0.1:7700" }
+            - { name: ES_URL,    value: "http://127.0.0.1:9200" }
+            - { name: REPORTS_DIR, value: "/reports" }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 384Mi }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "Waiting for both engines..."
+              until wget -qO- "$SURCH_URL/" >/dev/null 2>&1; do sleep 0.5; done
+              until wget -qO- "$ES_URL/_cluster/health?wait_for_status=yellow&timeout=60s" >/dev/null 2>&1; do sleep 1; done
+              mkdir -p "$REPORTS_DIR"
+              # mapping_v2.json carries settings.analysis (edge_ngram) +
+              # mappings; b1_oracle PUTs the full body to both engines.
+              ORACLE_RC=0
+              /usr/local/bin/b1_oracle \
+                --url-surch "$SURCH_URL" \
+                --url-es "$ES_URL" \
+                --mapping /usr/local/share/deces/mapping_v2.json \
+                --slice /usr/local/share/deces/slice-10000.ndjson.gz \
+                --replay /usr/local/share/deces/replays/deces_v2.json \
+                --out "$REPORTS_DIR/b2-oracle.json" || ORACLE_RC=$?
+              echo "BEGIN_SURCH_K8S_B2_ORACLE"
+              if [ -s "$REPORTS_DIR/b2-oracle.json" ]; then
+                cat "$REPORTS_DIR/b2-oracle.json"
+              else
+                echo '{"error":"b2-oracle.json missing"}'
+              fi
+              echo "END_SURCH_K8S_B2_ORACLE"
+              echo "b2-oracle-gate complete (oracle exit=$ORACLE_RC)."
+              exit "$ORACLE_RC"
+          volumeMounts:
+            - { name: reports, mountPath: /reports }
