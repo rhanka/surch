@@ -107,6 +107,20 @@ attendues" en fin de bloc).**
   large-corpus de Lot 3 et le citer comme « livré, neutre sur INSEE,
   bénéfice grand-corpus non isolé » ?** Le loop avance par défaut sur
   le multi-rep F4 (sans décision requise) en attendant.
+- **BEIR multi-datasets (F-gap-4, généralité qualité)** : ajouter
+  NFCorpus/FiQA pour élargir la preuve qualité. BLOQUÉ par 2 frictions :
+  (1) le job `deploy/k8s/jobs/00-init-corpora.yaml` qui provisionne les
+  corpus est en **Python** — l'étendre violerait la règle no-Python ;
+  (2) effort : re-download ~GiB dans le PVC `surch-corpus-beir`, +
+  scripts NDCG par dataset, + seuils SLO `bench_report`, + câblage
+  ci-k8s. **Décision : investir (réécrire l'init en shell + ajouter les
+  datasets) ou rester sur SciFact+TREC-COVID pour le premier article ?**
+- **État Objectif F au {2026-05-25}** : la story « lots récents » est
+  complète et rigoureuse — bulk (F2 3-rep), RSS (F2 3-rep), latence
+  INSEE (F2 3-rep), latence grand corpus (F4 3-rep + équivalence
+  in-artefact), qualité (NDCG stable), parité matchID (A10+A12). Restent
+  pour un article « complet » : F3 (historiques, bloqué), isolation
+  Lot 3 (décision ci-dessus), F5 figures, généralité BEIR (décision).
 
 ---
 
