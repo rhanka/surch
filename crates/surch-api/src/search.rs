@@ -317,6 +317,14 @@ pub enum SearchQuery {
         left_lon: f64,
         right_lon: f64,
     },
+    /// A2: `geo_polygon` filter — matches documents whose `field`
+    /// (`geo_point`) lies inside the polygon defined by `points` (≥ 3
+    /// `(lat, lon)` vertices), tested by ray casting. Non-scoring like the
+    /// other geo filters. Antimeridian-crossing polygons are out of scope.
+    GeoPolygon {
+        field: String,
+        points: Vec<(f64, f64)>,
+    },
 }
 
 /// A5 phase 2: one `function_score.functions[]` entry. Bundles the
@@ -3594,6 +3602,7 @@ fn parse_search_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         "function_score" => parse_function_score_query(query_body),
         "geo_distance" => parse_geo_distance_query(query_body),
         "geo_bounding_box" => parse_geo_bounding_box_query(query_body),
+        "geo_polygon" => parse_geo_polygon_query(query_body),
         unknown => Err(OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "parsing_exception",
@@ -4755,6 +4764,69 @@ fn parse_geo_bounding_box_query(value: &Value) -> Result<SearchQuery, OpenSearch
     })
 }
 
+/// Parse a `geo_polygon` query body (A2):
+///
+/// ```json
+/// { "geo_polygon": { "FIELD": { "points": [ {"lat":..,"lon":..}, … ] } } }
+/// ```
+fn parse_geo_polygon_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
+    let object = value.as_object().ok_or_else(|| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            "`geo_polygon` query body must be an object",
+        )
+    })?;
+    let (field, body) = object
+        .iter()
+        .find(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "validation_method" | "ignore_unmapped" | "_name" | "boost",
+            )
+        })
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                "`geo_polygon` query must contain a geo_point field",
+            )
+        })?;
+    let points_raw = body
+        .as_object()
+        .and_then(|object| object.get("points"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`geo_polygon` field `{field}` must contain a `points` array"),
+            )
+        })?;
+    if points_raw.len() < 3 {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("`geo_polygon.{field}.points` needs at least 3 vertices"),
+        ));
+    }
+    let mut points = Vec::with_capacity(points_raw.len());
+    for raw in points_raw {
+        let point = parse_geo_point_source(raw).map_err(|reason| {
+            OpenSearchError::new(
+                StatusCode::BAD_REQUEST,
+                "parsing_exception",
+                format!("`geo_polygon.{field}.points` invalid geo_point: {reason}"),
+            )
+        })?;
+        points.push(point);
+    }
+    Ok(SearchQuery::GeoPolygon {
+        field: field.clone(),
+        points,
+    })
+}
+
 /// Parse a `distance` value into metres. matchID emits the string form
 /// `"<number><unit>"` (e.g. `"1km"`); ES also accepts a bare number,
 /// which we treat as metres.
@@ -4962,6 +5034,34 @@ pub fn geo_bounding_box_field_matches(
         return false;
     };
     lat <= top_lat && lat >= bottom_lat && lon >= left_lon && lon <= right_lon
+}
+
+/// A2: point-in-polygon test for `geo_polygon` via ray casting (lat as y,
+/// lon as x). `points` are `(lat, lon)` vertices; the polygon is treated as
+/// implicitly closed. Antimeridian-crossing polygons are out of scope.
+pub fn geo_polygon_field_matches(source: &Value, field: &str, points: &[(f64, f64)]) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let Some(point) = source.get(field) else {
+        return false;
+    };
+    let Ok((lat, lon)) = parse_geo_point_source(point) else {
+        return false;
+    };
+    let (y, x) = (lat, lon);
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let (yi, xi) = (points[i].0, points[i].1);
+        let (yj, xj) = (points[j].0, points[j].1);
+        let intersects = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// Parse a `prefix` query body and return `(field, value)`.
@@ -5301,6 +5401,9 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
             *left_lon,
             *right_lon,
         ),
+        SearchQuery::GeoPolygon { field, points } => {
+            geo_polygon_field_matches(source, field, points)
+        }
     }
 }
 

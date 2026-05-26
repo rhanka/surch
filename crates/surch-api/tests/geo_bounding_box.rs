@@ -128,3 +128,80 @@ async fn execute(router: Router, method: Method, path: &str, body: String) -> (u
     };
     (status, value)
 }
+
+#[test]
+fn geo_polygon_filters_points_inside_the_polygon() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let router = app_router();
+
+    let (status, _) = runtime.block_on(execute(
+        router.clone(),
+        Method::PUT,
+        &format!("/{INDEX}"),
+        CREATE_BODY.to_string(),
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "create index OK");
+    let (status, body) = runtime.block_on(execute(
+        router.clone(),
+        Method::POST,
+        "/_bulk",
+        BULK_BODY.to_string(),
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "bulk OK: {body:?}");
+    let (status, _) = runtime.block_on(execute(
+        router.clone(),
+        Method::POST,
+        &format!("/{INDEX}/_refresh"),
+        String::new(),
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "refresh OK");
+
+    // A quad around Paris (lat 48..50, lon 1..4): contains Paris, excludes
+    // London (lat 51.5) and NYC.
+    let around_paris = serde_json::json!([
+        { "lat": 48.0, "lon": 1.0 },
+        { "lat": 50.0, "lon": 1.0 },
+        { "lat": 50.0, "lon": 4.0 },
+        { "lat": 48.0, "lon": 4.0 }
+    ]);
+    assert_eq!(
+        poly_total(&runtime, &router, &around_paris),
+        1,
+        "quad -> paris only"
+    );
+
+    // A small polygon far south contains nobody.
+    let empty = serde_json::json!([
+        { "lat": 40.0, "lon": 1.0 },
+        { "lat": 41.0, "lon": 1.0 },
+        { "lat": 41.0, "lon": 2.0 }
+    ]);
+    assert_eq!(
+        poly_total(&runtime, &router, &empty),
+        0,
+        "southern triangle -> none"
+    );
+}
+
+fn poly_total(
+    runtime: &tokio::runtime::Runtime,
+    router: &Router,
+    points: &serde_json::Value,
+) -> u64 {
+    let body = serde_json::json!({
+        "query": { "geo_polygon": { "loc": { "points": points } } },
+        "size": 10
+    })
+    .to_string();
+    let (status, body) = runtime.block_on(execute(
+        router.clone(),
+        Method::POST,
+        &format!("/{INDEX}/_search"),
+        body,
+    ));
+    assert_eq!(status, StatusCode::OK.as_u16(), "search OK");
+    body.expect("search body")
+        .pointer("/hits/total/value")
+        .and_then(Value::as_u64)
+        .expect("hits.total.value present")
+}

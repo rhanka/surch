@@ -245,7 +245,11 @@ b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
     `parse_geo_point_source`), `geo_bounding_box_field_matches` (point-in-box
     inclusif), dispatch + bras `query_matches` ; filtre non-scorant (catch-alls
     scoring/stats). Test e2e `geo_bounding_box.rs`. Antiméridien hors scope.
-  - [ ] Inc.2 — geo_polygon (point-in-polygon ray-casting).
+  - [x] **Inc.2 — geo_polygon** : variante `SearchQuery::GeoPolygon`,
+    `parse_geo_polygon_query` (≥3 points via `parse_geo_point_source`),
+    `geo_polygon_field_matches` (ray-casting point-in-polygon), dispatch +
+    bras `query_matches`. Test e2e (quad autour de Paris). **A2 complet**
+    (geo_bounding_box + geo_polygon ; geo_distance préexistant).
 - [ ] Lot 4 — A5 scoring widening.
 - [ ] Lot 5 — A6/A13 keyword-prefix (optionnel post-A10).
 - [ ] Lot 6 — A12 composite date_histogram + histogram numérique.
