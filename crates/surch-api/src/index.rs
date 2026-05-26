@@ -389,13 +389,26 @@ fn parse_create_index_request(body: &str) -> Result<CreateIndexRequest, OpenSear
         }
         None => json!({}),
     };
-    let mapping = IndexMapping::from_properties_value(&mapping).map_err(|error| {
+    let mut mapping = IndexMapping::from_properties_value(&mapping).map_err(|error| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
             "mapper_parsing_exception",
             error.to_string(),
         )
     })?;
+
+    // A1/A13: capture the `settings.analysis` block (edge_ngram tokenizers,
+    // user-defined analyzers/normalizers) onto the stored mapping so custom
+    // analyzers resolve at index + query time. Absent/empty analysis yields
+    // the default (no-op) settings.
+    let analysis = IndexMapping::from_index_settings_value(&settings).map_err(|error| {
+        OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "mapper_parsing_exception",
+            error.to_string(),
+        )
+    })?;
+    mapping.set_analysis(analysis);
 
     Ok(CreateIndexRequest {
         mapping,
