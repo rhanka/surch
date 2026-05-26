@@ -4,11 +4,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use chrono::{Duration, Months, NaiveDate, Utc};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
-use surch_index::mapping::{AnalyzerName, IndexMapping};
+use surch_index::mapping::{AnalyzerName, FieldType, IndexMapping};
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
@@ -5165,7 +5166,7 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
             value,
             fuzziness,
         } => fuzzy_field_matches(source, field, value, *fuzziness),
-        SearchQuery::Range { field, bounds } => range_field_matches(source, field, bounds),
+        SearchQuery::Range { field, bounds } => range_field_matches(source, field, bounds, mapping),
         SearchQuery::Exists { field } => exists_field_matches(source, field),
         SearchQuery::Terms { field, values } => values
             .iter()
@@ -5375,10 +5376,41 @@ pub fn exists_field_matches(source: &Value, field: &str) -> bool {
     }
 }
 
-pub fn range_field_matches(source: &Value, field: &str, bounds: &RangeBounds) -> bool {
+pub fn range_field_matches(
+    source: &Value,
+    field: &str,
+    bounds: &RangeBounds,
+    mapping: &IndexMapping,
+) -> bool {
     let Some(field_value) = source.get(field) else {
         return false;
     };
+    // A7: a `date` field compares in calendar terms — the stored value and
+    // each bound are parsed to a `NaiveDate` via the field's `format`, and
+    // bounds may be date-math (`now`, `now-1y/d`, …). Falls back to the
+    // lexicographic/numeric comparison when the value can't be parsed as a
+    // date (keeps the lex-sortable yyyyMMdd path working for any odd input).
+    if mapping
+        .resolve_field(field)
+        .map(|fm| fm.field_type == FieldType::Date)
+        .unwrap_or(false)
+    {
+        let format = mapping
+            .resolve_field(field)
+            .and_then(|fm| fm.date_format().map(str::to_owned))
+            .unwrap_or_else(|| "yyyyMMdd".to_owned());
+        if let Some(value_date) = field_value
+            .as_str()
+            .and_then(|text| parse_date_value(text, &format))
+            .or_else(|| {
+                field_value
+                    .as_i64()
+                    .and_then(|n| parse_date_value(&n.to_string(), &format))
+            })
+        {
+            return date_in_bounds(value_date, bounds, &format);
+        }
+    }
     if let Some(number) = field_value.as_f64() {
         return numeric_in_bounds(number, bounds);
     }
@@ -5386,6 +5418,105 @@ pub fn range_field_matches(source: &Value, field: &str, bounds: &RangeBounds) ->
         return text_in_bounds(text, bounds);
     }
     false
+}
+
+/// Parses a `range` bound (numeric or text) to a [`NaiveDate`] using the
+/// field `format`. A textual bound starting with `now` is date-math.
+fn range_value_to_date(value: &RangeValue, format: &str) -> Option<NaiveDate> {
+    match value {
+        RangeValue::Number(n) => parse_date_value(&(*n as i64).to_string(), format),
+        RangeValue::Text(s) => parse_date_value(s, format),
+    }
+}
+
+/// Inclusive/exclusive `date` comparison in calendar (day) granularity.
+fn date_in_bounds(value: NaiveDate, bounds: &RangeBounds, format: &str) -> bool {
+    if let Some(b) = &bounds.gt {
+        match range_value_to_date(b, format) {
+            Some(d) if value <= d => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    if let Some(b) = &bounds.gte {
+        match range_value_to_date(b, format) {
+            Some(d) if value < d => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    if let Some(b) = &bounds.lt {
+        match range_value_to_date(b, format) {
+            Some(d) if value >= d => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    if let Some(b) = &bounds.lte {
+        match range_value_to_date(b, format) {
+            Some(d) if value > d => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Parses a stored/bound date string per `format`. Supports `epoch_millis`,
+/// `epoch_second`, the default `yyyyMMdd`, and date-math (`now…`). The
+/// `format` may be a `||`-separated list (ES); the first token is used.
+fn parse_date_value(text: &str, format: &str) -> Option<NaiveDate> {
+    let text = text.trim();
+    if text.starts_with("now") {
+        return parse_date_math(text, Utc::now().date_naive());
+    }
+    let fmt = format.split("||").next().unwrap_or(format).trim();
+    match fmt {
+        "epoch_millis" => chrono::DateTime::from_timestamp_millis(text.parse::<i64>().ok()?)
+            .map(|dt| dt.date_naive()),
+        "epoch_second" => {
+            chrono::DateTime::from_timestamp(text.parse::<i64>().ok()?, 0).map(|dt| dt.date_naive())
+        }
+        _ => NaiveDate::parse_from_str(text, "%Y%m%d").ok(),
+    }
+}
+
+/// Evaluates an ES date-math expression at day granularity: `now`, with an
+/// optional single `(+|-)N(y|M|w|d)` offset and an optional `/d` day
+/// rounding (a no-op here since we already work in days).
+fn parse_date_math(expr: &str, anchor: NaiveDate) -> Option<NaiveDate> {
+    let rest = expr.strip_prefix("now")?;
+    let ops = rest.split('/').next().unwrap_or("").trim();
+    if ops.is_empty() {
+        return Some(anchor);
+    }
+    let (sign, body) = match ops.split_at(1) {
+        ("+", b) => (1_i64, b),
+        ("-", b) => (-1_i64, b),
+        _ => return None,
+    };
+    let (num_str, unit) = body.split_at(body.len().checked_sub(1)?);
+    let n: i64 = num_str.parse().ok()?;
+    let magnitude = sign * n;
+    match unit {
+        "d" => anchor.checked_add_signed(Duration::days(magnitude)),
+        "w" => anchor.checked_add_signed(Duration::weeks(magnitude)),
+        "M" => {
+            if magnitude >= 0 {
+                anchor.checked_add_months(Months::new(magnitude as u32))
+            } else {
+                anchor.checked_sub_months(Months::new((-magnitude) as u32))
+            }
+        }
+        "y" => {
+            if magnitude >= 0 {
+                anchor.checked_add_months(Months::new(12 * magnitude as u32))
+            } else {
+                anchor.checked_sub_months(Months::new(12 * (-magnitude) as u32))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn numeric_in_bounds(value: f64, bounds: &RangeBounds) -> bool {
@@ -6197,5 +6328,74 @@ fn fold_search_char(character: char) -> char {
         '\u{00fd}' | '\u{00ff}' => 'y',
         character if character.is_alphanumeric() => character,
         _ => ' ',
+    }
+}
+
+#[cfg(test)]
+mod a7_date_tests {
+    use super::{date_in_bounds, parse_date_math, parse_date_value, RangeBounds, RangeValue};
+    use chrono::NaiveDate;
+
+    fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn parse_date_math_offsets_at_day_granularity() {
+        let anchor = ymd(2026, 5, 25);
+        assert_eq!(parse_date_math("now", anchor), Some(anchor));
+        assert_eq!(parse_date_math("now-1d", anchor), Some(ymd(2026, 5, 24)));
+        assert_eq!(parse_date_math("now+1d", anchor), Some(ymd(2026, 5, 26)));
+        assert_eq!(parse_date_math("now-1w", anchor), Some(ymd(2026, 5, 18)));
+        assert_eq!(parse_date_math("now+2M", anchor), Some(ymd(2026, 7, 25)));
+        // `/d` day rounding is a no-op at day granularity.
+        assert_eq!(parse_date_math("now-1y/d", anchor), Some(ymd(2025, 5, 25)));
+        assert_eq!(parse_date_math("bogus", anchor), None);
+    }
+
+    #[test]
+    fn parse_date_value_honours_format() {
+        assert_eq!(
+            parse_date_value("19410813", "yyyyMMdd"),
+            Some(ymd(1941, 8, 13))
+        );
+        assert_eq!(parse_date_value("0", "epoch_millis"), Some(ymd(1970, 1, 1)));
+        assert_eq!(
+            parse_date_value("yyyyMMdd||epoch_millis split takes first", "yyyyMMdd"),
+            None
+        );
+        // A `||`-separated format list uses the first token.
+        assert_eq!(
+            parse_date_value("19410813", "yyyyMMdd||epoch_millis"),
+            Some(ymd(1941, 8, 13))
+        );
+    }
+
+    #[test]
+    fn date_in_bounds_literal_inclusive_and_strict() {
+        let value = ymd(1941, 8, 13);
+        let inclusive = RangeBounds {
+            gt: None,
+            gte: Some(RangeValue::Text("19410101".into())),
+            lt: None,
+            lte: Some(RangeValue::Text("19411231".into())),
+        };
+        assert!(date_in_bounds(value, &inclusive, "yyyyMMdd"));
+
+        let strict_gt_equal = RangeBounds {
+            gt: Some(RangeValue::Text("19410813".into())),
+            gte: None,
+            lt: None,
+            lte: None,
+        };
+        assert!(!date_in_bounds(value, &strict_gt_equal, "yyyyMMdd"));
+
+        let out_of_range = RangeBounds {
+            gt: None,
+            gte: Some(RangeValue::Text("19420101".into())),
+            lt: None,
+            lte: None,
+        };
+        assert!(!date_in_bounds(value, &out_of_range, "yyyyMMdd"));
     }
 }

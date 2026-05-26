@@ -7,6 +7,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
+use surch_index::mapping::IndexMapping;
 
 use crate::{
     index::validate_index_name,
@@ -136,6 +137,7 @@ fn count_matches(state: &AppState, index: &str, request: &CountRequest) -> u64 {
 }
 
 fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64 {
+    let mapping = state.index_mapping(index).unwrap_or_default();
     match query {
         CountQuery::MatchAll => state.count(index),
         CountQuery::Term { field, value } => state.term_matches_count(index, field, value) as u64,
@@ -146,7 +148,7 @@ fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64
                 let documents = state.documents(index);
                 documents
                     .into_iter()
-                    .filter(|document| query_matches(query, &document.source))
+                    .filter(|document| query_matches(query, &document.source, &mapping))
                     .count() as u64
             }
         }
@@ -158,7 +160,7 @@ fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64
         | CountQuery::MultiMatch { .. } => state
             .documents(index)
             .into_iter()
-            .filter(|document| query_matches(query, &document.source))
+            .filter(|document| query_matches(query, &document.source, &mapping))
             .count() as u64,
     }
 }
@@ -395,12 +397,14 @@ fn parse_term_value(value: &Value) -> Result<String, OpenSearchError> {
     }
 }
 
-fn query_matches(query: &CountQuery, source: &Value) -> bool {
+fn query_matches(query: &CountQuery, source: &Value, mapping: &IndexMapping) -> bool {
     match query {
         CountQuery::MatchAll => true,
         CountQuery::Term { field, value } => term_field_matches(source, field, value),
-        CountQuery::BoolMust(clauses) => clauses.iter().all(|clause| query_matches(clause, source)),
-        CountQuery::Range { field, bounds } => range_field_matches(source, field, bounds),
+        CountQuery::BoolMust(clauses) => clauses
+            .iter()
+            .all(|clause| query_matches(clause, source, mapping)),
+        CountQuery::Range { field, bounds } => range_field_matches(source, field, bounds, mapping),
         CountQuery::Exists { field } => exists_field_matches(source, field),
         CountQuery::Terms { field, values } => values
             .iter()
