@@ -194,11 +194,22 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
     sous-champs `.raw` keyword+norm et `.autocomplete` edge_ngram +
     `settings.analysis`) et validée e2e via Surch (test
     `deces_v2_fixture_autocomplete_and_raw_subfields`). Reste : oracle B2 K8s
-    comparant Surch vs ES 8.6.1. Valider la PARITÉ ES 8.6.1
-    du nouveau chemin (le e2e prouve la correction interne, pas la parité ES).
-    Créer `tests/matchid_compat/deces/mapping_v2.json` + un oracle B2 K8s
-    (`b2-oracle-gate.yaml`, binaire oracle réutilisé) comparant Surch vs ES 8.6.1
-    sur des requêtes edge_ngram. Plus lourd (nouveau job K8s + fixture + compat ES).
+    comparant Surch vs ES 8.6.1 (le e2e prouve la correction interne, pas la
+    parité ES). **Cadrage : extension CONTENUE, sans changement de binaire** —
+    `b1_oracle::bootstrap` PUT déjà le corps complet (settings+mappings) verbatim
+    aux 2 moteurs (ES 8.6.1 reçoit `settings.analysis` edge_ngram), et
+    `Request.expected` est `Option` → manifeste en comparaison LIVE Surch-vs-ES.
+    Étapes restantes :
+    - [x] manifeste `tests/matchid_compat/replays/deces_v2.json` (8 requêtes :
+      autocomplete NOM/PRENOMS, .raw exact, bool, baseline norm, sort sur .raw).
+    - [ ] Dockerfile : `COPY mapping_v2.json` + `replays/deces_v2.json` sous
+      `/usr/local/share/deces/` + check `ls`.
+    - [ ] `deploy/k8s/jobs/b2-oracle-gate.yaml` (clone de b1, `--mapping
+      mapping_v2.json --replay deces_v2.json`).
+    - [ ] `ci-k8s.yml` : ajouter `b2-oracle-gate` (choix `job`, contrôle image,
+      REPORT_FILES, reconstruction logs).
+    - [ ] Dispatch + analyser les divergences (chaînes edge_ngram/asciifolding
+      Surch vs ES peuvent diverger sur cas réels → itérer).
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
 - [ ] Lot 4 — A5 scoring widening.

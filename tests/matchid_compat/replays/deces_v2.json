@@ -1,0 +1,103 @@
+{
+  "name": "deces_v2",
+  "dataset": "deces",
+  "description": "matchID replay v2 — edge_ngram autocomplete + keyword .raw sub-field cross-check against Elasticsearch 8.6.1. Replays against the `deces` index created from mapping_v2.json (NOM/PRENOMS carry a `.raw` keyword+normalizer sub-field and an `.autocomplete` edge_ngram sub-field searched with `standard`). All entries use LIVE Surch-vs-ES comparison (no frozen `expected`): the b1_oracle binary fails on any divergence between the two engines, so this manifest validates that Surch's edge_ngram / normalizer analysis chains match ES's on the same corpus. Authored 2026-05-25 for A1/A13 inc.4b; expected hit counts are intentionally omitted because the goal is engine parity, not a frozen baseline.",
+  "requests": [
+    {
+      "name": "autocomplete_nom_prefix_2",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM.autocomplete": "du" } },
+          "size": 10
+        }
+      }
+    },
+    {
+      "name": "autocomplete_nom_prefix_3",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM.autocomplete": "dup" } },
+          "size": 10
+        }
+      }
+    },
+    {
+      "name": "autocomplete_prenoms_prefix",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "PRENOMS.autocomplete": "je" } },
+          "size": 10
+        }
+      }
+    },
+    {
+      "name": "autocomplete_nom_accented_prefix",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM.autocomplete": "é" } },
+          "size": 10
+        }
+      }
+    },
+    {
+      "name": "raw_nom_exact_normalized",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "term": { "NOM.raw": "dupont" } },
+          "size": 10
+        }
+      }
+    },
+    {
+      "name": "bool_autocomplete_nom_and_sexe",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": {
+            "bool": {
+              "must": [
+                { "match": { "NOM.autocomplete": "dup" } },
+                { "term": { "SEXE": "M" } }
+              ]
+            }
+          },
+          "size": 10
+        }
+      }
+    },
+    {
+      "name": "match_nom_norm_baseline",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM": "DUPONT" } },
+          "size": 5
+        }
+      }
+    },
+    {
+      "name": "autocomplete_nom_sorted_by_raw",
+      "request": {
+        "method": "POST",
+        "path": "/deces/_search",
+        "body": {
+          "query": { "match": { "NOM.autocomplete": "ma" } },
+          "sort": [{ "NOM.raw": "asc" }],
+          "size": 10
+        }
+      }
+    }
+  ]
+}
