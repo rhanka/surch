@@ -208,8 +208,21 @@ hors-scope dans `docs/wp-d-matchid/B1-phase-3-plan.md`.
       mapping_v2.json --replay deces_v2.json`).
     - [ ] `ci-k8s.yml` : ajouter `b2-oracle-gate` (choix `job`, contrôle image,
       REPORT_FILES, reconstruction logs).
-    - [ ] Dispatch + analyser les divergences (chaînes edge_ngram/asciifolding
-      Surch vs ES peuvent diverger sur cas réels → itérer).
+    - [x] Dispatch 1er run (GHA `26427933905` @ `f62894b`) :
+      **7/8 à parité**, 1 divergence. Rapport
+      `2026-05-25-b2-oracle-deces-v2-ES861-K8s/`. À parité : autocomplete
+      préfixe (2/3 chars), prefix accentué, `.raw` normalisé, baseline norm,
+      sort sur `.raw`. **Le gate B2 est opérationnel** (ES accepte le mapping
+      v2, comparaison live OK).
+    - [ ] **Corriger la divergence** : `bool[match NOM.autocomplete=dup, term
+      SEXE=M]` → ES 11 / Surch 0. Cause : un `match` seul passe par les
+      postings (OK), mais un `bool` re-filtre ses candidats via `query_matches`
+      (scan `_source`), où le sous-champ dérivé `NOM.autocomplete` n'existe pas
+      → 0. Fix : rendre le scan source conscient des sous-champs — analyser la
+      valeur du PARENT avec la chaîne du sous-champ (miroir de `subfield_terms`)
+      dans `field_tokens_for_source` (search.rs) + tokeniser la requête avec le
+      `search_analyzer` du sous-champ. Cross-crate (exposer l'analyse sous-champ
+      depuis surch-index). Puis re-run B2 → 0 divergence attendu.
 - [ ] Lot 2 — A7 runtime dates.
 - [ ] Lot 3 — A2 geo widening.
 - [ ] Lot 4 — A5 scoring widening.
