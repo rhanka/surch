@@ -3754,6 +3754,73 @@ async fn search_router_a5_phase2_gauss_decay_ranks_closer_dates_higher() {
 }
 
 #[tokio::test]
+async fn search_router_a5_exp_decay_ranks_closer_dates_higher() {
+    let router = app_router();
+    index_product(
+        &router,
+        "doc-near",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"20000115"}"#,
+    )
+    .await;
+    index_product(
+        &router,
+        "doc-far",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19500101"}"#,
+    )
+    .await;
+
+    // `exp` decay = decay^(dist/scale); the 50-year-far doc collapses to a
+    // tiny (but positive) factor, the 2-week-near doc stays close to 1.
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"NOM":"MARTIN"}},"functions":[{"exp":{"DATE_NAISSANCE":{"origin":"20000101","scale":"365d","decay":0.5}}}],"boost_mode":"multiply"}}}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["_id"], "doc-near");
+    assert_eq!(hits[1]["_id"], "doc-far");
+    let near = hits[0]["_score"].as_f64().expect("score");
+    let far = hits[1]["_score"].as_f64().expect("score");
+    assert!(near > far);
+    assert!(far < near * 0.5);
+}
+
+#[tokio::test]
+async fn search_router_a5_linear_decay_ranks_closer_dates_higher() {
+    let router = app_router();
+    index_product(
+        &router,
+        "doc-near",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"20000115"}"#,
+    )
+    .await;
+    // ~1 year far: `linear` = max(0, 1 - dist*(1-decay)/scale) stays positive
+    // but clearly below the near doc.
+    index_product(
+        &router,
+        "doc-far",
+        r#"{"NOM":"MARTIN","DATE_NAISSANCE":"19990101"}"#,
+    )
+    .await;
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"function_score":{"query":{"match":{"NOM":"MARTIN"}},"functions":[{"linear":{"DATE_NAISSANCE":{"origin":"20000101","scale":"365d","decay":0.5}}}],"boost_mode":"multiply"}}}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["_id"], "doc-near");
+    let near = hits[0]["_score"].as_f64().expect("score");
+    let far = hits[1]["_score"].as_f64().expect("score");
+    assert!(near > far);
+    assert!(far > 0.0);
+}
+
+#[tokio::test]
 async fn search_router_a5_phase2_score_mode_sum_then_boost_mode_multiply() {
     // Combine two functions with score_mode=sum and verify the inner
     // BM25 score gets multiplied by (f1 + f2): weight=3 + weight=4

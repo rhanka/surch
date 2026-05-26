@@ -252,11 +252,12 @@ b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
     (geo_bounding_box + geo_polygon ; geo_distance préexistant).
 - [~] Lot 4 — A5 scoring widening.
   - Déjà présents : `Weight`, `FieldValueFactor`, `GaussDecay` (date).
-  - [ ] Inc.1 — **exp/linear decay** : calquer `GaussDecay` (mêmes params
-    origin/scale/decay/offset, formules ES différentes : exp = `decay^(dist/
-    scale)`, linear = `max(0,(s-dist)/s)` avec `s=scale/(1-decay)`). Ajouter
-    variantes `ExpDecay`/`LinearDecay` (ou un `DecayKind`), bras `combine` +
-    parse. **Parité-sensible** (affecte `_score`) → tester contre ES.
+  - [x] **Inc.1 — exp/linear decay** : unifié en `ScoringFunction::Decay`
+    + `DecayKind {Gauss,Exp,Linear}` (parse `parse_decay_function(kind)`,
+    formules dans `evaluate_scoring_function` : exp = `exp(-dist·ln(1/decay)/
+    scale)`, linear = `max(0, 1-dist·(1-decay)/scale)`). Tests e2e exp+linear
+    (dates proches mieux classées). Messages d'erreur de parse restent
+    génériques « gauss.<field> » (même grammaire). CI à valider.
   - [ ] Inc.2 — **random_score** : nécessite un id de doc stable dans le
     contexte de scoring (hash field/seed). Vérifier la dispo de l'id.
   - [ ] **script_score — DÉCISION SCOPE** : nécessite un moteur d'évaluation

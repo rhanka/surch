@@ -361,17 +361,30 @@ pub enum ScoringFunction {
         modifier: FieldValueModifier,
         missing: f64,
     },
-    /// `gauss` decay over a keyword-encoded `YYYYMMDD` date field.
-    /// `origin` and `scale_days` are pre-parsed at request time so
-    /// scoring stays branch-light per doc. Score formula (ES 7.x):
-    /// `exp(- (max(0, distance_days - offset_days))^2 *
-    /// ln(1 / decay) / (scale_days^2))`. MVP keeps `offset_days = 0`.
-    GaussDecay {
+    /// `gauss` / `exp` / `linear` decay over a keyword-encoded `YYYYMMDD`
+    /// date field. `origin` and `scale_days` are pre-parsed at request time
+    /// so scoring stays branch-light per doc. Per-kind score formulas (ES
+    /// 7.x, `offset = 0` MVP), with `dist = |doc_days - origin_days|`:
+    /// - gauss:  `exp(- dist^2 * ln(1/decay) / scale^2)`
+    /// - exp:    `exp(- dist * ln(1/decay) / scale)` (= `decay^(dist/scale)`)
+    /// - linear: `max(0, 1 - dist * (1 - decay) / scale)`
+    Decay {
         field: String,
         origin_days: i64,
         scale_days: f64,
         decay: f64,
+        kind: DecayKind,
     },
+}
+
+/// A5: decay-function family selector. All three share the
+/// `origin`/`scale`/`decay` parameters and differ only in the per-document
+/// score curve (see [`ScoringFunction::Decay`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DecayKind {
+    Gauss,
+    Exp,
+    Linear,
 }
 
 /// A5 phase 2: numeric pipe for `field_value_factor.modifier`. MVP
@@ -2374,11 +2387,12 @@ fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>)
             let scaled = raw * *factor;
             apply_field_value_modifier(scaled, *modifier)
         }
-        ScoringFunction::GaussDecay {
+        ScoringFunction::Decay {
             field,
             origin_days,
             scale_days,
             decay,
+            kind,
         } => {
             let Some(doc_text) = source.and_then(|src| lookup_text_field(src, field)) else {
                 // Missing field — return the decay floor so the doc is
@@ -2389,10 +2403,15 @@ fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>)
                 return *decay;
             };
             let distance = (origin_days - doc_days).abs() as f64;
-            // ES 7.x gauss: exp( - distance^2 * ln(1/decay) / scale^2 ).
-            // No offset in MVP.
-            let sigma_sq = scale_days * scale_days;
-            (-distance * distance * (1.0_f64 / *decay).ln() / sigma_sq).exp()
+            // ES 7.x decay curves (no offset in MVP).
+            match kind {
+                DecayKind::Gauss => {
+                    let sigma_sq = scale_days * scale_days;
+                    (-distance * distance * (1.0_f64 / *decay).ln() / sigma_sq).exp()
+                }
+                DecayKind::Exp => (-distance * (1.0_f64 / *decay).ln() / *scale_days).exp(),
+                DecayKind::Linear => (1.0 - distance * (1.0 - *decay) / *scale_days).max(0.0),
+            }
         }
     }
 }
@@ -4259,16 +4278,13 @@ fn parse_scoring_function_clause(value: &Value) -> Result<ScoringFunctionClause,
                 function = Some(parse_field_value_factor_function(body)?);
             }
             "gauss" => {
-                function = Some(parse_gauss_decay_function(body)?);
+                function = Some(parse_decay_function(body, DecayKind::Gauss, "gauss")?);
             }
-            "linear" | "exp" => {
-                return Err(OpenSearchError::new(
-                    StatusCode::BAD_REQUEST,
-                    "parsing_exception",
-                    format!(
-                        "`function_score.functions[].{key}` decay is parsed but not implemented yet (tracked under function_score phase 3)"
-                    ),
-                ));
+            "exp" => {
+                function = Some(parse_decay_function(body, DecayKind::Exp, "exp")?);
+            }
+            "linear" => {
+                function = Some(parse_decay_function(body, DecayKind::Linear, "linear")?);
             }
             "script_score" | "random_score" => {
                 return Err(OpenSearchError::new(
@@ -4297,7 +4313,7 @@ fn parse_scoring_function_clause(value: &Value) -> Result<ScoringFunctionClause,
                 return Err(OpenSearchError::new(
                     StatusCode::BAD_REQUEST,
                     "parsing_exception",
-                    "`function_score.functions[]` entry must declare a scoring function (`weight`, `field_value_factor` or `gauss`)",
+                    "`function_score.functions[]` entry must declare a scoring function (`weight`, `field_value_factor`, `gauss`, `exp` or `linear`)",
                 ));
             }
         },
@@ -4396,10 +4412,16 @@ fn parse_field_value_factor_function(value: &Value) -> Result<ScoringFunction, O
     })
 }
 
-/// Parse a `gauss` decay function body. MVP: keyword-encoded
-/// `YYYYMMDD` date fields with `origin` and `scale` interpretable as
-/// dates and a day-count duration. `decay` defaults to 0.5.
-fn parse_gauss_decay_function(value: &Value) -> Result<ScoringFunction, OpenSearchError> {
+/// Parse a decay function body (`gauss` / `exp` / `linear`). MVP:
+/// keyword-encoded `YYYYMMDD` date fields with `origin` and `scale`
+/// interpretable as dates and a day-count duration; `decay` defaults to
+/// 0.5. All three kinds share this grammar (validation messages say
+/// `gauss.<field>` generically). The `kind` selects the per-doc curve in
+/// `evaluate_scoring_function`.
+fn parse_decay_function(
+    value: &Value,
+    kind: DecayKind,
+) -> Result<ScoringFunction, OpenSearchError> {
     let object = value.as_object().ok_or_else(|| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -4525,11 +4547,12 @@ fn parse_gauss_decay_function(value: &Value) -> Result<ScoringFunction, OpenSear
         ));
     }
 
-    Ok(ScoringFunction::GaussDecay {
+    Ok(ScoringFunction::Decay {
         field: field.clone(),
         origin_days,
         scale_days,
         decay,
+        kind,
     })
 }
 
