@@ -162,15 +162,16 @@ OpenSearch `p50 176.9 ms / p95 481.4 ms` — two-to-three orders of
 magnitude faster (`~354x` p50, `~370x` p95), and OpenSearch
 *degrades* under load (p50 climbs to ~190 ms at 50 RPS) while Surch
 stays flat. This is the long posting-list regime that INSEE 10k could
-not reach. Retrieval equivalence is established separately by NDCG@10
-parity on the same corpus (Surch `0.4750` vs OpenSearch `0.4902`), so
-the gap reflects WAND/MaxScore + skip-list early termination and the
-absence of JVM overhead, not a degenerate result set. Surch RSS peak
-here is `~2123 MB` median (`±0.7%`), `~1.5x` the OpenSearch JVM peak —
-the expected footprint at this corpus size. `artillery_bench` does
-not yet log `hits.total`, so the work-equivalence argument rests on
-the NDCG parity rather than an in-artifact hit-count assertion — a
-noted limitation.
+not reach. Retrieval equivalence is established two ways: NDCG@10
+parity on the same corpus (Surch `0.4750` vs OpenSearch `0.4902`), and
+an in-artifact hits-equivalence probe (`surch.bench.trec_hits.v1`)
+showing all 50 queries return non-empty sets on both engines with
+total matched-doc volume agreeing to `0.04 %` (Surch `7 507 757` vs
+OpenSearch `7 510 550`). The gap is therefore the same retrieval work
+done faster — WAND/MaxScore + skip-list early termination and no JVM
+overhead — not a degenerate result set. Surch RSS peak here is
+`~2123 MB` median (`±0.7%`), `~1.5x` the OpenSearch JVM peak — the
+expected footprint at this corpus size.
 
 ## 6. Quality (non-regression)
 
@@ -214,13 +215,13 @@ path — still `30/30`, 0 divergence
   job, F4) has landed and produced a 3-rep median verdict
   (`2026-05-25-F4-trec-covid-latency-3rep-K8s`): Surch is two-to-three
   orders of magnitude faster than OpenSearch on the 171k corpus, with
-  zero-variance p50/p95. `artillery_bench` does not yet capture
-  per-request `hits.total`, so engine work-equivalence rests on the
-  separately-measured NDCG@10 parity rather than an in-artifact
-  hit-count assertion — hit-count logging is the next hardening step.
-  Lot 3's block-leapfrog benefit is now measurable in this regime but
-  its same-stack isolation on the large corpus is still pending (no
-  runtime MaxScore toggle exists; method is a scope decision).
+  zero-variance p50/p95. Engine work-equivalence is confirmed both by
+  NDCG@10 parity and by an in-artifact hits-equivalence probe (all 50
+  queries non-empty on both engines, total matched-doc volume within
+  `0.04 %`). Lot 3's block-leapfrog benefit is now measurable in this
+  regime but its same-stack isolation on the large corpus is still
+  pending (no runtime MaxScore toggle exists; method is a scope
+  decision).
 
 ## 10. Conclusion
 

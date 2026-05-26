@@ -164,9 +164,13 @@ Atouts méthodo déjà en place :
     p95 `1.3 ms` (variance nulle) vs OpenSearch p50 `176.9 ms` /
     p95 `481.4 ms` (~354x / ~370x), RSS Surch `2123 MB ±0.7%`, 0 erreur
     toutes reps. Le caveat single-run du landing F4 est levé.
-  - [ ] Reste F4 : logger `hits.total` par requête dans
-    `artillery_bench` (assertion d'équivalence in-artefact) ; BEIR
-    multi-datasets (NFCorpus, FiQA…) + sweep de taille de corpus.
+  - [x] **Équivalence in-artefact livrée** : sonde non chronométrée
+    `surch.bench.trec_hits.v1` dans le job (run `26424807778`) — 50/50
+    requêtes non vides des 2 côtés, volume total apparié à `0.04 %`
+    (Surch 7 507 757 vs OpenSearch 7 510 550). Caveat d'équivalence levé
+    (addendum dans `2026-05-25-F4-trec-covid-latency-3rep-K8s/`).
+  - [ ] Reste F4 : BEIR multi-datasets (NFCorpus, FiQA…) + sweep de
+    taille de corpus (courbe de scaling bulk).
   - **Caveat équivalence (écart latence grand corpus)** : run vert
     `26422565840` donne Surch p50 `0.5 ms` / p95 `1.3 ms` vs
     OpenSearch p50 `183.8 ms` / p95 `487.8 ms` sur 171 k (13 170 req,

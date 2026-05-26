@@ -1,0 +1,10 @@
+{
+  "schema": "surch.bench.trec_hits.v1",
+  "run": "26424807778",
+  "queries": 50,
+  "both_nonzero": 50,
+  "surch_zero": 0,
+  "os_zero": 0,
+  "surch_total_hits": 7507757,
+  "os_total_hits": 7510550
+}

@@ -67,16 +67,33 @@ Surch RSS peak on the 171k corpus is `~2123 MB` median (range
 footprint at this corpus size (matches the F2 ndcg-gate `~2168 MB`),
 well within the `2560 MB` job budget.
 
-## Caveats
+## Work-equivalence probe (in-artifact)
 
-- **Work-equivalence between engines** still rests on the separately-
-  measured NDCG@10 parity on TREC-COVID (Surch `0.4750` vs OpenSearch
-  `0.4902`, `2026-05-25-F2-ndcg-3rep-K8s/`): `artillery_bench` records
-  latency + error rate only, not `hits.total`. The latency gap
-  reflects WAND/MaxScore + skip-list early termination on long posting
-  lists and no JVM overhead, not a degenerate Surch result set.
-  Logging `hits.total` per request remains the next hardening for an
-  in-artifact assertion.
+A subsequent run (`26424807778`, same Job + an untimed hits-equivalence
+probe before the artillery phases — `surch.bench.trec_hits.v1`) issues
+each of the 50 TREC queries once to both engines and records
+`hits.total`:
+
+| Metric | Value |
+|--------|------:|
+| queries | 50 |
+| both engines non-empty | **50 / 50** |
+| Surch empty result sets | 0 |
+| OpenSearch empty result sets | 0 |
+| Surch total matched docs | 7 507 757 |
+| OpenSearch total matched docs | 7 510 550 |
+| Surch / OpenSearch matched-doc ratio | **0.9996** (`-0.04 %`) |
+
+Every query returns a non-empty set on **both** engines, and the total
+matched-document volume agrees to within `0.04 %`. Combined with the
+NDCG@10 parity (Surch `0.4750` vs OpenSearch `0.4902`,
+`2026-05-25-F2-ndcg-3rep-K8s/`), this is direct in-artifact evidence
+that Surch does the *same* retrieval work as OpenSearch — the ~360x
+latency advantage is real work done faster (WAND/MaxScore + skip-list
+early termination on long posting lists, no JVM overhead), not a
+degenerate near-empty Surch result set. The probe is untimed (runs
+before the phases) and that run's latency is consistent with the
+3-rep medians (Surch p50 `0.5 ms` / p95 `1.2 ms`).
 
 ## Sources
 
