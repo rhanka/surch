@@ -258,11 +258,14 @@ b1-oracle 30/30, parité ES 8.6.1 certifiée (b2-oracle 8/8). Prochain : A7.
     scale)`, linear = `max(0, 1-dist·(1-decay)/scale)`). Tests e2e exp+linear
     (dates proches mieux classées). Messages d'erreur de parse restent
     génériques « gauss.<field> » (même grammaire). CI à valider.
-  - [~] Inc.2 — **random_score** : RÉSERVE. La parité bit-à-bit avec ES est
-    **infaisable** (RNG/hash interne ES différent) ; l'implémenter ferait
-    diverger l'oracle, à l'encontre de l'objectif parité. matchID ne l'utilise
-    pas. **Décision : implémenter une version non-parité (documentée) ou
-    déclarer hors-scope ?** Par défaut : hors-scope.
+  - [ ] Inc.2 — **random_score (ROADMAP, décision user 2026-05-26)** : à
+    construire, mais NON bloquant pour l'étude matchID. Parité bit-à-bit ES
+    infaisable → **documenter la non-parité (à qualifier davantage : préciser
+    quel sous-ensemble/seed est reproductible, et le comportement attendu)**.
+  - [ ] **script_score (ROADMAP, décision user 2026-05-26)** : à construire,
+    NON bloquant matchID. Étudier les options — potentiellement non-parité,
+    avec un **helper de transcodage de script** (mapper le DSL script ES/
+    painless vers un évaluateur interne) le cas échéant. Mettre en roadmap.
   - [ ] **script_score — DÉCISION SCOPE** : nécessite un moteur d'évaluation
     d'expressions (mini-langage type painless). Sous-système conséquent.
     **Décision user : construire un évaluateur de script minimal, ou
