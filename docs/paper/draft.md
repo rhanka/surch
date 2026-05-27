@@ -219,9 +219,16 @@ path — still `30/30`, 0 divergence
 
 - Final claims are 3-rep; per-lot isolations are single-run.
 - The historical optimisation family (top-K, lazy hydration, WAND,
-  FoR/FST, shared sources) is delivered and measured cumulatively
-  but not individually K8s-isolated (the historical SHAs predate the
-  CI/Docker surface) — F3, scope decision pending.
+  FoR/FST, shared sources) is delivered and measured cumulatively;
+  individual isolation (F3) is now in progress via measurement toggles
+  on a throwaway `perf-isolation` branch (the historical SHAs predate the
+  modern bench binaries, so replaying old commits directly does not
+  build). First isolated result:
+  **WAND/MaxScore on TREC-COVID 171k cuts tail latency p99 −90% / max
+  −92%, p50/p95 neutral** (`2026-05-26-F3-wand-isolation-trec-covid-K8s`)
+  — a large-corpus tail optimisation, neutral on the short-list INSEE 10k.
+  Remaining family members (top-K, lazy hydration, LRU, FST) follow the
+  same toggle-isolation method.
 - Single node; corpora limited to SciFact / TREC-COVID / INSEE.
   A large-corpus search-latency harness (`trec-covid-latency` K8s
   job, F4) has landed and produced a 3-rep median verdict

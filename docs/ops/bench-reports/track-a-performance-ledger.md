@@ -138,7 +138,7 @@ the proof state:
 | --- | --- | --- | --- |
 | `5081cc7` scalar top-K finalization | Search latency | Historical only | Needs replay if we want an isolated proof row; current cumulative proof starts later |
 | `3157afb` lazy `_source` hydration | Search latency / allocation pressure | Historical only | Needs replay with hydration-heavy query set and RSS peak/final |
-| `ed76014` MaxScore/WAND OR-match skipping | Search latency | Historical only | Needs isolated replay against the pre-WAND parent and SciFact quality guardrail |
+| `ed76014` MaxScore/WAND OR-match skipping | Search latency | **Isolated 2026-05-26** via `SURCH_DISABLE_MAXSCORE` toggle on `perf-isolation` branch (`2026-05-26-F3-wand-isolation-trec-covid-K8s`) | On TREC-COVID 171k the WAND/MaxScore family cuts tail latency **p99 −90% (51.4→5.3 ms), max −92% (3915→308 ms)**; p50/p95 neutral. Complements the INSEE-10k-neutral finding (short lists). Toggle never merged to main |
 | `65ccfbe` WAND `multi_match` + postings-builder cleanup | Search latency / RAM | Historical only | Needs replay with `multi_match` workload and RSS peak/final |
 | `e38bf91` Block-Max WAND per-128 contributions | Search latency / quality | Historical only | Needs replay with SciFact NDCG@10 and INSEE/BAN latency |
 | `644f62b` per-index LRU search response cache | Warm search latency | Historical only | Needs cold/warm split report; cache invalidation proof remains in tests |

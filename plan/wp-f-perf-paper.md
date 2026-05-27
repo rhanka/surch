@@ -135,9 +135,16 @@ Atouts méthodo déjà en place :
     mesure (= l'approche refusée par le user pour l'isolation Lot 3).
   - (c) Reconstruire l'ancien outillage bench tel quel au SHA → comparaison
     inter-harness non apples-to-apples.
-  **À trancher : (a), (b), (c), ou DÉFÉRER F3 et citer les optims historiques
-  comme « livrées, mesurées cumulativement, isolation déférée » dans
-  l'article ?** Le naïf « greffe workflows » est exclu.
+  **Décision user 2026-05-26 : option (b) sur branche isolée** (`perf-isolation`,
+  jamais mergée main ; toggle de mesure zéro-impact-défaut). 1er PoC livré :
+  - [x] **WAND/MaxScore isolé** (`SURCH_DISABLE_MAXSCORE`) sur TREC-COVID 171k :
+    p99 51.4→5.3 ms (−90%), max 3915→308 ms (−92%) ; p50/p95 neutres. Rapport
+    `2026-05-26-F3-wand-isolation-trec-covid-K8s/`. C'est une optim de TRAÎNE
+    grand corpus (complète le « neutre sur INSEE 10k »).
+  - [ ] Suite F3 (mêmes toggles isolés) : top-K scalaire, lazy `_source`
+    hydration, cache LRU, FST — chacun un toggle sur `perf-isolation` +
+    mesure avec/sans + rapport. (b)-style, jamais sur main.
+  - Note : (a) greffe historique exclue (binaires bench absents du vieux code).
 - [~] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
   sweep de taille (optionnel pour un premier draft).
   - [x] **Harness de latence grand corpus livré** : nouveau Job K8s
