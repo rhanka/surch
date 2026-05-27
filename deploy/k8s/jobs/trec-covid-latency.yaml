@@ -95,10 +95,10 @@ spec:
             - { name: RUST_LOG,   value: "warn" }
             # PERF-ISOLATION branch ONLY (never merged to main): isolate ONE
             # optimisation per run by setting its disable-env. Currently:
-            # cache OFF (maxscore back ON) to measure the warm-search LRU
-            # cache contribution on the repeated-query TREC-COVID workload,
-            # vs the published cache-on 3-rep median.
-            - { name: SURCH_DISABLE_SEARCH_CACHE, value: "1" }
+            # top-K shortcut OFF (cache + maxscore back ON) to measure the
+            # bounded-heap + lazy-hydration top-K shortcut contribution on the
+            # TREC-COVID workload, vs the published all-on 3-rep median.
+            - { name: SURCH_DISABLE_TOPK, value: "1" }
           resources:
             requests: { cpu: 150m, memory: 256Mi }
             limits:   { cpu: 2000m, memory: 7Gi }

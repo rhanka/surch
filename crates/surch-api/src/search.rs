@@ -1632,6 +1632,24 @@ impl TermsKey {
     }
 }
 
+/// PERF-ISOLATION ONLY (F3, never merged to main): is the top-K shortcut
+/// (bounded heap + lazy `_source` hydration of only the K winners, plus the
+/// `match_all` window short-circuit) enabled? Read ONCE from
+/// `SURCH_DISABLE_TOPK` (default: enabled — production hot path on main is
+/// unchanged). Setting it to `1`/`true` forces `run_topk_search` to bail to
+/// the legacy `run_search` full-scan path (which clones every matching
+/// `_source` before paginating), isolating the shortcut's latency contribution
+/// under the same harness.
+fn topk_shortcut_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SURCH_DISABLE_TOPK")
+            .map(|value| value != "1" && !value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    })
+}
+
 fn run_topk_search(
     state: &AppState,
     indices: &[String],
@@ -1639,6 +1657,9 @@ fn run_topk_search(
     scoring_enabled: bool,
     started_at: Instant,
 ) -> Option<SearchResponse> {
+    if !topk_shortcut_enabled() {
+        return None;
+    }
     if indices.len() != 1 || !is_default_score_sort(&request.sort) {
         return None;
     }
