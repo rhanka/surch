@@ -28,7 +28,10 @@ fn index_mapping_accepts_short_and_byte_numeric_types() {
 
     let mapping = IndexMapping::from_properties_value(&properties).expect("mapping should parse");
     assert_eq!(
-        mapping.field("AGE_DECES").expect("AGE_DECES exists").field_type,
+        mapping
+            .field("AGE_DECES")
+            .expect("AGE_DECES exists")
+            .field_type,
         FieldType::Short
     );
     assert_eq!(
