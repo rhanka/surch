@@ -238,8 +238,15 @@ path — still `30/30`, 0 divergence
   faster at the extreme tail. The `~354x` figure is therefore a hot,
   low-cardinality best case (the artillery harness replays 50 distinct
   queries → ~99.6% cache hit), not a raw-engine claim — see §9 caveat.
-  Remaining family members (top-K, lazy hydration, FST) follow the
-  same toggle-isolation method.
+  **(c) the top-K shortcut (bounded heap + lazy `_source` hydration) is the
+  single largest tail optimisation** (`2026-05-26-F3-topk-isolation-trec-covid-K8s`):
+  disabled, the full-scan path clones every matching `_source`, so cold
+  high-frequency queries explode to p50 `7.3 s` (phase 1), global p99
+  `5.3 ms → 4093 ms` (−770x), max `308 ms → 15.5 s` (−50x) — and Surch becomes
+  far slower than OpenSearch on the cold path. The sub-ms steady state is the
+  joint product of lazy hydration + the LRU; WAND caps the residual cold tail.
+  Remaining family member (FST term dictionary) follows the same
+  toggle-isolation method.
 - Single node; corpora limited to SciFact / TREC-COVID / INSEE.
   A large-corpus search-latency harness (`trec-covid-latency` K8s
   job, F4) has landed and produced a 3-rep median verdict

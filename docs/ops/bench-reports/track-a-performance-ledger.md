@@ -136,8 +136,7 @@ the proof state:
 
 | Commit / range | Axis | Proof state | Notes |
 | --- | --- | --- | --- |
-| `5081cc7` scalar top-K finalization | Search latency | Historical only | Needs replay if we want an isolated proof row; current cumulative proof starts later |
-| `3157afb` lazy `_source` hydration | Search latency / allocation pressure | Historical only | Needs replay with hydration-heavy query set and RSS peak/final |
+| `5081cc7` scalar top-K finalization + `3157afb` lazy `_source` hydration (bundled) | Search latency | **Isolated 2026-05-26** via `SURCH_DISABLE_TOPK` toggle on `perf-isolation` (`2026-05-26-F3-topk-isolation-trec-covid-K8s`) | On TREC-COVID 171k the top-K shortcut (bounded heap + lazy hydration of only the K winners) is the LARGEST tail optimisation: OFF → full-scan clones every matching `_source`, cold queries explode to p50 `7.3 s` (phase 1), global p99 `5.3→4093 ms` (−770x), max `308→15470 ms` (−50x); warm phases stay sub-ms (LRU). Without it Surch is far slower than OpenSearch on the cold path (OS cold p50 `43 ms`). A hydration-only split would need a third code path; this bundled result is the proof. Toggle never merged to main |
 | `ed76014` MaxScore/WAND OR-match skipping | Search latency | **Isolated 2026-05-26** via `SURCH_DISABLE_MAXSCORE` toggle on `perf-isolation` branch (`2026-05-26-F3-wand-isolation-trec-covid-K8s`) | On TREC-COVID 171k the WAND/MaxScore family cuts tail latency **p99 −90% (51.4→5.3 ms), max −92% (3915→308 ms)**; p50/p95 neutral. Complements the INSEE-10k-neutral finding (short lists). Toggle never merged to main |
 | `65ccfbe` WAND `multi_match` + postings-builder cleanup | Search latency / RAM | Historical only | Needs replay with `multi_match` workload and RSS peak/final |
 | `e38bf91` Block-Max WAND per-128 contributions | Search latency / quality | Historical only | Needs replay with SciFact NDCG@10 and INSEE/BAN latency |
