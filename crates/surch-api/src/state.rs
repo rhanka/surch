@@ -644,8 +644,25 @@ fn scalar_values(document: &Value, mapping: &IndexMapping, field: &str) -> Vec<S
     }
 }
 
+/// PERF-ISOLATION ONLY (F3, never merged to main): is the warm-search
+/// response cache enabled? Read ONCE from `SURCH_DISABLE_SEARCH_CACHE`
+/// (default: enabled — production path on main unchanged). `1`/`true`
+/// bypasses get + put, isolating the LRU cache's warm-query contribution.
+fn search_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SURCH_DISABLE_SEARCH_CACHE")
+            .map(|value| value != "1" && !value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    })
+}
+
 impl AppState {
     pub fn search_cache_get(&self, index: &str, key: u64) -> Option<Vec<u8>> {
+        if !search_cache_enabled() {
+            return None;
+        }
         let cache = self
             .search_cache
             .read()
@@ -656,6 +673,9 @@ impl AppState {
     }
 
     pub fn search_cache_put(&self, index: &str, key: u64, value: Vec<u8>) {
+        if !search_cache_enabled() {
+            return;
+        }
         let mut cache = self
             .search_cache
             .write()

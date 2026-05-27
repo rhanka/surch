@@ -93,11 +93,12 @@ spec:
             - { name: SURCH_HOST, value: "127.0.0.1" }
             - { name: SURCH_PORT, value: "7700" }
             - { name: RUST_LOG,   value: "warn" }
-            # PERF-ISOLATION branch ONLY: disable Block-Max WAND/MaxScore so
-            # this run measures the "without WAND" large-corpus latency, to
-            # isolate the WAND family's contribution vs the published
-            # maxscore-on 3-rep median. Never merged to main.
-            - { name: SURCH_DISABLE_MAXSCORE, value: "1" }
+            # PERF-ISOLATION branch ONLY (never merged to main): isolate ONE
+            # optimisation per run by setting its disable-env. Currently:
+            # cache OFF (maxscore back ON) to measure the warm-search LRU
+            # cache contribution on the repeated-query TREC-COVID workload,
+            # vs the published cache-on 3-rep median.
+            - { name: SURCH_DISABLE_SEARCH_CACHE, value: "1" }
           resources:
             requests: { cpu: 150m, memory: 256Mi }
             limits:   { cpu: 2000m, memory: 7Gi }
