@@ -173,7 +173,11 @@ showing all 50 queries return non-empty sets on both engines with
 total matched-doc volume agreeing to `0.04 %` (Surch `7 507 757` vs
 OpenSearch `7 510 550`). The gap is therefore the same retrieval work
 done faster — WAND/MaxScore + skip-list early termination and no JVM
-overhead — not a degenerate result set. Surch RSS peak here is
+overhead — not a degenerate result set. **Caveat (F3 isolation, §9):**
+this steady-state median is largely served by the per-query result LRU
+(the harness replays 50 distinct queries → ~99.6% hit rate); with the
+cache disabled Surch's raw p50 is `309 ms`, so the `354x` is a hot,
+low-cardinality best case rather than a raw-scorer figure. Surch RSS peak here is
 `~2123 MB` median (`±0.7%`), `~1.5x` the OpenSearch JVM peak — the
 expected footprint at this corpus size.
 
@@ -223,11 +227,18 @@ path — still `30/30`, 0 divergence
   individual isolation (F3) is now in progress via measurement toggles
   on a throwaway `perf-isolation` branch (the historical SHAs predate the
   modern bench binaries, so replaying old commits directly does not
-  build). First isolated result:
-  **WAND/MaxScore on TREC-COVID 171k cuts tail latency p99 −90% / max
+  build). Isolated results so far:
+  **(a) WAND/MaxScore on TREC-COVID 171k cuts tail latency p99 −90% / max
   −92%, p50/p95 neutral** (`2026-05-26-F3-wand-isolation-trec-covid-K8s`)
-  — a large-corpus tail optimisation, neutral on the short-list INSEE 10k.
-  Remaining family members (top-K, lazy hydration, LRU, FST) follow the
+  — a large-corpus tail optimisation, neutral on the short-list INSEE 10k;
+  **(b) the per-query result LRU carries the bulk of the headline median
+  advantage** (`2026-05-26-F3-lru-cache-isolation-trec-covid-K8s`): with the
+  cache disabled, Surch p50 goes `0.5 ms → 309 ms` (−618x), making the raw
+  scorer ~1.8x *slower* than OpenSearch at p50 on this workload and only
+  faster at the extreme tail. The `~354x` figure is therefore a hot,
+  low-cardinality best case (the artillery harness replays 50 distinct
+  queries → ~99.6% cache hit), not a raw-engine claim — see §9 caveat.
+  Remaining family members (top-K, lazy hydration, FST) follow the
   same toggle-isolation method.
 - Single node; corpora limited to SciFact / TREC-COVID / INSEE.
   A large-corpus search-latency harness (`trec-covid-latency` K8s
