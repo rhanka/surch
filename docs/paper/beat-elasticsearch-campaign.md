@@ -14,7 +14,17 @@ before/after measurement (CI, representative HW) → verdict**.
   through the matchID Node backend (which is its own bottleneck and confounds
   engine latency).
 - **Representative hardware** (NOT the 2-vCPU GitHub runner; the runner caps
-  every absolute number and starves the engines).
+  every absolute number and starves the engines). Two environments are in play,
+  always recorded per result: (a) **matchID CI = GitHub `ubuntu-latest`
+  (2 vCPU)** — runs the deces indexation + engine-to-engine latency; absolutes
+  runner-bound, relative Surch-vs-ES clean. (b) **surch ci-k8s = Scaleway burst
+  node** for ndcg-gate / trec-covid-latency / oracles. **Burst-node migration
+  (2026-05): DEV1-XL (4 vCPU / 12 GiB) → POP2-4C-16G (4 vCPU / 16 GiB).** CPU is
+  unchanged (4 vCPU) so cross-run timing/latency comparisons survive the
+  migration; RAM rose 12→16 GiB (more headroom for the 7Gi Surch limit, no
+  behavioural change). **Same-run head-to-heads (both engines in one pod) are
+  node-independent and remain valid regardless.** Engine RSS (e.g. #9's
+  2168→907 MiB) is corpus-driven, not node-RAM-driven.
 - **Real corpus** (`deces` 1.36M, then 28M), not a 50-query low-cardinality
   replay (the LRU cache gives a misleading "354x" on repeated queries — banned
   as a headline).
