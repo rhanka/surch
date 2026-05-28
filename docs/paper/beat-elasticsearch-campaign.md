@@ -48,10 +48,23 @@ before/after measurement (CI, representative HW) → verdict**.
   `analyze_document` (off-lock, parallel) + serial `merge_analyzed`; documents
   merged in input order → **byte-identical postings (parity-preserving)**.
   Unit tests (`surch-index`) green; cloud `ci` (workspace test/clippy/fmt) green.
-- **Measurement**: PENDING — ci-k8s `ndcg-gate` (trec-covid 171k bulk time,
-  multi-core) + `b2-oracle` (parity vs ES 8.6.1) + re-run matchID `surch-eval`
-  deces CI (Surch indexation before/after on the same runner).
-- **Verdict**: pending measurement.
+- **Measurement (ci-k8s `ndcg-gate`, run `26580620561`, image `sha-9b7e632`)**:
+  - Quality **parity preserved** (bit-stable): SciFact NDCG@10 `0.6576`,
+    TREC-COVID `0.4750` — identical to pre-change → the refactor is correct.
+  - Bulk SciFact: Surch `1.83 s` vs OS `14.85 s` (~8.1x). TREC-COVID: Surch
+    `68.4 s` vs OS `131.5 s` (~1.92x). Both within noise of the pre-change
+    3-rep medians (SciFact `2.09 s`, TREC-COVID `70.96 s`) → **no clear gain on
+    these corpora**, as expected: trec-covid/scifact have ≤2 analysed text
+    fields, so per-doc analysis is not the bulk bottleneck there (the serial
+    merge / postings build dominates).
+  - The parallelisation's payoff is on **rich mappings** (deces: 28 fields,
+    `norm` analyzer + `.raw` re-analysis + prefixes) where per-doc analysis
+    dominates — measured separately on the matchID `surch-eval` deces CI.
+- **Verdict**: parity-preserving ✓; neutral on simple corpora; deces measurement
+  PENDING (matchID `surch-eval` run `26582048931`, parallelised image, 1.36M).
+  The honest takeaway: parallelising analysis only helps where analysis is the
+  cost — so it must be paired with a parallel/faster **merge + postings build**
+  to move trec-covid too (candidate optimisation #N).
 
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
