@@ -40,6 +40,7 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10"
+rayon = "1.10"
 unicode-segmentation = "1.10"
 unicode-normalization = "0.1"
 parking_lot = "0.12"
