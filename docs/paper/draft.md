@@ -37,7 +37,7 @@ final claims.
 | Search p99 | INSEE 10k | 8.4 ms | 26.3 ms | **3.1x faster** |
 | Search p50 | TREC-COVID 171k | 0.5 ms | 176.9 ms | **~354x faster** |
 | Search p95 | TREC-COVID 171k | 1.3 ms | 481.4 ms | **~370x faster** |
-| RSS peak | TREC-COVID 171k | 2168 MiB (±0.5%) | 1467 MiB | 1.48x (Surch heavier) |
+| RSS peak | TREC-COVID 171k | 907 MiB (post-#9) | 1465 MiB | **0.62x (Surch lighter)** |
 | NDCG@10 | SciFact / TREC-COVID | 0.6576 / 0.4750 | 0.6537 / 0.4902 | parity (bit-stable) |
 | NDCG@10 | NFCorpus / FiQA | 0.3033 / 0.2294 | 0.3034 / 0.2389 | parity (NFCorpus identical) |
 | matchID B1 oracle | deces_v1 vs ES 8.6.1 | 30/30, 0 divergence | — | parity preserved |

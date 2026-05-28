@@ -102,10 +102,29 @@ before/after measurement (CI, representative HW) → verdict**.
 - **Matches/beats**: Lucene stores positions only when
   `index_options >= positions`; Surch stored them unconditionally — now it
   doesn't (until `index_options` is wired, separate item).
-- **Measurement**: PENDING — ci-k8s `ndcg-gate` (paired RSS envelope Surch vs
-  OpenSearch on TREC-COVID 171k + NDCG parity check).
-- **Verdict**: pending measurement (expecting a multi-GiB RSS drop at scale,
-  bit-stable quality).
+- **Measurement (ci-k8s `ndcg-gate`, run `26603090150`, image `sha-3ccdbc6`,
+  paired RSS envelope, TREC-COVID 171k)**:
+  - **RSS peak: Surch `907 MiB` vs OpenSearch `1465 MiB`**; final Surch `727`
+    vs OS `1465`. Pre-#9 baseline (F2 3-rep median, draft): Surch peak
+    `~2168 MiB`. → **Surch RSS peak `2168 → 907 MiB` (−58%)**, flipping the
+    memory dimension from **1.48x heavier than ES** to **0.62x of ES peak /
+    0.50x of ES final**. TREC-COVID body text is position-dense, so dropping the
+    per-posting `Vec<u32>` is exactly where the multi-hundred-MiB lived.
+  - Quality **bit-stable** (parity): SciFact NDCG@10 `0.6576`, TREC-COVID
+    `0.4750` — identical to every prior run.
+  - **No bulk regression** (positions are still computed in analysis to derive
+    freq; only storage dropped): TREC-COVID bulk Surch `61.8 s` vs OS `111.9 s`
+    (1.81x), SciFact `1.68 s` vs `13.6 s` — in-noise vs pre-#9, if anything a
+    touch faster (less allocator pressure).
+- **Verdict**: ✅ **second beat-ES milestone — and on the structural-risk
+  dimension (memory at scale, the 28M juge-de-paix).** Surch now uses **less RAM
+  than Elasticsearch** on the 171k corpus while preserving bit-stable quality and
+  bulk speed. Honest nuance (no-cheat): single ndcg-gate run (RSS historically
+  ±0.5% across reps, and the 907-vs-2168 / 907-vs-1465 margins dwarf that — the
+  verdict is robust); OS RSS `1465 ≈ 1467` matches the prior baseline, confirming
+  the measurement is comparable. Next: this de-risks the 28M memory question;
+  confirm it holds at 28M, and pursue #6 (search-latency idf hoist) for the
+  remaining unconquered front.
 
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
