@@ -82,6 +82,31 @@ before/after measurement (CI, representative HW) → verdict**.
   3 reps). Parity preserved (cloud `ci` oracles green). Search latency unchanged
   → optimisation #2 targets the read path / concurrency.
 
+### #9 — Drop per-posting `Vec<u32>` positions from the in-memory index — `<sha pending>`
+- **Hypothesis (from the candidate hunt, highest memory leverage)**: each
+  in-memory `Posting` carried `{doc_id, freq, Vec<u32> positions}` (~32 B struct
+  + a heap `Vec` + allocator metadata per posting), but **no production path
+  reads index positions** — BM25 reads only `freq`; `match_phrase` re-tokenises
+  `_source` (`search.rs` `phrase_token_spans`); the persisted codec never wrote
+  positions. Positions were computed during analysis only to derive `freq`.
+  Memory at scale is the in-memory engine's structural risk vs ES (disk +
+  page-cache), so this is the highest-leverage RSS win toward the 28M goal.
+- **Change**: `crates/surch-index/src/postings.rs` — `Posting{doc_id:u32,
+  freq:u32}` (now `Copy`, 8 B); `freq` computed identically at build
+  (`freq_from_positions`: empty→1 else len) so scoring is **bit-identical**.
+  Positions dropped at the builder boundary. RSS accounting updated
+  (`memory.rs`). **Parity-safe**: `freq`/`doc_id` unchanged, no positional read
+  path exists — verified by audit (only non-test reader was the RSS gauge) and
+  the full `surch-index` suite (95 tests green, incl. postings/document_index),
+  clippy + workspace compile clean.
+- **Matches/beats**: Lucene stores positions only when
+  `index_options >= positions`; Surch stored them unconditionally — now it
+  doesn't (until `index_options` is wired, separate item).
+- **Measurement**: PENDING — ci-k8s `ndcg-gate` (paired RSS envelope Surch vs
+  OpenSearch on TREC-COVID 171k + NDCG parity check).
+- **Verdict**: pending measurement (expecting a multi-GiB RSS drop at scale,
+  bit-stable quality).
+
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
    hangs) — table stakes for a production engine + unlocks honest QPS numbers.

@@ -150,16 +150,12 @@ fn accounting_from_postings(doc_index: &DocumentIndex) -> DocumentIndexAccountin
         for term in doc_index.terms(&field) {
             postings_bytes += term.len() as u64;
             if let Some(postings) = doc_index.postings(&field, &term) {
-                let mut total_positions: u64 = 0;
-                let mut count: u64 = 0;
-                for posting in postings {
-                    count += 1;
-                    total_positions += posting.positions.len() as u64;
-                }
+                // Optimisation #9: postings are flat `Copy` structs
+                // (`{doc_id, freq}`) — no per-posting heap `Vec<u32>` of
+                // positions anymore, so the whole posting list cost is just
+                // count * posting_size.
+                let count = postings.count() as u64;
                 postings_bytes += count.saturating_mul(posting_size);
-                // Each posting also carries a `Vec<u32>` of positions on
-                // the heap; account for that separately.
-                postings_bytes += total_positions.saturating_mul(size_of::<u32>() as u64);
             }
             if let Some(metas) = doc_index.block_metas(&field, &term) {
                 term_stats_bytes += (metas.len() as u64).saturating_mul(block_meta_size);
