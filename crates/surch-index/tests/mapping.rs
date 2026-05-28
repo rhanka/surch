@@ -18,6 +18,37 @@ fn index_mapping_from_properties_value_builds_fields_with_text_default_and_analy
 }
 
 #[test]
+fn index_mapping_accepts_short_and_byte_numeric_types() {
+    // matchID `deces_index.yml` declares `AGE_DECES` as ES `short`; `byte`
+    // is the narrower sibling. Both must parse and round-trip distinctly.
+    let properties = serde_json::json!({
+        "AGE_DECES": { "type": "short" },
+        "tiny": { "type": "byte" }
+    });
+
+    let mapping = IndexMapping::from_properties_value(&properties).expect("mapping should parse");
+    assert_eq!(
+        mapping
+            .field("AGE_DECES")
+            .expect("AGE_DECES exists")
+            .field_type,
+        FieldType::Short
+    );
+    assert_eq!(
+        mapping.field("tiny").expect("tiny exists").field_type,
+        FieldType::Byte
+    );
+    assert_eq!(
+        mapping.as_value()["properties"]["AGE_DECES"]["type"],
+        serde_json::json!("short")
+    );
+    assert_eq!(
+        mapping.as_value()["properties"]["tiny"]["type"],
+        serde_json::json!("byte")
+    );
+}
+
+#[test]
 fn index_mapping_preserves_explicit_norms_option() {
     let properties = serde_json::json!({
         "body": { "type": "text", "norms": false }

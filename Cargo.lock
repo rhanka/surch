@@ -3231,6 +3231,7 @@ name = "surch-index"
 version = "0.1.0"
 dependencies = [
  "fst",
+ "rayon",
  "serde_json",
  "surch-analysis",
  "surch-codec",

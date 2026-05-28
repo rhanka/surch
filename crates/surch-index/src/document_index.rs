@@ -4,13 +4,14 @@ use std::sync::{
     Arc,
 };
 
+use rayon::prelude::*;
 use surch_analysis::{
     Analyzer, KeywordAnalyzer, NormAnalyzer, Normalizer, SimpleAnalyzer, StandardAnalyzer,
     StopAnalyzer, WhitespaceAnalyzer,
 };
 use thiserror::Error;
 
-use crate::mapping::{AnalysisSettings, AnalyzerName, FieldPrefixes, FieldType, IndexMapping};
+use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
     BlockMeta, PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum,
 };
@@ -201,7 +202,7 @@ impl DocumentIndex {
         V: Into<String>,
     {
         let mut seen = BTreeSet::new();
-        let mut documents = documents
+        let documents = documents
             .into_iter()
             .map(|(doc_id, fields)| {
                 if self.live_docs.contains(&doc_id) || !seen.insert(doc_id) {
@@ -221,10 +222,20 @@ impl DocumentIndex {
 
                 Ok((doc_id, fields))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<(u32, Vec<(String, String)>)>>>()?;
 
-        for (doc_id, fields) in documents.drain(..) {
-            self.add_validated_document(doc_id, fields, mapping)?;
+        // Track A: parallelise the CPU-heavy per-document analysis (tokenise,
+        // asciifold/lowercase, prefix fan-out, sub-field re-analysis) across
+        // cores with rayon — it is a pure function of (doc, mapping). Only the
+        // merge into the shared `postings_builder`/side-tables stays serial.
+        // Document order is preserved by `collect`, so the postings are
+        // byte-identical to the previous serial path (parity-preserving).
+        let analyzed: Vec<AnalyzedDocument> = documents
+            .into_par_iter()
+            .map(|(doc_id, fields)| analyze_document(doc_id, &fields, mapping))
+            .collect();
+        for document in analyzed {
+            self.merge_analyzed(document)?;
         }
 
         if defer_terms_build {
@@ -412,148 +423,39 @@ impl DocumentIndex {
         self.doc_ids()
     }
 
-    fn add_validated_document(
-        &mut self,
-        doc_id: u32,
-        fields: Vec<(String, String)>,
-        mapping: &IndexMapping,
-    ) -> Result<()> {
-        let mut field_lengths = BTreeMap::<String, (u64, bool)>::new();
-        for (field, value) in &fields {
-            let field_mapping = mapping.field(field);
-            let analyzer = field_mapping
-                .map_or(AnalyzerName::default_for(FieldType::Text), |field| {
-                    field.analyzer()
-                });
-            let norms_enabled = field_mapping.is_none_or(|field| field.norms_enabled());
-            let index_prefixes = field_mapping.and_then(|m| m.index_prefixes);
-
-            let analyzed_terms = analyzed_terms(analyzer, field, value);
-            let token_count = analyzed_terms
-                .values()
-                .map(|positions| positions.len() as u64)
-                .sum::<u64>();
-            if token_count > 0 {
-                let (doc_len, field_norms_enabled) = field_lengths
-                    .entry(field.clone())
-                    .or_insert((0, norms_enabled));
-                *doc_len += token_count;
-                *field_norms_enabled = *field_norms_enabled || norms_enabled;
-            }
-
-            // A6 phase 2: fan-out each analyzed token into its [min..=max]
-            // length prefixes, stored in a side-table so BM25 stays unaffected.
-            if let Some(prefixes) = index_prefixes {
-                self.index_prefix_terms(doc_id, field, &analyzed_terms, prefixes);
-            }
-
-            // A10 (Phase 4): write-time fan-out of declared multi-field
-            // sub-fields. The parent's source value is re-analyzed with each
-            // sub-field's own analyzer/normalizer and indexed under the
-            // qualified `parent.sub` path (both as postings and as a stored
-            // projected value), so sort / agg / composite read the sub-field
-            // directly instead of aliasing back to the parent at read time.
-            if let Some(field_mapping) = field_mapping {
-                if field_mapping.has_subfields() {
-                    self.index_subfields(doc_id, field, value, field_mapping, mapping.analysis())?;
-                }
-            }
-
-            for ((field, term), positions) in analyzed_terms {
-                self.postings_builder.add(field, term, doc_id, positions)?;
-            }
+    /// Serial merge of a pre-analyzed document (produced off-lock by the pure
+    /// `analyze_document`) into the shared postings builder and side-tables.
+    /// This is the ONLY part of bulk indexing that mutates shared state, so it
+    /// stays serial; the CPU-heavy analysis runs in parallel beforehand. The
+    /// merge is cheap (inserts of already-computed terms) and preserves the
+    /// previous serial path's output exactly (documents merged in input order).
+    fn merge_analyzed(&mut self, document: AnalyzedDocument) -> Result<()> {
+        let doc_id = document.doc_id;
+        for (path, stored) in document.subfield_values {
+            self.subfield_values
+                .entry(path)
+                .or_default()
+                .insert(doc_id, stored);
         }
-
-        for (field, (doc_len, norms_enabled)) in field_lengths {
+        for (field, prefix) in document.prefixes {
+            self.prefix_postings
+                .entry(field)
+                .or_default()
+                .entry(prefix)
+                .or_default()
+                .insert(doc_id);
+        }
+        for (field, term, positions) in document.postings {
+            self.postings_builder.add(field, term, doc_id, positions)?;
+        }
+        for (field, doc_len, norms_enabled) in document.field_lengths {
             self.field_stats.entry(field).or_default().record_doc_len(
                 doc_id,
                 doc_len,
                 norms_enabled,
             );
         }
-
         self.live_docs.insert(doc_id);
-        Ok(())
-    }
-
-    /// A6 phase 2: for each analyzed token of `field`, generate the prefixes
-    /// of length `k` for every `k` in `[prefixes.min_chars..=prefixes.max_chars]`
-    /// and record `doc_id` under each prefix in `prefix_postings`.
-    ///
-    /// Operates on `char` boundaries so multibyte UTF-8 (`É`, etc.) is sliced
-    /// safely. Tokens shorter than `min_chars` contribute no entries; tokens
-    /// longer than `max_chars` only contribute prefixes up to `max_chars`
-    /// (ES `index_prefixes` semantics, see `MapperBuilder` in Lucene).
-    fn index_prefix_terms(
-        &mut self,
-        doc_id: u32,
-        field: &str,
-        analyzed_terms: &BTreeMap<(String, String), Vec<u32>>,
-        prefixes: FieldPrefixes,
-    ) {
-        let entry = self.prefix_postings.entry(field.to_owned()).or_default();
-        for (_field, term) in analyzed_terms.keys() {
-            let chars: Vec<char> = term.chars().collect();
-            let token_len = chars.len();
-            if token_len < prefixes.min_chars {
-                continue;
-            }
-            let upper = token_len.min(prefixes.max_chars);
-            for k in prefixes.min_chars..=upper {
-                let prefix: String = chars[..k].iter().collect();
-                entry.entry(prefix).or_default().insert(doc_id);
-            }
-        }
-    }
-
-    /// A10 (Phase 4): index the parent `value` under each declared sub-field
-    /// of `parent_mapping`.
-    ///
-    /// For every `parent.sub` sub-field the parent's raw source value is
-    /// re-analyzed with the sub-field's own analysis chain (see
-    /// [`subfield_terms`]):
-    ///
-    /// - a `keyword` sub-field carrying a `normalizer` (matchID's
-    ///   `NOM.raw: { type: keyword, normalizer: norm }`) stores the WHOLE
-    ///   value as a single token, lowercased and asciifolded — ES applies
-    ///   a normalizer to the single keyword token, it never tokenizes;
-    /// - a `keyword` sub-field without a normalizer stores the value
-    ///   verbatim as one token;
-    /// - a `text` sub-field is tokenized by its declared (or default)
-    ///   analyzer.
-    ///
-    /// The resulting tokens are added to the regular postings under the
-    /// qualified path so `term`/`match` on the sub-field resolves through
-    /// the FST, and the lowest-position token is recorded in
-    /// `subfield_values` as the per-doc stored projection that sort / agg
-    /// read directly.
-    fn index_subfields(
-        &mut self,
-        doc_id: u32,
-        parent: &str,
-        value: &str,
-        parent_mapping: &crate::mapping::FieldMapping,
-        analysis: &AnalysisSettings,
-    ) -> Result<()> {
-        for (sub_name, sub_mapping) in parent_mapping.subfields() {
-            let path = format!("{parent}.{sub_name}");
-            let analyzed = subfield_terms(sub_mapping, &path, value, analysis);
-
-            // Record the stored projection: the term at the lowest position
-            // (the whole normalized value for a keyword/normalizer sub-field,
-            // the first token for an analyzed text sub-field). Mirrors the
-            // single value matchID's sort / agg expect on `NOM.raw`.
-            if let Some(stored) = lowest_position_term(&analyzed) {
-                self.subfield_values
-                    .entry(path.clone())
-                    .or_default()
-                    .insert(doc_id, stored);
-            }
-
-            for ((field, term), positions) in analyzed {
-                self.postings_builder.add(field, term, doc_id, positions)?;
-            }
-        }
         Ok(())
     }
 
@@ -592,6 +494,107 @@ impl DocumentIndex {
 /// sub-field this is the whole normalized value (single token); for a text
 /// sub-field it is the leading token. `None` when the value analyzed to no
 /// tokens (empty / whitespace-only source).
+/// Pure, off-lock analysis output for one document. Produced in parallel by
+/// [`analyze_document`] and merged serially by `DocumentIndex::merge_analyzed`.
+struct AnalyzedDocument {
+    doc_id: u32,
+    /// Main + sub-field postings: `(field path, term, positions)`.
+    postings: Vec<(String, String, Vec<u32>)>,
+    /// `index_prefixes` fan-out: `(field, prefix)`.
+    prefixes: Vec<(String, String)>,
+    /// Sub-field stored projections: `(qualified path, stored value)`.
+    subfield_values: Vec<(String, String)>,
+    /// Per-field length stats: `(field, doc_len, norms_enabled)`.
+    field_lengths: Vec<(String, u64, bool)>,
+}
+
+/// Analyze one document into an [`AnalyzedDocument`] without touching any shared
+/// index state — a pure function of `(doc, mapping)`, so it runs in parallel
+/// across documents. Mirrors the previous serial `add_validated_document`
+/// exactly (same tokens, prefix fan-out, sub-field projections); only the
+/// execution is parallelized, the merged index is byte-identical.
+fn analyze_document(
+    doc_id: u32,
+    fields: &[(String, String)],
+    mapping: &IndexMapping,
+) -> AnalyzedDocument {
+    let mut field_lengths = BTreeMap::<String, (u64, bool)>::new();
+    let mut postings: Vec<(String, String, Vec<u32>)> = Vec::new();
+    let mut prefixes: Vec<(String, String)> = Vec::new();
+    let mut subfield_values: Vec<(String, String)> = Vec::new();
+
+    for (field, value) in fields {
+        let field_mapping = mapping.field(field);
+        let analyzer = field_mapping.map_or(AnalyzerName::default_for(FieldType::Text), |field| {
+            field.analyzer()
+        });
+        let norms_enabled = field_mapping.is_none_or(|field| field.norms_enabled());
+        let index_prefixes = field_mapping.and_then(|m| m.index_prefixes);
+
+        let analyzed = analyzed_terms(analyzer, field, value);
+        let token_count = analyzed
+            .values()
+            .map(|positions| positions.len() as u64)
+            .sum::<u64>();
+        if token_count > 0 {
+            let (doc_len, field_norms_enabled) = field_lengths
+                .entry(field.clone())
+                .or_insert((0, norms_enabled));
+            *doc_len += token_count;
+            *field_norms_enabled = *field_norms_enabled || norms_enabled;
+        }
+
+        // A6 phase 2: prefix fan-out (formerly `index_prefix_terms`).
+        if let Some(pfx) = index_prefixes {
+            for (_field, term) in analyzed.keys() {
+                let chars: Vec<char> = term.chars().collect();
+                let token_len = chars.len();
+                if token_len < pfx.min_chars {
+                    continue;
+                }
+                let upper = token_len.min(pfx.max_chars);
+                for k in pfx.min_chars..=upper {
+                    prefixes.push((field.clone(), chars[..k].iter().collect()));
+                }
+            }
+        }
+
+        // A10 (Phase 4): multi-field sub-field fan-out (formerly `index_subfields`).
+        if let Some(field_mapping) = field_mapping {
+            if field_mapping.has_subfields() {
+                for (sub_name, sub_mapping) in field_mapping.subfields() {
+                    let path = format!("{field}.{sub_name}");
+                    let analyzed_sub =
+                        subfield_terms(sub_mapping, &path, value, mapping.analysis());
+                    if let Some(stored) = lowest_position_term(&analyzed_sub) {
+                        subfield_values.push((path.clone(), stored));
+                    }
+                    for ((sub_field, term), positions) in analyzed_sub {
+                        postings.push((sub_field, term, positions));
+                    }
+                }
+            }
+        }
+
+        for ((field, term), positions) in analyzed {
+            postings.push((field, term, positions));
+        }
+    }
+
+    let field_lengths = field_lengths
+        .into_iter()
+        .map(|(field, (doc_len, norms_enabled))| (field, doc_len, norms_enabled))
+        .collect();
+
+    AnalyzedDocument {
+        doc_id,
+        postings,
+        prefixes,
+        subfield_values,
+        field_lengths,
+    }
+}
+
 fn lowest_position_term(analyzed: &BTreeMap<(String, String), Vec<u32>>) -> Option<String> {
     analyzed
         .iter()

@@ -16,25 +16,35 @@ pub enum PostingsError {
     EmptyTerm,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A single posting: one (doc_id, term_frequency) pair.
+///
+/// Track A (beat-ES optimisation #9): positions are NOT stored. They are
+/// computed during analysis only to derive `freq` (and the field's doc_len),
+/// then discarded — no production read path consumes index positions
+/// (`match_phrase` re-tokenises `_source`; BM25 reads only `freq`; the
+/// persisted codec never wrote positions). Dropping the per-posting
+/// `Vec<u32>` shrinks each posting from ~32 B + a heap Vec to a `Copy` 8 B
+/// struct, the dominant in-memory RSS term on multi-field large corpora —
+/// the in-memory engine's scale juge-de-paix vs ES (which stores positions
+/// only when `index_options >= positions`, Lucene-style).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Posting {
     pub doc_id: u32,
     pub freq: u32,
-    pub positions: Vec<u32>,
 }
 
 impl Posting {
-    pub fn new(doc_id: u32, positions: Vec<u32>) -> Self {
-        let freq = if positions.is_empty() {
+    pub fn new(doc_id: u32, freq: u32) -> Self {
+        Self { doc_id, freq }
+    }
+
+    /// Term frequency for a token list (matches the historical semantics: an
+    /// empty position list — a single non-positional occurrence — counts as 1).
+    pub fn freq_from_positions(positions: &[u32]) -> u32 {
+        if positions.is_empty() {
             1
         } else {
             positions.len() as u32
-        };
-
-        Self {
-            doc_id,
-            freq,
-            positions,
         }
     }
 }
@@ -115,12 +125,13 @@ impl PostingsBuilder {
             return Err(PostingsError::EmptyTerm);
         }
 
+        let freq = Posting::freq_from_positions(&positions);
         self.fields
             .entry(field)
             .or_default()
             .entry(term)
             .or_default()
-            .push(Posting::new(doc_id, positions));
+            .push(Posting::new(doc_id, freq));
 
         Ok(())
     }

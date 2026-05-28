@@ -37,7 +37,7 @@ final claims.
 | Search p99 | INSEE 10k | 8.4 ms | 26.3 ms | **3.1x faster** |
 | Search p50 | TREC-COVID 171k | 0.5 ms | 176.9 ms | **~354x faster** |
 | Search p95 | TREC-COVID 171k | 1.3 ms | 481.4 ms | **~370x faster** |
-| RSS peak | TREC-COVID 171k | 2168 MiB (±0.5%) | 1467 MiB | 1.48x (Surch heavier) |
+| RSS peak | TREC-COVID 171k | 907 MiB (post-#9) | 1465 MiB | **0.62x (Surch lighter)** |
 | NDCG@10 | SciFact / TREC-COVID | 0.6576 / 0.4750 | 0.6537 / 0.4902 | parity (bit-stable) |
 | NDCG@10 | NFCorpus / FiQA | 0.3033 / 0.2294 | 0.3034 / 0.2389 | parity (NFCorpus identical) |
 | matchID B1 oracle | deces_v1 vs ES 8.6.1 | 30/30, 0 divergence | — | parity preserved |
@@ -173,7 +173,11 @@ showing all 50 queries return non-empty sets on both engines with
 total matched-doc volume agreeing to `0.04 %` (Surch `7 507 757` vs
 OpenSearch `7 510 550`). The gap is therefore the same retrieval work
 done faster — WAND/MaxScore + skip-list early termination and no JVM
-overhead — not a degenerate result set. Surch RSS peak here is
+overhead — not a degenerate result set. **Caveat (F3 isolation, §9):**
+this steady-state median is largely served by the per-query result LRU
+(the harness replays 50 distinct queries → ~99.6% hit rate); with the
+cache disabled Surch's raw p50 is `309 ms`, so the `354x` is a hot,
+low-cardinality best case rather than a raw-scorer figure. Surch RSS peak here is
 `~2123 MB` median (`±0.7%`), `~1.5x` the OpenSearch JVM peak — the
 expected footprint at this corpus size.
 
@@ -219,9 +223,30 @@ path — still `30/30`, 0 divergence
 
 - Final claims are 3-rep; per-lot isolations are single-run.
 - The historical optimisation family (top-K, lazy hydration, WAND,
-  FoR/FST, shared sources) is delivered and measured cumulatively
-  but not individually K8s-isolated (the historical SHAs predate the
-  CI/Docker surface) — F3, scope decision pending.
+  FoR/FST, shared sources) is delivered and measured cumulatively;
+  individual isolation (F3) is now in progress via measurement toggles
+  on a throwaway `perf-isolation` branch (the historical SHAs predate the
+  modern bench binaries, so replaying old commits directly does not
+  build). Isolated results so far:
+  **(a) WAND/MaxScore on TREC-COVID 171k cuts tail latency p99 −90% / max
+  −92%, p50/p95 neutral** (`2026-05-26-F3-wand-isolation-trec-covid-K8s`)
+  — a large-corpus tail optimisation, neutral on the short-list INSEE 10k;
+  **(b) the per-query result LRU carries the bulk of the headline median
+  advantage** (`2026-05-26-F3-lru-cache-isolation-trec-covid-K8s`): with the
+  cache disabled, Surch p50 goes `0.5 ms → 309 ms` (−618x), making the raw
+  scorer ~1.8x *slower* than OpenSearch at p50 on this workload and only
+  faster at the extreme tail. The `~354x` figure is therefore a hot,
+  low-cardinality best case (the artillery harness replays 50 distinct
+  queries → ~99.6% cache hit), not a raw-engine claim — see §9 caveat.
+  **(c) the top-K shortcut (bounded heap + lazy `_source` hydration) is the
+  single largest tail optimisation** (`2026-05-26-F3-topk-isolation-trec-covid-K8s`):
+  disabled, the full-scan path clones every matching `_source`, so cold
+  high-frequency queries explode to p50 `7.3 s` (phase 1), global p99
+  `5.3 ms → 4093 ms` (−770x), max `308 ms → 15.5 s` (−50x) — and Surch becomes
+  far slower than OpenSearch on the cold path. The sub-ms steady state is the
+  joint product of lazy hydration + the LRU; WAND caps the residual cold tail.
+  Remaining family member (FST term dictionary) follows the same
+  toggle-isolation method.
 - Single node; corpora limited to SciFact / TREC-COVID / INSEE.
   A large-corpus search-latency harness (`trec-covid-latency` K8s
   job, F4) has landed and produced a 3-rep median verdict

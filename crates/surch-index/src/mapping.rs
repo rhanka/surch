@@ -15,6 +15,12 @@ pub enum FieldType {
     Keyword,
     Integer,
     Long,
+    /// matchID `AGE_DECES` uses ES `short`; `byte` is the narrower sibling.
+    /// Both are stored/compared as source JSON numbers exactly like
+    /// `Integer` (no dedicated numeric path keys off the variant) and only
+    /// round-trip distinctly in `_mapping` for ES parity.
+    Short,
+    Byte,
     Float,
     Double,
     Boolean,
@@ -38,6 +44,8 @@ impl FieldType {
             Self::Keyword => "keyword",
             Self::Integer => "integer",
             Self::Long => "long",
+            Self::Short => "short",
+            Self::Byte => "byte",
             Self::Float => "float",
             Self::Double => "double",
             Self::Boolean => "boolean",
@@ -55,6 +63,8 @@ impl FieldType {
             "keyword" => Some(Self::Keyword),
             "integer" | "int" => Some(Self::Integer),
             "long" => Some(Self::Long),
+            "short" => Some(Self::Short),
+            "byte" => Some(Self::Byte),
             "float" => Some(Self::Float),
             "double" => Some(Self::Double),
             "boolean" | "bool" => Some(Self::Boolean),

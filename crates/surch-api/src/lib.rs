@@ -3,9 +3,12 @@
 
 use axum::{
     extract::DefaultBodyLimit,
+    http::HeaderValue,
+    response::Response,
     routing::{get, post, put},
     Router,
 };
+use std::sync::OnceLock;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
@@ -55,6 +58,32 @@ pub struct AppRouterState {
     pub app: state::AppState,
     pub snapshot_repositories: snapshot_es::SnapshotRepositoryRegistry,
     pub slm_policies: slm::SlmPolicyRegistry,
+}
+
+/// Opt-in Elasticsearch product-compat: when `SURCH_ELASTIC_PRODUCT_COMPAT`
+/// is set (`1`/`true`), Surch stamps every response with
+/// `x-elastic-product: Elasticsearch`. The official `@elastic/elasticsearch`
+/// v8 client enforces a product check on that header and rejects every
+/// request otherwise — so this flag is required for ES-v8-client apps
+/// (e.g. matchID's `deces-backend`) to talk to Surch. Default off keeps the
+/// OpenSearch identity untouched. Read once at startup.
+fn elastic_product_compat_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SURCH_ELASTIC_PRODUCT_COMPAT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+async fn stamp_elastic_product_header(mut response: Response) -> Response {
+    if elastic_product_compat_enabled() {
+        response.headers_mut().insert(
+            "x-elastic-product",
+            HeaderValue::from_static("Elasticsearch"),
+        );
+    }
+    response
 }
 
 /// Build the P0 OpenSearch-compatible API router.
@@ -293,6 +322,8 @@ pub fn app_router_with_state(shared: AppRouterState) -> Router {
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
+        // Opt-in ES product-compat header (see `elastic_product_compat_enabled`).
+        .layer(axum::middleware::map_response(stamp_elastic_product_header))
 }
 
 /// Short crate purpose used by workspace smoke tests.

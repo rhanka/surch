@@ -14,7 +14,7 @@ use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
 use surch_search::maxscore::{MaxScoreExecutor, MaxScoreToken};
-use surch_search::scoring::{bm25_score, Bm25Config};
+use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
 
 use crate::{
     index::validate_index_name,
@@ -2027,6 +2027,7 @@ fn maxscore_match(
 
     struct TokenInfo<'a> {
         stats: &'a TermScoringStats,
+        scorer: Bm25TermScorer,
         max_contrib: f64,
         boost: f64,
     }
@@ -2038,19 +2039,19 @@ fn maxscore_match(
             if stats.doc_freq == 0 || stats.doc_freq > field_stats.doc_count {
                 return None;
             }
+            // Optimisation #6: validate config/corpus and precompute idf ONCE
+            // per token; the block + per-doc loops below then call the
+            // branch-free, ln()-free `scorer.score(tf, doc_len)` (bit-identical
+            // to the previous per-call `bm25_score`).
+            let scorer =
+                Bm25TermScorer::new(config, field_stats.doc_count, stats.doc_freq, avg_doc_len)
+                    .ok()?;
             let max_tf = stats.max_term_freq().max(1);
             let boost = *count as f64;
-            let single = bm25_score(
-                config,
-                field_stats.doc_count,
-                stats.doc_freq,
-                max_tf,
-                min_doc_len,
-                avg_doc_len,
-            )
-            .ok()?;
+            let single = scorer.score(max_tf, min_doc_len);
             Some(TokenInfo {
                 stats,
+                scorer,
                 max_contrib: single * boost,
                 boost,
             })
@@ -2084,15 +2085,7 @@ fn maxscore_match(
                 .iter()
                 .map(|meta| {
                     let block_max_tf = u64::from(meta.max_term_freq).max(1);
-                    let block_score = bm25_score(
-                        config,
-                        field_stats.doc_count,
-                        token.stats.doc_freq,
-                        block_max_tf,
-                        min_doc_len,
-                        avg_doc_len,
-                    )
-                    .unwrap_or(0.0);
+                    let block_score = token.scorer.score(block_max_tf, min_doc_len);
                     block_score * token.boost
                 })
                 .collect()
@@ -2128,16 +2121,7 @@ fn maxscore_match(
             } else {
                 1
             };
-            bm25_score(
-                config,
-                field_stats.doc_count,
-                token.stats.doc_freq,
-                tf,
-                doc_len,
-                avg_doc_len,
-            )
-            .ok()
-            .map(|score| score * token.boost)
+            Some(token.scorer.score(tf, doc_len) * token.boost)
         })
         .ok()?;
 

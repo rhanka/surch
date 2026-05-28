@@ -43,10 +43,8 @@ fn postings_builder_indexes_terms_and_postings_in_deterministic_order() {
     assert_eq!(search_postings.len(), 2);
     assert_eq!(search_postings[0].doc_id, 2);
     assert_eq!(search_postings[0].freq, 3);
-    assert_eq!(search_postings[0].positions, [0, 5, 8]);
     assert_eq!(search_postings[1].doc_id, 7);
     assert_eq!(search_postings[1].freq, 2);
-    assert_eq!(search_postings[1].positions, [4, 9]);
 }
 
 #[test]
@@ -66,7 +64,6 @@ fn postings_builder_derives_frequency_one_when_positions_are_absent() {
 
     assert_eq!(posting.doc_id, 4);
     assert_eq!(posting.freq, 1);
-    assert!(posting.positions.is_empty());
 }
 
 #[test]
@@ -131,10 +128,8 @@ fn postings_lucene_parity_fixture_matches_classic_shape() {
     assert_eq!(search_postings.len(), 2);
     assert_eq!(search_postings[0].doc_id, 1);
     assert_eq!(search_postings[0].freq, 2);
-    assert_eq!(search_postings[0].positions, [0, 3]);
     assert_eq!(search_postings[1].doc_id, 3);
     assert_eq!(search_postings[1].freq, 1);
-    assert_eq!(search_postings[1].positions, [5]);
 }
 
 #[test]
@@ -166,7 +161,7 @@ fn term_dictionary_fst_lookup_returns_postings_by_term() {
         .collect::<Vec<_>>();
     assert_eq!(paix.len(), 1);
     assert_eq!(paix[0].doc_id, 1);
-    assert_eq!(paix[0].positions, [0, 1, 2, 3]);
+    assert_eq!(paix[0].freq, 4);
 
     let mozart = dictionary
         .postings("address", "rue mozart")

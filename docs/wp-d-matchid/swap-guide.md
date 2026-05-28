@@ -50,31 +50,52 @@ Elasticsearch 8.6.1 node:
 - **Network**: loopback or same-AZ — Surch does not currently
   support cross-cluster reads (out of scope for WP-D).
 
-### 1.4 deces-backend client compatibility
+### 1.4 deces-backend client compatibility (validated end-to-end 2026-05-26)
 
-- `deces-backend` already targets the Elasticsearch 8.6.1 wire shape
-  (`hits.total.{value,relation}`); no client change is needed once
-  A14 lands. Confirm by reading `runRequest.ts:19-50` in the
-  matchID repo.
-- The `@opensearch-project/opensearch` Node client must keep its
-  `compatibility: true` flag (or equivalent) so it tolerates
-  Surch's `version.number = "2.17.1"` returned by `GET /`.
+A real local swap (Surch + Redis + the upstream `matchid/deces-backend`
+image, end-to-end `GET /deces/api/v1/search` returning the full matchID
+result) surfaced three hard requirements — see
+`docs/ops/bench-reports/` lineage and the matchID `surch-eval` branch:
+
+1. **The backend hardcodes `node: 'http://elasticsearch:9200'`**
+   (`dist/elasticsearch.js`) — it does **not** read `ES_URL`/`ELASTIC_URL`.
+   Surch must therefore be reachable as host `elasticsearch` on **port
+   9200** (run Surch with `SURCH_PORT=9200`, network alias `elasticsearch`).
+2. **The backend requires Redis** (host hardcoded `redis`, `redis:alpine`)
+   in front of the search path; without it the search returns `total:0`
+   without ever reaching the engine.
+3. **The backend uses `@elastic/elasticsearch` v8** (8.18.2 observed),
+   whose transport enforces a **product check**: it rejects every
+   response that lacks the header `x-elastic-product: Elasticsearch`,
+   silently yielding empty results. Surch presents as OpenSearch and
+   does not send it by default. **Run Surch with
+   `SURCH_ELASTIC_PRODUCT_COMPAT=1`** (opt-in, default off — see
+   `crates/surch-api/src/lib.rs`) so it stamps that header and the v8
+   client accepts it. All query DSL the backend emits (`match`,
+   `fuzziness:auto`, `function_score`, nested `bool`/`minimum_should_match`,
+   `min_score`, `sort:_score`, `track_total_hits`) is otherwise served
+   correctly by Surch.
 
 ## 2. The cutover — env-var flip
 
 The only swap strategy supported by this guide. **Not available
 before full compat.**
 
-matchID points its `ES_HOST` / `ELASTIC_URL` environment variable at
-the Surch node and restarts the `deces-backend` container.
+Because `deces-backend` hardcodes `http://elasticsearch:9200` (see §1.4),
+the flip is **not** an env-var change on the backend — it is swapping
+which container answers on the `elasticsearch` network alias / port 9200.
+Run Surch there with the compat env, keep the Redis sidecar:
 
 ```bash
-# Today, against Elasticsearch
-export ELASTIC_URL=http://elasticsearch:9200
-
-# After the flip, against Surch
-export ELASTIC_URL=http://surch:9200
+# Surch in place of the `elasticsearch` service (port 9200, compat header)
+docker run -d --network <matchid-net> --network-alias elasticsearch \
+  -e SURCH_PORT=9200 -e SURCH_ELASTIC_PRODUCT_COMPAT=1 surch:<tag>
+# Redis sidecar stays as-is (host alias `redis`)
+# then restart deces-backend
 ```
+
+The validated override compose lives on the matchID `surch-eval` branch
+(`packages/deces-infra/docker-compose-surch.yml`).
 
 **Pre-condition (mandatory)**: §1 above is fully satisfied. If any
 row in `gap-analysis.md` is not `implemented`, abort the swap.
