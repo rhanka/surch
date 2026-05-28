@@ -60,11 +60,21 @@ before/after measurement (CI, representative HW) → verdict**.
   - The parallelisation's payoff is on **rich mappings** (deces: 28 fields,
     `norm` analyzer + `.raw` re-analysis + prefixes) where per-doc analysis
     dominates — measured separately on the matchID `surch-eval` deces CI.
-- **Verdict**: parity-preserving ✓; neutral on simple corpora; deces measurement
-  PENDING (matchID `surch-eval` run `26582048931`, parallelised image, 1.36M).
-  The honest takeaway: parallelising analysis only helps where analysis is the
-  cost — so it must be paired with a parallel/faster **merge + postings build**
-  to move trec-covid too (candidate optimisation #N).
+- **Measurement (deces 1.36M, matchID `surch-eval` run `26582048931`,
+  parallelised image, 2-vCPU runner)**: bulk **Surch `104.2 s` vs ES `115.9 s`**
+  (1 355 728 docs). Baseline (pre-#1, run `26528627429`, same workflow): Surch
+  `2125 s` vs ES `116 s`.
+  → **The 18x indexation deficit on the rich deces mapping is CLOSED: Surch
+  reaches parity and edges ES (104.2 s vs 115.9 s).** The win lands exactly
+  where predicted (28 fields, `norm` + `.raw` re-analysis → analysis-bound).
+  Quality/parity unaffected (search results unchanged; cloud `ci` oracles green).
+- **Verdict**: ✅ **first beat-ES milestone — indexation deces 1.36M: Surch ≥ ES.**
+  Caveats (no-cheat): single run, ~10% margin → claim is "gap closed / parity,
+  Surch slightly ahead"; ≥3 reps needed to firm a hard "faster" figure (queued).
+  The large baseline ratio (2125→104) partly reflects baseline-run variance on
+  the shared runner; the defensible head-to-head is the **same-run** 104.2 vs
+  115.9 s. Search latency is unchanged (parallelising bulk does not touch the
+  read path) → next optimisations target search/concurrency.
 
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
