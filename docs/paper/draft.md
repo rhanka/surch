@@ -173,13 +173,23 @@ showing all 50 queries return non-empty sets on both engines with
 total matched-doc volume agreeing to `0.04 %` (Surch `7 507 757` vs
 OpenSearch `7 510 550`). The gap is therefore the same retrieval work
 done faster — WAND/MaxScore + skip-list early termination and no JVM
-overhead — not a degenerate result set. **Caveat (F3 isolation, §9):**
-this steady-state median is largely served by the per-query result LRU
-(the harness replays 50 distinct queries → ~99.6% hit rate); with the
-cache disabled Surch's raw p50 is `309 ms`, so the `354x` is a hot,
-low-cardinality best case rather than a raw-scorer figure. Surch RSS peak here is
-`~2123 MB` median (`±0.7%`), `~1.5x` the OpenSearch JVM peak — the
-expected footprint at this corpus size.
+overhead — not a degenerate result set.
+
+**Honest caveat — the `354x` is the cache, not the engine (F3 isolation, §9).**
+The steady-state median is dominated by the per-query result LRU: the harness
+replays 50 distinct queries → ~99.6% hit rate. With the cache **disabled**
+(`2026-05-26-F3-lru-cache-isolation-trec-covid-K8s`), Surch's raw-engine latency
+is `p50 309 / p95 532 / p99 624 / max 914 ms` against OpenSearch `169 / 415 /
+598 / 1094 ms` on the *same* run — i.e. **Surch's raw scorer is `1.83x` SLOWER
+than OpenSearch at the median** on TREC-COVID 171k (1.28x slower p95, ~parity
+p99, 1.2x faster max). So large-corpus search latency is **not** a Surch win on
+the raw engine — the LRU is what produces the headline. This is the campaign's
+key honesty: the small-corpus INSEE 10k latency win (`2.7–3.1x`) is real and
+cache-independent, but the large-corpus raw-engine latency is the **front still
+to be won** (see the beat-Elasticsearch campaign, §11, and the read-path
+optimisations it targets). Surch RSS peak on this corpus is `~907 MB` after the
+posting-positions drop (optimisation #9, §11) — `0.62x` the OpenSearch peak,
+down from `~2123 MB` (`1.45x`, heavier) before.
 
 ## 6. Quality (non-regression)
 
@@ -261,11 +271,83 @@ path — still `30/30`, 0 divergence
   on large corpora, folded into the cumulative result, rather than
   isolated against a no-Lot-3 control.
 
-## 10. Conclusion
+## 10. Beat-Elasticsearch campaign (matchID `deces`, vs ES 8.6.1)
+
+Sections 3–9 benchmark Surch against **OpenSearch 2.17.1**. A second,
+ongoing campaign benchmarks Surch against **Elasticsearch 8.6.1** on the
+**matchID `deces` corpus** (the French civil-death registry: a rich 28-field
+mapping with `norm` analyzer, `.raw` keyword sub-fields, `edge_ngram`
+autocomplete, `index_prefixes`, `geo_point`). matchID is the honest proving
+ground — Surch is the product, not matchID-specific tuning. Measurements run in
+the matchID CI (`matchID-project/matchID`, branch `surch-eval`): two isolated
+runner jobs (one engine each, no cross-engine CPU contention), Surch swapped in
+for Elasticsearch behind the real stack. Each optimisation is one
+paper-traceable step (hypothesis → change → before/after on the same workflow →
+verdict); the full log is `docs/paper/beat-elasticsearch-campaign.md`. The
+no-cheat bar: real corpus, ≥3 reps for claims, cache ON *and* OFF, all
+dimensions reported (so losses show as plainly as wins).
+
+**#1 — Parallel bulk analysis (rayon, `dd3f528`).** The bulk write held one
+write-lock that serialised the CPU-heavy per-doc analysis; ES/Lucene
+parallelise across cores. Moving the (pure) analysis off-lock to a `par_iter`,
+merging in input order (byte-identical postings), **eliminated the indexation
+deficit on the rich deces mapping**: deces 1.36M bulk Surch **104.2 s** (3-rep
+median, range ±3%) vs ES **115.9 s** (±15%) — from `18x slower` to parity /
+slightly ahead, and ~5× more consistent (the no-GC predictability thesis).
+Honest nuance: not a clean "always faster" (ES best run 91.5 s < Surch best
+100.8 s); claim = parity + markedly more predictable.
+
+**#9 — Drop per-posting positions (`3ccdbc6`).** No production read path consumes
+index positions (BM25 reads `freq`; `match_phrase` re-tokenises `_source`; the
+persisted codec excludes positions); they were kept only to derive `freq`.
+Shrinking `Posting` from `{doc_id, freq, Vec<u32>}` (~32 B + heap Vec) to a
+`Copy` `{doc_id, freq}` (8 B) — matching Lucene's `index_options`-gated
+positions — **flipped the memory dimension**: TREC-COVID 171k RSS peak
+`2168 → 907 MB` (−58%), now **0.62× the OpenSearch peak** (was 1.48× heavier),
+with bit-stable NDCG and no bulk regression. Memory at scale is the in-memory
+engine's structural risk vs ES (disk + page cache); this directly de-risks it.
+
+**#6 — Hoist BM25 idf out of the per-doc loop (`afa3a21`).** The WAND hot path
+re-ran config validation + the `ln()` idf per scored doc/block; a per-term
+`Bm25TermScorer` precomputes them once (bit-identical kernel). Parity-safe, but
+**measured neutral** on TREC-COVID cache-off (Surch p50 302 vs 309 ms baseline =
+noise): the ~300 ms cache-off latency is dominated by **posting-list decode +
+`_source` hydration**, not BM25 arithmetic. Reported honestly as a correct
+micro-opt that is not the read-path bottleneck — and as the signal that
+redirected the campaign to the decode/hydration path (read-path single-reader +
+zero-copy postings, in progress).
+
+**#2 — Field-name allocation in term aggregation (`3cdd1ab`).** Keyed the per-doc
+term map on the term only (field attached once per unique term), dropping
+field-`String` allocations `O(tokens) → O(unique-terms)`; parity-preserving
+allocation reduction folded into the indexing lead.
+
+### All-benchmarks status (honest)
+
+| Dimension | vs OpenSearch 2.17.1 | vs Elasticsearch 8.6.1 |
+|-----------|----------------------|------------------------|
+| Bulk indexing | ✅ 1.55× (TREC-COVID) / 6.7× (SciFact) | ✅ parity/ahead (deces 1.36M, 104 vs 116 s) |
+| Search latency, small corpus | ✅ 2.7–3.1× (INSEE 10k) | engine-to-engine harness pending |
+| Search latency, large corpus (cache ON) | ⚠️ 354× but LRU-masked, not an engine claim | engine-to-engine harness pending |
+| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | engine-to-engine harness pending |
+| Quality (NDCG@10) | ✅ parity (4 BEIR datasets) | ✅ parity (matchID oracle 30/30, 8/8) |
+| Memory (RSS) | ✅ 0.62× (TREC-COVID, post-#9) | 28M-scale measurement pending |
+| matchID DSL parity | — | ✅ B1 30/30, B2 8/8, 0 divergence |
+
+**Won:** bulk (both engines), small-corpus latency, quality, memory, matchID
+parity. **Open fronts:** large-corpus raw-engine latency vs OpenSearch (the
+read-path optimisations target this); a clean engine-to-engine `deces` latency
+benchmark vs ES 8.6.1 (the current artillery path is confounded by the Node
+backend + 2-vCPU runner); and the 28M full-corpus memory/indexation run.
+
+## 11. Conclusion
 
 A pure-Rust OpenSearch-compatible engine can match and beat a mature
-JVM engine on bulk, latency, and memory simultaneously, with no
-quality regression, given a few targeted algorithmic fixes and an
-allocator at parity. The measurement programme — versioned schemas,
-sibling-container fairness, quality guardrails, multi-rep medians —
-is itself reproducible from the promoted CI artefacts.
+JVM engine on bulk indexing, small-corpus latency, and memory
+simultaneously, with no quality regression, given a few targeted algorithmic
+fixes and an allocator at parity. The honest counter-finding — large-corpus
+raw-engine search latency (cache disabled) still trails OpenSearch — is
+reported as plainly as the wins, and is the active front of the
+beat-Elasticsearch campaign (§10). The measurement programme — versioned
+schemas, sibling-container fairness, quality guardrails, multi-rep medians,
+cache-on/off isolation — is itself reproducible from the promoted CI artefacts.
