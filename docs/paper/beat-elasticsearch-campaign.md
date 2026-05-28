@@ -166,6 +166,26 @@ before/after measurement (CI, representative HW) → verdict**.
   read-path bottleneck is posting-list decode/copy + hydration → prioritise #7
   (zero-copy postings) and the hydration path over further scoring micro-opts.**
 
+### #2 — Stop cloning the field name per token in term aggregation — `<sha pending>`
+- **Hypothesis (highest indexing leverage, S effort)**: `analyzed_terms` /
+  `subfield_terms` keyed the per-doc term map on `(field.to_owned(), term)` —
+  cloning the field `String` on **every token** (O(tokens), even repeated tokens
+  that collapse to one entry) and carrying field bytes through every BTreeMap
+  key comparison.
+- **Change**: `crates/surch-index/src/document_index.rs` — key the per-doc map
+  on the **term only** (`BTreeMap<String, Vec<u32>>`); the caller attaches the
+  constant field/path once per **unique term** when emitting postings. Field
+  `String` allocations drop O(tokens)→O(unique-terms); key comparisons no longer
+  carry field bytes. Matches Lucene's single `FieldInvertState`.
+  **Parity-preserving**: identical `(field, term, positions)` postings — 95
+  surch-index tests green (exact freq/postings/prefixes asserted), clippy + fmt
+  clean.
+- **Measurement**: folded into the next deces indexation 3-rep (the win is on
+  many-token / edge_ngram fields like the deces `autocomplete` sub-field;
+  expected single-digit-% bulk, likely within the ±3% deces-run noise — reported
+  as an allocation-reduction that compounds with #1, not a standalone headline).
+- **Verdict**: parity-safe ✅; magnitude pending the next deces 3-rep.
+
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
    hangs) — table stakes for a production engine + unlocks honest QPS numbers.

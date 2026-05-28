@@ -531,7 +531,7 @@ fn analyze_document(
         let norms_enabled = field_mapping.is_none_or(|field| field.norms_enabled());
         let index_prefixes = field_mapping.and_then(|m| m.index_prefixes);
 
-        let analyzed = analyzed_terms(analyzer, field, value);
+        let analyzed = analyzed_terms(analyzer, value);
         let token_count = analyzed
             .values()
             .map(|positions| positions.len() as u64)
@@ -546,7 +546,7 @@ fn analyze_document(
 
         // A6 phase 2: prefix fan-out (formerly `index_prefix_terms`).
         if let Some(pfx) = index_prefixes {
-            for (_field, term) in analyzed.keys() {
+            for term in analyzed.keys() {
                 let chars: Vec<char> = term.chars().collect();
                 let token_len = chars.len();
                 if token_len < pfx.min_chars {
@@ -564,20 +564,19 @@ fn analyze_document(
             if field_mapping.has_subfields() {
                 for (sub_name, sub_mapping) in field_mapping.subfields() {
                     let path = format!("{field}.{sub_name}");
-                    let analyzed_sub =
-                        subfield_terms(sub_mapping, &path, value, mapping.analysis());
+                    let analyzed_sub = subfield_terms(sub_mapping, value, mapping.analysis());
                     if let Some(stored) = lowest_position_term(&analyzed_sub) {
                         subfield_values.push((path.clone(), stored));
                     }
-                    for ((sub_field, term), positions) in analyzed_sub {
-                        postings.push((sub_field, term, positions));
+                    for (term, positions) in analyzed_sub {
+                        postings.push((path.clone(), term, positions));
                     }
                 }
             }
         }
 
-        for ((field, term), positions) in analyzed {
-            postings.push((field, term, positions));
+        for (term, positions) in analyzed {
+            postings.push((field.clone(), term, positions));
         }
     }
 
@@ -595,19 +594,22 @@ fn analyze_document(
     }
 }
 
-fn lowest_position_term(analyzed: &BTreeMap<(String, String), Vec<u32>>) -> Option<String> {
+fn lowest_position_term(analyzed: &BTreeMap<String, Vec<u32>>) -> Option<String> {
     analyzed
         .iter()
-        .filter_map(|((_, term), positions)| positions.iter().min().map(|pos| (*pos, term.clone())))
+        .filter_map(|(term, positions)| positions.iter().min().map(|pos| (*pos, term.clone())))
         .min_by_key(|(pos, _)| *pos)
         .map(|(_, term)| term)
 }
 
-fn analyzed_terms(
-    analyzer: AnalyzerName,
-    field: &str,
-    value: &str,
-) -> BTreeMap<(String, String), Vec<u32>> {
+/// Optimisation #2: the per-doc term map is keyed on the **term only** — the
+/// field name is constant for the whole call and is attached once per unique
+/// term by the caller when it emits postings. The previous
+/// `entry((field.to_owned(), term))` cloned the field `String` on EVERY token
+/// (O(tokens), even repeated tokens that collapse into one entry) and carried
+/// the field bytes through every BTreeMap key comparison. Matches Lucene's
+/// single `FieldInvertState` (field identity never re-materialised per token).
+fn analyzed_terms(analyzer: AnalyzerName, value: &str) -> BTreeMap<String, Vec<u32>> {
     let tokenized = match analyzer {
         AnalyzerName::Standard => StandardAnalyzer.token_stream(value),
         AnalyzerName::Simple => SimpleAnalyzer.token_stream(value),
@@ -617,15 +619,12 @@ fn analyzed_terms(
         AnalyzerName::Norm => NormAnalyzer.token_stream(value),
     };
 
-    let mut terms = BTreeMap::<(String, String), Vec<u32>>::new();
+    let mut terms = BTreeMap::<String, Vec<u32>>::new();
     let mut position = 0_u32;
 
     for token in tokenized {
         position += token.position_increment;
-        terms
-            .entry((field.to_owned(), token.term))
-            .or_default()
-            .push(position - 1);
+        terms.entry(token.term).or_default().push(position - 1);
     }
 
     terms
@@ -648,23 +647,19 @@ fn analyzed_terms(
 ///   tokenizes (`analyzed_terms`).
 fn subfield_terms(
     sub_mapping: &crate::mapping::FieldMapping,
-    field: &str,
     value: &str,
     analysis: &AnalysisSettings,
-) -> BTreeMap<(String, String), Vec<u32>> {
+) -> BTreeMap<String, Vec<u32>> {
     if sub_mapping.field_type == FieldType::Keyword {
         let tokens = match sub_mapping.normalizer {
             Some(_) => Normalizer.token_stream(value),
             None => KeywordAnalyzer.token_stream(value),
         };
-        let mut terms = BTreeMap::<(String, String), Vec<u32>>::new();
+        let mut terms = BTreeMap::<String, Vec<u32>>::new();
         let mut position = 0_u32;
         for token in tokens {
             position += token.position_increment;
-            terms
-                .entry((field.to_owned(), token.term))
-                .or_default()
-                .push(position - 1);
+            terms.entry(token.term).or_default().push(position - 1);
         }
         return terms;
     }
@@ -676,18 +671,15 @@ fn subfield_terms(
     // (resolution returns None) so a bad reference degrades gracefully.
     if let Some(name) = &sub_mapping.custom_analyzer {
         if let Some(resolved) = analysis.resolve_analyzer(name) {
-            let mut terms = BTreeMap::<(String, String), Vec<u32>>::new();
+            let mut terms = BTreeMap::<String, Vec<u32>>::new();
             for (position, term) in resolved.terms(value).into_iter().enumerate() {
-                terms
-                    .entry((field.to_owned(), term))
-                    .or_default()
-                    .push(position as u32);
+                terms.entry(term).or_default().push(position as u32);
             }
             return terms;
         }
     }
 
-    analyzed_terms(sub_mapping.analyzer(), field, value)
+    analyzed_terms(sub_mapping.analyzer(), value)
 }
 
 #[cfg(test)]
