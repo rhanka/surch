@@ -149,8 +149,22 @@ before/after measurement (CI, representative HW) → verdict**.
   (`trec-covid-latency` with `SURCH_DISABLE_SEARCH_CACHE` on `perf-isolation`
   rebased on this main), compared to the F3-LRU cache-off baseline (p50 309 ms /
   p99 624 ms). Plus b2-oracle (parity vs ES 8.6.1) + cache-on (no regression).
-- **Verdict**: pending measurement (expect a per-scored-doc CPU reduction visible
-  cache-off; bit-stable ranking).
+- **Measurement (ci-k8s `trec-covid-latency` cache-OFF, run `26605266605`,
+  `perf-isolation` `05c7fce` = main+#6 with `SURCH_DISABLE_SEARCH_CACHE=1`)**:
+  Surch global **p50 302.1 / p95 528.4 / p99 639.8 / max 918.5 ms** vs the
+  F3-LRU cache-off baseline **p50 309.1 / p95 532.3 / p99 623.8 / max 913.8 ms**.
+  → **Neutral (within run-to-run noise)** — the OS arm itself moved 169→184 ms
+  p50 across runs (~±10% runner noise), so the 302-vs-309 Surch delta is noise.
+  Retrieval parity held (hits probe 7 507 757, 50/50 non-zero).
+- **Verdict**: parity-safe ✅, **but no measurable latency win on TREC-COVID
+  cache-off.** Honest reading: the BM25 idf hoist removes a real per-doc `ln()`
+  + branches, but the ~300 ms cache-off p50 is dominated by **postings decode +
+  `_source` hydration / candidate resolution**, not BM25 arithmetic (exactly the
+  verifier's "bounded — decode + doc_len lookup dominate" caveat). Kept on main
+  (correct, zero-risk, helps BM25-bound high-QPS workloads with many cheap
+  terms), but it is not the read-path bottleneck here. **Campaign signal: the
+  read-path bottleneck is posting-list decode/copy + hydration → prioritise #7
+  (zero-copy postings) and the hydration path over further scoring micro-opts.**
 
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
