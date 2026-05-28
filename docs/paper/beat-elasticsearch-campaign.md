@@ -68,13 +68,19 @@ before/after measurement (CI, representative HW) → verdict**.
   reaches parity and edges ES (104.2 s vs 115.9 s).** The win lands exactly
   where predicted (28 fields, `norm` + `.raw` re-analysis → analysis-bound).
   Quality/parity unaffected (search results unchanged; cloud `ci` oracles green).
-- **Verdict**: ✅ **first beat-ES milestone — indexation deces 1.36M: Surch ≥ ES.**
-  Caveats (no-cheat): single run, ~10% margin → claim is "gap closed / parity,
-  Surch slightly ahead"; ≥3 reps needed to firm a hard "faster" figure (queued).
-  The large baseline ratio (2125→104) partly reflects baseline-run variance on
-  the shared runner; the defensible head-to-head is the **same-run** 104.2 vs
-  115.9 s. Search latency is unchanged (parallelising bulk does not touch the
-  read path) → next optimisations target search/concurrency.
+- **3-rep median (deces 1.36M, runs `26582048931` / `26583239933` /
+  `26583245581`)**:
+  - Surch bulk: `104.2 / 100.8 / 106.1 s` → **median `104.2 s`**, range ±3% (tight).
+  - ES bulk: `115.9 / 123.2 / 91.5 s` → **median `115.9 s`**, range ±15% (variable).
+- **Verdict**: ✅ **first beat-ES milestone.** The 18x indexation deficit on the
+  rich deces mapping is **eliminated**: Surch median ~10% ahead of ES **and ~5x
+  more consistent** (variance ±3% vs ±15% — supports the no-GC predictability
+  thesis). Honest nuance (no-cheat): not a clean "always faster" (ES best run
+  91.5 s < Surch best 100.8 s) → claim = **parity / Surch slightly ahead +
+  markedly more predictable**. Absolutes are still 2-vCPU-runner-bound (engine
+  could be faster on real HW), but the head-to-head is fair (same workflow/runner,
+  3 reps). Parity preserved (cloud `ci` oracles green). Search latency unchanged
+  → optimisation #2 targets the read path / concurrency.
 
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
