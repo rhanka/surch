@@ -22,6 +22,29 @@ before/after measurement (CI, representative HW) → verdict**.
   losses show as plainly as wins: bulk/indexation time, search p50/p95/p99/max,
   QPS under concurrency, and **RSS** (the in-memory model is the scale risk).
 
+## Latency benchmarks — what we have and what we're adding
+1. **OpenSearch 2.17.1, INSEE 10k** (`2026-05-25-F2-insee-3rep-K8s`): Surch
+   `2.7–3.1x` faster, cache-independent — a real win.
+2. **OpenSearch 2.17.1, TREC-COVID 171k** (`F4` cache-on + `F3-LRU` cache-off):
+   the honest revealer — cache-on `354x` is LRU-masked; **cache-off raw engine
+   is 1.83x SLOWER than OS at p50**. This is the diagnostic that defines the
+   front to win.
+3. **matchID `deces` vs ES 8.6.1 — engine-to-engine** (NEW, `surch-eval` CI
+   `latency_engine.sh`): replays the real deces-backend query shape
+   (`function_score`/`bool` `minimum_should_match`/`match` on PRENOM+NOM)
+   **directly** against each engine's `_search`, NO Node backend in the path
+   (the artillery-via-backend numbers are confounded by the backend + 2-vCPU
+   runner). One engine per isolated matrix job. This is the proper matchID
+   latency benchmark; absolutes stay runner-bound but the Surch-vs-ES relative
+   is clean.
+4. **External authoritative latency benchmark (to adopt):** the Tantivy
+   **`search-benchmark-game`** (Lucene vs Tantivy vs PISA vs Bleve on an English
+   Wikipedia corpus, standardised query set + latency methodology) — a citable,
+   non-matchID, non-overfit cross-engine latency standard. Adding a Surch driver
+   to it gives an independent, reproducible latency result the paper can cite
+   alongside the matchID and BEIR numbers. (Backlog item — corpus + query set
+   are public.)
+
 ## Dimensions tracked (where Surch can/can't credibly win)
 | Dimension | Honest prior | Why |
 |-----------|--------------|-----|
