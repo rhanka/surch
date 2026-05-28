@@ -126,6 +126,32 @@ before/after measurement (CI, representative HW) → verdict**.
   confirm it holds at 28M, and pursue #6 (search-latency idf hoist) for the
   remaining unconquered front.
 
+### #6 — Hoist BM25 idf + config validation out of the per-doc scoring loop — `<sha pending>`
+- **Hypothesis (highest search-latency leverage)**: the WAND/MaxScore hot path
+  (`maxscore_match`) called `bm25_score` per token, **per 128-block, and per
+  scored doc** — each re-running `Bm25Config::new` (4 validation branches),
+  corpus-stat validation, and a transcendental `ln()` idf, all **constant for a
+  given term**. Hoisting them matches Lucene's per-term-cached `BM25Scorer.idf`.
+- **Change**: `crates/surch-search/src/scoring.rs` — new `Bm25TermScorer`
+  precomputes `{idf, k1, b, avg_doc_len}` once (`new`, fallible, same errors as
+  before) and exposes a branch-free, `ln()`-free `score(tf, doc_len)`.
+  `bm25_score` is refactored to a thin wrapper over the **same** kernel → one
+  shared float expression. `maxscore_match` (`crates/surch-api/src/search.rs`)
+  builds the scorer once per token and uses it at all three sites (token
+  max-contrib, block bounds, per-doc). **Parity: bit-identical** — same float
+  association, idf computed identically once; the only dropped work
+  (`validate_score_inputs` per call) can never fire at these sites (matched
+  postings have tf≥1, doc_len guarded ≥1). Unit: 60 surch-search tests green
+  (incl. BM25), clippy + fmt clean.
+- **Matches**: Lucene per-term-cached idf + length-norm table.
+- **Measurement**: PENDING — the gain is on the COMPUTE path, which the LRU
+  result cache masks at steady state, so it must be read **cache-OFF**
+  (`trec-covid-latency` with `SURCH_DISABLE_SEARCH_CACHE` on `perf-isolation`
+  rebased on this main), compared to the F3-LRU cache-off baseline (p50 309 ms /
+  p99 624 ms). Plus b2-oracle (parity vs ES 8.6.1) + cache-on (no regression).
+- **Verdict**: pending measurement (expect a per-scored-doc CPU reduction visible
+  cache-off; bit-stable ranking).
+
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
    hangs) — table stakes for a production engine + unlocks honest QPS numbers.
