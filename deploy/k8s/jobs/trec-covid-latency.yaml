@@ -95,10 +95,12 @@ spec:
             - { name: RUST_LOG,   value: "warn" }
             # PERF-ISOLATION branch ONLY (never merged to main): isolate ONE
             # optimisation per run by setting its disable-env. Currently:
-            # top-K shortcut OFF (cache + maxscore back ON) to measure the
-            # bounded-heap + lazy-hydration top-K shortcut contribution on the
-            # TREC-COVID workload, vs the published all-on 3-rep median.
-            - { name: SURCH_DISABLE_TOPK, value: "1" }
+            # search-result cache OFF (maxscore + top-K ON) to expose the
+            # per-query COMPUTE path so optimisation #6 (hoisted BM25 idf) is
+            # measurable — the LRU cache masks it at steady state. Compared to
+            # the F3-LRU cache-off baseline (2026-05-26-F3-lru-cache-isolation:
+            # Surch global p50 309 ms / p95 532 / p99 624 / max 914).
+            - { name: SURCH_DISABLE_SEARCH_CACHE, value: "1" }
           resources:
             requests: { cpu: 150m, memory: 256Mi }
             limits:   { cpu: 2000m, memory: 7Gi }
