@@ -91,3 +91,313 @@ before/after measurement (CI, representative HW) → verdict**.
 3. **Reduce rich-mapping analysis cost** (normalise-once for parent + `.raw`).
 4. **Prove the tail-latency advantage** (no-GC) cleanly on deces.
 5. **Confront memory at scale** (can Surch hold 28M, at what RSS vs ES?).
+
+## Optimisation backlog (candidate hunt)
+
+Adversarially code-verified candidates from the post-#1 hunt. Each was checked
+against the actual source (every `file:line` confirmed) for: *is the cost real*,
+*is it general* (not deces/matchID-overfit), *is it parity-safe* (bit-stable
+results vs ES 8.6.1), and *is the claimed gain plausible*. Numbered as future
+optimisations and ordered within each dimension by **leverage = expected_gain ×
+confidence ÷ effort**. Magnitudes below are the *honest, de-hyped* figures (the
+verifier knocked down several inflated headline numbers — recorded as-corrected).
+Effort: S ≈ ½ day, M ≈ 1–3 days, L ≈ a week+. Parity-risk `none/low` = bit-stable
+by construction; `flagged` = the candidate *as written* changes results and must
+be narrowed before adoption (the safe subset is given).
+
+### Indexing (bulk / analysis)
+
+**#2 — Stop cloning the field name per token in term aggregation.** `S` ·
+parity none · conf 0.72 · *highest indexing leverage (S effort).*
+`crates/surch-index/src/document_index.rs:620-631,660-668,679-686`.
+*Change:* key the per-doc term map on the term `String` only and attach the
+constant field name once per unique term, instead of `entry((field.to_owned(),
+term))` per token. *Gain vs ES:* removes O(tokens)→O(unique-terms) field-`String`
+allocs and drops field bytes from every BTreeMap key comparison; realistic
+single-digit-% bulk win, larger on edge_ngram fan-out. *Matches:* Lucene's single
+`FieldInvertState` — field identity never re-materialised per token. *General:*
+fires on every multi-token text/keyword/edge_ngram field, any corpus.
+
+**#3 — ASCII fast-path for token lowercasing.** `S` · parity none · conf 0.66.
+`crates/surch-analysis/src/lib.rs:36,105,115,179,189,446` +
+`crates/surch-index/src/mapping.rs:555` (the cited `lib.rs:555` is a test; real
+site is the resolved edge_ngram chain in `mapping.rs`).
+*Change:* `if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_lowercase() }`
+(no `unsafe` — crate is `#![forbid(unsafe_code)]`), skipping the Unicode
+SpecialCasing scan on ASCII tokens. *Gain vs ES:* cuts the Unicode-table cost on
+the common ASCII token (saves the *scan*, not the alloc — `to_ascii_lowercase`
+still allocates one equal-length String); modest but reliable, helps query-time
+too. *Matches:* Lucene's JIT-specialised `LowerCaseFilter` ASCII path. *General:*
+any ASCII-dominant corpus (French names, English, identifiers, most BEIR);
+non-ASCII falls back unchanged → bit-identical.
+
+**#4 — Eliminate the `clone().build()` deep clone on the FST materialize path.**
+`M` · parity none · conf 0.78.
+`crates/surch-index/src/document_index.rs:255,280` (`postings_builder.clone()
+.build()`), build consumes by value at `crates/surch-index/src/postings.rs:128`.
+*Change:* make `build(&self) -> TermDictionary` borrow instead of consume, so no
+full deep copy of the field/term/postings tree is made and thrown away each
+materialize. *Must borrow, not `mem::take`/consume* — the `ensure_terms_ready`
+path needs the builder live for the next incremental append (`state.rs:856`).
+*Gain vs ES:* removes one O(total_postings) heap-clone pass per materialize and a
+transient RSS-doubling spike (clone coexists with original) — an RSS win vs ES,
+which never duplicates in-flight postings. (Verifier: "cuts materialize in half"
+is *optimistic*; sort + FST build + block_metas remain — the clone is one of
+several passes.) *Matches:* Lucene flushes from the live buffer without cloning
+it. *General:* every refresh/first-search after any bulk window, any corpus.
+
+**#5 — Parallel per-shard postings build (DWPT-style), merged at materialize.**
+`L` · parity low · conf 0.7.
+`crates/surch-index/src/document_index.rs:233-258,432-460` (rayon stops at
+analysis; the merge `for document in analyzed { merge_analyzed }` and `build()`
+are serial), `crates/surch-index/src/postings.rs:101-176`.
+*Change:* shard docs into N≈cores partitions, build N independent
+`PostingsBuilder`s in parallel (no shared lock), then k-way-merge the sorted
+per-field `BTreeMap<term, Vec<Posting>>` streams (terms already lex-ordered,
+postings already doc-id-ascending within a shard) into one logical
+`TermDictionary` — read path unchanged. *Gain vs ES:* parallelises the
+*post-analysis* serial bottleneck (the part rayon #1 left serial), which is what
+text-heavy/low-field mappings (trec-covid) hit. (Verifier: headline "3-6×" is
+**Amdahl-capped** — analysis is already parallel, so realistic *total-bulk* gain
+≈ 1.3–2×.) *Matches/beats:* Lucene's DocumentsWriterPerThread segments + merge,
+collapsed to one segment. *General:* targets text-heavy/low-field corpora — the
+*opposite* of deces tuning (deces = many short keyword-ish fields).
+
+### Search latency
+
+**#6 — Hoist BM25 idf + config validation out of the per-doc scoring loop.** `M`
+· parity low · conf 0.78 · *highest search-latency leverage.*
+`crates/surch-search/src/scoring.rs:84-102` (per-call `Bm25Config::new` 4-branch
+validate + a transcendental `.ln()` in `bm25_idf`); hot callers
+`crates/surch-api/src/search.rs:2085,2041,2614`.
+*Change:* a per-term `Bm25TermScorer { idf, k1, b, avg_doc_len }` computed once
+per token; the per-doc kernel becomes branch-free, `ln()`-free. *Parity caveat:*
+must keep `k1*(1-b + b*lnorm)` **factored** (left-associated) to stay
+bit-identical — do *not* collapse to a single `k1*(1-b)` constant (changes float
+association). ES oracle tolerance is ~1e-3 so even ULP drift is safe, but aim
+bit-stable. *Gain vs ES:* removes one `ln()` + ~6 branches per scored doc and per
+128-block bound; meaningful on high-df terms over large corpora, bounded (postings
+decode + doc_len lookup still dominate). *Matches:* Lucene's per-term-cached
+`BM25Scorer.idf` + length-norm table. *General:* core path for all
+match/multi_match/bool/fuzzy scoring.
+
+**#7 — Stop deep-copying the posting list + block_metas per query in
+`term_scoring_stats`.** `M`–`L` · parity low (bit-stable by value) · conf 0.72.
+`crates/surch-api/src/state.rs:454-505` (fresh `Vec<(u32,u64)>` copy of the whole
+list + `block_metas.to_vec()` per query per distinct token, with a `u32→u64`
+freq widen); consumed at `crates/surch-api/src/search.rs:2068,2489-2496`;
+`crates/surch-search/src/maxscore.rs:55`.
+*Change:* `block_metas` is trivially zero-copy-borrowable today — do that half
+now (pure win). For the posting list, the literal "borrow `&[Posting]`
+zero-copy" is **not possible**: stored `Posting{doc_id,freq:u32,positions:Vec}`
+is layout-incompatible with the executor's required `&[(u32,u64)]`. Real routes:
+(a) hold a read guard / `Arc<segment>` across scoring and feed a borrowed SoA
+(gated on the segment snapshot, #14), or (b) store a `(doc_id,freq)` SoA once at
+build time and borrow it (permanent extra index RAM). Keep freq `u32`. *Gain vs
+ES:* removes an O(doc_freq) malloc+copy+widen per head term from the hot path; a
+real allocator-pressure / p99 / RSS-jitter win on frequent terms (verifier:
+"multi-×" overstated — block-skip already prunes; the BM25 loop is the residual
+floor; the results byte-cache already absorbs exact repeats). *Matches:* Lucene's
+streamed `PostingsEnum`/`ImpactsEnum` — zero per-query list copy. *General:*
+per-distinct-token cost ∝ doc_freq, any scoring query, any corpus.
+
+**#8 — Collapse the per-query lock-acquisition storm into one scoped reader.**
+`M` · parity none · conf 0.68.
+`crates/surch-api/src/search.rs:2471-2496,1781-1892`; the ~2N+ per-query
+`store.read()` sites at `crates/surch-api/src/state.rs:1573,1591,1619,1630`
+(each `term_scoring_stats` also re-runs `ensure_terms_ready`) + `index_mapping`
+at `1161`.
+*Change:* hoist `ensure_terms_ready` once up front (it may need the *write* lock
+to materialize — must run *before* the long read guard or it deadlocks
+`std::RwLock`), then take one read guard / `&IndexData` and thread it through
+candidate resolution, scoring-context build, and hydration. Cuts O(tokens)+~4
+acquisitions → 1. *Gain vs ES:* a single point-in-time snapshot also removes the
+mid-query wedge windows where a bulk writer slips in (p95/p99/max win **under
+concurrent bulk**; near-neutral on read-only benches — magnitude unproven, gated
+on the concurrent harness). *Matches:* Lucene's one `IndexSearcher`/`LeafReader`
+per query reading all stats from one consistent reader. *General:* structural
+property of the scoring read path, any corpus.
+
+### Memory (RSS)
+
+**#9 — Drop the per-posting `Vec<u32>` positions from the in-memory index.** `M`
+· parity low · conf 0.82 · *highest memory leverage.*
+`crates/surch-index/src/postings.rs:19-24` (`Posting{doc_id,freq,positions}`);
+sole non-test reader is the RSS accounting at `crates/surch-index/src/memory.rs:157`.
+*Change:* shrink `Posting` to `{doc_id:u32, freq:u32}` (8 B, `Copy`). Positions
+are still computed during analysis to derive `freq` + doc_len, then discarded —
+**no production path reads them** (BM25 reads only freq; `match_phrase`
+re-tokenises `_source`; the persisted codec already excludes positions). *Gain vs
+ES:* ~32 B→8 B per posting **plus one eliminated heap alloc/Vec header per
+posting** (≈40–44 B + allocator metadata); plausibly multiple GiB on a
+multi-field 28M-doc corpus. (Verifier: candidate's "48 B" struct figure was
+wrong — real size is 32 B; conclusion stands.) *Matches/beats:* Lucene stores
+positions only when `index_options ≥ positions`; Surch stores them
+unconditionally today. *General:* every field/analyzer pays it now. *Note:* the
+SoA-split variant (separate `doc_ids`/`freqs` columns, positions opt-in via
+`index_options` plumbing) is the cache-dense superset of this — defer to it only
+once `index_options` is wired; the simple drop captures the RSS win immediately.
+
+**#10 — Collapse the three id side-tables into shared `Arc<str>` + a dense Vec.**
+`L` · parity low (medium if mis-implemented) · conf 0.8.
+`crates/surch-api/src/state.rs:55-57` (`documents` key, `document_ids` key,
+`reverse_document_ids` value — the public `_id` String is heap-allocated **three
+times** per doc, plus three B-tree node sets).
+*Change:* store the id once as `Arc<str>` shared between `documents` and
+`document_ids`; replace `reverse_document_ids` with a `Vec<Option<Arc<str>>>`
+indexed by dense `doc_id` (O(1) internal→public; `Option` because deletes leave
+holes — `next_doc_id` never recycles). Keep a `BTreeMap<Arc<str>,u32>` for
+public→internal to **preserve `documents_paginated`'s lexicographic `_id`
+order** (`state.rs:1467`) → bit-stable. *Gain vs ES:* removes 2 of 3 id-String
+copies + one whole BTreeMap; hundreds of MB→>1 GB at 28M docs; small O(log N)→O(1)
+hydration win on top-K. (Honest: invisible to the `stored_fields_bytes` gauge —
+measure via process RSS.) *Matches:* Lucene dense int docids + `_id` stored once.
+*General:* per-doc id bookkeeping, every index.
+
+**#11 — Store `_source` as a compressed blob with lazy parse.** `L` · parity low
+· conf 0.72.
+`crates/surch-api/src/state.rs:55` (`documents: BTreeMap<String, Arc<Value>>` —
+fully-parsed `serde_json::Value` tree; the team's own comment names this the
+"main driver of the matchID INSEE RAM footprint"); bloat model at
+`crates/surch-index/src/memory.rs:119-135`.
+*Change:* hold `Arc<CompressedSource>` (canonical JSON bytes, LZ4/zstd-1 or the
+already-present `flate2`), decompress+parse lazily behind the
+`documents()`/`documents_for_ids()` accessors with a small per-query parsed-Value
+LRU. *Gain vs ES:* ~3–6× on the `_source` component (eliminates parsed-tree node
+bloat *and* compresses text). Honest scoping: `_source` is 1 of 6 RSS components
+— *not* always the largest (postings can dominate text-heavy corpora). *Watch:*
+the full-corpus-scan fallback (`search.rs:2151`) would decompress every doc —
+bounded for posting-backed query shapes (Term/Match/MultiMatch/Bool) but a
+latency landmine for non-posting filters; per-hit parse adds retrieval CPU.
+*Matches:* Lucene `Lucene90CompressingStoredFieldsFormat` (LZ4/DEFLATE chunks,
+decompress on demand). *General:* generic in-memory-engine choice, any JSON corpus.
+
+### Concurrency / QPS
+
+**#12 — Hold one read lock per query** — *same change as #8, scored under the
+concurrency dimension* (`conf 0.7`, `L`). The lock-storm collapse is the read-path
+half; pairs with the FST-snapshot decoupling (#14). Listed once; do not
+double-count effort.
+
+**#13 — Split the global lock into per-index locks.** `M`–`L` · parity none ·
+conf 0.6.
+`crates/surch-api/src/state.rs:20` (`store: Arc<RwLock<MemoryStore>>` guards
+*every* index); a bulk on index A holds the write lock across the whole batch
+(`apply_document_writes:1012-1122`, incl. the rayon-parallel rebuild) so a search
+on unrelated index B stalls behind it.
+*Change:* `DashMap`/outer lock over `Arc<RwLock<InMemoryIndex>>` handles; aliases/
+templates to their own small lock. Pure locking-boundary refactor → bit-stable.
+*Gain vs ES:* multi-tenant/multi-index QPS scales with cores instead of
+serialising. **Honest caveat: zero benefit on the primary single-index deces
+benchmark** — bulk+search hit the same lock; only wins under concurrent
+multi-index traffic. *Matches:* ES per-shard `IndexWriter` locking. *General:* the
+ES isolation model, not matchID-specific (but off the primary bench).
+
+### Highest-leverage structural bet
+
+The candidate hunt surfaced — and the verifier **killed on parity** — the most
+tempting structural move: **serve searches from a committed FST snapshot
+(`ArcSwap<TermDictionary>`) and build the term dictionary only on `_refresh` / a
+background materializer**, taking `materialize_terms()` (the
+`postings_builder.clone().build()` full FST rebuild) off the read path entirely
+(`crates/surch-api/src/state.rs:835-858`, `document_index.rs:276-283`). The cost
+it targets is real, general, and severe — under interleaved bulk+search every
+search forces a full O(total-terms) rebuild that the next chunk re-dirties and
+discards, collapsing both reads and the bulk loop (the documented wedge). **But
+as written it is *not* parity-safe in this codebase**: Surch's enforced contract
+is *read-your-writes* (test `bulk_router_makes_batched_documents_searchable`
+searches immediately after `_bulk` with **no** `_refresh` and asserts the docs are
+visible). A snapshot-on-refresh model returns stale/zero results for those
+searches — an observable result change, not a perf no-op. The genuinely
+adoptable structural bet is therefore the **parity-preserving sibling: give the
+term dictionary its own lock and decouple the FST build from the doc-store writer
+lock while *still* materializing on the read path** (kills the write/write thrash
+without changing visibility), and, longer term, a **per-index `Arc<segment>`
+copy-on-write snapshot** (#13 + #14) that makes readers lock-free. That path —
+not the staleness route — is the way to ES-grade NRT concurrency without
+sacrificing the bit-stable parity the whole campaign rests on. It also unblocks
+the clean (borrow-not-copy) forms of #4 and #7.
+
+### Considered & dropped (verified, rejected — honesty trail)
+
+- **Bulk grouped appends into `PostingsBuilder`** — *not real*: the claimed
+  per-token field-`String` clone doesn't exist (the merge **moves** the owned
+  String), and the BTreeMap level it removes is the cheap ~2-entry outer map, not
+  the costly inner term descent.
+- **Skip the build()-time posting re-sort when already doc-id-ordered** — *gain
+  not plausible*: Rust 1.93 driftsort already early-returns O(n) on sorted input,
+  so the saving is a key-extraction scan, not the claimed n·log n; near-noise vs
+  FST build.
+- **SIMD bit-packed FoR codec to replace LEB128 varint** — *not real (dead
+  code)*: the FoR codec is unwired scaffolding (docs + Cargo comments confirm
+  "NOT wired into the postings hot path"); zero production callers, so ~0
+  end-to-end search gain.
+- **Precompute the `BlockSkipList` at index build instead of per query** — *gain
+  not plausible*: the skip list is ~1% of the per-token allocation that
+  `term_scoring_stats` already does (and the cited "per-skip cursor allocation"
+  doesn't exist — `BlockSkipCursor` is stack-only).
+- **Collapse the 3 per-term FST walks / hoist the field lookup** — *gain not
+  plausible*: the cited hot-path sites already use the combined single-walk
+  accessor, the executor module isn't wired into the API search path, and
+  per-request term dedup already exists.
+- **Stream FST range scans for prefix (avoid `BTreeSet`/`Vec<String>`)** — *not
+  general + gain overstated*: the `sorted_terms` half is off the hot path
+  (tests/admin only); the `BTreeSet` half is the narrow matchID-shaped
+  non-`index_prefixes` date/year path, tiny for selective prefixes.
+- **Replace full FST rebuild with per-batch immutable FST segments** — *not real
+  anymore*: the O(K²) per-chunk rebuild it targets was already removed by the
+  Lot 1.6 deferred build (one terminal `build()` per load, asserted in tests).
+- **Eliminate the duplicate live `PostingsBuilder` across the bulk path** —
+  *parity-unsafe + regressing*: consuming the builder loses the source-of-truth
+  for incremental append (data loss); periodic finalize trips the full-rebuild
+  guard and resurrects the O(n²) cost Lot 1.6 killed.
+- **Index analysis+merge off the write lock, swap result under lock** — *not
+  general + parity-unsafe*: the expensive FST build is already deferred off this
+  path; doc-id allocation runs inside the same write section, so dropping the
+  lock mid-batch opens a parity-breaking reorder window; no harness measures the
+  concurrent benefit.
+- **Immutable in-memory segments + copy-on-write readers (full Lucene NRT)** —
+  *parity-unsafe + gain pre-captured*: per-segment IDF would diverge from the
+  global-stats BM25 path (the candidate is silent on cross-segment stat
+  aggregation), the disk-codec reuse claim is false, and Lot 1.6 already captured
+  the headline indexing win. (The *parity-preserving* slice of this idea is the
+  structural bet above.)
+
+#### Parity-flagged (real + general, but the change as written changes results — adopt only the narrowed safe subset)
+
+- **Analyze the query string once per (field,value)** (`search.rs:2566`,
+  `1957`, `2582`; `state.rs:519`) — redundant 3–4× tokenisation is real, but
+  candidate-resolution and scoring use **different analyzers** (search_analyzer
+  vs builtin); merging them drifts ranking. *Safe subset:* dedupe only the two
+  *scoring* calls (identical builtin analyzer) and cache per-token **counts**
+  (not the order-lost `BTreeSet`, which would drop repeated-token boosts).
+  Effort M, modest gain.
+- **Normalise-once for parent text + `.raw`/`.norm` subfield**
+  (`document_index.rs:534,563-577,649-670`; `surch-analysis/src/lib.rs:415-454`)
+  — duplicate fold+lowercase passes are real. *Safe subset:* fuse lowercase+
+  asciifold into one per-token pass and drop the redundant `Vec<Token>` rebuild
+  (bit-stable). *Reject as written:* fold-then-tokenise changes token offsets
+  (asciifold changes byte length: ß→ss, Œ→OE) — `_analyze` offsets are an
+  ES-parity surface. Effort M.
+- **Fold the edge_ngram base token once and slice** (`mapping.rs:549-562`;
+  `lib.rs:341-371`) — the per-gram re-fold is genuine O(L²) at the production
+  `max_gram=20`. *Safe only via a rolling-fold* (append each new char's fold to
+  the prior gram's buffer) keeping Unicode-correct `to_lowercase`; a naive
+  pre-folded byte-slice breaks parity. Gate on the existing
+  `edge_ngram_subfield_fans_out_prefix_postings` test + a ß/Æ case. Effort M.
+- **Postings-driven candidate gathering for Range/Exists/Wildcard** (kills the
+  O(N) `_source` full-scan fallback, `search.rs:2174-2178`) — the full-scan is
+  real and general. *But:* the Prefix half is **already done**; **numeric Range**
+  cannot use a lexicographic FST scan (`'100' < '9'`) — needs a points/BKD index
+  not proposed; keyword scan paths normalise (lowercase+fold) so raw FST terms
+  need re-normalisation. *Safe subset:* Exists + keyword/date Range +
+  literal-prefix Wildcard only, with explicit normalisation and a numeric carve-out.
+- **Incremental delete/update via per-segment live-docs** (`state.rs:1052-1111`
+  full rebuild on any update/delete; unused `live_docs.rs` codec) — the quadratic
+  rebuild on update/delete-heavy bulk is real and general. *Parity-unsafe as
+  written:* retained-but-tombstoned postings inflate `doc_freq`/`doc_count`/
+  `avg_doc_len` (shifting IDF) and would emit deleted docs as hits unless
+  filtered; Surch's current baseline rebuilds so stats reflect deletes
+  immediately. Adoptable only by reproducing Lucene's exact stat-staleness +
+  refresh/merge timing (far beyond "flip a bit") — pair with the segmented
+  structural bet.
