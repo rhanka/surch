@@ -698,22 +698,39 @@ fn posting_candidate_ids(
                 .collect();
             let mut used_postings = !sets.is_empty();
 
-            // `should` with MSM >= 1: union of postings-backed clauses
-            // restricts the candidate pool. If any `should` clause cannot
-            // be answered from postings we conservatively skip the union
-            // contribution (must/filter still restricts; the final
-            // `query_matches` pass enforces MSM).
+            // `should` with MSM >= 1 restricts the candidate pool from
+            // postings. If any `should` clause cannot be answered from
+            // postings we conservatively skip the contribution (must/filter
+            // still restricts; the final `query_matches` pass enforces MSM).
             if !should.is_empty() && *minimum_should_match >= 1 {
-                let union_sets: Vec<BTreeSet<String>> = should
+                let should_sets: Vec<BTreeSet<String>> = should
                     .iter()
                     .filter_map(|q| posting_candidate_ids(state, index, q))
                     .collect();
-                if union_sets.len() == should.len() {
-                    let mut union = BTreeSet::new();
-                    for s in union_sets {
-                        union.extend(s);
+                if should_sets.len() == should.len() {
+                    if *minimum_should_match as usize == should.len() {
+                        // Optimisation #1 (beat-ES): MSM == n_should means
+                        // EVERY should clause is required — it is a conjunction
+                        // (the matchID deces query is `minimum_should_match:2`
+                        // over 2 shoulds). Push each should set individually so
+                        // the ascending-size intersection below ANDs them into
+                        // a small candidate set, instead of scoring the full
+                        // UNION (tens of thousands of docs for common name
+                        // terms on 1.36M). Parity-safe: a doc matching all
+                        // should clauses is exactly their intersection, and
+                        // `query_matches` still enforces MSM.
+                        for s in should_sets {
+                            sets.push(s);
+                        }
+                    } else {
+                        // True disjunction (MSM < n_should): the union of the
+                        // should clauses bounds the candidate space.
+                        let mut union = BTreeSet::new();
+                        for s in should_sets {
+                            union.extend(s);
+                        }
+                        sets.push(union);
                     }
-                    sets.push(union);
                     used_postings = true;
                 }
             }
