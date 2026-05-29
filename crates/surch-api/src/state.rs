@@ -1939,14 +1939,14 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
         let mut terms: Vec<(String, String)> = Vec::with_capacity(clauses.len());
-        for (field, value) in clauses {
+        for &(field, value) in clauses {
             let mut toks = normalized_terms_for_field(value, field, &data.mapping);
             // Single-token only: a multi-token match is a per-token OR/AND that
             // does not reduce to one posting list — let the caller fall back.
             if toks.len() != 1 {
                 return None;
             }
-            terms.push(((*field).to_string(), toks.remove(0)));
+            terms.push((field.to_string(), toks.remove(0)));
         }
         Some(data.conjunction_hits_internal(&terms))
     }
