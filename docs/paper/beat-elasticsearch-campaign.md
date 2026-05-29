@@ -247,6 +247,22 @@ before/after measurement (CI, representative HW) → verdict**.
 - **Verdict**: parity-safe ✅ (merged); latency delta pending the cache-off run.
 
 ## Backlog (ordered by leverage)
+0. **[IN PROGRESS] Dense-int-docid candidate intersection** — the deces residual
+   (87 ms vs ES 3.7 ms after the should-intersection win): `posting_candidate_ids`
+   intersects `BTreeSet<String>` of public `_id`s, and `documents_for_match`
+   clones a `String` per matching doc (tens of thousands per clause per query).
+   Intersect on internal `u32` doc-ids; resolve public ids only for the final
+   top-K window. Matches Lucene's dense int docids. (= backlog #10 from the hunt.)
+0b. **[BACKLOG — KEPT] Block-max WAND for bool `should` true disjunctions**
+   (`minimum_should_match < n_should`), reusing `MaxScoreExecutor` for the
+   `msm == 1` pure-disjunction case (each single-term `should` = one
+   `MaxScoreToken`). **Explicitly retained even though it does NOT help the
+   matchID deces workload** (deces is `msm == n_should`, a conjunction handled by
+   the should-intersection optimisation). It is a general engine win — any
+   disjunctive `bool` query benefits — and Lucene/ES apply block-max WAND here.
+   Parity caveat: a `function_score` with functions can produce scores ≤ 0, so
+   the WAND upper-bound must fall back to exhaustive in that case (mirrors the
+   ES limitation, issue #55222).
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
    hangs) — table stakes for a production engine + unlocks honest QPS numbers.
    See `docs/wp-a-perf-followups-concurrent-bulk-search-stall.md`.
