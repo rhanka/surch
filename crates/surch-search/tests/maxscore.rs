@@ -11,16 +11,18 @@
 
 use std::collections::BTreeMap;
 
+use surch_index::postings::Posting;
 use surch_search::maxscore::{MaxScoreExecutor, MaxScoreToken, BLOCK_SIZE};
 use surch_search::scoring::{bm25_score, Bm25Config};
 
 const EPSILON: f64 = 1e-9;
 
 /// A token described the way the production OR-match path describes it:
-/// postings `(doc_id, tf)`, a per-doc `doc_freq`, a repeat `boost`, and a
-/// `max_term_freq` per block so we can compute the block-max upper bound.
+/// postings (`{ doc_id, freq }`), a per-doc `doc_freq`, a repeat `boost`,
+/// and a `max_term_freq` per block so we can compute the block-max upper
+/// bound.
 struct Token {
-    postings: Vec<(u32, u64)>,
+    postings: Vec<Posting>,
     doc_freq: u64,
     boost: f64,
 }
@@ -55,7 +57,12 @@ impl Scenario {
             .postings
             .chunks(BLOCK_SIZE)
             .map(|chunk| {
-                let block_max_tf = chunk.iter().map(|(_, tf)| *tf).max().unwrap_or(1).max(1);
+                let block_max_tf = chunk
+                    .iter()
+                    .map(|p| u64::from(p.freq))
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
                 let score = bm25_score(
                     config,
                     self.doc_count,
@@ -102,12 +109,13 @@ impl Scenario {
     fn brute_force(&self) -> BTreeMap<u32, f64> {
         let mut scored: BTreeMap<u32, f64> = BTreeMap::new();
         for token in &self.tokens {
-            for &(doc_id, tf) in &token.postings {
+            for posting in &token.postings {
+                let tf = u64::from(posting.freq);
                 if tf == 0 {
                     continue;
                 }
-                if let Some(contrib) = self.score_doc(token, doc_id, tf) {
-                    *scored.entry(doc_id).or_insert(0.0) += contrib;
+                if let Some(contrib) = self.score_doc(token, posting.doc_id, tf) {
+                    *scored.entry(posting.doc_id).or_insert(0.0) += contrib;
                 }
             }
         }
@@ -178,12 +186,12 @@ fn run(scenario: &Scenario, limit: usize) -> (BTreeMap<u32, f64>, usize) {
 fn rare_common_scenario() -> Scenario {
     let n_blocks = 8u32;
     let n_docs = n_blocks * BLOCK_SIZE as u32;
-    let common: Vec<(u32, u64)> = (0..n_docs).map(|d| (d, 1)).collect();
+    let common: Vec<Posting> = (0..n_docs).map(|d| Posting::new(d, 1)).collect();
     // Rare token in 3 well-separated blocks, high tf.
-    let rare: Vec<(u32, u64)> = vec![
-        (1, 12),
-        (3 * BLOCK_SIZE as u32 + 7, 12),
-        (7 * BLOCK_SIZE as u32 + 3, 12),
+    let rare: Vec<Posting> = vec![
+        Posting::new(1, 12),
+        Posting::new(3 * BLOCK_SIZE as u32 + 7, 12),
+        Posting::new(7 * BLOCK_SIZE as u32 + 3, 12),
     ];
     let doc_len_by_id: BTreeMap<u32, u64> = (0..n_docs).map(|d| (d, 4)).collect();
     Scenario {
@@ -243,9 +251,9 @@ fn skip_executor_matches_brute_force_on_seeded_multi_token_corpus() {
         (0..n_docs).map(|d| (d, (next() % 20) as u64 + 1)).collect();
 
     let make_token = |modulo: u32, n: &mut dyn FnMut() -> u32, boost: f64| {
-        let postings: Vec<(u32, u64)> = (0..n_docs)
+        let postings: Vec<Posting> = (0..n_docs)
             .filter(|d| d % modulo == 0)
-            .map(|d| (d, (n() % 9) as u64 + 1))
+            .map(|d| Posting::new(d, (n() % 9) + 1))
             .collect();
         let doc_freq = postings.len() as u64;
         Token {

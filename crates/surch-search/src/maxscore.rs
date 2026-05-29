@@ -32,6 +32,7 @@
 
 use std::collections::BTreeMap;
 use surch_codec::postings_block::{BlockSkipEntry, BlockSkipList, PostingsBlockError};
+use surch_index::postings::Posting;
 
 /// Number of postings per logical block. Must match
 /// `surch_index::postings::BLOCK_SIZE` and the codec `FOR_BLOCK_SIZE`.
@@ -44,15 +45,20 @@ pub const BLOCK_SIZE: usize = surch_codec::postings_block::FOR_BLOCK_SIZE;
 /// (i+1)*128]`), and the token-level max contribution used to order
 /// tokens and gate `allow_new_docs`.
 ///
-/// `postings` carries `(doc_id, term_freq)` pairs. The per-doc score is
+/// `postings` borrows the live [`Posting`] slice (`{ doc_id, freq }`,
+/// sorted by ascending `doc_id`) straight from the in-memory term
+/// dictionary — the OR-match loop reads `doc_id` + `freq` directly, so
+/// the search path no longer deep-copies the posting list into an owned
+/// `Vec<(u32, u64)>` per query (optimisation #7). The per-doc score is
 /// computed by the caller-supplied closure passed to
-/// [`MaxScoreExecutor::run`], so this module stays free of BM25 / norms
-/// specifics and is reusable across single-field `Match` and per-field
-/// `multi_match`.
+/// [`MaxScoreExecutor::run`], which widens `freq` (`u32`) to the `u64`
+/// term-frequency the BM25 scorer expects, so this module stays free of
+/// BM25 / norms specifics and is reusable across single-field `Match` and
+/// per-field `multi_match`.
 #[derive(Debug, Clone)]
 pub struct MaxScoreToken<'a> {
-    /// `(doc_id, term_freq)` pairs, sorted by ascending `doc_id`.
-    pub postings: &'a [(u32, u64)],
+    /// Postings (`{ doc_id, freq }`), sorted by ascending `doc_id`.
+    pub postings: &'a [Posting],
     /// Per-block contribution upper bound, aligned with
     /// `postings.chunks(BLOCK_SIZE)`. `block_max_contribs.len()` must be
     /// `postings.len().div_ceil(BLOCK_SIZE)`.
@@ -224,8 +230,8 @@ impl MaxScoreExecutor {
                 continue;
             }
             let block_max = token.block_max_contribs[block_idx];
-            let block_first = block[0].0;
-            let block_last = block[block.len() - 1].0;
+            let block_first = block[0].doc_id;
+            let block_last = block[block.len() - 1].doc_id;
 
             // Block-level skip decision — identical to the Lot 1 linear
             // path: if new docs are gated off AND this block's tightest
@@ -267,7 +273,12 @@ impl MaxScoreExecutor {
             // Score the block. `allow_new_docs` controls whether a doc
             // not yet in `scored` may be inserted; docs already scored
             // are always updated (a rarer token may have seeded them).
-            for &(doc_id, tf) in block {
+            for posting in block {
+                let doc_id = posting.doc_id;
+                // Widen the stored `u32` freq to the `u64` term-frequency
+                // the scoring closure consumes — identical value, so the
+                // BM25 arithmetic downstream is bit-for-bit unchanged.
+                let tf = u64::from(posting.freq);
                 if tf == 0 {
                     continue;
                 }
@@ -292,7 +303,7 @@ impl MaxScoreExecutor {
 /// Build a [`BlockSkipList`] over a token's postings, deriving per-block
 /// `(min_doc_id, max_doc_id)` ranges from the 128-chunking. Returns
 /// `Ok(None)` when the posting list has 0 or 1 block (no skip benefit).
-fn build_skip_list(postings: &[(u32, u64)]) -> Result<Option<BlockSkipList>, PostingsBlockError> {
+fn build_skip_list(postings: &[Posting]) -> Result<Option<BlockSkipList>, PostingsBlockError> {
     if postings.len() <= BLOCK_SIZE {
         return Ok(None);
     }
@@ -301,8 +312,8 @@ fn build_skip_list(postings: &[(u32, u64)]) -> Result<Option<BlockSkipList>, Pos
         .enumerate()
         .map(|(idx, chunk)| BlockSkipEntry {
             block_index: idx,
-            min_doc_id: chunk[0].0,
-            max_doc_id: chunk[chunk.len() - 1].0,
+            min_doc_id: chunk[0].doc_id,
+            max_doc_id: chunk[chunk.len() - 1].doc_id,
         });
     Ok(Some(BlockSkipList::from_block_ranges(entries)?))
 }
@@ -351,13 +362,15 @@ mod tests {
                 }
                 let block_max = token.block_max_contribs[block_idx];
                 if !allow_new_docs && block_max < threshold {
-                    let block_first = block[0].0;
-                    let block_last = block[block.len() - 1].0;
+                    let block_first = block[0].doc_id;
+                    let block_last = block[block.len() - 1].doc_id;
                     if scored.range(block_first..=block_last).next().is_none() {
                         continue;
                     }
                 }
-                for &(doc_id, tf) in block {
+                for posting in block {
+                    let doc_id = posting.doc_id;
+                    let tf = u64::from(posting.freq);
                     if tf == 0 {
                         continue;
                     }
@@ -387,7 +400,7 @@ mod tests {
     /// `weight / (1 + term_freq fraction)` — monotone, finite, and
     /// bounded by `block_max_contribs` so the skip decision is sound.
     fn make_token<'a>(
-        postings: &'a [(u32, u64)],
+        postings: &'a [Posting],
         block_max: &'a mut Vec<f64>,
         weight: f64,
     ) -> MaxScoreToken<'a> {
@@ -408,7 +421,7 @@ mod tests {
 
     #[test]
     fn single_token_no_skip() {
-        let postings: Vec<(u32, u64)> = (0..300).map(|d| (d, 1)).collect();
+        let postings: Vec<Posting> = (0..300).map(|d| Posting::new(d, 1)).collect();
         let mut bm = Vec::new();
         let token = make_token(&postings, &mut bm, 2.0);
         let weights = [2.0];
@@ -427,12 +440,12 @@ mod tests {
         // has the higher max_contrib so it drives first; once K docs are
         // scored, the common token's blocks far from any rare doc are
         // skippable and the cursor must leapfrog them.
-        let common_postings: Vec<(u32, u64)> =
-            (0..(8 * BLOCK_SIZE as u32)).map(|d| (d, 1)).collect();
-        let rare_postings: Vec<(u32, u64)> = vec![
-            (0, 5),
-            (3 * BLOCK_SIZE as u32, 5),
-            (7 * BLOCK_SIZE as u32, 5),
+        let common_postings: Vec<Posting> =
+            (0..(8 * BLOCK_SIZE as u32)).map(|d| Posting::new(d, 1)).collect();
+        let rare_postings: Vec<Posting> = vec![
+            Posting::new(0, 5),
+            Posting::new(3 * BLOCK_SIZE as u32, 5),
+            Posting::new(7 * BLOCK_SIZE as u32, 5),
         ];
 
         let mut rare_bm = Vec::new();
@@ -474,12 +487,12 @@ mod tests {
         };
 
         // Three tokens of decreasing density over a 4*128 doc id space.
-        let make = |modulo: u32, n: &mut dyn FnMut() -> u32| -> Vec<(u32, u64)> {
-            let mut v: Vec<(u32, u64)> = (0..(4 * BLOCK_SIZE as u32))
+        let make = |modulo: u32, n: &mut dyn FnMut() -> u32| -> Vec<Posting> {
+            let mut v: Vec<Posting> = (0..(4 * BLOCK_SIZE as u32))
                 .filter(|d| d % modulo == 0)
-                .map(|d| (d, (n() % 7) as u64 + 1))
+                .map(|d| Posting::new(d, (n() % 7) + 1))
                 .collect();
-            v.sort_by_key(|p| p.0);
+            v.sort_by_key(|p| p.doc_id);
             v
         };
         let t0 = make(1, &mut next); // every doc
@@ -509,7 +522,7 @@ mod tests {
 
     #[test]
     fn rejects_misaligned_block_metas() {
-        let postings: Vec<(u32, u64)> = (0..300).map(|d| (d, 1)).collect();
+        let postings: Vec<Posting> = (0..300).map(|d| Posting::new(d, 1)).collect();
         // 300 postings => 3 blocks, but provide only 2 block maxes.
         let bad = MaxScoreToken {
             postings: &postings,

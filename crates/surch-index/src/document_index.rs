@@ -13,7 +13,8 @@ use thiserror::Error;
 
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
-    BlockMeta, PostingsBuilder, PostingsEnum, PostingsError, TermDictionary, TermsEnum,
+    BlockMeta, PostingsBuilder, PostingsEnum, PostingsError, PostingsList, TermDictionary,
+    TermsEnum,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
@@ -362,6 +363,14 @@ impl DocumentIndex {
     /// [`crate::postings::BlockMeta`] for the schema.
     pub fn block_metas(&self, field: &str, term: &str) -> Option<&[BlockMeta]> {
         self.terms.block_metas(field, term)
+    }
+
+    /// Runtime view that ties a term's postings to its FoR-aligned block
+    /// metadata in a single lookup. The search scoring path prefers this
+    /// over separate [`postings`]/[`block_metas`] calls so it can borrow
+    /// both zero-copy from the live term dictionary.
+    pub fn postings_with_block_metas(&self, field: &str, term: &str) -> Option<PostingsList<'_>> {
+        self.terms.postings_with_block_metas(field, term)
     }
 
     pub fn field_stats(&self, field: &str) -> Option<&FieldLengthStats> {

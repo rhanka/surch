@@ -8,7 +8,7 @@ use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, stored_fields_bytes_for, MemoryUsage},
-    postings::BlockMeta,
+    postings::{BlockMeta, Posting},
 };
 
 use crate::scroll::ScrollTable;
@@ -134,6 +134,67 @@ impl TermScoringStats {
         self.term_freq_by_doc_id
             .iter()
             .map(|(_, tf)| *tf)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Zero-copy borrowed counterpart of [`TermScoringStats`] (optimisation
+/// #7). A [`TermScoringStats`] copies the whole posting list into an owned
+/// `Vec<(u32, u64)>` (widening `freq` `u32` → `u64`) and clones the
+/// `block_metas` on every query for every distinct token. The scoring hot
+/// path does not need owned data — it only reads it while the single
+/// search read guard (optimisation #8) is held. `TermScoringView` borrows
+/// the live [`Posting`] slice and [`BlockMeta`] slice straight out of the
+/// in-memory term dictionary, eliminating both per-token allocations.
+///
+/// Parity: the postings come from the `TermDictionary` in ascending
+/// `doc_id` order with exactly one [`Posting`] per `(doc_id, field, term)`
+/// triple (the `analyzed_terms` invariant in
+/// `DocumentIndex::add_validated_document`). So this borrowed slice is
+/// element-for-element the same sequence the owned `term_freq_by_doc_id`
+/// held, only with `freq` kept as `u32` (widened to `u64` at the exact
+/// points the scorer consumes it). `doc_freq` equals `postings.len()`,
+/// matching the owned struct's `term_freq_by_doc_id.len()`.
+#[derive(Clone, Copy, Debug)]
+pub struct TermScoringView<'a> {
+    pub doc_freq: u64,
+    /// Borrowed postings, sorted ascending by `doc_id`, one entry per doc.
+    pub postings: &'a [Posting],
+    /// Borrowed per-block stats aligned with `postings.chunks(BLOCK_SIZE)`.
+    pub block_metas: &'a [BlockMeta],
+}
+
+impl<'a> TermScoringView<'a> {
+    /// Empty view (term absent / field unknown). `doc_freq == 0` so the
+    /// scorer skips it exactly as it skipped the default
+    /// [`TermScoringStats`].
+    pub fn empty() -> Self {
+        Self {
+            doc_freq: 0,
+            postings: &[],
+            block_metas: &[],
+        }
+    }
+
+    /// Term frequency for `doc_id`, or 0 when the doc is absent. Binary
+    /// search over the ascending-`doc_id` postings — identical lookup
+    /// semantics to [`TermScoringStats::term_freq`], widening the stored
+    /// `u32` freq to `u64`.
+    pub fn term_freq(&self, doc_id: u32) -> u64 {
+        self.postings
+            .binary_search_by_key(&doc_id, |posting| posting.doc_id)
+            .ok()
+            .map(|idx| u64::from(self.postings[idx].freq))
+            .unwrap_or(0)
+    }
+
+    /// Greatest term frequency across the postings (widened to `u64`).
+    /// Matches [`TermScoringStats::max_term_freq`].
+    pub fn max_term_freq(&self) -> u64 {
+        self.postings
+            .iter()
+            .map(|posting| u64::from(posting.freq))
             .max()
             .unwrap_or(0)
     }
@@ -504,6 +565,42 @@ impl InMemoryIndex {
         }
     }
 
+    /// Zero-copy borrowed term stats (optimisation #7). Returns a
+    /// [`TermScoringView`] that borrows the postings + block metas
+    /// directly from the term dictionary instead of copying them into
+    /// owned `Vec`s like [`Self::term_scoring_stats`] does.
+    ///
+    /// Parity with the owned path: `doc_freq` is `postings.len()` (one
+    /// posting per `(doc_id, field, term)` triple — see the invariant
+    /// documented on `term_scoring_stats`), so it equals the owned
+    /// struct's `term_freq_by_doc_id.len()`. The `debug_assert_eq!`
+    /// mirrors the owned path's block-meta alignment guard so a codec
+    /// regression is caught in debug builds. An absent field/term yields
+    /// an empty view (`doc_freq == 0`), exactly like the default
+    /// `TermScoringStats`.
+    fn term_scoring_view(&self, field: &str, term: &str) -> TermScoringView<'_> {
+        match self.index.postings_with_block_metas(field, term) {
+            Some(list) => {
+                let postings = list.postings();
+                let block_metas = list.block_metas();
+                debug_assert_eq!(
+                    block_metas.len(),
+                    postings.len().div_ceil(128),
+                    "block_metas alignment with postings chunks broken \
+                     (field={field}, term={term}, postings={}, metas={})",
+                    postings.len(),
+                    block_metas.len(),
+                );
+                TermScoringView {
+                    doc_freq: postings.len() as u64,
+                    postings,
+                    block_metas,
+                }
+            }
+            None => TermScoringView::empty(),
+        }
+    }
+
     fn match_hits(&self, field: &str, value: &str, require_all_terms: bool) -> Vec<String> {
         self.match_hits_internal(field, value, require_all_terms)
             .into_iter()
@@ -562,6 +659,76 @@ impl InMemoryIndex {
                     source: Arc::clone(source),
                 })
             })
+            .collect()
+    }
+}
+
+/// Borrowed read-only view of one index, scoped to a single
+/// `store.read()` guard (optimisation #8). The search path used to take
+/// one read lock per candidate-resolution call, per scoring-stats lookup
+/// (one per distinct query token, each ALSO re-running
+/// `ensure_terms_ready`), and again per `_source` hydration — `~2N+`
+/// acquisitions on a writer-preferring `std::sync::RwLock`. `IndexReader`
+/// borrows `&InMemoryIndex` once and threads it through the whole query:
+/// candidate resolution, scoring-context construction, term-stats lookup,
+/// and hydration all read through this single borrow, so the lock is
+/// acquired exactly once (after `ensure_terms_ready` has run up front).
+///
+/// Because it is a plain borrow of the live index, the term-stats lookups
+/// it exposes ([`Self::term_scoring_view`]) hand out zero-copy
+/// [`TermScoringView`]s (optimisation #7) instead of the owned
+/// [`TermScoringStats`] copies the lock-per-token path produced.
+pub struct IndexReader<'a> {
+    index: &'a str,
+    data: &'a InMemoryIndex,
+}
+
+impl<'a> IndexReader<'a> {
+    /// The index mapping (borrowed). Threading this avoids the separate
+    /// `index_mapping` read-lock acquisition the scoring context used to
+    /// take.
+    pub fn mapping(&self) -> &'a IndexMapping {
+        &self.data.mapping
+    }
+
+    /// Per-field scoring stats (doc count, avg doc len, norms). Owned, but
+    /// computed once per query per field — identical to
+    /// [`AppState::field_scoring_stats`].
+    pub fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats> {
+        self.data.field_scoring_stats(field)
+    }
+
+    /// Zero-copy borrowed term stats (optimisation #7). Equivalent data to
+    /// [`AppState::term_scoring_stats`] but borrowed from the live term
+    /// dictionary instead of copied into owned `Vec`s.
+    pub fn term_scoring_view(&self, field: &str, term: &str) -> TermScoringView<'a> {
+        self.data.term_scoring_view(field, term)
+    }
+
+    /// Internal candidate ids for an OR/AND `match` over `field`.
+    /// Identical to [`AppState::documents_for_match_internal`] but reads
+    /// through the shared guard.
+    pub fn match_hits_internal(
+        &self,
+        field: &str,
+        value: &str,
+        require_all_terms: bool,
+    ) -> Vec<u32> {
+        self.data.match_hits_internal(field, value, require_all_terms)
+    }
+
+    /// Hydrate `_source` documents for internal ids through the shared
+    /// guard. Identical to [`AppState::documents_by_internal_ids`].
+    pub fn documents_by_internal_ids(&self, internal_ids: &[u32]) -> Vec<StoredDocument> {
+        self.data.documents_by_internal_ids(self.index, internal_ids)
+    }
+
+    /// Map public ids to internal doc ids through the shared guard.
+    /// Identical to [`AppState::internal_doc_ids`].
+    pub fn internal_doc_ids(&self, public_ids: &[&str]) -> Vec<Option<u32>> {
+        public_ids
+            .iter()
+            .map(|id| self.data.document_ids.get(*id).copied())
             .collect()
     }
 }
@@ -1641,6 +1808,45 @@ impl AppState {
             .map_or_else(TermScoringStats::default, |data| {
                 data.term_scoring_stats(field, term)
             })
+    }
+
+    /// Optimisation #7 + #8: run `f` against a single scoped read guard.
+    ///
+    /// `ensure_terms_ready` is invoked FIRST (it may take the write lock to
+    /// materialise the deferred FST term dictionary) so the subsequent read
+    /// guard is held over a consistent, materialised snapshot. Because
+    /// `std::sync::RwLock` is writer-preferring and non-reentrant, doing the
+    /// (possibly write-locking) materialisation before acquiring the read
+    /// guard is what keeps this deadlock-free: `f` must never call back into
+    /// an `AppState` method that takes `store.read()` or `store.write()`
+    /// while the guard is live — it should read exclusively through the
+    /// [`IndexReader`] it is handed.
+    ///
+    /// The closure receives `Some(reader)` when `index` exists, `None`
+    /// otherwise. Threading the whole query (candidate resolution, scoring
+    /// context, term-stats lookup, hydration) through this single guard
+    /// collapses the prior `~2N+` per-query read-lock acquisitions (one per
+    /// scoring-stats lookup, each also re-running `ensure_terms_ready`, plus
+    /// candidate + hydration reads) down to one materialise + one read.
+    pub fn with_search_reader<R>(
+        &self,
+        index: &str,
+        f: impl FnOnce(Option<IndexReader<'_>>) -> R,
+    ) -> R {
+        // Materialise the deferred FST build up front (may write-lock).
+        // MUST happen before we hold the read guard below: the lock is
+        // non-reentrant and writer-preferring, so taking the write lock
+        // while a read guard is live would deadlock.
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let reader = store
+            .indices
+            .get(index)
+            .map(|data| IndexReader { index, data });
+        f(reader)
     }
 
     /// Approximate memory usage for `index`. Returns `None` when the

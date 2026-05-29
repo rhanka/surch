@@ -19,7 +19,7 @@ use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
 use crate::{
     index::validate_index_name,
     scroll::{parse_scroll_ttl, ScrollContext},
-    state::{AppState, FieldScoringStats, StoredDocument, TermScoringStats},
+    state::{AppState, FieldScoringStats, IndexReader, StoredDocument, TermScoringView},
     topn::TopN,
     OpenSearchError,
 };
@@ -1778,14 +1778,30 @@ fn topk_scored_documents(
     query: &SearchQuery,
     limit: usize,
 ) -> Option<(Vec<ScoredDocument>, u64)> {
+    // Optimisations #7 + #8: the entire top-K query — candidate
+    // resolution, scoring-context construction (with zero-copy borrowed
+    // term stats), the scoring loop, and `_source` hydration — runs under
+    // ONE scoped read guard. `ensure_terms_ready` is run up front by
+    // `with_search_reader` (it may write-lock) so the read guard never
+    // races a deferred-build write, and nothing inside the closure takes a
+    // second lock.
+    state.with_search_reader(index, |reader| {
+        let reader = reader?;
+        topk_scored_documents_inner(&reader, query, limit)
+    })
+}
+
+fn topk_scored_documents_inner(
+    reader: &IndexReader<'_>,
+    query: &SearchQuery,
+    limit: usize,
+) -> Option<(Vec<ScoredDocument>, u64)> {
     let candidates: Vec<u32> = match query {
         SearchQuery::Match {
             field,
             value,
             operator,
-        } => {
-            state.documents_for_match_internal(index, field, value, *operator == MatchOperator::And)
-        }
+        } => reader.match_hits_internal(field, value, *operator == MatchOperator::And),
         SearchQuery::MultiMatch {
             query,
             fields,
@@ -1793,8 +1809,7 @@ fn topk_scored_documents(
         } => {
             let mut matches = BTreeSet::new();
             for field in fields {
-                matches.extend(state.documents_for_match_internal(
-                    index,
+                matches.extend(reader.match_hits_internal(
                     field,
                     query,
                     *operator == MatchOperator::And,
@@ -1810,7 +1825,7 @@ fn topk_scored_documents(
         return Some((Vec::new(), total));
     }
 
-    let scoring_context = SearchScoringContext::new(state, index, query);
+    let scoring_context = SearchScoringContext::new(reader, query);
 
     // MaxScore-style skipping for OR-Match queries: iterate tokens from
     // highest to lowest max BM25 contribution. Once the top-K threshold
@@ -1827,7 +1842,7 @@ fn topk_scored_documents(
         } if *operator != MatchOperator::And => {
             if let Some(scored_pairs) = maxscore_match(field, value, limit, &scoring_context, total)
             {
-                return finalize_topk(state, index, scored_pairs, total, limit);
+                return finalize_topk(reader, scored_pairs, total, limit);
             }
         }
         SearchQuery::MultiMatch {
@@ -1837,7 +1852,7 @@ fn topk_scored_documents(
         } if *operator != MatchOperator::And => {
             if let Some(scored_pairs) = maxscore_multi_match(fields, value, limit, &scoring_context)
             {
-                return finalize_topk(state, index, scored_pairs, total, limit);
+                return finalize_topk(reader, scored_pairs, total, limit);
             }
         }
         _ => {}
@@ -1855,12 +1870,11 @@ fn topk_scored_documents(
         })
         .collect();
 
-    finalize_topk(state, index, scored, total, limit)
+    finalize_topk(reader, scored, total, limit)
 }
 
 fn finalize_topk(
-    state: &AppState,
-    index: &str,
+    reader: &IndexReader<'_>,
     scored: Vec<(f64, u32)>,
     total: u64,
     limit: usize,
@@ -1881,7 +1895,8 @@ fn finalize_topk(
     let scored = topn.into_sorted_vec();
 
     let winner_ids: Vec<u32> = scored.iter().map(|(_, id)| *id).collect();
-    let hydrated = state.documents_by_internal_ids(index, &winner_ids);
+    // Hydrate through the same scoped guard — no extra lock acquisition.
+    let hydrated = reader.documents_by_internal_ids(&winner_ids);
 
     let result = scored
         .into_iter()
@@ -1903,7 +1918,7 @@ fn maxscore_multi_match(
     fields: &[String],
     value: &str,
     limit: usize,
-    ctx: &SearchScoringContext,
+    ctx: &SearchScoringContext<'_>,
 ) -> Option<Vec<(f64, u32)>> {
     if fields.is_empty() {
         return None;
@@ -1947,14 +1962,14 @@ fn maxscore_match(
     field: &str,
     value: &str,
     limit: usize,
-    ctx: &SearchScoringContext,
+    ctx: &SearchScoringContext<'_>,
     total_hint: u64,
 ) -> Option<Vec<(f64, u32)>> {
     let field_stats = ctx.field_stats(field)?;
     if field_stats.doc_count == 0 {
         return None;
     }
-    let tokens = ctx.mapping.analyzer(field).terms(value);
+    let tokens = ctx.mapping().analyzer(field).terms(value);
     if tokens.is_empty() {
         return None;
     }
@@ -1980,7 +1995,7 @@ fn maxscore_match(
     }
 
     struct TokenInfo<'a> {
-        stats: &'a TermScoringStats,
+        stats: &'a TermScoringView<'a>,
         scorer: Bm25TermScorer,
         max_contrib: f64,
         boost: f64,
@@ -2058,7 +2073,10 @@ fn maxscore_match(
         .iter()
         .enumerate()
         .map(|(token_idx, token)| MaxScoreToken {
-            postings: token.stats.term_freq_by_doc_id.as_slice(),
+            // Zero-copy: borrow the live posting slice from the term
+            // dictionary (optimisation #7) — `MaxScoreExecutor` now reads
+            // `doc_id`/`freq` straight from `&[Posting]`.
+            postings: token.stats.postings,
             block_max_contribs: block_max_contribs[token_idx].as_slice(),
             max_contrib: token.max_contrib,
         })
@@ -2178,29 +2196,47 @@ fn score_documents(
             .collect();
     };
 
-    let scoring_context = SearchScoringContext::new(state, index, query);
-    let public_ids = documents
-        .iter()
-        .map(|doc| doc.id.as_str())
-        .collect::<Vec<_>>();
-    let internal_ids = state.internal_doc_ids(index, &public_ids);
+    // Optimisations #7 + #8: build the scoring context (zero-copy borrowed
+    // term stats) and resolve internal ids under ONE scoped read guard, so
+    // the per-token term-stats lookups no longer take a lock each (and no
+    // longer re-run `ensure_terms_ready`) and no longer copy posting lists.
+    // `documents` are already hydrated by the caller's candidate resolution;
+    // an absent index yields a `None` reader and the all-1.0 fallback
+    // (matching the prior `internal_doc_ids` → `vec![None; …]` behaviour).
+    state.with_search_reader(index, |reader| -> Vec<ScoredDocument> {
+        let Some(reader) = reader else {
+            return documents
+                .into_iter()
+                .map(|doc| ScoredDocument { doc, score: 1.0 })
+                .collect();
+        };
 
-    documents
-        .into_iter()
-        .zip(internal_ids)
-        .map(|(doc, internal_id)| {
-            let score = internal_id
-                .map(|id| score_for_query(query, id, &scoring_context, Some(doc.source.as_ref())))
-                .unwrap_or(1.0);
-            ScoredDocument { doc, score }
-        })
-        .collect()
+        let scoring_context = SearchScoringContext::new(&reader, query);
+        let public_ids = documents
+            .iter()
+            .map(|doc| doc.id.as_str())
+            .collect::<Vec<_>>();
+        let internal_ids = reader.internal_doc_ids(&public_ids);
+
+        documents
+            .into_iter()
+            .zip(internal_ids)
+            .map(|(doc, internal_id)| {
+                let score = internal_id
+                    .map(|id| {
+                        score_for_query(query, id, &scoring_context, Some(doc.source.as_ref()))
+                    })
+                    .unwrap_or(1.0);
+                ScoredDocument { doc, score }
+            })
+            .collect()
+    })
 }
 
 fn score_for_query(
     query: &SearchQuery,
     internal_doc_id: u32,
-    scoring_context: &SearchScoringContext,
+    scoring_context: &SearchScoringContext<'_>,
     source: Option<&Value>,
 ) -> f64 {
     match query {
@@ -2270,7 +2306,7 @@ fn score_for_query(
             }
 
             let combined_factor =
-                combine_scoring_functions(functions, *score_mode, source, &scoring_context.mapping);
+                combine_scoring_functions(functions, *score_mode, source, scoring_context.mapping());
             combine_with_boost_mode(inner_score, combined_factor, *boost_mode)
         }
         // `geo_distance` is a filter — constant score so it does not
@@ -2444,58 +2480,90 @@ fn lookup_text_field(source: &Value, field: &str) -> Option<String> {
     }
 }
 
+/// Per-query scoring context. Borrows everything it can from the live
+/// index through a single [`IndexReader`] guard (optimisations #7 + #8):
+///
+/// * `mapping` is borrowed (`&'a IndexMapping`) instead of cloned per
+///   query.
+/// * `term_stats_by_field` holds zero-copy [`TermScoringView`]s — the
+///   postings + block metas are borrowed straight out of the term
+///   dictionary, so the prior per-token deep copy into owned
+///   `Vec<(u32, u64)>` / `Vec<BlockMeta>` is gone (#7).
+///
+/// `field_stats_by_field` stays owned: a [`FieldScoringStats`] is built
+/// once per query *per field* (not per token), and the read path it backs
+/// (per-doc `doc_len` binary search) wants a stable owned snapshot. That
+/// copy is out of scope for #7, which targets the per-*token* posting-list
+/// copy.
 #[derive(Debug, Default)]
-struct SearchScoringContext {
-    mapping: IndexMapping,
+struct SearchScoringContext<'a> {
+    mapping: Option<&'a IndexMapping>,
     field_stats_by_field: BTreeMap<String, FieldScoringStats>,
-    term_stats_by_field: BTreeMap<String, BTreeMap<String, TermScoringStats>>,
+    term_stats_by_field: BTreeMap<String, BTreeMap<String, TermScoringView<'a>>>,
 }
 
-impl SearchScoringContext {
-    fn new(state: &AppState, index: &str, query: &SearchQuery) -> Self {
-        let mapping = state.index_mapping(index).unwrap_or_default();
+impl<'a> SearchScoringContext<'a> {
+    /// Build the context from a borrowed [`IndexReader`]. All term/field
+    /// statistics are read through the single search read guard the reader
+    /// holds, so there is no per-token lock acquisition and no per-token
+    /// posting-list copy.
+    fn new(reader: &IndexReader<'a>, query: &SearchQuery) -> Self {
+        let mapping = reader.mapping();
         let mut field_tokens = BTreeMap::<String, BTreeSet<String>>::new();
-        collect_scoring_field_tokens(query, &mapping, &mut field_tokens);
+        collect_scoring_field_tokens(query, mapping, &mut field_tokens);
         if field_tokens.is_empty() {
             return Self {
-                mapping,
+                mapping: Some(mapping),
                 ..Self::default()
             };
         }
 
         let mut field_stats_by_field = BTreeMap::new();
         for field in field_tokens.keys() {
-            if let Some(stats) = state.field_scoring_stats(index, field) {
+            if let Some(stats) = reader.field_scoring_stats(field) {
                 field_stats_by_field.insert(field.clone(), stats);
             }
         }
 
-        let mut term_stats_by_field = BTreeMap::<String, BTreeMap<String, TermScoringStats>>::new();
+        let mut term_stats_by_field =
+            BTreeMap::<String, BTreeMap<String, TermScoringView<'a>>>::new();
         for (field, tokens) in field_tokens {
             let token_stats = term_stats_by_field.entry(field.clone()).or_default();
             for token in tokens {
-                let stats = state.term_scoring_stats(index, &field, &token);
-                token_stats.insert(token, stats);
+                let view = reader.term_scoring_view(&field, &token);
+                token_stats.insert(token, view);
             }
         }
 
         Self {
-            mapping,
+            mapping: Some(mapping),
             field_stats_by_field,
             term_stats_by_field,
         }
+    }
+
+    /// The index mapping. Empty/default mapping when the index was absent
+    /// (mirrors the old `state.index_mapping(index).unwrap_or_default()`).
+    fn mapping(&self) -> &IndexMapping {
+        self.mapping.unwrap_or(&EMPTY_MAPPING)
     }
 
     fn field_stats(&self, field: &str) -> Option<&FieldScoringStats> {
         self.field_stats_by_field.get(field)
     }
 
-    fn term_stats(&self, field: &str, token: &str) -> Option<&TermScoringStats> {
+    fn term_stats(&self, field: &str, token: &str) -> Option<&TermScoringView<'a>> {
         self.term_stats_by_field
             .get(field)
             .and_then(|tokens| tokens.get(token))
     }
 }
+
+/// Shared empty mapping so [`SearchScoringContext::mapping`] can hand out
+/// a `&IndexMapping` even when the index does not exist, matching the old
+/// `unwrap_or_default()` behaviour without allocating per call.
+static EMPTY_MAPPING: std::sync::LazyLock<IndexMapping> =
+    std::sync::LazyLock::new(IndexMapping::default);
 
 fn collect_scoring_field_tokens(
     query: &SearchQuery,
@@ -2558,12 +2626,12 @@ fn insert_scoring_tokens(
 }
 
 fn bm25_field_score(
-    scoring_context: &SearchScoringContext,
+    scoring_context: &SearchScoringContext<'_>,
     field: &str,
     query: &str,
     internal_doc_id: u32,
 ) -> Option<f64> {
-    let query_tokens = scoring_context.mapping.analyzer(field).terms(query);
+    let query_tokens = scoring_context.mapping().analyzer(field).terms(query);
     let field_stats = scoring_context.field_stats(field)?;
     if query_tokens.is_empty() || field_stats.doc_count == 0 {
         return None;
