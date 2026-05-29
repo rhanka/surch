@@ -219,6 +219,33 @@ before/after measurement (CI, representative HW) → verdict**.
   as an allocation-reduction that compounds with #1, not a standalone headline).
 - **Verdict**: parity-safe ✅; magnitude pending the next deces 3-rep.
 
+### #7+#8 — Single scoped read guard + zero-copy borrowed postings — `f66519b`
+- **Hypothesis (the read-path bottleneck #6 revealed)**: the search path took
+  `~2N+` `store.read()` acquisitions per query (each `term_scoring_stats` also
+  re-ran `ensure_terms_ready`) and **deep-copied every posting list** into an
+  owned `Vec<(u32,u64)>` + `block_metas.to_vec()` per token. The ~300 ms
+  cache-off latency is dominated by this decode/copy + lock churn, not BM25.
+- **Change**: `crates/surch-api/src/{state,search}.rs`,
+  `crates/surch-search/src/maxscore.rs` — `ensure_terms_ready` runs ONCE up
+  front (may write-lock), then **one** scoped read guard (`with_search_reader`)
+  is threaded through candidate resolution, scoring, and `_source` hydration;
+  term stats are a **zero-copy `TermScoringView`** borrowing `&[Posting]` (now
+  `Copy {doc_id,freq}` after #9) + `&[BlockMeta]` directly from the live index —
+  no per-query posting copy, no second lock. Matches Lucene's one
+  `IndexSearcher`/`LeafReader` per query. **Deadlock-safe** (verified:
+  `ensure_terms_ready` strictly precedes the read guard; `std::RwLock` is
+  non-reentrant/writer-preferring).
+- **Parity**: bit-stable — full workspace suite green on cloud `ci` (oracles,
+  `bulk_router_*`, scoring, surch-index/search), clippy + fmt clean. (Recovered
+  and re-validated from a parallel worktree agent after a session crash.)
+- **Matches/beats**: Lucene single-reader-per-query + streamed `PostingsEnum`
+  (no per-query list copy).
+- **Measurement**: PENDING — `trec-covid-latency` **cache-OFF** (the compute
+  path #6 left untouched): does removing the per-query posting copy + lock churn
+  close the raw-engine gap vs OpenSearch (Surch 309 ms → ? vs OS 169 ms p50)?
+  Plus cache-on no-regression + b2-oracle parity.
+- **Verdict**: parity-safe ✅ (merged); latency delta pending the cache-off run.
+
 ## Backlog (ordered by leverage)
 1. **Fix the reader/writer concurrency wedge** (search during sustained bulk
    hangs) — table stakes for a production engine + unlocks honest QPS numbers.
