@@ -409,6 +409,25 @@ impl InMemoryIndex {
         self.term_hits(field, value).len()
     }
 
+    /// Optimisation #10 (beat-ES): internal `u32` doc-ids for a term, WITHOUT
+    /// the per-doc public-`_id` `String` clone `term_hits` pays. Candidate
+    /// resolution intersects these dense ints; public ids are resolved only for
+    /// the final top-K window. Same doc set as `term_hits` (parity-safe).
+    fn term_hits_internal(&self, field: &str, value: &str) -> Vec<u32> {
+        if field.trim().is_empty() || value.is_empty() {
+            return Vec::new();
+        }
+        let token = normalized_term_for_field(value, field, &self.mapping);
+        if token.is_empty() {
+            return Vec::new();
+        }
+        self.index
+            .postings(field, &token)
+            .into_iter()
+            .flat_map(|postings| postings.map(|posting| posting.doc_id))
+            .collect()
+    }
+
     /// A6 phases 2 & 3: postings-backed prefix lookup.
     ///
     /// Three branches, in priority order:
@@ -480,6 +499,47 @@ impl InMemoryIndex {
                     .filter_map(|doc_id| self.reverse_document_ids.get(doc_id).cloned())
                     .collect::<Vec<_>>();
                 Some(hits)
+            }
+            _ => None,
+        }
+    }
+
+    /// Optimisation #10 (beat-ES): internal `u32` doc-ids for a prefix, mirror
+    /// of `prefix_hits` without the public-`_id` `String` clone. Same branches,
+    /// same doc set (parity-safe).
+    fn prefix_hits_internal(&self, field: &str, prefix: &str) -> Option<Vec<u32>> {
+        if field.trim().is_empty() || prefix.is_empty() {
+            return None;
+        }
+        let field_mapping = self.mapping.field(field)?;
+        if let Some(bounds) = field_mapping.index_prefixes {
+            let normalized = normalized_term_for_field(prefix, field, &self.mapping);
+            if normalized.is_empty() {
+                return None;
+            }
+            let prefix_len = normalized.chars().count();
+            if prefix_len < bounds.min_chars || prefix_len > bounds.max_chars {
+                return None;
+            }
+            let hits = self
+                .index
+                .prefix_postings(field, &normalized)
+                .map(|set| set.iter().copied().collect::<Vec<u32>>())
+                .unwrap_or_default();
+            return Some(hits);
+        }
+        match field_mapping.field_type {
+            FieldType::Keyword | FieldType::Date => {
+                let normalized = normalized_term_for_field(prefix, field, &self.mapping);
+                if normalized.is_empty() {
+                    return None;
+                }
+                Some(
+                    self.index
+                        .term_prefix_doc_ids(field, &normalized)
+                        .into_iter()
+                        .collect(),
+                )
             }
             _ => None,
         }
@@ -1694,6 +1754,37 @@ impl AppState {
             .indices
             .get(index)
             .map_or_else(Vec::new, |data| data.term_hits(field, value))
+    }
+
+    /// Optimisation #10: internal `u32` doc-ids for a term (no `String` clone).
+    pub fn documents_for_term_internal(&self, index: &str, field: &str, value: &str) -> Vec<u32> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map_or_else(Vec::new, |data| data.term_hits_internal(field, value))
+    }
+
+    /// Optimisation #10: internal `u32` doc-ids for a prefix (no `String` clone).
+    pub fn documents_for_prefix_internal(
+        &self,
+        index: &str,
+        field: &str,
+        prefix: &str,
+    ) -> Option<Vec<u32>> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .and_then(|data| data.prefix_hits_internal(field, prefix))
     }
 
     /// A6 phase 2: postings-backed prefix lookup. Returns `Some(ids)` iff

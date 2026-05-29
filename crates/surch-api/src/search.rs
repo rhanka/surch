@@ -630,11 +630,16 @@ fn posting_candidate_ids(
     state: &AppState,
     index: &str,
     query: &SearchQuery,
-) -> Option<BTreeSet<String>> {
+) -> Option<BTreeSet<u32>> {
+    // Optimisation #10 (beat-ES): candidate resolution + intersection works on
+    // internal `u32` doc-ids (cheap integer compares, no allocation) instead of
+    // public `_id` `BTreeSet<String>` (which clones a `String` per matching doc
+    // — tens of thousands per clause per query on common name terms, the deces
+    // 87 ms residual). Public ids are resolved only for the final top-K window.
     match query {
         SearchQuery::Term { field, value } => Some(
             state
-                .documents_for_term(index, field, value)
+                .documents_for_term_internal(index, field, value)
                 .into_iter()
                 .collect(),
         ),
@@ -644,7 +649,7 @@ fn posting_candidate_ids(
             operator,
         } => Some(
             state
-                .documents_for_match(index, field, value, *operator == MatchOperator::And)
+                .documents_for_match_internal(index, field, value, *operator == MatchOperator::And)
                 .into_iter()
                 .collect(),
         ),
@@ -654,7 +659,7 @@ fn posting_candidate_ids(
         // we return `None` so the candidate-set path falls back to the
         // full-scan `query_matches` (which still uses `prefix_field_matches`).
         SearchQuery::Prefix { field, value } => state
-            .documents_for_prefix(index, field, value)
+            .documents_for_prefix_internal(index, field, value)
             .map(|ids| ids.into_iter().collect()),
         SearchQuery::MultiMatch {
             query,
@@ -663,7 +668,7 @@ fn posting_candidate_ids(
         } => {
             let mut matches = BTreeSet::new();
             for field in fields {
-                matches.extend(state.documents_for_match(
+                matches.extend(state.documents_for_match_internal(
                     index,
                     field,
                     query,
@@ -691,7 +696,7 @@ fn posting_candidate_ids(
             // candidate space when `minimum_should_match >= 1`, in which
             // case the union of postings-backed `should` clauses limits the
             // candidate space.
-            let mut sets: Vec<BTreeSet<String>> = must
+            let mut sets: Vec<BTreeSet<u32>> = must
                 .iter()
                 .chain(filter.iter())
                 .filter_map(|q| posting_candidate_ids(state, index, q))
@@ -703,7 +708,7 @@ fn posting_candidate_ids(
             // postings we conservatively skip the contribution (must/filter
             // still restricts; the final `query_matches` pass enforces MSM).
             if !should.is_empty() && *minimum_should_match >= 1 {
-                let should_sets: Vec<BTreeSet<String>> = should
+                let should_sets: Vec<BTreeSet<u32>> = should
                     .iter()
                     .filter_map(|q| posting_candidate_ids(state, index, q))
                     .collect();
@@ -736,7 +741,7 @@ fn posting_candidate_ids(
             }
 
             sets.sort_by_key(|s| s.len());
-            let mut matches: Option<BTreeSet<String>> = None;
+            let mut matches: Option<BTreeSet<u32>> = None;
             for current in sets {
                 matches = Some(match matches {
                     Some(previous) => previous.intersection(&current).cloned().collect(),
@@ -2173,7 +2178,8 @@ fn match_documents_for_index(
             SearchQuery::Bool { .. } => {
                 if let Some(ids) = posting_candidate_ids(state, index, query) {
                     let ids = ids.into_iter().collect::<Vec<_>>();
-                    documents_for_ids(state, index, &ids)
+                    state
+                        .documents_by_internal_ids(index, &ids)
                         .into_iter()
                         .filter(|document| query_matches(query, &document.source, &mapping))
                         .collect()
@@ -2188,7 +2194,7 @@ fn match_documents_for_index(
             SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. } => {
                 if let Some(ids) = posting_candidate_ids(state, index, query) {
                     let ids = ids.into_iter().collect::<Vec<_>>();
-                    documents_for_ids(state, index, &ids)
+                    state.documents_by_internal_ids(index, &ids)
                 } else {
                     state
                         .documents(index)
