@@ -2365,7 +2365,7 @@ async fn bool_conjunction_leapfrog_matches_btreeset_intersection_across_blocks()
     let router = app_router();
     for i in 0..300usize {
         let first = if i < 260 { "alpha" } else { "zzz" };
-        let last = if i % 2 == 0 { "beta" } else { "delta" };
+        let last = if i.is_multiple_of(2) { "beta" } else { "delta" };
         index_product(
             &router,
             &format!("d{i}"),
@@ -2390,7 +2390,10 @@ async fn bool_conjunction_leapfrog_matches_btreeset_intersection_across_blocks()
     for h in hits {
         let id = h["_id"].as_str().expect("id");
         let n: usize = id.trim_start_matches('d').parse().expect("numeric id");
-        assert!(n < 260 && n % 2 == 0, "unexpected non-matching doc {id}");
+        assert!(
+            n < 260 && n.is_multiple_of(2),
+            "unexpected non-matching doc {id}"
+        );
     }
 }
 
