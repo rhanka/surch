@@ -440,8 +440,9 @@ mod tests {
         // has the higher max_contrib so it drives first; once K docs are
         // scored, the common token's blocks far from any rare doc are
         // skippable and the cursor must leapfrog them.
-        let common_postings: Vec<Posting> =
-            (0..(8 * BLOCK_SIZE as u32)).map(|d| Posting::new(d, 1)).collect();
+        let common_postings: Vec<Posting> = (0..(8 * BLOCK_SIZE as u32))
+            .map(|d| Posting::new(d, 1))
+            .collect();
         let rare_postings: Vec<Posting> = vec![
             Posting::new(0, 5),
             Posting::new(3 * BLOCK_SIZE as u32, 5),

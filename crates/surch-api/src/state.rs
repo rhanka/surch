@@ -714,13 +714,15 @@ impl<'a> IndexReader<'a> {
         value: &str,
         require_all_terms: bool,
     ) -> Vec<u32> {
-        self.data.match_hits_internal(field, value, require_all_terms)
+        self.data
+            .match_hits_internal(field, value, require_all_terms)
     }
 
     /// Hydrate `_source` documents for internal ids through the shared
     /// guard. Identical to [`AppState::documents_by_internal_ids`].
     pub fn documents_by_internal_ids(&self, internal_ids: &[u32]) -> Vec<StoredDocument> {
-        self.data.documents_by_internal_ids(self.index, internal_ids)
+        self.data
+            .documents_by_internal_ids(self.index, internal_ids)
     }
 
     /// Map public ids to internal doc ids through the shared guard.

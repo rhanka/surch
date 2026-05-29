@@ -2305,8 +2305,12 @@ fn score_for_query(
                 return inner_score;
             }
 
-            let combined_factor =
-                combine_scoring_functions(functions, *score_mode, source, scoring_context.mapping());
+            let combined_factor = combine_scoring_functions(
+                functions,
+                *score_mode,
+                source,
+                scoring_context.mapping(),
+            );
             combine_with_boost_mode(inner_score, combined_factor, *boost_mode)
         }
         // `geo_distance` is a filter — constant score so it does not
