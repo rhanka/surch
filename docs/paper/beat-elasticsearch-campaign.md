@@ -565,3 +565,34 @@ the clean (borrow-not-copy) forms of #4 and #7.
   immediately. Adoptable only by reproducing Lucene's exact stat-staleness +
   refresh/merge timing (far beyond "flip a bit") — pair with the segmented
   structural bet.
+
+## deces search-latency (engine-to-engine vs ES 8.6.1) — the latency front
+
+The engine-to-engine deces latency probe (`surch-eval` CI `latency_engine.sh`,
+real backend query shape replayed directly on `_search`, NO Node backend)
+exposed the true search-latency gap the confounded artillery had hidden.
+
+**Baseline (`sha-f0a8d11`, run `26609427689`)**: ES 8.6.1 p50 **3.7 ms** vs
+Surch p50 **4513 ms** (~1200x). Root cause (code-verified): the deces query
+`bool.must[function_score{ bool{should:[match PRENOM, match NOM], msm:2} }]`
+(a) failed candidate resolution at the `function_score` wrapper (`_ => None`) →
+full 1.36M-doc scan, and (b) the bool `should` path UNIONed + scored the whole
+should posting set even though `msm == n_should` is a conjunction.
+
+**Optimisation (2 commits, parity-safe — verified: surch-api suite green, oracles
+bit-stable, 0 clippy)**:
+- `113e4ef` — intersect `should` clauses when `minimum_should_match == n_should`
+  (conjunction) instead of unioning + post-filtering.
+- `ec3e999` — resolve candidates through the `function_score` wrapper (functions
+  only re-rank, never filter → recurse into `inner`).
+
+**Result (`sha-ec3e999`, run `26616206949`, same probe/corpus)**: Surch p50
+**4513 → 87.2 ms (~52x faster)**, p95 166 / p99 197 / max 287, 0 errors. The
+deces latency gap vs ES collapses from **~1200x to ~24x** (87 vs 3.7 ms).
+
+**Honest residual**: the remaining 87-vs-3.7 ms is no longer union/disjunction —
+it is the public-`_id` `BTreeSet<String>` intersection + per-candidate scoring
+(+ the 2-vCPU runner). Next lever for deces is the dense-int-docid id maps
+(backlog #10), NOT the bool-disjunction WAND. The bool-disjunction WAND (`msm <
+n_should`, reusing the `MaxScoreExecutor` for `msm:1`) remains a valid general
+optimisation but targets a query shape the deces probe does not exercise.
