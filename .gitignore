@@ -43,3 +43,6 @@ __pycache__/
 tests/matchid_parity/local_dataprep_project/
 tests/matchid_parity/local_dataprep_output/
 tests/matchid_parity/elastic_capture_matchid_local_positive.jsonl
+
+# Claude Code harness-internal state (worktrees, locks, scheduled tasks)
+.claude/
