@@ -684,6 +684,49 @@ fn posting_candidate_ids(
             minimum_should_match,
             ..
         } => {
+            // Optimisation #11 (beat-ES): when the bool is a pure conjunction of
+            // single-term clauses, intersect via a leapfrog/galloping walk over
+            // the posting skip-lists instead of materialising every clause's
+            // full posting list (O(df) each) then BTreeSet-intersecting. This is
+            // the deces residual — `bool{minimum_should_match:2, should:[match
+            // PRENOM, match NOM]}`: drive the rarer name's postings and
+            // `advance_to` the other. `should` is included only when it is NOT a
+            // disjunction (MSM == n_should → every should required); otherwise
+            // its union restricts the candidate space and a must/filter-only
+            // intersection would drop true matches, so we fall back. Parity-safe:
+            // the leapfrog result is exactly the intersection of the same
+            // clauses (a superset of true matches; `query_matches` still
+            // enforces must_not / MSM downstream).
+            let should_all_required =
+                !should.is_empty() && *minimum_should_match as usize == should.len();
+            if should.is_empty() || should_all_required {
+                let mut required: Vec<&SearchQuery> = must.iter().chain(filter.iter()).collect();
+                if should_all_required {
+                    required.extend(should.iter());
+                }
+                let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(required.len());
+                let mut flat = true;
+                for q in &required {
+                    match q {
+                        SearchQuery::Match { field, value, .. } => {
+                            pairs.push((field.as_str(), value.as_str()));
+                        }
+                        SearchQuery::Term { field, value } => {
+                            pairs.push((field.as_str(), value.as_str()));
+                        }
+                        _ => {
+                            flat = false;
+                            break;
+                        }
+                    }
+                }
+                if flat && pairs.len() >= 2 {
+                    if let Some(ids) = state.conjunction_leapfrog(index, &pairs) {
+                        return Some(ids.into_iter().collect());
+                    }
+                }
+            }
+
             // Pre-compute candidate sets for every postings-backed clause and
             // intersect in ascending-size order. Starting with the smallest
             // set keeps the running intersection small and turns

@@ -8,7 +8,7 @@ use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, stored_fields_bytes_for, MemoryUsage},
-    postings::{BlockMeta, Posting},
+    postings::{BlockMeta, Posting, PostingsBlockSkipIter, PostingsList},
 };
 
 use crate::scroll::ScrollTable;
@@ -705,6 +705,81 @@ impl InMemoryIndex {
         }
 
         matches.unwrap_or_default().into_iter().collect()
+    }
+
+    /// Optimisation #11 (beat-ES): leapfrog/galloping intersection of several
+    /// single-term posting lists WITHOUT materialising any of them. Drives the
+    /// rarest term and `advance_to`s the others over their block skip-lists
+    /// (Lucene's `ConjunctionScorer`). The decomposition showed the deces cost
+    /// is O(df) per-term posting materialisation (a single `match` on a common
+    /// term is ~36 ms; the `bool` conjunction ~2x that); leapfrog avoids
+    /// touching the common term's full list when one term is rarer.
+    ///
+    /// `terms` is the FULL conjunction — every `(field, term)` must match.
+    /// Returns matched internal doc-ids in ascending order — byte-identical to
+    /// the `BTreeSet` intersection of the same lists (parity-safe).
+    fn conjunction_hits_internal(&self, terms: &[(String, String)]) -> Vec<u32> {
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        // Resolve every required term's posting list; a missing/empty term
+        // makes the whole AND empty.
+        let mut lists: Vec<PostingsList<'_>> = Vec::with_capacity(terms.len());
+        for (field, term) in terms {
+            match self.index.postings_with_block_metas(field, term) {
+                Some(list) if !list.postings().is_empty() => lists.push(list),
+                _ => return Vec::new(),
+            }
+        }
+        // Drive the rarest term; advance_to the others.
+        lists.sort_by_key(|l| l.postings().len());
+        let mut iters: Vec<PostingsBlockSkipIter<'_>> = Vec::with_capacity(lists.len() - 1);
+        for l in &lists[1..] {
+            match l.skip_iter() {
+                Ok(Some(it)) => iters.push(it),
+                // No skip list (tiny list) or codec hiccup -> exact materialised
+                // intersection (correctness over speed for this rare case).
+                _ => return Self::materialised_conjunction(&lists),
+            }
+        }
+        // `advance_to` RETURNS-AND-CONSUMES (position moves past the posting it
+        // returns), so we must HOLD each iterator's current doc-id in `cur[i]`
+        // and only re-advance when the driver target strictly exceeds it.
+        // Otherwise a posting `p > target` returned for a missed target would be
+        // skipped and a later equal driver doc would be lost (parity bug).
+        // `cur[i] = None` means that iterator is exhausted -> no further matches.
+        let mut cur: Vec<Option<u32>> = iters
+            .iter_mut()
+            .map(|it| it.advance_to(0).map(|p| p.doc_id))
+            .collect();
+        let mut out = Vec::new();
+        'docs: for posting in lists[0].postings() {
+            let target = posting.doc_id;
+            for (i, it) in iters.iter_mut().enumerate() {
+                if cur[i].is_some_and(|c| c < target) {
+                    cur[i] = it.advance_to(target).map(|p| p.doc_id);
+                }
+                if cur[i] != Some(target) {
+                    continue 'docs;
+                }
+            }
+            out.push(target);
+        }
+        out
+    }
+
+    /// Exact `BTreeSet` intersection of the lists' doc-ids (ascending). Fallback
+    /// for `conjunction_hits_internal` when a list has no skip list.
+    fn materialised_conjunction(lists: &[PostingsList<'_>]) -> Vec<u32> {
+        let mut acc: Option<BTreeSet<u32>> = None;
+        for l in lists {
+            let set: BTreeSet<u32> = l.postings().iter().map(|p| p.doc_id).collect();
+            acc = Some(match acc {
+                None => set,
+                Some(prev) => prev.intersection(&set).copied().collect(),
+            });
+        }
+        acc.unwrap_or_default().into_iter().collect()
     }
 
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
@@ -1846,6 +1921,34 @@ impl AppState {
         store.indices.get(index).map_or_else(Vec::new, |data| {
             data.match_hits_internal(field, value, require_all_terms)
         })
+    }
+
+    /// Optimisation #11: leapfrog conjunction over single-term clauses.
+    /// `clauses` is the FULL conjunction — every `(field, value)` must match.
+    /// Returns `Some(intersected internal doc-ids)` when EVERY clause analyses
+    /// to exactly one term (so it maps to a single posting list and the
+    /// galloping walk applies); `None` when any clause is multi-token or empty,
+    /// in which case the caller falls back to the generic `BTreeSet` candidate
+    /// path. Parity: the result equals the intersection of the clauses' match
+    /// sets — `conjunction_hits_internal` enforces that.
+    pub fn conjunction_leapfrog(&self, index: &str, clauses: &[(&str, &str)]) -> Option<Vec<u32>> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let data = store.indices.get(index)?;
+        let mut terms: Vec<(String, String)> = Vec::with_capacity(clauses.len());
+        for (field, value) in clauses {
+            let mut toks = normalized_terms_for_field(value, field, &data.mapping);
+            // Single-token only: a multi-token match is a per-token OR/AND that
+            // does not reduce to one posting list — let the caller fall back.
+            if toks.len() != 1 {
+                return None;
+            }
+            terms.push(((*field).to_string(), toks.remove(0)));
+        }
+        Some(data.conjunction_hits_internal(&terms))
     }
 
     pub fn documents_by_internal_ids(

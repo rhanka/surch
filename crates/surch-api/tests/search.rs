@@ -2350,6 +2350,51 @@ async fn bool_should_with_minimum_should_match_two_requires_two_matches() {
 }
 
 #[tokio::test]
+async fn bool_conjunction_leapfrog_matches_btreeset_intersection_across_blocks() {
+    // Optimisation #11 parity guard: the leapfrog/galloping conjunction
+    // (`AppState::conjunction_leapfrog`) must return EXACTLY the BTreeSet
+    // intersection of the clauses' posting lists — including the multi-block
+    // skip path that only triggers when a posting list spans more than one
+    // 128-entry FoR block (the deces case, invisible to the tiny fixtures
+    // above). `advance_to` returns-and-consumes, so a held-cursor bug would
+    // silently DROP matched docs; this asserts the exact count survives.
+    //
+    // 300 docs: `first=alpha` for i<260 (260 postings = 3 blocks),
+    // `last=beta` for even i (150 postings = 2 blocks). The msm:2 conjunction
+    // = first==alpha AND last==beta = even i < 260 = {0,2,…,258} = 130 docs.
+    let router = app_router();
+    for i in 0..300usize {
+        let first = if i < 260 { "alpha" } else { "zzz" };
+        let last = if i % 2 == 0 { "beta" } else { "delta" };
+        index_product(
+            &router,
+            &format!("d{i}"),
+            &format!(r#"{{"first":"{first}","last":"{last}"}}"#),
+        )
+        .await;
+    }
+
+    let body = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"should":[{"match":{"first":"alpha"}},{"match":{"last":"beta"}}],"minimum_should_match":2}},"_source":false,"size":300}"#,
+    )
+    .await;
+
+    let hits = body["hits"]["hits"].as_array().expect("hits array");
+    assert_eq!(
+        hits.len(),
+        130,
+        "leapfrog conjunction must return the exact intersection across FoR blocks"
+    );
+    // Every returned doc must satisfy BOTH clauses (even id < 260).
+    for h in hits {
+        let id = h["_id"].as_str().expect("id");
+        let n: usize = id.trim_start_matches('d').parse().expect("numeric id");
+        assert!(n < 260 && n % 2 == 0, "unexpected non-matching doc {id}");
+    }
+}
+
+#[tokio::test]
 async fn bool_should_default_minimum_when_only_should_present_is_one() {
     let router = app_router();
     index_product(&router, "sku-1", r#"{"first":"jean","last":"dupont"}"#).await;
