@@ -612,3 +612,18 @@ it is the public-`_id` `BTreeSet<String>` intersection + per-candidate scoring
 (backlog #10), NOT the bool-disjunction WAND. The bool-disjunction WAND (`msm <
 n_should`, reusing the `MaxScoreExecutor` for `msm:1`) remains a valid general
 optimisation but targets a query shape the deces probe does not exercise.
+
+### deces latency #10 — dense u32 candidate intersection (`8aae6a1`)
+`posting_candidate_ids` + `documents_for_{term,match,prefix}` resolved candidates
+as public-`_id` `BTreeSet<String>`, cloning a `String` per matching doc (tens of
+thousands per clause). Switched candidate resolution + intersection to internal
+`u32` doc-ids (new `term_hits_internal`/`prefix_hits_internal` + AppState
+wrappers; `documents_for_match_internal` already existed); public ids resolved
+only for the final window. Parity-safe (same doc set; surch-api 37 blocks green,
+0 clippy). **Measurement (run `26651526846`, same probe/corpus)**: Surch deces
+p50 `87.2 → 69.9 ms` (−20%), **p95 `166 → 84.7 ms` (÷2)**, p99 `197 → 120.5`,
+max `287 → 150`. Cumulative deces latency **4513 → 70 ms (~64x)**; gap vs ES
+3.7 ms now **~19x** (was ~1200x). Residual: candidate resolution still
+materialises both full posting lists before intersecting (O(df)/clause) — a
+leapfrog/galloping skip-list intersection is the next deces lever (diminishing
+returns) + the 2-vCPU runner cap.
