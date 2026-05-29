@@ -752,6 +752,14 @@ fn posting_candidate_ids(
                 None
             }
         }
+        // Optimisation #1 (beat-ES): a `function_score` matches EXACTLY the
+        // docs its inner query matches — the scoring functions only re-rank,
+        // they never filter. So resolve candidates from the inner query (and
+        // let scoring apply the functions later). Without this, the matchID
+        // deces query `bool.must[function_score{ bool{should…} }]` failed
+        // candidate resolution at the wrapper (`_ => None`) and fell back to a
+        // full 1.36M-doc scan. Parity-safe: same matched set.
+        SearchQuery::FunctionScore { inner, .. } => posting_candidate_ids(state, index, inner),
         _ => None,
     }
 }
