@@ -697,3 +697,43 @@ on this corpus so a common term stops costing O(df); that also fixes `bool` (whi
 is ~2× `match`). #11 stays in (parity-safe, sound for selective conjunctions where
 `df_rarest ≪ df_other` and single-token clauses) but is honestly logged as not
 moving the deces number.
+
+### deces latency #12 — per-QUERY O(n) setup elimination (`de19a9c`+`dfb6c25`) — the breakthrough
+The #11 note guessed the lever was the per-DOC hot loop (FoR-decode + BM25 per
+scored doc, a "constant-factor ~11× battle"). **That diagnosis was wrong, and the
+data says so.** Reading the path showed the in-memory postings are already
+decoded (`&[Posting]`, no per-doc FoR decode on the read path), and the real
+cost was **per-QUERY O(n) setup**, paid once per query regardless of how few docs
+match:
+1. `SearchScoringContext::new` copied the ENTIRE per-doc length map into a
+   `Vec<(u32,u64)>` by walking a `BTreeMap<u32,u64>` — O(n) pointer-chasing over
+   ~all 1.36M docs, for every query touching a norms field — and then probed it
+   per scored doc with an O(log n) binary search.
+2. `match_hits_internal` built a `BTreeSet<u32>` from the (already sorted, unique)
+   postings just to return the candidate set — O(df log df) inserts + a node
+   allocation per doc on a common term.
+
+Two parity-trivial changes:
+- **`de19a9c`** — store per-doc length as a dense `Vec<u64>` indexed by doc_id
+  (`0` = absent) instead of a `BTreeMap`; the per-query build is a flat memcpy
+  and the lookup is an O(1) cache-friendly index.
+- **`dfb6c25`** — single-token `match` candidate resolution collects posting
+  doc_ids straight into a `Vec` (postings are already ascending+unique), skipping
+  the `BTreeSet` round-trip.
+
+**Measurement (run `26696446460`, sha-`dfb6c25`, same probe/corpus 1.36M)**:
+
+| Surch p50 (ms) | match | bool | full | full probe (2000) |
+|----------------|------:|-----:|-----:|------------------:|
+| before (#10/#11) | 36–40 | 68–74 | 69–75 | 70–78 |
+| **after #12**    | **5.3** | **6.8** | **7.1** | **6.9** |
+
+**deces full p50 ~70 → 6.9 ms (~10× faster); the gap vs ES (~4.6 ms stable
+baseline; the es job flaked this run on the wikidata fetch) collapses from ~17×
+to ~1.5×.** Parity-safe: identical doc_len values + identical candidate set →
+bit-identical BM25 (`cargo test` oracles green; ndcg-gate pending). This is the
+breakthrough on the deces front — the bottleneck was per-query allocation/
+pointer-chasing setup, not per-doc arithmetic. Remaining to reach the "2× faster
+than ES" bar (Surch ≤ ~2.3 ms): the zero-copy `doc_len` borrow (removes the
+per-query flat copy entirely, in flight), then the residual `bool`/`function_score`
+wrapper overhead and the WAND scoring loop.

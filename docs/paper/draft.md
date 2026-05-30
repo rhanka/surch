@@ -48,7 +48,9 @@ absolute RSS (a JVM heap is sized for a different regime). Two latency
 fronts are NOT in this table and are honestly open (see §5/§10):
 large-corpus *raw* (cache-OFF) search latency, where Surch trails on
 both engines, and the engine-to-engine `deces` latency vs ES 8.6.1
-(~17× slower, the per-term hot loop being the lever). Sources:
+(now ~1.5× slower, down from ~17× after eliminating per-query O(n) setup
+costs — dense doc_len + single-token candidate resolution; closing on the
+2×-faster bar). Sources:
 `docs/ops/bench-reports/2026-05-25-F2-{ndcg,insee}-3rep-K8s/`,
 `…-b1-oracle-A10-ES861-K8s/`.
 
@@ -333,7 +335,7 @@ allocation reduction folded into the indexing lead.
 | Bulk indexing | ✅ 1.55× (TREC-COVID) / 6.7× (SciFact) | ✅ parity/ahead (deces 1.36M, 104 vs 116 s) |
 | Search latency, small corpus | ✅ 2.7–3.1× (INSEE 10k) | engine-to-engine harness pending |
 | Search latency, large corpus (cache ON) | ⚠️ 354× but LRU-masked, not an engine claim | engine-to-engine harness pending |
-| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | ❌ ~17× slower p50 (deces 1.36M engine-to-engine: 78 vs 4.6 ms) — front to win |
+| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | ⚠️ ~1.5× slower p50 (deces 1.36M engine-to-engine: 6.9 vs ~4.6 ms; was ~17× before the per-query setup-cost fixes) — closing |
 | Quality (NDCG@10) | ✅ parity (4 BEIR datasets) | ✅ parity (matchID oracle 30/30, 8/8) |
 | Memory (RSS) | ✅ 0.62× (TREC-COVID, post-#9) | 28M-scale measurement pending |
 | matchID DSL parity | — | ✅ B1 30/30, B2 8/8, 0 divergence |
