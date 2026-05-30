@@ -2568,15 +2568,15 @@ fn lookup_text_field(source: &Value, field: &str) -> Option<String> {
 ///   dictionary, so the prior per-token deep copy into owned
 ///   `Vec<(u32, u64)>` / `Vec<BlockMeta>` is gone (#7).
 ///
-/// `field_stats_by_field` stays owned: a [`FieldScoringStats`] is built
-/// once per query *per field* (not per token), and the read path it backs
-/// (per-doc `doc_len` binary search) wants a stable owned snapshot. That
-/// copy is out of scope for #7, which targets the per-*token* posting-list
-/// copy.
+/// `field_stats_by_field` now borrows zero-copy too: a [`FieldScoringStats`]
+/// is built once per query *per field*, and its `doc_len` slice points
+/// straight at the live index's dense per-doc length array (no per-query copy
+/// of the whole corpus length vector). The scalar fields (doc_count, avg, …)
+/// are tiny and stay by value.
 #[derive(Debug, Default)]
 struct SearchScoringContext<'a> {
     mapping: Option<&'a IndexMapping>,
-    field_stats_by_field: BTreeMap<String, FieldScoringStats>,
+    field_stats_by_field: BTreeMap<String, FieldScoringStats<'a>>,
     term_stats_by_field: BTreeMap<String, BTreeMap<String, TermScoringView<'a>>>,
 }
 
@@ -2626,7 +2626,7 @@ impl<'a> SearchScoringContext<'a> {
         self.mapping.unwrap_or(&EMPTY_MAPPING)
     }
 
-    fn field_stats(&self, field: &str) -> Option<&FieldScoringStats> {
+    fn field_stats(&self, field: &str) -> Option<&FieldScoringStats<'a>> {
         self.field_stats_by_field.get(field)
     }
 

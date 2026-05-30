@@ -82,20 +82,23 @@ pub struct StoredDocument {
     pub source: Arc<Value>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct FieldScoringStats {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FieldScoringStats<'a> {
     pub doc_count: u64,
     pub avg_doc_len: f64,
     pub norms_enabled: bool,
-    /// Dense per-`doc_id` length (`0` = absent), copied flat from the index's
-    /// `FieldLengthStats::doc_len_dense`. Empty when `norms_enabled` is false.
-    /// `doc_len(doc_id)` is an O(1) cache-friendly index (was an O(log n)
-    /// binary search over a sorted `Vec<(u32, u64)>`, itself built per query
-    /// from an O(n) pointer-chasing walk of a `BTreeMap`).
-    pub doc_len_dense: Vec<u64>,
+    /// Dense per-`doc_id` length (`0` = absent), borrowed ZERO-COPY straight
+    /// from the index's `FieldLengthStats::doc_len_dense` (optimisation mirrors
+    /// the zero-copy `TermScoringView` #7). Empty slice when `norms_enabled` is
+    /// false. `doc_len(doc_id)` is an O(1) cache-friendly index. The former
+    /// owned `Vec` made `SearchScoringContext::new` copy the whole per-doc
+    /// length array (~8 B × n_docs) per query per scored field; borrowing it
+    /// removes that per-query allocation entirely (deces touches PRENOM + NOM,
+    /// so it was ~2 × the full corpus length array copied on every query).
+    pub doc_len_dense: &'a [u64],
 }
 
-impl FieldScoringStats {
+impl<'a> FieldScoringStats<'a> {
     pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
         self.doc_len_dense
             .get(doc_id as usize)
@@ -549,7 +552,7 @@ impl InMemoryIndex {
         }
     }
 
-    fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats> {
+    fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats<'_>> {
         let stats = self.index.field_stats(field)?;
         let norms_enabled = self.mapping.norms_enabled(field);
         let avg_doc_len = if norms_enabled {
@@ -557,12 +560,12 @@ impl InMemoryIndex {
         } else {
             1.0
         };
-        let doc_len_dense = if norms_enabled {
-            // Flat memcpy of the index's dense slice — no per-query pointer
-            // chase, and the result is indexed O(1) by doc_id in the hot loop.
-            stats.doc_len_dense().to_vec()
+        // Borrow the index's dense slice zero-copy — no per-query allocation,
+        // O(1) cache-friendly doc_id indexing in the hot loop.
+        let doc_len_dense: &[u64] = if norms_enabled {
+            stats.doc_len_dense()
         } else {
-            Vec::new()
+            &[]
         };
 
         Some(FieldScoringStats {
@@ -843,10 +846,10 @@ impl<'a> IndexReader<'a> {
         &self.data.mapping
     }
 
-    /// Per-field scoring stats (doc count, avg doc len, norms). Owned, but
-    /// computed once per query per field — identical to
-    /// [`AppState::field_scoring_stats`].
-    pub fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats> {
+    /// Per-field scoring stats (doc count, avg doc len, norms). The `doc_len`
+    /// slice is borrowed zero-copy from the live index (like
+    /// [`Self::term_scoring_view`]), so no per-query allocation is paid.
+    pub fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats<'a>> {
         self.data.field_scoring_stats(field)
     }
 
@@ -1994,17 +1997,6 @@ impl AppState {
             .iter()
             .map(|id| data.document_ids.get(*id).copied())
             .collect()
-    }
-
-    pub fn field_scoring_stats(&self, index: &str, field: &str) -> Option<FieldScoringStats> {
-        let store = self
-            .store
-            .read()
-            .expect("in-memory API state lock should not be poisoned");
-        store
-            .indices
-            .get(index)
-            .and_then(|data| data.field_scoring_stats(field))
     }
 
     pub fn term_scoring_stats(&self, index: &str, field: &str, term: &str) -> TermScoringStats {
