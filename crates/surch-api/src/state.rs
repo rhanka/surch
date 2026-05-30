@@ -96,6 +96,10 @@ pub struct FieldScoringStats<'a> {
     /// removes that per-query allocation entirely (deces touches PRENOM + NOM,
     /// so it was ~2 × the full corpus length array copied on every query).
     pub doc_len_dense: &'a [u64],
+    /// Precomputed smallest `doc_len` (`0` = none), threaded from the index's
+    /// incrementally-maintained `FieldLengthStats::min_doc_len` so the WAND
+    /// upper bound no longer re-scans the whole dense slice per query.
+    pub min_doc_len: u64,
 }
 
 impl<'a> FieldScoringStats<'a> {
@@ -107,11 +111,7 @@ impl<'a> FieldScoringStats<'a> {
     }
 
     pub fn min_doc_len(&self) -> Option<u64> {
-        self.doc_len_dense
-            .iter()
-            .copied()
-            .filter(|&len| len > 0)
-            .min()
+        (self.min_doc_len > 0).then_some(self.min_doc_len)
     }
 }
 
@@ -568,11 +568,18 @@ impl InMemoryIndex {
             &[]
         };
 
+        let min_doc_len = if norms_enabled {
+            stats.min_doc_len().unwrap_or(0)
+        } else {
+            0
+        };
+
         Some(FieldScoringStats {
             doc_count: stats.doc_count,
             avg_doc_len,
             norms_enabled,
             doc_len_dense,
+            min_doc_len,
         })
     }
 

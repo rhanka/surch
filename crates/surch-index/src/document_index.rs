@@ -102,6 +102,11 @@ pub struct FieldLengthStats {
     pub doc_count: u64,
     pub total_terms: u64,
     doc_len_dense: Vec<u64>,
+    /// Smallest recorded `doc_len` (`0` = none), maintained incrementally so
+    /// the WAND block-max upper bound does not re-scan the whole dense slice on
+    /// every query (it needs `min_doc_len` — the shortest doc, hence the highest
+    /// possible BM25 score — to bound a token/block contribution).
+    min_doc_len: u64,
 }
 
 impl FieldLengthStats {
@@ -125,11 +130,34 @@ impl FieldLengthStats {
         }
         self.doc_len_dense[idx] = doc_len;
         self.total_terms += doc_len;
+        // Maintain the running minimum in O(1) on the common paths. The only
+        // case that can RAISE the minimum is overwriting the current-min doc
+        // with a larger length (an in-place doc_len update) — rare, and absent
+        // from the bulk-load path where each doc is recorded exactly once — and
+        // it triggers a single recompute scan.
+        if self.min_doc_len == 0 || doc_len < self.min_doc_len {
+            self.min_doc_len = doc_len;
+        } else if previous == self.min_doc_len && doc_len > previous {
+            self.min_doc_len = self
+                .doc_len_dense
+                .iter()
+                .copied()
+                .filter(|&len| len > 0)
+                .min()
+                .unwrap_or(0);
+        }
     }
 
     pub fn avg_doc_len(&self) -> Option<f64> {
         (self.doc_count > 0 && self.total_terms > 0)
             .then(|| self.total_terms as f64 / self.doc_count as f64)
+    }
+
+    /// The smallest recorded `doc_len` (precomputed, O(1)), or `None` when no
+    /// length was recorded (e.g. norms disabled). Equals
+    /// `doc_len_dense.iter().filter(|l| *l > 0).min()` without the per-query scan.
+    pub fn min_doc_len(&self) -> Option<u64> {
+        (self.min_doc_len > 0).then_some(self.min_doc_len)
     }
 
     pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
