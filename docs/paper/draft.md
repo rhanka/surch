@@ -42,9 +42,13 @@ final claims.
 | NDCG@10 | NFCorpus / FiQA | 0.3033 / 0.2294 | 0.3034 / 0.2389 | parity (NFCorpus identical) |
 | matchID B1 oracle | deces_v1 vs ES 8.6.1 | 30/30, 0 divergence | — | parity preserved |
 
-Surch leads on every speed and latency axis and on SciFact quality;
-it trails OpenSearch only on TREC-COVID NDCG@10 (`-0.0152`) and on
-absolute RSS (a JVM heap is sized for a different regime). Sources:
+Surch leads on every axis in this table and on SciFact quality; it
+trails OpenSearch only on TREC-COVID NDCG@10 (`-0.0152`) and on
+absolute RSS (a JVM heap is sized for a different regime). Two latency
+fronts are NOT in this table and are honestly open (see §5/§10):
+large-corpus *raw* (cache-OFF) search latency, where Surch trails on
+both engines, and the engine-to-engine `deces` latency vs ES 8.6.1
+(~17× slower, the per-term hot loop being the lever). Sources:
 `docs/ops/bench-reports/2026-05-25-F2-{ndcg,insee}-3rep-K8s/`,
 `…-b1-oracle-A10-ES861-K8s/`.
 
@@ -329,16 +333,24 @@ allocation reduction folded into the indexing lead.
 | Bulk indexing | ✅ 1.55× (TREC-COVID) / 6.7× (SciFact) | ✅ parity/ahead (deces 1.36M, 104 vs 116 s) |
 | Search latency, small corpus | ✅ 2.7–3.1× (INSEE 10k) | engine-to-engine harness pending |
 | Search latency, large corpus (cache ON) | ⚠️ 354× but LRU-masked, not an engine claim | engine-to-engine harness pending |
-| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | engine-to-engine harness pending |
+| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | ❌ ~17× slower p50 (deces 1.36M engine-to-engine: 78 vs 4.6 ms) — front to win |
 | Quality (NDCG@10) | ✅ parity (4 BEIR datasets) | ✅ parity (matchID oracle 30/30, 8/8) |
 | Memory (RSS) | ✅ 0.62× (TREC-COVID, post-#9) | 28M-scale measurement pending |
 | matchID DSL parity | — | ✅ B1 30/30, B2 8/8, 0 divergence |
 
 **Won:** bulk (both engines), small-corpus latency, quality, memory, matchID
-parity. **Open fronts:** large-corpus raw-engine latency vs OpenSearch (the
-read-path optimisations target this); a clean engine-to-engine `deces` latency
-benchmark vs ES 8.6.1 (the current artillery path is confounded by the Node
-backend + 2-vCPU runner); and the 28M full-corpus memory/indexation run.
+parity. **Open fronts:** raw-engine search latency on large corpora — the same
+front on both engines. The clean engine-to-engine `deces` benchmark vs ES 8.6.1
+now exists (replays the real backend query directly on `_search`, no Node
+backend) and is honest about the gap: after collapsing it from **~1200× to ~19×**
+(should-intersection + `function_score`-unwrap #1, dense-`u32` intersection #10),
+Surch deces p50 sits at **~70–78 ms vs ES ~4 ms**. The leapfrog conjunction (#11)
+was implemented, is parity-safe, but the decomposition proved it latency-neutral:
+the bottleneck is **not** clause intersection but the **per-term O(df) hot loop**
+(a single `match` on a common term = ~40 ms ≈ 11× ES; `bool ≈ 2× match`). ES
+avoids it via block-max WAND top-K. Making Surch's bare-`match` top-K actually
+skip is the identified lever to close this gap. Also open: the 28M full-corpus
+memory/indexation run.
 
 ## 11. Conclusion
 

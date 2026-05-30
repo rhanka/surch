@@ -247,12 +247,28 @@ before/after measurement (CI, representative HW) → verdict**.
 - **Verdict**: parity-safe ✅ (merged); latency delta pending the cache-off run.
 
 ## Backlog (ordered by leverage)
-0. **[IN PROGRESS] Dense-int-docid candidate intersection** — the deces residual
-   (87 ms vs ES 3.7 ms after the should-intersection win): `posting_candidate_ids`
-   intersects `BTreeSet<String>` of public `_id`s, and `documents_for_match`
-   clones a `String` per matching doc (tens of thousands per clause per query).
-   Intersect on internal `u32` doc-ids; resolve public ids only for the final
-   top-K window. Matches Lucene's dense int docids. (= backlog #10 from the hunt.)
+0z. **[NEXT — CONFIRMED LEVER] Bare-`match` top-K must actually skip on a common
+   term.** The #11 decomposition proves the deces floor is a single `match` =
+   ~40 ms ≈ 11× ES (3.6 ms), and `bool ≈ 2× match`. The dominant cost is the
+   per-term O(df) hot loop (FoR-decode + BM25-score the whole posting list), NOT
+   how clauses are intersected (#10/#11 already removed the intersection cost).
+   ES's block-max WAND top-K scores only enough for the top-20 (its `bool` 3.1 ms
+   < its `match` 3.6 ms). Make Surch's `run_topk_search`/`maxscore_match` actually
+   skip on this corpus (verify it even engages for a bare `match`, then that the
+   block-max bound prunes); this also fixes `bool` (≈ 2× `match`). This is THE
+   lever to approach the "2× faster than ES" bar; #10/#11 were necessary but not
+   sufficient.
+0. **[DONE — `8aae6a1`] Dense-int-docid candidate intersection** — resolved the
+   deces residual from `BTreeSet<String>` of public `_id`s to internal `u32`
+   doc-ids; public ids resolved only for the final window. Measured 87 → 70 ms
+   p50, p95 ÷2. (= backlog #10 from the hunt.)
+0a. **[DONE — `a6fa7aa`, NEUTRAL on deces] Leapfrog/galloping conjunction.**
+   Lucene `ConjunctionScorer` over the FoR block skip-lists (held-cursor leapfrog
+   + materialised fallback), engaged on pure single-term conjunctions. Parity-safe
+   (cargo test + ndcg-gate green) but the decomposition showed the conjunction was
+   not the deces bottleneck → latency-neutral. Kept (sound for selective
+   conjunctions); see the #11 section for the honest write-up. Supersedes the
+   "leapfrog is the next lever" note — it was tried and the real lever is 0z above.
 0b. **[BACKLOG — KEPT] Block-max WAND for bool `should` true disjunctions**
    (`minimum_should_match < n_should`), reusing `MaxScoreExecutor` for the
    `msm == 1` pure-disjunction case (each single-term `should` = one
@@ -627,3 +643,51 @@ max `287 → 150`. Cumulative deces latency **4513 → 70 ms (~64x)**; gap vs ES
 materialises both full posting lists before intersecting (O(df)/clause) — a
 leapfrog/galloping skip-list intersection is the next deces lever (diminishing
 returns) + the 2-vCPU runner cap.
+
+### deces latency #11 — leapfrog/galloping conjunction (`a6fa7aa`) — NEUTRAL on deces (honest)
+Hypothesis (from #10's residual): the bool conjunction materialised BOTH clauses'
+full posting lists before intersecting (O(df)/clause); a leapfrog/galloping
+intersection (Lucene `ConjunctionScorer`) driving the rarest term and
+`advance_to`-ing the others over the FoR block skip-lists would avoid touching
+the full lists. Implemented: `conjunction_hits_internal` (held-cursor leapfrog —
+`advance_to` returns-and-consumes, so each iterator's current doc-id is held and
+only re-advanced when the driver target exceeds it; falls back to an exact
+materialised `BTreeSet` intersection when a list has no skip list),
+`conjunction_leapfrog` (single-token gate), and a `posting_candidate_ids` Bool
+fast-path engaging on pure single-term conjunctions (`must`/`filter` + `should`
+when `msm == n_should`).
+
+**Parity-safe, verified**: `cargo test --workspace` green incl. a new multi-block
+parity test (`bool_conjunction_leapfrog_matches_btreeset_intersection_across_blocks`,
+>128 postings so the skip path is exercised); ci-k8s `ndcg-gate` green — SciFact
+Surch `0.6576` (OS `0.6537`), TREC-COVID Surch `0.4750` (OS `0.4902`), **unchanged
+vs pre-#11 → no relevance regression**.
+
+**Measurement (run `26668292578`, sha-`a6fa7aa`, same probe/corpus, es+surch in
+the SAME run)**: deces full p50 Surch **78.2 ms** / ES **4.6 ms** (17x). Decompose:
+
+| p50 (ms) | match (1 term) | bool (PRENOM ∧ NOM) | full |
+|----------|---------------:|--------------------:|-----:|
+| ES 8.6.1            | 3.6  | 3.1  | 2.7  |
+| Surch #10 (prev run)| 36.1 | 68.2 | 68.7 |
+| Surch #11 (this run)| 39.7 | 74.4 | 75.2 |
+
+**Honest verdict: #11 is latency-NEUTRAL on deces.** The tell: `match` (a single
+term — the leapfrog path is NOT engaged for it, `pairs.len() < 2`) moved
+36.1 → 39.7 (+10%) with ZERO code change to that path, i.e. this run's 2-vCPU
+runner is simply ~10% slower; applying that same +10% to #10's bool (68.2 × 1.10
+≈ 75) fully accounts for the 74.4 measured. So the conjunction intersection
+strategy changed bool latency by ~0%. The conjunction was **not** the deces
+bottleneck.
+
+**What the decomposition (re)proves is the real lever**: a single `match` on a
+common term costs **~40 ms ≈ 11× ES** (3.6 ms), and `bool ≈ 2× match`. The
+dominant cost is the **per-term O(df) hot loop** — FoR-decode + BM25-score the
+whole posting list for a common term — NOT how clauses are intersected. ES never
+pays it: block-max WAND top-K scores only enough for the top-20 (its `bool` 3.1 ms
+is even cheaper than its `match` 3.6 ms). The next deces lever is therefore to make
+Surch's bare-`match` top-K (`run_topk_search`/`maxscore_match`) actually **skip**
+on this corpus so a common term stops costing O(df); that also fixes `bool` (which
+is ~2× `match`). #11 stays in (parity-safe, sound for selective conjunctions where
+`df_rarest ≪ df_other` and single-token clauses) but is honestly logged as not
+moving the deces number.
