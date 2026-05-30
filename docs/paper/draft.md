@@ -46,11 +46,14 @@ Surch leads on every axis in this table and on SciFact quality; it
 trails OpenSearch only on TREC-COVID NDCG@10 (`-0.0152`) and on
 absolute RSS (a JVM heap is sized for a different regime). Two latency
 fronts are NOT in this table and are honestly open (see §5/§10):
-large-corpus *raw* (cache-OFF) search latency, where Surch trails on
-both engines, and the engine-to-engine `deces` latency vs ES 8.6.1
-(now ~1.5× slower, down from ~17× after eliminating per-query O(n) setup
-costs — dense doc_len + single-token candidate resolution; closing on the
-2×-faster bar). Sources:
+large-corpus *raw* (cache-OFF) search latency vs OpenSearch, where Surch
+trails on the median. On the engine-to-engine `deces` benchmark vs ES 8.6.1,
+Surch is now **2.45× faster on p50** (2.0 vs 4.9 ms), down from ~17× SLOWER,
+after eliminating per-query O(n) setup costs (dense doc_len + zero-copy borrow
++ incremental min_doc_len + single-token candidate resolution) — the "2× faster"
+bar is met on the median; the remaining front is the upper-percentile tail
+(p95/p99), where high-`df` bool/function_score queries still full-scan while ES
+prunes via WAND. Sources:
 `docs/ops/bench-reports/2026-05-25-F2-{ndcg,insee}-3rep-K8s/`,
 `…-b1-oracle-A10-ES861-K8s/`.
 
@@ -335,7 +338,7 @@ allocation reduction folded into the indexing lead.
 | Bulk indexing | ✅ 1.55× (TREC-COVID) / 6.7× (SciFact) | ✅ parity/ahead (deces 1.36M, 104 vs 116 s) |
 | Search latency, small corpus | ✅ 2.7–3.1× (INSEE 10k) | engine-to-engine harness pending |
 | Search latency, large corpus (cache ON) | ⚠️ 354× but LRU-masked, not an engine claim | engine-to-engine harness pending |
-| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | ⚠️ ~1.5× slower p50 (deces 1.36M engine-to-engine: 6.9 vs ~4.6 ms; was ~17× before the per-query setup-cost fixes) — closing |
+| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | ✅ **2.45× faster p50** (deces 1.36M engine-to-engine: 2.0 vs 4.9 ms; was ~17× slower before the per-query setup-cost fixes) — tail p95/p99 still trails (WAND-for-bool pending) |
 | Quality (NDCG@10) | ✅ parity (4 BEIR datasets) | ✅ parity (matchID oracle 30/30, 8/8) |
 | Memory (RSS) | ✅ 0.62× (TREC-COVID, post-#9) | 28M-scale measurement pending |
 | matchID DSL parity | — | ✅ B1 30/30, B2 8/8, 0 divergence |

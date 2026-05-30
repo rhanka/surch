@@ -247,23 +247,24 @@ before/after measurement (CI, representative HW) → verdict**.
 - **Verdict**: parity-safe ✅ (merged); latency delta pending the cache-off run.
 
 ## Backlog (ordered by leverage)
-0z. **[NEXT — CONFIRMED LEVER] The per-term hot loop is a constant-factor battle
-   (~11×), not an algorithmic one.** The #11 decomposition proves the deces floor
-   is a single `match` = ~40 ms ≈ 11× ES (3.6 ms), and `bool ≈ 2× match`. Code
-   diagnosis (`maxscore.rs`): a bare `match` DOES engage `run_topk_search` →
-   `maxscore_match` block-max WAND. But for a **single common term**, almost every
-   doc scores ~equally (tf = 1, similar doc_len → `block_max ≈ the 20th-best
-   threshold`), so the WAND skip condition (`block_max < threshold`) is rarely
-   true → **no pruning is possible, on EITHER engine** → both must FoR-decode +
-   BM25-score ~all `df` docs. So the 11× gap is the **constant factor of the
-   decode+score hot loop** (FoR/SIMD decode throughput, per-doc scoring cost,
-   per-doc overhead/allocations), not missing skips. This is THE deces lever and
-   it is a deep micro-optimisation (SIMD FoR decode, branch-lean BM25, zero
-   per-doc allocation) — necessary to approach the "2× faster than ES" bar, and
-   bigger than #10/#11. Possible cheaper partial win to probe first: for a
-   single-term top-K where the max-score block is saturated with ≥ k tied/near-tied
-   docs, bound the scan (Lucene-style early termination) — but BM25's doc_len term
-   breaks exact ties, so quantify before relying on it.
+0z. **[RESOLVED by #12 — the lever was per-QUERY setup, NOT the per-doc loop.]**
+   The #11 note guessed the deces floor was a per-DOC constant-factor battle
+   (SIMD FoR decode / branch-lean BM25). **#12 proved that wrong with data**:
+   in-memory postings are already decoded (`&[Posting]`), and the dominant cost
+   was per-QUERY O(n) setup — a `BTreeMap` doc_len map copied + pointer-chased
+   per query, and a `BTreeSet` built from already-sorted postings for the
+   candidate set. Replacing them with a dense `Vec<u64>` doc_len (O(1) borrowed,
+   incremental `min_doc_len`) + single-token direct candidate `Vec` took deces
+   `match`/`bool`/`full` from 40/74/75 ms to **5.3/6.8/7.1 ms** (full p50 ~70 →
+   ~7 ms, ~10×; gap vs ES ~17× → ~1.5×). **Corollary: the WP-A codec backlog
+   (Roaring, Elias-Fano, BM25 8-bit LUT, recursive-graph-bisection reorder) is
+   the WRONG target for deces LATENCY** — it optimises decode/score throughput,
+   which was never the bottleneck; it remains relevant for MEMORY/codec size and
+   on-disk snapshots, but is deprioritised for the latency goal. Remaining deces
+   latency is near the engine-to-engine floor (candidate resolution + small-set
+   scoring + hydration + HTTP/JSON + 2-vCPU runner); the "2× faster than ES" bar
+   may not be reachable on this probe without result caching (excluded by the
+   no-cheat bar), so honest near-parity is the expected landing.
 0. **[DONE — `8aae6a1`] Dense-int-docid candidate intersection** — resolved the
    deces residual from `BTreeSet<String>` of public `_id`s to internal `u32`
    doc-ids; public ids resolved only for the final window. Measured 87 → 70 ms
@@ -737,3 +738,36 @@ pointer-chasing setup, not per-doc arithmetic. Remaining to reach the "2× faste
 than ES" bar (Surch ≤ ~2.3 ms): the zero-copy `doc_len` borrow (removes the
 per-query flat copy entirely, in flight), then the residual `bool`/`function_score`
 wrapper overhead and the WAND scoring loop.
+
+### deces latency #13 — setup-cost batch 2 (`3bfec8f`+`2c59e91`) — **2× FASTER THAN ES (p50) — criterion MET**
+Two more per-query setup eliminations on top of #12: **`3bfec8f`** borrows the
+dense `doc_len` slice zero-copy (no per-query flat copy at all — deces touches
+PRENOM+NOM, so two full-corpus length arrays were copied per query), and
+**`2c59e91`** precomputes `min_doc_len` incrementally so the WAND upper bound
+stops re-scanning the whole dense slice per query.
+
+**Measurement (run `26697199003`, sha-`2c59e91`, same probe/corpus 1.36M, with a
+CLEAN same-run ES baseline — the es job did not flake this time)**:
+
+| deces p50 (ms) | match | bool | full | full probe (2000) |
+|----------------|------:|-----:|-----:|------------------:|
+| ES 8.6.1          | 3.8 | 3.1 | 2.7 | **4.9** |
+| **Surch batch 2** | **1.7** | **1.8** | **1.9** | **2.0** |
+
+**Surch p50 2.0 ms vs ES 4.9 ms = 2.45× FASTER — the user's "at least 2× faster
+than ES" criterion is MET on the median** (and on the mean: 3.8 vs 5.5 ms). On
+the decompose, Surch beats ES on every shape's p50 (match 1.7 vs 3.8, bool 1.8 vs
+3.1, full 1.9 vs 2.7). Cumulative deces journey: **4513 ms → 2.0 ms p50** across
+#1→#13, gap vs ES from ~1200× SLOWER to **2.45× FASTER**. Parity-safe throughout
+(`cargo test` oracles + ndcg-gate green; bit-identical BM25).
+
+**Honest caveat — the new front is the TAIL.** Surch's median wins, but the upper
+percentiles trail ES: p95 14.3 vs 10.6, p99 20.8 vs 15.2, max 62.8 vs 21.8 (the
+decompose shows it is the `bool`/`full` shapes: p95 ~14 / max ~60, while the bare
+`match` tail is already better than ES — p95 3.0 / max 8.8 vs 8.0 / 17.9). Cause:
+high-`df` name pairs whose `bool`/`function_score` query runs the full-scan
+`run_search` (scores the whole candidate set + sorts), where ES prunes with
+block-max WAND top-K. **Next deces lever = extend the WAND/top-K shortcut to
+`bool` (minimum_should_match) + `function_score`** so the common-name tail stops
+scoring the full intersection — the structural read-path optimisation that
+tightens p95/p99 toward (and past) ES.
