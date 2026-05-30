@@ -247,17 +247,23 @@ before/after measurement (CI, representative HW) → verdict**.
 - **Verdict**: parity-safe ✅ (merged); latency delta pending the cache-off run.
 
 ## Backlog (ordered by leverage)
-0z. **[NEXT — CONFIRMED LEVER] Bare-`match` top-K must actually skip on a common
-   term.** The #11 decomposition proves the deces floor is a single `match` =
-   ~40 ms ≈ 11× ES (3.6 ms), and `bool ≈ 2× match`. The dominant cost is the
-   per-term O(df) hot loop (FoR-decode + BM25-score the whole posting list), NOT
-   how clauses are intersected (#10/#11 already removed the intersection cost).
-   ES's block-max WAND top-K scores only enough for the top-20 (its `bool` 3.1 ms
-   < its `match` 3.6 ms). Make Surch's `run_topk_search`/`maxscore_match` actually
-   skip on this corpus (verify it even engages for a bare `match`, then that the
-   block-max bound prunes); this also fixes `bool` (≈ 2× `match`). This is THE
-   lever to approach the "2× faster than ES" bar; #10/#11 were necessary but not
-   sufficient.
+0z. **[NEXT — CONFIRMED LEVER] The per-term hot loop is a constant-factor battle
+   (~11×), not an algorithmic one.** The #11 decomposition proves the deces floor
+   is a single `match` = ~40 ms ≈ 11× ES (3.6 ms), and `bool ≈ 2× match`. Code
+   diagnosis (`maxscore.rs`): a bare `match` DOES engage `run_topk_search` →
+   `maxscore_match` block-max WAND. But for a **single common term**, almost every
+   doc scores ~equally (tf = 1, similar doc_len → `block_max ≈ the 20th-best
+   threshold`), so the WAND skip condition (`block_max < threshold`) is rarely
+   true → **no pruning is possible, on EITHER engine** → both must FoR-decode +
+   BM25-score ~all `df` docs. So the 11× gap is the **constant factor of the
+   decode+score hot loop** (FoR/SIMD decode throughput, per-doc scoring cost,
+   per-doc overhead/allocations), not missing skips. This is THE deces lever and
+   it is a deep micro-optimisation (SIMD FoR decode, branch-lean BM25, zero
+   per-doc allocation) — necessary to approach the "2× faster than ES" bar, and
+   bigger than #10/#11. Possible cheaper partial win to probe first: for a
+   single-term top-K where the max-score block is saturated with ≥ k tied/near-tied
+   docs, bound the scan (Lucene-style early termination) — but BM25's doc_len term
+   breaks exact ties, so quantify before relying on it.
 0. **[DONE — `8aae6a1`] Dense-int-docid candidate intersection** — resolved the
    deces residual from `BTreeSet<String>` of public `_id`s to internal `u32`
    doc-ids; public ids resolved only for the final window. Measured 87 → 70 ms
