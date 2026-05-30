@@ -679,6 +679,22 @@ impl InMemoryIndex {
             return Vec::new();
         }
 
+        // Single-token fast path: postings are stored ascending by doc_id with
+        // exactly one entry per doc (the `analyzed_terms` invariant), so the
+        // matched doc set IS the posting list — collecting straight into a Vec
+        // skips the `BTreeSet` round-trip, which on a common term costs
+        // O(df log df) inserts plus a node allocation per doc. This is the
+        // single-clause candidate-resolution path (deces `match NOM=…` and each
+        // leapfrog conjunction clause). Parity: identical ascending-unique set.
+        if terms.len() == 1 {
+            return self
+                .index
+                .postings(field, &terms[0])
+                .into_iter()
+                .flat_map(|postings| postings.map(|posting| posting.doc_id))
+                .collect();
+        }
+
         let mut matches: Option<BTreeSet<u32>> = None;
         for term in terms {
             let current = self
