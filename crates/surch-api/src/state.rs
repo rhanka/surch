@@ -87,23 +87,27 @@ pub struct FieldScoringStats {
     pub doc_count: u64,
     pub avg_doc_len: f64,
     pub norms_enabled: bool,
-    /// Sorted ascending by `doc_id`. Empty when `norms_enabled` is false.
-    pub doc_len_by_doc_id: Vec<(u32, u64)>,
+    /// Dense per-`doc_id` length (`0` = absent), copied flat from the index's
+    /// `FieldLengthStats::doc_len_dense`. Empty when `norms_enabled` is false.
+    /// `doc_len(doc_id)` is an O(1) cache-friendly index (was an O(log n)
+    /// binary search over a sorted `Vec<(u32, u64)>`, itself built per query
+    /// from an O(n) pointer-chasing walk of a `BTreeMap`).
+    pub doc_len_dense: Vec<u64>,
 }
 
 impl FieldScoringStats {
     pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
-        self.doc_len_by_doc_id
-            .binary_search_by_key(&doc_id, |(id, _)| *id)
-            .ok()
-            .map(|idx| self.doc_len_by_doc_id[idx].1)
+        self.doc_len_dense
+            .get(doc_id as usize)
+            .copied()
+            .filter(|&len| len > 0)
     }
 
     pub fn min_doc_len(&self) -> Option<u64> {
-        self.doc_len_by_doc_id
+        self.doc_len_dense
             .iter()
-            .map(|(_, len)| *len)
-            .filter(|len| *len > 0)
+            .copied()
+            .filter(|&len| len > 0)
             .min()
     }
 }
@@ -553,13 +557,10 @@ impl InMemoryIndex {
         } else {
             1.0
         };
-        let doc_len_by_doc_id = if norms_enabled {
-            // BTreeMap iteration yields ascending order, so the Vec is sorted.
-            stats
-                .doc_len_by_doc_id
-                .iter()
-                .map(|(id, len)| (*id, *len))
-                .collect()
+        let doc_len_dense = if norms_enabled {
+            // Flat memcpy of the index's dense slice — no per-query pointer
+            // chase, and the result is indexed O(1) by doc_id in the hot loop.
+            stats.doc_len_dense().to_vec()
         } else {
             Vec::new()
         };
@@ -568,7 +569,7 @@ impl InMemoryIndex {
             doc_count: stats.doc_count,
             avg_doc_len,
             norms_enabled,
-            doc_len_by_doc_id,
+            doc_len_dense,
         })
     }
 

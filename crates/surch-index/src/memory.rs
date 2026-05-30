@@ -200,12 +200,12 @@ fn subfield_values_bytes(doc_index: &DocumentIndex) -> u64 {
 
 fn field_stats_bytes(doc_index: &DocumentIndex) -> u64 {
     let stats_header = size_of::<FieldLengthStats>() as u64;
-    let pair_size = (size_of::<u32>() + size_of::<u64>()) as u64;
+    let entry_size = size_of::<u64>() as u64;
     let mut total: u64 = 0;
     for (field, stats) in doc_index.field_stats_map().iter() {
         total += field.len() as u64;
         total += stats_header;
-        total += (stats.doc_len_by_doc_id.len() as u64).saturating_mul(pair_size);
+        total += (stats.doc_len_dense().len() as u64).saturating_mul(entry_size);
     }
     total
 }

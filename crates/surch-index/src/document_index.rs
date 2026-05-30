@@ -85,11 +85,23 @@ pub struct DocumentIndex {
 }
 
 /// Per-field length statistics recorded during analysis for BM25 norms.
+///
+/// `doc_len_dense` is indexed directly by internal `doc_id` (which is dense:
+/// `0..n`), with `0` as the "absent" sentinel — a real recorded `doc_len` is
+/// always `>= 1` (`record_doc_len` skips `0`). This replaces the former
+/// `BTreeMap<u32, u64>`: the BM25 scoring hot loop looks up `doc_len(doc_id)`
+/// once per scored doc on the matched posting list — a `BTreeMap` made that an
+/// `O(log n)` pointer-chasing (cache-missing) probe per doc, and the per-query
+/// scoring context paid an `O(n)` pointer-chasing copy of the whole map. A
+/// dense `Vec` makes the lookup `O(1)` and cache-friendly (postings are walked
+/// in ascending `doc_id`, so the slice is touched near-sequentially), and is
+/// also lighter than the `BTreeMap` for fields present in most docs (8 B/doc
+/// vs a multi-pointer node per entry).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FieldLengthStats {
     pub doc_count: u64,
     pub total_terms: u64,
-    pub doc_len_by_doc_id: BTreeMap<u32, u64>,
+    doc_len_dense: Vec<u64>,
 }
 
 impl FieldLengthStats {
@@ -101,11 +113,17 @@ impl FieldLengthStats {
             self.doc_count += 1;
             return;
         }
-        if let Some(previous) = self.doc_len_by_doc_id.insert(doc_id, doc_len) {
+        let idx = doc_id as usize;
+        if idx >= self.doc_len_dense.len() {
+            self.doc_len_dense.resize(idx + 1, 0);
+        }
+        let previous = self.doc_len_dense[idx];
+        if previous > 0 {
             self.total_terms -= previous;
         } else {
             self.doc_count += 1;
         }
+        self.doc_len_dense[idx] = doc_len;
         self.total_terms += doc_len;
     }
 
@@ -115,7 +133,16 @@ impl FieldLengthStats {
     }
 
     pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
-        self.doc_len_by_doc_id.get(&doc_id).copied()
+        self.doc_len_dense
+            .get(doc_id as usize)
+            .copied()
+            .filter(|&len| len > 0)
+    }
+
+    /// The dense per-`doc_id` length slice (`0` = absent), for zero-copy /
+    /// flat-copy consumption by the scoring context. Indexed by `doc_id`.
+    pub fn doc_len_dense(&self) -> &[u64] {
+        &self.doc_len_dense
     }
 }
 
