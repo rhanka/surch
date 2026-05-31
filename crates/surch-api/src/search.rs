@@ -2208,6 +2208,52 @@ fn compute_max_score(documents: &[ScoredDocument], scoring_enabled: bool) -> Opt
         })
 }
 
+/// Whether `posting_candidate_ids(query)` returns the EXACT match set (no false
+/// positives), letting the caller skip the per-doc `query_matches` filter. MUST
+/// stay in sync with `posting_candidate_ids`: a clause is "exact" iff that
+/// function resolves it to precisely its match set. Conservative — anything not
+/// provably exact returns `false` (the filter stays). The b1/b2 oracles assert
+/// exact result sets vs ES, so a wrong `true` here trips CI.
+fn candidate_set_is_exact(query: &SearchQuery) -> bool {
+    match query {
+        // term / match / multi_match resolve to exactly their match set.
+        SearchQuery::Term { .. } | SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. } => {
+            true
+        }
+        SearchQuery::FunctionScore { inner, .. } => candidate_set_is_exact(inner),
+        SearchQuery::Bool {
+            must,
+            filter,
+            should,
+            must_not,
+            minimum_should_match,
+            ..
+        } => {
+            // must_not is never applied during candidate resolution -> superset.
+            // must/filter must all be exact (a non-postings clause is skipped by
+            // posting_candidate_ids -> superset).
+            if !must_not.is_empty()
+                || !must.iter().all(candidate_set_is_exact)
+                || !filter.iter().all(candidate_set_is_exact)
+            {
+                return false;
+            }
+            // `should` enters the candidate set only when MSM >= 1, and is exact
+            // only when EVERY should is required (MSM == n_should -> intersection)
+            // and each should is itself exact. MSM == 0 / empty should does not
+            // restrict matching (exactness rides on must/filter). MSM in
+            // [1, n_should) is a union superset -> not exact.
+            should.is_empty()
+                || *minimum_should_match == 0
+                || (*minimum_should_match as usize == should.len()
+                    && should.iter().all(candidate_set_is_exact))
+        }
+        // prefix may be a superset outside the index_prefixes window; everything
+        // else is not postings-backed (skipped -> superset) or needs the filter.
+        _ => false,
+    }
+}
+
 fn match_documents_for_index(
     state: &AppState,
     index: &str,
@@ -2228,12 +2274,30 @@ fn match_documents_for_index(
             SearchQuery::Bool { .. } => {
                 if let Some(ids) = posting_candidate_ids(state, index, query) {
                     let ids = ids.into_iter().collect::<Vec<u32>>();
-                    let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = state
-                        .documents_with_internal_ids(index, &ids)
-                        .into_iter()
-                        .filter(|(_, document)| query_matches(query, &document.source, &mapping))
-                        .map(|(id, document)| (document, id))
-                        .unzip();
+                    let pairs = state.documents_with_internal_ids(index, &ids);
+                    // When the postings candidate set is PROVABLY the exact match
+                    // set (no false positives), the per-doc `query_matches`
+                    // re-evaluation is a no-op — and on the deces tail it is the
+                    // dominant cost (2 field re-analyses per candidate over a
+                    // high-`df` intersection). Skip it then; otherwise (superset:
+                    // must_not, should-disjunction, a non-postings clause, …) the
+                    // filter still enforces correctness. Validated by the b1/b2
+                    // oracles (they assert exact result sets vs ES).
+                    let (docs, kept): (Vec<StoredDocument>, Vec<u32>) =
+                        if candidate_set_is_exact(query) {
+                            pairs
+                                .into_iter()
+                                .map(|(id, document)| (document, id))
+                                .unzip()
+                        } else {
+                            pairs
+                                .into_iter()
+                                .filter(|(_, document)| {
+                                    query_matches(query, &document.source, &mapping)
+                                })
+                                .map(|(id, document)| (document, id))
+                                .unzip()
+                        };
                     (docs, Some(kept))
                 } else {
                     (
