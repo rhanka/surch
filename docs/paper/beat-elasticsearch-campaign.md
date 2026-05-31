@@ -832,3 +832,35 @@ work (the engine is leaner even if this particular tail is elsewhere).
 (p50 ~2.0 ms vs ES ~4.9 ms, ~2.5–2.6× across four independent runs, mean also
 ahead, parity bit-clean). The p95/p99 tail remains the one axis where ES leads,
 pending a proper diagnosis of its (now narrowed) cause.**
+
+### deces TAIL #16 — DIAGNOSED via a WORKERS=2 probe (concurrency isolated)
+The probe runs 4 workers on the 2-vCPU runner (2× oversubscription). Re-ran it at
+WORKERS=2 (matches the cores) on the same image (`sha-f3ff8ca`, full 1.36M;
+`[skip ci]` avoided a wasted auto-run). Decompose p50/p95 (ms):
+
+| WORKERS=2 | match | bool | full |
+|-----------|------:|-----:|-----:|
+| ES 8.6.1  | 2.2 / 3.9 | 1.7 / 3.3 | 1.8 / 3.0 |
+| **Surch** | **1.2 / 1.7** | 1.1 / **10.2** | 1.0 / **10.0** |
+
+Two findings, both data-clean:
+1. **Oversubscription roughly doubles BOTH engines** (ES full p50 3.1→1.8,
+   Surch 1.9→1.0 from WORKERS=4→2). So the "2.6× faster" headline is at the
+   concurrent-load probe; at fair WORKERS=2 the p50 edge is **~1.6×** (Surch
+   1.0–1.1 vs ES 1.8). Honest nuance: the 2× holds under concurrent load, ~1.6×
+   at one-query-at-a-time-per-core.
+2. **The tail is INHERENT and localised to the conjunction path.** At WORKERS=2
+   (no oversubscription), Surch's bare-`match` tail is EXCELLENT (p95 1.7, beats
+   ES's 3.9) but the `bool`/`function_score` tail is p95 ~10 — ~3× ES (3.0). The
+   ONLY structural difference is the **leapfrog conjunction** (`advance_to` over
+   two posting lists) vs the single-term `maxscore`. So the tail is the
+   **leapfrog hot-loop constant factor** (`advance_to` per driver posting:
+   cursor re-derivation, per-`Posting` overhead) vs Lucene's tight
+   `ConjunctionScorer` — NOT round-trip / query_matches / hydration (consistent
+   with their three refutations). This is finally the **data-supported** cause.
+
+**Next deces lever (focused): tighten the leapfrog `advance_to` hot loop**
+(`conjunction_hits_internal` / `PostingsBlockSkipIter::advance_to`) — avoid the
+per-call `BlockSkipCursor::resume`, branch-lean the driver walk — a constant-
+factor micro-optimisation, the one remaining gap to ES on the conjunction tail.
+The p50 win stands.
