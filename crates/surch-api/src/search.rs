@@ -2214,47 +2214,70 @@ fn match_documents_for_index(
     query: Option<&SearchQuery>,
 ) -> Vec<ScoredDocument> {
     let mapping = state.index_mapping(index).unwrap_or_default();
-    let plain = match query {
-        None => state.documents(index),
+    // Each arm yields the candidate documents plus, when candidate resolution
+    // already produced internal `u32` doc-ids, those ids ALIGNED with the
+    // documents — so `score_documents` scores by internal id without the
+    // per-doc public-`_id` hashmap round-trip. `None` means "derive them"
+    // (full-scan / match_all fallbacks).
+    let (plain, known_ids): (Vec<StoredDocument>, Option<Vec<u32>>) = match query {
+        None => (state.documents(index), None),
         Some(query) => match query {
-            SearchQuery::Term { field, value } => documents_by_term(state, index, field, value),
+            SearchQuery::Term { field, value } => {
+                (documents_by_term(state, index, field, value), None)
+            }
             SearchQuery::Bool { .. } => {
                 if let Some(ids) = posting_candidate_ids(state, index, query) {
-                    let ids = ids.into_iter().collect::<Vec<_>>();
-                    state
-                        .documents_by_internal_ids(index, &ids)
+                    let ids = ids.into_iter().collect::<Vec<u32>>();
+                    let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = state
+                        .documents_with_internal_ids(index, &ids)
                         .into_iter()
-                        .filter(|document| query_matches(query, &document.source, &mapping))
-                        .collect()
+                        .filter(|(_, document)| query_matches(query, &document.source, &mapping))
+                        .map(|(id, document)| (document, id))
+                        .unzip();
+                    (docs, Some(kept))
                 } else {
-                    state
-                        .documents(index)
-                        .into_iter()
-                        .filter(|document| query_matches(query, &document.source, &mapping))
-                        .collect()
+                    (
+                        state
+                            .documents(index)
+                            .into_iter()
+                            .filter(|document| query_matches(query, &document.source, &mapping))
+                            .collect(),
+                        None,
+                    )
                 }
             }
             SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. } => {
                 if let Some(ids) = posting_candidate_ids(state, index, query) {
-                    let ids = ids.into_iter().collect::<Vec<_>>();
-                    state.documents_by_internal_ids(index, &ids)
-                } else {
-                    state
-                        .documents(index)
+                    let ids = ids.into_iter().collect::<Vec<u32>>();
+                    let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = state
+                        .documents_with_internal_ids(index, &ids)
                         .into_iter()
-                        .filter(|document| query_matches(query, &document.source, &mapping))
-                        .collect()
+                        .map(|(id, document)| (document, id))
+                        .unzip();
+                    (docs, Some(kept))
+                } else {
+                    (
+                        state
+                            .documents(index)
+                            .into_iter()
+                            .filter(|document| query_matches(query, &document.source, &mapping))
+                            .collect(),
+                        None,
+                    )
                 }
             }
-            SearchQuery::MatchAll { .. } => state.documents(index),
-            _ => state
-                .documents(index)
-                .into_iter()
-                .filter(|document| query_matches(query, &document.source, &mapping))
-                .collect(),
+            SearchQuery::MatchAll { .. } => (state.documents(index), None),
+            _ => (
+                state
+                    .documents(index)
+                    .into_iter()
+                    .filter(|document| query_matches(query, &document.source, &mapping))
+                    .collect(),
+                None,
+            ),
         },
     };
-    score_documents(state, index, query, plain)
+    score_documents(state, index, query, plain, known_ids)
 }
 
 fn score_documents(
@@ -2262,6 +2285,7 @@ fn score_documents(
     index: &str,
     query: Option<&SearchQuery>,
     documents: Vec<StoredDocument>,
+    known_ids: Option<Vec<u32>>,
 ) -> Vec<ScoredDocument> {
     let Some(query) = query else {
         return documents
@@ -2286,6 +2310,25 @@ fn score_documents(
         };
 
         let scoring_context = SearchScoringContext::new(&reader, query);
+
+        // When candidate resolution already produced the internal ids (Bool /
+        // Match candidate paths), they are aligned with `documents` — score
+        // straight from them. The internal id equals what a public-`_id`
+        // round-trip would derive (the id↔public_id map is bijective), so the
+        // score is bit-identical, without the per-doc String-hashmap lookup
+        // that dominated the high-`df` deces `bool`/`function_score` tail.
+        if let Some(ids) = known_ids {
+            return documents
+                .into_iter()
+                .zip(ids)
+                .map(|(doc, id)| {
+                    let score =
+                        score_for_query(query, id, &scoring_context, Some(doc.source.as_ref()));
+                    ScoredDocument { doc, score }
+                })
+                .collect();
+        }
+
         let public_ids = documents
             .iter()
             .map(|doc| doc.id.as_str())

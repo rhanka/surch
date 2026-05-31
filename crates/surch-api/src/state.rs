@@ -823,6 +823,36 @@ impl InMemoryIndex {
             })
             .collect()
     }
+
+    /// Hydrate documents while CARRYING each one's internal `doc_id`. The
+    /// candidate-resolution path already knows the internal ids (postings are
+    /// `u32`-keyed), so threading them to scoring avoids re-deriving them with
+    /// an `O(n)` public-`_id` String hashmap round-trip per matched doc — the
+    /// deces `bool`/`function_score` tail, which scales with the (high-`df`)
+    /// candidate-set size. Skipped ids (deleted/unknown) carry no pair, so the
+    /// `(doc_id, doc)` alignment is always exact (no positional assumption).
+    fn documents_with_internal_ids(
+        &self,
+        index: &str,
+        internal_ids: &[u32],
+    ) -> Vec<(u32, StoredDocument)> {
+        internal_ids
+            .iter()
+            .filter_map(|&doc_id| {
+                let id = self.reverse_document_ids.get(&doc_id)?;
+                self.documents.get(id).map(|source| {
+                    (
+                        doc_id,
+                        StoredDocument {
+                            index: index.to_owned(),
+                            id: id.clone(),
+                            source: Arc::clone(source),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 /// Borrowed read-only view of one index, scoped to a single
@@ -1989,6 +2019,23 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         store.indices.get(index).map_or_else(Vec::new, |data| {
             data.documents_by_internal_ids(index, internal_ids)
+        })
+    }
+
+    /// Hydrate documents carrying their internal `doc_id` (see
+    /// `IndexData::documents_with_internal_ids`) so the scoring path skips the
+    /// per-doc public-`_id` round-trip.
+    pub fn documents_with_internal_ids(
+        &self,
+        index: &str,
+        internal_ids: &[u32],
+    ) -> Vec<(u32, StoredDocument)> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.get(index).map_or_else(Vec::new, |data| {
+            data.documents_with_internal_ids(index, internal_ids)
         })
     }
 
