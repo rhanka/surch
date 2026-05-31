@@ -803,3 +803,32 @@ hydrate ONLY the window. Parity-critical (must preserve `total` for
 when functions reference fields), so it warrants a focused, oracle-gated pass.
 The two optimisations above stay (sound, parity-safe; `candidate_set_is_exact`
 is the reusable gate for that path).
+
+### deces TAIL #15 — the top-K path landed (parity-clean) but the tail STILL did not move
+`f3ff8ca` added `run_topk_exact_bool`: the exact `bool`/`function_score` case
+(deces shape) now scores straight from internal ids, keeps a K-sized heap, and
+hydrates ONLY the result window — no full-candidate hydration, no full sort.
+Parity CONFIRMED: b1 deces oracle **0 divergences** vs ES (+ `matchid_compat`
+green). **Yet the tail is unchanged** (bool p95 15.2 → 15.5, full 14.6 → 15.4;
+p50 still 1.9 vs ES 4.9 = 2.6× faster). So full hydration was NOT the tail
+either — the THIRD code-level hypothesis refuted by measurement (after the id
+round-trip and `query_matches`).
+
+**Honest stop-and-assess**: three parity-safe code changes, each targeting a
+plausible O(n) cost, NONE moved the p95/p99. The remaining candidates can no
+longer be distinguished by reading code — it is either (a) the leapfrog
+*finding* cost itself (`advance_to` × `df_rarest`, independent of the
+intersection size, so unaffected by hydration/scoring changes) or (b)
+infrastructural CPU-oversubscription jitter (the probe runs 4 workers on a
+2-vCPU runner = 2× oversubscription, and Surch's p50 is so low — 1.9 ms — that
+scheduling jitter dominates the *ratio* p50→p95 far more than for ES's 4.9 ms
+p50). **Next step is DIAGNOSIS, not another blind fix** (the #11 lesson): either
+a WORKERS=2 probe run (isolates the oversubscription hypothesis cheaply) or
+timing instrumentation of the bool/full path on the cluster. All three
+optimisations stay — they are sound, parity-clean, and reduce real per-query
+work (the engine is leaner even if this particular tail is elsewhere).
+
+**Bottom line on deces: the "2× faster than ES" criterion is MET and stable
+(p50 ~2.0 ms vs ES ~4.9 ms, ~2.5–2.6× across four independent runs, mean also
+ahead, parity bit-clean). The p95/p99 tail remains the one axis where ES leads,
+pending a proper diagnosis of its (now narrowed) cause.**
