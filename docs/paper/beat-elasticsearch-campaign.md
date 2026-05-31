@@ -859,8 +859,20 @@ Two findings, both data-clean:
    `ConjunctionScorer` — NOT round-trip / query_matches / hydration (consistent
    with their three refutations). This is finally the **data-supported** cause.
 
-**Next deces lever (focused): tighten the leapfrog `advance_to` hot loop**
-(`conjunction_hits_internal` / `PostingsBlockSkipIter::advance_to`) — avoid the
-per-call `BlockSkipCursor::resume`, branch-lean the driver walk — a constant-
-factor micro-optimisation, the one remaining gap to ES on the conjunction tail.
-The p50 win stands.
+**Next deces lever — and it is STRUCTURAL, not a micro-tweak.** A code read of
+the leapfrog hot loop found no gross inefficiency to shave: `BlockSkipCursor::
+resume` is O(1), and `conjunction_hits_internal`'s driver walk has no obvious
+waste. The tail is the *inherent* O(`df_rarest`) traversal of two decoded
+in-memory posting lists (`[Posting{doc_id:u32, freq:u32}]`, 8 B/entry → tens of
+thousands of entries → hundreds of KB → L2/L3 cache misses on the high-`df`
+pairs), at a reasonable-but-not-Lucene-tight constant factor. Beating ES's
+conjunction tail therefore needs **more compact / SIMD-friendly posting traversal**
+— which is exactly the **WP-A codec backlog** (Roaring bitmaps, Elias-Fano,
+recursive-graph-bisection doc-id reorder) that was deprioritised "for latency"
+when the bottleneck was per-query setup. **Re-prioritised: that backlog is the
+conjunction-tail lever** (compact postings = fewer cache lines per traversal). It
+is a substantial structural effort, warranting a focused pass — the p50 win
+(criterion met) stands meanwhile, and the bare-`match` path already beats ES on
+the tail too (only the conjunction path trails). A blind `advance_to` micro-tweak
+is NOT the answer (three earlier tail hypotheses were already refuted by
+measurement; this one is refuted by code inspection before spending a run).
