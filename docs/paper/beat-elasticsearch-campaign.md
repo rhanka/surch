@@ -771,3 +771,35 @@ block-max WAND top-K. **Next deces lever = extend the WAND/top-K shortcut to
 `bool` (minimum_should_match) + `function_score`** so the common-name tail stops
 scoring the full intersection — the structural read-path optimisation that
 tightens p95/p99 toward (and past) ES.
+
+### deces TAIL #14 — root-caused to full-candidate HYDRATION (two hypotheses refuted by data)
+The p50 criterion is met; the front is the `bool`/`function_score` p95/p99 tail.
+Two data-driven attempts, each MEASURED on the cluster, each parity-safe but
+NOT the tail:
+- **`2e7186b`** — thread internal doc-ids to scoring (drop the per-doc public-`_id`
+  String-hashmap round-trip). Tail unchanged (bool p95 14.3 → 15.0).
+- **`97a0ca0`** — skip `query_matches` when the postings candidate set is
+  provably exact (`candidate_set_is_exact`; the deces conjunction is exact, so
+  the per-doc 2-field re-analysis is a no-op). Tail unchanged (bool p95 → 15.2).
+  Parity CONFIRMED by the b1 deces oracle: **0 divergences vs ES** (the ci-k8s
+  `b1-oracle-gate` workflow went red only on a report-copy step — "no benchmark
+  summary file copied from /reports" — an artifact glitch to fix in WP-B/Track E,
+  NOT a parity issue; the oracle exited 0).
+
+**Root cause (isolated by elimination + the match-vs-bool contrast)**: the
+`run_search` path **hydrates EVERY candidate** (`documents_with_internal_ids`:
+2 hashmap lookups + 2 `String` allocations per doc) over the high-`df`
+intersection, then scores + sorts, then paginates to 20. The bare-`match`
+`maxscore` path (good tail, p95 3.0) scores all `df` but hydrates only the final
+top-20 — so scoring is NOT the tail, full hydration is. The deces `full` query is
+routed onto the full-hydration path by `min_score:0` + `function_score` +
+`track_total_hits` (each disqualifies `run_topk_search`).
+
+**The real fix** (substantial, accumulated): a top-K path for the exact
+`bool`/`function_score` case — score from internal ids (BM25 reads term stats,
+not `_source`; an empty `function_score` is transparent), keep a K-sized heap,
+hydrate ONLY the window. Parity-critical (must preserve `total` for
+`track_total_hits`, `min_score` semantics, and the function_score source-need
+when functions reference fields), so it warrants a focused, oracle-gated pass.
+The two optimisations above stay (sound, parity-safe; `candidate_set_is_exact`
+is the reusable gate for that path).
