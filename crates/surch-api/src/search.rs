@@ -1094,6 +1094,15 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
         {
             return response;
         }
+        // Exact bool/function_score top-K (source-independent scoring): the deces
+        // shape run_topk_search declines. Avoids hydrating the whole candidate
+        // intersection — hydrates only the result window. Falls through to the
+        // full path when its gates do not hold.
+        if let Some(response) =
+            run_topk_exact_bool(state, indices, request, scoring_enabled, started_at)
+        {
+            return response;
+        }
     }
 
     let mut matched_documents: Vec<ScoredDocument> = Vec::new();
@@ -1787,6 +1796,130 @@ fn run_topk_search(
 fn is_default_score_sort(sort: &[SortClause]) -> bool {
     sort.is_empty()
         || (sort.len() == 1 && sort[0].field == "_score" && sort[0].order == SortOrder::Desc)
+}
+
+/// Whether scoring `query` reads `_source` — only a `function_score` with
+/// non-empty `functions` does (they evaluate against field values). BM25
+/// (match/term/multi_match/bool/empty-`function_score`) scores from the term
+/// stats in the scoring context, so scoring can run from internal doc-ids
+/// WITHOUT hydrating the candidate's `_source`.
+fn scoring_needs_source(query: &SearchQuery) -> bool {
+    match query {
+        SearchQuery::FunctionScore {
+            inner, functions, ..
+        } => !functions.is_empty() || scoring_needs_source(inner),
+        // Only `must`/`should` contribute to the score (see `score_for_query`).
+        SearchQuery::Bool { must, should, .. } => {
+            must.iter().chain(should.iter()).any(scoring_needs_source)
+        }
+        _ => false,
+    }
+}
+
+/// Top-K shortcut for an EXACT `bool`/`function_score` query whose scoring does
+/// not read `_source`. This is the deces `function_score{bool{should msm:2}}`
+/// shape, which `run_topk_search` declines (it carries `min_score` /
+/// `function_score` / `track_total_hits` / a non-`Match` root). The `run_search`
+/// fallback HYDRATES every candidate over the high-`df` intersection (2 hashmap
+/// lookups + 2 `String` allocations per doc) before sorting + paginating to the
+/// window — the deces p95/p99 tail. This scores STRAIGHT FROM internal ids,
+/// keeps a K-sized heap, and hydrates ONLY the result window, mirroring the
+/// bare-`match` `maxscore` path that already beats ES on the tail.
+///
+/// Parity: the candidate set is exact (`candidate_set_is_exact` -> no
+/// `query_matches`), scores are source-independent (`scoring_needs_source` ->
+/// identical to the full path), `total` is the post-`min_score` match count
+/// (mirroring `run_search`, which counts after its `min_score` retain), and
+/// equal scores break on ascending internal id — exactly the stable order the
+/// full path yields (its candidate `Vec` is `BTreeSet`-ascending and its
+/// score-sort is stable). Gated by the b1/b2 deces oracles.
+fn run_topk_exact_bool(
+    state: &AppState,
+    indices: &[String],
+    request: &SearchRequest,
+    scoring_enabled: bool,
+    started_at: Instant,
+) -> Option<SearchResponse> {
+    if indices.len() != 1
+        || !is_default_score_sort(&request.sort)
+        || request.highlight.is_some()
+        || !scoring_enabled
+    {
+        return None;
+    }
+    let query = request.query.as_ref()?;
+    if !matches!(
+        query,
+        SearchQuery::Bool { .. } | SearchQuery::FunctionScore { .. }
+    ) || !candidate_set_is_exact(query)
+        || scoring_needs_source(query)
+    {
+        return None;
+    }
+
+    let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
+    let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
+    let limit = from.saturating_add(size);
+
+    // Candidate resolution takes its own read locks (recursive
+    // documents_for_*_internal), so it runs OUTSIDE the scoped scoring guard,
+    // exactly as the `run_search` Bool arm does.
+    let ids: Vec<u32> = posting_candidate_ids(state, &indices[0], query)?
+        .into_iter()
+        .collect();
+
+    state.with_search_reader(&indices[0], |reader| -> Option<SearchResponse> {
+        let reader = reader?;
+        let scoring_context = SearchScoringContext::new(&reader, query);
+        let cmp = |a: &(f64, u32), b: &(f64, u32)| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        };
+        let mut topn = TopN::new(limit, cmp);
+        let mut total: u64 = 0;
+        let mut max_score = f64::NEG_INFINITY;
+        for &id in &ids {
+            let score = score_for_query(query, id, &scoring_context, None);
+            if request.min_score.is_some_and(|min| score < min) {
+                continue;
+            }
+            total += 1;
+            if score > max_score {
+                max_score = score;
+            }
+            topn.push((score, id));
+        }
+        let window: Vec<(f64, u32)> = topn
+            .into_sorted_vec()
+            .into_iter()
+            .skip(from)
+            .take(size)
+            .collect();
+        let winner_ids: Vec<u32> = window.iter().map(|(_, id)| *id).collect();
+        let hydrated = reader.documents_by_internal_ids(&winner_ids);
+        let hits: Vec<_> = window
+            .iter()
+            .zip(hydrated)
+            .map(|((score, _), doc)| {
+                build_hit(
+                    &doc,
+                    request.source.as_ref(),
+                    Some(*score),
+                    request.highlight.as_ref(),
+                    request.query.as_ref(),
+                )
+            })
+            .collect();
+        let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
+        let mut response = build_search_response_with_total(
+            hits,
+            total_summary,
+            started_at.elapsed().as_millis() as u64,
+        );
+        response.hits.max_score = (total > 0).then_some(max_score);
+        Some(response)
+    })
 }
 
 /// `match_all` top-K shortcut. Since the query has no candidate filter
