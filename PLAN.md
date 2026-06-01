@@ -483,7 +483,18 @@ publishable scientific article. Detailed plan + gap analysis:
   and final A+F5 performance summary.
 - [ ] F6 — next scale proof: run full `deces` 28M indexation ES/Surch
   and report duration, throughput, RSS, final doc count, and failure
-  mode under the same no-cheat rules.
+  mode under the same no-cheat rules. **Preflight 2026-06-01**:
+  direct dispatch is blocked because matchID `surch-eval-perf.yml`
+  is still a 1.36M/dev workflow (`FILES_TO_PROCESS=deaths.txt.gz`,
+  dev bucket, no expected-count/RSS/failure-mode gate). Last safe
+  1.36M proof: matchID run `26704547454` (`surch-eval`
+  `25894cf8`) shows Surch bulk `90.33 s` vs ES `120.40 s`;
+  engine p50 `1.1 ms` vs ES `2.4 ms`; tail still behind
+  (`p95/p99` Surch `10.7/14.1 ms` vs ES `5.7/8.2 ms`). Required
+  before 28M: patch matchID workflow/script for full/prod inputs,
+  fail-closed `docs == count == expected_count`, RSS capture,
+  human `summary.md`, machine JSON artifacts, and a runner/remote
+  shape that is not the default 2-vCPU GitHub runner.
 
 ## Delivery Finalities
 

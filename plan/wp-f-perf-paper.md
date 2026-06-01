@@ -230,6 +230,23 @@ Atouts méthodo déjà en place :
     déces p95/p99 encore derrière ES.
   - [ ] Suite post-F5 : full `deces` 28M indexation proof ES/Surch
     (durée bulk/dataprep, débit, RSS, doc count final, failure mode).
+    - [x] **Preflight F6 2026-06-01** : ne pas dispatcher directement le
+      workflow matchID courant. Double relecture `gpt-5.5` xhigh confirme
+      que `matchID-surch-eval/.github/workflows/surch-eval-perf.yml`
+      est calibre 1.36M/dev (`deaths.txt.gz`, bucket dev,
+      `ES_MEM=1024m`) et ne capture pas encore RSS/failure mode ni
+      `expected_count` fail-closed. Le dernier run safe 1.36M
+      (`26704547454`, `surch-eval` `25894cf8`) donne Surch bulk
+      `90.33 s` vs ES `120.40 s`, p50 `1.1 ms` vs ES `2.4 ms`, mais
+      tail encore derriere (`p95/p99` `10.7/14.1 ms` vs ES
+      `5.7/8.2 ms`).
+    - [ ] **Patch requis avant F6 28M** : dans `matchID-surch-eval`,
+      parametrer `repository_bucket`, `files_to_process`,
+      `expected_count`, `ES_MEM`/runner shape ou mode remote; streamer ou
+      chunker sans dump massif fragile dans `/tmp`; ajouter RSS ES/Surch,
+      débit, doc count final, failure mode, `summary.md`, JSON stables, et
+      gate `docs == count == expected_count`. Ensuite seulement: smoke
+      1.36M fail-closed puis dispatch full 28M.
 
 ## Verdict de faisabilité (mise à jour 2026-05-31)
 
