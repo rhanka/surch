@@ -4,10 +4,11 @@ Track principal: F - scientific write-up of the Surch performance
 optimisation programme.
 Branch: `main`.
 Owner: conductor.
-Status: open (2026-05-25). Goal set by the user: assess whether the
-replayed perf evaluations of the Surch optimisations are rigorous
-enough to support a scientific article, and close the gaps so they
-are.
+Status: F5 finalized for the current Track A readout (2026-05-31);
+scale proof continues with the 28M deces indexation lane. Goal set by
+the user: assess whether the replayed perf evaluations of the Surch
+optimisations are rigorous enough to support a scientific article, and
+close the gaps so they are.
 
 ## Thèse de l'article
 
@@ -45,13 +46,12 @@ Atouts méthodo déjà en place :
 
 ## Gaps à combler pour un article rigoureux
 
-- [ ] **F-gap-1 — Rigueur statistique** : toutes les mesures
-  récentes sont en **single-run**. Le protocole replay Track A
-  (`plan/perf-replay-wp-a-algo-ledger.md`) exige déjà `>= 3`
-  répétitions avec médiane + IQR pour un verdict final. Re-rejouer
-  les lots 1 / 1.6 / 1.7 / 2 en 3 reps (ndcg-gate pour bulk+RSS,
-  insee-bench pour la latence). La variance de traîne observée
-  (max 21.6 vs 64.1 ms entre 2 runs Lot 2) confirme le besoin.
+- [x] **F-gap-1 — Rigueur statistique pour le readout courant** :
+  les charges disponibles ont maintenant une confirmation multi-rep
+  (F2 ndcg-gate pour bulk/RSS/qualité, F2 insee-bench pour latence,
+  F4 trec-covid-latency 3-rep). Les isolations par lot restent
+  single-run et sont présentées comme telles, pas comme verdicts
+  statistiques finaux.
 - [ ] **F-gap-2 — Optims historiques non isolées** : la famille
   Lot -2 (top-K scalaire `5081cc7`, lazy `_source` `3157afb`,
   WAND OR-match `ed76014`, WAND multi_match `65ccfbe`, Block-Max
@@ -67,17 +67,11 @@ Atouts méthodo déjà en place :
   porter la surface CI/K8s actuelle SANS réécrire le code applicatif
   historique (le plan replay autorise déjà ce "plumbing autour du
   code historique"), puis rejouer A-replay-1/2/3.
-- [ ] **F-gap-4 — Charges et généralité** : aujourd'hui SciFact +
-  TREC-COVID + INSEE. Un papier gagnerait à (a) BEIR multi-datasets
-  (NFCorpus, FiQA…) pour la généralité qualité, (b) un sweep de
-  taille de corpus pour la courbe de scaling bulk (montrer la
-  sortie de la quadraticité), (c) **un harness de latence search sur
-  grand corpus** (artillery TREC-COVID-scale). Ce dernier est devenu
-  prioritaire : Lot 3 (MaxScore block-leapfrog) est latence-neutre
-  sur INSEE 10k (`2026-05-25-lot3-bmw-skiplist-K8s/`) faute de
-  posting lists assez longues — son régime de bénéfice n'est
-  mesurable que sur grand corpus, qu'aucun harness de latence ne
-  couvre aujourd'hui (`ndcg-gate` = 50 requêtes sans percentiles).
+- [~] **F-gap-4 — Charges et généralité** : SciFact + TREC-COVID +
+  INSEE sont maintenant complétés par NFCorpus + FiQA pour la qualité
+  et par un harness TREC-COVID 171k de latence grand corpus. Le sweep
+  de taille de corpus reste optionnel ; le prochain vrai front n'est
+  plus une charge BEIR additionnelle mais le scale proof `deces` 28M.
 
 ## Plan F (lots)
 
@@ -97,9 +91,10 @@ Atouts méthodo déjà en place :
     `1.5/4.1/8.4/40.6 ms` vs OpenSearch `4.0/12.2/26.3/223.1 ms`
     (Surch `2.7–3.1x` plus rapide, p50 variance nulle, 0 erreur).
   - **F2 complet pour les charges disponibles** : bulk, RSS,
-    qualité, latence ont tous une médiane+étendue. Reste pour
-    l'article : F3 (historiques) + F4 (charges additionnelles dont
-    harness latence grand corpus).
+    qualité, latence ont tous une médiane+étendue. Pour le readout
+    courant, F2 ne laisse plus de blocage ; F3 reste seulement pour
+    des claims historiques un par un, et F6 porte le prochain scale
+    proof 28M.
 - [ ] **F3 — Débloquer + rejouer les historiques** (F-gap-2/3) :
   le gros morceau. **Investigation 2026-05-25 (DÉCISION USER
   requise)** : les SHAs historiques manquent la surface CI/Docker :
@@ -141,9 +136,10 @@ Atouts méthodo déjà en place :
     p99 51.4→5.3 ms (−90%), max 3915→308 ms (−92%) ; p50/p95 neutres. Rapport
     `2026-05-26-F3-wand-isolation-trec-covid-K8s/`. C'est une optim de TRAÎNE
     grand corpus (complète le « neutre sur INSEE 10k »).
-  - [ ] Suite F3 (mêmes toggles isolés) : top-K scalaire, lazy `_source`
-    hydration, cache LRU, FST — chacun un toggle sur `perf-isolation` +
-    mesure avec/sans + rapport. (b)-style, jamais sur main.
+  - [~] Suite F3 (mêmes toggles isolés) : WAND/MaxScore, cache LRU et
+    top-K/lazy hydration ont maintenant des readouts. Restent FST,
+    shared sources et autres historiques seulement si l'article final
+    veut les revendiquer un par un. (b)-style, jamais sur main.
   - Note : (a) greffe historique exclue (binaires bench absents du vieux code).
 - [~] **F4 — Charges additionnelles** (F-gap-4) : BEIR multi +
   sweep de taille (optionnel pour un premier draft).
@@ -204,41 +200,43 @@ Atouts méthodo déjà en place :
       Rapport `2026-05-26-F4-beir-nfcorpus-fiqa-K8s/` + draft maj. Qualité
       Surch validée sur **4 datasets BEIR** (SciFact, TREC-COVID, NFCorpus, FiQA).
     - [ ] (optionnel) Sweep de taille de corpus (courbe de scaling bulk).
-  - **Caveat équivalence (écart latence grand corpus)** : run vert
-    `26422565840` donne Surch p50 `0.5 ms` / p95 `1.3 ms` vs
-    OpenSearch p50 `183.8 ms` / p95 `487.8 ms` sur 171 k (13 170 req,
-    0 erreur des 2 côtés) — soit ~368x à p50. À publier AVEC réserve :
-    `artillery_bench` ne capture que latence + erreurs (drain du body
-    sans parser `hits.total`, cf. `issue_request` l.648-652), donc
-    l'égalité du travail entre moteurs ne se prouve pas depuis
-    l'artefact latence. **Preuve d'équivalence disponible par
-    ailleurs** : la parité NDCG@10 sur TREC-COVID (`0.4750` Surch vs
-    `0.4902` OS) établit que les top-K récupérés sont de qualité
-    équivalente → l'écart de latence reflète bien le saut WAND/MaxScore
-    + skip-lists sur longues listes (régime que l'INSEE 10k n'atteint
-    pas) et l'absence d'overhead JVM, pas un travail dégénéré côté
-    Surch. Durcissement futur : logger `hits.total` par requête dans
-    `artillery_bench` pour assertion directe. Claim à formuler comme
-    single-run illustratif, pas comme mesure multi-rep finale.
-- [~] **F5 — Draft de l'article** : premier draft livré
+  - [x] **Caveat équivalence traité** : le premier run vert
+    `26422565840` a ete promu, puis F4 a recu 3 repetitions et une
+    sonde `surch.bench.trec_hits.v1` (50/50 requetes non vides des
+    deux cotes, volume total apparié à `0.04 %`). Le claim F4 est donc
+    multi-rep et non dégénéré. Il reste formulé comme cache-on /
+    LRU-masked : le cache-off raw p50 Surch reste derrière OpenSearch
+    (`309 ms` vs `169 ms`), donc ce n'est pas un claim raw-engine.
+- [x] **F5 — Draft de l'article / reporting Track A finalisé** :
   `docs/paper/draft.md` (abstract, méthodo, séquence bulk Lot 1→1.6,
   mémoire, latence, qualité, parité matchID, discussion, limitations,
-  conclusion) sur les lots récents + multi-rep F2.
+  conclusion) sur les lots récents + multi-rep F2, avec lecture finale A+F5.
+  - [x] **Trajectoire par optimisation (OpenSearch + déces ES)** ajoutée dans la
+    section finale de `docs/paper/draft.md`, avec effets cumulés et fronts
+    ouverts par étape.
   - [x] **Données de figures livrées** : `docs/paper/figures/` (CSV
     plot-ready bulk-by-lot, RSS-by-lot, latency-by-corpus + provenance
-    par SHA/rapport). Référencées dans l'en-tête du draft. Le tracé
-    lui-même (gnuplot/tableur) reste au choix de l'auteur (repo
-    sans Python).
-  - [ ] Reste F5 : rendu graphique des figures + intégration des
-    historiques si F3 tranché.
+    par SHA/rapport) + rendus SVG (`bulk-trec-covid-by-lot.svg`,
+    `rss-trec-covid-by-lot.svg`, `latency-by-corpus.svg`). Référencées
+    dans l'en-tête du draft.
+  - [x] **Readout final A+F5** ajouté dans `docs/paper/draft.md` :
+    performances atteintes, caveats cache-on/cache-off, limites 28M, et
+    prochain incrément recommandé.
+  - [x] **Double validation critique** : relecture locale + validation
+    subagents `gpt-5.5` xhigh (read-only). Retours traités avant
+    commit: overclaim cache-on supprimé, statuts F2/F3/F4 harmonisés,
+    figure RSS alignée avec le point post-#9. Risques restants:
+    SciFact à citer sous protocole F2, 28M non encore mesuré, tail
+    déces p95/p99 encore derrière ES.
+  - [ ] Suite post-F5 : full `deces` 28M indexation proof ES/Surch
+    (durée bulk/dataprep, débit, RSS, doc count final, failure mode).
 
-## Verdict de faisabilité (au 2026-05-25)
+## Verdict de faisabilité (mise à jour 2026-05-31)
 
-**Article faisable, mais pas encore prêt.** Les lots récents sont
-bien isolés et racontent une histoire forte (Surch > OpenSearch sur
-3 axes, qualité stable). Manquent surtout : la rigueur multi-rep
-(F-gap-1, facile mais coûteux en CI) et l'isolation des optims
-historiques (F-gap-2/3, bloqué techniquement). Un premier draft
-"engineering experience report" est possible avec les seuls lots
-récents en multi-rep ; un article "complet" sur toute la séquence
-d'optimisations nécessite de débloquer Lot 4.
+**Le readout Track A/F5 courant est finalisé comme engineering performance
+report.** Il couvre les mesures multi-rep disponibles, les figures, la
+trajectoire par optimisation, les caveats cache-on/cache-off, et la campagne
+Elasticsearch `deces` 1.36M. Ce qui n'est pas encore un verdict fermé est
+explicitement hors F5 courant : isolation historique complète si le papier veut
+revendiquer chaque ancienne optimisation individuellement, et passage 28M pour
+la preuve production-scale.

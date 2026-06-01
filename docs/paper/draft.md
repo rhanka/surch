@@ -1,6 +1,6 @@
 # Surch: matching and beating a JVM search engine with a pure-Rust, OpenSearch-compatible core
 
-> **Draft** (Objective F F5, 2026-05-25). Engineering-experience
+> **Draft** (Objective F F5, 2026-05-31). Engineering-experience
 > report on the Surch performance optimisation programme. Methodology
 > in `docs/paper/methodology.md`; every figure cites a promoted K8s
 > report under `docs/ops/bench-reports/`. Scope: the *recent* lot
@@ -9,53 +9,75 @@
 > planned (backlog, after the Track D priority); until then this draft
 > cites those as delivered-but-not-yet-individually-isolated.
 > Plot-ready data for the headline curves (bulk-by-lot, RSS-by-lot,
-> latency-by-corpus) is in `docs/paper/figures/` (CSV + provenance).
+> latency-by-corpus) is in `docs/paper/figures/` (CSV + provenance +
+> SVG renders).
 
 ## Abstract
 
 We report the optimisation of Surch, an OpenSearch-compatible search
 engine written in pure Rust, to the point where it matches and
-exceeds OpenSearch 2.17.1 on bulk indexing, search latency, and
-memory footprint — without any retrieval-quality regression — on
-BEIR (SciFact, TREC-COVID) and a real matchID (INSEE) workload. The
-headline result: full 171k-document TREC-COVID bulk ingestion goes
-from `13.9x slower` than OpenSearch to `1.55x faster` (a `~17.8x`
-Surch speedup, `1002 s → 71 s` median) across a four-step sequence,
-while NDCG@10 stays bit-stable and resident memory drops to
-`~2168 MiB`. All measurements run on the same Kubernetes Pod (Surch
-and OpenSearch as sibling containers), with ≥3 repetitions for the
-final claims.
+exceeds OpenSearch 2.17.1 on bulk indexing, small-corpus search
+latency, and memory footprint — without any retrieval-quality
+regression — on BEIR (SciFact, TREC-COVID) and a real matchID (INSEE)
+workload. The headline result: full 171k-document TREC-COVID bulk
+ingestion goes from `13.9x slower` than OpenSearch to `1.55x faster`
+(a `~17.8x` Surch speedup, `1002 s → 71 s` median) across a four-step
+sequence, while NDCG@10 stays bit-stable and resident memory later
+drops to `907 MiB` (`0.62x` the OpenSearch peak) after removing unused
+in-memory posting positions. The large-corpus cache-on latency result
+is reported with its LRU caveat, and raw cache-off TREC-COVID p50
+remains an explicit open front. All measurements run on the same
+Kubernetes Pod (Surch and OpenSearch as sibling containers), with ≥3
+repetitions for the final OpenSearch claims.
 
-## Results at a glance (3-rep medians, Surch vs OpenSearch 2.17.1)
+## Results at a glance — four axes, Surch vs OpenSearch / Elasticsearch
 
-| Axis | Workload | Surch | OpenSearch | Surch advantage |
-|------|----------|------:|-----------:|----------------:|
-| Bulk index | TREC-COVID 171k | 70.96 s | 109.73 s | **1.55x faster** (non-overlapping) |
-| Bulk index | SciFact 5.2k | 2.09 s | 13.97 s | **6.7x faster** |
-| Search p50 | INSEE 10k | 1.5 ms | 4.0 ms | **2.7x faster** |
-| Search p95 | INSEE 10k | 4.1 ms | 12.2 ms | **3.0x faster** |
-| Search p99 | INSEE 10k | 8.4 ms | 26.3 ms | **3.1x faster** |
-| Search p50 | TREC-COVID 171k | 0.5 ms | 176.9 ms | **~354x faster** |
-| Search p95 | TREC-COVID 171k | 1.3 ms | 481.4 ms | **~370x faster** |
-| RSS peak | TREC-COVID 171k | 907 MiB (post-#9) | 1465 MiB | **0.62x (Surch lighter)** |
-| NDCG@10 | SciFact / TREC-COVID | 0.6576 / 0.4750 | 0.6537 / 0.4902 | parity (bit-stable) |
-| NDCG@10 | NFCorpus / FiQA | 0.3033 / 0.2294 | 0.3034 / 0.2389 | parity (NFCorpus identical) |
-| matchID B1 oracle | deces_v1 vs ES 8.6.1 | 30/30, 0 divergence | — | parity preserved |
+| Axis | vs OpenSearch 2.17.1 (BEIR / INSEE) | vs Elasticsearch 8.6.1 (matchID / deces) |
+|------|-------------------------------------|------------------------------------------|
+| **1. Bulk indexing** | **1.55x faster** on TREC-COVID 171k (`70.96 s` vs `109.73 s`, 3-rep median) and **6.7x faster** on SciFact (`2.09 s` vs `13.97 s`). | **Parity / slight lead** on deces 1.36M (`104.2 s` vs `115.9 s`, 3-rep median); honest nuance: ES best run `91.5 s` still beats Surch best `100.8 s`. |
+| **2. Search latency** | **2.7-3.1x faster** on INSEE 10k (`p50 1.5/4.0 ms`, `p95 4.1/12.2 ms`, `p99 8.4/26.3 ms`); **1.83x slower** on raw large-corpus TREC-COVID cache-OFF p50 (`309 ms` vs `169 ms`). The cache-ON `~354x` result is LRU-masked, not a raw-engine claim. | **2.45x faster p50** on deces 1.36M (`2.0 ms` vs `4.9 ms` under the concurrent probe; `~1.6x` at equal `WORKERS=2`). Tail still trails (`p95/p99` Surch `14/21 ms` vs ES `11/15 ms`) until the structural compact/SIMD postings work. |
+| **3. Memory (RSS)** | **0.62x, Surch lighter** on TREC-COVID 171k after the position drop (`907 MiB` vs `1465 MiB`; prior 3-rep Surch median was `2168 MiB`). | 28M-scale measurement pending. |
+| **4. Quality / parity** | **Parity across 4 BEIR datasets**: SciFact `0.6576/0.6537`, TREC-COVID `0.4750/0.4902`, NFCorpus `0.3033/0.3034`, FiQA `0.2294/0.2389` (Surch / OpenSearch NDCG@10). | **Bit-exact parity** on matchID oracles: B1 `30/30`, B2 `8/8`, `0` divergence. |
 
-Surch leads on every axis in this table and on SciFact quality; it
-trails OpenSearch only on TREC-COVID NDCG@10 (`-0.0152`) and on
-absolute RSS (a JVM heap is sized for a different regime). Two latency
-fronts are NOT in this table and are honestly open (see §5/§10):
-large-corpus *raw* (cache-OFF) search latency vs OpenSearch, where Surch
-trails on the median. On the engine-to-engine `deces` benchmark vs ES 8.6.1,
-Surch is now **2.45× faster on p50** (2.0 vs 4.9 ms), down from ~17× SLOWER,
-after eliminating per-query O(n) setup costs (dense doc_len + zero-copy borrow
-+ incremental min_doc_len + single-token candidate resolution) — the "2× faster"
-bar is met on the median; the remaining front is the upper-percentile tail
-(p95/p99), where high-`df` bool/function_score queries still full-scan while ES
-prunes via WAND. Sources:
+This is the canonical performance framing: four product axes, with
+OpenSearch and Elasticsearch separated instead of mixing cache-on,
+cache-off, BEIR, and matchID results in one flat scorecard. Surch wins
+bulk, small-corpus search latency, memory, and quality/parity on the
+measured fronts. The open fronts are also explicit: raw large-corpus
+search p50 vs OpenSearch, deces p95/p99 tail vs Elasticsearch, and
+28M-scale RSS/indexation. Sources:
 `docs/ops/bench-reports/2026-05-25-F2-{ndcg,insee}-3rep-K8s/`,
-`…-b1-oracle-A10-ES861-K8s/`.
+`docs/ops/bench-reports/2026-05-26-F3-lru-cache-isolation-trec-covid-K8s/`,
+`docs/ops/bench-reports/2026-05-25-b2-oracle-deces-v2-ES861-K8s/`,
+and `docs/paper/beat-elasticsearch-campaign.md`.
+
+## A+F5 final readout
+
+The Track A / F5 package is now the current publishable readout for the
+performance programme: methodology, per-axis scorecard, optimisation
+trajectory, explicit limitations, CSV figure data, and rendered SVG figures.
+The headline numbers to carry forward are:
+
+- Bulk: TREC-COVID 171k `1001.95 s -> 70.96 s` median for Surch; final
+  head-to-head `70.96 s` vs OpenSearch `109.73 s` (`1.55x` faster).
+- Bulk on rich matchID `deces` mapping: Surch `104.2 s` vs Elasticsearch
+  `115.9 s` median on 1.36M docs; parity / slight lead, with ES retaining
+  the best single run (`91.5 s`).
+- Search latency: INSEE 10k Surch `p50/p95/p99 = 1.5/4.1/8.4 ms` vs
+  OpenSearch `4.0/12.2/26.3 ms`.
+- Large-corpus search: TREC-COVID cache-on is `~354x` p50 for Surch, but this
+  is explicitly LRU-masked; cache-off raw p50 remains behind OpenSearch
+  (`309 ms` vs `169 ms`).
+- Memory: post-position-drop Surch RSS `907 MiB` vs OpenSearch `1465 MiB`
+  on TREC-COVID 171k (`0.62x`, Surch lighter).
+- Quality/parity: no optimisation regressed BEIR quality; matchID B1/B2
+  oracles remain `0` divergence against Elasticsearch 8.6.1.
+
+The next measurement should be the full `deces` indexation run, not another
+local micro-optimisation. The 1.36M path is now strong enough to justify a
+28M-scale ES/Surch indexation proof: run Elasticsearch first as the production
+baseline, then Surch on the same dataprep corpus and report bulk duration,
+throughput, RSS, final doc count, and any failure mode.
 
 ## 1. Introduction
 
@@ -143,10 +165,15 @@ distributions**, Surch `1.55x` faster. SciFact bulk: Surch median
 
 ## 4. Memory
 
-3-rep Surch RSS peak on the full TREC-COVID corpus: median
-`2168 MiB` (range 2159–2180, `±0.5%`), `~1.48x` the OpenSearch peak
-(`~1467 MiB`). Reproducible to half a percent
-(`2026-05-25-F2-ndcg-3rep-K8s`).
+The F2 3-rep Surch RSS peak on the full TREC-COVID corpus was
+`2168 MiB` (range 2159-2180, `±0.5%`), `~1.48x` the OpenSearch peak
+(`~1467 MiB`) (`2026-05-25-F2-ndcg-3rep-K8s`). The later position-drop
+optimisation (#9, `3ccdbc6`) removed the unused per-posting `Vec<u32>`
+from the in-memory index and flipped the current memory comparison:
+Surch RSS peak `907 MiB` vs OpenSearch `1465 MiB` on the same
+TREC-COVID workload (`0.62x`, Surch lighter). This post-#9 point is a
+single K8s run, but the margin is far larger than the previously
+observed RSS variance; the 28M-scale memory measurement is still open.
 
 ## 5. Search latency
 
@@ -180,9 +207,10 @@ parity on the same corpus (Surch `0.4750` vs OpenSearch `0.4902`), and
 an in-artifact hits-equivalence probe (`surch.bench.trec_hits.v1`)
 showing all 50 queries return non-empty sets on both engines with
 total matched-doc volume agreeing to `0.04 %` (Surch `7 507 757` vs
-OpenSearch `7 510 550`). The gap is therefore the same retrieval work
-done faster — WAND/MaxScore + skip-list early termination and no JVM
-overhead — not a degenerate result set.
+OpenSearch `7 510 550`). The result set is therefore not degenerate;
+the measured `~354x` gap is still a cache-on workload result dominated
+by Surch's result LRU, not proof that the raw scorer performs the same
+work faster.
 
 **Honest caveat — the `354x` is the cache, not the engine (F3 isolation, §9).**
 The steady-state median is dominated by the per-query result LRU: the harness
@@ -331,31 +359,65 @@ term map on the term only (field attached once per unique term), dropping
 field-`String` allocations `O(tokens) → O(unique-terms)`; parity-preserving
 allocation reduction folded into the indexing lead.
 
-### All-benchmarks status (honest)
+### Performance-by-optimization trajectory (Track A)
 
-| Dimension | vs OpenSearch 2.17.1 | vs Elasticsearch 8.6.1 |
-|-----------|----------------------|------------------------|
-| Bulk indexing | ✅ 1.55× (TREC-COVID) / 6.7× (SciFact) | ✅ parity/ahead (deces 1.36M, 104 vs 116 s) |
-| Search latency, small corpus | ✅ 2.7–3.1× (INSEE 10k) | engine-to-engine harness pending |
-| Search latency, large corpus (cache ON) | ⚠️ 354× but LRU-masked, not an engine claim | engine-to-engine harness pending |
-| Search latency, large corpus (cache OFF, raw) | ❌ 1.83× slower p50 (TREC-COVID) — front to win | ✅ **2.45× faster p50** (deces 1.36M engine-to-engine: 2.0 vs 4.9 ms; was ~17× slower before the per-query setup-cost fixes) — tail p95/p99 still trails (WAND-for-bool pending) |
-| Quality (NDCG@10) | ✅ parity (4 BEIR datasets) | ✅ parity (matchID oracle 30/30, 8/8) |
-| Memory (RSS) | ✅ 0.62× (TREC-COVID, post-#9) | 28M-scale measurement pending |
-| matchID DSL parity | — | ✅ B1 30/30, B2 8/8, 0 divergence |
+This draft now tracks the optimisation path explicitly in campaign order, with
+axis-aware outcomes and remaining gaps.
 
-**Won:** bulk (both engines), small-corpus latency, quality, memory, matchID
-parity. **Open fronts:** raw-engine search latency on large corpora — the same
-front on both engines. The clean engine-to-engine `deces` benchmark vs ES 8.6.1
-now exists (replays the real backend query directly on `_search`, no Node
-backend) and is honest about the gap: after collapsing it from **~1200× to ~19×**
-(should-intersection + `function_score`-unwrap #1, dense-`u32` intersection #10),
-Surch deces p50 sits at **~70–78 ms vs ES ~4 ms**. The leapfrog conjunction (#11)
-was implemented, is parity-safe, but the decomposition proved it latency-neutral:
-the bottleneck is **not** clause intersection but the **per-term O(df) hot loop**
-(a single `match` on a common term = ~40 ms ≈ 11× ES; `bool ≈ 2× match`). ES
-avoids it via block-max WAND top-K. Making Surch's bare-`match` top-K actually
-skip is the identified lever to close this gap. Also open: the 28M full-corpus
-memory/indexation run.
+#### OpenSearch 2.17.1 route (Track A)
+
+| Step | Main lever | Reported effect |
+|------|------------|-----------------|
+| Baseline (pre-lots) | Full bulk rebuild in `append_to_index` | TREC-COVID 171k bulk `1001.95 s` vs OpenSearch `72.27 s` (`13.9x` slower). |
+| Lot 1 | Incremental bulk append (`367acdc`) | TREC-COVID bulk `1001.95 → 179.86 s` (`~5.6x` speedup for Surch vs baseline), OpenSearch delta drops `13.9x → 2.06x` slower. |
+| Lot 1.5 | Drop `PostingsBuilder` on refresh (`8a5150f`) | RSS `5859 → 5591 MiB` after builder removal; no major throughput gain, allocator pressure remains high. |
+| Lot 1.7 | Jemalloc (`b9f6636`) | RSS peak `5591 → 3424 MiB` (`-39%`) and final `5591 → 1382 MiB` (`-75%`); bulk `189.18 → 139.05 s` (`-26%`). |
+| Lot 1.6 | Deferred FST materialization (`2e4361e`) | TREC-COVID bulk `139.05 → 56.38 s`; Surch becomes `1.54x` faster than OpenSearch on this workload. |
+| F2 3-rep confirmation (`2026-05-25-F2-3rep`) | Stable median across 3 runs | TREC-COVID bulk `70.96 s` vs OpenSearch `109.73 s` (`1.55x` faster, non-overlap); SciFact `2.09 s` vs `13.97 s` (`6.7x`). |
+| Lot 2 | Skip lists + leapfrog AND (`d73c862`) | INSEE tail `p95` and `p99` reduce `-13%` and `-18%` respectively, ranking unchanged. |
+| Lot 3 | MaxScore block-leapfrog (`e293cfc`) | INSEE 10k impact neutral (posting lists mostly short); long-tail readiness improved in design. |
+| F3 WAND isolation (`2026-05-26-F3-wand-isolation-trec-covid-K8s`) | WAND/MaxScore enabled path only | TREC-COVID raw-tail `p99 51.4 → 5.3 ms` and `max 3915 → 308 ms` (`~90%+` cuts) with `p50/p95` neutral. |
+| F3 top-K isolation (`2026-05-26-F3-topk-isolation-trec-covid-K8s`) | Top-K + lazy hydration enabled | Disabling it alone explodes de facto cold path (`full` `p99 5.3 → 4093 ms`, `max 308 → 15500 ms`); enabled case is the shipped baseline. |
+| #9 | Drop per-posting positions (`3ccdbc6`) | TREC-COVID RSS peak `2168 → 907 MiB`; memory flips to `0.62x` OpenSearch peak. |
+
+#### matchID deces route vs Elasticsearch 8.6.1 (track D/Track A boundary)
+
+| Step | Main lever | Reported deces latency effect |
+|------|------------|------------------------------|
+| Baseline (pre-campaign) | Raw decode + docid intersection chain | p50 around `4513 ms` (`~1200x` slower than ES). |
+| Campaign setup 1 (early deces cleanup) | `should`-intersection + `function_score` unwrap | p50 `4513 → 87.2 ms`; still large gap but no longer catastrophic. |
+| Campaign setup 2 (`#10`, `8aae6a1`) | Dense single-token candidate intersection | Full path p50 `~70 ms`; cumulated improvement `4513 → 70 ms`. |
+| Campaign setup 3 (`#11`, `a6fa7aa`) | Leapfrog conjunction + full candidate path redesign | No measurable gain on deces; neutral, kept for safety. |
+| Campaign setup 4 (`#12`, `de19a9c`+`dfb6c25`) | `Vec<u64>` doc_len + postings-only candidate merge | Full/deces path p50 `~70 → 6.9 ms`; cumulative p50 to ~`6.9 ms` (now ~`10x` faster). |
+| Campaign setup 5 (`#13`, `3bfec8f`+`2c59e91`) | Borrowed doc-len slices + one-pass min bound | p50 `6.9 → 2.0 ms`; ES p50 `4.9 ms`, so Surch is now `~2.45x` faster at p50 under concurrent probe. |
+| Campaign setup 6 (`#14`, `2e7186b`+`97a0ca0`) | Reduced hashmap+`query_matches` overhead | Tail unaffected (`p95/p99` around `15/20.8 ms`), parity preserved; no headline delta. |
+| Campaign setup 7 (`#15`, `f3ff8ca`) | Exact bool/function_score top-K path | Tail still `~15/20 ms` on bool/full; p50 remains `~1.9 ms`. |
+| Campaign setup 8 (`#16`, `WORKERS=2`) | 2 workers / contention probe | Relative gap narrows under fair setting; deces bool/full still tail-heavy (`p95 ~10 ms`) while match path keeps lead (`<2 ms`). |
+
+*Readout provenance:* baseline (`26609427689`), cleanup (`#1`, `26616206949`), `#10` (`26651526846`),
+`#11` (`26668292578`), `#12` (`26696446460`), `#13` (`26697199003`), and `#16` probe (`sha-f3ff8ca`, same probe family).
+
+### All-benchmarks status by the same four axes
+
+| Axis | vs OpenSearch 2.17.1 | vs Elasticsearch 8.6.1 |
+|------|----------------------|------------------------|
+| **1. Bulk indexing** | **1.55x faster** on TREC-COVID and **6.7x faster** on SciFact. | **Parity / slight lead** on deces 1.36M: Surch `104.2 s` vs ES `115.9 s` median, with ES still owning the best individual run. |
+| **2. Search latency** | **2.7-3.1x faster** on INSEE 10k; **1.83x slower** raw p50 on TREC-COVID cache-OFF. Cache-ON `~354x` is a hot LRU case, not a raw-engine claim. | **2.45x faster p50** on deces (`2.0 ms` vs `4.9 ms`), after the per-query setup-cost fixes; tail still trails (`p95/p99` Surch `14/21 ms` vs ES `11/15 ms`). |
+| **3. Memory (RSS)** | **0.62x, Surch lighter** on TREC-COVID post-#9 (`907 MiB` vs `1465 MiB`). | 28M-scale RSS pending. |
+| **4. Quality / parity** | **Parity** across 4 BEIR datasets. | **Bit-exact parity** on B1 `30/30` and B2 `8/8`, `0` divergence. |
+
+**Won:** bulk (both engines), small-corpus latency vs OpenSearch,
+median deces latency vs Elasticsearch, quality/parity, and current
+TREC-COVID memory vs OpenSearch. **Open fronts:** raw-engine
+large-corpus search p50 vs OpenSearch, deces p95/p99 tail vs
+Elasticsearch, and the 28M full-corpus memory/indexation run. The
+deces p50 gap was collapsed from the pre-campaign multi-second path to
+`2.0 ms` via per-query setup fixes (should-intersection,
+`function_score` unwrap, dense `u32` candidate intersection, dense
+`doc_len`, zero-copy borrowed doc lengths, incremental `min_doc_len`,
+and single-token candidate fast path). Four later hypotheses failed to
+move the deces tail; the remaining lever is structural compact/SIMD
+postings work, not another local scoring micro-tweak.
 
 ## 11. Conclusion
 

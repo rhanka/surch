@@ -1,6 +1,6 @@
 # Surch Global Plan
 
-Updated: 2026-05-21
+Updated: 2026-05-31
 
 This is the live conductor plan for Surch. It tracks the repo by the
 official tracks A-E and points to branch-level plans under `plan/`.
@@ -448,15 +448,17 @@ run promoted as
 
 ## Objective F - Scientific perf write-up
 
-Reste estime: ~85% (just opened 2026-05-25). Goal: turn the
-replayed Surch optimisation evaluations into a publishable
-scientific article. Detailed plan + gap analysis:
+Reste estime: ~10% for the current Track A/F5 readout (F1/F2/F4/F5
+closed for the available workloads; remaining proof is the 28M `deces`
+scale run plus any future historical toggles that the paper chooses to
+claim). Goal: turn the replayed Surch optimisation evaluations into a
+publishable scientific article. Detailed plan + gap analysis:
 `plan/wp-f-perf-paper.md`.
 
-- [x] Feasibility assessed: article is feasible but not yet ready.
-  Recent lots (1, 1.5, 1.6, 1.7, 2) are cleanly K8s-isolated and
-  tell a strong story (Surch beats OpenSearch on bulk + search
-  latency + RAM, quality stable), but all single-run.
+- [x] Feasibility assessed and current Track A/F5 readout finalized as
+  an engineering performance report. Recent lots are cleanly
+  K8s-isolated, the available workloads have multi-rep confirmation
+  where final claims are made, and caveats are explicit.
 - [x] F1 — methodology section shipped: `docs/paper/methodology.md`
   (system under test, environment, workloads, metric schemas,
   SLO/quality guardrails, fairness controls, isolation protocol,
@@ -467,15 +469,21 @@ scientific article. Detailed plan + gap analysis:
   RSS `2168 MiB ±0.5%`; NDCG bit-stable) and insee-bench latency
   (`2026-05-25-F2-insee-3rep-K8s/`: Surch median
   `1.5/4.1/8.4/40.6 ms` vs OS `4.0/12.2/26.3/223.1 ms`, `2.7–3.1x`
-  faster). Remaining for the paper: F3 (historical isolation) + F4
-  (extra workloads).
-- [ ] F3 — unblock + replay the historical optimisations
-  (top-K, WAND family, FoR/FST, shared sources): owned by
-  `plan/perf-replay-wp-a-algo-ledger.md`, blocked on the missing
-  workflow surface at the historical SHAs.
-- [ ] F4 — additional workloads (BEIR multi-dataset + corpus-size
-  scaling sweep), optional for a first draft.
-- [ ] F5 — assemble the article draft (results, figures, discussion).
+  faster).
+- [~] F3 — historical optimisation isolation switched from impossible
+  old-SHA replay to forward toggles on `perf-isolation`: WAND/MaxScore,
+  LRU cache, top-K/lazy hydration measured; remaining historical family
+  only matters if the final paper claims those optimisations one-by-one.
+- [x] F4 — additional workloads delivered for the first draft:
+  TREC-COVID large-corpus latency harness, 3-rep latency report, hits
+  equivalence probe, and BEIR NFCorpus/FiQA quality widening.
+- [x] F5 — Track A article/reporting readout assembled in
+  `docs/paper/draft.md` with four-axis scorecard, optimisation
+  trajectory, rendered SVG figures under `docs/paper/figures/`, caveats,
+  and final A+F5 performance summary.
+- [ ] F6 — next scale proof: run full `deces` 28M indexation ES/Surch
+  and report duration, throughput, RSS, final doc count, and failure
+  mode under the same no-cheat rules.
 
 ## Delivery Finalities
 
@@ -491,9 +499,10 @@ scientific article. Detailed plan + gap analysis:
   not only Surch HEAD.
 - [ ] Track E finality: `ci-k8s` is a reliable heavy-benchmark target
   with preserved diagnostics.
-- [ ] Objective F finality: a publishable scientific article on the
-  Surch optimisation programme, backed by multi-rep K8s-isolated
-  measurements for every optimisation claimed.
+- [~] Objective F finality: current Track A/F5 readout is publishable as
+  an engineering performance report for the available workloads; the
+  remaining frontier is the 28M `deces` scale proof before claiming full
+  production-scale parity.
 
 ## Hors-track maintenance
 
