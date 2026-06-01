@@ -46,3 +46,11 @@ tests/matchid_parity/elastic_capture_matchid_local_positive.jsonl
 
 # Claude Code harness-internal state (worktrees, locks, scheduled tasks)
 .claude/
+
+# h2a inter-agent coordination workspace state (not part of the repo)
+.h2a/
+.h2a-schema.json
+identity/
+inbox/
+keys/
+registry/
