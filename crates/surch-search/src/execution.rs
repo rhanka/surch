@@ -282,9 +282,10 @@ impl<'a> BooleanQueryExecutor<'a> {
         // Walk the rarest posting list one doc at a time; for each
         // candidate, ask every other clause to `advance_to(doc_id)`
         // and check if it landed exactly on `doc_id`.
-        let driver_postings = clauses[0].postings.postings().to_vec();
-        for posting in &driver_postings {
-            let doc_id = posting.doc_id;
+        // Drive the rarest term's compact doc_id channel (half the bytes of
+        // the `[Posting]` slice — the leapfrog only needs doc_ids).
+        let driver_doc_ids = clauses[0].postings.doc_ids().to_vec();
+        for (driver_idx, &doc_id) in driver_doc_ids.iter().enumerate() {
             let mut all_match = true;
             // The driver itself trivially contributes its own freq.
             // Iterate the followers and verify presence.
@@ -294,7 +295,7 @@ impl<'a> BooleanQueryExecutor<'a> {
                     all_match = false;
                     break;
                 };
-                if found.doc_id != doc_id {
+                if found != doc_id {
                     // The leapfrog landed past doc_id (gap in the
                     // follower's posting list). This candidate is
                     // not in the intersection.
@@ -315,8 +316,10 @@ impl<'a> BooleanQueryExecutor<'a> {
             // Confirmed: every clause has `doc_id`. Score the
             // contribution of every clause and sum.
             let mut summed = 0.0_f64;
-            // Driver contribution from `posting`.
-            summed += self.score_posting(&clauses[0], posting)?;
+            // Driver contribution: the driver's Posting is index-aligned with
+            // its doc_id channel, so postings()[driver_idx] is the freq we need.
+            let driver_posting = clauses[0].postings.postings()[driver_idx];
+            summed += self.score_posting(&clauses[0], &driver_posting)?;
             // Follower contributions — we need the actual Posting for
             // each follower at doc_id. The cursor returned it but we
             // discarded it inside the loop; re-look up via a binary

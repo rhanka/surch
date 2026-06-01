@@ -775,16 +775,15 @@ impl InMemoryIndex {
         // Otherwise a posting `p > target` returned for a missed target would be
         // skipped and a later equal driver doc would be lost (parity bug).
         // `cur[i] = None` means that iterator is exhausted -> no further matches.
-        let mut cur: Vec<Option<u32>> = iters
-            .iter_mut()
-            .map(|it| it.advance_to(0).map(|p| p.doc_id))
-            .collect();
+        let mut cur: Vec<Option<u32>> = iters.iter_mut().map(|it| it.advance_to(0)).collect();
         let mut out = Vec::new();
-        'docs: for posting in lists[0].postings() {
-            let target = posting.doc_id;
+        // Drive the rarest term's compact doc_id channel (4 B/entry, half the
+        // cache footprint of the `[Posting]` slice) — the conjunction never
+        // needs `freq` here.
+        'docs: for &target in lists[0].doc_ids() {
             for (i, it) in iters.iter_mut().enumerate() {
                 if cur[i].is_some_and(|c| c < target) {
-                    cur[i] = it.advance_to(target).map(|p| p.doc_id);
+                    cur[i] = it.advance_to(target);
                 }
                 if cur[i] != Some(target) {
                     continue 'docs;
@@ -800,7 +799,7 @@ impl InMemoryIndex {
     fn materialised_conjunction(lists: &[PostingsList<'_>]) -> Vec<u32> {
         let mut acc: Option<BTreeSet<u32>> = None;
         for l in lists {
-            let set: BTreeSet<u32> = l.postings().iter().map(|p| p.doc_id).collect();
+            let set: BTreeSet<u32> = l.doc_ids().iter().copied().collect();
             acc = Some(match acc {
                 None => set,
                 Some(prev) => prev.intersection(&set).copied().collect(),

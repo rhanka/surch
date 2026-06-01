@@ -157,6 +157,7 @@ impl PostingsBuilder {
             // the input invariant, which is a programmer bug.
             let mut builder = MapBuilder::memory();
             let mut postings: Vec<Vec<Posting>> = Vec::with_capacity(terms.len());
+            let mut doc_ids: Vec<Vec<u32>> = Vec::with_capacity(terms.len());
             let mut block_metas: Vec<Vec<BlockMeta>> = Vec::with_capacity(terms.len());
             for (idx, (term, term_postings)) in terms.into_iter().enumerate() {
                 builder
@@ -167,6 +168,9 @@ impl PostingsBuilder {
                 // `maxscore_match` instead of being recomputed at every
                 // query.
                 block_metas.push(build_block_metas(&term_postings));
+                // Compact doc_id channel for the conjunction leapfrog (same
+                // ascending order as `term_postings`, so index-aligned).
+                doc_ids.push(term_postings.iter().map(|posting| posting.doc_id).collect());
                 postings.push(term_postings);
             }
             let bytes = builder
@@ -178,6 +182,7 @@ impl PostingsBuilder {
                 FieldPostings {
                     fst,
                     postings,
+                    doc_ids,
                     block_metas,
                 },
             );
@@ -196,6 +201,14 @@ impl PostingsBuilder {
 pub struct FieldPostings {
     fst: Map<Vec<u8>>,
     postings: Vec<Vec<Posting>>,
+    /// Parallel to `postings` (same FST index): just the `doc_id` of each
+    /// posting, in the same ascending order. The conjunction leapfrog scans
+    /// ONLY doc_ids (the `freq` is read by value lookup at scoring time), so a
+    /// dedicated `[u32]` channel touches half the bytes (4 vs 8/posting) of the
+    /// `[Posting]` slice — fewer cache lines on the high-`df` conjunction tail.
+    /// (Validation step toward the on-disk-codec SoA layout; the AoS
+    /// `postings` channel stays for the scoring consumers.)
+    doc_ids: Vec<Vec<u32>>,
     /// Per-term `Vec<BlockMeta>` aligned with `postings` (same index, same
     /// length: one inner Vec per term). Inside each term, the `BlockMeta`
     /// at position `i` describes `postings[term_idx][i*BLOCK_SIZE ..
@@ -219,6 +232,7 @@ impl FieldPostings {
         let idx = self.fst.get(term.as_bytes())? as usize;
         Some(PostingsList {
             postings: self.postings.get(idx)?.as_slice(),
+            doc_ids: self.doc_ids.get(idx)?.as_slice(),
             block_metas: self.block_metas.get(idx)?.as_slice(),
         })
     }
@@ -400,12 +414,20 @@ impl<'a> Iterator for PostingsEnum<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct PostingsList<'a> {
     postings: &'a [Posting],
+    doc_ids: &'a [u32],
     block_metas: &'a [BlockMeta],
 }
 
 impl<'a> PostingsList<'a> {
     pub fn postings(&self) -> &'a [Posting] {
         self.postings
+    }
+
+    /// The compact ascending `doc_id` channel (index-aligned with
+    /// [`Self::postings`]). The conjunction leapfrog walks this instead of the
+    /// `[Posting]` slice to touch half the bytes per posting.
+    pub fn doc_ids(&self) -> &'a [u32] {
+        self.doc_ids
     }
 
     pub fn block_metas(&self) -> &'a [BlockMeta] {
@@ -460,7 +482,7 @@ impl<'a> PostingsList<'a> {
             return Ok(None);
         };
         Ok(Some(PostingsBlockSkipIter {
-            postings: self.postings,
+            doc_ids: self.doc_ids,
             skip_list,
             cursor_position: 0,
             position: 0,
@@ -469,12 +491,14 @@ impl<'a> PostingsList<'a> {
     }
 }
 
-/// Iterator over a term's postings that leapfrogs whole 128-block
+/// Iterator over a term's doc_ids that leapfrogs whole 128-block
 /// chunks whenever the caller advances past a block's `max_doc_id`.
-/// Built by [`PostingsList::skip_iter`].
+/// Built by [`PostingsList::skip_iter`]. Walks the compact `[u32]` doc_id
+/// channel (not `[Posting]`): the conjunction only needs doc_ids, and halving
+/// the per-entry footprint cuts the cache lines touched on the high-`df` tail.
 #[derive(Debug)]
 pub struct PostingsBlockSkipIter<'a> {
-    postings: &'a [Posting],
+    doc_ids: &'a [u32],
     skip_list: BlockSkipList,
     /// Current bottom-layer cursor position, kept in sync with
     /// the internal `BlockSkipCursor`. We re-derive a fresh
@@ -493,14 +517,13 @@ impl<'a> PostingsBlockSkipIter<'a> {
         self.blocks_skipped
     }
 
-    /// Advance to the first posting whose `doc_id >= target`. The
-    /// `target` must be non-decreasing across calls. Returns the
-    /// matching posting (or `None` if the iterator is exhausted).
-    /// Calling `advance_to` repeatedly produces postings in strictly
-    /// ascending `doc_id` order, just like `Iterator::next`, but with
-    /// block-level skipping.
-    pub fn advance_to(&mut self, target: u32) -> Option<&'a Posting> {
-        if self.position >= self.postings.len() {
+    /// Advance to the first `doc_id >= target`. The `target` must be
+    /// non-decreasing across calls. Returns the matching `doc_id` (or `None`
+    /// if the iterator is exhausted). Calling `advance_to` repeatedly produces
+    /// doc_ids in strictly ascending order, just like `Iterator::next`, but
+    /// with block-level skipping.
+    pub fn advance_to(&mut self, target: u32) -> Option<u32> {
+        if self.position >= self.doc_ids.len() {
             return None;
         }
 
@@ -527,17 +550,16 @@ impl<'a> PostingsBlockSkipIter<'a> {
             self.cursor_position = cursor.position();
         }
 
-        // Linear scan from `position` until we find the first posting
-        // whose doc_id >= target. We do not need an upper bound here:
-        // the skip list above already guarantees that the block at
-        // `position` contains a doc_id >= target (or the iterator is
-        // exhausted), so this scan touches O(BLOCK_SIZE) postings
-        // worst case.
-        while self.position < self.postings.len() {
-            let posting = &self.postings[self.position];
-            if posting.doc_id >= target {
+        // Linear scan from `position` until we find the first doc_id >= target.
+        // We do not need an upper bound here: the skip list above already
+        // guarantees that the block at `position` contains a doc_id >= target
+        // (or the iterator is exhausted), so this scan touches O(BLOCK_SIZE)
+        // doc_ids worst case.
+        while self.position < self.doc_ids.len() {
+            let doc_id = self.doc_ids[self.position];
+            if doc_id >= target {
                 self.position += 1;
-                return Some(posting);
+                return Some(doc_id);
             }
             self.position += 1;
         }
@@ -545,12 +567,12 @@ impl<'a> PostingsBlockSkipIter<'a> {
     }
 }
 
-impl<'a> Iterator for PostingsBlockSkipIter<'a> {
-    type Item = &'a Posting;
+impl Iterator for PostingsBlockSkipIter<'_> {
+    type Item = u32;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let posting = self.postings.get(self.position)?;
+    fn next(&mut self) -> Option<u32> {
+        let doc_id = *self.doc_ids.get(self.position)?;
         self.position += 1;
-        Some(posting)
+        Some(doc_id)
     }
 }

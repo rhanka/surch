@@ -156,6 +156,9 @@ fn accounting_from_postings(doc_index: &DocumentIndex) -> DocumentIndexAccountin
                 // count * posting_size.
                 let count = postings.count() as u64;
                 postings_bytes += count.saturating_mul(posting_size);
+                // Parallel compact doc_id channel (the conjunction leapfrog
+                // walks it): `count * size_of::<u32>()`, index-aligned.
+                postings_bytes += count.saturating_mul(size_of::<u32>() as u64);
             }
             if let Some(metas) = doc_index.block_metas(&field, &term) {
                 term_stats_bytes += (metas.len() as u64).saturating_mul(block_meta_size);
