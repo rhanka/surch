@@ -876,3 +876,27 @@ is a substantial structural effort, warranting a focused pass — the p50 win
 the tail too (only the conjunction path trails). A blind `advance_to` micro-tweak
 is NOT the answer (three earlier tail hypotheses were already refuted by
 measurement; this one is refuted by code inspection before spending a run).
+
+### deces TAIL #17 — compact doc_id channel: the cache-win is REAL but MODEST (~15%), not the gap-closer
+Acting on the codec-compact lever (agent-mapped): added a parallel compact
+`doc_id` channel (`FieldPostings.doc_ids: Vec<Vec<u32>>`, 4 B/entry) that the
+conjunction leapfrog walks instead of the 8-B `[Posting]` slice
+(`PostingsBlockSkipIter` now holds `&[u32]`, `advance_to -> u32`; both leapfrogs
+— `conjunction_hits_internal` prod + `execution.rs` — migrated). Parity-safe:
+b1 deces oracle **0 divergences**, `cargo test`/`matchid_compat` green.
+
+**Measurement (`sha-16db443`, WORKERS=4, full 1.36M):** Surch `bool`/`full`
+p95 ~15.5 → **~13.3 ms** (ES stable ~6) — a **real but MODEST ~15% tail
+reduction**. p50 1.8 ms vs ES 5.3 (criterion holds).
+
+**Honest read**: halving the bytes touched (8→4) buys only ~15%, NOT a factor —
+so the conjunction tail is NOT dominated by the posting byte-footprint but by the
+**per-posting `advance_to` algorithm constant factor** (cursor/branch work per
+entry) vs Lucene's SIMD-decoded block walk. The tail stays ~2× ES. Closing it
+would need a deeper block-decode rewrite, not posting layout. Also: the doc_id
+channel STANDALONE is a memory regression (it duplicates doc_ids); the full SoA
+split (`Posting` → `doc_ids[]` + `freqs[]`) would make it memory-clean but for
+the SAME ~15% (it's the same leapfrog) — so the SoA is a memory-neutrality
+refactor, not a further queue win. RSS impact being measured (ndcg-gate) to
+decide keep / SoA-clean / revert. **Bottom line: the codec-compact lever caps at
+~15% on the tail; the p50 win is unaffected and stands.**
