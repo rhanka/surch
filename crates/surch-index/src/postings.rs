@@ -517,6 +517,16 @@ impl<'a> PostingsBlockSkipIter<'a> {
         self.blocks_skipped
     }
 
+    /// Bottom-layer cursor position: the number of doc_ids consumed so far.
+    /// After `advance_to(target)` returns `Some(target)`, the matched entry is
+    /// at index `position() - 1` in the underlying channel — and, since the
+    /// `doc_id` channel is index-aligned with the term's `[Posting]` slice, at
+    /// the same index in `PostingsList::postings()`. Lets the conjunction
+    /// capture the matched `freq` in O(1) instead of a `binary_search` per hit.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
     /// Advance to the first `doc_id >= target`. The `target` must be
     /// non-decreasing across calls. Returns the matching `doc_id` (or `None`
     /// if the iterator is exhausted). Calling `advance_to` repeatedly produces

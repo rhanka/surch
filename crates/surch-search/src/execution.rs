@@ -273,8 +273,12 @@ impl<'a> BooleanQueryExecutor<'a> {
     fn run_leapfrog(
         &self,
         clauses: &mut [LeapfrogClause<'a>],
-    ) -> Result<BTreeMap<u32, f64>, TermQueryExecutionError> {
-        let mut out: BTreeMap<u32, f64> = BTreeMap::new();
+    ) -> Result<Vec<(u32, f64)>, TermQueryExecutionError> {
+        // The driver walks its doc_ids in ascending order and each term has one
+        // posting per doc, so the candidates come out strictly ascending with no
+        // duplicates — a `Vec` (append O(1)) replaces the `BTreeMap` (red-black
+        // insert per hit) with the same ascending iteration order downstream.
+        let mut out: Vec<(u32, f64)> = Vec::new();
         if clauses.is_empty() {
             return Ok(out);
         }
@@ -320,20 +324,23 @@ impl<'a> BooleanQueryExecutor<'a> {
             // its doc_id channel, so postings()[driver_idx] is the freq we need.
             let driver_posting = clauses[0].postings.postings()[driver_idx];
             summed += self.score_posting(&clauses[0], &driver_posting)?;
-            // Follower contributions — we need the actual Posting for
-            // each follower at doc_id. The cursor returned it but we
-            // discarded it inside the loop; re-look up via a binary
-            // search on the follower's postings (cheap: O(log N) per
-            // hit, hit count is the AND intersection size).
+            // Follower contributions. The matching loop above just landed each
+            // follower's cursor exactly on `doc_id`, so the matched posting is at
+            // `iter.position() - 1` (the channel is index-aligned with the
+            // `[Posting]` slice) — read its `freq` in O(1) instead of a
+            // `binary_search` per hit (the cache-missing per-candidate cost the
+            // deces tail decompose flagged; see campaign #18/#19).
             for follower in &clauses[1..] {
                 let follower_postings = follower.postings.postings();
-                let idx = follower_postings
-                    .binary_search_by_key(&doc_id, |p| p.doc_id)
-                    .expect("follower has doc_id (just confirmed by leapfrog cursor)");
+                let idx = follower.iter.position() - 1;
+                debug_assert_eq!(
+                    follower_postings[idx].doc_id, doc_id,
+                    "leapfrog cursor position must point at the just-matched doc_id"
+                );
                 summed += self.score_posting(follower, &follower_postings[idx])?;
             }
 
-            out.insert(doc_id, summed);
+            out.push((doc_id, summed));
         }
 
         Ok(out)
