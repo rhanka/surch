@@ -1914,9 +1914,18 @@ fn run_topk_exact_bool(
     // Candidate resolution takes its own read locks (recursive
     // documents_for_*_internal), so it runs OUTSIDE the scoped scoring guard,
     // exactly as the `run_search` Bool arm does.
+    // #20: the GENERIC bool/full path (fused declined — e.g. a multi-token
+    // compound-name `should`). Suspected home of the ~10ms tail: a large union
+    // candidate set + per-candidate `score_for_query`. Confirm directly.
+    metrics::counter!("surch_dbg_generic_total").increment(1);
+    let t_grecall = std::time::Instant::now();
     let ids: Vec<u32> = posting_candidate_ids(state, &indices[0], query)?
         .into_iter()
         .collect();
+    metrics::histogram!("surch_dbg_generic_recall_us")
+        .record(t_grecall.elapsed().as_micros() as f64);
+    metrics::histogram!("surch_dbg_generic_ids").record(ids.len() as f64);
+    let t_gscore = std::time::Instant::now();
 
     state.with_search_reader(&indices[0], |reader| -> Option<SearchResponse> {
         let reader = reader?;
@@ -1968,6 +1977,8 @@ fn run_topk_exact_bool(
             started_at.elapsed().as_millis() as u64,
         );
         response.hits.max_score = (total > 0).then_some(max_score);
+        metrics::histogram!("surch_dbg_generic_score_us")
+            .record(t_gscore.elapsed().as_micros() as f64);
         Some(response)
     })
 }
