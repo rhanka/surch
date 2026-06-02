@@ -1013,4 +1013,42 @@ is a large change under the SSE2-baseline / stable-Rust / generic-multi-target
 build constraints. **It is the ONLY axis where Surch trails ES; p50 (1.9 vs 4.4,
 ≈2.3×), `match` p95 (3.0 vs 8.0, ≈2.7×), memory (0.66× OS) and BEIR quality all
 stand. Decision deferred to the user: invest in the vectorised conjunction, or
-bank the 3-of-4-axis win.**
+bank the 3-of-4-axis win.** *(The "memory (0.66× OS)" claim is CORRECTED in
+#20 — it was a small-corpus artifact.)*
+
+### deces TAIL #20 — roaring also NEUTRAL (5th miss): the tail is NOT the conjunction. Plus: the memory "win" was a small-corpus mirage
+Owner raised the bar to **strict ≥2× on every speed axis + 0.5× RAM/disk + strict
+NDCG parity**. Two hard structural findings landed.
+
+**(1) A1 roaring/hybrid bitmap — built, oracle-tested, ACTIVATED, parity-clean
+(b1 0-div) — and NEUTRAL.** A from-scratch `RoaringDocSet` (chunked dense
+`[u64;1024]` / sparse `u16` arrays, word-parallel `u64 &` = Lucene's conjunction
+algorithm, unsafe-free under `#![forbid(unsafe_code)]`) wired into BOTH conjunction
+paths (`fused_conjunction_scores` for the `function_score` query, recall for the
+`bool` probe) for two high-`df` terms. Preceded by A3 (`run_leapfrog`
+BTreeMap→Vec + drop the per-hit `binary_search` via `position()`). **Measured
+(W2): bool/full p95 ≈ 10 ms — unchanged across A3 (10.3/10.6) and A1 (10.0/9.8);
+ES 3.2/3.8.** That is the **FIFTH** parity-clean conjunction lever
+(byte-halving, galloping, fused, A3, roaring) to land in the ±1 ms noise. A
+word-parallel AND that does NOT move a tail the decompose attributed to the
+intersection is decisive: **the bottleneck is NOT the intersection, nor the
+per-candidate scoring.** Per the methodology's rotate-after-2-rejects rule we
+STOP guessing and **instrument** (`#20`: per-stage Prometheus histograms —
+recall+score / top-K / hydrate quantiles — to locate the ~10 ms before a 6th
+attempt). The roaring is correct + the right algorithm for when the conjunction
+DOES dominate, but it adds RAM for 0 latency here → its fate rides on the
+instrumentation + the memory rewrite.
+
+**(2) The memory axis was measured on the WRONG corpus.** The "0.66× OS / Surch
+wins memory" headline was **TREC-COVID (171 k docs, RSS 964 vs OS 1462)** — a
+small corpus. On the real **deces (1.36 M), same run: Surch RSS ≈ 9951 MiB vs ES
+≈ 1708 MiB — Surch is 5.8× WORSE.** Surch is **all-in-RAM** (decoded postings +
+the doc_id/roaring channels + `_source` held in memory); Lucene **mmaps segments
+off-disk** (RSS ≈ heap + page cache). Strict 0.5× on deces = a ~12× cut =
+**not reachable without an architectural change**. **Owner decision: commit to
+the mmap / on-disk rewrite** (postings off-heap + stop holding `_source` in RAM)
+— a major project, with a latency risk (part of the p50/`match` 2× win comes
+from the all-in-RAM model). **Honest scorecard now: Surch wins p50 + `match`
+latency decisively; LOSES bool/full latency (tail unlocated) AND memory on large
+corpora (in-RAM vs mmap). Two structural fronts open: instrument bool/full, and
+the mmap rewrite.**
