@@ -897,6 +897,19 @@ would need a deeper block-decode rewrite, not posting layout. Also: the doc_id
 channel STANDALONE is a memory regression (it duplicates doc_ids); the full SoA
 split (`Posting` → `doc_ids[]` + `freqs[]`) would make it memory-clean but for
 the SAME ~15% (it's the same leapfrog) — so the SoA is a memory-neutrality
-refactor, not a further queue win. RSS impact being measured (ndcg-gate) to
-decide keep / SoA-clean / revert. **Bottom line: the codec-compact lever caps at
-~15% on the tail; the p50 win is unaffected and stands.**
+refactor, not a further queue win.
+
+**RSS measured (ndcg-gate, TREC-COVID 171k):** Surch peak **907 → 964 MiB**
+(+57 MiB from the doc_id duplication), i.e. **0.62× → 0.66× OS** (1462 MiB) — the
+memory win is preserved but the headline degrades, and it scales worse on deces
+(more postings). BEIR NDCG bit-stable (no relevance regression).
+
+**Decision (user): do BOTH (a) the full SoA split to make it memory-clean — lock
+the ~15% at the 0.62× headline — AND (b) pursue the real gap-closer.** The
+gap-closer is the per-posting `advance_to` constant factor: SIMD-vectorise the
+intra-block doc_id scan (compare N×u32 per instruction over the contiguous
+`doc_ids[]` channel the SoA provides) to beat Lucene's block conjunction. The SoA
+and the SIMD scan are COMPLEMENTARY (SoA gives the contiguous `[u32]`; SIMD scans
+it fast). **Bottom line: the codec-compact LAYOUT lever caps at ~15% (data); the
+queue gap-close needs the `advance_to` ALGORITHM (SIMD block scan) — both in
+progress; the p50 2× win is unaffected and stands.**
