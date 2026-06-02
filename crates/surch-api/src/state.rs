@@ -2057,21 +2057,19 @@ impl AppState {
         }
         let mut terms: Vec<TermCtx<'_>> = Vec::with_capacity(clauses.len());
         for &(field, value) in clauses {
-            // A custom search-analyzer field recalls with a token that may
-            // differ from the analyzer token the generic scorer uses — the
-            // captured freq would then mis-score. Decline (fall back).
-            if data
-                .mapping
-                .custom_search_terms_for_field(value, field)
-                .is_some()
-            {
+            // The generic path RECALLS with `normalized_terms_for_field` (custom
+            // search analyzer / search_analyzer / custom_analyzer, else the
+            // builtin) but SCORES with `analyzer(field).terms` (the field's main
+            // analyzer). The fused walk captures the recall token's freq AND
+            // scores it, so it is bit-identical only when the two normalisations
+            // agree on a SINGLE token — true for builtin and custom-MAIN
+            // analyzers (the deces French folding), false when a separate search
+            // analyzer is set (then decline → generic path, the parity ref).
+            let recall = normalized_terms_for_field(value, field, &data.mapping);
+            if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
                 return None;
             }
-            let mut toks = data.mapping.analyzer(field).terms(value);
-            if toks.len() != 1 {
-                return None;
-            }
-            let token = toks.remove(0);
+            let token = recall.into_iter().next().expect("len checked == 1");
             let list = match data.index.postings_with_block_metas(field, &token) {
                 Some(list) if !list.postings().is_empty() => list,
                 // A required term with no postings ⇒ the intersection is empty.
