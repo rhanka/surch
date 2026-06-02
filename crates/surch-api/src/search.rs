@@ -1117,6 +1117,13 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
         }
     }
 
+    // #20: the general full-scan fallback (both top-K paths declined). The
+    // bool/full tail (~10ms) is suspected to land here — count it, time the
+    // match materialisation, and record how many docs it scans, to confirm
+    // before fixing (the 5 conjunction levers all missed because the tail
+    // never reached them).
+    metrics::counter!("surch_dbg_general_path_total").increment(1);
+    let t_general = std::time::Instant::now();
     let mut matched_documents: Vec<ScoredDocument> = Vec::new();
     for index in indices {
         matched_documents.extend(match_documents_for_index(
@@ -1125,6 +1132,9 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
             request.query.as_ref(),
         ));
     }
+    metrics::histogram!("surch_dbg_general_match_us")
+        .record(t_general.elapsed().as_micros() as f64);
+    metrics::histogram!("surch_dbg_general_matched").record(matched_documents.len() as f64);
     if scoring_enabled {
         if let Some(min) = request.min_score {
             matched_documents.retain(|doc| doc.score >= min);
