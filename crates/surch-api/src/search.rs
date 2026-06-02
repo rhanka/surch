@@ -865,10 +865,18 @@ pub async fn search_handler(
         }
     }
 
-    match parse_search_request(&body) {
+    // #20 instrumentation: split the server-side request envelope into parse /
+    // run / serialize, since the search core measured ~0.1ms p95 while the
+    // bool/full round-trip is ~10ms — the time is OUTSIDE the search.
+    let t_parse = std::time::Instant::now();
+    let parsed = parse_search_request(&body);
+    metrics::histogram!("surch_dbg_parse_us").record(t_parse.elapsed().as_micros() as f64);
+    match parsed {
         Ok(request) => {
             let query_type = classify_query(request.query.as_ref());
+            let t_run = std::time::Instant::now();
             let mut response = run_search(&state, &indices, &request);
+            metrics::histogram!("surch_dbg_run_us").record(t_run.elapsed().as_micros() as f64);
             if let Some(keepalive) = scroll_keepalive {
                 // Attach a `_scroll_id` so the client can paginate via
                 // `POST /_search/scroll`. The cursor starts where the
@@ -890,7 +898,11 @@ pub async fn search_handler(
                     response.scroll_id = Some(id);
                 }
             }
-            let bytes = match serde_json::to_vec(&response) {
+            let t_ser = std::time::Instant::now();
+            let serialized = serde_json::to_vec(&response);
+            metrics::histogram!("surch_dbg_serialize_us")
+                .record(t_ser.elapsed().as_micros() as f64);
+            let bytes = match serialized {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     metrics::counter!(
