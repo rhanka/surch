@@ -22,9 +22,12 @@ Mesures de référence W2 (charge équitable, la seule base de décision). Ratio
 | Latence TREC-COVID cache-OFF p50 | ms | ~302 | OS ~184 | 0.61x (1.6x plus lent) | **ROUGE (2e cible)** | Surch <= OS/2. Réaliste sous contraintes: parité (voir caveats) |
 | Parité oracles b1/b2 deces | divergences | 0 | — | — | **VERT — SACRÉ** | Toujours 0. Bloquant absolu |
 
-**Reformulation des axes non-ratio (à faire acter par le propriétaire) :**
-- **Qualité NDCG : "2x" est mathématiquement impossible** (doubler 0.66 = 1.32 > 1.0). L'axe qualité n'est PAS une dimension de vitesse. Définition retenue : **"jamais inférieur à OS, tolérance 0.01"** (gate de non-régression, déjà tenu). Les 3 plans concordent : c'est une exception de définition, pas un objectif atteignable.
-- **Mémoire : "2x moins de RAM" (0.5x) est plausible mais borné par ce qu'OS choisit d'allouer** (positions, normes, fielddata). Cible affichée 0.5x, plancher honnête documenté 0.6x.
+**CIBLES ACTÉES PAR LE PROPRIÉTAIRE (2026-06-02) — STRICTES :**
+- **Latence : 2× STRICT** (Surch ≤ ES/OS / 2) sur p50 ET p95 par shape ET global.
+- **Indexation : 2× STRICT** (docs/s Surch ≥ 2× ES/OS). Pas encore atteint (1.1–1.5×) → vrai travail.
+- **Mémoire RAM : 0.5× STRICT** (pas de plancher 0.6× ; viser 0.5× quitte à bitpacker les postings bas-df en RAM).
+- **Disque : 0.5× STRICT** — NOUVEL AXE. Taille de l'index sur disque Surch ≤ OS/2. Jamais mesuré → Phase 0 (après confirmation du modèle de persistance Surch).
+- **Qualité : PARITÉ STRICTE** — `NDCG(Surch) ≥ NDCG(OS)` sur CHAQUE dataset BEIR/INSEE (0 tolérance, 0 régression) + oracle deces 0-divergence vs ES. La qualité n'est pas un axe "2×" (NDCG borné [0,1]) ; c'est un gate de justesse. **Conséquence : TREC-COVID NDCG 0.4750 < OS 0.4902 (−0.015) VIOLE la parité stricte → désormais un point à CORRIGER, pas à tolérer.**
 
 ---
 
