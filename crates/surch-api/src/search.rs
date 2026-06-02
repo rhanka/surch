@@ -1861,6 +1861,27 @@ fn run_topk_exact_bool(
     let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
     let limit = from.saturating_add(size);
 
+    // Fused fast path (campaign #18): the deces `bool`/`full` shape reduces to a
+    // single-token conjunction scored by a plain BM25 sum. Score it in ONE
+    // intersection walk with the `freq` captured O(1) at each matched position,
+    // instead of the generic path's per-candidate-per-term `term_freq`
+    // `binary_search` (the measured CPU tail). `fused_conjunction_scores`
+    // returns `None` to decline on any other shape, so the generic
+    // (oracle-equivalent) path below stays the parity reference.
+    if let Some(clauses) = reduce_deces_conjunction(query) {
+        if let Some(scored) = state.fused_conjunction_scores(&indices[0], &clauses) {
+            return finalize_fused_topk(
+                state,
+                &indices[0],
+                request,
+                scored,
+                from,
+                size,
+                started_at,
+            );
+        }
+    }
+
     // Candidate resolution takes its own read locks (recursive
     // documents_for_*_internal), so it runs OUTSIDE the scoped scoring guard,
     // exactly as the `run_search` Bool arm does.
@@ -1920,6 +1941,133 @@ fn run_topk_exact_bool(
         response.hits.max_score = (total > 0).then_some(max_score);
         Some(response)
     })
+}
+
+/// Reduce the deces `bool`/`function_score` shape to its required single-clause
+/// `(field, value)` leaves (every leaf must match — a conjunction), or `None`
+/// when the query is not that exact shape. Used by [`run_topk_exact_bool`] to
+/// take the fused-scoring fast path (#18); anything it does not recognise falls
+/// back to the generic per-candidate scorer, so this only needs to RECOGNISE
+/// the shape — never to be exhaustive, and never to change a result.
+///
+/// Recognised: `function_score{}` (no functions, boost 1) and `bool` wrappers
+/// (boost 1, no `filter`/`must_not`) collapsing either a single `must` child or
+/// a terminal `should`-conjunction (`minimum_should_match == n_should`, no
+/// `must`) down to single-token `match` leaves. The single-token / custom-field
+/// checks live in `fused_conjunction_scores`, which declines (so the generic
+/// path runs) when they do not hold.
+fn reduce_deces_conjunction(query: &SearchQuery) -> Option<Vec<(&str, &str)>> {
+    let mut out = Vec::new();
+    (reduce_deces_conjunction_into(query, &mut out) && !out.is_empty()).then_some(out)
+}
+
+fn reduce_deces_conjunction_into<'q>(
+    query: &'q SearchQuery,
+    out: &mut Vec<(&'q str, &'q str)>,
+) -> bool {
+    match query {
+        SearchQuery::FunctionScore {
+            inner,
+            boost,
+            functions,
+            ..
+        } => functions.is_empty() && *boost == 1.0 && reduce_deces_conjunction_into(inner, out),
+        SearchQuery::Bool {
+            must,
+            filter,
+            must_not,
+            should,
+            minimum_should_match,
+            boost,
+        } => {
+            if *boost != 1.0 || !must_not.is_empty() || !filter.is_empty() {
+                return false;
+            }
+            if should.is_empty() {
+                // Pure single-child `must` wrapper (e.g. `function_score`'s
+                // `bool.must[inner_bool]`).
+                must.len() == 1 && reduce_deces_conjunction_into(&must[0], out)
+            } else {
+                // Terminal `should`-conjunction: every `should` required, no
+                // `must`. (`must` + `should` mixed would change the generic
+                // sum's `!= 1.0` filtering, so decline it.)
+                must.is_empty()
+                    && *minimum_should_match as usize == should.len()
+                    && should
+                        .iter()
+                        .all(|clause| reduce_deces_conjunction_into(clause, out))
+            }
+        }
+        SearchQuery::Match { field, value, .. } => {
+            out.push((field.as_str(), value.as_str()));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Finalize the fused fast path: apply `min_score`, collect the top-K window,
+/// hydrate the winners and build the response — the exact tail of
+/// [`run_topk_exact_bool`], but fed the pre-computed `(score, doc_id)` pairs
+/// from [`AppState::fused_conjunction_scores`] and hydrating through the state's
+/// own read lock (the scores need no scoring guard).
+fn finalize_fused_topk(
+    state: &AppState,
+    index: &str,
+    request: &SearchRequest,
+    scored: Vec<(f64, u32)>,
+    from: usize,
+    size: usize,
+    started_at: Instant,
+) -> Option<SearchResponse> {
+    let limit = from.saturating_add(size);
+    let cmp = |a: &(f64, u32), b: &(f64, u32)| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    };
+    let mut topn = TopN::new(limit, cmp);
+    let mut total: u64 = 0;
+    let mut max_score = f64::NEG_INFINITY;
+    for (score, id) in scored {
+        if request.min_score.is_some_and(|min| score < min) {
+            continue;
+        }
+        total += 1;
+        if score > max_score {
+            max_score = score;
+        }
+        topn.push((score, id));
+    }
+    let window: Vec<(f64, u32)> = topn
+        .into_sorted_vec()
+        .into_iter()
+        .skip(from)
+        .take(size)
+        .collect();
+    let winner_ids: Vec<u32> = window.iter().map(|(_, id)| *id).collect();
+    let hydrated = state.documents_by_internal_ids(index, &winner_ids);
+    let hits: Vec<_> = window
+        .iter()
+        .zip(hydrated)
+        .map(|((score, _), doc)| {
+            build_hit(
+                &doc,
+                request.source.as_ref(),
+                Some(*score),
+                request.highlight.as_ref(),
+                request.query.as_ref(),
+            )
+        })
+        .collect();
+    let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
+    let mut response = build_search_response_with_total(
+        hits,
+        total_summary,
+        started_at.elapsed().as_millis() as u64,
+    );
+    response.hits.max_score = (total > 0).then_some(max_score);
+    Some(response)
 }
 
 /// `match_all` top-K shortcut. Since the query has no candidate filter

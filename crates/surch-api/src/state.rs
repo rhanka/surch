@@ -11,6 +11,8 @@ use surch_index::{
     postings::{BlockMeta, Posting, PostingsBlockSkipIter, PostingsList},
 };
 
+use surch_search::scoring::{bm25_score, Bm25Config};
+
 use crate::scroll::ScrollTable;
 use crate::stats::{clear_memory_gauges, refresh_memory_gauges};
 
@@ -2005,6 +2007,149 @@ impl AppState {
             terms.push((field.to_string(), toks.remove(0)));
         }
         Some(data.conjunction_hits_internal(&terms))
+    }
+
+    /// Fused single-token conjunction scoring — the deces `bool`/`full` tail
+    /// closer (campaign #18). `clauses` are the required single-clause `(field,
+    /// raw_value)` leaves of the deces shape (extracted by
+    /// `reduce_deces_conjunction` in `search.rs`); every leaf must match.
+    ///
+    /// `run_topk_exact_bool` otherwise resolves the intersection, throws the
+    /// `freq` away, then re-derives it per candidate per term with a
+    /// `binary_search` O(log df) inside `bm25_field_score` — the measured CPU
+    /// tail. This walks the intersection ONCE over the AoS `[Posting]` slices
+    /// (driver = rarest term, galloping cursors over the rest), capturing each
+    /// term's `freq` at the matched position (O(1), `postings[idx].freq`) and
+    /// accumulating the BM25 sum inline.
+    ///
+    /// Returns `Some(scored)` — one `(score, doc_id)` per intersected candidate,
+    /// ascending — **bit-identical** to `score_for_query` for this shape:
+    /// `score = if S > 0 { S } else { 1.0 }`, `S = Σ_term bm25(term)` dropping a
+    /// term scoring exactly `1.0` (the generic `should` sum's placeholder
+    /// filter). `Some(empty)` means the intersection is empty. Returns `None` to
+    /// DECLINE — a custom search-analyzer field (its recall token differs from
+    /// its scoring token, so a captured `freq` would not match the generic
+    /// scorer) or a value that is not exactly one token — so the caller falls
+    /// back to the generic, oracle-equivalent path.
+    pub fn fused_conjunction_scores(
+        &self,
+        index: &str,
+        clauses: &[(&str, &str)],
+    ) -> Option<Vec<(f64, u32)>> {
+        if clauses.is_empty() {
+            return None;
+        }
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let data = store.indices.get(index)?;
+
+        // Per-term: field stats + the AoS postings (doc_id+freq together — the
+        // scorer reads BOTH, so the AoS is exactly the right layout here, NOT a
+        // SoA split, see #18). `doc_freq == postings.len()` (one posting per
+        // doc), matching `bm25_field_score`'s `term_stats.doc_freq`.
+        struct TermCtx<'a> {
+            field_stats: FieldScoringStats<'a>,
+            doc_freq: u64,
+            postings: &'a [Posting],
+        }
+        let mut terms: Vec<TermCtx<'_>> = Vec::with_capacity(clauses.len());
+        for &(field, value) in clauses {
+            // A custom search-analyzer field recalls with a token that may
+            // differ from the analyzer token the generic scorer uses — the
+            // captured freq would then mis-score. Decline (fall back).
+            if data
+                .mapping
+                .custom_search_terms_for_field(value, field)
+                .is_some()
+            {
+                return None;
+            }
+            let mut toks = data.mapping.analyzer(field).terms(value);
+            if toks.len() != 1 {
+                return None;
+            }
+            let token = toks.remove(0);
+            let list = match data.index.postings_with_block_metas(field, &token) {
+                Some(list) if !list.postings().is_empty() => list,
+                // A required term with no postings ⇒ the intersection is empty.
+                _ => return Some(Vec::new()),
+            };
+            let field_stats = data.field_scoring_stats(field)?;
+            terms.push(TermCtx {
+                field_stats,
+                doc_freq: list.postings().len() as u64,
+                postings: list.postings(),
+            });
+        }
+
+        // Drive the rarest term; gallop the others.
+        terms.sort_by_key(|t| t.postings.len());
+        let config = Bm25Config::default();
+
+        // One term's BM25 contribution — replicates `bm25_field_score` exactly
+        // (same `bm25_score` primitive + guards) but with the captured `freq`,
+        // and folds in the generic `should` sum's `!= 1.0` placeholder filter.
+        let term_contrib = |t: &TermCtx<'_>, doc_id: u32, freq: u32| -> f64 {
+            if freq == 0 || t.doc_freq == 0 || t.doc_freq > t.field_stats.doc_count {
+                return 0.0;
+            }
+            let doc_len = if t.field_stats.norms_enabled {
+                match t.field_stats.doc_len(doc_id) {
+                    Some(len) => len,
+                    None => return 0.0,
+                }
+            } else {
+                1
+            };
+            match bm25_score(
+                config,
+                t.field_stats.doc_count,
+                t.doc_freq,
+                u64::from(freq),
+                doc_len,
+                t.field_stats.avg_doc_len,
+            ) {
+                Ok(score) if score != 1.0 => score,
+                _ => 0.0,
+            }
+        };
+
+        // Follower galloping cursors over the AoS postings. Monotonic: driver
+        // doc_ids ascend strictly (one posting per doc), so each cursor only
+        // moves forward.
+        let mut cursors: Vec<usize> = vec![0; terms.len()];
+        let mut scored: Vec<(f64, u32)> = Vec::new();
+        'docs: for driver_posting in terms[0].postings {
+            let doc_id = driver_posting.doc_id;
+            let mut sum = term_contrib(&terms[0], doc_id, driver_posting.freq);
+            for i in 1..terms.len() {
+                let follower = &terms[i];
+                let pos = cursors[i];
+                let rest = &follower.postings[pos..];
+                // Galloping (exponential bound) + branchless `partition_point`:
+                // first posting with `doc_id >= target`.
+                let mut hi = 1usize;
+                while hi < rest.len() && rest[hi].doc_id < doc_id {
+                    hi <<= 1;
+                }
+                let lo = hi >> 1;
+                let hi = hi.min(rest.len());
+                let offset = lo + rest[lo..hi].partition_point(|p| p.doc_id < doc_id);
+                cursors[i] = pos + offset;
+                match follower.postings.get(cursors[i]) {
+                    Some(p) if p.doc_id == doc_id => {
+                        sum += term_contrib(follower, doc_id, p.freq);
+                    }
+                    // Absent from this follower ⇒ not in the intersection.
+                    _ => continue 'docs,
+                }
+            }
+            scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+        }
+        Some(scored)
     }
 
     pub fn documents_by_internal_ids(
