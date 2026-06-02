@@ -48,6 +48,62 @@ fn postings_builder_indexes_terms_and_postings_in_deterministic_order() {
 }
 
 #[test]
+fn skip_iter_advance_to_matches_naive_linear_walk() {
+    // Parity guard for the galloping + partition_point `advance_to` (the
+    // conjunction leapfrog hot loop). A multi-block corpus (> 3*BLOCK_SIZE)
+    // with irregular gaps exercises both the skip-list block jumps AND the
+    // intra-block galloping. For ANY non-decreasing target sequence, the
+    // galloping must yield the EXACT same "first doc_id >= target" sequence as
+    // a naive linear walk — bit-identical, or the conjunction set diverges.
+    let mut builder = PostingsBuilder::new();
+    // i*7 + i%5: strictly increasing (min step 3), irregular gaps (3 or 8).
+    let doc_ids: Vec<u32> = (0..(BLOCK_SIZE * 3 + 17) as u32)
+        .map(|i| i * 7 + i % 5)
+        .collect();
+    for &doc_id in &doc_ids {
+        builder
+            .add("body", "t", doc_id, vec![1])
+            .expect("add posting");
+    }
+    let dictionary = builder.build();
+    let list = dictionary
+        .postings_with_block_metas("body", "t")
+        .expect("postings list");
+
+    // Non-decreasing target stream: every doc_id, plus near-misses around it,
+    // plus a past-the-end probe.
+    let mut targets: Vec<u32> = Vec::new();
+    for &doc_id in &doc_ids {
+        targets.push(doc_id.saturating_sub(1));
+        targets.push(doc_id);
+        targets.push(doc_id + 1);
+    }
+    targets.push(doc_ids.last().unwrap() + 1000);
+    targets.sort_unstable();
+
+    let mut iter = list
+        .skip_iter()
+        .expect("block skip list builds")
+        .expect("non-empty postings");
+    let mut naive_pos = 0usize;
+    for &target in &targets {
+        let got = iter.advance_to(target);
+        // Naive reference: first doc_id >= target from the current cursor,
+        // consuming past it (same return-and-consume semantics as advance_to).
+        let want = loop {
+            let Some(&doc_id) = doc_ids.get(naive_pos) else {
+                break None;
+            };
+            naive_pos += 1;
+            if doc_id >= target {
+                break Some(doc_id);
+            }
+        };
+        assert_eq!(got, want, "advance_to({target}) diverged from linear walk");
+    }
+}
+
+#[test]
 fn postings_builder_derives_frequency_one_when_positions_are_absent() {
     let mut builder = PostingsBuilder::new();
 

@@ -550,20 +550,27 @@ impl<'a> PostingsBlockSkipIter<'a> {
             self.cursor_position = cursor.position();
         }
 
-        // Linear scan from `position` until we find the first doc_id >= target.
-        // We do not need an upper bound here: the skip list above already
-        // guarantees that the block at `position` contains a doc_id >= target
-        // (or the iterator is exhausted), so this scan touches O(BLOCK_SIZE)
-        // doc_ids worst case.
-        while self.position < self.doc_ids.len() {
-            let doc_id = self.doc_ids[self.position];
-            if doc_id >= target {
-                self.position += 1;
-                return Some(doc_id);
-            }
-            self.position += 1;
+        // Find the first doc_id >= target from `position`. The skip list above
+        // already bounded the distance to ~BLOCK_SIZE, but a per-element linear
+        // scan branch-mispredicts on irregular gaps — the per-posting constant
+        // factor that dominates the conjunction tail. Replace it with galloping
+        // (exponential bound, O(log δ)) + `partition_point` (branchless cmov on
+        // the ascending slice). Result is the exact "first >= target", so it is
+        // BIT-IDENTICAL to the linear scan (parity-trivial, deterministic).
+        let rest = &self.doc_ids[self.position..];
+        let mut hi = 1usize;
+        while hi < rest.len() && rest[hi] < target {
+            hi <<= 1;
         }
-        None
+        let lo = hi >> 1;
+        let hi = hi.min(rest.len());
+        let offset = lo + rest[lo..hi].partition_point(|&doc_id| doc_id < target);
+        if offset >= rest.len() {
+            self.position = self.doc_ids.len();
+            return None;
+        }
+        self.position += offset + 1;
+        Some(rest[offset])
     }
 }
 
