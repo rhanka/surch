@@ -1869,16 +1869,23 @@ fn run_topk_exact_bool(
     // returns `None` to decline on any other shape, so the generic
     // (oracle-equivalent) path below stays the parity reference.
     if let Some(clauses) = reduce_deces_conjunction(query) {
-        if let Some(scored) = state.fused_conjunction_scores(&indices[0], &clauses) {
-            return finalize_fused_topk(
-                state,
-                &indices[0],
-                request,
-                scored,
-                from,
-                size,
-                started_at,
-            );
+        let t_recall = std::time::Instant::now();
+        let fused = state.fused_conjunction_scores(&indices[0], &clauses);
+        if let Some(scored) = fused {
+            // Instrumentation (#20 — locate the bool/full ~10ms tail after 5
+            // neutral conjunction levers): split recall+score from
+            // finalize+hydrate, plus the intersection size, as Prometheus
+            // histograms so /_prometheus_metrics exposes per-stage QUANTILES
+            // (the p95 tail, not just the mean).
+            metrics::histogram!("surch_bool_recall_score_us")
+                .record(t_recall.elapsed().as_micros() as f64);
+            metrics::histogram!("surch_bool_candidates").record(scored.len() as f64);
+            let t_fin = std::time::Instant::now();
+            let resp =
+                finalize_fused_topk(state, &indices[0], request, scored, from, size, started_at);
+            metrics::histogram!("surch_bool_finalize_us")
+                .record(t_fin.elapsed().as_micros() as f64);
+            return resp;
         }
     }
 
@@ -2046,6 +2053,11 @@ fn finalize_fused_topk(
         .take(size)
         .collect();
     let winner_ids: Vec<u32> = window.iter().map(|(_, id)| *id).collect();
+    // Instrumentation (#20): isolate hydration + hit-building (the top-K
+    // _source fetch / source-filter / serialise) from the top-K collection
+    // loop above, to see whether the bool/full tail is the per-candidate
+    // scoring or the per-query response build.
+    let t_hydrate = std::time::Instant::now();
     let hydrated = state.documents_by_internal_ids(index, &winner_ids);
     let hits: Vec<_> = window
         .iter()
@@ -2060,6 +2072,7 @@ fn finalize_fused_topk(
             )
         })
         .collect();
+    metrics::histogram!("surch_bool_hydrate_us").record(t_hydrate.elapsed().as_micros() as f64);
     let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
     let mut response = build_search_response_with_total(
         hits,
