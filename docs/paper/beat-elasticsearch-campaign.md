@@ -969,3 +969,48 @@ exact positions** (freq is `postings[idx].freq`, O(1)) and **threw the freq away
   **declines** to the existing path on anything but the exact single-token
   conjunction shape (boosts≠1, `functions`, `must_not`, `filter`, multi-token →
   fallback). **The p50/match wins are unaffected and stand.**
+
+### deces TAIL #19 — fused scorer LANDED & ACTIVATED (parity-clean) but the tail is the CONJUNCTION WALK, not the scoring (decompose-proven)
+The fused conjunction scorer (`AppState::fused_conjunction_scores`) shipped in two
+steps: the path (`1e380b3`), then an activation fix (`51ccb31`). The first version
+declined on the real corpus — the deces `NOM`/`PRENOM` fields use `analyzer: norm`
+(custom: `alphanum` char_filter + `asciifolding` + `lowercase`) as their MAIN
+analyzer, and the guard wrongly declined on *any* `custom_search_terms_for_field`.
+Corrected to the precise condition (`recall == score` single token: fuse iff the
+recall normalisation equals the scoring normalisation — true for a custom-MAIN
+analyzer, false only for a SEPARATE search analyzer). b1 oracle **green** with the
+fused path now ACTIVE on the real 1.36M mapping (authoritative bit-identical
+parity).
+
+**But the tail did not move.** Measured p95 (WORKERS=4, full 1.36M) across the
+attack: byte-halving 13.3 → galloping 13.3 → fused-declined 13.6 → fused-active
+**13.6 (bool) / 12.9 (full)**. ES same-run ~5.5–6.2. **Four codec/scoring levers,
+all within run-to-run noise (±1 ms).**
+
+**The decompose pinpoints why** (same name pairs, three shapes, `51ccb31`):
+
+| shape | what it adds | p95 ms |
+|-------|--------------|--------|
+| `match` (1 term) | analysis + 1 posting list + score | **3.0** |
+| `bool` (`must[match P, match N]`, generic path) | the 2nd term + the intersection | 13.6 |
+| `full` (`function_score{}(bool msm should[P,N])`, FUSED path) | function_score + min_score + sort | **12.9** |
+
+`full ≈ bool` ⇒ the `function_score`/`min_score`/`track_total_hits`/`sort`
+wrapping is ~free. `bool − match = 10.6 ms` ⇒ the cost is the **2-term
+conjunction itself**. And `full (fused 12.9) < bool (generic 13.6)` ⇒ the fused
+path IS active and shaves the per-candidate `binary_search` — but only ~5%
+(noise): **the per-candidate scoring was a MINOR term; the dominant cost is the
+dense intersection walk of two common names** (e.g. `MARIE ∩ MARTIN`), a large
+posting-list overlap that Surch walks scalar-ly where Lucene/ES uses
+SIMD-decoded block postings + roaring-style skips (~2× faster, the measured gap).
+
+**Verdict.** The fused scorer is KEPT — it is correct, parity-clean, and the
+architecturally-right shape (score during the conjunction walk, à la Lucene
+`ConjunctionDISI`); it removes a real cache-missing `binary_search` + a separate
+recall pass, just not the dominant term here. The remaining bool/full gap is a
+**structural dense-conjunction** problem (vectorised/bitmap intersection), which
+is a large change under the SSE2-baseline / stable-Rust / generic-multi-target
+build constraints. **It is the ONLY axis where Surch trails ES; p50 (1.9 vs 4.4,
+≈2.3×), `match` p95 (3.0 vs 8.0, ≈2.7×), memory (0.66× OS) and BEIR quality all
+stand. Decision deferred to the user: invest in the vectorised conjunction, or
+bank the 3-of-4-axis win.**
