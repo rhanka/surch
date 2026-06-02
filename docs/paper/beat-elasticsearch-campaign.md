@@ -897,7 +897,7 @@ would need a deeper block-decode rewrite, not posting layout. Also: the doc_id
 channel STANDALONE is a memory regression (it duplicates doc_ids); the full SoA
 split (`Posting` → `doc_ids[]` + `freqs[]`) would make it memory-clean but for
 the SAME ~15% (it's the same leapfrog) — so the SoA is a memory-neutrality
-refactor, not a further queue win.
+refactor, not a further queue win. **(Plan revised by #18 — read on.)**
 
 **RSS measured (ndcg-gate, TREC-COVID 171k):** Surch peak **907 → 964 MiB**
 (+57 MiB from the doc_id duplication), i.e. **0.62× → 0.66× OS** (1462 MiB) — the
@@ -913,3 +913,59 @@ and the SIMD scan are COMPLEMENTARY (SoA gives the contiguous `[u32]`; SIMD scan
 it fast). **Bottom line: the codec-compact LAYOUT lever caps at ~15% (data); the
 queue gap-close needs the `advance_to` ALGORITHM (SIMD block scan) — both in
 progress; the p50 2× win is unaffected and stands.**
+
+### deces TAIL #18 — the gap-closer was the WRONG layer: it's per-candidate SCORING, not the intersection (data-proven, plan corrected)
+#17 hypothesised the conjunction tail was the `advance_to` per-posting constant
+factor and proposed (a) the SoA + (b) a SIMD block scan. Two measurements
+**refuted that** and re-aimed the campaign.
+
+**(a) Galloping `advance_to` (`sha-5582074`) — NEUTRAL.** Build is SSE2-baseline
+only (stable Rust, no `target-cpu`, cargo-dist generic multi-target → no AVX2,
+`std::simd` is nightly), so SIMD is the wrong lever; the in-build equivalent is
+galloping (exponential bound, O(log δ)) + `slice::partition_point` (branchless
+cmov), bit-identical to the linear scan. **Measured (WORKERS=4, full 1.36M):**
+`bool`/`full` p95 **13.3 ms — IDENTICAL to the #17 byte-halving baseline.** So the
+intra-block scan is NOT the tail; the ~15% from #17 was pure cache/bandwidth, not
+algorithm. Galloping is kept (correct, parity-safe, b1 oracle 0-divergence) but
+neutral here. **The "branch-mispredict per-posting" hypothesis is refuted.**
+
+**(b) Fair-concurrency probe (WORKERS=2, both engines) — the gap is INTRINSIC,
+not the test rig.** The WORKERS=4 runner is 2× oversubscribed on 2 vCPU; halving
+to fair concurrency:
+
+| p95 ms | Surch W4 → W2 | ES W4 → W2 |
+|--------|---------------|------------|
+| match  | 2.9 → **1.6** | 8.3 → 4.2  |
+| bool   | 13.3 → **9.3**| 6.8 → 3.5  |
+| full   | 13.2 → **9.4**| 6.6 → 3.2  |
+
+ES `bool`/`full` p95 **halves** (6.8→3.5) — its tail was oversubscription. Surch
+only drops **−30%** (13.3→9.3) — its tail is **CPU work per query, not queueing.**
+At fair load Surch is **2.7–2.9× SLOWER on bool/full** (the one axis it loses)
+while **2.6× FASTER on match** (1.6 vs 4.2) and **2.5× FASTER on p50** (1.0 vs 2.5).
+The asymmetry localises the cost to the bool/full path specifically.
+
+**Root cause (code-traced).** The deces `full` query `function_score{}(bool.must[
+bool{msm:2-of-2, should:[match PRENOM, match NOM]}])` reduces to a **2-term
+conjunction** (`msm == n_should` → `conjunction_leapfrog`, `search.rs:701`). The
+intersection is fast (the channel/galloping). The cost is **downstream**:
+`run_topk_exact_bool` scores **every** intersected candidate via `score_for_query`
+→ `bm25_field_score` → `TermScoringView::term_freq(doc_id)` = a
+**`binary_search` O(log df) per candidate PER TERM** (`state.rs:193`). For common
+(prénom, nom) pairs the intersection is large and each of `N×2` lookups
+cache-misses across the full term postings. The leapfrog **already walked those
+exact positions** (freq is `postings[idx].freq`, O(1)) and **threw the freq away**.
+
+**Plan corrected.**
+- **SoA (#17 plan a) — DROPPED.** It splits `doc_id`/`freq` into two cache lines;
+  the bool/full scorer reads BOTH per posting, so the SoA would *regress the very
+  tail we are closing* to reclaim +57 MiB we don't need (Surch is already
+  0.66× < OS). The AoS `[Posting]` is exactly right for the scorer — **keep it.**
+- **SIMD block scan (#17 plan b) — DROPPED** (wrong layer + SSE2-only).
+- **NEW lever: fused conjunction scoring.** Fuse intersection + BM25 in one walk:
+  capture each term's `freq` at the matched position (O(1) from the index-aligned
+  AoS), accumulate `bm25_score` (the shared primitive — bit-identical), feed a
+  top-K heap. Eliminates `N×2×O(log df)`. Parity-safe by construction: it
+  **declines** to the existing path on anything but the exact single-token
+  conjunction shape (boosts≠1, `functions`, `must_not`, `filter`, multi-token →
+  fallback). **The p50/match wins are unaffected and stand.**
