@@ -4,6 +4,15 @@ use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use surch_codec::postings_block::{
     BlockSkipCursor, BlockSkipEntry, BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
 };
+
+use crate::roaring::RoaringDocSet;
+
+/// A1: build a roaring/hybrid bitmap only for terms with more than this many
+/// postings. Below it, the galloping leapfrog already wins and the bitmap RAM
+/// is not worth it; above it (the common-name tail), the word-parallel AND is
+/// the bool/full gap-closer. The container choice (dense bitmap vs sparse
+/// array) is then made per 65 536-chunk inside [`RoaringDocSet`].
+const TERM_ROARING_THRESHOLD: usize = 4_096;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, PostingsError>;
@@ -159,6 +168,7 @@ impl PostingsBuilder {
             let mut postings: Vec<Vec<Posting>> = Vec::with_capacity(terms.len());
             let mut doc_ids: Vec<Vec<u32>> = Vec::with_capacity(terms.len());
             let mut block_metas: Vec<Vec<BlockMeta>> = Vec::with_capacity(terms.len());
+            let mut roaring: Vec<Option<RoaringDocSet>> = Vec::with_capacity(terms.len());
             for (idx, (term, term_postings)) in terms.into_iter().enumerate() {
                 builder
                     .insert(term.as_bytes(), idx as u64)
@@ -170,7 +180,18 @@ impl PostingsBuilder {
                 block_metas.push(build_block_metas(&term_postings));
                 // Compact doc_id channel for the conjunction leapfrog (same
                 // ascending order as `term_postings`, so index-aligned).
-                doc_ids.push(term_postings.iter().map(|posting| posting.doc_id).collect());
+                let term_doc_ids: Vec<u32> =
+                    term_postings.iter().map(|posting| posting.doc_id).collect();
+                // A1: precompute a roaring/hybrid bitmap for high-`df` terms so
+                // the conjunction of two common terms ANDs word-parallel bitmaps
+                // instead of walking O(df_rare) scalar-ly. Below the threshold
+                // the galloping leapfrog already wins, so we skip the RAM.
+                roaring.push(if term_doc_ids.len() > TERM_ROARING_THRESHOLD {
+                    Some(RoaringDocSet::from_sorted(&term_doc_ids))
+                } else {
+                    None
+                });
+                doc_ids.push(term_doc_ids);
                 postings.push(term_postings);
             }
             let bytes = builder
@@ -184,6 +205,7 @@ impl PostingsBuilder {
                     postings,
                     doc_ids,
                     block_metas,
+                    roaring,
                 },
             );
         }
@@ -215,6 +237,12 @@ pub struct FieldPostings {
     /// (i+1)*BLOCK_SIZE]`. Built once in `PostingsBuilder::build()` and
     /// never mutated afterwards.
     block_metas: Vec<Vec<BlockMeta>>,
+    /// Parallel to `postings` (same FST index): `Some` only for terms whose
+    /// `df > TERM_ROARING_THRESHOLD` — a roaring/hybrid bitmap of the term's
+    /// doc_ids, so a conjunction of two high-`df` terms ANDs word-parallel
+    /// bitmaps (A1, the bool/full gap-closer) instead of a scalar O(df) walk.
+    /// `None` for low-`df` terms (the galloping leapfrog handles them).
+    roaring: Vec<Option<RoaringDocSet>>,
 }
 
 impl FieldPostings {
@@ -234,6 +262,7 @@ impl FieldPostings {
             postings: self.postings.get(idx)?.as_slice(),
             doc_ids: self.doc_ids.get(idx)?.as_slice(),
             block_metas: self.block_metas.get(idx)?.as_slice(),
+            roaring: self.roaring.get(idx).and_then(Option::as_ref),
         })
     }
 
@@ -416,6 +445,7 @@ pub struct PostingsList<'a> {
     postings: &'a [Posting],
     doc_ids: &'a [u32],
     block_metas: &'a [BlockMeta],
+    roaring: Option<&'a RoaringDocSet>,
 }
 
 impl<'a> PostingsList<'a> {
@@ -428,6 +458,13 @@ impl<'a> PostingsList<'a> {
     /// `[Posting]` slice to touch half the bytes per posting.
     pub fn doc_ids(&self) -> &'a [u32] {
         self.doc_ids
+    }
+
+    /// The precomputed roaring/hybrid bitmap for this term, present only for
+    /// high-`df` terms (`df > TERM_ROARING_THRESHOLD`). `Some` on both sides of
+    /// a conjunction ⇒ the intersection ANDs word-parallel bitmaps (A1).
+    pub fn roaring(&self) -> Option<&'a RoaringDocSet> {
+        self.roaring
     }
 
     pub fn block_metas(&self) -> &'a [BlockMeta] {

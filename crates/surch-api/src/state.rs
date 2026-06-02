@@ -9,6 +9,7 @@ use surch_index::{
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, stored_fields_bytes_for, MemoryUsage},
     postings::{BlockMeta, Posting, PostingsBlockSkipIter, PostingsList},
+    roaring::RoaringDocSet,
 };
 
 use surch_search::scoring::{bm25_score, Bm25Config};
@@ -762,6 +763,20 @@ impl InMemoryIndex {
         }
         // Drive the rarest term; advance_to the others.
         lists.sort_by_key(|l| l.postings().len());
+
+        // A1 fast path: two high-`df` terms (both have a precomputed roaring
+        // bitmap) AND word-parallel instead of the scalar O(df_rare) leapfrog.
+        // Recall-only here (no scoring), so it just emits the intersection
+        // doc_ids ascending — bit-identical to the leapfrog set below (the
+        // roaring module is oracle-tested against a naive set intersection).
+        if lists.len() == 2 {
+            if let (Some(r0), Some(r1)) = (lists[0].roaring(), lists[1].roaring()) {
+                let mut out = Vec::new();
+                r0.intersect_for_each(r1, |doc_id| out.push(doc_id));
+                return out;
+            }
+        }
+
         let mut iters: Vec<PostingsBlockSkipIter<'_>> = Vec::with_capacity(lists.len() - 1);
         for l in &lists[1..] {
             match l.skip_iter() {
@@ -2054,6 +2069,7 @@ impl AppState {
             field_stats: FieldScoringStats<'a>,
             doc_freq: u64,
             postings: &'a [Posting],
+            roaring: Option<&'a RoaringDocSet>,
         }
         let mut terms: Vec<TermCtx<'_>> = Vec::with_capacity(clauses.len());
         for &(field, value) in clauses {
@@ -2080,12 +2096,32 @@ impl AppState {
                 field_stats,
                 doc_freq: list.postings().len() as u64,
                 postings: list.postings(),
+                roaring: list.roaring(),
             });
         }
 
         // Drive the rarest term; gallop the others.
         terms.sort_by_key(|t| t.postings.len());
         let config = Bm25Config::default();
+
+        // Monotonic galloping freq lookup over a term's AoS postings: the
+        // matched `freq` for `doc_id`, advancing `cursor` forward (ascending
+        // `doc_id` callers only). Branchless `partition_point` like the walk.
+        let freq_at = |postings: &[Posting], cursor: &mut usize, doc_id: u32| -> u32 {
+            let rest = &postings[(*cursor).min(postings.len())..];
+            let mut hi = 1usize;
+            while hi < rest.len() && rest[hi].doc_id < doc_id {
+                hi <<= 1;
+            }
+            let lo = hi >> 1;
+            let hi = hi.min(rest.len());
+            let offset = lo + rest[lo..hi].partition_point(|p| p.doc_id < doc_id);
+            *cursor += offset;
+            postings
+                .get(*cursor)
+                .filter(|p| p.doc_id == doc_id)
+                .map_or(0, |p| p.freq)
+        };
 
         // One term's BM25 contribution — replicates `bm25_field_score` exactly
         // (same `bm25_score` primitive + guards) but with the captured `freq`,
@@ -2114,6 +2150,31 @@ impl AppState {
                 _ => 0.0,
             }
         };
+
+        // A1 fast path: two high-`df` terms (the deces bool/full tail) whose
+        // intersection is a dense posting-list overlap. AND their precomputed
+        // roaring bitmaps word-parallel (`u64 & u64`, 64 doc_ids per op) instead
+        // of the scalar O(df_rare) walk, then capture each term's `freq` with a
+        // monotonic galloping sweep. Bit-identical to the walk below: the
+        // intersection set is identical (roaring module is oracle-tested), the
+        // `freq` is the same `postings[idx].freq`, and the score formula is the
+        // same `term_contrib` sum with the `!= 1.0` filter.
+        if terms.len() == 2 {
+            if let (Some(r0), Some(r1)) = (terms[0].roaring, terms[1].roaring) {
+                let mut result: Vec<u32> = Vec::new();
+                r0.intersect_for_each(r1, |doc_id| result.push(doc_id));
+                let mut scored: Vec<(f64, u32)> = Vec::with_capacity(result.len());
+                let (mut c0, mut c1) = (0usize, 0usize);
+                for doc_id in result {
+                    let f0 = freq_at(terms[0].postings, &mut c0, doc_id);
+                    let f1 = freq_at(terms[1].postings, &mut c1, doc_id);
+                    let sum =
+                        term_contrib(&terms[0], doc_id, f0) + term_contrib(&terms[1], doc_id, f1);
+                    scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+                }
+                return Some(scored);
+            }
+        }
 
         // Follower galloping cursors over the AoS postings. Monotonic: driver
         // doc_ids ascend strictly (one posting per doc), so each cursor only
