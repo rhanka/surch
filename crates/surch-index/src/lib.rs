@@ -8,6 +8,7 @@ pub mod live_docs;
 pub mod mapping;
 pub mod memory;
 pub mod postings;
+pub mod roaring;
 pub mod segment_field_infos;
 pub mod segment_infos;
 pub mod segment_manifest;
