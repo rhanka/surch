@@ -7,7 +7,7 @@ use serde_json::Value;
 use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
-    memory::{document_index_memory_usage, stored_fields_bytes_for, MemoryUsage},
+    memory::{document_index_memory_usage, MemoryUsage},
     postings::{BlockMeta, Posting, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
 };
@@ -55,7 +55,12 @@ struct InMemoryIndex {
     /// counting the `Value` payload size once (regardless of the
     /// strong count), so the gauge tracks unique stored bytes —
     /// which is what capacity planning cares about.
-    documents: BTreeMap<String, Arc<Value>>,
+    /// #15 memory: the `_source` is stored as the SERIALIZED JSON bytes
+    /// (`Arc<str>`), NOT a parsed `serde_json::Value` tree (the deces breakdown
+    /// showed the parsed `Value` is the dominant RSS term — ~2-3× the serialized
+    /// size). It is parsed back to a `Value` on access via [`Self::parsed_source`]
+    /// — cheap because reads hydrate only the top-K window (~20 docs/query).
+    documents: BTreeMap<String, Arc<str>>,
     document_ids: BTreeMap<String, u32>,
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
@@ -259,15 +264,17 @@ impl InMemoryIndex {
             doc_id
         });
 
-        // Wrap once per upsert so concurrent readers that already
-        // hold the previous `Arc` keep observing their consistent
-        // snapshot; the write replaces the slot with a fresh handle.
-        self.documents.insert(id.to_owned(), Arc::new(source));
-        let inserted_source = self
-            .documents
-            .get(id)
-            .expect("document must exist after insertion");
-        self.mapping.ensure_fields(inserted_source);
+        // #15: store the SERIALIZED `_source` bytes (not the parsed `Value`).
+        // `ensure_fields` needs the `Value`, so analyse it BEFORE serialising;
+        // the write then replaces the slot with a fresh `Arc<str>` handle so
+        // concurrent readers keep their consistent snapshot.
+        self.mapping.ensure_fields(&source);
+        self.documents.insert(
+            id.to_owned(),
+            Arc::from(
+                serde_json::to_string(&source).expect("a validated _source serialises to JSON"),
+            ),
+        );
     }
 
     fn delete_document(&mut self, id: &str) {
@@ -359,8 +366,8 @@ impl InMemoryIndex {
             .iter()
             .filter_map(|&doc_id| {
                 let id = self.reverse_document_ids.get(&doc_id)?;
-                let source = self.documents.get(id)?;
-                Some((doc_id, indexed_fields_for_document(source, &self.mapping)))
+                let source = self.parsed_source(id)?;
+                Some((doc_id, indexed_fields_for_document(&source, &self.mapping)))
             })
             .collect::<Vec<_>>();
         // Lot 1.6: defer the FST rebuild on the bulk hot path. Reads
@@ -825,16 +832,25 @@ impl InMemoryIndex {
         acc.unwrap_or_default().into_iter().collect()
     }
 
+    /// Parse a stored `_source` (serialized bytes, #15) back into an owned
+    /// `Arc<Value>` for the consumers that need a `&Value` (build_hit,
+    /// query_matches, lookup_sort_value, …). `None` when `id` is unknown.
+    fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
+        let raw = self.documents.get(id)?;
+        Some(Arc::new(
+            serde_json::from_str(raw).expect("stored _source is valid JSON"),
+        ))
+    }
+
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
         internal_ids
             .iter()
             .filter_map(|doc_id| {
                 let id = self.reverse_document_ids.get(doc_id)?;
-                self.documents.get(id).map(|source| StoredDocument {
+                self.parsed_source(id).map(|source| StoredDocument {
                     index: index.to_owned(),
                     id: id.clone(),
-                    // Refcount bump, not a JSON deep clone.
-                    source: Arc::clone(source),
+                    source,
                 })
             })
             .collect()
@@ -856,13 +872,13 @@ impl InMemoryIndex {
             .iter()
             .filter_map(|&doc_id| {
                 let id = self.reverse_document_ids.get(&doc_id)?;
-                self.documents.get(id).map(|source| {
+                self.parsed_source(id).map(|source| {
                     (
                         doc_id,
                         StoredDocument {
                             index: index.to_owned(),
                             id: id.clone(),
-                            source: Arc::clone(source),
+                            source,
                         },
                     )
                 })
@@ -1797,7 +1813,7 @@ impl AppState {
         store
             .indices
             .get(index)
-            .and_then(|data| data.documents.get(id).map(|source| (**source).clone()))
+            .and_then(|data| data.parsed_source(id).map(|source| (*source).clone()))
     }
 
     pub fn documents(&self, index: &str) -> Vec<StoredDocument> {
@@ -1810,11 +1826,14 @@ impl AppState {
             .get(index)
             .into_iter()
             .flat_map(|data| {
-                data.documents.iter().map(|(id, source)| StoredDocument {
-                    index: index.to_owned(),
-                    id: id.clone(),
-                    // Refcount bump per hit, not a JSON deep clone.
-                    source: Arc::clone(source),
+                // #15: full scan re-parses each stored `_source` (admin/agg
+                // path; the hot top-K path parses only the window).
+                data.documents.keys().filter_map(move |id| {
+                    data.parsed_source(id).map(|source| StoredDocument {
+                        index: index.to_owned(),
+                        id: id.clone(),
+                        source,
+                    })
                 })
             })
             .collect()
@@ -1861,11 +1880,13 @@ impl AppState {
             .iter()
             .skip(from)
             .take(size)
-            .map(|(id, source)| StoredDocument {
+            .map(|(id, raw)| StoredDocument {
                 index: index.to_owned(),
                 id: id.clone(),
-                // Refcount bump per hit, not a JSON deep clone.
-                source: Arc::clone(source),
+                // #15: parse the stored bytes back to a Value (window only).
+                source: Arc::new(
+                    serde_json::from_str(raw.as_ref()).expect("stored _source is valid JSON"),
+                ),
             })
             .collect()
     }
@@ -1881,11 +1902,10 @@ impl AppState {
 
         ids.iter()
             .filter_map(|id| {
-                data.documents.get(id).map(|source| StoredDocument {
+                data.parsed_source(id).map(|source| StoredDocument {
                     index: index.to_owned(),
                     id: id.clone(),
-                    // Refcount bump per hit, not a JSON deep clone.
-                    source: Arc::clone(source),
+                    source,
                 })
             })
             .collect()
@@ -2452,8 +2472,10 @@ impl AppState {
         // outstanding `Arc` strong count: the gauge tracks the
         // unique RAM held by `_source` JSON, not the per-reader
         // cumulative footprint.
-        usage.stored_fields_bytes =
-            stored_fields_bytes_for(data.documents.values().map(Arc::as_ref));
+        // #15: `_source` is now the serialized bytes, so the stored size is
+        // simply their length (the parsed-`Value` accounting is gone with the
+        // parsed-`Value` storage — this is the real, smaller resident size).
+        usage.stored_fields_bytes = data.documents.values().map(|raw| raw.len() as u64).sum();
         Some(usage)
     }
 
