@@ -55,16 +55,12 @@ struct InMemoryIndex {
     /// counting the `Value` payload size once (regardless of the
     /// strong count), so the gauge tracks unique stored bytes —
     /// which is what capacity planning cares about.
-    /// #15 memory: the `_source` is stored as DEFLATE-COMPRESSED serialized JSON
-    /// bytes (`Arc<[u8]>`), NOT a parsed `serde_json::Value` tree (the deces
-    /// breakdown showed the parsed `Value` is the dominant RSS term — ~2-3× the
-    /// serialized size, and the serialized JSON compresses ~3-4×). It is
-    /// decompressed + parsed back to a `Value` on access via
-    /// [`Self::parsed_source`] — cheap because reads hydrate only the top-K
-    /// window (~20 docs/query); compression uses `Compression::fast` so the
-    /// per-doc index-time cost stays small (the owner's indexing-regression
-    /// concern). See [`compress_source`] / [`decompress_source`].
-    documents: BTreeMap<String, Arc<[u8]>>,
+    /// #15 memory: the `_source` is stored as the SERIALIZED JSON bytes
+    /// (`Arc<str>`), NOT a parsed `serde_json::Value` tree (the deces breakdown
+    /// showed the parsed `Value` is the dominant RSS term — ~2-3× the serialized
+    /// size). It is parsed back to a `Value` on access via [`Self::parsed_source`]
+    /// — cheap because reads hydrate only the top-K window (~20 docs/query).
+    documents: BTreeMap<String, Arc<str>>,
     document_ids: BTreeMap<String, u32>,
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
@@ -273,9 +269,12 @@ impl InMemoryIndex {
         // the write then replaces the slot with a fresh `Arc<str>` handle so
         // concurrent readers keep their consistent snapshot.
         self.mapping.ensure_fields(&source);
-        let json = serde_json::to_string(&source).expect("a validated _source serialises to JSON");
-        self.documents
-            .insert(id.to_owned(), Arc::from(compress_source(&json)));
+        self.documents.insert(
+            id.to_owned(),
+            Arc::from(
+                serde_json::to_string(&source).expect("a validated _source serialises to JSON"),
+            ),
+        );
     }
 
     fn delete_document(&mut self, id: &str) {
@@ -312,11 +311,10 @@ impl InMemoryIndex {
             .iter()
             .filter_map(|(id, source)| {
                 self.document_ids.get(id).map(|doc_id| {
-                    // #15: stored _source is compressed; decompress + parse to a
+                    // #15: the stored _source is serialized bytes; parse to a
                     // Value to extract its indexed fields (full-reindex path).
-                    let json = decompress_source(source);
-                    let parsed: Value =
-                        serde_json::from_str(&json).expect("stored _source is valid JSON");
+                    let parsed: Value = serde_json::from_str(source.as_ref())
+                        .expect("stored _source is valid JSON");
                     (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
                 })
             })
@@ -843,9 +841,8 @@ impl InMemoryIndex {
     /// query_matches, lookup_sort_value, …). `None` when `id` is unknown.
     fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
         let raw = self.documents.get(id)?;
-        let json = decompress_source(raw);
         Some(Arc::new(
-            serde_json::from_str(&json).expect("stored _source is valid JSON"),
+            serde_json::from_str(raw).expect("stored _source is valid JSON"),
         ))
     }
 
@@ -1011,31 +1008,6 @@ fn normalized_terms_for_field(value: &str, field: &str, mapping: &IndexMapping) 
         return terms;
     }
     mapping.analyzer(field).terms(value)
-}
-
-/// #15: DEFLATE-compress a serialized `_source` JSON string for in-RAM storage.
-/// `Compression::fast` keeps the per-document index-time cost small (the owner's
-/// indexing-regression concern); the serialized JSON still compresses ~3-4×.
-fn compress_source(json: &str) -> Vec<u8> {
-    use std::io::Write;
-    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
-    encoder
-        .write_all(json.as_bytes())
-        .expect("in-memory deflate never fails I/O");
-    encoder
-        .finish()
-        .expect("in-memory deflate finish never fails I/O")
-}
-
-/// #15: inflate a stored `_source` back to its serialized JSON string.
-fn decompress_source(bytes: &[u8]) -> String {
-    use std::io::Read;
-    let mut decoder = flate2::read::DeflateDecoder::new(bytes);
-    let mut json = String::new();
-    decoder
-        .read_to_string(&mut json)
-        .expect("stored _source is valid deflate of UTF-8 JSON");
-    json
 }
 
 fn indexed_fields_for_document(document: &Value, mapping: &IndexMapping) -> Vec<(String, String)> {
@@ -1915,10 +1887,9 @@ impl AppState {
             .map(|(id, raw)| StoredDocument {
                 index: index.to_owned(),
                 id: id.clone(),
-                // #15: decompress + parse the stored bytes (window only).
+                // #15: parse the stored bytes back to a Value (window only).
                 source: Arc::new(
-                    serde_json::from_str(&decompress_source(raw))
-                        .expect("stored _source is valid JSON"),
+                    serde_json::from_str(raw.as_ref()).expect("stored _source is valid JSON"),
                 ),
             })
             .collect()
