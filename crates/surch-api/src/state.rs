@@ -2211,6 +2211,122 @@ impl AppState {
         Some(scored)
     }
 
+    /// Candidate set of a `should`-all-required conjunction of `match` clauses
+    /// WITHOUT materialising any clause's full token union — the deces bool/full
+    /// tail (#20: `posting_candidate_ids` spent ~7.5ms p95 building the
+    /// `jean ∪ pierre` BTreeSet for a compound prénom, only to intersect down to
+    /// ≤10 docs). Each clause is `(field, value, require_all_terms)`; a doc
+    /// matches a clause when it has ANY token (OR) / ALL tokens (AND).
+    ///
+    /// Drives the clause with the smallest size estimate (∑df for OR, min df for
+    /// AND), materialises ONLY its matching docs, then keeps those that are
+    /// members of every other clause (a `binary_search` per token over the
+    /// ascending `doc_id` channel — no union allocation). Returns the matching
+    /// doc ids ascending, bit-identical to the intersection-of-unions.
+    pub fn conjunction_of_matches(
+        &self,
+        index: &str,
+        clauses: &[(&str, &str, bool)],
+    ) -> Option<Vec<u32>> {
+        if clauses.is_empty() {
+            return None;
+        }
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let data = store.indices.get(index)?;
+
+        // Per clause: its tokens' ascending doc_id slices + the operator.
+        struct ClauseTokens<'a> {
+            require_all: bool,
+            token_doc_ids: Vec<&'a [u32]>,
+        }
+        let mut clause_tokens: Vec<ClauseTokens<'_>> = Vec::with_capacity(clauses.len());
+        for &(field, value, require_all) in clauses {
+            let tokens = normalized_terms_for_field(value, field, &data.mapping);
+            if tokens.is_empty() {
+                return Some(Vec::new());
+            }
+            let mut token_doc_ids: Vec<&[u32]> = Vec::with_capacity(tokens.len());
+            for token in &tokens {
+                match data.index.postings_with_block_metas(field, token) {
+                    Some(list) => token_doc_ids.push(list.doc_ids()),
+                    // Absent token: AND ⇒ the clause (hence the conjunction) is
+                    // empty; OR ⇒ this token simply contributes nothing.
+                    None if require_all => return Some(Vec::new()),
+                    None => {}
+                }
+            }
+            if token_doc_ids.is_empty() {
+                // Every token of an OR clause is absent ⇒ matches nothing.
+                return Some(Vec::new());
+            }
+            clause_tokens.push(ClauseTokens {
+                require_all,
+                token_doc_ids,
+            });
+        }
+
+        // Size estimate: OR ≈ ∑df (union upper bound), AND ≈ min df.
+        let estimate = |c: &ClauseTokens<'_>| -> usize {
+            if c.require_all {
+                c.token_doc_ids.iter().map(|s| s.len()).min().unwrap_or(0)
+            } else {
+                c.token_doc_ids.iter().map(|s| s.len()).sum()
+            }
+        };
+        let driver_idx = (0..clause_tokens.len())
+            .min_by_key(|&i| estimate(&clause_tokens[i]))
+            .expect("clause_tokens is non-empty");
+
+        // Does `doc_id` match clause `c`? (binary_search per token, no alloc.)
+        let clause_contains = |c: &ClauseTokens<'_>, doc_id: u32| -> bool {
+            if c.require_all {
+                c.token_doc_ids
+                    .iter()
+                    .all(|s| s.binary_search(&doc_id).is_ok())
+            } else {
+                c.token_doc_ids
+                    .iter()
+                    .any(|s| s.binary_search(&doc_id).is_ok())
+            }
+        };
+
+        // Materialise ONLY the driver clause's matching docs (ascending, unique).
+        let driver = &clause_tokens[driver_idx];
+        let driver_docs: Vec<u32> = if driver.token_doc_ids.len() == 1 {
+            // Single token: the posting list IS the matching set, already sorted.
+            driver.token_doc_ids[0].to_vec()
+        } else if driver.require_all {
+            let mut acc: BTreeSet<u32> = driver.token_doc_ids[0].iter().copied().collect();
+            for s in &driver.token_doc_ids[1..] {
+                let next: BTreeSet<u32> = s.iter().copied().collect();
+                acc.retain(|d| next.contains(d));
+            }
+            acc.into_iter().collect()
+        } else {
+            let mut acc: BTreeSet<u32> = BTreeSet::new();
+            for s in &driver.token_doc_ids {
+                acc.extend(s.iter().copied());
+            }
+            acc.into_iter().collect()
+        };
+
+        // Keep driver docs that are members of every OTHER clause.
+        let out: Vec<u32> = driver_docs
+            .into_iter()
+            .filter(|&doc_id| {
+                clause_tokens
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| i == driver_idx || clause_contains(c, doc_id))
+            })
+            .collect();
+        Some(out)
+    }
+
     pub fn documents_by_internal_ids(
         &self,
         index: &str,

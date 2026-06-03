@@ -705,14 +705,28 @@ fn posting_candidate_ids(
                     required.extend(should.iter());
                 }
                 let mut pairs: Vec<(&str, &str)> = Vec::with_capacity(required.len());
+                // (field, value, require_all_terms) for the multi-token fallback,
+                // collected only while every required clause is a `match`.
+                let mut match_clauses: Vec<(&str, &str, bool)> = Vec::with_capacity(required.len());
                 let mut flat = true;
+                let mut all_match = true;
                 for q in &required {
                     match q {
-                        SearchQuery::Match { field, value, .. } => {
+                        SearchQuery::Match {
+                            field,
+                            value,
+                            operator,
+                        } => {
                             pairs.push((field.as_str(), value.as_str()));
+                            match_clauses.push((
+                                field.as_str(),
+                                value.as_str(),
+                                *operator == MatchOperator::And,
+                            ));
                         }
                         SearchQuery::Term { field, value } => {
                             pairs.push((field.as_str(), value.as_str()));
+                            all_match = false;
                         }
                         _ => {
                             flat = false;
@@ -721,8 +735,20 @@ fn posting_candidate_ids(
                     }
                 }
                 if flat && pairs.len() >= 2 {
+                    // Single-token conjunction: the galloping leapfrog. Declines
+                    // (None) when any clause is multi-token (a compound name).
                     if let Some(ids) = state.conjunction_leapfrog(index, &pairs) {
                         return Some(ids.into_iter().collect());
+                    }
+                    // #20 fix: a multi-token clause (e.g. prénom "JEAN PIERRE")
+                    // made the leapfrog decline; the old fallback materialised
+                    // the full `jean ∪ pierre` union (~7.5ms p95) only to
+                    // intersect down to ≤10 docs. Drive the smallest clause +
+                    // membership-check instead — no union allocation.
+                    if all_match {
+                        if let Some(ids) = state.conjunction_of_matches(index, &match_clauses) {
+                            return Some(ids.into_iter().collect());
+                        }
                     }
                 }
             }
