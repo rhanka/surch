@@ -310,9 +310,13 @@ impl InMemoryIndex {
             .documents
             .iter()
             .filter_map(|(id, source)| {
-                self.document_ids
-                    .get(id)
-                    .map(|doc_id| (*doc_id, indexed_fields_for_document(source, &self.mapping)))
+                self.document_ids.get(id).map(|doc_id| {
+                    // #15: the stored _source is serialized bytes; parse to a
+                    // Value to extract its indexed fields (full-reindex path).
+                    let parsed: Value = serde_json::from_str(source.as_ref())
+                        .expect("stored _source is valid JSON");
+                    (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
+                })
             })
             .collect::<Vec<_>>();
         // Lot 1.6: defer the FST rebuild. The bulk path then chains
