@@ -1052,3 +1052,43 @@ from the all-in-RAM model). **Honest scorecard now: Surch wins p50 + `match`
 latency decisively; LOSES bool/full latency (tail unlocated) AND memory on large
 corpora (in-RAM vs mmap). Two structural fronts open: instrument bool/full, and
 the mmap rewrite.**
+
+### deces TAIL #21 — SOLVED. The tail was never the search; it was the RECALL materialising a multi-token union
+Per-stage Prometheus histograms (`surch_dbg_*`, scraped from `/_prometheus_metrics`
+after the probes) ended the guessing and located the ~10 ms **exactly**:
+
+| stage (p95) | before | meaning |
+|-------------|--------|---------|
+| search core (`recall_score`+`finalize`+`hydrate`) | **~0.1 ms** | the conjunction was NEVER the cost — why 5 levers missed |
+| server total (`surch_search_duration`) | 8.5 ms | server-side, not curl/network |
+| parse / serialize | 10 µs / 1 µs | negligible |
+| **`generic_recall_us` (`posting_candidate_ids`)** | **7.5 ms** | **the bottleneck** |
+| `generic_score_us` | 42 µs | scoring ≤10 candidates is free |
+| `generic_ids` (final candidates) | **≤10** | the result set is tiny |
+| `generic_total` | **3338 (67 %)** | two-thirds of bool/full queries hit it |
+
+**Root cause:** a compound prénom (`"JEAN PIERRE"`) is a multi-token `match` →
+the single-token leapfrog declines → `posting_candidate_ids` materialised the
+**full `jean ∪ pierre` union** (~100 k+ `BTreeSet` inserts, 7.5 ms) only to
+intersect it down to **≤10** docs. 67 % of deces queries have compound names, so
+this WAS the p95 tail — and the five conjunction levers (#17–#20) could never
+touch it because the slow queries never reached the conjunction core (0.1 ms).
+
+**Fix (`706d539`):** `AppState::conjunction_of_matches` resolves a
+should-all-required `match` conjunction WITHOUT materialising any union — drive
+the clause with the smallest size estimate (∑df for OR / min-df for AND),
+materialise only its matching docs, keep those that are members of every other
+clause via a `binary_search` per token over the ascending `doc_id` channel.
+Wired into `posting_candidate_ids` right after the single-token leapfrog declines.
+
+**Measured (`sha-706d539`, W2):** `generic_recall_us` p95 **7512 µs → 86 µs (87×)**;
+server total p95 **8.5 ms → 0.29 ms**; **`bool` p95 10 → 1.5 ms, `full` 10 → 1.5 ms.**
+ES same run: `bool`/`full` p95 3.2/3.3 ms. **Surch is now 2.1–2.2× FASTER than ES
+on bool/full — the last losing latency shape.** b1 oracle **0-divergence**
+(`conjunction_of_matches` is bit-identical to the intersection-of-unions).
+
+**Latency front WON: Surch ≥ 2× ES on EVERY shape (W2): p50 0.9 vs ~2.5, `match`
+1.8 vs 4.4, `bool` 1.5 vs 3.2, `full` 1.5 vs 3.3.** Method lesson, banked: after 2
+parity-clean levers miss, STOP and INSTRUMENT — the per-stage histograms found in
+one round what five blind attempts could not. Remaining fronts: the mmap/on-disk
+memory rewrite (deces RSS 5.8× ES), indexing 2×, and the disk axis.
