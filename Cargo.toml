@@ -51,7 +51,6 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false }
 fst = "0.4"
 tar = "0.4"
 flate2 = "1.0"
-zstd = "0.13"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"

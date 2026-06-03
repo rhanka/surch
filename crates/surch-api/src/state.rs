@@ -1013,21 +1013,29 @@ fn normalized_terms_for_field(value: &str, field: &str, mapping: &IndexMapping) 
     mapping.analyzer(field).terms(value)
 }
 
-/// #15: zstd-compress a serialized `_source` JSON string for in-RAM storage.
-/// Research verdict (workflow wl8y0l71q): zstd level 3 gives ~2.8× on small
-/// repetitive JSON (vs deflate's ~1.4×) AND is ~5-10× faster, so the index-time
-/// codec cost stays <1% — the earlier deflate attempt's −40% indexing was the
-/// SLOW codec + per-doc, not the compression approach. A trained shared
-/// dictionary (a later increment) lifts the ratio to ~3-5× without losing the
-/// per-doc random-access decompress that keeps top-K hydration latency flat.
+/// #15: DEFLATE-compress a serialized `_source` JSON string for in-RAM storage.
+/// `Compression::fast` keeps the per-document index-time cost small (the owner's
+/// indexing-regression concern); the serialized JSON still compresses ~3-4×.
 fn compress_source(json: &str) -> Vec<u8> {
-    zstd::encode_all(json.as_bytes(), 3).expect("in-memory zstd encode never fails I/O")
+    use std::io::Write;
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder
+        .write_all(json.as_bytes())
+        .expect("in-memory deflate never fails I/O");
+    encoder
+        .finish()
+        .expect("in-memory deflate finish never fails I/O")
 }
 
-/// #15: zstd-inflate a stored `_source` back to its serialized JSON string.
+/// #15: inflate a stored `_source` back to its serialized JSON string.
 fn decompress_source(bytes: &[u8]) -> String {
-    let inflated = zstd::decode_all(bytes).expect("stored _source is valid zstd");
-    String::from_utf8(inflated).expect("stored _source is UTF-8 JSON")
+    use std::io::Read;
+    let mut decoder = flate2::read::DeflateDecoder::new(bytes);
+    let mut json = String::new();
+    decoder
+        .read_to_string(&mut json)
+        .expect("stored _source is valid deflate of UTF-8 JSON");
+    json
 }
 
 fn indexed_fields_for_document(document: &Value, mapping: &IndexMapping) -> Vec<(String, String)> {
