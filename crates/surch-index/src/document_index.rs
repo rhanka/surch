@@ -446,6 +446,21 @@ impl DocumentIndex {
         self.terms.field_names()
     }
 
+    /// #17 memory accounting: total FST byte size across fields.
+    pub fn fst_bytes(&self) -> u64 {
+        self.terms.fst_bytes()
+    }
+
+    /// #17 memory accounting: total bytes held by precomputed roaring bitmaps.
+    pub fn roaring_bytes(&self) -> u64 {
+        self.terms.roaring_bytes()
+    }
+
+    /// #17 memory accounting: per-term `Vec<BlockMeta>` capacity bytes.
+    pub fn block_metas_bytes(&self) -> u64 {
+        self.terms.block_metas_bytes()
+    }
+
     /// Returns the in-memory prefix-postings side table. Empty for fields
     /// that did not declare `index_prefixes`. Used by the memory
     /// accounting helper.

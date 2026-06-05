@@ -61,6 +61,16 @@ pub struct MemoryUsage {
     /// Per-term block-meta vectors that back the Block-Max WAND
     /// scoring path (one `Vec<BlockMeta>` per term).
     pub term_stats_bytes: u64,
+    /// #17: per-field FST term-dictionary bytes (held in memory as the
+    /// serialized FST byte string).
+    pub fst_bytes: u64,
+    /// #17: precomputed roaring bitmaps for high-`df` terms (A1 conjunction
+    /// gap-closer), summed across fields.
+    pub roaring_bytes: u64,
+    /// #17: per-term `Vec<BlockMeta>` capacity bytes — the block-skip
+    /// metadata that drives BMW. (Distinct from `term_stats_bytes`, which
+    /// counts the API-side `TermScoringStats` copies.)
+    pub block_metas_bytes: u64,
 }
 
 impl MemoryUsage {
@@ -72,6 +82,9 @@ impl MemoryUsage {
             .saturating_add(self.stored_fields_bytes)
             .saturating_add(self.field_stats_bytes)
             .saturating_add(self.term_stats_bytes)
+            .saturating_add(self.fst_bytes)
+            .saturating_add(self.roaring_bytes)
+            .saturating_add(self.block_metas_bytes)
     }
 }
 
@@ -93,6 +106,9 @@ pub fn document_index_memory_usage(doc_index: &DocumentIndex) -> MemoryUsage {
         stored_fields_bytes: 0,
         field_stats_bytes: field_stats_bytes(doc_index),
         term_stats_bytes,
+        fst_bytes: doc_index.fst_bytes(),
+        roaring_bytes: doc_index.roaring_bytes(),
+        block_metas_bytes: doc_index.block_metas_bytes(),
     }
 }
 

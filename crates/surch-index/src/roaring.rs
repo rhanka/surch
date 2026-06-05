@@ -102,6 +102,20 @@ impl RoaringDocSet {
         self.len == 0
     }
 
+    /// Approximate resident bytes held by this roaring set (memory accounting
+    /// #17): the chunk vector's capacity overhead plus, per chunk, either the
+    /// dense 8 KiB bitmap or the `Vec<u16>` capacity.
+    pub fn memory_bytes(&self) -> usize {
+        let mut bytes = self.chunks.capacity() * std::mem::size_of::<(u16, Container)>();
+        for (_, c) in &self.chunks {
+            bytes += match c {
+                Container::Bitmap(_) => WORDS_PER_CHUNK * 8,
+                Container::Array(a) => a.capacity() * std::mem::size_of::<u16>(),
+            };
+        }
+        bytes
+    }
+
     /// Call `f(doc_id)` for every doc-id in `self ∩ other`, ascending. The
     /// word-parallel AND of two dense chunks is the hot path (the gap-closer);
     /// mixed/sparse chunks fall back to membership tests / a sorted merge.

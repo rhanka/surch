@@ -388,6 +388,37 @@ impl TermDictionary {
         self.fields.keys().cloned().collect()
     }
 
+    /// #17 memory accounting: total bytes held by every field's FST term
+    /// dictionary (the on-disk byte representation, which is exactly the RAM
+    /// footprint since the FST is held in memory as its serialized bytes).
+    pub fn fst_bytes(&self) -> u64 {
+        self.fields
+            .values()
+            .map(|fp| fp.fst.as_fst().as_bytes().len() as u64)
+            .sum()
+    }
+
+    /// #17 memory accounting: total bytes held by the precomputed roaring
+    /// bitmaps (high-`df` terms only).
+    pub fn roaring_bytes(&self) -> u64 {
+        self.fields
+            .values()
+            .flat_map(|fp| fp.roaring.iter())
+            .filter_map(|r| r.as_ref().map(|set| set.memory_bytes() as u64))
+            .sum()
+    }
+
+    /// #17 memory accounting: total bytes held by per-term `Vec<BlockMeta>`
+    /// (the BMW block-skip metadata stored alongside the postings).
+    pub fn block_metas_bytes(&self) -> u64 {
+        let meta_size = std::mem::size_of::<BlockMeta>() as u64;
+        self.fields
+            .values()
+            .flat_map(|fp| fp.block_metas.iter())
+            .map(|metas| metas.len() as u64 * meta_size)
+            .sum()
+    }
+
     /// A6 phase 3: union of doc ids across every term of `field` whose
     /// bytes start with `prefix`. Used by the keyword-prefix iterator on
     /// fields that did not declare `index_prefixes` (e.g. matchID's

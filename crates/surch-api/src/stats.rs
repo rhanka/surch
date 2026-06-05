@@ -49,6 +49,10 @@ fn set_gauges(index: &str, doc_count: u64, usage: &MemoryUsage) {
         .set(usage.stored_fields_bytes as f64);
     metrics::gauge!("surch_index_field_stats_bytes", &label).set(usage.field_stats_bytes as f64);
     metrics::gauge!("surch_index_term_stats_bytes", &label).set(usage.term_stats_bytes as f64);
+    // #17: break out the previously-unaccounted RSS portion.
+    metrics::gauge!("surch_index_fst_bytes", &label).set(usage.fst_bytes as f64);
+    metrics::gauge!("surch_index_roaring_bytes", &label).set(usage.roaring_bytes as f64);
+    metrics::gauge!("surch_index_block_metas_bytes", &label).set(usage.block_metas_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
     metrics::gauge!("surch_index_doc_count", &label).set(doc_count as f64);
 }
@@ -74,6 +78,10 @@ pub struct MemoryReport {
     pub stored_fields_bytes: u64,
     pub field_stats_bytes: u64,
     pub term_stats_bytes: u64,
+    // #17: previously-unaccounted RSS components.
+    pub fst_bytes: u64,
+    pub roaring_bytes: u64,
+    pub block_metas_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -85,6 +93,9 @@ impl From<MemoryUsage> for MemoryReport {
             stored_fields_bytes: value.stored_fields_bytes,
             field_stats_bytes: value.field_stats_bytes,
             term_stats_bytes: value.term_stats_bytes,
+            fst_bytes: value.fst_bytes,
+            roaring_bytes: value.roaring_bytes,
+            block_metas_bytes: value.block_metas_bytes,
             total_bytes: value.total_bytes(),
         }
     }
