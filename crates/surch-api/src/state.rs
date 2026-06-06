@@ -2483,6 +2483,53 @@ impl AppState {
         Some(usage)
     }
 
+    /// API-side state overhead for `index` — the bytes NOT already counted by
+    /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
+    /// `documents_overhead` is the per-entry overhead of `documents:
+    /// BTreeMap<String, Arc<str>>` ON TOP OF the `_source` payload (already
+    /// reported via `stored_fields_bytes`): the key `String`'s heap bytes, the
+    /// `Arc` 16-byte refcount header, and a rough `BTreeMap` node cost per
+    /// entry. `id_maps` covers both `document_ids` and `reverse_document_ids`.
+    ///
+    /// #17b: the structured index gauges only account for ~2.8 GiB of the
+    /// inc1 RSS (~7.97 GiB). The remaining ~5.2 GiB is the target of this
+    /// helper, complemented by the jemalloc gauges in `stats.rs`.
+    pub fn index_state_memory_bytes(&self, index: &str) -> Option<(u64, u64)> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let data = store.indices.get(index)?;
+        // BTreeMap node overhead per entry: rough approximation that lumps the
+        // balancing metadata together. The exact figure is implementation
+        // defined, but the order of magnitude is enough to compare against
+        // jemalloc allocated.
+        const BTREE_NODE_OVERHEAD: u64 = 48;
+        // Arc<str> header: two atomic refcounts.
+        const ARC_HEADER: u64 = 16;
+        let mut documents_overhead: u64 = 0;
+        for (key, _) in &data.documents {
+            documents_overhead = documents_overhead
+                .saturating_add(BTREE_NODE_OVERHEAD)
+                .saturating_add(ARC_HEADER)
+                .saturating_add(key.len() as u64);
+        }
+        let mut id_maps: u64 = 0;
+        for key in data.document_ids.keys() {
+            id_maps = id_maps
+                .saturating_add(BTREE_NODE_OVERHEAD)
+                .saturating_add(4)
+                .saturating_add(key.len() as u64);
+        }
+        for value in data.reverse_document_ids.values() {
+            id_maps = id_maps
+                .saturating_add(BTREE_NODE_OVERHEAD)
+                .saturating_add(4)
+                .saturating_add(value.len() as u64);
+        }
+        Some((documents_overhead, id_maps))
+    }
+
     /// Doc count for `index`. Returns `None` for an unknown index, so
     /// callers can distinguish "missing" from "empty".
     pub fn index_doc_count(&self, index: &str) -> Option<u64> {
