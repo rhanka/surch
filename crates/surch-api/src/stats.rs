@@ -53,8 +53,9 @@ fn refresh_process_memory_gauges() {
             continue;
         };
         // `rest` looks like "    123456 kB"; jemalloc and the kernel both
-        // expose this field in kibibytes.
-        let kib_str = rest.trim().split_whitespace().next().unwrap_or("0");
+        // expose this field in kibibytes. `split_whitespace` already skips
+        // the leading run of whitespace, no trim needed.
+        let kib_str = rest.split_whitespace().next().unwrap_or("0");
         let Ok(kib) = kib_str.parse::<u64>() else {
             continue;
         };
