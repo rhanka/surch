@@ -31,16 +31,58 @@ use crate::state::AppState;
 pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     let usage = state.index_memory_usage(index).unwrap_or_default();
     let doc_count = state.index_doc_count(index).unwrap_or(0);
-    set_gauges(index, doc_count, &usage);
+    let (state_docs_overhead, state_id_maps) =
+        state.index_state_memory_bytes(index).unwrap_or((0, 0));
+    set_gauges(
+        index,
+        doc_count,
+        &usage,
+        state_docs_overhead,
+        state_id_maps,
+    );
+    refresh_jemalloc_gauges();
 }
+
+/// Process-wide jemalloc accounting (#17b). Updated alongside the index
+/// gauges so a scrape captures both "what Surch thinks it stores" and
+/// "what jemalloc actually holds". Linux-only because the allocator is.
+#[cfg(target_os = "linux")]
+fn refresh_jemalloc_gauges() {
+    // Advance the epoch so the stat counters reflect post-bulk state.
+    let _ = tikv_jemalloc_ctl::epoch::advance();
+    if let Ok(v) = tikv_jemalloc_ctl::stats::allocated::read() {
+        metrics::gauge!("surch_jemalloc_allocated_bytes").set(v as f64);
+    }
+    if let Ok(v) = tikv_jemalloc_ctl::stats::active::read() {
+        metrics::gauge!("surch_jemalloc_active_bytes").set(v as f64);
+    }
+    if let Ok(v) = tikv_jemalloc_ctl::stats::resident::read() {
+        metrics::gauge!("surch_jemalloc_resident_bytes").set(v as f64);
+    }
+    if let Ok(v) = tikv_jemalloc_ctl::stats::retained::read() {
+        metrics::gauge!("surch_jemalloc_retained_bytes").set(v as f64);
+    }
+    if let Ok(v) = tikv_jemalloc_ctl::stats::mapped::read() {
+        metrics::gauge!("surch_jemalloc_mapped_bytes").set(v as f64);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn refresh_jemalloc_gauges() {}
 
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
-    set_gauges(index, 0, &MemoryUsage::default());
+    set_gauges(index, 0, &MemoryUsage::default(), 0, 0);
 }
 
-fn set_gauges(index: &str, doc_count: u64, usage: &MemoryUsage) {
+fn set_gauges(
+    index: &str,
+    doc_count: u64,
+    usage: &MemoryUsage,
+    state_documents_overhead: u64,
+    state_id_maps: u64,
+) {
     let label = [("index", index.to_owned())];
     metrics::gauge!("surch_index_postings_bytes", &label).set(usage.postings_bytes as f64);
     metrics::gauge!("surch_index_prefix_postings_bytes", &label)
@@ -55,6 +97,13 @@ fn set_gauges(index: &str, doc_count: u64, usage: &MemoryUsage) {
     metrics::gauge!("surch_index_block_metas_bytes", &label).set(usage.block_metas_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
     metrics::gauge!("surch_index_doc_count", &label).set(doc_count as f64);
+    // #17b: api-side state overhead — the `documents` BTreeMap node + Arc
+    // header + key strings, and the id maps. The _source payload is already
+    // reported via `surch_index_stored_fields_bytes`, so this gauge is the
+    // ON-TOP-OF cost.
+    metrics::gauge!("surch_state_documents_overhead_bytes", &label)
+        .set(state_documents_overhead as f64);
+    metrics::gauge!("surch_state_id_maps_bytes", &label).set(state_id_maps as f64);
 }
 
 /// `?index=<name>` query string for `GET /_surch/stats`.
