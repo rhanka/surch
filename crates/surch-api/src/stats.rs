@@ -33,42 +33,46 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     let doc_count = state.index_doc_count(index).unwrap_or(0);
     let (state_docs_overhead, state_id_maps) =
         state.index_state_memory_bytes(index).unwrap_or((0, 0));
-    set_gauges(
-        index,
-        doc_count,
-        &usage,
-        state_docs_overhead,
-        state_id_maps,
-    );
-    refresh_jemalloc_gauges();
+    set_gauges(index, doc_count, &usage, state_docs_overhead, state_id_maps);
+    refresh_process_memory_gauges();
 }
 
-/// Process-wide jemalloc accounting (#17b). Updated alongside the index
-/// gauges so a scrape captures both "what Surch thinks it stores" and
-/// "what jemalloc actually holds". Linux-only because the allocator is.
+/// Process-wide RSS accounting (#17b). Reads `/proc/self/status` to
+/// surface VmRSS / VmAnon / VmData / VmHWM as Prometheus gauges. Combined
+/// with the per-index `surch_index_*` gauges this isolates the gap
+/// between "what Surch thinks it stores" (~2.8 GiB after inc1) and "what
+/// the kernel reports resident" (~8.0 GiB). Zero allocations on the
+/// scrape path — the file is short and parsed line by line. Linux-only.
 #[cfg(target_os = "linux")]
-fn refresh_jemalloc_gauges() {
-    // Advance the epoch so the stat counters reflect post-bulk state.
-    let _ = tikv_jemalloc_ctl::epoch::advance();
-    if let Ok(v) = tikv_jemalloc_ctl::stats::allocated::read() {
-        metrics::gauge!("surch_jemalloc_allocated_bytes").set(v as f64);
-    }
-    if let Ok(v) = tikv_jemalloc_ctl::stats::active::read() {
-        metrics::gauge!("surch_jemalloc_active_bytes").set(v as f64);
-    }
-    if let Ok(v) = tikv_jemalloc_ctl::stats::resident::read() {
-        metrics::gauge!("surch_jemalloc_resident_bytes").set(v as f64);
-    }
-    if let Ok(v) = tikv_jemalloc_ctl::stats::retained::read() {
-        metrics::gauge!("surch_jemalloc_retained_bytes").set(v as f64);
-    }
-    if let Ok(v) = tikv_jemalloc_ctl::stats::mapped::read() {
-        metrics::gauge!("surch_jemalloc_mapped_bytes").set(v as f64);
+fn refresh_process_memory_gauges() {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return;
+    };
+    for line in status.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        // `rest` looks like "    123456 kB"; jemalloc and the kernel both
+        // expose this field in kibibytes.
+        let kib_str = rest.trim().split_whitespace().next().unwrap_or("0");
+        let Ok(kib) = kib_str.parse::<u64>() else {
+            continue;
+        };
+        let bytes = kib.saturating_mul(1024) as f64;
+        match key {
+            "VmRSS" => metrics::gauge!("surch_process_rss_bytes").set(bytes),
+            "VmHWM" => metrics::gauge!("surch_process_rss_peak_bytes").set(bytes),
+            "VmData" => metrics::gauge!("surch_process_data_bytes").set(bytes),
+            "RssAnon" => metrics::gauge!("surch_process_rss_anon_bytes").set(bytes),
+            "RssFile" => metrics::gauge!("surch_process_rss_file_bytes").set(bytes),
+            "VmSize" => metrics::gauge!("surch_process_vsize_bytes").set(bytes),
+            _ => {}
+        }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn refresh_jemalloc_gauges() {}
+fn refresh_process_memory_gauges() {}
 
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
