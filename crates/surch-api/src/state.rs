@@ -2508,7 +2508,7 @@ impl AppState {
         // Arc<str> header: two atomic refcounts.
         const ARC_HEADER: u64 = 16;
         let mut documents_overhead: u64 = 0;
-        for (key, _) in &data.documents {
+        for key in data.documents.keys() {
             documents_overhead = documents_overhead
                 .saturating_add(BTREE_NODE_OVERHEAD)
                 .saturating_add(ARC_HEADER)
