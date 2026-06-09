@@ -12,23 +12,21 @@ use serde_json::Value;
 /// init), inc3 on truncation (compress_vec doesn't grow the Vec), inc3b
 /// on DecompressError(General) for >1 MiB docs (decompress_vec stalled
 /// at output-capacity boundary). The high-level `write::DeflateEncoder`
-/// + `read::DeflateDecoder` APIs are bulletproof on any size, at the
+/// and `read::DeflateDecoder` APIs are bulletproof on any size, at the
 /// cost of one `Compress`/`Decompress` allocation per doc (~16 KiB each,
 /// reused immediately by jemalloc). Expected indexation overhead: <10 %
 /// — acceptable for ~700 MiB stored_fields savings.
 mod source_compression {
     use std::io::{Read, Write};
 
-    use flate2::{
-        read::DeflateDecoder,
-        write::DeflateEncoder,
-        Compression,
-    };
+    use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 
     /// Deflate-compress `input`. Returns the encoded bytes.
     pub(super) fn compress(input: &[u8]) -> Vec<u8> {
-        let mut encoder =
-            DeflateEncoder::new(Vec::with_capacity(input.len() / 2 + 16), Compression::fast());
+        let mut encoder = DeflateEncoder::new(
+            Vec::with_capacity(input.len() / 2 + 16),
+            Compression::fast(),
+        );
         encoder
             .write_all(input)
             .expect("write_all into Vec<u8> is infallible");
@@ -361,8 +359,8 @@ impl InMemoryIndex {
                     // decompress, parse, extract indexed fields (full-reindex
                     // path). Bound to full rebuilds — not the hot bulk path.
                     let serialized = source_compression::decompress(source.as_ref());
-                    let parsed: Value = serde_json::from_slice(&serialized)
-                        .expect("stored _source is valid JSON");
+                    let parsed: Value =
+                        serde_json::from_slice(&serialized).expect("stored _source is valid JSON");
                     (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
                 })
             })
@@ -1943,8 +1941,7 @@ impl AppState {
                 source: {
                     let serialized = source_compression::decompress(raw.as_ref());
                     Arc::new(
-                        serde_json::from_slice(&serialized)
-                            .expect("stored _source is valid JSON"),
+                        serde_json::from_slice(&serialized).expect("stored _source is valid JSON"),
                     )
                 },
             })
