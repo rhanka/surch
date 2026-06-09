@@ -4,166 +4,6 @@ use std::{
 };
 
 use serde_json::Value;
-
-/// `mmap M1`: file-backed `_source` payload store, the campaign-mémoire pivot
-/// after 5 rejected attempts on in-RAM compression (#15 inc2 ×3 + inc3/3b/3c).
-/// Each [`InMemoryIndex`] owns one append-only segment file under `TMPDIR`,
-/// indexed by internal `doc_id`. Reads use Linux `pread` so concurrent
-/// searches share the same `Arc<File>` without locking. No new dependency —
-/// `memmap2` was rejected because the workspace `Cargo.lock` is pinned via
-/// `--locked` in CI and adding a dep would require a separate lockfile dance.
-/// A follow-up M1.5 can mmap the segment on top of the same layout once the
-/// dep gate is paid; for now `pread` adds ~5–10 µs per doc to hydration,
-/// projected at ~+100–200 µs on top of bool/full p95 1.3 ms.
-#[cfg(target_os = "linux")]
-mod source_store {
-    use std::{
-        fs::{File, OpenOptions},
-        os::unix::fs::FileExt,
-        path::PathBuf,
-        sync::Arc,
-    };
-
-    /// Append-only on-disk `_source` segment, indexed by `doc_id`.
-    #[derive(Debug)]
-    pub(super) struct SourceStore {
-        file: Arc<File>,
-        /// `idx[doc_id] = Some((offset, length))` for live docs, `None` for
-        /// deleted ones. Sparse on delete; updates orphan their previous
-        /// bytes in the segment (acceptable for M1; compaction is M2).
-        idx: Vec<Option<(u64, u32)>>,
-        next_offset: u64,
-        path: PathBuf,
-    }
-
-    impl Default for SourceStore {
-        fn default() -> Self {
-            let id = uuid::Uuid::new_v4();
-            let path = std::env::temp_dir().join(format!("surch-source-{id}.dat"));
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .expect("failed to create surch source store tempfile");
-            Self {
-                file: Arc::new(file),
-                idx: Vec::new(),
-                next_offset: 0,
-                path,
-            }
-        }
-    }
-
-    impl SourceStore {
-        pub(super) fn insert(&mut self, doc_id: u32, bytes: &[u8]) {
-            self.file
-                .write_all_at(bytes, self.next_offset)
-                .expect("source store segment file should accept positional write");
-            let idx_pos = doc_id as usize;
-            if idx_pos >= self.idx.len() {
-                self.idx.resize(idx_pos + 1, None);
-            }
-            self.idx[idx_pos] = Some((self.next_offset, bytes.len() as u32));
-            self.next_offset += bytes.len() as u64;
-        }
-
-        pub(super) fn get(&self, doc_id: u32) -> Option<Vec<u8>> {
-            let (offset, length) = self.idx.get(doc_id as usize).copied().flatten()?;
-            let mut buf = vec![0u8; length as usize];
-            self.file
-                .read_exact_at(&mut buf, offset)
-                .expect("source store segment file should accept positional read");
-            Some(buf)
-        }
-
-        pub(super) fn remove(&mut self, doc_id: u32) {
-            if let Some(slot) = self.idx.get_mut(doc_id as usize) {
-                *slot = None;
-            }
-        }
-
-        pub(super) fn doc_count(&self) -> u64 {
-            self.idx.iter().filter(|s| s.is_some()).count() as u64
-        }
-
-        pub(super) fn bytes_stored(&self) -> u64 {
-            self.idx
-                .iter()
-                .filter_map(|s| s.as_ref())
-                .map(|(_, length)| *length as u64)
-                .sum()
-        }
-
-        pub(super) fn iter_live(&self) -> impl Iterator<Item = (u32, Vec<u8>)> + '_ {
-            self.idx.iter().enumerate().filter_map(|(idx, slot)| {
-                slot.and_then(|(offset, length)| {
-                    let mut buf = vec![0u8; length as usize];
-                    self.file.read_exact_at(&mut buf, offset).ok()?;
-                    Some((idx as u32, buf))
-                })
-            })
-        }
-    }
-
-    impl Drop for SourceStore {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-use source_store::SourceStore;
-
-// Non-Linux fallback (macOS/Windows dev): keep an in-RAM `Vec<Option<Vec<u8>>>`
-// behind the same API. Release target is Linux distroless cc-debian12.
-#[cfg(not(target_os = "linux"))]
-mod source_store {
-    #[derive(Debug, Default)]
-    pub(super) struct SourceStore {
-        idx: Vec<Option<Vec<u8>>>,
-    }
-
-    impl SourceStore {
-        pub(super) fn insert(&mut self, doc_id: u32, bytes: &[u8]) {
-            let idx_pos = doc_id as usize;
-            if idx_pos >= self.idx.len() {
-                self.idx.resize(idx_pos + 1, None);
-            }
-            self.idx[idx_pos] = Some(bytes.to_vec());
-        }
-        pub(super) fn get(&self, doc_id: u32) -> Option<Vec<u8>> {
-            self.idx.get(doc_id as usize).cloned().flatten()
-        }
-        pub(super) fn remove(&mut self, doc_id: u32) {
-            if let Some(slot) = self.idx.get_mut(doc_id as usize) {
-                *slot = None;
-            }
-        }
-        pub(super) fn doc_count(&self) -> u64 {
-            self.idx.iter().filter(|s| s.is_some()).count() as u64
-        }
-        pub(super) fn bytes_stored(&self) -> u64 {
-            self.idx
-                .iter()
-                .filter_map(|s| s.as_ref())
-                .map(|b| b.len() as u64)
-                .sum()
-        }
-        pub(super) fn iter_live(&self) -> impl Iterator<Item = (u32, Vec<u8>)> + '_ {
-            self.idx
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, slot)| slot.as_ref().map(|b| (idx as u32, b.clone())))
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-use source_store::SourceStore;
-
 use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
@@ -203,19 +43,24 @@ struct MemoryStore {
     index_templates: BTreeMap<String, StoredIndexTemplate>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct InMemoryIndex {
-    /// `mmap M1`: `_source` payloads live in a per-index segment file under
-    /// `TMPDIR/surch-source-<uuid>.dat`, indexed by internal `doc_id`. Reads
-    /// hydrate via Linux `pread` — no in-RAM BTreeMap of `Arc<[u8]>` (or the
-    /// reverted `Arc<str>` from inc1). The Prometheus gauge
-    /// `surch_index_stored_fields_bytes` now reflects the sum of on-disk
-    /// `_source` lengths, NOT in-RAM bytes. Memory savings on deces 1.36 M:
-    /// stored_fields gauge 1187 MiB → `surch_process_rss_bytes` drops by
-    /// the same amount (modulo page-cache hot pages that the kernel keeps
-    /// resident). Reads cost ~5–10 µs per doc via `pread`, projected at
-    /// +100–200 µs on the top-K hydration window of bool/full p95 1.3 ms.
-    source_store: SourceStore,
+    /// `_source` payloads, refcounted so the search hot path
+    /// (`build_hit`, `score_documents`, `lookup_sort_value`, …) can
+    /// hand each reader a fresh [`StoredDocument`] without cloning
+    /// the entire JSON. Multiple concurrent reads on the same doc
+    /// share the same `Arc<Value>`; writes always allocate a fresh
+    /// `Arc` so an in-flight reader's snapshot stays untouched. The
+    /// Prometheus gauge `surch_index_stored_fields_bytes` keeps
+    /// counting the `Value` payload size once (regardless of the
+    /// strong count), so the gauge tracks unique stored bytes —
+    /// which is what capacity planning cares about.
+    /// #15 memory: the `_source` is stored as the SERIALIZED JSON bytes
+    /// (`Arc<str>`), NOT a parsed `serde_json::Value` tree (the deces breakdown
+    /// showed the parsed `Value` is the dominant RSS term — ~2-3× the serialized
+    /// size). It is parsed back to a `Value` on access via [`Self::parsed_source`]
+    /// — cheap because reads hydrate only the top-K window (~20 docs/query).
+    documents: BTreeMap<String, Arc<str>>,
     document_ids: BTreeMap<String, u32>,
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
@@ -412,22 +257,24 @@ impl InMemoryIndex {
     }
 
     fn upsert_document_deferred(&mut self, id: &str, source: Value) {
-        let doc_id = *self.document_ids.entry(id.to_owned()).or_insert_with(|| {
-            let assigned = self.next_doc_id;
+        self.document_ids.entry(id.to_owned()).or_insert_with(|| {
+            let doc_id = self.next_doc_id;
             self.next_doc_id += 1;
-            self.reverse_document_ids.insert(assigned, id.to_owned());
-            assigned
+            self.reverse_document_ids.insert(doc_id, id.to_owned());
+            doc_id
         });
 
-        // `mmap M1`: serialise then append-write the bytes to the per-index
-        // segment file. `ensure_fields` needs the `Value`, so analyse it
-        // BEFORE the on-disk store call. Updates (same `id`) overwrite the
-        // slot in `source_store.idx`, orphaning the previous bytes (M2
-        // compaction will reclaim them).
+        // #15: store the SERIALIZED `_source` bytes (not the parsed `Value`).
+        // `ensure_fields` needs the `Value`, so analyse it BEFORE serialising;
+        // the write then replaces the slot with a fresh `Arc<str>` handle so
+        // concurrent readers keep their consistent snapshot.
         self.mapping.ensure_fields(&source);
-        let serialized =
-            serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
-        self.source_store.insert(doc_id, &serialized);
+        self.documents.insert(
+            id.to_owned(),
+            Arc::from(
+                serde_json::to_string(&source).expect("a validated _source serialises to JSON"),
+            ),
+        );
     }
 
     fn delete_document(&mut self, id: &str) {
@@ -438,7 +285,7 @@ impl InMemoryIndex {
 
     fn delete_document_deferred(&mut self, id: &str) -> bool {
         if let Some(doc_id) = self.document_ids.remove(id) {
-            self.source_store.remove(doc_id);
+            self.documents.remove(id);
             self.reverse_document_ids.remove(&doc_id);
             return true;
         }
@@ -459,16 +306,17 @@ impl InMemoryIndex {
 
     fn rebuild_index(&mut self) {
         self.index.clear();
-        // `mmap M1`: read each live `_source` from the segment store, parse,
-        // extract indexed fields. Iterator yields `(doc_id, Vec<u8>)` pairs
-        // already; we don't need the `String` id here.
         let documents = self
-            .source_store
-            .iter_live()
-            .map(|(doc_id, bytes)| {
-                let parsed: Value =
-                    serde_json::from_slice(&bytes).expect("stored _source is valid JSON");
-                (doc_id, indexed_fields_for_document(&parsed, &self.mapping))
+            .documents
+            .iter()
+            .filter_map(|(id, source)| {
+                self.document_ids.get(id).map(|doc_id| {
+                    // #15: the stored _source is serialized bytes; parse to a
+                    // Value to extract its indexed fields (full-reindex path).
+                    let parsed: Value = serde_json::from_str(source.as_ref())
+                        .expect("stored _source is valid JSON");
+                    (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
+                })
             })
             .collect::<Vec<_>>();
         // Lot 1.6: defer the FST rebuild. The bulk path then chains
@@ -988,15 +836,13 @@ impl InMemoryIndex {
         acc.unwrap_or_default().into_iter().collect()
     }
 
-    /// Read a stored `_source` from the on-disk segment (`mmap M1`),
-    /// then parse it into an owned `Arc<Value>` for the consumers that
-    /// need a `&Value` (build_hit, query_matches, lookup_sort_value, …).
-    /// `None` when `id` is unknown or its slot has been deleted.
+    /// Parse a stored `_source` (serialized bytes, #15) back into an owned
+    /// `Arc<Value>` for the consumers that need a `&Value` (build_hit,
+    /// query_matches, lookup_sort_value, …). `None` when `id` is unknown.
     fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
-        let doc_id = self.document_ids.get(id)?;
-        let bytes = self.source_store.get(*doc_id)?;
+        let raw = self.documents.get(id)?;
         Some(Arc::new(
-            serde_json::from_slice(&bytes).expect("stored _source is valid JSON"),
+            serde_json::from_str(raw).expect("stored _source is valid JSON"),
         ))
     }
 
@@ -1698,7 +1544,7 @@ impl AppState {
         store
             .indices
             .get(index)
-            .map_or(0, |index| index.source_store.doc_count())
+            .map_or(0, |index| index.documents.len() as u64)
     }
 
     pub fn mapping(&self, index: &str) -> Option<Value> {
@@ -1984,10 +1830,9 @@ impl AppState {
             .get(index)
             .into_iter()
             .flat_map(|data| {
-                // `mmap M1`: full scan reads each `_source` from disk via
-                // the segment store (admin/agg path; the hot top-K path
-                // only pulls the window).
-                data.document_ids.keys().filter_map(move |id| {
+                // #15: full scan re-parses each stored `_source` (admin/agg
+                // path; the hot top-K path parses only the window).
+                data.documents.keys().filter_map(move |id| {
                     data.parsed_source(id).map(|source| StoredDocument {
                         index: index.to_owned(),
                         id: id.clone(),
@@ -2010,7 +1855,7 @@ impl AppState {
         store
             .indices
             .get(index)
-            .map_or(0, |data| data.source_store.doc_count())
+            .map_or(0, |data| data.documents.len() as u64)
     }
 
     /// Returns documents at positions `[from, from + size)` in the
@@ -2035,22 +1880,17 @@ impl AppState {
         let Some(data) = store.indices.get(index) else {
             return Vec::new();
         };
-        // `mmap M1`: iterate the live `id → doc_id` map (sorted by `id` like
-        // the old `BTreeMap<String, Arc<str>>`), pull the `_source` from
-        // the segment file for the requested window only.
-        data.document_ids
+        data.documents
             .iter()
             .skip(from)
             .take(size)
-            .filter_map(|(id, doc_id)| {
-                let bytes = data.source_store.get(*doc_id)?;
-                Some(StoredDocument {
-                    index: index.to_owned(),
-                    id: id.clone(),
-                    source: Arc::new(
-                        serde_json::from_slice(&bytes).expect("stored _source is valid JSON"),
-                    ),
-                })
+            .map(|(id, raw)| StoredDocument {
+                index: index.to_owned(),
+                id: id.clone(),
+                // #15: parse the stored bytes back to a Value (window only).
+                source: Arc::new(
+                    serde_json::from_str(raw.as_ref()).expect("stored _source is valid JSON"),
+                ),
             })
             .collect()
     }
@@ -2632,20 +2472,24 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
         let mut usage = document_index_memory_usage(&data.index);
-        // `mmap M1`: `_source` bytes now live on disk in
-        // `source_store.dat`. The gauge tracks the on-disk segment size
-        // (sum of live `_source` lengths) — this is no longer in-RAM,
-        // so RSS savings show up under `surch_process_rss_bytes`.
-        usage.stored_fields_bytes = data.source_store.bytes_stored();
+        // Each stored payload is counted once regardless of the
+        // outstanding `Arc` strong count: the gauge tracks the
+        // unique RAM held by `_source` JSON, not the per-reader
+        // cumulative footprint.
+        // #15: `_source` is now the serialized bytes, so the stored size is
+        // simply their length (the parsed-`Value` accounting is gone with the
+        // parsed-`Value` storage — this is the real, smaller resident size).
+        usage.stored_fields_bytes = data.documents.values().map(|raw| raw.len() as u64).sum();
         Some(usage)
     }
 
     /// API-side state overhead for `index` — the bytes NOT already counted by
     /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
-    /// `documents_overhead` covers the per-`doc_id` `(offset, length)` slot
-    /// in `SourceStore::idx` (12 bytes per live doc) plus the empty Option
-    /// tag, and `id_maps` covers both `document_ids` and
-    /// `reverse_document_ids`.
+    /// `documents_overhead` is the per-entry overhead of `documents:
+    /// BTreeMap<String, Arc<str>>` ON TOP OF the `_source` payload (already
+    /// reported via `stored_fields_bytes`): the key `String`'s heap bytes, the
+    /// `Arc` 16-byte refcount header, and a rough `BTreeMap` node cost per
+    /// entry. `id_maps` covers both `document_ids` and `reverse_document_ids`.
     ///
     /// #17b: the structured index gauges only account for ~2.8 GiB of the
     /// inc1 RSS (~7.97 GiB). The remaining ~5.2 GiB is the target of this
@@ -2661,13 +2505,15 @@ impl AppState {
         // defined, but the order of magnitude is enough to compare against
         // jemalloc allocated.
         const BTREE_NODE_OVERHEAD: u64 = 48;
-        // `mmap M1`: each `SourceStore::idx` slot is `Option<(u64, u32)>` →
-        // 16 bytes incl. Option discriminant + padding on x86_64.
-        const SOURCE_STORE_SLOT_BYTES: u64 = 16;
-        let documents_overhead = data
-            .source_store
-            .doc_count()
-            .saturating_mul(SOURCE_STORE_SLOT_BYTES);
+        // Arc<str> header: two atomic refcounts.
+        const ARC_HEADER: u64 = 16;
+        let mut documents_overhead: u64 = 0;
+        for key in data.documents.keys() {
+            documents_overhead = documents_overhead
+                .saturating_add(BTREE_NODE_OVERHEAD)
+                .saturating_add(ARC_HEADER)
+                .saturating_add(key.len() as u64);
+        }
         let mut id_maps: u64 = 0;
         for key in data.document_ids.keys() {
             id_maps = id_maps
@@ -2694,7 +2540,7 @@ impl AppState {
         store
             .indices
             .get(index)
-            .map(|data| data.source_store.doc_count())
+            .map(|data| data.documents.len() as u64)
     }
 
     pub fn term_matches_count(&self, index: &str, field: &str, value: &str) -> usize {
