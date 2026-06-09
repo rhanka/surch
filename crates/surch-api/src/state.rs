@@ -231,6 +231,15 @@ struct InMemoryIndex {
     /// `rebuild_index()` to preserve the previously-indexed
     /// postings. The flag is reset by any rebuild or append.
     terms_finalized: bool,
+    /// `mmap M1`: indexed fields cached by [`Self::upsert_document_deferred`]
+    /// and drained by [`Self::append_to_index`]. Without this the bulk
+    /// append path would `pread` each freshly-written `_source` back from
+    /// disk to re-parse it — observed catastrophic on the matchID 1.36 M
+    /// corpus (perf-W2 27186815746 hit the workflow timeout: 58 min
+    /// indexation vs ES 14 min). The buffer is cleared by `rebuild_index`
+    /// because a rebuild reads every live doc from disk and would
+    /// double-count the pending entries.
+    pending_indexed_fields: Vec<(u32, Vec<(String, String)>)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -423,8 +432,11 @@ impl InMemoryIndex {
         // segment file. `ensure_fields` needs the `Value`, so analyse it
         // BEFORE the on-disk store call. Updates (same `id`) overwrite the
         // slot in `source_store.idx`, orphaning the previous bytes (M2
-        // compaction will reclaim them).
+        // compaction will reclaim them). Also stash `indexed_fields` so
+        // `append_to_index` does not have to re-read the doc from disk.
         self.mapping.ensure_fields(&source);
+        let fields = indexed_fields_for_document(&source, &self.mapping);
+        self.pending_indexed_fields.push((doc_id, fields));
         let serialized =
             serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
         self.source_store.insert(doc_id, &serialized);
@@ -459,9 +471,13 @@ impl InMemoryIndex {
 
     fn rebuild_index(&mut self) {
         self.index.clear();
-        // `mmap M1`: read each live `_source` from the segment store, parse,
-        // extract indexed fields. Iterator yields `(doc_id, Vec<u8>)` pairs
-        // already; we don't need the `String` id here.
+        // `mmap M1`: a full rebuild re-reads every live doc from disk, so
+        // any `pending_indexed_fields` collected during the current bulk
+        // batch would double-count. Drop it.
+        self.pending_indexed_fields.clear();
+        // Read each live `_source` from the segment store, parse, extract
+        // indexed fields. Iterator yields `(doc_id, Vec<u8>)` pairs already;
+        // we don't need the `String` id here.
         let documents = self
             .source_store
             .iter_live()
@@ -506,6 +522,9 @@ impl InMemoryIndex {
     /// `set_mapping`, single-doc PUT/DELETE, or a bulk with updates).
     fn append_to_index(&mut self, new_doc_ids: &[u32]) {
         if new_doc_ids.is_empty() {
+            // Caller had no fresh doc ids; pending may still be populated
+            // if a sibling rebuild path ran during the same `apply` batch
+            // — `rebuild_index` already clears it, so nothing to do here.
             return;
         }
         if self.terms_finalized {
@@ -518,14 +537,18 @@ impl InMemoryIndex {
             self.rebuild_index();
             return;
         }
-        let documents = new_doc_ids
-            .iter()
-            .filter_map(|&doc_id| {
-                let id = self.reverse_document_ids.get(&doc_id)?;
-                let source = self.parsed_source(id)?;
-                Some((doc_id, indexed_fields_for_document(&source, &self.mapping)))
-            })
-            .collect::<Vec<_>>();
+        // `mmap M1`: drain the indexed_fields cache populated by
+        // `upsert_document_deferred` — the bulk hot path stays entirely in
+        // RAM, no pread per doc. `debug_assert` guards the invariant that
+        // the cached entries match the caller's `new_doc_ids` in order.
+        let documents = std::mem::take(&mut self.pending_indexed_fields);
+        debug_assert!(
+            documents
+                .iter()
+                .map(|(d, _)| *d)
+                .eq(new_doc_ids.iter().copied()),
+            "pending_indexed_fields must mirror new_doc_ids in insertion order"
+        );
         // Lot 1.6: defer the FST rebuild on the bulk hot path. Reads
         // arriving between two `_bulk` POSTs go through
         // `AppState::ensure_terms_ready`, which materializes lazily.
