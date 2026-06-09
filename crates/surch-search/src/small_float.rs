@@ -120,11 +120,11 @@ mod tests {
             (0u32, 0u8, 0u32),
             (1, 1, 1),
             (23, 23, 23),
-            (24, 24, 24),    // boundary: first non-free, encoder forwards 0.
-            (25, 25, 25),    // 24 + longToInt4(1) = 24 + 1
-            (31, 31, 31),    // 24 + longToInt4(7) = 24 + 7
-            (32, 32, 32),    // 24 + longToInt4(8) = 24 + 8
-            (255, 70, 248),  // hand-traced in docs/paper #22 root-cause.
+            (24, 24, 24),   // boundary: first non-free, encoder forwards 0.
+            (25, 25, 25),   // 24 + longToInt4(1) = 24 + 1
+            (31, 31, 31),   // 24 + longToInt4(7) = 24 + 7
+            (32, 32, 32),   // 24 + longToInt4(8) = 24 + 8
+            (255, 70, 248), // hand-traced in docs/paper #22 root-cause.
             (1000, 87, 984),
             (1500, 91, 1432),
             (65535, 135, 61464),
@@ -224,9 +224,7 @@ mod tests {
         let len_norm = quantized as f64 / avg_doc_len;
         let denom = freq + k1 * (1.0 - b + b * len_norm);
         let tf_norm = freq * (k1 + 1.0) / denom;
-        let idf = (1.0
-            + (doc_count as f64 - doc_freq as f64 + 0.5) / (doc_freq as f64 + 0.5))
-            .ln();
+        let idf = (1.0 + (doc_count as f64 - doc_freq as f64 + 0.5) / (doc_freq as f64 + 0.5)).ln();
         let reference = idf * tf_norm;
 
         assert!(
