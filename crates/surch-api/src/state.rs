@@ -78,19 +78,16 @@ impl SourceBlob {
                 scratch.clear();
                 // Heuristique : sortie attendue ~3-4× l'entrée pour du JSON.
                 let initial = bytes.len().saturating_mul(4).max(4096);
-                if scratch.capacity() < initial {
-                    scratch.reserve(initial - scratch.capacity());
+                let cur_cap = scratch.capacity();
+                if cur_cap < initial {
+                    scratch.reserve(initial - cur_cap);
                 }
 
                 loop {
                     let prev_out = decoder.total_out();
                     let input_pos = decoder.total_in() as usize;
                     let status = decoder
-                        .decompress_vec(
-                            &bytes[input_pos..],
-                            &mut scratch,
-                            FlushDecompress::Finish,
-                        )
+                        .decompress_vec(&bytes[input_pos..], &mut scratch, FlushDecompress::Finish)
                         .expect("stored compressed _source decodes (compact_after_refresh contract)");
                     match status {
                         Status::StreamEnd => break,
@@ -138,8 +135,9 @@ impl SourceBlob {
                 // (ratio ~3-4×), mais on prévoit large pour éviter la
                 // ré-alloc pendant la boucle.
                 let initial = raw.len().max(4096);
-                if scratch.capacity() < initial {
-                    scratch.reserve(initial - scratch.capacity());
+                let cur_cap = scratch.capacity();
+                if cur_cap < initial {
+                    scratch.reserve(initial - cur_cap);
                 }
 
                 loop {
@@ -173,7 +171,8 @@ fn parse_source_blob(blob: &SourceBlob) -> Value {
         }
         SourceBlob::Compressed(bytes) => {
             let decoded = SourceBlob::decode_compressed(bytes.as_ref());
-            serde_json::from_slice(&decoded).expect("stored Compressed _source decodes to valid JSON")
+            serde_json::from_slice(&decoded)
+                .expect("stored Compressed _source decodes to valid JSON")
         }
     }
 }
