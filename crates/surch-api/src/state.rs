@@ -1,58 +1,9 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, RwLock},
 };
 
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use serde_json::Value;
-
-/// `#15 inc3`: deflate-compress the `_source` payloads stored in
-/// `InMemoryIndex::documents`. The 3 previous inc2 attempts (deflate /
-/// zstd / zstd-no-dict) all regressed indexing 30–40 % because the
-/// codec context was rebuilt from scratch on every doc. The fix: keep
-/// the `flate2::Compress` and `flate2::Decompress` engines alive in a
-/// `thread_local!` and `reset()` between docs — the heavy state
-/// (~32 KiB sliding window) is allocated ONCE per worker thread.
-/// Compression cost per doc is dominated by the Huffman/LZ77 work,
-/// not the engine allocation, so this is the only architecture that
-/// preserves the 14 357 docs/s achieved before #15.
-mod source_compression {
-    use super::{
-        Compress, Compression, Decompress, FlushCompress, FlushDecompress, RefCell,
-    };
-
-    thread_local! {
-        static COMPRESSOR: RefCell<Compress> =
-            RefCell::new(Compress::new(Compression::fast(), false));
-        static DECOMPRESSOR: RefCell<Decompress> = RefCell::new(Decompress::new(false));
-    }
-
-    pub(super) fn compress(input: &[u8]) -> Vec<u8> {
-        COMPRESSOR.with(|c| {
-            let mut c = c.borrow_mut();
-            c.reset();
-            // Deflate on repetitive matchID JSON typically hits 2–3×;
-            // start at half the input size to dodge most reallocs.
-            let mut out = Vec::with_capacity(input.len() / 2 + 16);
-            c.compress_vec(input, &mut out, FlushCompress::Finish)
-                .expect("flate2 Compress with FlushCompress::Finish never errors on valid input");
-            out
-        })
-    }
-
-    pub(super) fn decompress(input: &[u8]) -> Vec<u8> {
-        DECOMPRESSOR.with(|d| {
-            let mut d = d.borrow_mut();
-            d.reset(false);
-            let mut out = Vec::with_capacity(input.len() * 3);
-            d.decompress_vec(input, &mut out, FlushDecompress::Finish)
-                .expect("stored `_source` blobs are valid deflate-compressed JSON");
-            out
-        })
-    }
-}
-
 use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
@@ -104,15 +55,12 @@ struct InMemoryIndex {
     /// counting the `Value` payload size once (regardless of the
     /// strong count), so the gauge tracks unique stored bytes —
     /// which is what capacity planning cares about.
-    /// #15 memory: the `_source` is stored as DEFLATE-compressed bytes of
-    /// the serialized JSON (`Arc<[u8]>`), reused on read via
-    /// [`Self::parsed_source`]. Compression typically halves the
-    /// `stored_fields_bytes` gauge on the matchID corpus (1.36 M ≈ 200-byte
-    /// JSON docs) while keeping the hot search path untouched: reads only
-    /// hydrate the top-K window (~20 docs/query) and the codec context
-    /// lives in a `thread_local!` to avoid the per-call allocation that
-    /// killed the 3 previous inc2 attempts (−40 % indexing).
-    documents: BTreeMap<String, Arc<[u8]>>,
+    /// #15 memory: the `_source` is stored as the SERIALIZED JSON bytes
+    /// (`Arc<str>`), NOT a parsed `serde_json::Value` tree (the deces breakdown
+    /// showed the parsed `Value` is the dominant RSS term — ~2-3× the serialized
+    /// size). It is parsed back to a `Value` on access via [`Self::parsed_source`]
+    /// — cheap because reads hydrate only the top-K window (~20 docs/query).
+    documents: BTreeMap<String, Arc<str>>,
     document_ids: BTreeMap<String, u32>,
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
@@ -316,16 +264,17 @@ impl InMemoryIndex {
             doc_id
         });
 
-        // #15 inc3: serialise → deflate-compress → store. `ensure_fields`
-        // needs the `Value`, so analyse it BEFORE serialising; the write
-        // then replaces the slot with a fresh `Arc<[u8]>` handle so
+        // #15: store the SERIALIZED `_source` bytes (not the parsed `Value`).
+        // `ensure_fields` needs the `Value`, so analyse it BEFORE serialising;
+        // the write then replaces the slot with a fresh `Arc<str>` handle so
         // concurrent readers keep their consistent snapshot.
         self.mapping.ensure_fields(&source);
-        let serialized =
-            serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
-        let compressed = source_compression::compress(&serialized);
-        self.documents
-            .insert(id.to_owned(), Arc::from(compressed.into_boxed_slice()));
+        self.documents.insert(
+            id.to_owned(),
+            Arc::from(
+                serde_json::to_string(&source).expect("a validated _source serialises to JSON"),
+            ),
+        );
     }
 
     fn delete_document(&mut self, id: &str) {
@@ -362,11 +311,9 @@ impl InMemoryIndex {
             .iter()
             .filter_map(|(id, source)| {
                 self.document_ids.get(id).map(|doc_id| {
-                    // #15 inc3: the stored _source is deflate-compressed JSON;
-                    // decompress, parse, extract indexed fields (full-reindex
-                    // path). Bound to full rebuilds — not the hot bulk path.
-                    let serialized = source_compression::decompress(source.as_ref());
-                    let parsed: Value = serde_json::from_slice(&serialized)
+                    // #15: the stored _source is serialized bytes; parse to a
+                    // Value to extract its indexed fields (full-reindex path).
+                    let parsed: Value = serde_json::from_str(source.as_ref())
                         .expect("stored _source is valid JSON");
                     (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
                 })
@@ -889,17 +836,13 @@ impl InMemoryIndex {
         acc.unwrap_or_default().into_iter().collect()
     }
 
-    /// Decompress + parse a stored `_source` (#15 inc3: deflate-compressed
-    /// JSON bytes) back into an owned `Arc<Value>` for the consumers that
-    /// need a `&Value` (build_hit, query_matches, lookup_sort_value, …).
-    /// `None` when `id` is unknown. Only the top-K window (~20 docs/query)
-    /// goes through this on the hot path; `thread_local!` codec context
-    /// keeps the per-doc decompress cost in the low µs.
+    /// Parse a stored `_source` (serialized bytes, #15) back into an owned
+    /// `Arc<Value>` for the consumers that need a `&Value` (build_hit,
+    /// query_matches, lookup_sort_value, …). `None` when `id` is unknown.
     fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
         let raw = self.documents.get(id)?;
-        let serialized = source_compression::decompress(raw.as_ref());
         Some(Arc::new(
-            serde_json::from_slice(&serialized).expect("stored _source is valid JSON"),
+            serde_json::from_str(raw).expect("stored _source is valid JSON"),
         ))
     }
 
@@ -1944,14 +1887,10 @@ impl AppState {
             .map(|(id, raw)| StoredDocument {
                 index: index.to_owned(),
                 id: id.clone(),
-                // #15 inc3: decompress + parse (paginated window only).
-                source: {
-                    let serialized = source_compression::decompress(raw.as_ref());
-                    Arc::new(
-                        serde_json::from_slice(&serialized)
-                            .expect("stored _source is valid JSON"),
-                    )
-                },
+                // #15: parse the stored bytes back to a Value (window only).
+                source: Arc::new(
+                    serde_json::from_str(raw.as_ref()).expect("stored _source is valid JSON"),
+                ),
             })
             .collect()
     }
@@ -2537,10 +2476,9 @@ impl AppState {
         // outstanding `Arc` strong count: the gauge tracks the
         // unique RAM held by `_source` JSON, not the per-reader
         // cumulative footprint.
-        // #15 inc3: `_source` blobs are now deflate-compressed bytes; the
-        // gauge tracks their on-the-heap size directly (sum of `Arc<[u8]>`
-        // lengths). Compression of the matchID corpus drops this from
-        // ~1187 MiB (raw JSON inc1) down to ~400–600 MiB expected.
+        // #15: `_source` is now the serialized bytes, so the stored size is
+        // simply their length (the parsed-`Value` accounting is gone with the
+        // parsed-`Value` storage — this is the real, smaller resident size).
         usage.stored_fields_bytes = data.documents.values().map(|raw| raw.len() as u64).sum();
         Some(usage)
     }
@@ -2548,7 +2486,7 @@ impl AppState {
     /// API-side state overhead for `index` — the bytes NOT already counted by
     /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
     /// `documents_overhead` is the per-entry overhead of `documents:
-    /// BTreeMap<String, Arc<[u8]>>` ON TOP OF the `_source` payload (already
+    /// BTreeMap<String, Arc<str>>` ON TOP OF the `_source` payload (already
     /// reported via `stored_fields_bytes`): the key `String`'s heap bytes, the
     /// `Arc` 16-byte refcount header, and a rough `BTreeMap` node cost per
     /// entry. `id_maps` covers both `document_ids` and `reverse_document_ids`.
@@ -2567,8 +2505,7 @@ impl AppState {
         // defined, but the order of magnitude is enough to compare against
         // jemalloc allocated.
         const BTREE_NODE_OVERHEAD: u64 = 48;
-        // Arc<[u8]> header: two atomic refcounts + length word (the slice
-        // metadata lives in the fat pointer, not the heap allocation).
+        // Arc<str> header: two atomic refcounts.
         const ARC_HEADER: u64 = 16;
         let mut documents_overhead: u64 = 0;
         for key in data.documents.keys() {
