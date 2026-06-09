@@ -1,87 +1,50 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, RwLock},
 };
 
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use serde_json::Value;
 
-/// `#15 inc3`: deflate-compress the `_source` payloads stored in
-/// `InMemoryIndex::documents`. The 3 previous inc2 attempts (deflate /
-/// zstd / zstd-no-dict) all regressed indexing 30–40 % because the
-/// codec context was rebuilt from scratch on every doc. The fix: keep
-/// the `flate2::Compress` and `flate2::Decompress` engines alive in a
-/// `thread_local!` and `reset()` between docs — the heavy state
-/// (~32 KiB sliding window) is allocated ONCE per worker thread.
-/// Compression cost per doc is dominated by the Huffman/LZ77 work,
-/// not the engine allocation, so this is the only architecture that
-/// preserves the 14 357 docs/s achieved before #15.
+/// `#15 inc3c`: deflate-compress the `_source` payloads stored in
+/// `InMemoryIndex::documents`. The 4 previous attempts (deflate per-call,
+/// zstd, zstd-no-dict, thread_local Compress::compress_vec with manual
+/// buffer loop) all failed: inc1/inc2 on indexing perf (per-call codec
+/// init), inc3 on truncation (compress_vec doesn't grow the Vec), inc3b
+/// on DecompressError(General) for >1 MiB docs (decompress_vec stalled
+/// at output-capacity boundary). The high-level `write::DeflateEncoder`
+/// + `read::DeflateDecoder` APIs are bulletproof on any size, at the
+/// cost of one `Compress`/`Decompress` allocation per doc (~16 KiB each,
+/// reused immediately by jemalloc). Expected indexation overhead: <10 %
+/// — acceptable for ~700 MiB stored_fields savings.
 mod source_compression {
-    use super::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, RefCell};
-    use flate2::Status;
+    use std::io::{Read, Write};
 
-    thread_local! {
-        static COMPRESSOR: RefCell<Compress> =
-            RefCell::new(Compress::new(Compression::fast(), false));
-        static DECOMPRESSOR: RefCell<Decompress> = RefCell::new(Decompress::new(false));
-    }
+    use flate2::{
+        read::DeflateDecoder,
+        write::DeflateEncoder,
+        Compression,
+    };
 
-    /// Deflate-compress `input`. Loops on `Status::Ok`/`BufError` until the
-    /// engine emits `Status::StreamEnd`, growing the output buffer between
-    /// iterations — `Compress::compress_vec` never grows the `Vec` itself,
-    /// it only writes into the existing capacity. The previous inc3 push
-    /// (`d0bb0ab`) shipped a single-shot call that silently truncated on
-    /// large docs, surfacing as "EOF while parsing" in the bulk_router test
-    /// suite at column 28911.
+    /// Deflate-compress `input`. Returns the encoded bytes.
     pub(super) fn compress(input: &[u8]) -> Vec<u8> {
-        COMPRESSOR.with(|c| {
-            let mut c = c.borrow_mut();
-            c.reset();
-            // Conservative initial capacity: deflate of N bytes never exceeds
-            // N + N/16383 * 5 + 11 worst-case, so input.len()+64 is generous
-            // for the highly-repetitive matchID JSON we expect.
-            let mut out = Vec::with_capacity(input.len() + 64);
-            let mut consumed = 0usize;
-            loop {
-                if out.len() == out.capacity() {
-                    out.reserve(input.len().max(1024));
-                }
-                let status = c
-                    .compress_vec(&input[consumed..], &mut out, FlushCompress::Finish)
-                    .expect("flate2 Compress never errors on valid input");
-                consumed = c.total_in() as usize;
-                if matches!(status, Status::StreamEnd) {
-                    debug_assert_eq!(consumed, input.len());
-                    return out;
-                }
-            }
-        })
+        let mut encoder =
+            DeflateEncoder::new(Vec::with_capacity(input.len() / 2 + 16), Compression::fast());
+        encoder
+            .write_all(input)
+            .expect("write_all into Vec<u8> is infallible");
+        encoder
+            .finish()
+            .expect("flate2 DeflateEncoder::finish on Vec<u8> is infallible for valid input")
     }
 
-    /// Decompress a deflate blob produced by [`compress`]. Same looping
-    /// pattern: grow the destination until the engine signals end-of-stream.
+    /// Decompress a deflate blob produced by [`compress`].
     pub(super) fn decompress(input: &[u8]) -> Vec<u8> {
-        DECOMPRESSOR.with(|d| {
-            let mut d = d.borrow_mut();
-            d.reset(false);
-            // Expect ~2-3× expansion on matchID JSON; start at 4× for
-            // headroom on outlier docs.
-            let mut out = Vec::with_capacity(input.len() * 4);
-            let mut consumed = 0usize;
-            loop {
-                if out.len() == out.capacity() {
-                    out.reserve(input.len() * 2);
-                }
-                let status = d
-                    .decompress_vec(&input[consumed..], &mut out, FlushDecompress::Finish)
-                    .expect("stored `_source` blobs are valid deflate-compressed JSON");
-                consumed = d.total_in() as usize;
-                if matches!(status, Status::StreamEnd) {
-                    return out;
-                }
-            }
-        })
+        let mut decoder = DeflateDecoder::new(input);
+        let mut out = Vec::with_capacity(input.len() * 4);
+        decoder
+            .read_to_end(&mut out)
+            .expect("stored `_source` blobs are valid deflate-compressed JSON");
+        out
     }
 }
 
