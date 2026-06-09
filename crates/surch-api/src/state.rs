@@ -88,7 +88,9 @@ impl SourceBlob {
                     let input_pos = decoder.total_in() as usize;
                     let status = decoder
                         .decompress_vec(&bytes[input_pos..], &mut scratch, FlushDecompress::Finish)
-                        .expect("stored compressed _source decodes (compact_after_refresh contract)");
+                        .expect(
+                            "stored compressed _source decodes (compact_after_refresh contract)",
+                        );
                     match status {
                         Status::StreamEnd => break,
                         Status::Ok => {
@@ -616,7 +618,10 @@ impl InMemoryIndex {
         let ids: Vec<String> = self
             .documents
             .iter()
-            .filter_map(|(id, blob)| matches!(blob, SourceBlob::Raw(_)).then(|| id.clone()))
+            .filter_map(|(id, blob)| match blob {
+                SourceBlob::Raw(_) => Some(id.clone()),
+                SourceBlob::Compressed(_) => None,
+            })
             .collect();
         for id in ids {
             let Some(slot) = self.documents.get_mut(&id) else {
