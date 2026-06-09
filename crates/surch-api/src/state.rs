@@ -95,18 +95,23 @@ pub struct FieldScoringStats<'a> {
     pub doc_count: u64,
     pub avg_doc_len: f64,
     pub norms_enabled: bool,
-    /// Dense per-`doc_id` length (`0` = absent), borrowed ZERO-COPY straight
-    /// from the index's `FieldLengthStats::doc_len_dense` (optimisation mirrors
-    /// the zero-copy `TermScoringView` #7). Empty slice when `norms_enabled` is
-    /// false. `doc_len(doc_id)` is an O(1) cache-friendly index. The former
-    /// owned `Vec` made `SearchScoringContext::new` copy the whole per-doc
-    /// length array (~8 B × n_docs) per query per scored field; borrowing it
-    /// removes that per-query allocation entirely (deces touches PRENOM + NOM,
-    /// so it was ~2 × the full corpus length array copied on every query).
-    pub doc_len_dense: &'a [u64],
-    /// Precomputed smallest `doc_len` (`0` = none), threaded from the index's
-    /// incrementally-maintained `FieldLengthStats::min_doc_len` so the WAND
-    /// upper bound no longer re-scans the whole dense slice per query.
+    /// Dense per-`doc_id` **Lucene `SmallFloat`-quantized** length (`0` =
+    /// absent), borrowed ZERO-COPY from the index's
+    /// `FieldLengthStats::doc_len_dense`. Each byte must be decoded via
+    /// [`surch_index::decode_doc_len_byte`] (or [`Self::doc_len`]) before
+    /// being fed to BM25 — the encoding is the same one Lucene's
+    /// `BM25Similarity` uses, so the reconstructed value is the value the
+    /// scorer must consume (see `docs/paper/ndcg-trec-covid-rootcause-22.md`).
+    ///
+    /// Empty slice when `norms_enabled` is false. The switch from
+    /// `Vec<u64>` to `Vec<u8>` also drops `field_stats_bytes` ~8× on the
+    /// 1.36 M docs × ~6 indexed fields corpus (~65 MiB freed).
+    pub doc_len_dense: &'a [u8],
+    /// Precomputed smallest reconstructed `doc_len` (`0` = none),
+    /// threaded from the index's incrementally-maintained
+    /// `FieldLengthStats::min_doc_len` so the WAND upper bound no
+    /// longer re-scans the dense slice per query. Already in the
+    /// reconstructed-length domain (same as [`Self::doc_len`]).
     pub min_doc_len: u64,
 }
 
@@ -115,7 +120,8 @@ impl<'a> FieldScoringStats<'a> {
         self.doc_len_dense
             .get(doc_id as usize)
             .copied()
-            .filter(|&len| len > 0)
+            .filter(|&byte| byte > 0)
+            .map(surch_index::decode_doc_len_byte)
     }
 
     pub fn min_doc_len(&self) -> Option<u64> {
@@ -575,8 +581,11 @@ impl InMemoryIndex {
             1.0
         };
         // Borrow the index's dense slice zero-copy — no per-query allocation,
-        // O(1) cache-friendly doc_id indexing in the hot loop.
-        let doc_len_dense: &[u64] = if norms_enabled {
+        // O(1) cache-friendly doc_id indexing in the hot loop. Bytes are
+        // Lucene `SmallFloat`-quantized lengths; reconstruction is folded
+        // into `FieldScoringStats::doc_len` and the hot-path call sites
+        // (search.rs / state.rs `bm25_field_score`).
+        let doc_len_dense: &[u8] = if norms_enabled {
             stats.doc_len_dense()
         } else {
             &[]
