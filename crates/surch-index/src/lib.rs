@@ -3,6 +3,10 @@
 
 pub mod document_index;
 pub mod field_infos;
+
+// Convenience re-exports for the BM25 hot paths in `surch-api` /
+// `surch-search` that consume the quantized doc-length slice.
+pub use document_index::decode_doc_len_byte;
 pub mod field_infos_codec;
 pub mod live_docs;
 pub mod mapping;
