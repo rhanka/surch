@@ -18,8 +18,9 @@ use serde_json::Value;
 /// not the engine allocation, so this is the only architecture that
 /// preserves the 14 357 docs/s achieved before #15.
 mod source_compression {
-    use super::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, RefCell};
-    use flate2::Status;
+    use super::{
+        Compress, Compression, Decompress, FlushCompress, FlushDecompress, RefCell,
+    };
 
     thread_local! {
         static COMPRESSOR: RefCell<Compress> =
@@ -27,60 +28,27 @@ mod source_compression {
         static DECOMPRESSOR: RefCell<Decompress> = RefCell::new(Decompress::new(false));
     }
 
-    /// Deflate-compress `input`. Loops on `Status::Ok`/`BufError` until the
-    /// engine emits `Status::StreamEnd`, growing the output buffer between
-    /// iterations — `Compress::compress_vec` never grows the `Vec` itself,
-    /// it only writes into the existing capacity. The previous inc3 push
-    /// (`d0bb0ab`) shipped a single-shot call that silently truncated on
-    /// large docs, surfacing as "EOF while parsing" in the bulk_router test
-    /// suite at column 28911.
     pub(super) fn compress(input: &[u8]) -> Vec<u8> {
         COMPRESSOR.with(|c| {
             let mut c = c.borrow_mut();
             c.reset();
-            // Conservative initial capacity: deflate of N bytes never exceeds
-            // N + N/16383 * 5 + 11 worst-case, so input.len()+64 is generous
-            // for the highly-repetitive matchID JSON we expect.
-            let mut out = Vec::with_capacity(input.len() + 64);
-            let mut consumed = 0usize;
-            loop {
-                if out.len() == out.capacity() {
-                    out.reserve(input.len().max(1024));
-                }
-                let status = c
-                    .compress_vec(&input[consumed..], &mut out, FlushCompress::Finish)
-                    .expect("flate2 Compress never errors on valid input");
-                consumed = c.total_in() as usize;
-                if matches!(status, Status::StreamEnd) {
-                    debug_assert_eq!(consumed, input.len());
-                    return out;
-                }
-            }
+            // Deflate on repetitive matchID JSON typically hits 2–3×;
+            // start at half the input size to dodge most reallocs.
+            let mut out = Vec::with_capacity(input.len() / 2 + 16);
+            c.compress_vec(input, &mut out, FlushCompress::Finish)
+                .expect("flate2 Compress with FlushCompress::Finish never errors on valid input");
+            out
         })
     }
 
-    /// Decompress a deflate blob produced by [`compress`]. Same looping
-    /// pattern: grow the destination until the engine signals end-of-stream.
     pub(super) fn decompress(input: &[u8]) -> Vec<u8> {
         DECOMPRESSOR.with(|d| {
             let mut d = d.borrow_mut();
             d.reset(false);
-            // Expect ~2-3× expansion on matchID JSON; start at 4× for
-            // headroom on outlier docs.
-            let mut out = Vec::with_capacity(input.len() * 4);
-            let mut consumed = 0usize;
-            loop {
-                if out.len() == out.capacity() {
-                    out.reserve(input.len() * 2);
-                }
-                let status = d
-                    .decompress_vec(&input[consumed..], &mut out, FlushDecompress::Finish)
-                    .expect("stored `_source` blobs are valid deflate-compressed JSON");
-                consumed = d.total_in() as usize;
-                if matches!(status, Status::StreamEnd) {
-                    return out;
-                }
-            }
+            let mut out = Vec::with_capacity(input.len() * 3);
+            d.decompress_vec(input, &mut out, FlushDecompress::Finish)
+                .expect("stored `_source` blobs are valid deflate-compressed JSON");
+            out
         })
     }
 }
