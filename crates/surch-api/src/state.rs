@@ -1,10 +1,8 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, RwLock},
 };
 
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use serde_json::Value;
 use surch_index::{
     document_index::DocumentIndex,
@@ -13,171 +11,6 @@ use surch_index::{
     postings::{BlockMeta, Posting, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
 };
-
-/// Campagne mémoire — option B (cf. `docs/paper/memory-pivot-decision.md`).
-///
-/// `_source` est stocké soit sous forme brute (`Raw`, JSON serialisé en
-/// `Arc<str>`) sur la voie d'INSERT bulk, soit sous forme compressée
-/// (`Compressed`, deflate brut en `Arc<[u8]>`) après le passage de
-/// `compact_after_refresh()` lors d'un `_refresh`. Toutes les `Raw`
-/// présentes dans l'index sont converties en `Compressed` en bloc, hors
-/// hot path bulk, en réutilisant un `flate2::Compress` thread-local.
-///
-/// Décisions :
-/// - Hot path INSERT (`upsert_document_deferred`, `append_to_index` ->
-///   `parsed_source` pendant le bulk) : TOUJOURS sur la variante `Raw`,
-///   ZÉRO coût codec. Le gate indexation >= 14 000 docs/s reste intact
-///   par construction.
-/// - Hot path search post-refresh (`parsed_source` pour top-K) : décode
-///   chaque blob compressé via un `Decompress` thread-local bouclé
-///   jusqu'à `Status::StreamEnd` (fix correctness inc3b/c — la boucle
-///   évite la troncature observée sur >1 MiB blobs et l'erreur sur
-///   `StreamEnd` partiel). Coût ~5-10 µs / blob, soit ~100-200 µs sur
-///   un top-K=20.
-/// - Gauge `stored_fields_bytes` reflète la taille effectivement en RAM
-///   (compressed après refresh = ce qu'on annonce sur scoreboard).
-#[derive(Clone, Debug)]
-enum SourceBlob {
-    /// Bytes JSON serialisés tels que reçus du bulk. Hot path.
-    Raw(Arc<str>),
-    /// Bytes deflate-bruts produits par `compact_after_refresh()`.
-    /// Decode via [`SourceBlob::decode_compressed`] (Decompress thread-local).
-    Compressed(Arc<[u8]>),
-}
-
-impl SourceBlob {
-    /// Taille en RAM des bytes utiles (sans le header Arc), pour la
-    /// gauge `surch_index_stored_fields_bytes`.
-    fn payload_len(&self) -> usize {
-        match self {
-            Self::Raw(s) => s.len(),
-            Self::Compressed(b) => b.len(),
-        }
-    }
-
-    /// Décode un blob compressé en `Vec<u8>`. Réutilise un `Decompress`
-    /// thread-local pour amortir l'init (le bug #15 inc3c était
-    /// l'allocation per-call d'un `Decoder` haut-niveau ; on garde le
-    /// codec entre appels).
-    ///
-    /// Boucle obligatoire `decompress_vec` jusqu'à `Status::StreamEnd`
-    /// — c'est le fix correctness inc3b/inc3c : un seul appel peut
-    /// retourner `Status::Ok` avec un output buffer rempli sans avoir
-    /// fini, ce qui tronquait silencieusement les gros docs.
-    fn decode_compressed(bytes: &[u8]) -> Vec<u8> {
-        thread_local! {
-            static DECODER: RefCell<Decompress> = RefCell::new(Decompress::new(false));
-            static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
-        }
-
-        DECODER.with(|decoder_cell| {
-            SCRATCH.with(|scratch_cell| {
-                let mut decoder = decoder_cell.borrow_mut();
-                let mut scratch = scratch_cell.borrow_mut();
-                decoder.reset(false);
-                scratch.clear();
-                // Heuristique : sortie attendue ~3-4× l'entrée pour du JSON.
-                let initial = bytes.len().saturating_mul(4).max(4096);
-                let cur_cap = scratch.capacity();
-                if cur_cap < initial {
-                    scratch.reserve(initial - cur_cap);
-                }
-
-                loop {
-                    let prev_out = decoder.total_out();
-                    let input_pos = decoder.total_in() as usize;
-                    let status = decoder
-                        .decompress_vec(&bytes[input_pos..], &mut scratch, FlushDecompress::Finish)
-                        .expect(
-                            "stored compressed _source decodes (compact_after_refresh contract)",
-                        );
-                    match status {
-                        Status::StreamEnd => break,
-                        Status::Ok => {
-                            // Made progress mais pas encore fini — agrandir le
-                            // buffer puis reprendre. Si on n'a fait AUCUN
-                            // progrès on évite la boucle infinie.
-                            if decoder.total_out() == prev_out {
-                                let extra = scratch.capacity().max(4096);
-                                scratch.reserve(extra);
-                            }
-                        }
-                        Status::BufError => {
-                            // Pas assez de place en sortie — agrandir.
-                            let extra = scratch.capacity().max(4096);
-                            scratch.reserve(extra);
-                        }
-                    }
-                }
-                scratch.clone()
-            })
-        })
-    }
-
-    /// Compresse les bytes d'un `Raw` pour produire un `Compressed`.
-    /// Réutilise un `Compress` thread-local (cf. inc3c).
-    /// `Compression::fast()` (level 1) : ~3× plus rapide que `default()`
-    /// pour ~10 % de ratio en moins ; option B est dominée par la
-    /// SOMME (refresh + decode hot path), pas par le ratio.
-    fn encode_for_compact(raw: &[u8]) -> Vec<u8> {
-        thread_local! {
-            static ENCODER: RefCell<Compress> = RefCell::new(
-                Compress::new(Compression::fast(), false),
-            );
-            static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
-        }
-
-        ENCODER.with(|encoder_cell| {
-            SCRATCH.with(|scratch_cell| {
-                let mut encoder = encoder_cell.borrow_mut();
-                let mut scratch = scratch_cell.borrow_mut();
-                encoder.reset();
-                scratch.clear();
-                // Sortie deflate généralement << entrée pour du JSON
-                // (ratio ~3-4×), mais on prévoit large pour éviter la
-                // ré-alloc pendant la boucle.
-                let initial = raw.len().max(4096);
-                let cur_cap = scratch.capacity();
-                if cur_cap < initial {
-                    scratch.reserve(initial - cur_cap);
-                }
-
-                loop {
-                    let prev_out = encoder.total_out();
-                    let input_pos = encoder.total_in() as usize;
-                    let status = encoder
-                        .compress_vec(&raw[input_pos..], &mut scratch, FlushCompress::Finish)
-                        .expect("Compress::compress_vec only fails on programmer error");
-                    match status {
-                        Status::StreamEnd => break,
-                        Status::Ok | Status::BufError => {
-                            if encoder.total_out() == prev_out {
-                                let extra = scratch.capacity().max(4096);
-                                scratch.reserve(extra);
-                            }
-                        }
-                    }
-                }
-                scratch.clone()
-            })
-        })
-    }
-}
-
-/// Helper free-function pour parser un [`SourceBlob`] en `Value`.
-/// Réutilisée par `parsed_source`, `rebuild_index` et `documents_paginated`.
-fn parse_source_blob(blob: &SourceBlob) -> Value {
-    match blob {
-        SourceBlob::Raw(s) => {
-            serde_json::from_str(s.as_ref()).expect("stored Raw _source is valid JSON")
-        }
-        SourceBlob::Compressed(bytes) => {
-            let decoded = SourceBlob::decode_compressed(bytes.as_ref());
-            serde_json::from_slice(&decoded)
-                .expect("stored Compressed _source decodes to valid JSON")
-        }
-    }
-}
 
 use surch_search::scoring::{bm25_score, Bm25Config};
 
@@ -222,21 +55,12 @@ struct InMemoryIndex {
     /// counting the `Value` payload size once (regardless of the
     /// strong count), so the gauge tracks unique stored bytes —
     /// which is what capacity planning cares about.
-    /// #15 memory: the `_source` is stored as the SERIALIZED JSON bytes,
-    /// NOT a parsed `serde_json::Value` tree (the deces breakdown
+    /// #15 memory: the `_source` is stored as the SERIALIZED JSON bytes
+    /// (`Arc<str>`), NOT a parsed `serde_json::Value` tree (the deces breakdown
     /// showed the parsed `Value` is the dominant RSS term — ~2-3× the serialized
     /// size). It is parsed back to a `Value` on access via [`Self::parsed_source`]
     /// — cheap because reads hydrate only the top-K window (~20 docs/query).
-    ///
-    /// Campagne mémoire option B (cf. `docs/paper/memory-pivot-decision.md`) :
-    /// la valeur est un [`SourceBlob`] qui peut être `Raw(Arc<str>)`
-    /// (chemin INSERT bulk — hot path) ou `Compressed(Arc<[u8]>)`
-    /// (état après [`Self::compact_after_refresh`]). La voie d'INSERT et
-    /// la voie `append_to_index` voient EXCLUSIVEMENT `Raw`, donc le
-    /// gate indexation reste intact par construction. Le decode payé
-    /// sur la voie search post-refresh (~5-10 µs / blob) ne touche que
-    /// les ~20 docs du top-K.
-    documents: BTreeMap<String, SourceBlob>,
+    documents: BTreeMap<String, Arc<str>>,
     document_ids: BTreeMap<String, u32>,
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
@@ -450,17 +274,12 @@ impl InMemoryIndex {
         // `ensure_fields` needs the `Value`, so analyse it BEFORE serialising;
         // the write then replaces the slot with a fresh `Arc<str>` handle so
         // concurrent readers keep their consistent snapshot.
-        //
-        // Campagne mémoire option B : on insère TOUJOURS `SourceBlob::Raw`
-        // sur ce chemin (INSERT bulk) — la compression n'a lieu qu'à
-        // `_refresh` via `compact_after_refresh`. Cela garantit ZÉRO
-        // surcoût codec sur le hot path bulk (gate >= 14 000 docs/s).
         self.mapping.ensure_fields(&source);
         self.documents.insert(
             id.to_owned(),
-            SourceBlob::Raw(Arc::from(
+            Arc::from(
                 serde_json::to_string(&source).expect("a validated _source serialises to JSON"),
-            )),
+            ),
         );
     }
 
@@ -496,17 +315,12 @@ impl InMemoryIndex {
         let documents = self
             .documents
             .iter()
-            .filter_map(|(id, blob)| {
+            .filter_map(|(id, source)| {
                 self.document_ids.get(id).map(|doc_id| {
                     // #15: the stored _source is serialized bytes; parse to a
                     // Value to extract its indexed fields (full-reindex path).
-                    //
-                    // Option B : si le blob est `Compressed` (cas post-refresh
-                    // suivi d'une réindexation complète — set_mapping ou
-                    // fallback `terms_finalized`), on paie le decode ici.
-                    // C'est le seul chemin d'INDEXATION qui touche le decode ;
-                    // il n'est PAS le hot path bulk (steady-state).
-                    let parsed = parse_source_blob(blob);
+                    let parsed: Value = serde_json::from_str(source.as_ref())
+                        .expect("stored _source is valid JSON");
                     (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
                 })
             })
@@ -593,45 +407,6 @@ impl InMemoryIndex {
         self.index.materialize_terms();
         self.index.finalize_postings();
         self.terms_finalized = true;
-        // Option B campagne mémoire : passe de compression _source en
-        // BLOC, hors du hot path bulk. Idempotente (un blob déjà
-        // `Compressed` n'est pas re-traité).
-        self.compact_after_refresh();
-    }
-
-    /// Convertit en bloc tous les `SourceBlob::Raw` du `documents` en
-    /// `SourceBlob::Compressed` (deflate). Appelée UNE SEULE FOIS par
-    /// `_refresh`, en dehors du hot path bulk : c'est le contrat de
-    /// l'option B (cf. `docs/paper/memory-pivot-decision.md`).
-    ///
-    /// Budget chiffré : ~5-10 µs / blob avec un `Compress` thread-local
-    /// réutilisé entre appels. Sur deces 1,36 M docs : ~7-14 s ajoutés
-    /// au `_refresh` ; gate non-bloquant (le `_refresh` n'est pas dans
-    /// le hot path latence).
-    ///
-    /// Gain RAM attendu : `stored_fields_bytes` 1187 MiB -> ~330-400 MiB
-    /// (ratio JSON typiquement 3-4×). Sur deces : RSS 7903 -> ~7100 MiB.
-    fn compact_after_refresh(&mut self) {
-        // Itération sur les clés pour éviter une re-clone du blob ;
-        // `get_mut` puis remplacement sur place via `std::mem::replace`
-        // évite un re-hash dans `BTreeMap`.
-        let ids: Vec<String> = self
-            .documents
-            .iter()
-            .filter_map(|(id, blob)| match blob {
-                SourceBlob::Raw(_) => Some(id.clone()),
-                SourceBlob::Compressed(_) => None,
-            })
-            .collect();
-        for id in ids {
-            let Some(slot) = self.documents.get_mut(&id) else {
-                continue;
-            };
-            if let SourceBlob::Raw(raw) = slot {
-                let bytes = SourceBlob::encode_for_compact(raw.as_bytes());
-                *slot = SourceBlob::Compressed(Arc::from(bytes.into_boxed_slice()));
-            }
-        }
     }
 
     fn set_mapping(&mut self, mapping: IndexMapping) {
@@ -1073,14 +848,11 @@ impl InMemoryIndex {
     /// Parse a stored `_source` (serialized bytes, #15) back into an owned
     /// `Arc<Value>` for the consumers that need a `&Value` (build_hit,
     /// query_matches, lookup_sort_value, …). `None` when `id` is unknown.
-    ///
-    /// Option B : dispatch sur la variante `SourceBlob`. `Raw` reste le
-    /// chemin de base (hot path bulk INSERT + `append_to_index`),
-    /// `Compressed` paie un decode thread-local (~5-10 µs) sur la voie
-    /// search post-refresh.
     fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
-        let blob = self.documents.get(id)?;
-        Some(Arc::new(parse_source_blob(blob)))
+        let raw = self.documents.get(id)?;
+        Some(Arc::new(
+            serde_json::from_str(raw).expect("stored _source is valid JSON"),
+        ))
     }
 
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
@@ -2121,13 +1893,13 @@ impl AppState {
             .iter()
             .skip(from)
             .take(size)
-            .map(|(id, blob)| StoredDocument {
+            .map(|(id, raw)| StoredDocument {
                 index: index.to_owned(),
                 id: id.clone(),
-                // #15 + option B : parse le _source stocké (Raw direct,
-                // Compressed -> decode thread-local) en `Value` ; cette
-                // voie ne traite que la fenêtre `[from..from+size)`.
-                source: Arc::new(parse_source_blob(blob)),
+                // #15: parse the stored bytes back to a Value (window only).
+                source: Arc::new(
+                    serde_json::from_str(raw.as_ref()).expect("stored _source is valid JSON"),
+                ),
             })
             .collect()
     }
@@ -2713,27 +2485,20 @@ impl AppState {
         // outstanding `Arc` strong count: the gauge tracks the
         // unique RAM held by `_source` JSON, not the per-reader
         // cumulative footprint.
-        // #15 + option B : `_source` est soit `Raw(Arc<str>)`, soit
-        // `Compressed(Arc<[u8]>)` après `compact_after_refresh`. Dans
-        // les deux cas, `payload_len()` retourne la taille des bytes
-        // utiles ; la gauge `stored_fields_bytes` reflète donc la
-        // RAM RÉELLE (compressed après refresh, raw avant).
-        usage.stored_fields_bytes = data
-            .documents
-            .values()
-            .map(|blob| blob.payload_len() as u64)
-            .sum();
+        // #15: `_source` is now the serialized bytes, so the stored size is
+        // simply their length (the parsed-`Value` accounting is gone with the
+        // parsed-`Value` storage — this is the real, smaller resident size).
+        usage.stored_fields_bytes = data.documents.values().map(|raw| raw.len() as u64).sum();
         Some(usage)
     }
 
     /// API-side state overhead for `index` — the bytes NOT already counted by
     /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
     /// `documents_overhead` is the per-entry overhead of `documents:
-    /// BTreeMap<String, SourceBlob>` ON TOP OF the `_source` payload (already
+    /// BTreeMap<String, Arc<str>>` ON TOP OF the `_source` payload (already
     /// reported via `stored_fields_bytes`): the key `String`'s heap bytes, the
-    /// `Arc` 16-byte refcount header (identique pour `Arc<str>` Raw et
-    /// `Arc<[u8]>` Compressed), et un coût `BTreeMap` approximatif par
-    /// entrée. `id_maps` couvre `document_ids` et `reverse_document_ids`.
+    /// `Arc` 16-byte refcount header, and a rough `BTreeMap` node cost per
+    /// entry. `id_maps` covers both `document_ids` and `reverse_document_ids`.
     ///
     /// #17b: the structured index gauges only account for ~2.8 GiB of the
     /// inc1 RSS (~7.97 GiB). The remaining ~5.2 GiB is the target of this
@@ -2749,8 +2514,7 @@ impl AppState {
         // defined, but the order of magnitude is enough to compare against
         // jemalloc allocated.
         const BTREE_NODE_OVERHEAD: u64 = 48;
-        // Arc header (strong + weak counts) : identique pour `Arc<str>`
-        // (Raw) et `Arc<[u8]>` (Compressed), option B campagne mémoire.
+        // Arc<str> header: two atomic refcounts.
         const ARC_HEADER: u64 = 16;
         let mut documents_overhead: u64 = 0;
         for key in data.documents.keys() {
