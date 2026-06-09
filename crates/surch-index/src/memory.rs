@@ -219,7 +219,11 @@ fn subfield_values_bytes(doc_index: &DocumentIndex) -> u64 {
 
 fn field_stats_bytes(doc_index: &DocumentIndex) -> u64 {
     let stats_header = size_of::<FieldLengthStats>() as u64;
-    let entry_size = size_of::<u64>() as u64;
+    // #18 ndcg-smallfloat: `doc_len_dense` switched from `Vec<u64>` (8 B/doc)
+    // to `Vec<u8>` (Lucene `SmallFloat`-quantized, 1 B/doc). The ledger
+    // entry size shrinks 8× — ~65 MiB freed on the deces 1.36 M × ~6
+    // indexed fields workload.
+    let entry_size = size_of::<u8>() as u64;
     let mut total: u64 = 0;
     for (field, stats) in doc_index.field_stats_map().iter() {
         total += field.len() as u64;

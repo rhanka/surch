@@ -84,28 +84,102 @@ pub struct DocumentIndex {
     terms_build_count: Arc<AtomicU64>,
 }
 
+/// Lucene-compatible 1-byte length quantization used by [`FieldLengthStats`]
+/// to store the per-doc field length the BM25 scorer reads. Bit-identical
+/// mirror of `surch_search::small_float`; the canonical reference, full
+/// test vectors and documentation live there. We duplicate the encoder
+/// here only because `surch-search` already depends on `surch-index`
+/// (cannot import upward); a CI parity test
+/// (`crates/surch-search/tests/small_float_parity.rs`) asserts the two
+/// implementations produce byte-identical output for every input the
+/// indexer can record.
+mod small_float {
+    /// Lucene `NUM_FREE_VALUES = 255 - longToInt4(Integer.MAX_VALUE) = 24`.
+    /// Inputs strictly below this round-trip lossless.
+    const NUM_FREE_VALUES: u32 = 24;
+
+    #[inline]
+    fn long_to_int4(value: u64) -> u32 {
+        let num_bits = 64 - value.leading_zeros();
+        if num_bits < 4 {
+            return value as u32;
+        }
+        let shift = num_bits - 4;
+        let mantissa = (value >> shift) as u32 & 0x07;
+        let exponent = shift + 1;
+        mantissa | (exponent << 3)
+    }
+
+    #[inline]
+    fn int4_to_long(encoded: u32) -> u64 {
+        let bits = (encoded & 0x07) as u64;
+        let exp = encoded >> 3;
+        if exp == 0 {
+            bits
+        } else {
+            (bits | 0x08) << (exp - 1)
+        }
+    }
+
+    #[inline]
+    pub(super) fn int_to_byte4(value: u32) -> u8 {
+        if value < NUM_FREE_VALUES {
+            return value as u8;
+        }
+        let offset = (value - NUM_FREE_VALUES) as u64;
+        let encoded = long_to_int4(offset);
+        (NUM_FREE_VALUES + encoded) as u8
+    }
+
+    #[inline]
+    pub(super) fn byte4_to_int(byte: u8) -> u32 {
+        let i = byte as u32;
+        if i < NUM_FREE_VALUES {
+            return i;
+        }
+        let decoded = NUM_FREE_VALUES as u64 + int4_to_long(i - NUM_FREE_VALUES);
+        decoded.min(u32::MAX as u64) as u32
+    }
+}
+
 /// Per-field length statistics recorded during analysis for BM25 norms.
 ///
 /// `doc_len_dense` is indexed directly by internal `doc_id` (which is dense:
-/// `0..n`), with `0` as the "absent" sentinel — a real recorded `doc_len` is
-/// always `>= 1` (`record_doc_len` skips `0`). This replaces the former
-/// `BTreeMap<u32, u64>`: the BM25 scoring hot loop looks up `doc_len(doc_id)`
-/// once per scored doc on the matched posting list — a `BTreeMap` made that an
-/// `O(log n)` pointer-chasing (cache-missing) probe per doc, and the per-query
-/// scoring context paid an `O(n)` pointer-chasing copy of the whole map. A
-/// dense `Vec` makes the lookup `O(1)` and cache-friendly (postings are walked
-/// in ascending `doc_id`, so the slice is touched near-sequentially), and is
-/// also lighter than the `BTreeMap` for fields present in most docs (8 B/doc
-/// vs a multi-pointer node per entry).
+/// `0..n`), with `0` as the "absent" sentinel — a real recorded `doc_len`
+/// always quantizes to a non-zero byte (`record_doc_len` skips `0` raw
+/// lengths and `int_to_byte4(1) = 1`).
+///
+/// Each entry is a **Lucene `SmallFloat`-quantized 1-byte length** (mirrors
+/// `BM25Similarity.computeNorm`), not the raw token count. This:
+///
+/// 1. closes the TREC-COVID NDCG@10 parity gap (Surch 0.4750 → ≥ 0.4902 OS,
+///    see `docs/paper/ndcg-trec-covid-rootcause-22.md` #22 — the gap is
+///    entirely caused by Surch scoring with exact `doc_len` while Lucene
+///    scored with the quantized bucket, so the top-K ordering inside the
+///    same candidate set diverged);
+/// 2. cuts `field_stats_bytes` from 8 B/doc to 1 B/doc — ~65 MiB freed on
+///    the deces 1.36 M × ~6 indexed fields corpus, half of the
+///    `field_stats` memory ledger.
+///
+/// `total_terms` continues to track the **raw** sum (so `avg_doc_len`
+/// matches Lucene's `CollectionStatistics.sumTotalTermFreq / docCount`,
+/// which is unaffected by per-doc quantization).
+///
+/// `doc_len(doc_id)` returns the quantized-then-reconstructed length —
+/// the same value Lucene feeds to BM25 — so callers see the SAME number
+/// Lucene would on the same input. Same for `min_doc_len()`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FieldLengthStats {
     pub doc_count: u64,
     pub total_terms: u64,
-    doc_len_dense: Vec<u64>,
-    /// Smallest recorded `doc_len` (`0` = none), maintained incrementally so
-    /// the WAND block-max upper bound does not re-scan the whole dense slice on
-    /// every query (it needs `min_doc_len` — the shortest doc, hence the highest
-    /// possible BM25 score — to bound a token/block contribution).
+    /// One byte per `doc_id`, `0` = absent, otherwise the Lucene
+    /// `SmallFloat` encoded length (see [`small_float`]).
+    doc_len_dense: Vec<u8>,
+    /// Smallest **reconstructed** `doc_len` (`0` = none), maintained
+    /// incrementally so the WAND block-max upper bound does not re-scan
+    /// the whole dense slice per query. Kept in the same domain as
+    /// `doc_len(doc_id)` so the scorer can feed it directly to
+    /// `Bm25TermScorer::score`.
     min_doc_len: u64,
 }
 
@@ -122,27 +196,51 @@ impl FieldLengthStats {
         if idx >= self.doc_len_dense.len() {
             self.doc_len_dense.resize(idx + 1, 0);
         }
-        let previous = self.doc_len_dense[idx];
-        if previous > 0 {
-            self.total_terms -= previous;
+        // Saturate the raw length into the `u32` domain the Lucene
+        // encoder expects — field lengths are bounded by token counts
+        // in a single doc, which never approach `u32::MAX` in
+        // practice; saturation is a defensive no-op that keeps the
+        // function infallible.
+        let raw = doc_len.min(u32::MAX as u64) as u32;
+        let encoded = small_float::int_to_byte4(raw);
+        let previous_byte = self.doc_len_dense[idx];
+        let previous_reconstructed = if previous_byte == 0 {
+            0
+        } else {
+            small_float::byte4_to_int(previous_byte) as u64
+        };
+        if previous_byte != 0 {
+            // We do not store the raw `doc_len` (only the quantized
+            // byte), so on the rare in-place overwrite path we
+            // subtract the reconstructed bucket length. The bulk-load
+            // path never overwrites (each `doc_id` is recorded once,
+            // `previous_byte` is `0`), so this branch is dead in
+            // production. On the rare update path the drift is
+            // bounded by one bucket of quantization error on a single
+            // doc — negligible vs `total_terms` of the whole corpus.
+            self.total_terms = self.total_terms.saturating_sub(previous_reconstructed);
         } else {
             self.doc_count += 1;
         }
-        self.doc_len_dense[idx] = doc_len;
+        self.doc_len_dense[idx] = encoded;
         self.total_terms += doc_len;
-        // Maintain the running minimum in O(1) on the common paths. The only
-        // case that can RAISE the minimum is overwriting the current-min doc
-        // with a larger length (an in-place doc_len update) — rare, and absent
-        // from the bulk-load path where each doc is recorded exactly once — and
-        // it triggers a single recompute scan.
-        if self.min_doc_len == 0 || doc_len < self.min_doc_len {
-            self.min_doc_len = doc_len;
-        } else if previous == self.min_doc_len && doc_len > previous {
+        let reconstructed = small_float::byte4_to_int(encoded) as u64;
+        // Maintain the running minimum on the reconstructed (Lucene-
+        // bucketed) length, so it matches the value `doc_len(doc_id)`
+        // returns and the scorer consumes directly. The common path
+        // (lower minimum, or first record) is O(1); the rare overwrite
+        // that RAISES the minimum forces a recompute scan.
+        if self.min_doc_len == 0 || reconstructed < self.min_doc_len {
+            self.min_doc_len = reconstructed;
+        } else if previous_reconstructed == self.min_doc_len
+            && reconstructed > previous_reconstructed
+        {
             self.min_doc_len = self
                 .doc_len_dense
                 .iter()
                 .copied()
-                .filter(|&len| len > 0)
+                .filter(|&byte| byte > 0)
+                .map(|byte| small_float::byte4_to_int(byte) as u64)
                 .min()
                 .unwrap_or(0);
         }
@@ -153,24 +251,43 @@ impl FieldLengthStats {
             .then(|| self.total_terms as f64 / self.doc_count as f64)
     }
 
-    /// The smallest recorded `doc_len` (precomputed, O(1)), or `None` when no
-    /// length was recorded (e.g. norms disabled). Equals
-    /// `doc_len_dense.iter().filter(|l| *l > 0).min()` without the per-query scan.
+    /// The smallest reconstructed `doc_len` (Lucene quantized, O(1)
+    /// lookup), or `None` when no length was recorded (e.g. norms
+    /// disabled).
     pub fn min_doc_len(&self) -> Option<u64> {
         (self.min_doc_len > 0).then_some(self.min_doc_len)
     }
 
+    /// Lucene-quantized `doc_len` for `doc_id`, or `None` when no
+    /// length was recorded. Same value `BM25Similarity` would feed its
+    /// scoring formula on the same input.
     pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
         self.doc_len_dense
             .get(doc_id as usize)
             .copied()
-            .filter(|&len| len > 0)
+            .filter(|&byte| byte > 0)
+            .map(|byte| small_float::byte4_to_int(byte) as u64)
     }
 
-    /// The dense per-`doc_id` length slice (`0` = absent), for zero-copy /
-    /// flat-copy consumption by the scoring context. Indexed by `doc_id`.
-    pub fn doc_len_dense(&self) -> &[u64] {
+    /// The dense per-`doc_id` quantized length byte slice (`0` =
+    /// absent), for zero-copy consumption by the scoring context.
+    /// Indexed by `doc_id`. Each byte is the Lucene `SmallFloat`
+    /// encoding; callers must reconstruct via
+    /// [`decode_doc_len_byte`] before feeding it to BM25.
+    pub fn doc_len_dense(&self) -> &[u8] {
         &self.doc_len_dense
+    }
+}
+
+/// Decode a single `doc_len_dense` byte to its reconstructed Lucene
+/// `SmallFloat` length. Returns `0` when the byte is `0` (absent),
+/// otherwise the same value `doc_len(doc_id)` would return.
+#[inline]
+pub fn decode_doc_len_byte(byte: u8) -> u64 {
+    if byte == 0 {
+        0
+    } else {
+        small_float::byte4_to_int(byte) as u64
     }
 }
 
