@@ -132,14 +132,43 @@ Hot path `append_to_index` (cas bulk-puis-refresh-puis-bulk) :
 
 ## 5. Ce qu'il reste à valider sur cluster CI
 
-- Run CI sur push de la branche `worktree-agent-ab04eca27db33c0e9` :
-  - mesure RSS post-refresh (cible 7000-7200 MiB).
-  - mesure indexation 5-rep médiane (gate ≥ 14 000 docs/s).
-  - mesure match/bool/full p95 5-rep W2 (gate < 2,1 ms ; non-régression bool/full).
-  - oracle b1/b2 0-divergence (SACRÉ).
-  - mesure durée `_refresh` (cible ≤ 15 s).
-- Si gates verts → ADOPTER, mettre à jour scoreboard.
-- Si décode hot path tire le p95 au-delà de 2,1 ms → mesurer le coût ;
-  envisager codec plus rapide (lz4_flex `compress_prepend_size`/`decompress_size_prepended` ≈
-  3× plus rapide que deflate, 1,5× moins compressé mais reste > 2×).
-- Si gain RAM < 500 MiB → REVERT, passer à A.
+État du worktree au moment de la livraison :
+- branche : `worktree-agent-ab04eca27db33c0e9` (à merger sur `main`).
+- HEAD : commit `[campaign-memory-reset] option B - compression post-refresh`.
+- modifs : `crates/surch-api/src/state.rs` (+254 LOC nets : `SourceBlob`,
+  `parse_source_blob`, `compact_after_refresh`, dispatch des accès `documents`).
+- AUCUN `cargo test/clippy/check` lancé localement (consigne : valider via CI
+  cluster, le PC user a déjà planté 5 fois sur ce sujet).
+
+À valider sur le cluster CI (push de la branche) :
+
+1. **Compile + clippy** : zéro warning, zéro erreur (Rust 1.81+).
+2. **Tests unitaires** `crates/surch-api` : tous les tests `_refresh →
+   search` round-trip doivent valider, notamment `bulk_router`,
+   `matchid_autocomplete`, `matchid_compat`, `date_range` (≥ 5 suites
+   couvrent le chemin `index_document → _refresh → search`).
+3. **Run bench cluster K8s** sur deces 1,36 M, W=2, 5 reps :
+   - RSS final cible **~7100 MiB** (−800 MiB vs 7903 baseline) ; tolérance ±100.
+   - Indexation cible **≤ 95 s** (gate ≥ 14 000 docs/s = 97,1 s max).
+   - `_refresh` durée cible **≤ 15 s** (vs ~3 s baseline) — instrumenter via
+     log timing dans `finalize_terms_for_refresh`.
+   - match/bool/full p95 cible **≤ 1,7 ms** (gate non-régression 2,1 ms).
+   - parité oracle b1/b2 = **0 divergence** (SACRÉ).
+4. **Décisions go/no-go** post-CI :
+   - **ADOPTER** si tous gates verts ET gain RSS ≥ 500 MiB → mettre à jour
+     scoreboard master-plan + reprendre #17c (gap heap 3,8 GiB) pour
+     descendre vers la cible 4 GiB.
+   - **REJETER + ITÉRER** si match p95 > 2,1 ms : tester `lz4_flex`
+     (`compress_prepend_size`/`decompress_size_prepended`, ~3× plus rapide
+     que deflate, ratio ~1,5× moins bon mais toujours > 2×) avant revert.
+   - **REJETER + PIVOTER A** si indexation > 97,1 s OU gain RSS < 500 MiB :
+     revert option B, reprendre l'option A (mmap + `posix_fallocate`) avec
+     pré-mesure `filefrag` pour valider que ext4 honore fallocate.
+
+Risque résiduel connu : pendant un re-build complet déclenché par
+`set_mapping` ou `terms_finalized=true` post-refresh, `rebuild_index`
+appelle `parse_source_blob` sur des `Compressed` (~5-10 µs × 1,36 M =
+7-14 s ajoutés). Ce chemin n'est PAS le steady-state bulk ; il est déjà
+le fallback "rebuild" assumé par la conception #15. Si une suite CI
+mesure ce chemin spécifiquement (rare), elle verra le surcoût ; à
+documenter mais pas à corriger.
