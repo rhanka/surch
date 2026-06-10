@@ -419,6 +419,30 @@ impl TermDictionary {
             .sum()
     }
 
+    /// #17c memory accounting: capacity SLACK on the per-term `Vec<Posting>`
+    /// and `Vec<u32>` channels — the bytes allocated but unused after the
+    /// builder finalized (the standard Vec geometric growth leaves up to
+    /// ~50 % slack on the last reallocation). Walks every term's inner
+    /// vec, sums `(capacity - len) * sizeof(item)`. Read-only, O(terms).
+    pub fn postings_capacity_slack_bytes(&self) -> u64 {
+        let post = std::mem::size_of::<Posting>() as u64;
+        let doc_id = std::mem::size_of::<u32>() as u64;
+        let mut total: u64 = 0;
+        for fp in self.fields.values() {
+            for v in &fp.postings {
+                total = total.saturating_add(
+                    (v.capacity().saturating_sub(v.len()) as u64).saturating_mul(post),
+                );
+            }
+            for v in &fp.doc_ids {
+                total = total.saturating_add(
+                    (v.capacity().saturating_sub(v.len()) as u64).saturating_mul(doc_id),
+                );
+            }
+        }
+        total
+    }
+
     /// A6 phase 3: union of doc ids across every term of `field` whose
     /// bytes start with `prefix`. Used by the keyword-prefix iterator on
     /// fields that did not declare `index_prefixes` (e.g. matchID's
