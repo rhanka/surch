@@ -5,6 +5,7 @@ use std::{
 };
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+use rayon::prelude::*;
 use serde_json::Value;
 use surch_index::{
     document_index::DocumentIndex,
@@ -558,12 +559,25 @@ impl InMemoryIndex {
             self.rebuild_index();
             return;
         }
+        // Étape 1 du plan indexation 2× ES : parallélisation tokenization.
+        // À ce point, `ensure_fields` a déjà été appelé pour CHAQUE doc du
+        // batch (via `upsert_document_deferred`), donc `self.mapping` est
+        // stable pour la suite. `parsed_source` et `indexed_fields_for_document`
+        // ne touchent que des structures immutables (`documents` BTreeMap,
+        // `mapping`, `reverse_document_ids`), donc l'itération `rayon::par_iter`
+        // est thread-safe. Chaque worker thread dispose de son propre
+        // `Decompress` via le `thread_local!` du module `source_compression`.
+        // Coût per-doc dominant ≈ 50 %, gain attendu ~1.4× sur 2 cores W=2.
+        let self_ref = &*self;
         let documents = new_doc_ids
-            .iter()
+            .par_iter()
             .filter_map(|&doc_id| {
-                let id = self.reverse_document_ids.get(&doc_id)?;
-                let source = self.parsed_source(id)?;
-                Some((doc_id, indexed_fields_for_document(&source, &self.mapping)))
+                let id = self_ref.reverse_document_ids.get(&doc_id)?;
+                let source = self_ref.parsed_source(id)?;
+                Some((
+                    doc_id,
+                    indexed_fields_for_document(&source, &self_ref.mapping),
+                ))
             })
             .collect::<Vec<_>>();
         // Lot 1.6: defer the FST rebuild on the bulk hot path. Reads
