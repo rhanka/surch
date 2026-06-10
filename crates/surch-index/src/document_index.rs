@@ -578,6 +578,15 @@ impl DocumentIndex {
         self.terms.block_metas_bytes()
     }
 
+    /// #17c memory accounting: Vec capacity slack across every term's
+    /// `Vec<Posting>` and `Vec<u32>` channels. Surfaces the bytes
+    /// allocated-but-unused after the FST build — typically up to ~50 %
+    /// of the live `postings_bytes` because of `Vec`'s geometric growth
+    /// (~doubling) leaving the last realloc half-filled.
+    pub fn postings_capacity_slack_bytes(&self) -> u64 {
+        self.terms.postings_capacity_slack_bytes()
+    }
+
     /// Returns the in-memory prefix-postings side table. Empty for fields
     /// that did not declare `index_prefixes`. Used by the memory
     /// accounting helper.

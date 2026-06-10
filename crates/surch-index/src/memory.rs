@@ -71,6 +71,12 @@ pub struct MemoryUsage {
     /// metadata that drives BMW. (Distinct from `term_stats_bytes`, which
     /// counts the API-side `TermScoringStats` copies.)
     pub block_metas_bytes: u64,
+    /// #17c: Vec capacity slack on per-term `Vec<Posting>` + `Vec<u32>`
+    /// channels (bytes allocated but unused). Surfaces the bytes
+    /// jemalloc holds because of size-class rounding — typically up to
+    /// ~50 % of the last realloc stays unused. Helps explain heap above
+    /// `postings_bytes`.
+    pub postings_capacity_slack_bytes: u64,
 }
 
 impl MemoryUsage {
@@ -85,6 +91,7 @@ impl MemoryUsage {
             .saturating_add(self.fst_bytes)
             .saturating_add(self.roaring_bytes)
             .saturating_add(self.block_metas_bytes)
+            .saturating_add(self.postings_capacity_slack_bytes)
     }
 }
 
@@ -109,6 +116,7 @@ pub fn document_index_memory_usage(doc_index: &DocumentIndex) -> MemoryUsage {
         fst_bytes: doc_index.fst_bytes(),
         roaring_bytes: doc_index.roaring_bytes(),
         block_metas_bytes: doc_index.block_metas_bytes(),
+        postings_capacity_slack_bytes: doc_index.postings_capacity_slack_bytes(),
     }
 }
 

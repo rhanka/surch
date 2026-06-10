@@ -100,6 +100,10 @@ fn set_gauges(
     metrics::gauge!("surch_index_fst_bytes", &label).set(usage.fst_bytes as f64);
     metrics::gauge!("surch_index_roaring_bytes", &label).set(usage.roaring_bytes as f64);
     metrics::gauge!("surch_index_block_metas_bytes", &label).set(usage.block_metas_bytes as f64);
+    // #17c: capacity slack on per-term Vec<Posting>/Vec<u32> — bytes allocated
+    // but unused after the FST build (size-class rounding).
+    metrics::gauge!("surch_index_postings_capacity_slack_bytes", &label)
+        .set(usage.postings_capacity_slack_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
     metrics::gauge!("surch_index_doc_count", &label).set(doc_count as f64);
     // #17b: api-side state overhead — the `documents` BTreeMap node + Arc
@@ -136,6 +140,8 @@ pub struct MemoryReport {
     pub fst_bytes: u64,
     pub roaring_bytes: u64,
     pub block_metas_bytes: u64,
+    // #17c: capacity slack on Vec<Posting>/Vec<u32> per-term channels.
+    pub postings_capacity_slack_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -150,6 +156,7 @@ impl From<MemoryUsage> for MemoryReport {
             fst_bytes: value.fst_bytes,
             roaring_bytes: value.roaring_bytes,
             block_metas_bytes: value.block_metas_bytes,
+            postings_capacity_slack_bytes: value.postings_capacity_slack_bytes,
             total_bytes: value.total_bytes(),
         }
     }
