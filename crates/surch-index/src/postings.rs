@@ -138,8 +138,8 @@ impl PostingsBuilder {
             for (term, postings) in terms {
                 total = total.saturating_add(inner_kv);
                 total = total.saturating_add(term.len() as u64);
-                total = total
-                    .saturating_add((postings.capacity() as u64).saturating_mul(posting_size));
+                total =
+                    total.saturating_add((postings.capacity() as u64).saturating_mul(posting_size));
             }
         }
         total
