@@ -77,6 +77,10 @@ pub struct MemoryUsage {
     /// ~50 % of the last realloc stays unused. Helps explain heap above
     /// `postings_bytes`.
     pub postings_capacity_slack_bytes: u64,
+    /// #17c walker complet : taille on-heap du `PostingsBuilder` retenu
+    /// entre rebuilds incrémentaux (Lot 1.5). Premier suspect du gap
+    /// heap ~4 GiB inexpliqué sur deces 1.36M (cf scoreboard-2026-06-10-mesured.md).
+    pub postings_builder_bytes: u64,
 }
 
 impl MemoryUsage {
@@ -92,6 +96,7 @@ impl MemoryUsage {
             .saturating_add(self.roaring_bytes)
             .saturating_add(self.block_metas_bytes)
             .saturating_add(self.postings_capacity_slack_bytes)
+            .saturating_add(self.postings_builder_bytes)
     }
 }
 
@@ -117,6 +122,7 @@ pub fn document_index_memory_usage(doc_index: &DocumentIndex) -> MemoryUsage {
         roaring_bytes: doc_index.roaring_bytes(),
         block_metas_bytes: doc_index.block_metas_bytes(),
         postings_capacity_slack_bytes: doc_index.postings_capacity_slack_bytes(),
+        postings_builder_bytes: doc_index.postings_builder_bytes(),
     }
 }
 

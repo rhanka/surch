@@ -587,6 +587,14 @@ impl DocumentIndex {
         self.terms.postings_capacity_slack_bytes()
     }
 
+    /// #17c memory accounting: taille on-heap du `PostingsBuilder` retenu.
+    /// Lot 1.5 garde le builder live entre rebuilds incrémentaux, donc
+    /// pour 1.36 M docs ça peut peser GROS et n'était pas compté ailleurs.
+    /// Suspect #1 du gap heap ~4 GiB sur deces (cf docs/paper/scoreboard-2026-06-10-mesured.md).
+    pub fn postings_builder_bytes(&self) -> u64 {
+        self.postings_builder.memory_bytes()
+    }
+
     /// Returns the in-memory prefix-postings side table. Empty for fields
     /// that did not declare `index_prefixes`. Used by the memory
     /// accounting helper.
