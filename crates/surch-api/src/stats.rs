@@ -135,6 +135,8 @@ fn set_gauges(
     // subfields (PRENOM.raw + NOM.raw côté matchID).
     metrics::gauge!("surch_index_subfield_values_bytes", &label)
         .set(usage.subfield_values_bytes as f64);
+    // #17c walker complet : live_docs BTreeSet<u32>.
+    metrics::gauge!("surch_index_live_docs_bytes", &label).set(usage.live_docs_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
     // #17c walker complet : exposer en clair les gaps qui restent à traquer.
     // `unaccounted` = ce qui est dans le heap mais pas dans nos gauges
