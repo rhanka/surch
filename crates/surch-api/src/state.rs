@@ -15,43 +15,266 @@ use surch_index::{
     roaring::RoaringDocSet,
 };
 
-/// Campagne mémoire — option B (cf. `docs/paper/memory-pivot-decision.md`).
+/// `mmap M1` (P1 du plan persistance segments + manifest, cf.
+/// `docs/paper/persistence-iceberg-architecture.md` §10) — cherry-pick
+/// adapte du commit `3c864af` reverte a tort le 2026-06-09. Le timeout
+/// 58 min observe sur `mmap M1.1` (`c2fd9ad`) etait du au **bug Artillery
+/// bulk-search stall pre-existant** ET a l'**extension ext4 1-10 ms par
+/// `pwrite` en bout de fichier** (1.36 M × 5 ms ≈ 113 min, cf.
+/// `docs/paper/memory-campaign-blocker.md` §"Diagnostic"). On corrige les
+/// deux : (1) on cherry-pick l'esprit du store file-backed (pas le commit
+/// litteral car il faut composer avec l'option B compression
+/// post-refresh mergee depuis dans `febbc86`) ; (2) on ajoute
+/// `posix_fallocate(64 MiB)` a la creation du segment pour pre-allouer
+/// une extent contigue, ce qui ramene chaque `pwrite` a un cout O(1)
+/// independant de la taille courante du fichier.
 ///
-/// `_source` est stocké soit sous forme brute (`Raw`, JSON serialisé en
-/// `Arc<str>`) sur la voie d'INSERT bulk, soit sous forme compressée
-/// (`Compressed`, deflate brut en `Arc<[u8]>`) après le passage de
-/// `compact_after_refresh()` lors d'un `_refresh`. Toutes les `Raw`
-/// présentes dans l'index sont converties en `Compressed` en bloc, hors
-/// hot path bulk, en réutilisant un `flate2::Compress` thread-local.
+/// Le module reste a l'interieur de `state.rs` — il n'a pas vocation a
+/// etre reutilise par d'autres crates, et P2 (manifest atomique) le
+/// migrera vers `surch-store` avec une API segments multi-instances.
+#[cfg(target_os = "linux")]
+mod source_store {
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::{fs::FileExt, io::AsRawFd},
+        path::PathBuf,
+        sync::Arc,
+    };
+
+    /// Pre-allocation initiale du segment `source.dat`, en octets.
+    /// 64 MiB couvre confortablement plusieurs dizaines de milliers de
+    /// docs deces avant qu'un `posix_fallocate` supplementaire ne soit
+    /// necessaire ; l'append boucle re-fallocate par chunks de 64 MiB
+    /// chaque fois que `next_offset + bytes.len() > fallocated_len` (cf.
+    /// `SourceStore::ensure_capacity`). Choix justifie : sur deces
+    /// 1.36 M docs × ~300 oct/doc serialise = ~400 MiB, soit ~7
+    /// arrondis de 64 MiB ; sur SciFact 5 k docs = un seul.
+    const FALLOCATE_CHUNK: i64 = 64 * 1024 * 1024;
+
+    /// `mmap M1` — segment `_source` append-only file-backed, indexe par
+    /// `doc_id` interne. `idx[doc_id] = Some((offset, length))` pour
+    /// les docs vivants, `None` pour les supprimes (sparse). Reads via
+    /// Linux `pread` (`FileExt::read_exact_at`) — concurrent search
+    /// share `Arc<File>` sans verrou applicatif.
+    #[derive(Debug)]
+    pub(super) struct SourceStore {
+        file: Arc<File>,
+        next_offset: u64,
+        /// Taille deja `posix_fallocate`-ee, en octets. On
+        /// re-fallocate par chunks de 64 MiB chaque fois que la
+        /// prochaine ecriture deborderait. Le but est d'eviter
+        /// l'extension ext4 *par bloc 4 KiB* a chaque `pwrite`,
+        /// remplacee par une extension *par bunch de 64 MiB*. Sur
+        /// deces : 7 fallocate au lieu de 1.36 M extensions.
+        fallocated_len: i64,
+        path: PathBuf,
+    }
+
+    impl Default for SourceStore {
+        fn default() -> Self {
+            let id = uuid::Uuid::new_v4();
+            let path = std::env::temp_dir().join(format!("surch-source-{id}.dat"));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("failed to create surch source store tempfile");
+            let mut store = Self {
+                file: Arc::new(file),
+                next_offset: 0,
+                fallocated_len: 0,
+                path,
+            };
+            store.fallocate(FALLOCATE_CHUNK);
+            store
+        }
+    }
+
+    impl SourceStore {
+        /// `posix_fallocate(fd, 0, fallocated_len + extra)` via
+        /// l'appel direct `libc::posix_fallocate`. Mute
+        /// `fallocated_len`. Pas d'erreur fatale si le syscall echoue
+        /// (ENOSPC, EINVAL) — on log seulement, le fichier garde sa
+        /// taille courante et chaque `pwrite` retombera sur
+        /// l'extension ext4 classique (le bug original).
+        fn fallocate(&mut self, extra: i64) {
+            let new_len = self.fallocated_len.saturating_add(extra);
+            // SAFETY: `self.file.as_raw_fd()` est valide pendant la vie
+            // de `self.file` (Arc) ; `posix_fallocate` ne touche pas
+            // les bytes (zero-fill mais a la longueur, pas du
+            // contenu) ; les arguments sont des entiers positifs.
+            let ret = unsafe {
+                libc::posix_fallocate(self.file.as_raw_fd(), 0, new_len)
+            };
+            if ret == 0 {
+                self.fallocated_len = new_len;
+            } else {
+                tracing::warn!(
+                    target: "surch_api::source_store",
+                    errno = ret,
+                    fallocated_len = self.fallocated_len,
+                    new_len,
+                    "posix_fallocate failed; falling back to per-pwrite ext4 expansion (mmap M1.1 timeout risk)"
+                );
+            }
+        }
+
+        fn ensure_capacity(&mut self, write_end: u64) {
+            while (write_end as i64) > self.fallocated_len {
+                self.fallocate(FALLOCATE_CHUNK);
+                // Si fallocate a echoue, on sort de la boucle apres
+                // un seul tour pour eviter le spin.
+                if self.fallocated_len == 0 {
+                    break;
+                }
+            }
+        }
+
+        /// Append `bytes` au segment, retourne `(offset, length)` pour
+        /// stocker dans le `BTreeMap<String, SourceBlob>`.
+        pub(super) fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+            let offset = self.next_offset;
+            let length = bytes.len() as u32;
+            self.ensure_capacity(offset.saturating_add(length as u64));
+            self.file
+                .write_all_at(bytes, offset)
+                .expect("source store segment file should accept positional write");
+            self.next_offset = offset.saturating_add(length as u64);
+            (offset, length)
+        }
+
+        /// Read `length` bytes at `offset` via `pread`. Concurrent-safe
+        /// (no lock applicatif), share `Arc<File>` entre threads.
+        pub(super) fn read(&self, offset: u64, length: u32) -> Vec<u8> {
+            let mut buf = vec![0u8; length as usize];
+            self.file
+                .read_exact_at(&mut buf, offset)
+                .expect("source store segment file should accept positional read");
+            buf
+        }
+
+        /// Reset le segment a vide : truncate le fichier a 0, re-fallocate
+        /// le chunk initial. Appele par `compact_after_refresh` une
+        /// fois que TOUS les `SourceBlob::OnDisk` ont ete migres en
+        /// `Compressed` — les bytes du segment sont alors orphelins
+        /// (plus reference par aucun slot `documents`).
+        pub(super) fn reset(&mut self) {
+            if let Err(err) = self.file.set_len(0) {
+                tracing::warn!(
+                    target: "surch_api::source_store",
+                    ?err,
+                    "failed to truncate source store segment; segment file will keep its on-disk size"
+                );
+                return;
+            }
+            self.next_offset = 0;
+            self.fallocated_len = 0;
+            self.fallocate(FALLOCATE_CHUNK);
+        }
+
+        /// Taille on-disk effective du segment (bytes ecrits, hors
+        /// reserve `posix_fallocate`). Exposee pour l'axe #19 (mesure
+        /// disque) — la gauge dediee sera branchee par P2 (manifest +
+        /// `_cat/indices?bytes=b`). `allow(dead_code)` en attendant.
+        #[allow(dead_code)]
+        pub(super) fn bytes_written(&self) -> u64 {
+            self.next_offset
+        }
+    }
+
+    impl Drop for SourceStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Fallback non-Linux : tampon in-RAM derriere la meme API. Cible de
+/// release est Linux distroless cc-debian12, mais le code doit
+/// continuer a builder/tester sur macOS dev sans pulling `libc::
+/// posix_fallocate`.
+#[cfg(not(target_os = "linux"))]
+mod source_store {
+    #[derive(Debug, Default)]
+    pub(super) struct SourceStore {
+        buf: Vec<u8>,
+    }
+
+    impl SourceStore {
+        pub(super) fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+            let offset = self.buf.len() as u64;
+            self.buf.extend_from_slice(bytes);
+            (offset, bytes.len() as u32)
+        }
+
+        pub(super) fn read(&self, offset: u64, length: u32) -> Vec<u8> {
+            let start = offset as usize;
+            let end = start + length as usize;
+            self.buf[start..end].to_vec()
+        }
+
+        pub(super) fn reset(&mut self) {
+            self.buf.clear();
+            self.buf.shrink_to_fit();
+        }
+
+        #[allow(dead_code)]
+        pub(super) fn bytes_written(&self) -> u64 {
+            self.buf.len() as u64
+        }
+    }
+}
+
+use source_store::SourceStore;
+
+/// Campagne mémoire — option B (cf. `docs/paper/memory-pivot-decision.md`)
+/// **composee avec `mmap M1` (P1 persistance)**.
+///
+/// Apres `mmap M1`, la variante "fresh source" du bulk path n'est plus
+/// `Raw(Arc<str>)` en RAM : c'est `OnDisk { offset, length }`, un
+/// pointeur dans le segment `source.dat` file-backed (cf. module
+/// `source_store`). Les bytes vivent dans le page-cache OS, pas dans le
+/// heap du process. Apres `_refresh`, `compact_after_refresh` lit chaque
+/// `OnDisk`, compresse, et remplace le slot par `Compressed(Arc<[u8]>)`
+/// — RAM moyenne ~400 MiB compresses, segment `source.dat` truncate a 0.
 ///
 /// Décisions :
-/// - Hot path INSERT (`upsert_document_deferred`, `append_to_index` ->
-///   `parsed_source` pendant le bulk) : TOUJOURS sur la variante `Raw`,
-///   ZÉRO coût codec. Le gate indexation >= 14 000 docs/s reste intact
-///   par construction.
-/// - Hot path search post-refresh (`parsed_source` pour top-K) : décode
-///   chaque blob compressé via un `Decompress` thread-local bouclé
-///   jusqu'à `Status::StreamEnd` (fix correctness inc3b/c — la boucle
-///   évite la troncature observée sur >1 MiB blobs et l'erreur sur
-///   `StreamEnd` partiel). Coût ~5-10 µs / blob, soit ~100-200 µs sur
-///   un top-K=20.
-/// - Gauge `stored_fields_bytes` reflète la taille effectivement en RAM
-///   (compressed après refresh = ce qu'on annonce sur scoreboard).
+/// - Hot path INSERT (`upsert_document_deferred`) : append au segment,
+///   stocke `OnDisk`. Cout : 1× `pwrite` (~5 µs amorti grace au
+///   `posix_fallocate`) + 8 octets de side-table. Gate indexation
+///   >= 14 000 docs/s preserve.
+/// - Hot path search post-refresh : `Compressed` decompresses via
+///   `Decompress` thread-local (~5-10 µs / blob).
+/// - Hot path search PENDANT le bulk (cf. `append_to_index` /
+///   `rebuild_index` qui passent par `parsed_source`) : la voie OnDisk
+///   fait un `pread` (~5-10 µs SSD NVMe) + parse. Marginal sur top-K=20.
+/// - Gauge `stored_fields_bytes` ne compte que les bytes RAM
+///   (`Compressed.len()`) — les `OnDisk` sont sortis du heap par
+///   construction. La taille on-disk visible est exposee separement via
+///   `source_store.bytes_written()` (axe #19).
 #[derive(Clone, Debug)]
 enum SourceBlob {
-    /// Bytes JSON serialisés tels que reçus du bulk. Hot path.
-    Raw(Arc<str>),
+    /// Pointeur dans le segment `source.dat` file-backed. Etat
+    /// transitoire entre l'INSERT bulk et le premier `_refresh`. Le
+    /// `length` `u32` borne un doc a 4 GiB — largement au-dela des
+    /// `_source` matchID / BEIR observes (< 1 MiB).
+    OnDisk { offset: u64, length: u32 },
     /// Bytes deflate-bruts produits par `compact_after_refresh()`.
     /// Decode via [`SourceBlob::decode_compressed`] (Decompress thread-local).
     Compressed(Arc<[u8]>),
 }
 
 impl SourceBlob {
-    /// Taille en RAM des bytes utiles (sans le header Arc), pour la
-    /// gauge `surch_index_stored_fields_bytes`.
+    /// Taille en **RAM** des bytes utiles (sans le header Arc), pour la
+    /// gauge `surch_index_stored_fields_bytes`. Les blobs `OnDisk`
+    /// retournent 0 : leurs bytes vivent dans le segment file-backed
+    /// (page-cache OS), pas dans le heap du process — c'est exactement
+    /// le levier RAM que `mmap M1` apporte.
     fn payload_len(&self) -> usize {
         match self {
-            Self::Raw(s) => s.len(),
+            Self::OnDisk { .. } => 0,
             Self::Compressed(b) => b.len(),
         }
     }
@@ -165,12 +388,17 @@ impl SourceBlob {
     }
 }
 
-/// Helper free-function pour parser un [`SourceBlob`] en `Value`.
-/// Réutilisée par `parsed_source`, `rebuild_index` et `documents_paginated`.
-fn parse_source_blob(blob: &SourceBlob) -> Value {
+/// Helper pour parser un [`SourceBlob`] en `Value`. Reutilise par
+/// `parsed_source`, `rebuild_index` et `documents_paginated`.
+///
+/// `mmap M1` : le `store` est lu pour les blobs `OnDisk` (pread sur le
+/// segment file-backed) ; les `Compressed` decodent via le `Decompress`
+/// thread-local (inchange option B).
+fn parse_source_blob(blob: &SourceBlob, store: &SourceStore) -> Value {
     match blob {
-        SourceBlob::Raw(s) => {
-            serde_json::from_str(s.as_ref()).expect("stored Raw _source is valid JSON")
+        SourceBlob::OnDisk { offset, length } => {
+            let bytes = store.read(*offset, *length);
+            serde_json::from_slice(&bytes).expect("stored OnDisk _source is valid JSON")
         }
         SourceBlob::Compressed(bytes) => {
             let decoded = SourceBlob::decode_compressed(bytes.as_ref());
@@ -211,7 +439,13 @@ struct MemoryStore {
     index_templates: BTreeMap<String, StoredIndexTemplate>,
 }
 
-#[derive(Debug, Default, Clone)]
+// `mmap M1` : `InMemoryIndex` n'est plus `Clone`. Le champ
+// `source_store` detient un `Arc<File>` qui ne devrait PAS etre
+// duplique (deux indices partageant le meme segment file casseraient
+// `next_offset` et les `OnDisk { offset, length }`). Le derive Clone
+// originel n'etait pas utilise (verification par grep) — on le retire
+// pour eviter un piege future.
+#[derive(Debug, Default)]
 struct InMemoryIndex {
     /// `_source` payloads, refcounted so the search hot path
     /// (`build_hit`, `score_documents`, `lookup_sort_value`, …) can
@@ -229,15 +463,24 @@ struct InMemoryIndex {
     /// size). It is parsed back to a `Value` on access via [`Self::parsed_source`]
     /// — cheap because reads hydrate only the top-K window (~20 docs/query).
     ///
-    /// Campagne mémoire option B (cf. `docs/paper/memory-pivot-decision.md`) :
-    /// la valeur est un [`SourceBlob`] qui peut être `Raw(Arc<str>)`
-    /// (chemin INSERT bulk — hot path) ou `Compressed(Arc<[u8]>)`
-    /// (état après [`Self::compact_after_refresh`]). La voie d'INSERT et
-    /// la voie `append_to_index` voient EXCLUSIVEMENT `Raw`, donc le
+    /// Campagne mémoire option B (cf. `docs/paper/memory-pivot-decision.md`)
+    /// composee avec `mmap M1` (P1 persistance) : la valeur est un
+    /// [`SourceBlob`] qui peut être `OnDisk { offset, length }` (chemin
+    /// INSERT bulk — pointeur dans `source_store`, page-cache OS) ou
+    /// `Compressed(Arc<[u8]>)` (état après [`Self::compact_after_refresh`]).
+    /// La voie d'INSERT et
+    /// la voie `append_to_index` voient EXCLUSIVEMENT `OnDisk`, donc le
     /// gate indexation reste intact par construction. Le decode payé
     /// sur la voie search post-refresh (~5-10 µs / blob) ne touche que
     /// les ~20 docs du top-K.
     documents: BTreeMap<String, SourceBlob>,
+    /// `mmap M1` — segment `source.dat` file-backed sous `TMPDIR`,
+    /// pre-alloue par `posix_fallocate(64 MiB)`. Append-only pendant le
+    /// bulk, truncate a 0 a la fin de `compact_after_refresh` une fois
+    /// tous les blobs migres en `Compressed`. Le store est cree
+    /// paresseusement via `Default` (un tempfile par index) ; il est
+    /// supprime au `Drop` de `InMemoryIndex`.
+    source_store: SourceStore,
     document_ids: BTreeMap<String, u32>,
     reverse_document_ids: BTreeMap<u32, String>,
     next_doc_id: u32,
@@ -447,22 +690,31 @@ impl InMemoryIndex {
             doc_id
         });
 
-        // #15: store the SERIALIZED `_source` bytes (not the parsed `Value`).
-        // `ensure_fields` needs the `Value`, so analyse it BEFORE serialising;
-        // the write then replaces the slot with a fresh `Arc<str>` handle so
-        // concurrent readers keep their consistent snapshot.
+        // `mmap M1` + option B : on serialise puis on append au segment
+        // `source.dat` file-backed (cf. module `source_store`). Le slot
+        // `documents` stocke `OnDisk { offset, length }` — 12 octets en
+        // RAM au lieu des bytes JSON eux-memes. La compression a lieu a
+        // `_refresh` via `compact_after_refresh` (option B), qui
+        // migrera ces blobs vers `Compressed(Arc<[u8]>)` puis truncate
+        // le segment.
         //
-        // Campagne mémoire option B : on insère TOUJOURS `SourceBlob::Raw`
-        // sur ce chemin (INSERT bulk) — la compression n'a lieu qu'à
-        // `_refresh` via `compact_after_refresh`. Cela garantit ZÉRO
-        // surcoût codec sur le hot path bulk (gate >= 14 000 docs/s).
+        // Coût bulk : 1× pwrite (~5 µs amorti grace au
+        // `posix_fallocate` qui evite l'extension ext4 par bloc 4 KiB)
+        // au lieu de 1× `Arc::from` + insertion BTreeMap. Gate
+        // indexation >= 14 000 docs/s preserve.
+        //
+        // `ensure_fields` a besoin du `Value` parse, donc analyse
+        // AVANT serialisation. Updates (meme `id`) ecrasent le slot
+        // `documents` — les bytes precedents dans `source.dat` sont
+        // orphelins (acceptable pour P1 ; P2/P3 ajoutent une
+        // compaction segments). En pratique le bulk matchID est
+        // append-only par construction, donc zero orphelin.
         self.mapping.ensure_fields(&source);
-        self.documents.insert(
-            id.to_owned(),
-            SourceBlob::Raw(Arc::from(
-                serde_json::to_string(&source).expect("a validated _source serialises to JSON"),
-            )),
-        );
+        let serialized =
+            serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
+        let (offset, length) = self.source_store.append(&serialized);
+        self.documents
+            .insert(id.to_owned(), SourceBlob::OnDisk { offset, length });
     }
 
     fn delete_document(&mut self, id: &str) {
@@ -494,20 +746,18 @@ impl InMemoryIndex {
 
     fn rebuild_index(&mut self) {
         self.index.clear();
+        let store_ref = &self.source_store;
         let documents = self
             .documents
             .iter()
             .filter_map(|(id, blob)| {
                 self.document_ids.get(id).map(|doc_id| {
-                    // #15: the stored _source is serialized bytes; parse to a
-                    // Value to extract its indexed fields (full-reindex path).
-                    //
-                    // Option B : si le blob est `Compressed` (cas post-refresh
-                    // suivi d'une réindexation complète — set_mapping ou
-                    // fallback `terms_finalized`), on paie le decode ici.
-                    // C'est le seul chemin d'INDEXATION qui touche le decode ;
-                    // il n'est PAS le hot path bulk (steady-state).
-                    let parsed = parse_source_blob(blob);
+                    // #15 + `mmap M1` : on parse le `_source` stocke
+                    // (OnDisk -> pread sur le segment file-backed,
+                    // Compressed -> decode thread-local). Seul chemin
+                    // d'INDEXATION qui touche le decode/pread ; pas le
+                    // hot path bulk steady-state.
+                    let parsed = parse_source_blob(blob, store_ref);
                     (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
                 })
             })
@@ -565,9 +815,15 @@ impl InMemoryIndex {
         // stable pour la suite. `parsed_source` et `indexed_fields_for_document`
         // ne touchent que des structures immutables (`documents` BTreeMap,
         // `mapping`, `reverse_document_ids`), donc l'itération `rayon::par_iter`
-        // est thread-safe. Chaque worker thread dispose de son propre
-        // `Decompress` via le `thread_local!` du module `source_compression`.
-        // Coût per-doc dominant ≈ 50 %, gain attendu ~1.4× sur 2 cores W=2.
+        // est thread-safe.
+        //
+        // `mmap M1` : sur le hot path bulk steady-state, `parsed_source`
+        // emprunte la voie `OnDisk` → `pread` sur le segment `source.dat`
+        // file-backed (les bytes viennent juste d'etre ecrits par
+        // `upsert_document_deferred`, page-cache OS chaud). Aucun decode
+        // codec ici. Chaque worker thread partage `Arc<File>` (Sync), le
+        // `pread` syscall est concurrent-safe par construction. Cout
+        // per-doc dominant ≈ 50 %, gain attendu ~1.4× sur 2 cores W=2.
         let self_ref = &*self;
         let documents = new_doc_ids
             .par_iter()
@@ -613,27 +869,41 @@ impl InMemoryIndex {
         self.compact_after_refresh();
     }
 
-    /// Convertit en bloc tous les `SourceBlob::Raw` du `documents` en
+    /// Convertit en bloc tous les `SourceBlob::OnDisk` du `documents` en
     /// `SourceBlob::Compressed` (deflate). Appelée UNE SEULE FOIS par
     /// `_refresh`, en dehors du hot path bulk : c'est le contrat de
-    /// l'option B (cf. `docs/paper/memory-pivot-decision.md`).
+    /// l'option B (cf. `docs/paper/memory-pivot-decision.md`) compose
+    /// avec `mmap M1`.
     ///
-    /// Budget chiffré : ~5-10 µs / blob avec un `Compress` thread-local
-    /// réutilisé entre appels. Sur deces 1,36 M docs : ~7-14 s ajoutés
-    /// au `_refresh` ; gate non-bloquant (le `_refresh` n'est pas dans
-    /// le hot path latence).
+    /// Sequence par blob :
+    /// 1. Lit les bytes depuis `source.dat` via `pread`.
+    /// 2. Encode deflate via `Compress` thread-local.
+    /// 3. Remplace le slot par `Compressed(Arc<[u8]>)`.
     ///
-    /// Gain RAM attendu : `stored_fields_bytes` 1187 MiB -> ~330-400 MiB
-    /// (ratio JSON typiquement 3-4×). Sur deces : RSS 7903 -> ~7100 MiB.
+    /// Une fois TOUS les blobs migres en `Compressed`, on tronque le
+    /// segment `source.dat` a 0 (`source_store.reset()`) — les bytes
+    /// du fichier sont alors orphelins, et la prochaine vague de bulk
+    /// recommencera a offset 0. Sur deces post-refresh : segment
+    /// `source.dat` 0 octets, RAM compressed ~400 MiB.
+    ///
+    /// Budget chiffré : ~5-10 µs / blob compression (Compress
+    /// thread-local) + ~5-10 µs / blob pread (SSD NVMe). Sur deces
+    /// 1.36 M docs : ~15-25 s ajoutes au `_refresh` ; gate non-bloquant
+    /// (le `_refresh` n'est pas dans le hot path latence).
+    ///
+    /// Gain RAM cumule (`mmap M1` + option B) : `stored_fields_bytes`
+    /// gauge passe de 1187 MiB en RAM heap → ~400 MiB en RAM compressed
+    /// + 0 octet on-disk (segment truncate). RSS attendu deces
+    /// 6621 → ~5500 MiB.
     fn compact_after_refresh(&mut self) {
-        // Itération sur les clés pour éviter une re-clone du blob ;
-        // `get_mut` puis remplacement sur place via `std::mem::replace`
-        // évite un re-hash dans `BTreeMap`.
+        // Itération sur les clés pour eviter une re-clone du blob ;
+        // `get_mut` puis remplacement sur place via `*slot = ...` evite
+        // un re-hash dans `BTreeMap`.
         let ids: Vec<String> = self
             .documents
             .iter()
             .filter_map(|(id, blob)| match blob {
-                SourceBlob::Raw(_) => Some(id.clone()),
+                SourceBlob::OnDisk { .. } => Some(id.clone()),
                 SourceBlob::Compressed(_) => None,
             })
             .collect();
@@ -641,10 +911,22 @@ impl InMemoryIndex {
             let Some(slot) = self.documents.get_mut(&id) else {
                 continue;
             };
-            if let SourceBlob::Raw(raw) = slot {
-                let bytes = SourceBlob::encode_for_compact(raw.as_bytes());
-                *slot = SourceBlob::Compressed(Arc::from(bytes.into_boxed_slice()));
+            if let SourceBlob::OnDisk { offset, length } = *slot {
+                let raw_bytes = self.source_store.read(offset, length);
+                let compressed = SourceBlob::encode_for_compact(&raw_bytes);
+                *slot = SourceBlob::Compressed(Arc::from(compressed.into_boxed_slice()));
             }
+        }
+        // Tous les `OnDisk` sont desormais migres ; les bytes du
+        // segment `source.dat` n'ont plus de reference depuis
+        // `documents`. On tronque a 0 + re-fallocate le chunk initial
+        // pour la prochaine vague bulk.
+        let still_on_disk = self
+            .documents
+            .values()
+            .any(|blob| matches!(blob, SourceBlob::OnDisk { .. }));
+        if !still_on_disk {
+            self.source_store.reset();
         }
     }
 
@@ -1088,13 +1370,14 @@ impl InMemoryIndex {
     /// `Arc<Value>` for the consumers that need a `&Value` (build_hit,
     /// query_matches, lookup_sort_value, …). `None` when `id` is unknown.
     ///
-    /// Option B : dispatch sur la variante `SourceBlob`. `Raw` reste le
-    /// chemin de base (hot path bulk INSERT + `append_to_index`),
-    /// `Compressed` paie un decode thread-local (~5-10 µs) sur la voie
-    /// search post-refresh.
+    /// `mmap M1` + option B : dispatch sur la variante `SourceBlob`.
+    /// `OnDisk { offset, length }` paie un `pread` sur le segment
+    /// file-backed (~5-10 µs SSD NVMe), `Compressed(Arc<[u8]>)` paie
+    /// un decode thread-local (~5-10 µs) sur la voie search
+    /// post-refresh.
     fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
         let blob = self.documents.get(id)?;
-        Some(Arc::new(parse_source_blob(blob)))
+        Some(Arc::new(parse_source_blob(blob, &self.source_store)))
     }
 
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
@@ -2138,10 +2421,11 @@ impl AppState {
             .map(|(id, blob)| StoredDocument {
                 index: index.to_owned(),
                 id: id.clone(),
-                // #15 + option B : parse le _source stocké (Raw direct,
-                // Compressed -> decode thread-local) en `Value` ; cette
-                // voie ne traite que la fenêtre `[from..from+size)`.
-                source: Arc::new(parse_source_blob(blob)),
+                // #15 + option B + `mmap M1` : parse le `_source`
+                // stocke (OnDisk -> pread, Compressed -> decode
+                // thread-local) en `Value` ; cette voie ne traite que
+                // la fenetre `[from..from+size)`.
+                source: Arc::new(parse_source_blob(blob, &data.source_store)),
             })
             .collect()
     }
@@ -2727,11 +3011,15 @@ impl AppState {
         // outstanding `Arc` strong count: the gauge tracks the
         // unique RAM held by `_source` JSON, not the per-reader
         // cumulative footprint.
-        // #15 + option B : `_source` est soit `Raw(Arc<str>)`, soit
-        // `Compressed(Arc<[u8]>)` après `compact_after_refresh`. Dans
-        // les deux cas, `payload_len()` retourne la taille des bytes
-        // utiles ; la gauge `stored_fields_bytes` reflète donc la
-        // RAM RÉELLE (compressed après refresh, raw avant).
+        // `mmap M1` + option B : `_source` est soit `OnDisk { offset,
+        // length }` (bytes dans le segment file-backed, RAM 0 — la
+        // pression RSS effective est le page-cache OS), soit
+        // `Compressed(Arc<[u8]>)` (bytes deflate en heap). La gauge
+        // `stored_fields_bytes` ne compte que le RAM heap : 0 pour
+        // OnDisk, `Arc<[u8]>::len()` pour Compressed. Sur deces
+        // post-bulk avant refresh : ~0 MiB (tout est OnDisk).
+        // Post-refresh : ~400 MiB compresses. Avant `mmap M1` la
+        // meme gauge valait 1187 MiB en RAM avant refresh.
         usage.stored_fields_bytes = data
             .documents
             .values()
@@ -2744,9 +3032,10 @@ impl AppState {
     /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
     /// `documents_overhead` is the per-entry overhead of `documents:
     /// BTreeMap<String, SourceBlob>` ON TOP OF the `_source` payload (already
-    /// reported via `stored_fields_bytes`): the key `String`'s heap bytes, the
-    /// `Arc` 16-byte refcount header (identique pour `Arc<str>` Raw et
-    /// `Arc<[u8]>` Compressed), et un coût `BTreeMap` approximatif par
+    /// reported via `stored_fields_bytes`): the key `String`'s heap bytes,
+    /// l'enum discriminant + payload du `SourceBlob` (16 octets en
+    /// inline pour `OnDisk { u64, u32 }`, 16 octets `Arc<[u8]>` header
+    /// pour `Compressed`), et un coût `BTreeMap` approximatif par
     /// entrée. `id_maps` couvre `document_ids` et `reverse_document_ids`.
     ///
     /// #17b: the structured index gauges only account for ~2.8 GiB of the
@@ -2763,14 +3052,20 @@ impl AppState {
         // defined, but the order of magnitude is enough to compare against
         // jemalloc allocated.
         const BTREE_NODE_OVERHEAD: u64 = 48;
-        // Arc header (strong + weak counts) : identique pour `Arc<str>`
-        // (Raw) et `Arc<[u8]>` (Compressed), option B campagne mémoire.
-        const ARC_HEADER: u64 = 16;
+        // `mmap M1` : taille en RAM de `SourceBlob` lui-meme (sans le
+        // payload Compressed, qui est compte par `stored_fields_bytes`).
+        // L'enum est dimensionne par la plus grande variante : OnDisk
+        // = 12 octets (u64 + u32) ; Compressed = 16 octets (Arc<[u8]>
+        // fat pointer = ptr + len). Avec discriminant + alignement,
+        // l'enum total ≈ 24 octets. On approxime a 24 pour les deux
+        // variantes (OnDisk allocate 0 sur le heap, Compressed allocate
+        // les bytes deja comptes par la gauge).
+        const SOURCE_BLOB_INLINE: u64 = 24;
         let mut documents_overhead: u64 = 0;
         for key in data.documents.keys() {
             documents_overhead = documents_overhead
                 .saturating_add(BTREE_NODE_OVERHEAD)
-                .saturating_add(ARC_HEADER)
+                .saturating_add(SOURCE_BLOB_INLINE)
                 .saturating_add(key.len() as u64);
         }
         let mut id_maps: u64 = 0;
