@@ -885,10 +885,12 @@ impl InMemoryIndex {
         self.index.materialize_terms();
         self.index.finalize_postings();
         self.terms_finalized = true;
-        // Option B campagne mémoire : passe de compression _source en
-        // BLOC, hors du hot path bulk. Idempotente (un blob déjà
-        // `Compressed` n'est pas re-traité).
-        self.compact_after_refresh();
+        // P1 mmap M1 + Option B se neutralisent : Option B compressait
+        // OnDisk -> Compressed(Arc<[u8]>) en RAM, ce qui rapatriait les
+        // bytes que P1 avait sorti sur disque. On ne compacte plus.
+        // Gain attendu : −stored_fields_bytes sur la gauge. Le segment
+        // `source.dat` conserve les bytes (pread O(1) sur la lecture).
+        // Voir docs/paper/persistence-iceberg-architecture.md.
     }
 
     /// Convertit en bloc tous les `SourceBlob::OnDisk` du `documents` en
@@ -916,6 +918,12 @@ impl InMemoryIndex {
     /// Gain RAM cumule (`mmap M1` + option B) : `stored_fields_bytes`
     /// gauge passe de 1187 MiB en RAM heap → ~400 MiB en RAM compressed
     /// + 0 octet on-disk (segment truncate). RSS attendu deces 6621 → ~5500 MiB.
+    ///
+    /// NOTE: Plus appelée depuis `finalize_terms_for_refresh` — avec P1
+    /// mmap M1 actif les blobs OnDisk restent sur disque (pread O(1)) et
+    /// le heap baisse plus que via la compression option B. Conservée pour
+    /// usage manuel/test et resurrection éventuelle (`P2 manifest` notamment).
+    #[allow(dead_code)]
     fn compact_after_refresh(&mut self) {
         // Itération sur les clés pour eviter une re-clone du blob ;
         // `get_mut` puis remplacement sur place via `*slot = ...` evite
