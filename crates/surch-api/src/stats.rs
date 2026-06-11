@@ -129,7 +129,21 @@ fn set_gauges(
     // 2026-06-10-mesured.md). Walk les BTreeMap imbriqués + Vec capacity.
     metrics::gauge!("surch_index_postings_builder_bytes", &label)
         .set(usage.postings_builder_bytes as f64);
+    // #17c walker complet — A10 multi-field side-table déjà calculée
+    // dans `MemoryUsage` mais jamais exposée en gauge (suspect #2 confirmé
+    // sur deces : 426 MiB = ~10 % du RSS). Inclut tous les `.raw`
+    // subfields (PRENOM.raw + NOM.raw côté matchID).
+    metrics::gauge!("surch_index_subfield_values_bytes", &label)
+        .set(usage.subfield_values_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
+    // #17c walker complet : exposer en clair les gaps qui restent à traquer.
+    // `unaccounted` = ce qui est dans le heap mais pas dans nos gauges
+    // structurelles. C'est le levier RAM restant.
+    let total_accounted = usage
+        .total_bytes()
+        .saturating_add(state_documents_overhead)
+        .saturating_add(state_id_maps);
+    metrics::gauge!("surch_index_total_accounted_bytes", &label).set(total_accounted as f64);
     metrics::gauge!("surch_index_doc_count", &label).set(doc_count as f64);
     // #17b: api-side state overhead — the `documents` BTreeMap node + Arc
     // header + key strings, and the id maps. The _source payload is already
@@ -169,6 +183,8 @@ pub struct MemoryReport {
     pub postings_capacity_slack_bytes: u64,
     // #17c walker complet: PostingsBuilder retenu Lot 1.5.
     pub postings_builder_bytes: u64,
+    // #17c walker complet: A10 multi-field side-table (PRENOM.raw etc.).
+    pub subfield_values_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -185,6 +201,7 @@ impl From<MemoryUsage> for MemoryReport {
             block_metas_bytes: value.block_metas_bytes,
             postings_capacity_slack_bytes: value.postings_capacity_slack_bytes,
             postings_builder_bytes: value.postings_builder_bytes,
+            subfield_values_bytes: value.subfield_values_bytes,
             total_bytes: value.total_bytes(),
         }
     }
