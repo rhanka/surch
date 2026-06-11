@@ -67,6 +67,12 @@ mod source_store {
         /// remplacee par une extension *par bunch de 64 MiB*. Sur
         /// deces : 7 fallocate au lieu de 1.36 M extensions.
         fallocated_len: i64,
+        /// Plus grosse taille `next_offset` jamais atteinte depuis la
+        /// creation du segment. Pas reset par `reset()` — sert a la
+        /// gauge `surch_index_disk_segment_peak_bytes` (axe #19) pour
+        /// que le scrape post-refresh voie la mesure pic-disque,
+        /// pas le 0 post-truncate de la compaction.
+        peak_offset: u64,
         path: PathBuf,
     }
 
@@ -85,6 +91,7 @@ mod source_store {
                 file: Arc::new(file),
                 next_offset: 0,
                 fallocated_len: 0,
+                peak_offset: 0,
                 path,
             };
             store.fallocate(FALLOCATE_CHUNK);
@@ -141,6 +148,9 @@ mod source_store {
                 .write_all_at(bytes, offset)
                 .expect("source store segment file should accept positional write");
             self.next_offset = offset.saturating_add(length as u64);
+            if self.next_offset > self.peak_offset {
+                self.peak_offset = self.next_offset;
+            }
             (offset, length)
         }
 
@@ -179,6 +189,14 @@ mod source_store {
         /// `_cat/indices?bytes=b`). `allow(dead_code)` en attendant.
         pub(super) fn bytes_written(&self) -> u64 {
             self.next_offset
+        }
+
+        /// Pic on-disk depuis la creation : `max(next_offset)` jamais
+        /// reset par `reset()`. C'est la mesure utile pour l'axe disque
+        /// #19 puisque le scrape #20 arrive APRES `_refresh` qui
+        /// declenche `compact_after_refresh` -> `reset()` -> 0.
+        pub(super) fn peak_bytes_written(&self) -> u64 {
+            self.peak_offset
         }
     }
 
@@ -219,6 +237,13 @@ mod source_store {
         }
 
         pub(super) fn bytes_written(&self) -> u64 {
+            self.buf.len() as u64
+        }
+
+        pub(super) fn peak_bytes_written(&self) -> u64 {
+            // Fallback non-Linux : pas de notion de pic distincte du courant
+            // (Vec<u8> est resetable instantanement, on n'a pas la
+            // segmentation linux/fichier qui motive `peak_offset`).
             self.buf.len() as u64
         }
     }
@@ -3094,6 +3119,20 @@ impl AppState {
             .indices
             .get(index)
             .map(|data| data.source_store.bytes_written())
+    }
+
+    /// Pic on-disk depuis la creation du segment (jamais reset par la
+    /// compaction). C'est la mesure utile pour le scoreboard axe disque
+    /// car le scrape #20 arrive APRES `_refresh` qui truncate le segment.
+    pub fn index_disk_segment_peak_bytes(&self, index: &str) -> Option<u64> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.source_store.peak_bytes_written())
     }
 
     /// Doc count for `index`. Returns `None` for an unknown index, so
