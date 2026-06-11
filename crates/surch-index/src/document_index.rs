@@ -595,6 +595,19 @@ impl DocumentIndex {
         self.postings_builder.memory_bytes()
     }
 
+    /// #17c walker complet: `live_docs: BTreeSet<u32>` avec 1.36M entrees
+    /// sur deces. BTreeSet a un overhead par-nœud (~256B pour ~11 entrees)
+    /// donc le compte est non-trivial. Lazy approximation : entries × 4B
+    /// (u32 data) + 28 % de slack BTreeSet nodes typique.
+    pub fn live_docs_bytes(&self) -> u64 {
+        use std::mem::size_of;
+        let entries = self.live_docs.len() as u64;
+        let entry_size = size_of::<u32>() as u64;
+        // BTreeSet : nodes de 11 entrees, ~256B header chacun + 11×4B data.
+        // ~32 B/entree effectif (incl. pointeurs internes).
+        entries.saturating_mul(entry_size.saturating_add(28))
+    }
+
     /// Returns the in-memory prefix-postings side table. Empty for fields
     /// that did not declare `index_prefixes`. Used by the memory
     /// accounting helper.
