@@ -21,8 +21,17 @@ surch-types = { path = "../surch-types" }
 # Linux-only because tikv-jemalloc-sys does not build on the
 # musl-on-distroless target reliably; the runtime image is
 # `gcr.io/distroless/cc-debian12` (glibc Linux), so this is safe.
+#
+# `libc` est ajoute pour `posix_fallocate` (P1 mmap restore) — appel
+# direct sur `RawFd` pour pre-allouer 64 MiB de `source.dat` en une
+# extent contigue ext4, ce qui evite l'extension repetee pwrite par
+# pwrite (cause confirmee du timeout 58 min sur mmap M1.1 — cf.
+# docs/paper/memory-campaign-blocker.md §"Diagnostic"). Linux-only par
+# coherence avec le module `source_store` Linux : sur macOS/Windows
+# dev, on retombe sur le fallback in-RAM `Vec<Option<Vec<u8>>>`.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"
+libc = "0.2"
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
