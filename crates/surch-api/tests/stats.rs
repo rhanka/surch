@@ -160,7 +160,14 @@ async fn stats_grows_with_documents() {
         .expect("total_bytes");
 
     assert!(postings > 0, "postings_bytes should grow with 100 docs");
-    assert!(stored > 0, "stored_fields_bytes should grow with 100 docs");
+    // P1 mmap M1 : `stored_fields_bytes` est une gauge RAM. Les blobs
+    // `OnDisk` (hot path bulk) retournent 0 — leurs bytes vivent dans
+    // le segment file-backed via mmap, pas dans le heap. La gauge ne
+    // devient positive qu'après `compact_after_refresh` qui convertit
+    // certains blobs en `Compressed` (in-RAM). Le test ne fait pas de
+    // `_refresh` ici, donc l'assertion historique > 0 n'est plus tenue ;
+    // on borne juste à ≥ 0 (informatif).
+    let _ = stored;
     assert!(
         field_stats > 0,
         "field_stats_bytes should grow with 100 docs"
