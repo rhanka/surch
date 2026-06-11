@@ -33,7 +33,15 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     let doc_count = state.index_doc_count(index).unwrap_or(0);
     let (state_docs_overhead, state_id_maps) =
         state.index_state_memory_bytes(index).unwrap_or((0, 0));
-    set_gauges(index, doc_count, &usage, state_docs_overhead, state_id_maps);
+    let disk_segment_bytes = state.index_disk_segment_bytes(index).unwrap_or(0);
+    set_gauges(
+        index,
+        doc_count,
+        &usage,
+        state_docs_overhead,
+        state_id_maps,
+        disk_segment_bytes,
+    );
     refresh_process_memory_gauges();
 }
 
@@ -78,7 +86,7 @@ fn refresh_process_memory_gauges() {}
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
-    set_gauges(index, 0, &MemoryUsage::default(), 0, 0);
+    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0);
 }
 
 fn set_gauges(
@@ -87,8 +95,14 @@ fn set_gauges(
     usage: &MemoryUsage,
     state_documents_overhead: u64,
     state_id_maps: u64,
+    disk_segment_bytes: u64,
 ) {
     let label = [("index", index.to_owned())];
+    // P1 mmap M1 + axe disque #19 : taille on-disk effective du segment
+    // `source.dat` (bytes ecrits, hors reserve posix_fallocate). Permet la
+    // mesure disque sans modifier le workflow matchID (le scrape #20
+    // attrape automatiquement les gauges `surch_index_*`).
+    metrics::gauge!("surch_index_disk_segment_bytes", &label).set(disk_segment_bytes as f64);
     metrics::gauge!("surch_index_postings_bytes", &label).set(usage.postings_bytes as f64);
     metrics::gauge!("surch_index_prefix_postings_bytes", &label)
         .set(usage.prefix_postings_bytes as f64);

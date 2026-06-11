@@ -177,7 +177,6 @@ mod source_store {
         /// reserve `posix_fallocate`). Exposee pour l'axe #19 (mesure
         /// disque) — la gauge dediee sera branchee par P2 (manifest +
         /// `_cat/indices?bytes=b`). `allow(dead_code)` en attendant.
-        #[allow(dead_code)]
         pub(super) fn bytes_written(&self) -> u64 {
             self.next_offset
         }
@@ -219,7 +218,6 @@ mod source_store {
             self.buf.shrink_to_fit();
         }
 
-        #[allow(dead_code)]
         pub(super) fn bytes_written(&self) -> u64 {
             self.buf.len() as u64
         }
@@ -3080,6 +3078,22 @@ impl AppState {
                 .saturating_add(value.len() as u64);
         }
         Some((documents_overhead, id_maps))
+    }
+
+    /// P1 mmap M1 + axe disque #19 : taille on-disk effective du segment
+    /// `source.dat` (bytes ecrits, hors reserve `posix_fallocate`).
+    /// Permet la mesure disque sans modifier le workflow matchID — la
+    /// gauge `surch_index_disk_segment_bytes` est capturee par le scrape
+    /// `#20` existant qui filtre `surch_index_*`.
+    pub fn index_disk_segment_bytes(&self, index: &str) -> Option<u64> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.source_store.bytes_written())
     }
 
     /// Doc count for `index`. Returns `None` for an unknown index, so
