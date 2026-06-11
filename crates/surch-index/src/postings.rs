@@ -117,6 +117,34 @@ impl PostingsBuilder {
         Self::default()
     }
 
+    /// #17c memory accounting : taille on-heap effective du builder retenu
+    /// (Lot 1.5 le garde live entre rebuilds incrémentaux). Walk les
+    /// BTreeMap imbriqués + somme `Vec<Posting>` capacities. Le but est
+    /// de chiffrer enfin la part de RAM heap (#17b gap ~4 GiB) qui vient
+    /// de la version "build snapshot" en attente d'`finalize_postings`.
+    /// Read-only, O(field × terms × postings.capacity).
+    pub fn memory_bytes(&self) -> u64 {
+        use std::mem::size_of;
+        let posting_size = size_of::<Posting>() as u64;
+        let str_overhead = size_of::<String>() as u64;
+        // BTreeMap node overhead approximé : 11 entrées par nœud côté Rust,
+        // donc on majore l'estimate plate avec 1.5× pour le slack typique.
+        let inner_kv = (str_overhead + size_of::<Vec<Posting>>() as u64) * 3 / 2;
+        let outer_kv = (str_overhead + size_of::<BTreeMap<String, Vec<Posting>>>() as u64) * 3 / 2;
+        let mut total: u64 = 0;
+        for (field, terms) in &self.fields {
+            total = total.saturating_add(outer_kv);
+            total = total.saturating_add(field.len() as u64);
+            for (term, postings) in terms {
+                total = total.saturating_add(inner_kv);
+                total = total.saturating_add(term.len() as u64);
+                total = total
+                    .saturating_add((postings.capacity() as u64).saturating_mul(posting_size));
+            }
+        }
+        total
+    }
+
     pub fn add(
         &mut self,
         field: impl Into<String>,
