@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! OpenSearch-compatible REST API boundary.
 
 use axum::{

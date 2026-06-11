@@ -99,15 +99,14 @@ mod source_store {
         /// (ENOSPC, EINVAL) — on log seulement, le fichier garde sa
         /// taille courante et chaque `pwrite` retombera sur
         /// l'extension ext4 classique (le bug original).
+        #[allow(unsafe_code)]
         fn fallocate(&mut self, extra: i64) {
             let new_len = self.fallocated_len.saturating_add(extra);
             // SAFETY: `self.file.as_raw_fd()` est valide pendant la vie
             // de `self.file` (Arc) ; `posix_fallocate` ne touche pas
             // les bytes (zero-fill mais a la longueur, pas du
             // contenu) ; les arguments sont des entiers positifs.
-            let ret = unsafe {
-                libc::posix_fallocate(self.file.as_raw_fd(), 0, new_len)
-            };
+            let ret = unsafe { libc::posix_fallocate(self.file.as_raw_fd(), 0, new_len) };
             if ret == 0 {
                 self.fallocated_len = new_len;
             } else {
@@ -893,8 +892,7 @@ impl InMemoryIndex {
     ///
     /// Gain RAM cumule (`mmap M1` + option B) : `stored_fields_bytes`
     /// gauge passe de 1187 MiB en RAM heap → ~400 MiB en RAM compressed
-    /// + 0 octet on-disk (segment truncate). RSS attendu deces
-    /// 6621 → ~5500 MiB.
+    /// + 0 octet on-disk (segment truncate). RSS attendu deces 6621 → ~5500 MiB.
     fn compact_after_refresh(&mut self) {
         // Itération sur les clés pour eviter une re-clone du blob ;
         // `get_mut` puis remplacement sur place via `*slot = ...` evite

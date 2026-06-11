@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 // Track A wp-a-perf-followups.md Lot 1.7: use jemalloc on Linux so
 // the heap returns freed pages to the OS aggressively (paired with
