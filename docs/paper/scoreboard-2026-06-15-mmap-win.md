@@ -47,7 +47,8 @@ la référence pour 1.36M ; ce 06-15 montre que sur 10k Surch domine ES par
 | Erreurs | 0 % | 0 % | ✅ parité |
 | Indexation docs/s | ≥ 2×ES | non mesuré sur ce config (bootstrap 10k) | ⚪ |
 | Disque | ≤ ½×ES | gauge non scrappée ici (mesuré 1.36M : 1187 MiB = 0.70×) | ⚪ |
-| Qualité NDCG | ≥ OS | run `27518262523` ndcg-gate en cours | ⚪ |
+| Qualité NDCG SciFact | ≥ OS | **+0.0062** (run `27518262523`) | ✅ |
+| Qualité NDCG TREC-COVID | ≥ OS | −0.0125 (résiduel inchangé vs 06-09) | 🟡 |
 
 ## Verdict global insee-bench
 
@@ -55,13 +56,33 @@ la référence pour 1.36M ; ce 06-15 montre que sur 10k Surch domine ES par
 de 2× ES sur toutes les latences et la RAM**. **3 axes non mesurés sur ce
 config** (indexation 1.36M, disque, NDCG — couverts par d'autres workflows).
 
+### Cluster ndcg-gate `27518262523` (BEIR retrieval — 2026-06-15)
+
+| Dataset | Métrique | Surch (7a64941) | OS 2.17 | Ratio Surch/OS |
+|---|---|---|---|---|
+| SciFact | NDCG@10 | **0.6599** | 0.6537 | **+0.0062** ✅ |
+| SciFact | Recall@10 | **0.8133** | 0.8033 | +0.0100 ✅ |
+| SciFact | bulk indexation | **1707 ms** | 15 227 ms | **8.9× OS** ✅ |
+| TREC-COVID | NDCG@10 | 0.4777 | 0.4902 | −0.0125 🟡 |
+| TREC-COVID | Recall@10 | 0.0132 | 0.0132 | parité ✅ |
+| TREC-COVID | bulk indexation | **61 771 ms** | 101 779 ms | **1.65× OS** 🟡 (sous gate 2×) |
+| RSS peak | (combiné BEIR) | **646 MB** | 1466 MB | **2.27× OS** ✅ |
+| RSS final | (combiné BEIR) | **483 MB** | 1466 MB | **3.03× OS** ✅ |
+
+#18 NDCG SmallFloat confirmé : valeurs identiques au run 06-09 (`27242686637`)
+malgré la suppression de `compact_after_refresh`. Le résiduel TREC-COVID
+−0.0125 reste comme dette qualité documentée.
+
 ## Action suivante
 
-- Attendre run ndcg-gate `27518262523` pour confirmer #18 NDCG SmallFloat
-  (régression vs run 06-09 `27242686637` : SciFact 0.6599 / TREC-COVID 0.4777).
+- TREC-COVID bulk indexation 1.65× OS : sous gate STRICT 2×. Identifier ce
+  qui retient sur cet axe (peut-être lié à la masse de docs CSV vs corpus
+  scientifique structuré SciFact).
 - Ajouter scrape `/metrics` au workflow `ci-k8s` pour exposer gauges RAM
-  fines + `disk_segment_peak_bytes` en post-bench (ne nécessite pas de
-  re-dispatch matchID externe).
+  fines + `disk_segment_peak_bytes` en post-bench ⇒ **livré commit `f1d8137`**.
+- Prochain insee-bench / ndcg-gate produira l'artefact
+  `*.surch.metrics.txt` avec **toutes** les gauges, déverrouillant l'axe
+  disque/RAM détaillé sans dépendre de matchID externe.
 
 ## HEAD source
 
