@@ -177,6 +177,11 @@ jobs:
           JOB_LABEL="app.kubernetes.io/component=${{ inputs.job }}"
           POD_TOP_SAMPLES="target/bench-reports/k8s/${{ inputs.job }}.pods.top.samples.txt"
           NODE_TOP_SAMPLES="target/bench-reports/k8s/${{ inputs.job }}.nodes.top.samples.txt"
+          # Axe #19 disque + #17c walker : scrape Prometheus du sidecar
+          # surch tant qu'il tourne (avant SIGTERM). On garde la dernière
+          # snapshot ; les gauges incluent disk_segment_peak_bytes (axe
+          # disque mesuré sur 1.36M) et tous les surch_index_*.
+          SURCH_METRICS_FILE="target/bench-reports/k8s/${{ inputs.job }}.surch.metrics.txt"
           deadline=$((SECONDS + SCW_MAX_DURATION_MIN * 60))
           while [ "$SECONDS" -le "$deadline" ]; do
             conditions="$(kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" \
@@ -263,6 +268,31 @@ jobs:
               echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
               kubectl top nodes
             } >> "$NODE_TOP_SAMPLES" 2>&1 || true
+            # Scrape /metrics du sidecar surch via port-forward (le
+            # container surch est distroless, pas d'exec possible). On
+            # overwrite la snapshot à chaque tick ; au SIGTERM la dernière
+            # scrape reste sur disque pour l'artefact. Background du
+            # port-forward + curl bref + kill PID.
+            POD="$(kubectl -n "$SCW_NAMESPACE" get pods -l "$JOB_LABEL" \
+              -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            if [ -n "$POD" ]; then
+              kubectl -n "$SCW_NAMESPACE" port-forward "pod/$POD" \
+                7700:7700 >/dev/null 2>&1 &
+              PF_PID=$!
+              # laisse le tunnel se stabiliser (~1-2s)
+              for _ in 1 2 3 4 5; do
+                if curl -fsS --max-time 3 \
+                  http://127.0.0.1:7700/metrics \
+                  > "$SURCH_METRICS_FILE.tmp" 2>/dev/null; then
+                  mv "$SURCH_METRICS_FILE.tmp" "$SURCH_METRICS_FILE"
+                  break
+                fi
+                sleep 1
+              done
+              rm -f "$SURCH_METRICS_FILE.tmp"
+              kill "$PF_PID" 2>/dev/null || true
+              wait "$PF_PID" 2>/dev/null || true
+            fi
             kubectl -n "$SCW_NAMESPACE" get "job/$JOB_NAME" -o wide || true
             sleep 10
           done
