@@ -18,6 +18,196 @@ use crate::postings::{
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
+/// C0 (`docs/paper/lot-c-disk-backed-plan.md`) disk-backed sub-field
+/// projections. `subfield_values` used to hold each projected `.raw`/`.norm`
+/// token as a resident `String` (~427 MiB on deces 1.36 M docs). It now holds
+/// a [`SubfieldRef`] `(offset, len)` into this append-only segment, and the
+/// token bytes are read back with `pread` (`FileExt::read_exact_at`) only when
+/// a `sort`/`agg` projection needs them, bounding the heap.
+///
+/// Mirrors surch-api's `source_store` but stays inside
+/// `#![forbid(unsafe_code)]`: no `posix_fallocate` (that syscall is `unsafe`),
+/// so the file is pre-extended in 64 MiB chunks with the safe `File::set_len`
+/// (ftruncate) to keep positional writes O(1) instead of paying the
+/// per-`pwrite` ext4 size-extension that caused the `mmap M1.1` timeout.
+#[cfg(unix)]
+mod subfield_store {
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::FileExt,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+    };
+
+    /// Logical pre-extension chunk for `subfields.dat`, in bytes.
+    const EXTEND_CHUNK: u64 = 64 * 1024 * 1024;
+
+    /// Unique tempfile name without pulling a `uuid` dependency into
+    /// surch-index: `pid` + a process-global sequence + wall-clock nanos.
+    fn next_temp_path() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("surch-subfields-{pid}-{seq}-{nanos}.dat"))
+    }
+
+    /// Append-only `(offset, len)`-addressed segment read via Linux `pread`.
+    /// Concurrent search threads share the `Arc<File>` without an application
+    /// lock (`read_exact_at` is positional, no shared cursor).
+    #[derive(Debug)]
+    pub(crate) struct SubfieldStore {
+        file: Arc<File>,
+        next_offset: u64,
+        extended_len: u64,
+        path: PathBuf,
+    }
+
+    impl Default for SubfieldStore {
+        fn default() -> Self {
+            let path = next_temp_path();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("failed to create surch subfield store tempfile");
+            Self {
+                file: Arc::new(file),
+                next_offset: 0,
+                extended_len: 0,
+                path,
+            }
+        }
+    }
+
+    impl Clone for SubfieldStore {
+        /// `DocumentIndex` derives `Clone`; at runtime it is never cloned
+        /// (verified by grep across surch-api / surch-search). A clone shares
+        /// the same append-only segment via `Arc<File>` plus a deep copy of
+        /// the offset side-table, so READS on the clone `pread` the same bytes
+        /// and stay correct. Concurrent independent WRITES to both halves
+        /// after the clone would diverge on `next_offset`; no caller does
+        /// that, so the cheap shared-handle clone is kept deliberately.
+        fn clone(&self) -> Self {
+            Self {
+                file: Arc::clone(&self.file),
+                next_offset: self.next_offset,
+                extended_len: self.extended_len,
+                path: self.path.clone(),
+            }
+        }
+    }
+
+    impl SubfieldStore {
+        /// Pre-extend the file's logical length past `write_end` in
+        /// `EXTEND_CHUNK` steps so positional writes never extend the file
+        /// size one block at a time. `set_len` failure is non-fatal: the file
+        /// keeps its current length and the next `pwrite` falls back to the
+        /// per-write ext4 extension (slower, still correct).
+        fn ensure_capacity(&mut self, write_end: u64) {
+            if write_end <= self.extended_len {
+                return;
+            }
+            let mut new_len = self.extended_len;
+            while new_len < write_end {
+                new_len = new_len.saturating_add(EXTEND_CHUNK);
+            }
+            if self.file.set_len(new_len).is_ok() {
+                self.extended_len = new_len;
+            }
+        }
+
+        /// Append `bytes`, returning the `(offset, len)` to store in the
+        /// side-table.
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+            let offset = self.next_offset;
+            let length = bytes.len() as u32;
+            self.ensure_capacity(offset.saturating_add(length as u64));
+            self.file
+                .write_all_at(bytes, offset)
+                .expect("subfield store segment file should accept positional write");
+            self.next_offset = offset.saturating_add(length as u64);
+            (offset, length)
+        }
+
+        /// Read `length` bytes at `offset` via `pread`. Concurrent-safe. The
+        /// segment only ever holds analyzed tokens (valid UTF-8 by
+        /// construction), so the decode cannot fail for bytes this store wrote.
+        pub(crate) fn read(&self, offset: u64, length: u32) -> String {
+            let mut buf = vec![0u8; length as usize];
+            self.file
+                .read_exact_at(&mut buf, offset)
+                .expect("subfield store segment file should accept positional read");
+            String::from_utf8(buf).expect("subfield store holds valid UTF-8 tokens")
+        }
+
+        /// Truncate to empty, called from `DocumentIndex::clear()` before a
+        /// rebuild re-appends every live doc's projection from offset 0.
+        pub(crate) fn reset(&mut self) {
+            let _ = self.file.set_len(0);
+            self.next_offset = 0;
+            self.extended_len = 0;
+        }
+    }
+
+    impl Drop for SubfieldStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Non-Unix fallback (Windows / unusual dev hosts): the same API backed by an
+/// in-RAM buffer. The release target is Linux distroless and `pread`
+/// (`FileExt`) is Unix-only, so this keeps the crate building elsewhere.
+#[cfg(not(unix))]
+mod subfield_store {
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct SubfieldStore {
+        buf: Vec<u8>,
+    }
+
+    impl SubfieldStore {
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+            let offset = self.buf.len() as u64;
+            self.buf.extend_from_slice(bytes);
+            (offset, bytes.len() as u32)
+        }
+
+        pub(crate) fn read(&self, offset: u64, length: u32) -> String {
+            let start = offset as usize;
+            let end = start + length as usize;
+            String::from_utf8(self.buf[start..end].to_vec())
+                .expect("subfield store holds valid UTF-8 tokens")
+        }
+
+        pub(crate) fn reset(&mut self) {
+            self.buf.clear();
+            self.buf.shrink_to_fit();
+        }
+    }
+}
+
+use subfield_store::SubfieldStore;
+
+/// C0 disk-backed descriptor: a compact `(offset, len)` pointer into the
+/// `subfields.dat` segment, replacing the resident `String` value of
+/// [`DocumentIndex::subfield_values`]. `Copy` so the side-table stores it
+/// inline (12 bytes) with no per-projection heap allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct SubfieldRef {
+    offset: u64,
+    len: u32,
+}
+
 pub type Result<T> = std::result::Result<T, DocumentIndexError>;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -64,7 +254,19 @@ pub struct DocumentIndex {
     /// `term`/`match` on the sub-field resolves through the FST like any
     /// other field. This side-table only holds the per-doc projected value
     /// for the read paths that need a stored value rather than postings.
-    subfield_values: BTreeMap<String, BTreeMap<u32, String>>,
+    ///
+    /// C0 disk-backed (`docs/paper/lot-c-disk-backed-plan.md`): the value is
+    /// now a [`SubfieldRef`] `(offset, len)` into [`Self::subfield_store`]
+    /// instead of a resident `String`. The token bytes are read back with
+    /// `pread` at projection time (`subfield_projection` / `subfield_value`),
+    /// so the ~427 MiB of `.raw`/`.norm` tokens leave the heap; only the
+    /// 12-byte descriptors stay resident.
+    subfield_values: BTreeMap<String, BTreeMap<u32, SubfieldRef>>,
+    /// C0 disk-backed: append-only `subfields.dat` segment that physically
+    /// holds the projected token bytes pointed to by `subfield_values`.
+    /// Created lazily under `TMPDIR` (`Default`), truncated on `clear()`, and
+    /// removed on `Drop` — mirrors surch-api's `source_store`.
+    subfield_store: SubfieldStore,
     /// Track A `wp-a-perf-followups.md` Lot 1.6: deferred-FST-build flag.
     /// `true` when `postings_builder` has accumulated writes that the
     /// `terms` FST does not yet reflect. A subsequent
@@ -501,6 +703,9 @@ impl DocumentIndex {
         self.field_stats.clear();
         self.prefix_postings.clear();
         self.subfield_values.clear();
+        // C0: truncate the disk segment so the next generation re-appends
+        // every live doc's projection from offset 0 (rebuild path).
+        self.subfield_store.reset();
         // The fresh `TermDictionary::default()` is in sync with the
         // fresh `PostingsBuilder::new()` (both empty), so the index is
         // clean as far as the deferred-rebuild contract is concerned.
@@ -658,10 +863,14 @@ impl DocumentIndex {
     fn merge_analyzed(&mut self, document: AnalyzedDocument) -> Result<()> {
         let doc_id = document.doc_id;
         for (path, stored) in document.subfield_values {
+            // C0: append the projected token to the disk segment and keep
+            // only the `(offset, len)` descriptor resident. The merge is
+            // serial, so the store's append cursor stays consistent.
+            let (offset, len) = self.subfield_store.append(stored.as_bytes());
             self.subfield_values
                 .entry(path)
                 .or_default()
-                .insert(doc_id, stored);
+                .insert(doc_id, SubfieldRef { offset, len });
         }
         for (field, prefix) in document.prefixes {
             self.prefix_postings
@@ -687,17 +896,35 @@ impl DocumentIndex {
 
     /// A10 (Phase 4): stored projected value for `(field_path, doc_id)`.
     ///
-    /// Returns `Some(&str)` when `field_path` is a declared multi-field
+    /// Returns `Some(value)` — read from the `subfields.dat` segment via
+    /// `pread` (C0 disk-backed) — when `field_path` is a declared multi-field
     /// sub-field (`parent.sub`) that was fanned out at write time for this
     /// doc, with the sub-field's analyzer/normalizer already applied. The
     /// query side uses this for `sort`/`agg`/`composite` on `.raw`/`.norm`
     /// without re-normalizing the parent's `_source` on read. Returns `None`
     /// for top-level fields and for docs missing the sub-field value.
-    pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<&str> {
-        self.subfield_values
-            .get(field_path)?
-            .get(&doc_id)
-            .map(String::as_str)
+    pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<String> {
+        let slot = *self.subfield_values.get(field_path)?.get(&doc_id)?;
+        Some(self.subfield_store.read(slot.offset, slot.len))
+    }
+
+    /// C0 disk-backed: the full per-doc projection for `field_path`, read from
+    /// the `subfields.dat` segment with one `pread` per live doc. The previous
+    /// representation cloned a resident `BTreeMap<u32, String>`; the values are
+    /// now materialized lazily here so they no longer sit in the heap. Returns
+    /// the same `(doc_id, value)` pairs in the same ascending `doc_id` order as
+    /// before, so the caller's sort/agg parity is exact.
+    ///
+    /// The `BTreeMap` iterates by ascending `doc_id`; within a generation the
+    /// append order matches `doc_id` order, so the offsets are ascending too
+    /// and the `pread`s are forward-sequential (page-cache friendly).
+    pub fn subfield_projection(&self, field_path: &str) -> Option<BTreeMap<u32, String>> {
+        let per_doc = self.subfield_values.get(field_path)?;
+        let projection = per_doc
+            .iter()
+            .map(|(&doc_id, slot)| (doc_id, self.subfield_store.read(slot.offset, slot.len)))
+            .collect();
+        Some(projection)
     }
 
     /// A10 (Phase 4): whether `field_path` carries write-time fanned-out
@@ -707,10 +934,12 @@ impl DocumentIndex {
         self.subfield_values.contains_key(field_path)
     }
 
-    /// A10 (Phase 4): the full per-doc stored sub-field projection map.
-    /// Empty when no field in the mapping declared sub-fields. Exposed for
-    /// memory accounting and for the query side to enumerate projections.
-    pub fn subfield_values_map(&self) -> &BTreeMap<String, BTreeMap<u32, String>> {
+    /// A10 (Phase 4): the per-doc sub-field offset side-table. Empty when no
+    /// field in the mapping declared sub-fields. C0 disk-backed: each value is
+    /// a [`SubfieldRef`] descriptor, not the token bytes (those live in
+    /// `subfields.dat`). Exposed for memory accounting (`memory.rs`); the
+    /// query side reads materialized values via [`Self::subfield_projection`].
+    pub fn subfield_values_map(&self) -> &BTreeMap<String, BTreeMap<u32, SubfieldRef>> {
         &self.subfield_values
     }
 }
@@ -1022,7 +1251,10 @@ mod tests {
 
         assert!(index.has_subfield_values("NOM.raw"));
         // Whole value, lowercased + asciifolded, single keyword token.
-        assert_eq!(index.subfield_value("NOM.raw", 1), Some("etienne dupre"));
+        assert_eq!(
+            index.subfield_value("NOM.raw", 1).as_deref(),
+            Some("etienne dupre")
+        );
         // The parent field is untouched: no stored projection on "NOM".
         assert!(!index.has_subfield_values("NOM"));
         assert!(index.subfield_value("NOM", 1).is_none());
@@ -1160,7 +1392,10 @@ mod tests {
             .add_document_with_mapping(1, [("NOM", "Dupré Martin")], &mapping)
             .expect("doc 1");
 
-        assert_eq!(index.subfield_value("NOM.exact", 1), Some("Dupré Martin"));
+        assert_eq!(
+            index.subfield_value("NOM.exact", 1).as_deref(),
+            Some("Dupré Martin")
+        );
     }
 
     #[test]
