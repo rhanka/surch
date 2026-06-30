@@ -7,6 +7,14 @@
 >
 > ⚠️ **1,36 M n'est PAS le full.** Le full deces = **28 M** (bucket prod). Ce run est un
 > intermédiaire de confirmation, pas le full.
+>
+> 🛑 **CAVEAT D'HONNÊTETÉ (ajouté après revue user) : la latence ci-dessous n'est PAS un « win »
+> bankable.** Elle est achetée par une faille de design — Surch tient **tout l'index inversé en
+> heap (RAM)**, ce qu'aucun moteur scalable ne fait (Lucene/ES/Tantivy/Quickwit sont disk-backed,
+> mmap + page cache). Comparer Surch tout-en-RAM à ES disk-backed est **truqué** : à jeu égal
+> (Surch disk-backed, warm), l'avantage latence fondrait et le cold-start régresserait. Et la RAM
+> **échoue la cible** (3,2× pire). ⇒ **Surch ne bat pas ES honnêtement tant qu'il n'est pas
+> disk-backed.** Voir mémoire `all-in-ram-design-flaw`.
 
 ## Chiffres
 
@@ -35,11 +43,14 @@ Bulk : Surch 88,79 s / ES 112,5 s (le `total_s` inclut le `dump_s` ES-side, hors
 
 ## Implication 28 M (chemin critique)
 
-À 1,36 M l'architecture tout-en-RAM tient (5,4 GiB) mais **perd la mémoire**. À 28 M (~20×) →
-**~110 GiB RAM**, infaisable mono-nœud. **Le full 28 M est bloqué par l'architecture tout-en-RAM**
-tant que le disk-backed/S3-natif (étude `s3-native-storage-study-2026-06-29.md`, Lot C : découpler
-l'executor du `MemoryStore`, lecture paresseuse des blocs de postings) n'est pas livré. L'axe
-mémoire et le full 28 M ont la **même** dépendance.
+L'index **vivant en RAM** = ~1,8 GiB pour 1,36 M = **~1,3 KB/doc**. Extrapolé linéairement à 28 M :
+**~35–40 GiB de heap anonyme** (PAS 110 GiB — chiffre initial erroné qui multipliait le RSS entier,
+rétention allocateur + page cache `source.dat` inclus). C'est tout de même infaisable/absurde
+mono-nœud là où ES tient à ~1,7 GiB de heap (index sur disque mmap, page cache évictable). **Le
+problème n'est pas la taille — c'est que l'index vit dans le heap au lieu du disque.** Corrigé par
+le disk-backed (étude `s3-native-storage-study-2026-06-29.md`, Lot C : executor lit les blocs de
+postings/sous-champs depuis le disque mmap, comme Lucene ; `_source` est déjà sorti). **C'est aussi
+la condition pour que les chiffres de latence redeviennent honnêtes.**
 
 ## Suites
 
