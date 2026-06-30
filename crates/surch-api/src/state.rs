@@ -2162,13 +2162,20 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
-        let per_doc = data.index.subfield_values_map().get(field_path)?;
+        // C0 disk-backed: the projected token bytes live in the `subfields.dat`
+        // segment; `DocumentIndex::subfield_projection` materializes them with
+        // one `pread` per live doc (forward-sequential, page-cache friendly)
+        // and hands back the same `(internal doc_id, value)` pairs the resident
+        // map used to expose. We then map internal ids to public ids. The read
+        // lock is held across the preads, exactly as it was held across the
+        // previous per-entry `value.clone()`.
+        let per_doc = data.index.subfield_projection(field_path)?;
         let projection = per_doc
-            .iter()
+            .into_iter()
             .filter_map(|(doc_id, value)| {
                 data.reverse_document_ids
-                    .get(doc_id)
-                    .map(|public_id| (public_id.clone(), value.clone()))
+                    .get(&doc_id)
+                    .map(|public_id| (public_id.clone(), value))
             })
             .collect();
         Some(projection)
