@@ -30,7 +30,20 @@ surch-types = { path = "../surch-types" }
 # coherence avec le module `source_store` Linux : sur macOS/Windows
 # dev, on retombe sur le fallback in-RAM `Vec<Option<Vec<u8>>>`.
 [target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemallocator = "0.6"
+# Lot C Phase 0b : `features = ["stats"]` compile jemalloc avec
+# `--enable-stats` (OFF par defaut : le build sortait `--disable-stats`,
+# `stats: 0`) pour que `tikv-jemalloc-ctl` puisse lire les compteurs
+# internes (allocated / active / resident / retained / mapped) et les
+# exposer en gauges Prometheus. But : expliquer le gap heap anonyme
+# (~1,5-2 GiB non attribues aux structures d'index comptees par
+# `stats::set_gauges`).
+tikv-jemallocator = { version = "0.6", features = ["stats"] }
+# `tikv-jemalloc-ctl` lit les stats via `mallctl`. Meme version majeure
+# 0.6 que `tikv-jemallocator` pour partager le meme `tikv-jemalloc-sys`
+# (une seule copie => feature `stats` unifiee sur le build C). La feature
+# `stats` est OBLIGATOIRE ici : le module `tikv_jemalloc_ctl::stats` est
+# gate `#[cfg(feature = "stats")]`, il n'existe pas sans elle.
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 libc = "0.2"
 axum = { workspace = true }
 serde = { workspace = true }
