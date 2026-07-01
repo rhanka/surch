@@ -47,10 +47,8 @@ pub struct MemoryUsage {
     pub postings_bytes: u64,
     /// A6 prefix side-table: `field -> prefix -> BTreeSet<doc_id>`.
     pub prefix_postings_bytes: u64,
-    /// A10 multi-field side-table: `parent.sub -> doc_id -> SubfieldRef`.
-    /// C0 disk-backed — only the `(offset, len)` descriptors are counted; the
-    /// projected `.raw`/`.norm` token bytes live in the `subfields.dat` pread
-    /// segment, not the heap.
+    /// A10 multi-field side-table: `parent.sub -> doc_id -> stored token`,
+    /// the write-time fan-out projections read by sort / agg on `.raw`.
     pub subfield_values_bytes: u64,
     /// Stored `_source` payloads — populated by the API layer through
     /// [`stored_fields_bytes_for`]; [`document_index_memory_usage`]
@@ -226,17 +224,15 @@ fn prefix_postings_bytes(doc_index: &DocumentIndex) -> u64 {
 }
 
 fn subfield_values_bytes(doc_index: &DocumentIndex) -> u64 {
-    // C0 disk-backed (`docs/paper/lot-c-disk-backed-plan.md`): the projected
-    // `.raw`/`.norm` token bytes now live in the `subfields.dat` pread segment
-    // (page-cache OS), not the heap. The side-table only holds a fixed-size
-    // `(offset, len)` descriptor (`SubfieldRef`) per `(field, doc)`, so the
-    // gauge counts the descriptors, not the token bytes (~427 MiB → ~30 MiB).
-    let pair_overhead = (size_of::<u32>() + size_of::<crate::document_index::SubfieldRef>()) as u64;
+    let pair_overhead = (size_of::<u32>() + size_of::<String>()) as u64;
     let mut total: u64 = 0;
     for (field, by_doc) in doc_index.subfield_values_map().iter() {
         total += field.len() as u64;
         total += size_of::<String>() as u64;
-        total += (by_doc.len() as u64).saturating_mul(pair_overhead);
+        for value in by_doc.values() {
+            total += pair_overhead;
+            total += value.len() as u64;
+        }
     }
     total
 }
