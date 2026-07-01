@@ -882,8 +882,10 @@ impl InMemoryIndex {
         if self.terms_finalized {
             return;
         }
-        self.index.materialize_terms();
-        self.index.finalize_postings();
+        // Lot C Phase 0 : méthode combinée sans clone du builder — évite le
+        // pic transitoire ~1,3 GiB (builder + clone) au refresh, prérequis
+        // anti-OOM sous limite mémoire. Cf. document_index.rs.
+        self.index.materialize_terms_and_finalize_postings();
         self.terms_finalized = true;
         // P1 mmap M1 + Option B se neutralisent : Option B compressait
         // OnDisk -> Compressed(Arc<[u8]>) en RAM, ce qui rapatriait les
