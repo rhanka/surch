@@ -494,6 +494,30 @@ impl DocumentIndex {
         self.postings_builder = PostingsBuilder::new();
     }
 
+    /// Lot C Phase 0 : fusionne `materialize_terms()` + `finalize_postings()`
+    /// pour le chemin `_refresh`, SANS le clone du builder.
+    ///
+    /// `materialize_terms()` doit rester clone-based (un search entre deux
+    /// bulks matérialise le FST mais le builder doit conserver l'historique
+    /// pour les writes incrémentaux suivants). Mais au `_refresh` le builder
+    /// est droppé juste après : on le sort donc par `mem::replace` et on
+    /// build depuis la valeur possédée, économisant une copie pleine du
+    /// builder (~la moitié de la RAM d'index) au pic du refresh. C'est le
+    /// prérequis anti-OOM pour tourner sous une limite mémoire (Lot C).
+    ///
+    /// À n'utiliser QUE là où le builder n'est plus nécessaire ensuite (le
+    /// cycle de refresh) — sur le chemin search, utiliser `materialize_terms()`.
+    pub fn materialize_terms_and_finalize_postings(&mut self) {
+        if self.terms_dirty {
+            let builder = std::mem::replace(&mut self.postings_builder, PostingsBuilder::new());
+            self.terms = builder.build();
+            self.terms_dirty = false;
+            self.terms_build_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.postings_builder = PostingsBuilder::new();
+        }
+    }
+
     pub fn clear(&mut self) {
         self.live_docs.clear();
         self.postings_builder = PostingsBuilder::new();
