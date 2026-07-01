@@ -45,6 +45,11 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         disk_segment_peak_bytes,
     );
     refresh_process_memory_gauges();
+    // Lot C Phase 0b : stats internes jemalloc. Appelé ici, donc APRÈS
+    // `finalize_terms_for_refresh` sur le chemin `_refresh` (le builder
+    // est déjà droppé), pour lire l'`allocated` à l'état steady et non
+    // gonflé par le `PostingsBuilder` vivant.
+    refresh_jemalloc_gauges();
 }
 
 /// Process-wide RSS accounting (#17b). Reads `/proc/self/status` to
@@ -84,6 +89,61 @@ fn refresh_process_memory_gauges() {
 
 #[cfg(not(target_os = "linux"))]
 fn refresh_process_memory_gauges() {}
+
+/// Lot C Phase 0b : stats INTERNES de l'allocateur jemalloc, exposées en
+/// gauges Prometheus pour EXPLIQUER le gap heap anonyme (~1,5-2 GiB que
+/// `set_gauges` n'attribue à aucune structure d'index comptée).
+///
+/// Lecture à l'état steady POST-`_refresh` : `refresh_memory_gauges` est
+/// invoqué par `refresh_index` APRÈS `finalize_terms_for_refresh` (le
+/// `PostingsBuilder` est déjà droppé), donc `allocated` reflète les
+/// allocations vivantes résiduelles, pas le builder transitoire.
+/// Interprétation visée :
+///   - `resident − allocated ≈ 1,5-2 GiB` => fragmentation / pages dirty
+///     retenues par l'allocateur (levier : decay / compaction) ;
+///   - `allocated ≈ 3,8 GiB` => allocations VIVANTES non comptées
+///     (levier : structures d'index encore attachées au heap).
+///
+/// Les compteurs jemalloc sont cachés : ils ne se rafraîchissent qu'en
+/// avançant l'`epoch`. Sans cet advance on relirait des valeurs figées.
+/// Nécessite la feature `stats` sur `tikv-jemalloc-ctl` (sinon le module
+/// n'est pas compilé) ET sur le `tikv-jemalloc-sys` sous-jacent (sinon
+/// jemalloc est `--disable-stats` et chaque `read()` renvoie une erreur,
+/// ignorée silencieusement ici comme le reste du module). Zéro `unwrap`.
+/// Linux-only : jemalloc n'est le `#[global_allocator]` que sur Linux.
+#[cfg(target_os = "linux")]
+fn refresh_jemalloc_gauges() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    // Rafraîchit le cache de stats. `advance()` renvoie l'ancienne valeur
+    // d'epoch (`Result<u64>`) ; on l'ignore, seul l'effet de bord compte.
+    // En cas d'erreur (jemalloc compilé sans stats), on abandonne sans
+    // émettre : les gauges gardent leur dernière valeur plutôt que 0.
+    if epoch::advance().is_err() {
+        return;
+    }
+
+    // `read()` renvoie `Result<usize>` (`libc::size_t`). `usize as f64`
+    // est exact jusqu'à 2^53 octets, très au-delà des tailles heap ici.
+    if let Ok(bytes) = stats::allocated::read() {
+        metrics::gauge!("surch_jemalloc_allocated_bytes").set(bytes as f64);
+    }
+    if let Ok(bytes) = stats::active::read() {
+        metrics::gauge!("surch_jemalloc_active_bytes").set(bytes as f64);
+    }
+    if let Ok(bytes) = stats::resident::read() {
+        metrics::gauge!("surch_jemalloc_resident_bytes").set(bytes as f64);
+    }
+    if let Ok(bytes) = stats::retained::read() {
+        metrics::gauge!("surch_jemalloc_retained_bytes").set(bytes as f64);
+    }
+    if let Ok(bytes) = stats::mapped::read() {
+        metrics::gauge!("surch_jemalloc_mapped_bytes").set(bytes as f64);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn refresh_jemalloc_gauges() {}
 
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
