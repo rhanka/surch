@@ -32,12 +32,100 @@ pub enum DocumentIndexError {
     Postings(#[from] PostingsError),
 }
 
+/// Lot C Phase 1 lever A: dense bit-vector backing [`DocumentIndex::live_docs`].
+///
+/// `doc_id`s are dense (`0..next_doc_id`), so `bits[doc_id / 64]` bit
+/// `doc_id % 64` records presence — one bit per doc_id instead of the
+/// ~32 B/entry a `BTreeSet<u32>` node costs. `bits` grows by
+/// resize-on-write to the highest doc_id seen (never shrinks on its own,
+/// same convention as `FieldLengthStats::doc_len_dense`), and `count`
+/// tracks the number of set bits so `live_doc_count()` stays O(1) instead
+/// of a full bitmap scan.
+#[derive(Debug, Default, Clone)]
+struct LiveDocsBitset {
+    bits: Vec<u64>,
+    count: usize,
+}
+
+impl LiveDocsBitset {
+    /// Marks `doc_id` live. Idempotent: inserting an already-live doc_id
+    /// does not double-count it (mirrors `BTreeSet::insert`).
+    fn insert(&mut self, doc_id: u32) {
+        let idx = doc_id as usize;
+        let word = idx / 64;
+        if word >= self.bits.len() {
+            self.bits.resize(word + 1, 0);
+        }
+        let mask = 1u64 << (idx % 64);
+        if self.bits[word] & mask == 0 {
+            self.bits[word] |= mask;
+            self.count += 1;
+        }
+    }
+
+    /// Whether `doc_id` is currently live. `doc_id`s past the highest one
+    /// ever inserted are simply absent (never resized), so this is a safe
+    /// bounds-checked lookup rather than a panic.
+    fn contains(&self, doc_id: u32) -> bool {
+        let idx = doc_id as usize;
+        let word = idx / 64;
+        self.bits
+            .get(word)
+            .is_some_and(|w| w & (1u64 << (idx % 64)) != 0)
+    }
+
+    /// Number of live doc_ids (population count), O(1).
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn clear(&mut self) {
+        self.bits.clear();
+        self.count = 0;
+    }
+
+    /// Ascending doc_id iteration — same contract as the previous
+    /// `BTreeSet<u32>::iter()`. Uses the same trailing-zeros bit-clearing
+    /// trick as [`crate::roaring`]'s container intersection.
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.bits.iter().enumerate().flat_map(|(word_idx, &word)| {
+            let base = (word_idx as u32) * 64;
+            let mut remaining = word;
+            std::iter::from_fn(move || {
+                if remaining == 0 {
+                    None
+                } else {
+                    let bit = remaining.trailing_zeros();
+                    remaining &= remaining - 1;
+                    Some(base + bit)
+                }
+            })
+        })
+    }
+
+    /// Approximate heap bytes held by the bitmap: `bits` capacity only
+    /// (`count` is stack-resident). Used by
+    /// [`DocumentIndex::live_docs_bytes`].
+    fn memory_bytes(&self) -> u64 {
+        (self.bits.capacity() * std::mem::size_of::<u64>()) as u64
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DocumentIndex {
     /// Live document ids in this generation. The full source is held by
     /// the caller (surch-api `InMemoryIndex`) so this is just a presence
     /// set, not a copy of `StoredDocument`.
-    live_docs: BTreeSet<u32>,
+    ///
+    /// Lot C Phase 1 lever A: `doc_id`s are dense (`0..next_doc_id`, see
+    /// `surch-api::InMemoryIndex::next_doc_id`), so a `BTreeSet<u32>`
+    /// (~32 B/entry incl. node overhead — ~43 MiB on the deces 1.36 M
+    /// corpus) is massively oversized for what is really "is this bit
+    /// set". [`LiveDocsBitset`] replaces it with a dense bit-vector (1
+    /// bit/doc_id, resized to the highest doc_id seen), ~1/256th the
+    /// size, while preserving the same `insert`/`contains`/ascending
+    /// `iter` contract every call site below relies on.
+    live_docs: LiveDocsBitset,
     postings_builder: PostingsBuilder,
     terms: TermDictionary,
     field_stats: BTreeMap<String, FieldLengthStats>,
@@ -517,7 +605,7 @@ impl DocumentIndex {
         let documents = documents
             .into_iter()
             .map(|(doc_id, fields)| {
-                if self.live_docs.contains(&doc_id) || !seen.insert(doc_id) {
+                if self.live_docs.contains(doc_id) || !seen.insert(doc_id) {
                     return Err(DocumentIndexError::DuplicateDocId { doc_id });
                 }
 
@@ -673,7 +761,7 @@ impl DocumentIndex {
     }
 
     pub fn doc_ids(&self) -> Vec<u32> {
-        self.live_docs.iter().copied().collect()
+        self.live_docs.iter().collect()
     }
 
     /// Stored field retrieval is the caller's responsibility (sources live
@@ -765,17 +853,14 @@ impl DocumentIndex {
         self.postings_builder.memory_bytes()
     }
 
-    /// #17c walker complet: `live_docs: BTreeSet<u32>` avec 1.36M entrees
-    /// sur deces. BTreeSet a un overhead par-nœud (~256B pour ~11 entrees)
-    /// donc le compte est non-trivial. Lazy approximation : entries × 4B
-    /// (u32 data) + 28 % de slack BTreeSet nodes typique.
+    /// #17c walker complet: real heap bytes held by the `live_docs`
+    /// presence bitmap (Lot C Phase 1 lever A). One bit per doc_id,
+    /// resized to the highest doc_id seen — replaces the previous
+    /// `BTreeSet<u32>` lazy approximation (~32 B/entry incl. node
+    /// overhead, ~43 MiB on the deces 1.36 M corpus) with an exact
+    /// `bits.capacity()` read (~170 KiB on the same corpus).
     pub fn live_docs_bytes(&self) -> u64 {
-        use std::mem::size_of;
-        let entries = self.live_docs.len() as u64;
-        let entry_size = size_of::<u32>() as u64;
-        // BTreeSet : nodes de 11 entrees, ~256B header chacun + 11×4B data.
-        // ~32 B/entree effectif (incl. pointeurs internes).
-        entries.saturating_mul(entry_size.saturating_add(28))
+        self.live_docs.memory_bytes()
     }
 
     /// Returns the in-memory prefix-postings side table. Empty for fields
@@ -812,7 +897,7 @@ impl DocumentIndex {
     }
 
     pub fn live_doc_count(&self) -> usize {
-        self.live_docs.len()
+        self.live_docs.count()
     }
 
     pub fn live_docs(&self) -> Vec<u32> {
