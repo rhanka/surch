@@ -2176,13 +2176,18 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
-        let per_doc = data.index.subfield_values_map().get(field_path)?;
-        let projection = per_doc
+        let column = data.index.subfield_values_map().get(field_path)?;
+        // Lot C Phase 1 lever 2: `column.iter()` yields owned `doc_id: u32`
+        // (dense-array index) + borrowed `&str` (dict-interned, zero-copy)
+        // instead of the previous `BTreeMap<u32, String>::iter()` pairs of
+        // borrowed `&u32`/`&String` — same ascending-doc_id, absent-omitted
+        // contract, so the resulting projection is unchanged.
+        let projection = column
             .iter()
             .filter_map(|(doc_id, value)| {
                 data.reverse_document_ids
-                    .get(doc_id)
-                    .map(|public_id| (public_id.clone(), value.clone()))
+                    .get(&doc_id)
+                    .map(|public_id| (public_id.clone(), value.to_owned()))
             })
             .collect();
         Some(projection)
