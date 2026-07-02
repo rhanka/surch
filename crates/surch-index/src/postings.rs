@@ -196,8 +196,8 @@ impl PostingsBuilder {
 
             // --- Pass 1 (Lot C Phase 1 — flatten `FieldPostings`) -------
             // Read-only pass over `terms` (nothing is moved out yet) to
-            // size the flat buffers EXACTLY: Σdf for `postings_flat` /
-            // `doc_ids_flat`, Σblocks for `block_metas_flat`, and the
+            // size the flat buffers EXACTLY: Σdf for `doc_ids_flat` /
+            // `freqs_flat`, Σblocks for `block_metas_flat`, and the
             // term count for the CSR offset tables (`T + 1` entries).
             // Exact sizing means `Vec::with_capacity` never triggers a
             // geometric-growth reallocation below, so the final
@@ -209,7 +209,7 @@ impl PostingsBuilder {
                 .map(|postings| postings.len().div_ceil(BLOCK_SIZE))
                 .sum();
 
-            let mut postings_flat: Vec<Posting> = Vec::with_capacity(total_postings);
+            let mut freqs_flat: Vec<u32> = Vec::with_capacity(total_postings);
             let mut doc_ids_flat: Vec<u32> = Vec::with_capacity(total_postings);
             let mut block_metas_flat: Vec<BlockMeta> = Vec::with_capacity(total_blocks);
             let mut offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
@@ -231,11 +231,12 @@ impl PostingsBuilder {
             // `terms.into_iter()` DRAINS the per-field
             // `BTreeMap<String, Vec<Posting>>` one entry at a time: each
             // term's source `Vec<Posting>` is moved into `term_postings`
-            // below and consumed by `postings_flat.extend(term_postings)`
-            // at the end of the loop body, which frees that source Vec's
-            // heap allocation as soon as its bytes have been copied into
-            // the flat buffer. RAM therefore grows monotonically toward
-            // `total_postings`, it never double-peaks.
+            // below and only ever BORROWED afterwards (into `doc_ids_flat`
+            // then `freqs_flat`) — it is dropped at the end of the loop
+            // body (the `for` pattern owns it), which frees that source
+            // Vec's heap allocation as soon as its bytes have been copied
+            // into the flat buffers. RAM therefore grows monotonically
+            // toward `total_postings`, it never double-peaks.
             for (idx, (term, term_postings)) in terms.into_iter().enumerate() {
                 builder
                     .insert(term.as_bytes(), idx as u64)
@@ -255,7 +256,7 @@ impl PostingsBuilder {
 
                 // Compact doc_id channel for the conjunction leapfrog (same
                 // ascending order as `term_postings`, so index-aligned with
-                // the `postings_flat` slice pushed below).
+                // the `freqs_flat` slice pushed below).
                 let doc_ids_start = doc_ids_flat.len();
                 doc_ids_flat.extend(term_postings.iter().map(|posting| posting.doc_id));
 
@@ -274,17 +275,23 @@ impl PostingsBuilder {
                     ));
                 }
 
-                // AoS postings channel. `extend` consumes `term_postings` by
-                // value — this is the last use of the source `Vec<Posting>`
-                // the drained `BTreeMap` entry owned, so it is freed right
-                // here (see the transitory-peak mitigation note above).
-                postings_flat.extend(term_postings);
+                // SoA freq channel (Lot C Phase 1 levier 5), index-aligned
+                // with `doc_ids_flat` via the same `offsets` CSR table —
+                // this is the last use of the source `Vec<Posting>` the
+                // drained `BTreeMap` entry owned (only borrowed here, via
+                // `.iter()`), so it drops and frees its heap allocation at
+                // the end of this loop iteration (see the transitory-peak
+                // mitigation note above). Eliminates the `doc_id`
+                // duplication the historical AoS `postings_flat:
+                // Box<[Posting]>` carried (`doc_id` was already stored in
+                // `doc_ids_flat` above).
+                freqs_flat.extend(term_postings.iter().map(|posting| posting.freq));
                 debug_assert!(
-                    postings_flat.len() <= u32::MAX as usize,
-                    "postings_flat offset overflowed u32 — switch offsets to u64 \
+                    freqs_flat.len() <= u32::MAX as usize,
+                    "freqs_flat offset overflowed u32 — switch offsets to u64 \
                      (only relevant well past matchID's 1.36M-doc scale)"
                 );
-                offsets.push(postings_flat.len() as u32);
+                offsets.push(freqs_flat.len() as u32);
             }
             roaring.shrink_to_fit();
 
@@ -296,8 +303,8 @@ impl PostingsBuilder {
                 field,
                 FieldPostings {
                     fst,
-                    postings_flat: postings_flat.into_boxed_slice(),
                     doc_ids_flat: doc_ids_flat.into_boxed_slice(),
+                    freqs_flat: freqs_flat.into_boxed_slice(),
                     block_metas_flat: block_metas_flat.into_boxed_slice(),
                     offsets: offsets.into_boxed_slice(),
                     block_offsets: block_offsets.into_boxed_slice(),
@@ -330,37 +337,52 @@ impl PostingsBuilder {
 /// overhead and slack while keeping the exact same bytes in the exact
 /// same order — `lookup*` below hand back sub-slices of the shared
 /// buffers, zero-copy, same lifetime as `&self`.
+///
+/// Lot C Phase 1 levier 5: the original AoS `postings_flat: Box<[Posting]>`
+/// channel duplicated `doc_id` a second time — once inside every
+/// `Posting { doc_id, freq }`, once more in `doc_ids_flat` for the
+/// leapfrog. It has been replaced by a SoA split: `doc_ids_flat` is kept
+/// byte-for-byte as before (still the ONLY channel the conjunction
+/// leapfrog / `PostingsBlockSkipIter` walks, so its cache footprint is
+/// unchanged), and `freqs_flat` below carries just the `freq` values,
+/// index-aligned with `doc_ids_flat` via the same `offsets` table.
+/// `lookup*` hands back the two slices together instead of one
+/// `&[Posting]`; scoring reads `doc_id` from `doc_ids_flat[i]` and `freq`
+/// from `freqs_flat[i]`.
 #[derive(Debug, Clone)]
 pub struct FieldPostings {
     fst: Map<Vec<u8>>,
-    /// All terms' postings concatenated, in FST idx order, ascending
-    /// `doc_id` within each term (same order as the historical per-term
-    /// `Vec<Posting>`). Exactly `Σdf` long — sized once in
+    /// All terms' `doc_id` channel concatenated, in FST idx order,
+    /// ascending `doc_id` within each term (same order as the historical
+    /// per-term `Vec<Posting>`). Exactly `Σdf` long — sized once in
     /// `PostingsBuilder::build()`'s pass 1, so `capacity == len` and this
-    /// `Box<[Posting]>` carries no growth slack.
-    postings_flat: Box<[Posting]>,
-    /// All terms' `doc_id` channel concatenated the same way, index-aligned
-    /// with `postings_flat` (same `offsets` table). The conjunction
-    /// leapfrog scans ONLY doc_ids (the `freq` is read by value lookup at
-    /// scoring time), so a dedicated `[u32]` channel touches half the bytes
-    /// (4 vs 8/posting) of the `[Posting]` slice — fewer cache lines on the
-    /// high-`df` conjunction tail. Kept as its own channel in this phase
-    /// (NOT fused into `postings_flat`; that is a separate, bench-gated
-    /// step).
+    /// `Box<[u32]>` carries no growth slack. The conjunction leapfrog
+    /// scans ONLY this channel (the `freq` is read by index lookup into
+    /// `freqs_flat` at scoring time), so it touches half the bytes (4 vs
+    /// 8/posting) a `[Posting]` slice would — fewer cache lines on the
+    /// high-`df` conjunction tail.
     doc_ids_flat: Box<[u32]>,
+    /// All terms' `freq` channel concatenated the same way, index-aligned
+    /// with `doc_ids_flat` (same `offsets` table): posting `i` of a term
+    /// is `(doc_ids_flat[start + i], freqs_flat[start + i])`. Read ONLY at
+    /// scoring time — never by the leapfrog, which stays on `doc_ids_flat`
+    /// above — so this channel adds no cache pressure to the doc_id-only
+    /// hot path.
+    freqs_flat: Box<[u32]>,
     /// All terms' `BlockMeta` chunks concatenated, in FST idx order. Term
     /// `i`'s blocks are `block_metas_flat[block_offsets[i]..
     /// block_offsets[i+1]]`; inside that range, block `j` describes
-    /// `postings_flat[offsets[i] + j*BLOCK_SIZE .. offsets[i] +
-    /// min((j+1)*BLOCK_SIZE, df)]`. Built once in
-    /// `PostingsBuilder::build()` and never mutated afterwards.
+    /// `doc_ids_flat[offsets[i] + j*BLOCK_SIZE .. offsets[i] +
+    /// min((j+1)*BLOCK_SIZE, df)]` (and the same range of `freqs_flat`).
+    /// Built once in `PostingsBuilder::build()` and never mutated
+    /// afterwards.
     block_metas_flat: Box<[BlockMeta]>,
-    /// CSR offsets into `postings_flat` / `doc_ids_flat`, length `T + 1`
-    /// (`T` = number of distinct terms in this field). Term `i`'s postings
-    /// are `postings_flat[offsets[i]..offsets[i+1]]` (and likewise for
-    /// `doc_ids_flat`, which shares the same offsets since both channels
+    /// CSR offsets into `doc_ids_flat` / `freqs_flat`, length `T + 1`
+    /// (`T` = number of distinct terms in this field). Term `i`'s doc_ids
+    /// are `doc_ids_flat[offsets[i]..offsets[i+1]]` (and likewise for
+    /// `freqs_flat`, which shares the same offsets since both channels
     /// are index-aligned). `offsets[0] == 0` and `offsets[T] ==
-    /// postings_flat.len()`. `u32` is enough for matchID's 1.36 M docs;
+    /// doc_ids_flat.len()`. `u32` is enough for matchID's 1.36 M docs;
     /// `PostingsBuilder::build()` carries a `debug_assert` that the
     /// cumulative count fits, with a comment on switching to `u64` if a
     /// future corpus needs more than ~4.29 B total postings in one field.
@@ -388,9 +410,13 @@ impl FieldPostings {
         Some((idx, start, end))
     }
 
-    fn lookup(&self, term: &str) -> Option<&[Posting]> {
+    /// Returns the term's `(doc_ids, freqs)` slice pair, index-aligned.
+    fn lookup(&self, term: &str) -> Option<(&[u32], &[u32])> {
         let (_, start, end) = self.term_range(term)?;
-        self.postings_flat.get(start..end)
+        Some((
+            self.doc_ids_flat.get(start..end)?,
+            self.freqs_flat.get(start..end)?,
+        ))
     }
 
     fn lookup_block_metas(&self, term: &str) -> Option<&[BlockMeta]> {
@@ -414,8 +440,8 @@ impl FieldPostings {
         let block_start = *self.block_offsets.get(idx)? as usize;
         let block_end = *self.block_offsets.get(idx + 1)? as usize;
         Some(PostingsList {
-            postings: self.postings_flat.get(start..end)?,
             doc_ids: self.doc_ids_flat.get(start..end)?,
+            freqs: self.freqs_flat.get(start..end)?,
             block_metas: self.block_metas_flat.get(block_start..block_end)?,
             roaring: self.lookup_roaring(idx as u32),
         })
@@ -509,8 +535,9 @@ impl TermDictionary {
         self.fields
             .get(field)
             .and_then(|field_postings| field_postings.lookup(term))
-            .map(|postings| PostingsEnum {
-                postings,
+            .map(|(doc_ids, freqs)| PostingsEnum {
+                doc_ids,
+                freqs,
                 position: 0,
             })
     }
@@ -591,17 +618,22 @@ impl TermDictionary {
 
     /// Lot C Phase 1 memory accounting: real on-heap bytes of the flat
     /// postings buffers — term strings (read back from the FST) +
-    /// `postings_flat` + `doc_ids_flat`, summed over fields. Replaces the
+    /// `doc_ids_flat` + `freqs_flat`, summed over fields. Replaces the
     /// old `surch-index::memory::accounting_from_postings` walker, which
     /// paid one FST point-lookup per term (`doc_index.postings(field,
     /// term)`) plus an O(df) count just to re-derive numbers that are now
-    /// directly available as buffer lengths. Numerically identical to the
-    /// old walker's `postings_bytes` total (same term-byte + posting +
-    /// doc_id counts), just computed without the redundant per-term FST
-    /// round-trips.
+    /// directly available as buffer lengths.
+    ///
+    /// Lot C Phase 1 levier 5: the historical AoS `postings_flat:
+    /// Box<[Posting]>` (8 B/posting: a duplicated `doc_id` + `freq`) was
+    /// replaced by the SoA `freqs_flat: Box<[u32]>` (4 B/posting) kept
+    /// alongside the already-present `doc_ids_flat`. Total per-posting
+    /// cost drops from 12 B (`postings_flat` 8 B + `doc_ids_flat` 4 B) to
+    /// 8 B (`doc_ids_flat` 4 B + `freqs_flat` 4 B) — the duplicated
+    /// `doc_id` is gone.
     pub fn postings_bytes(&self) -> u64 {
-        let posting_size = std::mem::size_of::<Posting>() as u64;
         let doc_id_size = std::mem::size_of::<u32>() as u64;
+        let freq_size = std::mem::size_of::<u32>() as u64;
         self.fields
             .values()
             .map(|fp| {
@@ -611,8 +643,8 @@ impl TermDictionary {
                     term_bytes += bytes.len() as u64;
                 }
                 term_bytes
-                    + (fp.postings_flat.len() as u64).saturating_mul(posting_size)
                     + (fp.doc_ids_flat.len() as u64).saturating_mul(doc_id_size)
+                    + (fp.freqs_flat.len() as u64).saturating_mul(freq_size)
             })
             .sum()
     }
@@ -679,38 +711,44 @@ impl Iterator for TermsEnum {
 
 #[derive(Debug, Clone)]
 pub struct PostingsEnum<'a> {
-    postings: &'a [Posting],
+    doc_ids: &'a [u32],
+    freqs: &'a [u32],
     position: usize,
 }
 
-impl<'a> Iterator for PostingsEnum<'a> {
-    type Item = &'a Posting;
+impl Iterator for PostingsEnum<'_> {
+    type Item = Posting;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let posting = self.postings.get(self.position);
-        self.position += usize::from(posting.is_some());
-        posting
+        let doc_id = *self.doc_ids.get(self.position)?;
+        let freq = self.freqs[self.position];
+        self.position += 1;
+        Some(Posting::new(doc_id, freq))
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct PostingsList<'a> {
-    postings: &'a [Posting],
     doc_ids: &'a [u32],
+    freqs: &'a [u32],
     block_metas: &'a [BlockMeta],
     roaring: Option<&'a RoaringDocSet>,
 }
 
 impl<'a> PostingsList<'a> {
-    pub fn postings(&self) -> &'a [Posting] {
-        self.postings
-    }
-
-    /// The compact ascending `doc_id` channel (index-aligned with
-    /// [`Self::postings`]). The conjunction leapfrog walks this instead of the
-    /// `[Posting]` slice to touch half the bytes per posting.
+    /// The compact ascending `doc_id` channel. The conjunction leapfrog /
+    /// `PostingsBlockSkipIter` walks ONLY this slice — never
+    /// [`Self::freqs`] — so it touches half the bytes per posting a
+    /// `[Posting]` slice would.
     pub fn doc_ids(&self) -> &'a [u32] {
         self.doc_ids
+    }
+
+    /// The `freq` channel, index-aligned with [`Self::doc_ids`] (posting
+    /// `i` is `(doc_ids()[i], freqs()[i])`). Read only at scoring time —
+    /// the leapfrog never touches this slice.
+    pub fn freqs(&self) -> &'a [u32] {
+        self.freqs
     }
 
     /// The precomputed roaring/hybrid bitmap for this term, present only for
@@ -810,8 +848,8 @@ impl<'a> PostingsBlockSkipIter<'a> {
     /// Bottom-layer cursor position: the number of doc_ids consumed so far.
     /// After `advance_to(target)` returns `Some(target)`, the matched entry is
     /// at index `position() - 1` in the underlying channel — and, since the
-    /// `doc_id` channel is index-aligned with the term's `[Posting]` slice, at
-    /// the same index in `PostingsList::postings()`. Lets the conjunction
+    /// `doc_id` channel is index-aligned with the term's `freqs` channel, at
+    /// the same index in `PostingsList::freqs()`. Lets the conjunction
     /// capture the matched `freq` in O(1) instead of a `binary_search` per hit.
     pub fn position(&self) -> usize {
         self.position

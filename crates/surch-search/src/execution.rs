@@ -135,7 +135,7 @@ impl<'a> TermQueryExecutor<'a> {
         let doc_freq = postings.doc_freq_from_block_metas() as u64;
         debug_assert_eq!(
             doc_freq,
-            postings.postings().len() as u64,
+            postings.doc_ids().len() as u64,
             "FoR block metadata doc_freq must stay aligned with postings"
         );
 
@@ -143,25 +143,23 @@ impl<'a> TermQueryExecutor<'a> {
             return Ok(collector.finish());
         }
 
-        for posting in postings.postings() {
+        for (&doc_id, &freq) in postings.doc_ids().iter().zip(postings.freqs()) {
             let doc_len = self
                 .stats
                 .doc_len_by_doc_id
-                .get(&posting.doc_id)
+                .get(&doc_id)
                 .copied()
-                .ok_or(TermQueryExecutionError::MissingDocLen {
-                    doc_id: posting.doc_id,
-                })?;
+                .ok_or(TermQueryExecutionError::MissingDocLen { doc_id })?;
             let score = bm25_score(
                 self.bm25_config,
                 self.stats.doc_count,
                 doc_freq,
-                u64::from(posting.freq),
+                u64::from(freq),
                 doc_len,
                 self.stats.avg_doc_len,
             )?;
 
-            collector.collect(posting.doc_id, score)?;
+            collector.collect(doc_id, score)?;
         }
 
         Ok(collector.finish())
@@ -287,7 +285,7 @@ impl<'a> BooleanQueryExecutor<'a> {
         // candidate, ask every other clause to `advance_to(doc_id)`
         // and check if it landed exactly on `doc_id`.
         // Drive the rarest term's compact doc_id channel (half the bytes of
-        // the `[Posting]` slice — the leapfrog only needs doc_ids).
+        // an AoS `Posting` — the leapfrog only needs doc_ids, never freqs).
         let driver_doc_ids = clauses[0].postings.doc_ids().to_vec();
         for (driver_idx, &doc_id) in driver_doc_ids.iter().enumerate() {
             let mut all_match = true;
@@ -320,24 +318,25 @@ impl<'a> BooleanQueryExecutor<'a> {
             // Confirmed: every clause has `doc_id`. Score the
             // contribution of every clause and sum.
             let mut summed = 0.0_f64;
-            // Driver contribution: the driver's Posting is index-aligned with
-            // its doc_id channel, so postings()[driver_idx] is the freq we need.
-            let driver_posting = clauses[0].postings.postings()[driver_idx];
-            summed += self.score_posting(&clauses[0], &driver_posting)?;
+            // Driver contribution: the driver's `freqs` channel is index-aligned
+            // with its doc_id channel, so freqs()[driver_idx] is the freq we need.
+            let driver_freq = clauses[0].postings.freqs()[driver_idx];
+            summed += self.score_posting(&clauses[0], doc_id, driver_freq)?;
             // Follower contributions. The matching loop above just landed each
             // follower's cursor exactly on `doc_id`, so the matched posting is at
-            // `iter.position() - 1` (the channel is index-aligned with the
-            // `[Posting]` slice) — read its `freq` in O(1) instead of a
+            // `iter.position() - 1` (the `freqs` channel is index-aligned with the
+            // `doc_ids` channel) — read its `freq` in O(1) instead of a
             // `binary_search` per hit (the cache-missing per-candidate cost the
             // deces tail decompose flagged; see campaign #18/#19).
             for follower in &clauses[1..] {
-                let follower_postings = follower.postings.postings();
                 let idx = follower.iter.position() - 1;
                 debug_assert_eq!(
-                    follower_postings[idx].doc_id, doc_id,
+                    follower.postings.doc_ids()[idx],
+                    doc_id,
                     "leapfrog cursor position must point at the just-matched doc_id"
                 );
-                summed += self.score_posting(follower, &follower_postings[idx])?;
+                let follower_freq = follower.postings.freqs()[idx];
+                summed += self.score_posting(follower, doc_id, follower_freq)?;
             }
 
             out.push((doc_id, summed));
@@ -349,21 +348,20 @@ impl<'a> BooleanQueryExecutor<'a> {
     fn score_posting(
         &self,
         clause: &LeapfrogClause<'a>,
-        posting: &surch_index::postings::Posting,
+        doc_id: u32,
+        freq: u32,
     ) -> Result<f64, TermQueryExecutionError> {
         let stats = &self.term_executor.stats;
         let doc_len = stats
             .doc_len_by_doc_id
-            .get(&posting.doc_id)
+            .get(&doc_id)
             .copied()
-            .ok_or(TermQueryExecutionError::MissingDocLen {
-                doc_id: posting.doc_id,
-            })?;
+            .ok_or(TermQueryExecutionError::MissingDocLen { doc_id })?;
         bm25_score(
             self.term_executor.bm25_config,
             stats.doc_count,
             clause.doc_freq,
-            u64::from(posting.freq),
+            u64::from(freq),
             doc_len,
             stats.avg_doc_len,
         )

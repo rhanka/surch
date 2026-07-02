@@ -11,18 +11,18 @@
 
 use std::collections::BTreeMap;
 
-use surch_index::postings::Posting;
 use surch_search::maxscore::{MaxScoreExecutor, MaxScoreToken, BLOCK_SIZE};
 use surch_search::scoring::{bm25_score, Bm25Config};
 
 const EPSILON: f64 = 1e-9;
 
 /// A token described the way the production OR-match path describes it:
-/// postings (`{ doc_id, freq }`), a per-doc `doc_freq`, a repeat `boost`,
-/// and a `max_term_freq` per block so we can compute the block-max upper
-/// bound.
+/// SoA `doc_ids`/`freqs` (Lot C Phase 1 levier 5, index-aligned), a
+/// per-doc `doc_freq`, a repeat `boost`, and a `max_term_freq` per block
+/// so we can compute the block-max upper bound.
 struct Token {
-    postings: Vec<Posting>,
+    doc_ids: Vec<u32>,
+    freqs: Vec<u32>,
     doc_freq: u64,
     boost: f64,
 }
@@ -54,12 +54,12 @@ impl Scenario {
             .unwrap_or(1)
             .max(1);
         token
-            .postings
+            .freqs
             .chunks(BLOCK_SIZE)
-            .map(|chunk| {
-                let block_max_tf = chunk
+            .map(|freq_chunk| {
+                let block_max_tf = freq_chunk
                     .iter()
-                    .map(|p| u64::from(p.freq))
+                    .map(|&freq| u64::from(freq))
                     .max()
                     .unwrap_or(1)
                     .max(1);
@@ -109,13 +109,13 @@ impl Scenario {
     fn brute_force(&self) -> BTreeMap<u32, f64> {
         let mut scored: BTreeMap<u32, f64> = BTreeMap::new();
         for token in &self.tokens {
-            for posting in &token.postings {
-                let tf = u64::from(posting.freq);
+            for (&doc_id, &freq) in token.doc_ids.iter().zip(&token.freqs) {
+                let tf = u64::from(freq);
                 if tf == 0 {
                     continue;
                 }
-                if let Some(contrib) = self.score_doc(token, posting.doc_id, tf) {
-                    *scored.entry(posting.doc_id).or_insert(0.0) += contrib;
+                if let Some(contrib) = self.score_doc(token, doc_id, tf) {
+                    *scored.entry(doc_id).or_insert(0.0) += contrib;
                 }
             }
         }
@@ -166,7 +166,8 @@ fn run(scenario: &Scenario, limit: usize) -> (BTreeMap<u32, f64>, usize) {
         .iter()
         .enumerate()
         .map(|(i, t)| MaxScoreToken {
-            postings: t.postings.as_slice(),
+            doc_ids: t.doc_ids.as_slice(),
+            freqs: t.freqs.as_slice(),
             block_max_contribs: block_maxes[i].as_slice(),
             max_contrib: scenario.max_contrib(&block_maxes[i]),
         })
@@ -186,23 +187,23 @@ fn run(scenario: &Scenario, limit: usize) -> (BTreeMap<u32, f64>, usize) {
 fn rare_common_scenario() -> Scenario {
     let n_blocks = 8u32;
     let n_docs = n_blocks * BLOCK_SIZE as u32;
-    let common: Vec<Posting> = (0..n_docs).map(|d| Posting::new(d, 1)).collect();
+    let common_doc_ids: Vec<u32> = (0..n_docs).collect();
+    let common_freqs: Vec<u32> = vec![1; common_doc_ids.len()];
     // Rare token in 3 well-separated blocks, high tf.
-    let rare: Vec<Posting> = vec![
-        Posting::new(1, 12),
-        Posting::new(3 * BLOCK_SIZE as u32 + 7, 12),
-        Posting::new(7 * BLOCK_SIZE as u32 + 3, 12),
-    ];
+    let rare_doc_ids: Vec<u32> = vec![1, 3 * BLOCK_SIZE as u32 + 7, 7 * BLOCK_SIZE as u32 + 3];
+    let rare_freqs: Vec<u32> = vec![12, 12, 12];
     let doc_len_by_id: BTreeMap<u32, u64> = (0..n_docs).map(|d| (d, 4)).collect();
     Scenario {
         tokens: vec![
             Token {
-                postings: rare,
+                doc_ids: rare_doc_ids,
+                freqs: rare_freqs,
                 doc_freq: 3,
                 boost: 1.0,
             },
             Token {
-                postings: common,
+                doc_ids: common_doc_ids,
+                freqs: common_freqs,
                 doc_freq: n_docs as u64,
                 boost: 1.0,
             },
@@ -251,13 +252,16 @@ fn skip_executor_matches_brute_force_on_seeded_multi_token_corpus() {
         (0..n_docs).map(|d| (d, (next() % 20) as u64 + 1)).collect();
 
     let make_token = |modulo: u32, n: &mut dyn FnMut() -> u32, boost: f64| {
-        let postings: Vec<Posting> = (0..n_docs)
-            .filter(|d| d % modulo == 0)
-            .map(|d| Posting::new(d, (n() % 9) + 1))
-            .collect();
-        let doc_freq = postings.len() as u64;
+        // `doc_ids` is built first (ascending, by construction), then
+        // `freqs` is derived by walking it in that same ascending order —
+        // same RNG draw sequence/count as the historical single-pass
+        // `Posting::new(d, (n() % 9) + 1)` map.
+        let doc_ids: Vec<u32> = (0..n_docs).filter(|d| d % modulo == 0).collect();
+        let freqs: Vec<u32> = doc_ids.iter().map(|_| (n() % 9) + 1).collect();
+        let doc_freq = doc_ids.len() as u64;
         Token {
-            postings,
+            doc_ids,
+            freqs,
             doc_freq,
             boost,
         }

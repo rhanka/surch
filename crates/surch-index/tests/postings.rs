@@ -356,7 +356,8 @@ fn term_dictionary_runtime_postings_exposes_for_block_metadata() {
         .postings_with_block_metas("body", "runtime")
         .expect("runtime postings");
 
-    assert_eq!(runtime_postings.postings().len(), total_docs);
+    assert_eq!(runtime_postings.doc_ids().len(), total_docs);
+    assert_eq!(runtime_postings.freqs().len(), total_docs);
     assert_eq!(runtime_postings.block_metas().len(), 3);
     assert_eq!(runtime_postings.doc_freq_from_block_metas(), total_docs);
     assert_eq!(

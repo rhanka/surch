@@ -43,9 +43,11 @@ use crate::document_index::{DocumentIndex, FieldLengthStats};
 /// caveats.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryUsage {
-    /// Inverted index: the flat `postings_flat` + `doc_ids_flat` buffers
-    /// (Lot C Phase 1 — one `Box<[T]>` per field, CSR-indexed by the FST)
-    /// plus the term strings themselves.
+    /// Inverted index: the flat `doc_ids_flat` + `freqs_flat` buffers
+    /// (Lot C Phase 1 — one `Box<[u32]>` per channel per field,
+    /// CSR-indexed by the FST; levier 5 split the historical AoS
+    /// `postings_flat: Box<[Posting]>` into this SoA pair to stop
+    /// duplicating `doc_id`) plus the term strings themselves.
     pub postings_bytes: u64,
     /// A6 prefix side-table: `field -> prefix -> BTreeSet<doc_id>`.
     pub prefix_postings_bytes: u64,

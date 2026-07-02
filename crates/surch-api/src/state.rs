@@ -11,7 +11,7 @@ use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
-    postings::{BlockMeta, Posting, PostingsBlockSkipIter, PostingsList},
+    postings::{BlockMeta, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
 };
 
@@ -621,23 +621,28 @@ impl TermScoringStats {
 /// `block_metas` on every query for every distinct token. The scoring hot
 /// path does not need owned data — it only reads it while the single
 /// search read guard (optimisation #8) is held. `TermScoringView` borrows
-/// the live [`Posting`] slice and [`BlockMeta`] slice straight out of the
-/// in-memory term dictionary, eliminating both per-token allocations.
+/// the live `doc_ids` / `freqs` SoA slices (Lot C Phase 1 levier 5:
+/// `surch_index::postings::PostingsList::doc_ids` / `::freqs`) and the
+/// [`BlockMeta`] slice straight out of the in-memory term dictionary,
+/// eliminating both per-token allocations.
 ///
 /// Parity: the postings come from the `TermDictionary` in ascending
-/// `doc_id` order with exactly one [`Posting`] per `(doc_id, field, term)`
-/// triple (the `analyzed_terms` invariant in
-/// `DocumentIndex::add_validated_document`). So this borrowed slice is
+/// `doc_id` order with exactly one `(doc_id, freq)` pair per
+/// `(doc_id, field, term)` triple (the `analyzed_terms` invariant in
+/// `DocumentIndex::add_validated_document`). So these borrowed slices are
 /// element-for-element the same sequence the owned `term_freq_by_doc_id`
 /// held, only with `freq` kept as `u32` (widened to `u64` at the exact
-/// points the scorer consumes it). `doc_freq` equals `postings.len()`,
+/// points the scorer consumes it). `doc_freq` equals `doc_ids.len()`,
 /// matching the owned struct's `term_freq_by_doc_id.len()`.
 #[derive(Clone, Copy, Debug)]
 pub struct TermScoringView<'a> {
     pub doc_freq: u64,
-    /// Borrowed postings, sorted ascending by `doc_id`, one entry per doc.
-    pub postings: &'a [Posting],
-    /// Borrowed per-block stats aligned with `postings.chunks(BLOCK_SIZE)`.
+    /// Borrowed `doc_id` channel, sorted ascending, one entry per doc.
+    pub doc_ids: &'a [u32],
+    /// Borrowed `freq` channel, index-aligned with `doc_ids` (posting `i`
+    /// is `(doc_ids[i], freqs[i])`).
+    pub freqs: &'a [u32],
+    /// Borrowed per-block stats aligned with `doc_ids.chunks(BLOCK_SIZE)`.
     pub block_metas: &'a [BlockMeta],
 }
 
@@ -648,29 +653,30 @@ impl<'a> TermScoringView<'a> {
     pub fn empty() -> Self {
         Self {
             doc_freq: 0,
-            postings: &[],
+            doc_ids: &[],
+            freqs: &[],
             block_metas: &[],
         }
     }
 
     /// Term frequency for `doc_id`, or 0 when the doc is absent. Binary
-    /// search over the ascending-`doc_id` postings — identical lookup
+    /// search over the ascending-`doc_id` channel — identical lookup
     /// semantics to [`TermScoringStats::term_freq`], widening the stored
     /// `u32` freq to `u64`.
     pub fn term_freq(&self, doc_id: u32) -> u64 {
-        self.postings
-            .binary_search_by_key(&doc_id, |posting| posting.doc_id)
+        self.doc_ids
+            .binary_search(&doc_id)
             .ok()
-            .map(|idx| u64::from(self.postings[idx].freq))
+            .map(|idx| u64::from(self.freqs[idx]))
             .unwrap_or(0)
     }
 
     /// Greatest term frequency across the postings (widened to `u64`).
     /// Matches [`TermScoringStats::max_term_freq`].
     pub fn max_term_freq(&self) -> u64 {
-        self.postings
+        self.freqs
             .iter()
-            .map(|posting| u64::from(posting.freq))
+            .map(|&freq| u64::from(freq))
             .max()
             .unwrap_or(0)
     }
@@ -1271,19 +1277,21 @@ impl InMemoryIndex {
     fn term_scoring_view(&self, field: &str, term: &str) -> TermScoringView<'_> {
         match self.index.postings_with_block_metas(field, term) {
             Some(list) => {
-                let postings = list.postings();
+                let doc_ids = list.doc_ids();
+                let freqs = list.freqs();
                 let block_metas = list.block_metas();
                 debug_assert_eq!(
                     block_metas.len(),
-                    postings.len().div_ceil(128),
+                    doc_ids.len().div_ceil(128),
                     "block_metas alignment with postings chunks broken \
                      (field={field}, term={term}, postings={}, metas={})",
-                    postings.len(),
+                    doc_ids.len(),
                     block_metas.len(),
                 );
                 TermScoringView {
-                    doc_freq: postings.len() as u64,
-                    postings,
+                    doc_freq: doc_ids.len() as u64,
+                    doc_ids,
+                    freqs,
                     block_metas,
                 }
             }
@@ -1377,12 +1385,12 @@ impl InMemoryIndex {
         let mut lists: Vec<PostingsList<'_>> = Vec::with_capacity(terms.len());
         for (field, term) in terms {
             match self.index.postings_with_block_metas(field, term) {
-                Some(list) if !list.postings().is_empty() => lists.push(list),
+                Some(list) if !list.doc_ids().is_empty() => lists.push(list),
                 _ => return Vec::new(),
             }
         }
         // Drive the rarest term; advance_to the others.
-        lists.sort_by_key(|l| l.postings().len());
+        lists.sort_by_key(|l| l.doc_ids().len());
 
         // A1 fast path: two high-`df` terms (both have a precomputed roaring
         // bitmap) AND word-parallel instead of the scalar O(df_rare) leapfrog.
@@ -1415,8 +1423,8 @@ impl InMemoryIndex {
         let mut cur: Vec<Option<u32>> = iters.iter_mut().map(|it| it.advance_to(0)).collect();
         let mut out = Vec::new();
         // Drive the rarest term's compact doc_id channel (4 B/entry, half the
-        // cache footprint of the `[Posting]` slice) — the conjunction never
-        // needs `freq` here.
+        // cache footprint an AoS `Posting` would carry) — the conjunction
+        // never needs `freq` here.
         'docs: for &target in lists[0].doc_ids() {
             for (i, it) in iters.iter_mut().enumerate() {
                 if cur[i].is_some_and(|c| c < target) {
@@ -2691,10 +2699,11 @@ impl AppState {
     /// `run_topk_exact_bool` otherwise resolves the intersection, throws the
     /// `freq` away, then re-derives it per candidate per term with a
     /// `binary_search` O(log df) inside `bm25_field_score` — the measured CPU
-    /// tail. This walks the intersection ONCE over the AoS `[Posting]` slices
-    /// (driver = rarest term, galloping cursors over the rest), capturing each
-    /// term's `freq` at the matched position (O(1), `postings[idx].freq`) and
-    /// accumulating the BM25 sum inline.
+    /// tail. This walks the intersection ONCE over the SoA `doc_ids`/`freqs`
+    /// slices (Lot C Phase 1 levier 5; driver = rarest term, galloping cursors
+    /// over the rest), capturing each term's `freq` at the matched position
+    /// (O(1), `freqs[idx]`, same index the galloping cursor just landed on in
+    /// `doc_ids`) and accumulating the BM25 sum inline.
     ///
     /// Returns `Some(scored)` — one `(score, doc_id)` per intersected candidate,
     /// ascending — **bit-identical** to `score_for_query` for this shape:
@@ -2720,14 +2729,17 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
 
-        // Per-term: field stats + the AoS postings (doc_id+freq together — the
-        // scorer reads BOTH, so the AoS is exactly the right layout here, NOT a
-        // SoA split, see #18). `doc_freq == postings.len()` (one posting per
-        // doc), matching `bm25_field_score`'s `term_stats.doc_freq`.
+        // Per-term: field stats + the SoA doc_ids/freqs channels (Lot C Phase 1
+        // levier 5 — `doc_id` is only ever stored once, in `doc_ids`; `freqs` is
+        // index-aligned with it so the matched `freq` is still an O(1) lookup at
+        // the same index the galloping cursor landed on). `doc_freq ==
+        // doc_ids.len()` (one posting per doc), matching `bm25_field_score`'s
+        // `term_stats.doc_freq`.
         struct TermCtx<'a> {
             field_stats: FieldScoringStats<'a>,
             doc_freq: u64,
-            postings: &'a [Posting],
+            doc_ids: &'a [u32],
+            freqs: &'a [u32],
             roaring: Option<&'a RoaringDocSet>,
         }
         let mut terms: Vec<TermCtx<'_>> = Vec::with_capacity(clauses.len());
@@ -2746,40 +2758,41 @@ impl AppState {
             }
             let token = recall.into_iter().next().expect("len checked == 1");
             let list = match data.index.postings_with_block_metas(field, &token) {
-                Some(list) if !list.postings().is_empty() => list,
+                Some(list) if !list.doc_ids().is_empty() => list,
                 // A required term with no postings ⇒ the intersection is empty.
                 _ => return Some(Vec::new()),
             };
             let field_stats = data.field_scoring_stats(field)?;
             terms.push(TermCtx {
                 field_stats,
-                doc_freq: list.postings().len() as u64,
-                postings: list.postings(),
+                doc_freq: list.doc_ids().len() as u64,
+                doc_ids: list.doc_ids(),
+                freqs: list.freqs(),
                 roaring: list.roaring(),
             });
         }
 
         // Drive the rarest term; gallop the others.
-        terms.sort_by_key(|t| t.postings.len());
+        terms.sort_by_key(|t| t.doc_ids.len());
         let config = Bm25Config::default();
 
-        // Monotonic galloping freq lookup over a term's AoS postings: the
+        // Monotonic galloping freq lookup over a term's SoA doc_ids/freqs: the
         // matched `freq` for `doc_id`, advancing `cursor` forward (ascending
         // `doc_id` callers only). Branchless `partition_point` like the walk.
-        let freq_at = |postings: &[Posting], cursor: &mut usize, doc_id: u32| -> u32 {
-            let rest = &postings[(*cursor).min(postings.len())..];
+        let freq_at = |doc_ids: &[u32], freqs: &[u32], cursor: &mut usize, doc_id: u32| -> u32 {
+            let rest = &doc_ids[(*cursor).min(doc_ids.len())..];
             let mut hi = 1usize;
-            while hi < rest.len() && rest[hi].doc_id < doc_id {
+            while hi < rest.len() && rest[hi] < doc_id {
                 hi <<= 1;
             }
             let lo = hi >> 1;
             let hi = hi.min(rest.len());
-            let offset = lo + rest[lo..hi].partition_point(|p| p.doc_id < doc_id);
+            let offset = lo + rest[lo..hi].partition_point(|&d| d < doc_id);
             *cursor += offset;
-            postings
-                .get(*cursor)
-                .filter(|p| p.doc_id == doc_id)
-                .map_or(0, |p| p.freq)
+            match doc_ids.get(*cursor) {
+                Some(&found) if found == doc_id => freqs[*cursor],
+                _ => 0,
+            }
         };
 
         // One term's BM25 contribution — replicates `bm25_field_score` exactly
@@ -2816,8 +2829,8 @@ impl AppState {
         // of the scalar O(df_rare) walk, then capture each term's `freq` with a
         // monotonic galloping sweep. Bit-identical to the walk below: the
         // intersection set is identical (roaring module is oracle-tested), the
-        // `freq` is the same `postings[idx].freq`, and the score formula is the
-        // same `term_contrib` sum with the `!= 1.0` filter.
+        // `freq` is the same `freqs[idx]`, and the score formula is the same
+        // `term_contrib` sum with the `!= 1.0` filter.
         if terms.len() == 2 {
             if let (Some(r0), Some(r1)) = (terms[0].roaring, terms[1].roaring) {
                 let mut result: Vec<u32> = Vec::new();
@@ -2825,8 +2838,8 @@ impl AppState {
                 let mut scored: Vec<(f64, u32)> = Vec::with_capacity(result.len());
                 let (mut c0, mut c1) = (0usize, 0usize);
                 for doc_id in result {
-                    let f0 = freq_at(terms[0].postings, &mut c0, doc_id);
-                    let f1 = freq_at(terms[1].postings, &mut c1, doc_id);
+                    let f0 = freq_at(terms[0].doc_ids, terms[0].freqs, &mut c0, doc_id);
+                    let f1 = freq_at(terms[1].doc_ids, terms[1].freqs, &mut c1, doc_id);
                     let sum =
                         term_contrib(&terms[0], doc_id, f0) + term_contrib(&terms[1], doc_id, f1);
                     scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
@@ -2835,31 +2848,30 @@ impl AppState {
             }
         }
 
-        // Follower galloping cursors over the AoS postings. Monotonic: driver
-        // doc_ids ascend strictly (one posting per doc), so each cursor only
-        // moves forward.
+        // Follower galloping cursors over the SoA doc_ids/freqs. Monotonic:
+        // driver doc_ids ascend strictly (one posting per doc), so each cursor
+        // only moves forward.
         let mut cursors: Vec<usize> = vec![0; terms.len()];
         let mut scored: Vec<(f64, u32)> = Vec::new();
-        'docs: for driver_posting in terms[0].postings {
-            let doc_id = driver_posting.doc_id;
-            let mut sum = term_contrib(&terms[0], doc_id, driver_posting.freq);
+        'docs: for (driver_idx, &doc_id) in terms[0].doc_ids.iter().enumerate() {
+            let mut sum = term_contrib(&terms[0], doc_id, terms[0].freqs[driver_idx]);
             for i in 1..terms.len() {
                 let follower = &terms[i];
                 let pos = cursors[i];
-                let rest = &follower.postings[pos..];
+                let rest = &follower.doc_ids[pos..];
                 // Galloping (exponential bound) + branchless `partition_point`:
                 // first posting with `doc_id >= target`.
                 let mut hi = 1usize;
-                while hi < rest.len() && rest[hi].doc_id < doc_id {
+                while hi < rest.len() && rest[hi] < doc_id {
                     hi <<= 1;
                 }
                 let lo = hi >> 1;
                 let hi = hi.min(rest.len());
-                let offset = lo + rest[lo..hi].partition_point(|p| p.doc_id < doc_id);
+                let offset = lo + rest[lo..hi].partition_point(|&d| d < doc_id);
                 cursors[i] = pos + offset;
-                match follower.postings.get(cursors[i]) {
-                    Some(p) if p.doc_id == doc_id => {
-                        sum += term_contrib(follower, doc_id, p.freq);
+                match follower.doc_ids.get(cursors[i]) {
+                    Some(&found) if found == doc_id => {
+                        sum += term_contrib(follower, doc_id, follower.freqs[cursors[i]]);
                     }
                     // Absent from this follower ⇒ not in the intersection.
                     _ => continue 'docs,

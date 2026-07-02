@@ -2499,10 +2499,12 @@ fn maxscore_match(
         .iter()
         .enumerate()
         .map(|(token_idx, token)| MaxScoreToken {
-            // Zero-copy: borrow the live posting slice from the term
-            // dictionary (optimisation #7) — `MaxScoreExecutor` now reads
-            // `doc_id`/`freq` straight from `&[Posting]`.
-            postings: token.stats.postings,
+            // Zero-copy: borrow the live SoA slices from the term
+            // dictionary (optimisation #7, Lot C Phase 1 levier 5) —
+            // `MaxScoreExecutor` now reads `doc_id` from `doc_ids` and
+            // `freq` from the index-aligned `freqs` slice.
+            doc_ids: token.stats.doc_ids,
+            freqs: token.stats.freqs,
             block_max_contribs: block_max_contribs[token_idx].as_slice(),
             max_contrib: token.max_contrib,
         })
