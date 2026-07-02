@@ -592,6 +592,13 @@ impl DocumentIndex {
         self.terms.fst_bytes()
     }
 
+    /// Lot C Phase 1 memory accounting: real bytes held by the flat
+    /// postings buffers (term strings + `postings_flat` + `doc_ids_flat`,
+    /// summed over fields). See [`crate::postings::TermDictionary::postings_bytes`].
+    pub fn postings_bytes(&self) -> u64 {
+        self.terms.postings_bytes()
+    }
+
     /// #17 memory accounting: total bytes held by precomputed roaring bitmaps.
     pub fn roaring_bytes(&self) -> u64 {
         self.terms.roaring_bytes()
