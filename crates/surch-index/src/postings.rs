@@ -58,25 +58,32 @@ impl Posting {
     }
 }
 
-/// Per-block statistics computed once at `PostingsBuilder::build()` time,
+/// Per-block statistic computed once at `PostingsBuilder::build()` time,
 /// then read directly on the hot scoring path instead of being recomputed
 /// at every query (the Block-Max WAND a.k.a. `BlockWAND` schema used by
 /// Tantivy / Lucene block-max postings).
 ///
 /// Each `BlockMeta` describes one chunk of up to [`BLOCK_SIZE`] consecutive
-/// postings inside a term's `Vec<Posting>` (postings are kept sorted by
-/// ascending `doc_id`, so `min_doc_id`/`max_doc_id` are simply the first
-/// and last entry of the chunk).
+/// postings inside a term's flattened `doc_ids_flat` slice (postings are
+/// kept sorted by ascending `doc_id`, and the flat buffers are CSR-indexed
+/// by `offsets`/`block_offsets` — see [`FieldPostings`]).
+///
+/// Lot C Phase 1 lever B: `BlockMeta` used to also carry `posting_count`,
+/// `min_doc_id`, `max_doc_id` (16 B total). All three are DERIVABLE at
+/// O(1) from data already resident: block `j` of term `i` is exactly
+/// `doc_ids_flat[offsets[i] + j*BLOCK_SIZE .. offsets[i] +
+/// min((j+1)*BLOCK_SIZE, df)]`, so its `posting_count` is that range's
+/// length and `min_doc_id`/`max_doc_id` are its first/last entry
+/// ([`PostingsList::doc_freq_from_block_metas`] and
+/// [`PostingsList::block_skip_list`] read them straight off `doc_ids`
+/// now). Only `max_term_freq` truly needs precomputing — finding it
+/// requires an O(block) scan the hot path cannot repeat per query — so
+/// `BlockMeta` shrank from 16 to 4 bytes: ~119 MiB to ~30 MiB on the
+/// deces 1.36 M-doc corpus (one block per 128 postings, several fields).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BlockMeta {
-    /// Number of postings described by this block.
-    pub posting_count: usize,
     /// Greatest term_freq inside this block of up to [`BLOCK_SIZE`] postings.
     pub max_term_freq: u32,
-    /// Smallest `doc_id` inside this block (so callers can range-skip).
-    pub min_doc_id: u32,
-    /// Largest `doc_id` inside this block.
-    pub max_doc_id: u32,
 }
 
 /// Number of postings per BMW block. Must match the `BLOCK_SIZE` used by
@@ -88,16 +95,8 @@ fn build_block_metas(postings: &[Posting]) -> Vec<BlockMeta> {
     postings
         .chunks(BLOCK_SIZE)
         .map(|chunk| {
-            // `chunks` only yields non-empty slices, so first/last are safe.
-            let min_doc_id = chunk.first().expect("chunk is non-empty").doc_id;
-            let max_doc_id = chunk.last().expect("chunk is non-empty").doc_id;
             let max_term_freq = chunk.iter().map(|p| p.freq).max().unwrap_or(0);
-            BlockMeta {
-                posting_count: chunk.len(),
-                max_term_freq,
-                min_doc_id,
-                max_doc_id,
-            }
+            BlockMeta { max_term_freq }
         })
         .collect()
 }
@@ -762,32 +761,44 @@ impl<'a> PostingsList<'a> {
         self.block_metas
     }
 
+    /// Total posting count for this term. Lot C Phase 1 lever B dropped
+    /// `BlockMeta::posting_count` (derivable at O(1): the CSR-flattened
+    /// `doc_ids` slice is already sized exactly to the term's `df`, so
+    /// summing per-block counts and reading the buffer length are the
+    /// same number), so this reads `doc_ids.len()` directly instead of
+    /// summing over `block_metas`.
     pub fn doc_freq_from_block_metas(&self) -> usize {
-        self.block_metas.iter().map(|meta| meta.posting_count).sum()
+        self.doc_ids.len()
     }
 
     /// Build a [`BlockSkipList`] (Lot 2: skip lists on the codec FoR
-    /// path) from this term's per-block metadata. Returns `None` when
-    /// the posting list is empty (so callers can short-circuit without
-    /// constructing an empty skip list). Returns `Err(_)` only on a
-    /// programmer-bug-level invariant violation (postings not strictly
-    /// increasing across blocks); these errors should never fire in
-    /// practice because `PostingsBuilder::build()` sorts postings by
-    /// ascending `doc_id` before `build_block_metas` runs.
+    /// path) over this term's postings. Returns `None` when the posting
+    /// list is empty (so callers can short-circuit without constructing
+    /// an empty skip list). Returns `Err(_)` only on a programmer-bug-level
+    /// invariant violation (postings not strictly increasing across
+    /// blocks); these errors should never fire in practice because
+    /// `PostingsBuilder::build()` sorts postings by ascending `doc_id`.
+    ///
+    /// Lot C Phase 1 lever B: `min_doc_id`/`max_doc_id` are no longer
+    /// stored in `BlockMeta` — derived here at O(1) from `doc_ids`
+    /// directly (postings sorted ascending, so a block's range is simply
+    /// its first/last entry in `doc_ids.chunks(BLOCK_SIZE)`, the exact
+    /// chunking `build_block_metas` computed these fields from before).
+    /// Bit-identical values, read from the buffer instead of the struct.
     pub fn block_skip_list(
         &self,
     ) -> std::result::Result<Option<BlockSkipList>, PostingsBlockError> {
-        if self.block_metas.is_empty() {
+        if self.doc_ids.is_empty() {
             return Ok(None);
         }
         let entries = self
-            .block_metas
-            .iter()
+            .doc_ids
+            .chunks(BLOCK_SIZE)
             .enumerate()
-            .map(|(idx, meta)| BlockSkipEntry {
+            .map(|(idx, chunk)| BlockSkipEntry {
                 block_index: idx,
-                min_doc_id: meta.min_doc_id,
-                max_doc_id: meta.max_doc_id,
+                min_doc_id: chunk[0],
+                max_doc_id: chunk[chunk.len() - 1],
             });
         let skip_list = BlockSkipList::from_block_ranges(entries)?;
         Ok(Some(skip_list))

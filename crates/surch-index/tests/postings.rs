@@ -243,9 +243,10 @@ fn term_dictionary_fst_lookup_returns_postings_by_term() {
 fn term_dictionary_block_metas_match_postings_chunks() {
     // Insert enough postings to span three 128-doc blocks (full + full +
     // partial) and check the BlockMeta Vec is correctly sized and aligned
-    // with `postings.chunks(BLOCK_SIZE)` — each meta's `min_doc_id` /
-    // `max_doc_id` is the first / last doc_id of the corresponding chunk
-    // in the (ascending-doc_id) posting list.
+    // with `postings.chunks(BLOCK_SIZE)`. Lot C Phase 1 lever B: `BlockMeta`
+    // no longer stores `posting_count`/`min_doc_id`/`max_doc_id` (derivable
+    // at O(1) from `doc_ids`) — those ranges are now checked through
+    // `block_skip_list()`'s derived entries instead of the struct fields.
     let mut builder = PostingsBuilder::new();
     let total_docs: u32 = (BLOCK_SIZE as u32) * 2 + 17;
     // Push doc_ids in scrambled order so the test exercises the
@@ -272,13 +273,21 @@ fn term_dictionary_block_metas_match_postings_chunks() {
         3,
         "two full blocks + one partial trailing block"
     );
+    // Single-position postings -> freq 1 everywhere.
+    assert!(metas.iter().all(|meta| meta.max_term_freq == 1));
 
-    for (chunk, meta) in postings.chunks(BLOCK_SIZE).zip(metas.iter()) {
-        assert_eq!(meta.posting_count, chunk.len());
-        assert_eq!(meta.min_doc_id, chunk.first().expect("chunk").doc_id);
-        assert_eq!(meta.max_doc_id, chunk.last().expect("chunk").doc_id);
-        // Single-position postings -> freq 1 everywhere.
-        assert_eq!(meta.max_term_freq, 1);
+    let list = dictionary
+        .postings_with_block_metas("body", "hit")
+        .expect("hit postings list");
+    assert_eq!(list.doc_freq_from_block_metas(), total_docs as usize);
+
+    let skip_list = list
+        .block_skip_list()
+        .expect("skip list builds")
+        .expect("non-empty postings");
+    for (chunk, entry) in postings.chunks(BLOCK_SIZE).zip(skip_list.entries()) {
+        assert_eq!(entry.min_doc_id, chunk.first().expect("chunk").doc_id);
+        assert_eq!(entry.max_doc_id, chunk.last().expect("chunk").doc_id);
     }
 
     // Unknown field / term yields `None`, consistent with `postings()`.
@@ -327,18 +336,30 @@ fn term_dictionary_block_metas_follow_codec_block_size() {
         .collect::<Vec<_>>();
     assert_eq!(chunk_lengths, vec![FOR_BLOCK_SIZE, FOR_BLOCK_SIZE, 17]);
     assert_eq!(metas.len(), chunk_lengths.len());
-    assert_eq!(metas[0].posting_count, FOR_BLOCK_SIZE);
-    assert_eq!(metas[0].min_doc_id, 0);
-    assert_eq!(metas[0].max_doc_id, (FOR_BLOCK_SIZE - 1) as u32);
     assert_eq!(metas[0].max_term_freq, 1);
-    assert_eq!(metas[1].posting_count, FOR_BLOCK_SIZE);
-    assert_eq!(metas[1].min_doc_id, FOR_BLOCK_SIZE as u32);
-    assert_eq!(metas[1].max_doc_id, (FOR_BLOCK_SIZE * 2 - 1) as u32);
     assert_eq!(metas[1].max_term_freq, 4);
-    assert_eq!(metas[2].posting_count, 17);
-    assert_eq!(metas[2].min_doc_id, (FOR_BLOCK_SIZE * 2) as u32);
-    assert_eq!(metas[2].max_doc_id, (total_docs - 1) as u32);
     assert_eq!(metas[2].max_term_freq, 1);
+
+    // Lot C Phase 1 lever B: `posting_count`/`min_doc_id`/`max_doc_id` are
+    // no longer stored on `BlockMeta` — derived at O(1) from `doc_ids` via
+    // `doc_freq_from_block_metas()` / `block_skip_list()` (also exercised
+    // by the AND-leapfrog hot path).
+    let list = dictionary
+        .postings_with_block_metas("body", "codec-sized")
+        .expect("codec-sized postings list");
+    assert_eq!(list.doc_freq_from_block_metas(), total_docs);
+    let skip_list = list
+        .block_skip_list()
+        .expect("skip list builds")
+        .expect("non-empty postings");
+    let entries = skip_list.entries();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].min_doc_id, 0);
+    assert_eq!(entries[0].max_doc_id, (FOR_BLOCK_SIZE - 1) as u32);
+    assert_eq!(entries[1].min_doc_id, FOR_BLOCK_SIZE as u32);
+    assert_eq!(entries[1].max_doc_id, (FOR_BLOCK_SIZE * 2 - 1) as u32);
+    assert_eq!(entries[2].min_doc_id, (FOR_BLOCK_SIZE * 2) as u32);
+    assert_eq!(entries[2].max_doc_id, (total_docs - 1) as u32);
 }
 
 #[test]
@@ -360,11 +381,13 @@ fn term_dictionary_runtime_postings_exposes_for_block_metadata() {
     assert_eq!(runtime_postings.freqs().len(), total_docs);
     assert_eq!(runtime_postings.block_metas().len(), 3);
     assert_eq!(runtime_postings.doc_freq_from_block_metas(), total_docs);
+    // Lot C Phase 1 lever B: per-block posting counts are no longer stored
+    // on `BlockMeta` — derived from `doc_ids().chunks(BLOCK_SIZE)` instead.
     assert_eq!(
         runtime_postings
-            .block_metas()
-            .iter()
-            .map(|meta| meta.posting_count)
+            .doc_ids()
+            .chunks(BLOCK_SIZE)
+            .map(<[_]>::len)
             .collect::<Vec<_>>(),
         vec![BLOCK_SIZE, BLOCK_SIZE, 9]
     );
@@ -407,19 +430,29 @@ fn term_dictionary_block_metas_max_freq_per_block() {
     assert_eq!(metas.len(), 3);
 
     // Block 0 covers doc_ids 0..=127 inclusive; max freq is 9 (doc 10).
-    assert_eq!(metas[0].min_doc_id, 0);
-    assert_eq!(metas[0].max_doc_id, 127);
     assert_eq!(metas[0].max_term_freq, 9);
-
     // Block 1 covers doc_ids 128..=255 inclusive; max freq is 5 (doc 200).
-    assert_eq!(metas[1].min_doc_id, 128);
-    assert_eq!(metas[1].max_doc_id, 255);
     assert_eq!(metas[1].max_term_freq, 5);
-
     // Block 2 covers doc_ids 256..=285 inclusive (partial); max freq is 7 (doc 270).
-    assert_eq!(metas[2].min_doc_id, 256);
-    assert_eq!(metas[2].max_doc_id, total_docs - 1);
     assert_eq!(metas[2].max_term_freq, 7);
+
+    // Lot C Phase 1 lever B: `min_doc_id`/`max_doc_id` are no longer
+    // stored on `BlockMeta` — derived at O(1) from `doc_ids` via
+    // `block_skip_list()`.
+    let list = dictionary
+        .postings_with_block_metas("body", "varied")
+        .expect("varied postings list");
+    let skip_list = list
+        .block_skip_list()
+        .expect("skip list builds")
+        .expect("non-empty postings");
+    let entries = skip_list.entries();
+    assert_eq!(entries[0].min_doc_id, 0);
+    assert_eq!(entries[0].max_doc_id, 127);
+    assert_eq!(entries[1].min_doc_id, 128);
+    assert_eq!(entries[1].max_doc_id, 255);
+    assert_eq!(entries[2].min_doc_id, 256);
+    assert_eq!(entries[2].max_doc_id, total_docs - 1);
 }
 
 #[test]

@@ -150,12 +150,13 @@ fn term_query_executor_uses_for_block_metadata_doc_freq_without_changing_scores(
             .expect("runtime posting");
     }
     let dictionary = builder.build();
+    // Lot C Phase 1 lever B: `BlockMeta::posting_count` is gone (derivable
+    // from `doc_ids` at O(1)) — `doc_freq_from_block_metas()` is the
+    // supported way to get the same total posting count.
     let metadata_doc_freq = dictionary
-        .block_metas("body", "runtime")
-        .expect("runtime block metas")
-        .iter()
-        .map(|meta| meta.posting_count as u64)
-        .sum::<u64>();
+        .postings_with_block_metas("body", "runtime")
+        .expect("runtime postings list")
+        .doc_freq_from_block_metas() as u64;
     assert_eq!(metadata_doc_freq, total_docs as u64);
 
     let stats = TermQueryStats::new(
