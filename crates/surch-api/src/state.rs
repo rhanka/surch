@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, RwLock},
 };
 
@@ -139,7 +139,7 @@ mod source_store {
         }
 
         /// Append `bytes` au segment, retourne `(offset, length)` pour
-        /// stocker dans le `BTreeMap<String, SourceBlob>`.
+        /// stocker dans le `BTreeMap<Arc<str>, SourceBlob>`.
         pub(super) fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
             let offset = self.next_offset;
             let length = bytes.len() as u32;
@@ -495,7 +495,14 @@ struct InMemoryIndex {
     /// gate indexation reste intact par construction. Le decode payé
     /// sur la voie search post-refresh (~5-10 µs / blob) ne touche que
     /// les ~20 docs du top-K.
-    documents: BTreeMap<String, SourceBlob>,
+    /// Lot C Phase 1 levier 3 : la clé est un `Arc<str>` PARTAGÉ avec
+    /// `document_ids` (clé) et `reverse_document_ids` (valeur) — les 3
+    /// maps portent le même buffer UTF-8 alloué UNE SEULE fois par
+    /// document, au lieu de 3 `String` dupliquées (~44 o/UID × 1,36 M ×
+    /// 2 copies redondantes sur le corpus deces). Voir
+    /// [`Self::upsert_document_deferred`] pour le point d'insertion
+    /// partagée (un seul `Arc::from`, deux `Arc::clone`).
+    documents: BTreeMap<Arc<str>, SourceBlob>,
     /// `mmap M1` — segment `source.dat` file-backed sous `TMPDIR`,
     /// pre-alloue par `posix_fallocate(64 MiB)`. Append-only pendant le
     /// bulk, truncate a 0 a la fin de `compact_after_refresh` une fois
@@ -503,8 +510,14 @@ struct InMemoryIndex {
     /// paresseusement via `Default` (un tempfile par index) ; il est
     /// supprime au `Drop` de `InMemoryIndex`.
     source_store: SourceStore,
-    document_ids: BTreeMap<String, u32>,
-    reverse_document_ids: BTreeMap<u32, String>,
+    /// Lot C Phase 1 levier 3 : clé `Arc<str>` partagée avec `documents`
+    /// (clé) et `reverse_document_ids` (valeur) — même buffer, pas de
+    /// copie des octets UTF-8 de l'UID.
+    document_ids: BTreeMap<Arc<str>, u32>,
+    /// Lot C Phase 1 levier 3 : valeur `Arc<str>` partagée avec
+    /// `documents` et `document_ids` (mêmes instances, `Arc::clone`
+    /// uniquement).
+    reverse_document_ids: BTreeMap<u32, Arc<str>>,
     next_doc_id: u32,
     mapping: IndexMapping,
     settings: Value,
@@ -705,12 +718,29 @@ impl InMemoryIndex {
     }
 
     fn upsert_document_deferred(&mut self, id: &str, source: Value) {
-        self.document_ids.entry(id.to_owned()).or_insert_with(|| {
-            let doc_id = self.next_doc_id;
-            self.next_doc_id += 1;
-            self.reverse_document_ids.insert(doc_id, id.to_owned());
-            doc_id
-        });
+        // Lot C Phase 1 levier 3 : un SEUL `Arc<str>` porte l'UID, partagé
+        // entre `documents` (clé), `document_ids` (clé) et
+        // `reverse_document_ids` (valeur) via `Arc::clone` — les 3 handles
+        // pointent sur le MEME buffer alloué une fois. `entry()` consomme
+        // toujours le buffer `Arc::from(id)` construit ci-dessous : sur un
+        // INSERT (`Entry::Vacant`) il devient la clé stockée ; sur un
+        // UPDATE (`Entry::Occupied`, id déjà présent) il est droppé et on
+        // réutilise `Arc::clone(occupied.key())` — le buffer déjà partagé
+        // par `document_ids`/`reverse_document_ids` — pour que `documents`
+        // reste aligné sur la MEME instance (partage vrai y compris sur
+        // update, pas seulement sur le chemin append-only dominant du
+        // bulk matchID).
+        let uid: Arc<str> = match self.document_ids.entry(Arc::from(id)) {
+            Entry::Vacant(entry) => {
+                let doc_id = self.next_doc_id;
+                self.next_doc_id += 1;
+                let uid = Arc::clone(entry.key());
+                self.reverse_document_ids.insert(doc_id, Arc::clone(&uid));
+                entry.insert(doc_id);
+                uid
+            }
+            Entry::Occupied(entry) => Arc::clone(entry.key()),
+        };
 
         // `mmap M1` + option B : on serialise puis on append au segment
         // `source.dat` file-backed (cf. module `source_store`). Le slot
@@ -736,7 +766,7 @@ impl InMemoryIndex {
             serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
         let (offset, length) = self.source_store.append(&serialized);
         self.documents
-            .insert(id.to_owned(), SourceBlob::OnDisk { offset, length });
+            .insert(uid, SourceBlob::OnDisk { offset, length });
     }
 
     fn delete_document(&mut self, id: &str) {
@@ -930,11 +960,13 @@ impl InMemoryIndex {
         // Itération sur les clés pour eviter une re-clone du blob ;
         // `get_mut` puis remplacement sur place via `*slot = ...` evite
         // un re-hash dans `BTreeMap`.
-        let ids: Vec<String> = self
+        // Lot C Phase 1 levier 3 : `id.clone()` clone l'`Arc<str>` partagé
+        // (bump du strong_count, pas de recopie d'octets).
+        let ids: Vec<Arc<str>> = self
             .documents
             .iter()
             .filter_map(|(id, blob)| match blob {
-                SourceBlob::OnDisk { .. } => Some(id.clone()),
+                SourceBlob::OnDisk { .. } => Some(Arc::clone(id)),
                 SourceBlob::Compressed(_) => None,
             })
             .collect();
@@ -980,7 +1012,15 @@ impl InMemoryIndex {
             .postings(field, &token)
             .into_iter()
             .flat_map(|postings| postings.map(|posting| posting.doc_id))
-            .filter_map(|doc_id| self.reverse_document_ids.get(&doc_id).cloned())
+            // Lot C Phase 1 levier 3: `reverse_document_ids` value is now a
+            // shared `Arc<str>`; `term_hits` keeps its public `Vec<String>`
+            // contract, so the public id is materialised here (bounded by
+            // the matched-doc set, not the full corpus).
+            .filter_map(|doc_id| {
+                self.reverse_document_ids
+                    .get(&doc_id)
+                    .map(|s| s.to_string())
+            })
             .collect()
     }
 
@@ -1051,7 +1091,9 @@ impl InMemoryIndex {
                 .prefix_postings(field, &normalized)
                 .map(|set| {
                     set.iter()
-                        .filter_map(|doc_id| self.reverse_document_ids.get(doc_id).cloned())
+                        .filter_map(|doc_id| {
+                            self.reverse_document_ids.get(doc_id).map(|s| s.to_string())
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -1075,7 +1117,9 @@ impl InMemoryIndex {
                 let doc_ids = self.index.term_prefix_doc_ids(field, &normalized);
                 let hits = doc_ids
                     .iter()
-                    .filter_map(|doc_id| self.reverse_document_ids.get(doc_id).cloned())
+                    .filter_map(|doc_id| {
+                        self.reverse_document_ids.get(doc_id).map(|s| s.to_string())
+                    })
                     .collect::<Vec<_>>();
                 Some(hits)
             }
@@ -1250,7 +1294,11 @@ impl InMemoryIndex {
     fn match_hits(&self, field: &str, value: &str, require_all_terms: bool) -> Vec<String> {
         self.match_hits_internal(field, value, require_all_terms)
             .into_iter()
-            .filter_map(|doc_id| self.reverse_document_ids.get(&doc_id).cloned())
+            .filter_map(|doc_id| {
+                self.reverse_document_ids
+                    .get(&doc_id)
+                    .map(|s| s.to_string())
+            })
             .collect()
     }
 
@@ -1418,7 +1466,11 @@ impl InMemoryIndex {
                 let id = self.reverse_document_ids.get(doc_id)?;
                 self.parsed_source(id).map(|source| StoredDocument {
                     index: index.to_owned(),
-                    id: id.clone(),
+                    // Lot C Phase 1 levier 3: `id` borrows the shared
+                    // `Arc<str>`; `StoredDocument::id` stays a plain
+                    // `String` (no serde `rc` feature enabled), so it is
+                    // materialised here for this hydrated document only.
+                    id: id.to_string(),
                     source,
                 })
             })
@@ -1446,7 +1498,7 @@ impl InMemoryIndex {
                         doc_id,
                         StoredDocument {
                             index: index.to_owned(),
-                            id: id.clone(),
+                            id: id.to_string(),
                             source,
                         },
                     )
@@ -2025,7 +2077,7 @@ impl AppState {
                     touched.insert(index.clone());
                     if was_present {
                         needs_full_rebuild.insert(index.clone());
-                    } else if let Some(&doc_id) = data.document_ids.get(&id) {
+                    } else if let Some(&doc_id) = data.document_ids.get(id.as_str()) {
                         new_doc_ids_per_index
                             .entry(index.clone())
                             .or_default()
@@ -2050,7 +2102,7 @@ impl AppState {
                     } else {
                         data.upsert_document_deferred(&id, source);
                         touched.insert(index.clone());
-                        if let Some(&doc_id) = data.document_ids.get(&id) {
+                        if let Some(&doc_id) = data.document_ids.get(id.as_str()) {
                             new_doc_ids_per_index
                                 .entry(index.clone())
                                 .or_default()
@@ -2187,7 +2239,7 @@ impl AppState {
             .filter_map(|(doc_id, value)| {
                 data.reverse_document_ids
                     .get(&doc_id)
-                    .map(|public_id| (public_id.clone(), value.to_owned()))
+                    .map(|public_id| (public_id.to_string(), value.to_owned()))
             })
             .collect();
         Some(projection)
@@ -2417,7 +2469,7 @@ impl AppState {
                 data.documents.keys().filter_map(move |id| {
                     data.parsed_source(id).map(|source| StoredDocument {
                         index: index.to_owned(),
-                        id: id.clone(),
+                        id: id.to_string(),
                         source,
                     })
                 })
@@ -2468,7 +2520,7 @@ impl AppState {
             .take(size)
             .map(|(id, blob)| StoredDocument {
                 index: index.to_owned(),
-                id: id.clone(),
+                id: id.to_string(),
                 // #15 + option B + `mmap M1` : parse le `_source`
                 // stocke (OnDisk -> pread, Compressed -> decode
                 // thread-local) en `Value` ; cette voie ne traite que
@@ -3079,12 +3131,47 @@ impl AppState {
     /// API-side state overhead for `index` — the bytes NOT already counted by
     /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
     /// `documents_overhead` is the per-entry overhead of `documents:
-    /// BTreeMap<String, SourceBlob>` ON TOP OF the `_source` payload (already
-    /// reported via `stored_fields_bytes`): the key `String`'s heap bytes,
-    /// l'enum discriminant + payload du `SourceBlob` (16 octets en
-    /// inline pour `OnDisk { u64, u32 }`, 16 octets `Arc<[u8]>` header
-    /// pour `Compressed`), et un coût `BTreeMap` approximatif par
-    /// entrée. `id_maps` couvre `document_ids` et `reverse_document_ids`.
+    /// BTreeMap<Arc<str>, SourceBlob>` ON TOP OF the `_source` payload
+    /// (already reported via `stored_fields_bytes`): the UID's heap bytes
+    /// + the `Arc` control-block header, l'enum discriminant + payload du
+    /// `SourceBlob` (16 octets en inline pour `OnDisk { u64, u32 }`, 16
+    /// octets `Arc<[u8]>` header pour `Compressed`), et un coût
+    /// `BTreeMap` approximatif par entrée. `id_maps` couvre `document_ids`
+    /// et `reverse_document_ids`.
+    ///
+    /// Lot C Phase 1 levier 3 : les 3 maps (`documents`, `document_ids`,
+    /// `reverse_document_ids`) partagent le MEME `Arc<str>` par UID (voir
+    /// [`InMemoryIndex::upsert_document_deferred`]) — le buffer UTF-8 de
+    /// l'UID + son en-tête `Arc` (strong/weak `AtomicUsize`, 16 octets) ne
+    /// doivent donc être comptés QU'UNE SEULE FOIS, via `documents` (la map
+    /// qui existe 1:1 avec les deux autres, y compris sur les updates —
+    /// cf. le commentaire de `upsert_document_deferred` sur la réutilisation
+    /// de l'`Arc` existant). `document_ids` et `reverse_document_ids` ne
+    /// portent plus, chacun, qu'un HANDLE vers ce même buffer : un fat
+    /// pointer `Arc<str>` (ptr + len, 16 octets) stocké inline dans le
+    /// nœud `BTreeMap`, à la place de l'ancienne `String` indépendante
+    /// (24 octets ptr+len+cap + ses propres octets UTF-8 heap-alloués).
+    /// Ce fat pointer plus petit reste absorbé dans le lump-sum
+    /// `BTREE_NODE_OVERHEAD` (déjà une approximation grossière qui ne
+    /// détaillait pas la taille inline de la clé/valeur) — inutile de
+    /// rajouter un terme fixe dédié. Ce qui compte est la SUPPRESSION du
+    /// terme `key.len()`/`value.len()` : compter les octets UTF-8 de l'UID
+    /// une deuxième et une troisième fois — comme avant ce levier, quand
+    /// chaque map détenait sa propre `String` — sur-compterait la même
+    /// mémoire 3× alors qu'elle n'est plus allouée qu'une fois : la gauge
+    /// ne refléterait pas le gain réel. Sur le corpus deces (UID matchID
+    /// du type `ins_20240113_11_01004_2`, ~22-24 octets), le gain net
+    /// attendu sur `documents_overhead + id_maps` est de l'ordre de
+    /// `2 × UID_len - ARC_HEADER` ≈ 30-32 octets/document, soit
+    /// ~40-45 MiB sur 1,36 M docs pour cette seule gauge — un plancher
+    /// conservateur : le gain RÉEL en RSS est plus élevé car cette
+    /// approximation ignore l'arrondi par classe de taille de
+    /// l'allocateur (jemalloc), qui pénalise davantage les 3 petites
+    /// allocations séparées de l'ancien design que l'unique allocation
+    /// partagée du nouveau (cf. l'estimation ~90-180 MiB côté RSS réel).
+    /// `strong_count`/`weak_count` ne sont PAS des allocations
+    /// supplémentaires (juste des compteurs dans l'en-tête déjà compté)
+    /// donc non pertinents ici.
     ///
     /// #17b: the structured index gauges only account for ~2.8 GiB of the
     /// inc1 RSS (~7.97 GiB). The remaining ~5.2 GiB is the target of this
@@ -3109,26 +3196,39 @@ impl AppState {
         // variantes (OnDisk allocate 0 sur le heap, Compressed allocate
         // les bytes deja comptes par la gauge).
         const SOURCE_BLOB_INLINE: u64 = 24;
+        // Lot C Phase 1 levier 3 : en-tête `ArcInner` (strong: AtomicUsize
+        // + weak: AtomicUsize = 16 octets sur 64 bits) du buffer `Arc<str>`
+        // partagé — compté UNE FOIS ici, avec les octets UTF-8 de l'UID.
+        // C'est un coût RÉEL et NOUVEAU par rapport à l'ancien `String`
+        // (qui n'a pas d'en-tête de comptage de références), donc on
+        // l'itemise explicitement au lieu de le laisser dans le lump-sum
+        // `BTREE_NODE_OVERHEAD`.
+        const ARC_HEADER: u64 = 16;
         let mut documents_overhead: u64 = 0;
         for key in data.documents.keys() {
             documents_overhead = documents_overhead
                 .saturating_add(BTREE_NODE_OVERHEAD)
                 .saturating_add(SOURCE_BLOB_INLINE)
+                .saturating_add(ARC_HEADER)
                 .saturating_add(key.len() as u64);
         }
-        let mut id_maps: u64 = 0;
-        for key in data.document_ids.keys() {
-            id_maps = id_maps
-                .saturating_add(BTREE_NODE_OVERHEAD)
-                .saturating_add(4)
-                .saturating_add(key.len() as u64);
-        }
-        for value in data.reverse_document_ids.values() {
-            id_maps = id_maps
-                .saturating_add(BTREE_NODE_OVERHEAD)
-                .saturating_add(4)
-                .saturating_add(value.len() as u64);
-        }
+        // Lot C Phase 1 levier 3 : `document_ids` et `reverse_document_ids`
+        // ne portent plus qu'un HANDLE (`Arc<str>` fat pointer, 16 octets)
+        // vers le buffer déjà compté ci-dessus au lieu d'une `String`
+        // indépendante (24 octets ptr+len+cap) — comme l'ancien
+        // `BTREE_NODE_OVERHEAD` ne détaillait déjà pas la taille inline de
+        // la clé/valeur (lump-sum approximatif, cf. commentaire plus haut),
+        // le fat pointer plus petit reste couvert par ce même lump-sum : on
+        // ne rajoute PAS de terme fixe supplémentaire ici. Le point qui
+        // compte est la SUPPRESSION du terme `key.len()`/`value.len()` —
+        // ces deux maps ne recopient plus les octets UTF-8 de l'UID, d'où
+        // la baisse de la gauge. Le coût par entrée est désormais CONSTANT
+        // (indépendant de la longueur de l'UID), donc une multiplication
+        // par `.len()` remplace la boucle O(n) devenue inutile.
+        const ID_MAP_ENTRY_OVERHEAD: u64 = BTREE_NODE_OVERHEAD + 4;
+        let id_maps = (data.document_ids.len() as u64)
+            .saturating_add(data.reverse_document_ids.len() as u64)
+            .saturating_mul(ID_MAP_ENTRY_OVERHEAD);
         Some((documents_overhead, id_maps))
     }
 
