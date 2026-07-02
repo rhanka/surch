@@ -3132,8 +3132,8 @@ impl AppState {
     /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
     /// `documents_overhead` is the per-entry overhead of `documents:
     /// BTreeMap<Arc<str>, SourceBlob>` ON TOP OF the `_source` payload
-    /// (already reported via `stored_fields_bytes`): the UID's heap bytes
-    /// + the `Arc` control-block header, l'enum discriminant + payload du
+    /// (already reported via `stored_fields_bytes`): the UID's heap bytes,
+    /// plus the `Arc` control-block header, l'enum discriminant + payload du
     /// `SourceBlob` (16 octets en inline pour `OnDisk { u64, u32 }`, 16
     /// octets `Arc<[u8]>` header pour `Compressed`), et un coût
     /// `BTreeMap` approximatif par entrée. `id_maps` couvre `document_ids`
