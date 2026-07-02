@@ -43,6 +43,20 @@ tikv-jemallocator = { version = "0.6", features = ["stats"] }
 # (une seule copie => feature `stats` unifiee sur le build C). La feature
 # `stats` est OBLIGATOIRE ici : le module `tikv_jemalloc_ctl::stats` est
 # gate `#[cfg(feature = "stats")]`, il n'existe pas sans elle.
+# Lot C Phase 1 : purge explicite post-`_refresh`. `tikv-jemalloc-ctl`
+# 0.6.1 n'expose AUCUN binding (sur ni sous) capable d'appeler le
+# mallctl `arena.<i>.purge` : ce mallctl est un "pur call" cote C
+# (handler `NEITHER_READ_NOR_WRITE()` dans jemalloc/src/ctl.c), qui
+# EPERM tout appel ou oldp/oldlenp/newp ne sont pas NULL / newlen != 0
+# — or `raw::read*`/`write*`/`update*` du crate ctl fixent TOUJOURS un
+# pointeur non-NULL local (meme pour `T=()`). Deja resolu de facon
+# transitive (dependance de `tikv-jemallocator` ET `tikv-jemalloc-ctl`,
+# meme version 0.6.1) : le declarer en direct ne fait qu'exposer le
+# binding FFI `mallctl` deja genere par son build script (qui gere le
+# bon nom de symbole selon prefixage jemalloc), sans reecrire
+# l'`extern "C"` a la main (fragile). Pas de feature requise : on
+# n'utilise que le coeur `mallctl`, pas le sous-module `stats`.
+tikv-jemalloc-sys = { version = "0.6" }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 libc = "0.2"
 axum = { workspace = true }
