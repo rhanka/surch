@@ -145,6 +145,127 @@ fn refresh_jemalloc_gauges() {
 #[cfg(not(target_os = "linux"))]
 fn refresh_jemalloc_gauges() {}
 
+/// Lot C Phase 1 : purge EXPLICITE et SYNCHRONE des extents jemalloc
+/// libérés par le free-storm du build aplati
+/// (`materialize_terms_and_finalize_postings`, appelé juste avant ceci
+/// par `finalize_terms_for_refresh` sur le chemin `_refresh`).
+///
+/// CONTEXTE MESURÉ : au `_refresh`, le build aplati libère ~745 MiB de
+/// heap alloué (des millions de petites `Vec` par-terme remplacées par
+/// quelques gros `Box<[T]>`), mais le RSS ne baisse que de ~376 MiB —
+/// `resident − allocated` passe de 855 à 1225 MiB et `retained`
+/// augmente de 141 MiB : jemalloc a bien commencé à rendre des pages,
+/// mais n'a pas fini de purger tout ce que le free-storm vient de
+/// libérer au moment où on lit les gauges.
+///
+/// POURQUOI UNE PURGE EXPLICITE AIDE MALGRÉ `dirty_decay_ms:0,
+/// muzzy_decay_ms:0` (cf. `Dockerfile`) : ces réglages mettent le
+/// DÉLAI de décroissance à zéro, mais la décroissance elle-même reste
+/// OPPORTUNISTE — elle s'exécute au prochain tick du thread
+/// `background_thread:true`, ou à la prochaine allocation/désallocation
+/// qui retraverse l'arène concernée. Juste après un `_refresh`, le
+/// process peut rester inactif un moment (pas de `_bulk`/recherche
+/// immédiats) : les extents fraîchement libérés par LE free-storm du
+/// build restent donc « dirty » (mappés, comptant dans le RSS) le temps
+/// que l'évènement opportuniste suivant survienne. Un appel SYNCHRONE
+/// au mallctl de purge force jemalloc à rendre ces pages au système
+/// immédiatement, sans dépendre d'une activité allocateur ultérieure.
+///
+/// API TROUVÉE (inspection de la source du crate, PAS de mémoire) :
+/// `tikv-jemalloc-ctl` 0.6.1 N'EXPOSE AUCUN binding — sûr ou même
+/// unsafe — capable d'appeler `arena.<i>.purge`. Preuve :
+/// - `~/.cargo/registry/.../tikv-jemalloc-sys-0.6.1+.../jemalloc/src/ctl.c`
+///   définit `arena_i_purge_ctl` avec la macro `NEITHER_READ_NOR_WRITE()`
+///   (même fichier, macro autour de la ligne 1797), qui fait
+///   `if (oldp != NULL || oldlenp != NULL || newp != NULL || newlen != 0)
+///   { ret = EPERM; ... }` : ce mallctl EST un pur déclencheur d'effet
+///   de bord, sans lecture ni écriture — les QUATRE paramètres doivent
+///   être NULL/0.
+/// - `~/.cargo/registry/.../tikv-jemalloc-sys-.../jemalloc/include/jemalloc/jemalloc_macros.h.in`
+///   documente l'usage exact :
+///   `mallctl("arena." STRINGIFY(MALLCTL_ARENAS_ALL) ".purge", NULL,
+///   NULL, NULL, 0)` avec `MALLCTL_ARENAS_ALL = 4096` — d'où le nom
+///   `"arena.4096.purge"` utilisé ci-dessous pour purger TOUTES les
+///   arènes en un seul appel (équivalent à `arenas.purge` sur des
+///   jemalloc plus anciens, qui n'existe plus sous ce nom en 5.3.0).
+/// - `~/.cargo/registry/.../tikv-jemalloc-ctl-0.6.1/src/raw.rs` : TOUTES
+///   les primitives (`read`, `read_mib`, `write`, `write_mib`,
+///   `update`, `update_mib`) prennent l'adresse d'une variable LOCALE
+///   pour `oldp` et/ou `newp` — jamais NULL, même pour `T = ()` (une
+///   référence Rust vers un zero-sized type reste un pointeur non-NULL
+///   bien formé). Utiliser `raw::write_mib::<()>` échouerait donc
+///   TOUJOURS avec `Err(EPERM)`, silencieusement avalé par une gestion
+///   d'erreur sans `unwrap` — un piège qui aurait fait croire à une
+///   purge fonctionnelle sans jamais purger quoi que ce soit.
+/// - `~/.cargo/registry/.../tikv-jemalloc-ctl-0.6.1/src/arenas.rs` ne
+///   modélise que `arenas::narenas` (lecture seule) ; aucun module du
+///   crate n'expose de mallctl « call pur ».
+///
+/// VOIE CHOISIE : appel direct à `tikv_jemalloc_sys::mallctl` (le
+/// binding FFI généré par le build script du crate `tikv-jemalloc-sys`,
+/// qui résout déjà le bon nom de symbole selon que jemalloc est
+/// compilé préfixé ou non — voir `#[cfg_attr(prefixed, link_name =
+/// ...)]` dans `tikv-jemalloc-sys/src/lib.rs`). Ce crate est déjà
+/// résolu de façon transitive (dépendance commune de
+/// `tikv-jemallocator` et `tikv-jemalloc-ctl`, même version 0.6.1) ; il
+/// est déclaré en dépendance directe Linux-only dans `Cargo.toml` pour
+/// y accéder sans réécrire l'`extern "C"` à la main (fragile : le nom
+/// de symbole change sous `#[cfg(prefixed)]`).
+///
+/// Appelée UNIQUEMENT sur le chemin `_refresh`
+/// (`AppState::refresh_index`), jamais sur le hot path de requête :
+/// c'est un évènement rare (un `_refresh` par batch d'indexation, pas
+/// par requête de recherche).
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub fn refresh_jemalloc_purge() {
+    // `arena.4096.purge` : 4096 = `MALLCTL_ARENAS_ALL`, purge toutes
+    // les arènes en un seul appel. Nom null-terminé requis par
+    // `mallctl`.
+    const PURGE_ALL_ARENAS: &[u8] = b"arena.4096.purge\0";
+
+    // SAFETY: `mallctl` est le point d'entrée de contrôle standard de
+    // jemalloc — ce n'est pas un déréférencement de pointeur
+    // utilisateur, juste un appel FFI vers l'allocateur déjà lié au
+    // process (jemalloc est le `#[global_allocator]` sur Linux, cf.
+    // `main.rs`). `PURGE_ALL_ARENAS` est un littéral `&'static [u8]`
+    // valide et null-terminé, converti en `*const c_char` (cast
+    // `u8` -> `i8`, même représentation mémoire). Les quatre autres
+    // arguments sont NULL/0 exactement comme documenté par jemalloc
+    // pour ce mallctl "call pur" (voir commentaire de fonction
+    // ci-dessus) : jemalloc ne lit ni n'écrit aucune valeur à travers
+    // ces pointeurs pour `arena.<i>.purge`, il déclenche seulement un
+    // effet de bord synchrone (purge des extents dirty/muzzy de
+    // chaque arène). Le retour est un `c_int` (0 = succès), vérifié
+    // ci-dessous — pas de valeur produite à faire fuiter hors de ce
+    // bloc `unsafe`.
+    let ret = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            PURGE_ALL_ARENAS.as_ptr() as *const libc::c_char,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        // Purge indisponible (jemalloc compilé sans les arènes
+        // attendues, ou toute autre erreur mallctl) : skip silencieux,
+        // comme le reste de ce module. Un `_refresh` ne doit jamais
+        // échouer à cause d'une optimisation RSS best-effort.
+        return;
+    }
+    // Purge synchrone terminée : relit les gauges jemalloc pour que
+    // `surch_jemalloc_resident_bytes` (et les autres) reflètent l'état
+    // POST-purge au prochain scrape, plutôt que le pic pré-purge
+    // (sinon la gauge resterait gonflée jusqu'à la prochaine activité
+    // allocateur qui avance l'epoch).
+    refresh_jemalloc_gauges();
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn refresh_jemalloc_purge() {}
+
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {

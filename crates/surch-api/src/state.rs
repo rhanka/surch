@@ -433,7 +433,7 @@ fn parse_source_blob(blob: &SourceBlob, store: &SourceStore) -> Value {
 use surch_search::scoring::{bm25_score, Bm25Config};
 
 use crate::scroll::ScrollTable;
-use crate::stats::{clear_memory_gauges, refresh_memory_gauges};
+use crate::stats::{clear_memory_gauges, refresh_jemalloc_purge, refresh_memory_gauges};
 
 /// Shared in-memory API state used by API handlers.
 #[derive(Clone, Default)]
@@ -1839,6 +1839,18 @@ impl AppState {
         // refresh that frees the builder is observable through the
         // `surch_index_*` Prometheus gauges.
         self.invalidate_search_cache(index);
+        // Lot C Phase 1 : `finalize_terms_for_refresh` (au-dessus, sous
+        // le write-lock) vient de droper le `PostingsBuilder` — c'est
+        // le free-storm qui libère les millions de petites `Vec`
+        // par-terme. On purge les extents jemalloc AVANT de relire les
+        // gauges (`refresh_memory_gauges` ci-dessous se termine par
+        // `refresh_jemalloc_gauges()`), pour que la mesure exposée
+        // reflète le RSS post-purge plutôt que le pic transitoire.
+        // Purge hors du lock (pas besoin du store) et jamais sur le
+        // hot path de requête : uniquement ici, sur `_refresh`, un
+        // évènement rare. Voir `stats::refresh_jemalloc_purge` pour le
+        // détail de l'API jemalloc utilisée.
+        refresh_jemalloc_purge();
         refresh_memory_gauges(self, index);
     }
 
