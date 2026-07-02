@@ -186,9 +186,11 @@ impl SubfieldColumn {
     /// entries omitted — the exact iteration contract the previous
     /// `BTreeMap<u32, String>::iter()` provided.
     pub fn iter(&self) -> impl Iterator<Item = (u32, &str)> {
-        self.codes.iter().enumerate().filter_map(|(idx, &code)| {
-            (code != Self::ABSENT).then(|| (idx as u32, self.dict[code as usize].as_ref()))
-        })
+        self.codes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &code)| code != Self::ABSENT)
+            .map(|(idx, &code)| (idx as u32, self.dict[code as usize].as_ref()))
     }
 
     /// Lot C Phase 1 lever 2 memory accounting: approximate heap bytes
