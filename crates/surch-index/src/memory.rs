@@ -43,7 +43,9 @@ use crate::document_index::{DocumentIndex, FieldLengthStats};
 /// caveats.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryUsage {
-    /// Inverted index: per-term `Vec<Posting>` chained from the FST.
+    /// Inverted index: the flat `postings_flat` + `doc_ids_flat` buffers
+    /// (Lot C Phase 1 — one `Box<[T]>` per field, CSR-indexed by the FST)
+    /// plus the term strings themselves.
     pub postings_bytes: u64,
     /// A6 prefix side-table: `field -> prefix -> BTreeSet<doc_id>`.
     pub prefix_postings_bytes: u64,
@@ -58,8 +60,12 @@ pub struct MemoryUsage {
     /// Per-field BM25 length stats (`doc_count`, `avg_doc_len`, and
     /// the per-doc length map when norms are enabled).
     pub field_stats_bytes: u64,
-    /// Per-term block-meta vectors that back the Block-Max WAND
-    /// scoring path (one `Vec<BlockMeta>` per term).
+    /// DEPRECATED, always 0. Used to re-walk per-term block-meta vectors
+    /// (Block-Max WAND scoring metadata) and double-count the exact same
+    /// bytes [`Self::block_metas_bytes`] reports (Lot C Phase 1 bonus fix,
+    /// ~125 MiB double count on the deces 1.36 M corpus). Kept as a field
+    /// (rather than removed) so existing dashboards/tests that read
+    /// `term_stats_bytes` keep resolving. Use `block_metas_bytes` instead.
     pub term_stats_bytes: u64,
     /// #17: per-field FST term-dictionary bytes (held in memory as the
     /// serialized FST byte string).
@@ -175,36 +181,28 @@ struct DocumentIndexAccounting {
     term_stats_bytes: u64,
 }
 
+/// Lot C Phase 1: `FieldPostings` flattened its per-term `Vec<Posting>` /
+/// `Vec<u32>` / `Vec<BlockMeta>` into one `Box<[T]>` per field (see
+/// `crate::postings`), so the historical walker here — one FST point
+/// lookup (`doc_index.postings(field, term)`) PLUS one O(df) count PER
+/// TERM, plus a second per-term `doc_index.block_metas(field, term)`
+/// lookup — is now redundant: [`DocumentIndex::postings_bytes`] already
+/// sums the flat buffer lengths directly (O(fields), no per-term FST
+/// round-trip), and is numerically identical to the old walker's total
+/// (same term-byte + posting + doc_id counts).
+///
+/// `term_stats_bytes` used to re-walk `block_metas(field, term)` and
+/// re-sum the exact same bytes [`DocumentIndex::block_metas_bytes`]
+/// already reports — a straight double count (~125 MiB on the deces
+/// 1.36 M corpus). `block_metas_bytes` is the single source of truth now
+/// ([`crate::postings::TermDictionary::block_metas_bytes`]); this
+/// component is hard-wired to 0 rather than removed, so existing
+/// dashboards/tests that read `MemoryUsage::term_stats_bytes` keep
+/// resolving the field (just always 0).
 fn accounting_from_postings(doc_index: &DocumentIndex) -> DocumentIndexAccounting {
-    use crate::postings::BlockMeta;
-    let mut postings_bytes: u64 = 0;
-    let mut term_stats_bytes: u64 = 0;
-    let posting_size = size_of::<crate::postings::Posting>() as u64;
-    let block_meta_size = size_of::<BlockMeta>() as u64;
-
-    for field in doc_index.field_names() {
-        for term in doc_index.terms(&field) {
-            postings_bytes += term.len() as u64;
-            if let Some(postings) = doc_index.postings(&field, &term) {
-                // Optimisation #9: postings are flat `Copy` structs
-                // (`{doc_id, freq}`) — no per-posting heap `Vec<u32>` of
-                // positions anymore, so the whole posting list cost is just
-                // count * posting_size.
-                let count = postings.count() as u64;
-                postings_bytes += count.saturating_mul(posting_size);
-                // Parallel compact doc_id channel (the conjunction leapfrog
-                // walks it): `count * size_of::<u32>()`, index-aligned.
-                postings_bytes += count.saturating_mul(size_of::<u32>() as u64);
-            }
-            if let Some(metas) = doc_index.block_metas(&field, &term) {
-                term_stats_bytes += (metas.len() as u64).saturating_mul(block_meta_size);
-            }
-        }
-    }
-
     DocumentIndexAccounting {
-        postings_bytes,
-        term_stats_bytes,
+        postings_bytes: doc_index.postings_bytes(),
+        term_stats_bytes: 0,
     }
 }
 
@@ -290,7 +288,12 @@ mod tests {
             .expect("doc 2");
         let usage = document_index_memory_usage(&index);
         assert!(usage.postings_bytes > 0);
-        assert!(usage.term_stats_bytes > 0);
+        // Lot C Phase 1 bonus: `term_stats_bytes` used to double-count the
+        // exact same bytes `block_metas_bytes` reports (both walked the
+        // same per-term `BlockMeta` data); it is now hard-wired to 0 and
+        // `block_metas_bytes` is the single source of truth.
+        assert_eq!(usage.term_stats_bytes, 0);
+        assert!(usage.block_metas_bytes > 0);
         assert!(usage.field_stats_bytes > 0);
         // Stored fields live outside DocumentIndex.
         assert_eq!(usage.stored_fields_bytes, 0);

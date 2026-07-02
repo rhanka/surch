@@ -193,35 +193,101 @@ impl PostingsBuilder {
             // construction. If they ever do fire it means we passed
             // the input invariant, which is a programmer bug.
             let mut builder = MapBuilder::memory();
-            let mut postings: Vec<Vec<Posting>> = Vec::with_capacity(terms.len());
-            let mut doc_ids: Vec<Vec<u32>> = Vec::with_capacity(terms.len());
-            let mut block_metas: Vec<Vec<BlockMeta>> = Vec::with_capacity(terms.len());
-            let mut roaring: Vec<Option<RoaringDocSet>> = Vec::with_capacity(terms.len());
+
+            // --- Pass 1 (Lot C Phase 1 — flatten `FieldPostings`) -------
+            // Read-only pass over `terms` (nothing is moved out yet) to
+            // size the flat buffers EXACTLY: Σdf for `postings_flat` /
+            // `doc_ids_flat`, Σblocks for `block_metas_flat`, and the
+            // term count for the CSR offset tables (`T + 1` entries).
+            // Exact sizing means `Vec::with_capacity` never triggers a
+            // geometric-growth reallocation below, so the final
+            // `into_boxed_slice()` is a plain, slack-free conversion.
+            let term_count = terms.len();
+            let total_postings: usize = terms.values().map(Vec::len).sum();
+            let total_blocks: usize = terms
+                .values()
+                .map(|postings| postings.len().div_ceil(BLOCK_SIZE))
+                .sum();
+
+            let mut postings_flat: Vec<Posting> = Vec::with_capacity(total_postings);
+            let mut doc_ids_flat: Vec<u32> = Vec::with_capacity(total_postings);
+            let mut block_metas_flat: Vec<BlockMeta> = Vec::with_capacity(total_blocks);
+            let mut offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
+            let mut block_offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
+            // Sparse side table: only terms with df > TERM_ROARING_THRESHOLD
+            // get an entry, so there is no useful exact size to precompute;
+            // `shrink_to_fit()` right before insertion below removes the
+            // geometric-growth slack instead.
+            let mut roaring: Vec<(u32, RoaringDocSet)> = Vec::new();
+            offsets.push(0);
+            block_offsets.push(0);
+
+            // --- Pass 2: fill, draining `terms` term-by-term ------------
+            // Transitory-peak mitigation (risk #1 of the flattening): a
+            // naive "collect everything into Vec<Vec<_>>, then flatten"
+            // would briefly hold BOTH the fully-populated builder map AND
+            // the fully-populated flat buffers in RAM at once — doubling
+            // the peak for the duration of the flatten. Instead,
+            // `terms.into_iter()` DRAINS the per-field
+            // `BTreeMap<String, Vec<Posting>>` one entry at a time: each
+            // term's source `Vec<Posting>` is moved into `term_postings`
+            // below and consumed by `postings_flat.extend(term_postings)`
+            // at the end of the loop body, which frees that source Vec's
+            // heap allocation as soon as its bytes have been copied into
+            // the flat buffer. RAM therefore grows monotonically toward
+            // `total_postings`, it never double-peaks.
             for (idx, (term, term_postings)) in terms.into_iter().enumerate() {
                 builder
                     .insert(term.as_bytes(), idx as u64)
                     .expect("fst::MapBuilder accepts lex-sorted keys");
+
                 // Per-block stats are computed once here, against the
                 // ascending-doc_id postings, then read back in O(1) by
                 // `maxscore_match` instead of being recomputed at every
                 // query.
-                block_metas.push(build_block_metas(&term_postings));
+                block_metas_flat.extend(build_block_metas(&term_postings));
+                debug_assert!(
+                    block_metas_flat.len() <= u32::MAX as usize,
+                    "block_metas_flat offset overflowed u32 — switch block_offsets to u64 \
+                     (only relevant well past matchID's 1.36M-doc scale)"
+                );
+                block_offsets.push(block_metas_flat.len() as u32);
+
                 // Compact doc_id channel for the conjunction leapfrog (same
-                // ascending order as `term_postings`, so index-aligned).
-                let term_doc_ids: Vec<u32> =
-                    term_postings.iter().map(|posting| posting.doc_id).collect();
+                // ascending order as `term_postings`, so index-aligned with
+                // the `postings_flat` slice pushed below).
+                let doc_ids_start = doc_ids_flat.len();
+                doc_ids_flat.extend(term_postings.iter().map(|posting| posting.doc_id));
+
                 // A1: precompute a roaring/hybrid bitmap for high-`df` terms so
                 // the conjunction of two common terms ANDs word-parallel bitmaps
                 // instead of walking O(df_rare) scalar-ly. Below the threshold
-                // the galloping leapfrog already wins, so we skip the RAM.
-                roaring.push(if term_doc_ids.len() > TERM_ROARING_THRESHOLD {
-                    Some(RoaringDocSet::from_sorted(&term_doc_ids))
-                } else {
-                    None
-                });
-                doc_ids.push(term_doc_ids);
-                postings.push(term_postings);
+                // the galloping leapfrog already wins, so we skip the RAM. We
+                // iterate `idx` in strictly increasing order (the drained
+                // `BTreeMap` yields terms in FST order), so appending here
+                // keeps `roaring` sorted by term idx for free — `lookup`
+                // below can `binary_search` it directly.
+                if term_postings.len() > TERM_ROARING_THRESHOLD {
+                    roaring.push((
+                        idx as u32,
+                        RoaringDocSet::from_sorted(&doc_ids_flat[doc_ids_start..]),
+                    ));
+                }
+
+                // AoS postings channel. `extend` consumes `term_postings` by
+                // value — this is the last use of the source `Vec<Posting>`
+                // the drained `BTreeMap` entry owned, so it is freed right
+                // here (see the transitory-peak mitigation note above).
+                postings_flat.extend(term_postings);
+                debug_assert!(
+                    postings_flat.len() <= u32::MAX as usize,
+                    "postings_flat offset overflowed u32 — switch offsets to u64 \
+                     (only relevant well past matchID's 1.36M-doc scale)"
+                );
+                offsets.push(postings_flat.len() as u32);
             }
+            roaring.shrink_to_fit();
+
             let bytes = builder
                 .into_inner()
                 .expect("fst::MapBuilder memory writer never fails I/O");
@@ -230,9 +296,11 @@ impl PostingsBuilder {
                 field,
                 FieldPostings {
                     fst,
-                    postings,
-                    doc_ids,
-                    block_metas,
+                    postings_flat: postings_flat.into_boxed_slice(),
+                    doc_ids_flat: doc_ids_flat.into_boxed_slice(),
+                    block_metas_flat: block_metas_flat.into_boxed_slice(),
+                    offsets: offsets.into_boxed_slice(),
+                    block_offsets: block_offsets.into_boxed_slice(),
                     roaring,
                 },
             );
@@ -242,60 +310,119 @@ impl PostingsBuilder {
     }
 }
 
-/// Per-field FST term dictionary plus a `Vec<Vec<Posting>>` indexed by
-/// the FST output (a `u64` we narrow to `usize`). The FST shares
-/// prefixes between terms (e.g. all the "rue de la X" or "DUPONT"
-/// variants in a French civic address corpus) which is where the RAM
-/// gain comes from compared to the previous `BTreeMap<String, …>`.
+/// Per-field FST term dictionary plus FLAT postings buffers indexed by
+/// the FST output (a `u64` we narrow to `usize`) through CSR-style offset
+/// tables. The FST shares prefixes between terms (e.g. all the "rue de la
+/// X" or "DUPONT" variants in a French civic address corpus) which is
+/// where the RAM gain comes from compared to the historical
+/// `BTreeMap<String, …>`.
+///
+/// Lot C Phase 1: `postings`/`doc_ids`/`block_metas` used to be one
+/// `Vec<Posting>` / `Vec<u32>` / `Vec<BlockMeta>` PER TERM (a `Vec<Vec<T>>`
+/// indexed by FST idx). On the deces 1.36 M-doc corpus that is millions of
+/// small heap allocations, each paying a ~24-56 B allocator header plus up
+/// to ~50 % geometric-growth slack. They are now ONE allocation per field
+/// per channel: every term's postings/doc_ids/block_metas are concatenated,
+/// in FST idx order, into `postings_flat` / `doc_ids_flat` /
+/// `block_metas_flat`, and `offsets` / `block_offsets` are CSR index
+/// tables (`len == T + 1`) such that term `i`'s slice is
+/// `buf[offsets[i]..offsets[i+1]]`. This recovers the per-term Vec header
+/// overhead and slack while keeping the exact same bytes in the exact
+/// same order — `lookup*` below hand back sub-slices of the shared
+/// buffers, zero-copy, same lifetime as `&self`.
 #[derive(Debug, Clone)]
 pub struct FieldPostings {
     fst: Map<Vec<u8>>,
-    postings: Vec<Vec<Posting>>,
-    /// Parallel to `postings` (same FST index): just the `doc_id` of each
-    /// posting, in the same ascending order. The conjunction leapfrog scans
-    /// ONLY doc_ids (the `freq` is read by value lookup at scoring time), so a
-    /// dedicated `[u32]` channel touches half the bytes (4 vs 8/posting) of the
-    /// `[Posting]` slice — fewer cache lines on the high-`df` conjunction tail.
-    /// (Validation step toward the on-disk-codec SoA layout; the AoS
-    /// `postings` channel stays for the scoring consumers.)
-    doc_ids: Vec<Vec<u32>>,
-    /// Per-term `Vec<BlockMeta>` aligned with `postings` (same index, same
-    /// length: one inner Vec per term). Inside each term, the `BlockMeta`
-    /// at position `i` describes `postings[term_idx][i*BLOCK_SIZE ..
-    /// (i+1)*BLOCK_SIZE]`. Built once in `PostingsBuilder::build()` and
-    /// never mutated afterwards.
-    block_metas: Vec<Vec<BlockMeta>>,
-    /// Parallel to `postings` (same FST index): `Some` only for terms whose
-    /// `df > TERM_ROARING_THRESHOLD` — a roaring/hybrid bitmap of the term's
-    /// doc_ids, so a conjunction of two high-`df` terms ANDs word-parallel
-    /// bitmaps (A1, the bool/full gap-closer) instead of a scalar O(df) walk.
-    /// `None` for low-`df` terms (the galloping leapfrog handles them).
-    roaring: Vec<Option<RoaringDocSet>>,
+    /// All terms' postings concatenated, in FST idx order, ascending
+    /// `doc_id` within each term (same order as the historical per-term
+    /// `Vec<Posting>`). Exactly `Σdf` long — sized once in
+    /// `PostingsBuilder::build()`'s pass 1, so `capacity == len` and this
+    /// `Box<[Posting]>` carries no growth slack.
+    postings_flat: Box<[Posting]>,
+    /// All terms' `doc_id` channel concatenated the same way, index-aligned
+    /// with `postings_flat` (same `offsets` table). The conjunction
+    /// leapfrog scans ONLY doc_ids (the `freq` is read by value lookup at
+    /// scoring time), so a dedicated `[u32]` channel touches half the bytes
+    /// (4 vs 8/posting) of the `[Posting]` slice — fewer cache lines on the
+    /// high-`df` conjunction tail. Kept as its own channel in this phase
+    /// (NOT fused into `postings_flat`; that is a separate, bench-gated
+    /// step).
+    doc_ids_flat: Box<[u32]>,
+    /// All terms' `BlockMeta` chunks concatenated, in FST idx order. Term
+    /// `i`'s blocks are `block_metas_flat[block_offsets[i]..
+    /// block_offsets[i+1]]`; inside that range, block `j` describes
+    /// `postings_flat[offsets[i] + j*BLOCK_SIZE .. offsets[i] +
+    /// min((j+1)*BLOCK_SIZE, df)]`. Built once in
+    /// `PostingsBuilder::build()` and never mutated afterwards.
+    block_metas_flat: Box<[BlockMeta]>,
+    /// CSR offsets into `postings_flat` / `doc_ids_flat`, length `T + 1`
+    /// (`T` = number of distinct terms in this field). Term `i`'s postings
+    /// are `postings_flat[offsets[i]..offsets[i+1]]` (and likewise for
+    /// `doc_ids_flat`, which shares the same offsets since both channels
+    /// are index-aligned). `offsets[0] == 0` and `offsets[T] ==
+    /// postings_flat.len()`. `u32` is enough for matchID's 1.36 M docs;
+    /// `PostingsBuilder::build()` carries a `debug_assert` that the
+    /// cumulative count fits, with a comment on switching to `u64` if a
+    /// future corpus needs more than ~4.29 B total postings in one field.
+    offsets: Box<[u32]>,
+    /// CSR offsets into `block_metas_flat`, length `T + 1`, same shape as
+    /// `offsets` but for the (coarser) block-meta channel.
+    block_offsets: Box<[u32]>,
+    /// SPARSE side table: only terms whose `df > TERM_ROARING_THRESHOLD`
+    /// get an entry — `(term_idx, bitmap)`, sorted ascending by `term_idx`
+    /// (built that way, see `PostingsBuilder::build()`) so `lookup` can
+    /// `binary_search_by_key` it in O(log terms_over_threshold) instead of
+    /// paying one `Vec` slot per LOW-df term the way the historical
+    /// `Vec<Option<RoaringDocSet>>` (one slot per term, `None` almost
+    /// everywhere) did.
+    roaring: Vec<(u32, RoaringDocSet)>,
 }
 
 impl FieldPostings {
-    fn lookup(&self, term: &str) -> Option<&[Posting]> {
+    /// Resolve `term` through the FST, then the term's `[start, end)` range
+    /// in the CSR `offsets` table. Shared by every `lookup*` method below.
+    fn term_range(&self, term: &str) -> Option<(usize, usize, usize)> {
         let idx = self.fst.get(term.as_bytes())? as usize;
-        self.postings.get(idx).map(Vec::as_slice)
+        let start = *self.offsets.get(idx)? as usize;
+        let end = *self.offsets.get(idx + 1)? as usize;
+        Some((idx, start, end))
+    }
+
+    fn lookup(&self, term: &str) -> Option<&[Posting]> {
+        let (_, start, end) = self.term_range(term)?;
+        self.postings_flat.get(start..end)
     }
 
     fn lookup_block_metas(&self, term: &str) -> Option<&[BlockMeta]> {
         let idx = self.fst.get(term.as_bytes())? as usize;
-        self.block_metas.get(idx).map(Vec::as_slice)
+        let start = *self.block_offsets.get(idx)? as usize;
+        let end = *self.block_offsets.get(idx + 1)? as usize;
+        self.block_metas_flat.get(start..end)
+    }
+
+    /// Sparse roaring lookup by FST term idx: `binary_search_by_key` over
+    /// the `(term_idx, bitmap)` side table (ascending by construction).
+    fn lookup_roaring(&self, term_idx: u32) -> Option<&RoaringDocSet> {
+        self.roaring
+            .binary_search_by_key(&term_idx, |(idx, _)| *idx)
+            .ok()
+            .map(|pos| &self.roaring[pos].1)
     }
 
     fn lookup_with_block_metas(&self, term: &str) -> Option<PostingsList<'_>> {
-        let idx = self.fst.get(term.as_bytes())? as usize;
+        let (idx, start, end) = self.term_range(term)?;
+        let block_start = *self.block_offsets.get(idx)? as usize;
+        let block_end = *self.block_offsets.get(idx + 1)? as usize;
         Some(PostingsList {
-            postings: self.postings.get(idx)?.as_slice(),
-            doc_ids: self.doc_ids.get(idx)?.as_slice(),
-            block_metas: self.block_metas.get(idx)?.as_slice(),
-            roaring: self.roaring.get(idx).and_then(Option::as_ref),
+            postings: self.postings_flat.get(start..end)?,
+            doc_ids: self.doc_ids_flat.get(start..end)?,
+            block_metas: self.block_metas_flat.get(block_start..block_end)?,
+            roaring: self.lookup_roaring(idx as u32),
         })
     }
 
     fn sorted_terms(&self) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.postings.len());
+        let mut out = Vec::with_capacity(self.offsets.len().saturating_sub(1));
         let mut stream = self.fst.stream().into_stream();
         while let Some((bytes, _)) = stream.next() {
             // Terms entered the FST as UTF-8 (analyzed tokens are
@@ -324,12 +451,14 @@ impl FieldPostings {
         }
         let mut stream = builder.into_stream();
         while let Some((_, idx)) = stream.next() {
-            let Some(term_postings) = self.postings.get(idx as usize) else {
+            let idx = idx as usize;
+            let Some((&start, &end)) = self.offsets.get(idx).zip(self.offsets.get(idx + 1)) else {
                 continue;
             };
-            for posting in term_postings {
-                out.insert(posting.doc_id);
-            }
+            let Some(term_doc_ids) = self.doc_ids_flat.get(start as usize..end as usize) else {
+                continue;
+            };
+            out.extend(term_doc_ids.iter().copied());
         }
         out
     }
@@ -427,48 +556,89 @@ impl TermDictionary {
     }
 
     /// #17 memory accounting: total bytes held by the precomputed roaring
-    /// bitmaps (high-`df` terms only).
+    /// bitmaps (high-`df` terms only). Lot C Phase 1: `roaring` is now the
+    /// sparse `Vec<(u32, RoaringDocSet)>` side table (one entry per
+    /// over-threshold term, no more `None` slots for the rest), so this is
+    /// a flat sum over its entries instead of a `flat_map` + `filter_map`
+    /// over a dense `Vec<Option<RoaringDocSet>>`.
     pub fn roaring_bytes(&self) -> u64 {
         self.fields
             .values()
             .flat_map(|fp| fp.roaring.iter())
-            .filter_map(|r| r.as_ref().map(|set| set.memory_bytes() as u64))
+            .map(|(_, set)| set.memory_bytes() as u64)
             .sum()
     }
 
-    /// #17 memory accounting: total bytes held by per-term `Vec<BlockMeta>`
-    /// (the BMW block-skip metadata stored alongside the postings).
+    /// #17 memory accounting: total bytes held by the flat `block_metas_flat`
+    /// buffer across every field (the BMW block-skip metadata stored
+    /// alongside the postings). Lot C Phase 1: one `Box<[BlockMeta]>` per
+    /// field replaces the historical per-term `Vec<BlockMeta>`, so this is
+    /// now `field.block_metas_flat.len() * size_of::<BlockMeta>()` summed
+    /// over fields instead of walking every term's inner Vec.
+    ///
+    /// This is the SINGLE source of truth for block-meta bytes — see
+    /// [`MemoryUsage::term_stats_bytes`] in `surch-index::memory`, which
+    /// used to recompute the exact same bytes a second time (double
+    /// counting ~125 MiB on the deces 1.36 M corpus) and is now hard-wired
+    /// to 0.
     pub fn block_metas_bytes(&self) -> u64 {
         let meta_size = std::mem::size_of::<BlockMeta>() as u64;
         self.fields
             .values()
-            .flat_map(|fp| fp.block_metas.iter())
-            .map(|metas| metas.len() as u64 * meta_size)
+            .map(|fp| fp.block_metas_flat.len() as u64 * meta_size)
             .sum()
     }
 
-    /// #17c memory accounting: capacity SLACK on the per-term `Vec<Posting>`
-    /// and `Vec<u32>` channels — the bytes allocated but unused after the
-    /// builder finalized (the standard Vec geometric growth leaves up to
-    /// ~50 % slack on the last reallocation). Walks every term's inner
-    /// vec, sums `(capacity - len) * sizeof(item)`. Read-only, O(terms).
+    /// Lot C Phase 1 memory accounting: real on-heap bytes of the flat
+    /// postings buffers — term strings (read back from the FST) +
+    /// `postings_flat` + `doc_ids_flat`, summed over fields. Replaces the
+    /// old `surch-index::memory::accounting_from_postings` walker, which
+    /// paid one FST point-lookup per term (`doc_index.postings(field,
+    /// term)`) plus an O(df) count just to re-derive numbers that are now
+    /// directly available as buffer lengths. Numerically identical to the
+    /// old walker's `postings_bytes` total (same term-byte + posting +
+    /// doc_id counts), just computed without the redundant per-term FST
+    /// round-trips.
+    pub fn postings_bytes(&self) -> u64 {
+        let posting_size = std::mem::size_of::<Posting>() as u64;
+        let doc_id_size = std::mem::size_of::<u32>() as u64;
+        self.fields
+            .values()
+            .map(|fp| {
+                let mut term_bytes = 0u64;
+                let mut stream = fp.fst.stream().into_stream();
+                while let Some((bytes, _)) = stream.next() {
+                    term_bytes += bytes.len() as u64;
+                }
+                term_bytes
+                    + (fp.postings_flat.len() as u64).saturating_mul(posting_size)
+                    + (fp.doc_ids_flat.len() as u64).saturating_mul(doc_id_size)
+            })
+            .sum()
+    }
+
+    /// #17c memory accounting: capacity SLACK across the postings buffers.
+    /// Lot C Phase 1 flattened `postings`/`doc_ids`/`block_metas`/`offsets`/
+    /// `block_offsets` from per-term `Vec<T>` (millions of small
+    /// allocations, each with up to ~50 % geometric-growth slack) into one
+    /// `Box<[T]>` PER FIELD, sized EXACTLY by `PostingsBuilder::build()`'s
+    /// two-pass sizing. A boxed slice has no spare capacity by
+    /// construction, so those five channels now contribute exactly 0. The
+    /// sparse `roaring` side table is the one remaining `Vec` (it grows by
+    /// `push` while draining, since its final size is not worth a separate
+    /// counting pass) — `shrink_to_fit()` is called on it at the end of
+    /// `build()`, so in steady state this whole gauge is ~0. Kept as a
+    /// real computation rather than a hardcoded 0 so it still catches a
+    /// future regression that reintroduces slack. Read-only, O(fields).
     pub fn postings_capacity_slack_bytes(&self) -> u64 {
-        let post = std::mem::size_of::<Posting>() as u64;
-        let doc_id = std::mem::size_of::<u32>() as u64;
-        let mut total: u64 = 0;
-        for fp in self.fields.values() {
-            for v in &fp.postings {
-                total = total.saturating_add(
-                    (v.capacity().saturating_sub(v.len()) as u64).saturating_mul(post),
-                );
-            }
-            for v in &fp.doc_ids {
-                total = total.saturating_add(
-                    (v.capacity().saturating_sub(v.len()) as u64).saturating_mul(doc_id),
-                );
-            }
-        }
-        total
+        let entry_size = std::mem::size_of::<(u32, RoaringDocSet)>() as u64;
+        self.fields
+            .values()
+            .map(|fp| {
+                (fp.roaring.capacity().saturating_sub(fp.roaring.len()) as u64)
+                    .saturating_mul(entry_size)
+            })
+            .sum()
     }
 
     /// A6 phase 3: union of doc ids across every term of `field` whose
