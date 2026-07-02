@@ -221,16 +221,18 @@ fn prefix_postings_bytes(doc_index: &DocumentIndex) -> u64 {
     total
 }
 
+/// Lot C Phase 1 lever 2: `SubfieldColumn` replaced the inner
+/// `BTreeMap<u32, String>` with a dict-interned dense column (see
+/// `crate::document_index::SubfieldColumn` docs). Per-column accounting
+/// (dict + codes + the write-time intern index) is delegated to
+/// `SubfieldColumn::memory_bytes`; this walker just sums it across the
+/// outer `field -> column` map plus the path-string overhead.
 fn subfield_values_bytes(doc_index: &DocumentIndex) -> u64 {
-    let pair_overhead = (size_of::<u32>() + size_of::<String>()) as u64;
     let mut total: u64 = 0;
-    for (field, by_doc) in doc_index.subfield_values_map().iter() {
+    for (field, column) in doc_index.subfield_values_map().iter() {
         total += field.len() as u64;
         total += size_of::<String>() as u64;
-        for value in by_doc.values() {
-            total += pair_overhead;
-            total += value.len() as u64;
-        }
+        total += column.memory_bytes();
     }
     total
 }

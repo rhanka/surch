@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -55,16 +55,29 @@ pub struct DocumentIndex {
     /// sub-field's analyzer/normalizer already applied (see
     /// [`subfield_terms`]).
     ///
-    /// Outer key is the qualified field path (`"NOM.raw"`), inner key is the
-    /// doc id, value is the normalized token. This is the durable storage
-    /// the query side (`sort: NOM.raw`, `agg.cardinality` on `.raw`) reads
-    /// directly, instead of aliasing the sub-field path back to the parent's
-    /// `_source` and normalizing on read. Sub-field tokens are ALSO indexed
-    /// into the regular postings (under the same qualified path) so a
-    /// `term`/`match` on the sub-field resolves through the FST like any
-    /// other field. This side-table only holds the per-doc projected value
-    /// for the read paths that need a stored value rather than postings.
-    subfield_values: BTreeMap<String, BTreeMap<u32, String>>,
+    /// Outer key is the qualified field path (`"NOM.raw"`). This is the
+    /// durable storage the query side (`sort: NOM.raw`, `agg.cardinality` on
+    /// `.raw`) reads directly, instead of aliasing the sub-field path back
+    /// to the parent's `_source` and normalizing on read. Sub-field tokens
+    /// are ALSO indexed into the regular postings (under the same qualified
+    /// path) so a `term`/`match` on the sub-field resolves through the FST
+    /// like any other field. This side-table only holds the per-doc
+    /// projected value for the read paths that need a stored value rather
+    /// than postings.
+    ///
+    /// Lot C Phase 1 lever 2: was `BTreeMap<String, BTreeMap<u32, String>>`
+    /// — on the matchID deces 1.36 M corpus (4 sub-fields × ~1.36 M docs)
+    /// that is ~4 M `BTreeMap` nodes (48 B/node) PLUS one heap `String`
+    /// allocation per entry, for values that are extremely repetitive
+    /// French surnames/given names/prefixes. [`SubfieldColumn`] replaces
+    /// the inner `BTreeMap<u32, String>` with a dense `Vec<u32>` indexed
+    /// directly by `doc_id` (mirrors the `doc_len_dense` pattern in
+    /// [`FieldLengthStats`]: same resize-on-write growth, `u32::MAX` as the
+    /// "absent" sentinel instead of `0`) plus a deduplicated `Vec<Box<str>>`
+    /// dictionary of the distinct values (dict-interning). Measured gain:
+    /// ~200-400 MiB of jemalloc-resident heap on the deces corpus (see
+    /// `docs/paper/` Lot C Phase 1 notes).
+    subfield_values: BTreeMap<String, SubfieldColumn>,
     /// Track A `wp-a-perf-followups.md` Lot 1.6: deferred-FST-build flag.
     /// `true` when `postings_builder` has accumulated writes that the
     /// `terms` FST does not yet reflect. A subsequent
@@ -82,6 +95,130 @@ pub struct DocumentIndex {
     /// `bulk_router_*` test snapshots the counter pre-bulk and asserts
     /// the rebuild count stayed ~constant across many chunks.
     terms_build_count: Arc<AtomicU64>,
+}
+
+/// Lot C Phase 1 lever 2: dense, dict-interned column backing
+/// [`DocumentIndex::subfield_values`] for ONE qualified sub-field path
+/// (`"NOM.raw"`).
+///
+/// Replaces `BTreeMap<u32, String>` (one B-tree node + one heap `String`
+/// per doc) with:
+///
+/// - `dict`: the distinct values actually seen, deduplicated. French
+///   surnames/prefixes are extremely repetitive, so `dict.len()` is
+///   orders of magnitude smaller than the doc count.
+/// - `codes`: one `u32` per `doc_id`, `u32::MAX` ([`SubfieldColumn::ABSENT`])
+///   meaning "this doc has no value for this path". Grows by
+///   resize-on-write exactly like `FieldLengthStats::doc_len_dense` — the
+///   array is only as long as the highest `doc_id` written so far, NOT
+///   bounded by the live doc count (deletes leave holes, `doc_id`s are
+///   never reused, see `surch-api::InMemoryIndex::next_doc_id`).
+/// - `intern_index`: write-time-only `value -> code` lookup so repeated
+///   `add_documents_with_mapping*` batches within the same index
+///   generation reuse the same code for a value seen before, instead of
+///   re-scanning `dict` (O(1) amortized insert instead of O(dict.len())).
+///   Its keys duplicate the SAME distinct strings already held by `dict`
+///   (one extra small allocation per DISTINCT value, not per doc), which
+///   is intentionally simple: on this workload `dict.len()` is tiny next
+///   to `codes.len()`, so the duplication is noise compared to the
+///   millions of eliminated per-doc `String`/B-tree-node allocations.
+///
+/// A doc absent from a path (parent field missing/empty for that doc)
+/// MUST stay `ABSENT`, never an interned empty string — sort/agg parity
+/// with the ES oracle depends on distinguishing "no value" from "empty
+/// string value" (flagged in the Lot C Phase 1 lever 2 triple consensus).
+#[derive(Debug, Default, Clone)]
+pub struct SubfieldColumn {
+    dict: Vec<Box<str>>,
+    codes: Vec<u32>,
+    intern_index: HashMap<Box<str>, u32>,
+}
+
+impl SubfieldColumn {
+    /// Sentinel `codes` entry meaning "no value for this doc_id".
+    pub const ABSENT: u32 = u32::MAX;
+
+    /// Record `value` for `doc_id`, interning it into `dict` (reusing the
+    /// code of an already-seen equal value). Resizes `codes` with the
+    /// `ABSENT` sentinel exactly like `FieldLengthStats::record_doc_len`
+    /// resizes `doc_len_dense` with `0` — every position between the
+    /// previous length and `doc_id` that has no explicit `set()` call
+    /// stays `ABSENT`.
+    fn set(&mut self, doc_id: u32, value: String) {
+        let code = self.intern(value);
+        let idx = doc_id as usize;
+        if idx >= self.codes.len() {
+            self.codes.resize(idx + 1, Self::ABSENT);
+        }
+        self.codes[idx] = code;
+    }
+
+    /// Returns the existing code for `value` if already interned,
+    /// otherwise allocates the next code and stores `value` in `dict`
+    /// (and, duplicated, as the `intern_index` key — see the struct docs).
+    fn intern(&mut self, value: String) -> u32 {
+        if let Some(&code) = self.intern_index.get(value.as_str()) {
+            return code;
+        }
+        debug_assert!(
+            self.dict.len() < Self::ABSENT as usize,
+            "sub-field dictionary exceeded u32::MAX - 1 distinct values"
+        );
+        let code = self.dict.len() as u32;
+        let boxed: Box<str> = value.into_boxed_str();
+        self.intern_index.insert(boxed.clone(), code);
+        self.dict.push(boxed);
+        code
+    }
+
+    /// Stored value for `doc_id`, zero-copy borrowed from `dict`. `None`
+    /// when `doc_id` is out of range or its code is the `ABSENT` sentinel.
+    pub fn get(&self, doc_id: u32) -> Option<&str> {
+        let code = *self.codes.get(doc_id as usize)?;
+        if code == Self::ABSENT {
+            None
+        } else {
+            Some(self.dict[code as usize].as_ref())
+        }
+    }
+
+    /// `(doc_id, value)` pairs in ascending `doc_id` order, `ABSENT`
+    /// entries omitted — the exact iteration contract the previous
+    /// `BTreeMap<u32, String>::iter()` provided.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &str)> {
+        self.codes.iter().enumerate().filter_map(|(idx, &code)| {
+            (code != Self::ABSENT).then(|| (idx as u32, self.dict[code as usize].as_ref()))
+        })
+    }
+
+    /// Lot C Phase 1 lever 2 memory accounting: approximate heap bytes
+    /// held by this column, for [`crate::memory::document_index_memory_usage`].
+    /// `dict`: one `Box<str>` fat-pointer header (16 B on 64-bit) + UTF-8
+    /// bytes per DISTINCT value. `codes`: 4 B per `doc_id` slot (dense,
+    /// includes `ABSENT` holes — same accounting convention as
+    /// `field_stats_bytes` counting the full `doc_len_dense` slice).
+    /// `intern_index`: duplicate `Box<str>` keys over the same distinct
+    /// values as `dict`, plus a conservative per-entry hash-table
+    /// overhead — bounded by `dict.len()`, negligible next to `codes`.
+    pub fn memory_bytes(&self) -> u64 {
+        let box_str_header = std::mem::size_of::<Box<str>>() as u64;
+        let dict_bytes: u64 = self
+            .dict
+            .iter()
+            .map(|value| box_str_header + value.len() as u64)
+            .sum();
+        let codes_bytes = self.codes.len() as u64 * std::mem::size_of::<u32>() as u64;
+        // Conservative per-entry overhead for the `HashMap` bucket
+        // metadata (hash + control byte + pointer-sized slack), on top of
+        // the duplicated `Box<str>` key.
+        let intern_entry_overhead = box_str_header + std::mem::size_of::<u32>() as u64 + 16;
+        let intern_bytes: u64 = self
+            .intern_index
+            .keys()
+            .map(|value| intern_entry_overhead + value.len() as u64)
+            .sum();
+        dict_bytes + codes_bytes + intern_bytes
+    }
 }
 
 /// Lucene-compatible 1-byte length quantization used by [`FieldLengthStats`]
@@ -692,7 +829,7 @@ impl DocumentIndex {
             self.subfield_values
                 .entry(path)
                 .or_default()
-                .insert(doc_id, stored);
+                .set(doc_id, stored);
         }
         for (field, prefix) in document.prefixes {
             self.prefix_postings
@@ -725,10 +862,7 @@ impl DocumentIndex {
     /// without re-normalizing the parent's `_source` on read. Returns `None`
     /// for top-level fields and for docs missing the sub-field value.
     pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<&str> {
-        self.subfield_values
-            .get(field_path)?
-            .get(&doc_id)
-            .map(String::as_str)
+        self.subfield_values.get(field_path)?.get(doc_id)
     }
 
     /// A10 (Phase 4): whether `field_path` carries write-time fanned-out
@@ -741,7 +875,7 @@ impl DocumentIndex {
     /// A10 (Phase 4): the full per-doc stored sub-field projection map.
     /// Empty when no field in the mapping declared sub-fields. Exposed for
     /// memory accounting and for the query side to enumerate projections.
-    pub fn subfield_values_map(&self) -> &BTreeMap<String, BTreeMap<u32, String>> {
+    pub fn subfield_values_map(&self) -> &BTreeMap<String, SubfieldColumn> {
         &self.subfield_values
     }
 }
