@@ -252,7 +252,12 @@ fn term_dictionary_block_metas_match_postings_chunks() {
     // Push doc_ids in scrambled order so the test exercises the
     // ascending-doc_id sort performed by `PostingsBuilder::build()`.
     for offset in 0..total_docs {
-        let doc_id = (offset * 7 + 3) % total_docs;
+        // Multiplier MUST be coprime with `total_docs` so the modulo is a
+        // bijection (distinct doc_ids). 273 = 3*7*13, so `*7` would collapse
+        // to 39 values each repeated 7x — a term with duplicate doc_ids,
+        // which `block_skip_list()` rightly rejects as non-monotonic. 11 is
+        // coprime with 273 → a permutation → distinct, valid postings.
+        let doc_id = (offset * 11 + 3) % total_docs;
         builder
             .add("body", "hit", doc_id, vec![0])
             .expect("hit posting");
