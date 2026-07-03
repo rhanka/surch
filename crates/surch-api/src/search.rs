@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 use surch_index::mapping::{AnalyzerName, FieldType, IndexMapping};
+use surch_index::postings::{BlockMeta, BLOCK_SIZE};
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
 };
@@ -1955,7 +1956,8 @@ fn run_topk_exact_bool(
 
     state.with_search_reader(&indices[0], |reader| -> Option<SearchResponse> {
         let reader = reader?;
-        let scoring_context = SearchScoringContext::new(&reader, query);
+        let mut arena = ScoringArena::default();
+        let scoring_context = SearchScoringContext::new(&reader, query, &mut arena);
         let cmp = |a: &(f64, u32), b: &(f64, u32)| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -2251,7 +2253,8 @@ fn topk_scored_documents_inner(
         return Some((Vec::new(), total));
     }
 
-    let scoring_context = SearchScoringContext::new(reader, query);
+    let mut arena = ScoringArena::default();
+    let scoring_context = SearchScoringContext::new(reader, query, &mut arena);
 
     // MaxScore-style skipping for OR-Match queries: iterate tokens from
     // highest to lowest max BM25 contribution. Once the top-K threshold
@@ -2728,7 +2731,8 @@ fn score_documents(
                 .collect();
         };
 
-        let scoring_context = SearchScoringContext::new(&reader, query);
+        let mut arena = ScoringArena::default();
+        let scoring_context = SearchScoringContext::new(&reader, query, &mut arena);
 
         // When candidate resolution already produced the internal ids (Bool /
         // Match candidate paths), they are aligned with `documents` — score
@@ -3020,6 +3024,53 @@ fn lookup_text_field(source: &Value, field: &str) -> Option<String> {
     }
 }
 
+/// Lot C `C1b` sous-pas 2 (`docs/paper/c1b-disk-backed-design-2026-07-02.md`
+/// §"Arène par requête"): query-scoped owned storage for full-term
+/// postings decoded from the disk segment, populated ONLY when
+/// [`IndexReader::postings_disk_backed`] is `true` — empty (no
+/// allocation) under the RAM engine, which never touches it.
+///
+/// Two-phase by construction, enforced by the borrow checker rather than
+/// a runtime contract: [`SearchScoringContext::new`]'s disk branch calls
+/// [`Self::decode`] (takes `&mut self`) for every needed term FIRST,
+/// then reborrows the arena as shared (`&'a ScoringArena`, the exact
+/// `'a` [`SearchScoringContext`] carries) before calling [`Self::get`]
+/// — a plain, safe Rust "freeze" (an immutable reborrow of a `&'a mut T`
+/// parameter that outlives the function, valid because the mutable
+/// borrow is never used again afterward). That is what lets
+/// [`TermScoringView`]'s fields stay PLAIN `&'a [u32]` (unchanged from
+/// the RAM path) even though, under disk mode, `'a` now points at this
+/// arena instead of the index's read guard.
+#[derive(Debug, Default)]
+struct ScoringArena {
+    entries: Vec<(Box<[u32]>, Box<[u32]>, Box<[BlockMeta]>)>,
+}
+
+impl ScoringArena {
+    /// Decode-and-own one term's postings, returning an opaque id to
+    /// retrieve it later via [`Self::get`]. `block_metas` mirrors
+    /// `surch_index::postings::build_block_metas`'s
+    /// `chunks(BLOCK_SIZE).map(max freq)` shape (private to that crate,
+    /// so recomputed here from the already-decoded `freqs`).
+    fn decode(&mut self, doc_ids: Vec<u32>, freqs: Vec<u32>, block_metas: Vec<BlockMeta>) -> usize {
+        self.entries.push((
+            doc_ids.into_boxed_slice(),
+            freqs.into_boxed_slice(),
+            block_metas.into_boxed_slice(),
+        ));
+        self.entries.len() - 1
+    }
+
+    /// Borrow entry `id`'s three channels back out, tied to `&self`'s
+    /// lifetime. `id` is always one this SAME arena's [`Self::decode`]
+    /// just returned — [`SearchScoringContext::new`] never reads an id
+    /// from anywhere else.
+    fn get(&self, id: usize) -> (&[u32], &[u32], &[BlockMeta]) {
+        let (doc_ids, freqs, block_metas) = &self.entries[id];
+        (doc_ids, freqs, block_metas)
+    }
+}
+
 /// Per-query scoring context. Borrows everything it can from the live
 /// index through a single [`IndexReader`] guard (optimisations #7 + #8):
 ///
@@ -3047,7 +3098,12 @@ impl<'a> SearchScoringContext<'a> {
     /// statistics are read through the single search read guard the reader
     /// holds, so there is no per-token lock acquisition and no per-token
     /// posting-list copy.
-    fn new(reader: &IndexReader<'a>, query: &SearchQuery) -> Self {
+    ///
+    /// `arena` is only ever mutated (via [`ScoringArena::decode`]) when
+    /// [`IndexReader::postings_disk_backed`] is `true` — the RAM branch
+    /// below never touches it, so callers under the default (flag-off)
+    /// engine pay nothing beyond an empty `Vec`'s stack slots for it.
+    fn new(reader: &IndexReader<'a>, query: &SearchQuery, arena: &'a mut ScoringArena) -> Self {
         let mapping = reader.mapping();
         let mut field_tokens = BTreeMap::<String, BTreeSet<String>>::new();
         collect_scoring_field_tokens(query, mapping, &mut field_tokens);
@@ -3067,11 +3123,60 @@ impl<'a> SearchScoringContext<'a> {
 
         let mut term_stats_by_field =
             BTreeMap::<String, BTreeMap<String, TermScoringView<'a>>>::new();
-        for (field, tokens) in field_tokens {
-            let token_stats = term_stats_by_field.entry(field.clone()).or_default();
-            for token in tokens {
-                let view = reader.term_scoring_view(&field, &token);
-                token_stats.insert(token, view);
+        if reader.postings_disk_backed() {
+            // Lot C `C1b` sous-pas 2: disk-backed path — `reader.term_scoring_view`
+            // (the RAM branch below) reads the RAM `doc_ids_flat`/`freqs_flat`
+            // channels, intentionally empty under disk mode (see
+            // `FieldPostings`'s doc comment in surch-index). Decode every
+            // needed term's FULL postings into `arena` instead (design
+            // decision: "matérialisation terme-entier dans l'arène, simple,
+            // parité triviale" — v2 can go block-lazy here if the gate serres).
+            //
+            // Phase 1: decode (mutates `arena`), collecting each entry's id
+            // alongside its `(field, token)`.
+            let mut pending: Vec<(String, String, usize)> = Vec::new();
+            for (field, tokens) in &field_tokens {
+                for token in tokens {
+                    let Some((doc_ids, freqs)) = reader.decode_term_for_scoring(field, token)
+                    else {
+                        continue;
+                    };
+                    let block_metas: Vec<BlockMeta> = freqs
+                        .chunks(BLOCK_SIZE)
+                        .map(|chunk| BlockMeta {
+                            max_term_freq: chunk.iter().copied().max().unwrap_or(0),
+                        })
+                        .collect();
+                    let id = arena.decode(doc_ids, freqs, block_metas);
+                    pending.push((field.clone(), token.clone(), id));
+                }
+            }
+
+            // Phase 2: freeze `arena` to a shared borrow tied to the SAME
+            // `'a` the exclusive parameter carried (safe: `arena` — the
+            // `&'a mut` binding — is never used again after this point).
+            let arena: &'a ScoringArena = arena;
+
+            for (field, token, id) in pending {
+                let (doc_ids, freqs, block_metas) = arena.get(id);
+                let view = TermScoringView {
+                    doc_freq: doc_ids.len() as u64,
+                    doc_ids,
+                    freqs,
+                    block_metas,
+                };
+                term_stats_by_field
+                    .entry(field)
+                    .or_default()
+                    .insert(token, view);
+            }
+        } else {
+            for (field, tokens) in field_tokens {
+                let token_stats = term_stats_by_field.entry(field.clone()).or_default();
+                for token in tokens {
+                    let view = reader.term_scoring_view(&field, &token);
+                    token_stats.insert(token, view);
+                }
             }
         }
 
