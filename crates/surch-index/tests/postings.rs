@@ -532,32 +532,32 @@ fn postings_segment_blocked_roundtrip_matches_ram() {
 }
 
 #[test]
-fn postings_segment_tolerates_duplicate_doc_ids() {
-    // Hardening regression for the C1a-batché crash observed on the real
-    // deces corpus (1.36 M docs, bulk OK, `count: 0` after `_refresh`):
-    // a source `Value::Array` field gets exploded into several `(field,
-    // value)` pairs of the SAME doc_id upstream
-    // (`indexed_fields_for_document` in surch-api), and
-    // `PostingsBuilder::add` does not deduplicate — so a term can carry
-    // duplicate doc_ids. `encode_postings_blocked` rightly rejects that
-    // as non-monotonic once sorted (`sort_by_key` sorts, it does not
-    // dedup). The SHADOW segment write must never be able to crash
-    // indexation over this: `build()` must NOT panic, RAM must stay the
-    // fully correct source of truth (duplicates included — deduplicating
-    // them is a separate, out-of-scope fix), and only the offending
-    // term's disk coverage is dropped (sentinel descriptor), observable
-    // via the public `postings_segment_skipped_terms()` counter.
+fn postings_segment_encodes_after_duplicate_doc_ids_are_merged() {
+    // Correction fix regression for the C1a-batché crash observed on the
+    // real deces corpus (1.36 M docs, bulk OK, `count: 0` after
+    // `_refresh`): a source `Value::Array` field gets exploded into
+    // several `(field, value)` pairs of the SAME doc_id upstream
+    // (`indexed_fields_for_document` in surch-api), so the same `(field,
+    // term, doc_id)` triple can reach `PostingsBuilder::add` more than
+    // once for one document. `build()` now merges those same-doc_id runs
+    // (`dedup_merge_postings`) BEFORE the sort-derived encode below, so
+    // `encode_postings_blocked` never sees a non-monotonic doc_id from
+    // this cause any more — the SHADOW segment gets FULL disk coverage,
+    // not a sentinel, and `postings_segment_skipped_terms()` stays 0.
     let mut builder = PostingsBuilder::new();
 
-    // A normal term: gets full disk coverage, unaffected by the other
-    // term's encode failure in the same field.
+    // A normal term: unaffected by the other term's multi-valued merge
+    // in the same field.
     builder
         .add("body", "clean", 1, vec![0])
         .expect("clean posting");
 
     // A term with TWO postings for the SAME doc_id (5) — the duplicate
     // doc_id that used to make `encode_postings_blocked(...).expect(...)`
-    // panic inside `PostingsBuilder::build()`.
+    // panic inside `PostingsBuilder::build()` before the SHADOW
+    // hardening, and that the hardening used to tolerate by dropping
+    // disk coverage for the term. Positions `[0]` then `[1, 2]` mirror
+    // two source array values both containing this term.
     builder
         .add("body", "dup", 5, vec![0])
         .expect("dup posting #1");
@@ -565,17 +565,17 @@ fn postings_segment_tolerates_duplicate_doc_ids() {
         .add("body", "dup", 5, vec![1, 2])
         .expect("dup posting #2 (same doc_id as #1)");
 
-    // The panic this test guards against would fire inside `build()`.
     let dictionary = builder.build();
 
-    // RAM stays authoritative and fully correct: both postings for
-    // "dup" are present, duplicate doc_id included.
+    // RAM now holds the Lucene-shaped merge: ONE posting for doc 5, freq
+    // = 1 + 2 = 3 (total occurrences across both source values).
     let dup_postings: Vec<_> = dictionary
         .postings("body", "dup")
         .expect("dup postings")
         .collect();
-    assert_eq!(dup_postings.len(), 2);
-    assert!(dup_postings.iter().all(|posting| posting.doc_id == 5));
+    assert_eq!(dup_postings.len(), 1);
+    assert_eq!(dup_postings[0].doc_id, 5);
+    assert_eq!(dup_postings[0].freq, 3);
 
     // The unrelated "clean" term is unaffected.
     let clean_postings: Vec<_> = dictionary
@@ -585,17 +585,87 @@ fn postings_segment_tolerates_duplicate_doc_ids() {
     assert_eq!(clean_postings.len(), 1);
     assert_eq!(clean_postings[0].doc_id, 1);
 
-    // "dup" has NO disk coverage (sentinel descriptor): the SHADOW
-    // segment decode returns `None` for it...
-    assert!(dictionary.decode_from_segment("body", "dup").is_none());
-    // ...while "clean" still round-trips through the segment normally.
+    // "dup" now gets FULL disk coverage — the merge made its doc_ids
+    // strictly increasing, so the SHADOW segment round-trips it exactly
+    // like "clean".
+    let (dup_doc_ids, dup_freqs) = dictionary
+        .decode_from_segment("body", "dup")
+        .expect("dup segment decode (no longer skipped)");
+    assert_eq!(dup_doc_ids, vec![5]);
+    assert_eq!(dup_freqs, vec![3]);
     assert!(dictionary.decode_from_segment("body", "clean").is_some());
 
-    // Exactly one term failed to encode — observable through the public
-    // counter backing `surch_index_disk_postings_skipped_terms`. This is
-    // the signal that distinguishes "duplicate doc_ids" from an
-    // unrelated IO/tmpfs failure (which would leave this at 0).
-    assert_eq!(dictionary.postings_segment_skipped_terms(), 1);
+    // No term failed to encode any more — the gauge backing
+    // `surch_index_disk_postings_skipped_terms` reads 0.
+    assert_eq!(dictionary.postings_segment_skipped_terms(), 0);
+}
+
+#[test]
+fn postings_builder_dedups_multivalue_doc_id() {
+    // Direct unit test for `dedup_merge_postings`: a multi-valued source
+    // field (e.g. a `Value::Array` exploded by `indexed_fields_for_document`
+    // in surch-api into several `(field, value)` pairs of the same
+    // doc_id) can make the SAME `(field, term, doc_id)` triple reach
+    // `add` twice for one document — once per array value that contains
+    // the term. `build()` must collapse that into ONE posting per
+    // Lucene/ES multi-valued-field semantics: `df` counts the document
+    // once, `freq` (`tf`) is the total occurrence count across every
+    // value.
+    let mut builder = PostingsBuilder::new();
+
+    // Two other documents to prove the merge only touches the doc_id
+    // that actually repeats, and that ordering/doc_ids stay correct
+    // around it.
+    builder.add("name", "jean", 1, vec![0]).expect("doc 1 jean");
+    builder
+        .add("name", "jean", 10, vec![0])
+        .expect("doc 10 jean");
+
+    // Doc 5: "jean" occurs in two array values, e.g. ["Jean Pierre",
+    // "Jean Paul"] — each value's tokenization restarts positions at 0
+    // (no position_increment_gap in surch), so this is `add`-ed twice
+    // for the SAME (field="name", term="jean", doc_id=5).
+    builder
+        .add("name", "jean", 5, vec![0])
+        .expect("doc 5 jean, value #1");
+    builder
+        .add("name", "jean", 5, vec![0])
+        .expect("doc 5 jean, value #2");
+
+    let dictionary = builder.build();
+
+    let postings: Vec<_> = dictionary
+        .postings("name", "jean")
+        .expect("name/jean postings")
+        .collect();
+
+    // Exactly one posting per document: df == 3, not 4.
+    assert_eq!(postings.len(), 3);
+
+    let doc_ids: Vec<u32> = postings.iter().map(|p| p.doc_id).collect();
+    assert_eq!(doc_ids, vec![1, 5, 10]);
+    // Strictly increasing: no duplicate doc_id survives the merge.
+    assert!(doc_ids.windows(2).all(|pair| pair[0] < pair[1]));
+
+    // Doc 5's freq is the SUM of both values' occurrence counts (1 + 1 =
+    // 2) — `tf` = total occurrences, matching Lucene/ES.
+    let doc5 = postings
+        .iter()
+        .find(|p| p.doc_id == 5)
+        .expect("doc 5 posting");
+    assert_eq!(doc5.freq, 2);
+
+    // The untouched single-value docs keep freq == 1.
+    assert_eq!(postings[0].freq, 1);
+    assert_eq!(postings[2].freq, 1);
+
+    // The merge fed a strictly-increasing doc_id sequence to the FoR
+    // encoder, so the SHADOW segment gets full disk coverage for this
+    // term too — a second, end-to-end confirmation that
+    // `postings_segment_skipped_terms()` stays 0 after a multi-valued
+    // merge.
+    assert!(dictionary.decode_from_segment("name", "jean").is_some());
+    assert_eq!(dictionary.postings_segment_skipped_terms(), 0);
 }
 
 #[test]

@@ -39,7 +39,7 @@ use postings_segment::PostingsSegment;
 /// real deces corpus (1.36 M docs) once paniced inside `build()` because
 /// `encode_postings_blocked` legitimately rejects duplicate doc_ids
 /// (`Value::Array` fields explode into several same-doc_id postings
-/// upstream, and `PostingsBuilder::add` does not deduplicate) and the
+/// upstream, and `PostingsBuilder::add` used to not deduplicate) and the
 /// call site used to `.expect()` that away. Since a SHADOW feature must
 /// never be able to crash indexation, every failure mode here — tempfile
 /// creation, a term's encode, a field's batched write, a `pread` —
@@ -48,6 +48,14 @@ use postings_segment::PostingsSegment;
 /// (`doc_ids_flat`/`freqs_flat`) is unaffected by any of it; see
 /// [`TermDictionary::postings_segment_skipped_terms`] for the gauge that
 /// makes per-term encode failures observable.
+///
+/// Correction fix: `PostingsBuilder::build()` now merges same-doc_id runs
+/// (`dedup_merge_postings`, matching Lucene/ES multi-valued-field
+/// semantics) BEFORE the sort/encode above, so the scenario that used to
+/// panic no longer arises from ordinary indexing — the skipped-terms
+/// gauge should read 0 in steady state. The best-effort fallback (and
+/// this whole tolerance path) stays in place as defense-in-depth for any
+/// other future bug that could produce non-monotonic doc_ids.
 #[cfg(unix)]
 mod postings_segment {
     use std::{
@@ -303,6 +311,52 @@ pub struct BlockMeta {
 /// `Vec<Posting>` chunks produced by `Vec::chunks(BLOCK_SIZE)`.
 pub const BLOCK_SIZE: usize = FOR_BLOCK_SIZE;
 
+/// Correction fix (post-C1a-batché hardening): merge every run of equal
+/// `doc_id` in an already-sorted `postings` slice into ONE posting,
+/// matching Lucene/ES semantics where a document appears at most once in
+/// a term's posting list. `df` (`postings.len()` after this call) is the
+/// number of distinct documents; `freq` on the merged posting is the SUM
+/// of the run's freqs, i.e. `tf` = total occurrences of the term across
+/// every value of the source field, not per value.
+///
+/// Runs exist because `PostingsBuilder::add` is called once per `(field,
+/// value)` pair `indexed_fields_for_document` (surch-api) fans a source
+/// `Value::Array` field out into: several pairs share the same
+/// `field`/`doc_id` and, when the same term occurs in more than one
+/// value, the same `(field, term, doc_id)` triple gets `add`-ed several
+/// times for one document. `add` itself stays a plain push (append-only,
+/// O(1), no per-insert scan of the term's Vec); this function is the one
+/// and only place the merge happens, and it must run AFTER the
+/// ascending-`doc_id` sort so every run is contiguous.
+///
+/// Positions are not affected: `Posting` does not carry them (see the
+/// doc comment on `Posting`, positions are discarded right after `freq`
+/// is derived from them at `add` time), so there is no position-list
+/// concatenation to do here.
+///
+/// A mono-valued field never produces a run (`analyze_document` calls
+/// `analyzed_terms` exactly once per field per document, so each
+/// distinct term is `add`-ed exactly once): the common case is the
+/// `postings.len() < 2` early return, and otherwise the loop below finds
+/// no two adjacent entries with an equal `doc_id`, so it degrades to a
+/// copy with no merge — mono-valued indexing is byte-identical to
+/// before this fix.
+fn dedup_merge_postings(postings: &mut Vec<Posting>) {
+    if postings.len() < 2 {
+        return;
+    }
+    let mut write = 0;
+    for read in 1..postings.len() {
+        if postings[read].doc_id == postings[write].doc_id {
+            postings[write].freq = postings[write].freq.saturating_add(postings[read].freq);
+        } else {
+            write += 1;
+            postings[write] = postings[read];
+        }
+    }
+    postings.truncate(write + 1);
+}
+
 fn build_block_metas(postings: &[Posting]) -> Vec<BlockMeta> {
     postings
         .chunks(BLOCK_SIZE)
@@ -386,10 +440,14 @@ impl PostingsBuilder {
 
     pub fn build(mut self) -> TermDictionary {
         // Sort each posting list by ascending doc_id (the query engine
-        // relies on this to do single-pass conjunctions and unions).
+        // relies on this to do single-pass conjunctions and unions), then
+        // merge same-doc_id runs into a single Lucene-shaped posting: see
+        // `dedup_merge_postings` below for why a run can exist at all
+        // (multi-valued source fields) and what "merge" means here.
         for terms in self.fields.values_mut() {
             for postings in terms.values_mut() {
                 postings.sort_by_key(|posting| posting.doc_id);
+                dedup_merge_postings(postings);
             }
         }
 
@@ -539,25 +597,26 @@ impl PostingsBuilder {
                 // self-contained FoR blocks and accumulate into the
                 // FIELD-wide payload buffer — NOT written to disk yet
                 // (see the single `postings_segment.append()` after this
-                // loop). `term_postings` is USUALLY sorted strictly
-                // ascending by `doc_id` at this point (the sort at the
-                // top of `build()`), matching `encode_postings_blocked`'s
-                // strictly-increasing contract — but `sort_by_key` only
-                // sorts, it does not deduplicate: a term can carry
-                // several postings for the SAME `doc_id` when a source
-                // `Value::Array` field is exploded into several
+                // loop). `term_postings` is now GUARANTEED strictly
+                // ascending by `doc_id` at this point: the sort at the
+                // top of `build()` plus `dedup_merge_postings` right
+                // after it (Correction fix) sort AND merge every
+                // same-doc_id run into one posting, matching
+                // `encode_postings_blocked`'s strictly-increasing
+                // contract exactly. Same-doc_id runs used to come from a
+                // source `Value::Array` field exploded into several
                 // same-doc_id `(field, value)` pairs upstream
-                // (`indexed_fields_for_document` in surch-api) and
-                // `PostingsBuilder::add` does not deduplicate either (out
-                // of scope here — this is a tolerance hardening, not a
-                // fix of that root cause). `encode_postings_blocked`
-                // rightly rejects that as `NotMonotonic`; best-effort
-                // here means the term just gets NO disk coverage
-                // (sentinel descriptor) instead of crashing the whole
-                // `_refresh` — RAM (`doc_ids_flat`/`freqs_flat`) already
-                // holds every posting regardless of encode success, so
-                // nothing is lost, only the SHADOW segment's coverage of
-                // this one term.
+                // (`indexed_fields_for_document` in surch-api), each
+                // `add`-ed separately — `dedup_merge_postings` is what
+                // now collapses them. The `NotMonotonic` branch below is
+                // kept as defense-in-depth for any other bug that could
+                // still produce non-monotonic doc_ids; best-effort here
+                // means such a term just gets NO disk coverage (sentinel
+                // descriptor) instead of crashing the whole `_refresh` —
+                // RAM (`doc_ids_flat`/`freqs_flat`) already holds every
+                // posting regardless of encode success, so nothing is
+                // lost, only the SHADOW segment's coverage of this one
+                // term.
                 match encode_postings_blocked(
                     &doc_ids_flat[doc_ids_start..],
                     &freqs_flat[freqs_start..],
@@ -598,7 +657,8 @@ impl PostingsBuilder {
             // These are NOT counted in `postings_skipped_terms` — that
             // gauge is reserved for genuine per-term encode failures
             // above, so the two failure modes stay distinguishable at
-            // read time (`skipped_terms > 0` ⇒ duplicate doc_ids;
+            // read time (`skipped_terms > 0` ⇒ non-monotonic doc_ids,
+            // expected to never happen post Correction fix;
             // `skipped_terms == 0` but `postings_segment_bytes() == 0`
             // ⇒ I/O).
             let field_base_offset = if field_payload.is_empty() {
@@ -961,14 +1021,19 @@ pub struct TermDictionary {
     postings_segment: Option<Arc<PostingsSegment>>,
     /// Lot C `C1a-batché` hardening gauge: total number of terms across
     /// every field whose FoR encode failed (`encode_postings_blocked`
-    /// returned `Err`, most commonly non-strictly-increasing doc_ids from
-    /// an un-deduplicated source `Value::Array` field — see the module
+    /// returned `Err`, non-strictly-increasing doc_ids — see the module
     /// doc at the top of this file) and therefore carry NO disk coverage
     /// (sentinel `(0, 0)` descriptor). Feeds
     /// `surch_index_disk_postings_skipped_terms`; deliberately does NOT
     /// count terms that lost disk coverage purely because the segment
     /// itself was absent/disabled (I/O failure) — see
     /// [`Self::postings_segment_skipped_terms`].
+    ///
+    /// Correction fix: since `PostingsBuilder::build()` now merges every
+    /// same-doc_id run before this encode step (`dedup_merge_postings`),
+    /// non-strictly-increasing doc_ids from a multi-valued source field
+    /// can no longer occur — this gauge is expected to read 0 in steady
+    /// state and now only guards against an unrelated future regression.
     postings_skipped_terms: u64,
 }
 
@@ -1079,12 +1144,12 @@ impl TermDictionary {
     /// disk coverage because their FoR encode failed at build time
     /// (`surch_index_disk_postings_skipped_terms`) — see the
     /// `postings_skipped_terms` field doc above. Diagnostic pairing with
-    /// [`Self::postings_segment_bytes`]: `skipped_terms > 0` points at
-    /// duplicate/non-monotonic doc_ids (the C1a-batché crash root
-    /// cause); `skipped_terms == 0` while `postings_segment_bytes() ==
-    /// 0` instead points at an I/O failure (segment never created, or a
-    /// batched `append()` failed and disabled it for the rest of the
-    /// build).
+    /// [`Self::postings_segment_bytes`]: `skipped_terms > 0` points at a
+    /// non-monotonic-doc_ids regression (should not happen post
+    /// Correction fix, see the field doc above); `skipped_terms == 0`
+    /// while `postings_segment_bytes() == 0` instead points at an I/O
+    /// failure (segment never created, or a batched `append()` failed
+    /// and disabled it for the rest of the build).
     pub fn postings_segment_skipped_terms(&self) -> u64 {
         self.postings_skipped_terms
     }
