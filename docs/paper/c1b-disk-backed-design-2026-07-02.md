@@ -81,6 +81,26 @@ les 12 266 termes à doublons.
 - **bench deces : `skipped_terms` → 0** (tous FoR-encodables, C1b débloqué), count PASS, indexation
   13 630 doc/s, latence p95 match/bool/full 1,8/1,5/1,5 ms (marginalement meilleure). Mono-valué byte-identique.
 
+## 🏆 C2 (id_maps flat) + C1b flag-ON — ≤ES/2 ATTEINT (bench 28682072869, sha-a664ed8)
+Aplatir les 3 id_maps (FST uid→doc_id + reverse `Box<[u8]>`+offsets + `documents: Vec<Option<SourceBlob>>`)
++ drop `intern_index` a tué les ~1,36 M `Arc<str>` qui épinglaient les slabs fragmentés :
+
+| axe | C1b seul | **C2 + C1b flag-ON** | ES | vs ES |
+|---|---:|---:|---:|---:|
+| jemalloc allocated (live) | 731 | **532** | — | — |
+| jemalloc **active** | 1402 | **844** | — | ≈ cible 843 |
+| **RAM anon (resident)** | 1446 | **881 MiB** | 1685 | **0,52× ES** |
+| match / bool / full p95 (ms) | 2,0/2,6/2,5 | 2,0/2,8/2,6 | 4,3/3,5/3,0 | sous ES |
+| indexation doc/s | 13 222 | 12 827 | ~12 000 | ≥ ES |
+| skipped_terms | 0 | 0 | — | — |
+
+**Surch bat ES ~2× sur la RAM (0,52×) HONNÊTEMENT (disk-backed, pas tout-en-RAM), tout en restant sous
+ES en latence sur les 3 types, indexation ≥ ES.** Le frag interne a chuté de 671 → ~312 MiB (active−allocated),
+exactement le mécanisme prédit par le triple consensus (tuer les small-alloc long-vivants dépingle les slabs).
+**Parité : CI verte (6 tests id_maps + test parité flag-ON==flag-OFF + tout l'existant). Oracle vrai-corpus
+(surtout le changement d'ordre match_all lex→insertion) EN RE-RUN** (le 1er run oracle a échoué en
+FailedScheduling/quota cluster, PAS une divergence). Claim ≤ES/2 à confirmer sur l'oracle vert.
+
 ## ✅✅ C1b FONCTIONNEL + MESURÉ (flag-ON, bench 28651348936, sha-94e11a8)
 Read-path disk-backed câblé derrière `SURCH_POSTINGS_DISK`, dual-path, **parité flag-ON==flag-OFF
 bit-identique** (test `postings_disk_parity` vert). Mesure flag-ON sur deces 1,36 M :
