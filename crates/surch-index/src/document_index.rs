@@ -856,6 +856,15 @@ impl DocumentIndex {
         self.terms.postings_segment_bytes()
     }
 
+    /// Lot C `C1a-batché` hardening: number of terms with no disk
+    /// coverage because their FoR encode failed at build time
+    /// (`surch_index_disk_postings_skipped_terms`). See
+    /// [`crate::postings::TermDictionary::postings_segment_skipped_terms`]
+    /// for the diagnostic pairing with [`Self::postings_segment_bytes`].
+    pub fn postings_segment_skipped_terms(&self) -> u64 {
+        self.terms.postings_segment_skipped_terms()
+    }
+
     /// #17c memory accounting: taille on-heap du `PostingsBuilder` retenu.
     /// Lot 1.5 garde le builder live entre rebuilds incrémentaux, donc
     /// pour 1.36 M docs ça peut peser GROS et n'était pas compté ailleurs.

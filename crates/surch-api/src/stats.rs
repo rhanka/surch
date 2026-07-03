@@ -36,6 +36,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     let disk_segment_bytes = state.index_disk_segment_bytes(index).unwrap_or(0);
     let disk_segment_peak_bytes = state.index_disk_segment_peak_bytes(index).unwrap_or(0);
     let disk_postings_bytes = state.index_disk_postings_bytes(index).unwrap_or(0);
+    let disk_postings_skipped_terms = state.index_disk_postings_skipped_terms(index).unwrap_or(0);
     set_gauges(
         index,
         doc_count,
@@ -45,6 +46,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         disk_segment_bytes,
         disk_segment_peak_bytes,
         disk_postings_bytes,
+        disk_postings_skipped_terms,
     );
     refresh_process_memory_gauges();
     // Lot C Phase 0b : stats internes jemalloc. Appelé ici, donc APRÈS
@@ -271,13 +273,14 @@ pub fn refresh_jemalloc_purge() {}
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
-    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0);
+    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0, 0);
 }
 
 // Internal gauge-fan-out helper: one positional arg per Prometheus gauge
 // family. The list grows by one each time a new disk/RAM accounting gauge
-// is added (C1a added `disk_postings_bytes`); bundling into a struct would
-// just move the same fields around without improving the single call site.
+// is added (C1a added `disk_postings_bytes`, the C1a-batché hardening pass
+// added `disk_postings_skipped_terms`); bundling into a struct would just
+// move the same fields around without improving the single call site.
 #[allow(clippy::too_many_arguments)]
 fn set_gauges(
     index: &str,
@@ -288,6 +291,7 @@ fn set_gauges(
     disk_segment_bytes: u64,
     disk_segment_peak_bytes: u64,
     disk_postings_bytes: u64,
+    disk_postings_skipped_terms: u64,
 ) {
     let label = [("index", index.to_owned())];
     // P1 mmap M1 + axe disque #19 : taille on-disk effective du segment
@@ -307,6 +311,13 @@ fn set_gauges(
     // reste la source de vérité tant que C1b n'a pas basculé le read
     // path) — les sommer doublerait le compte.
     metrics::gauge!("surch_index_disk_postings_bytes", &label).set(disk_postings_bytes as f64);
+    // C1a-batché hardening : nombre de termes sans couverture disque suite
+    // a un echec d'encode FoR (typiquement doc_id dupliques issus d'un
+    // champ `Value::Array` eclate sans dedup en amont). Diagnostic couple
+    // avec la gauge ci-dessus : `skipped_terms > 0` => doc_id dupliques ;
+    // `skipped_terms == 0` mais `disk_postings_bytes == 0` => IO/tmpfs.
+    metrics::gauge!("surch_index_disk_postings_skipped_terms", &label)
+        .set(disk_postings_skipped_terms as f64);
     metrics::gauge!("surch_index_postings_bytes", &label).set(usage.postings_bytes as f64);
     metrics::gauge!("surch_index_prefix_postings_bytes", &label)
         .set(usage.prefix_postings_bytes as f64);

@@ -3292,6 +3292,26 @@ impl AppState {
             .map(|data| data.index.postings_segment_bytes())
     }
 
+    /// Lot C `C1a-batché` hardening : nombre de termes sans couverture
+    /// disque suite a un echec d'encode FoR au build
+    /// (`surch_index_disk_postings_skipped_terms`). Diagnostic : couple
+    /// avec `index_disk_postings_bytes` ci-dessus pour distinguer un
+    /// crash cause par des doc_id dupliques (`skipped_terms > 0`) d'un
+    /// echec IO/tmpfs (`skipped_terms == 0` mais `bytes == 0`). Meme
+    /// pattern que `index_disk_postings_bytes` (materialise le FST en
+    /// attente avant de lire).
+    pub fn index_disk_postings_skipped_terms(&self, index: &str) -> Option<u64> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.index.postings_segment_skipped_terms())
+    }
+
     /// Doc count for `index`. Returns `None` for an unknown index, so
     /// callers can distinguish "missing" from "empty".
     pub fn index_doc_count(&self, index: &str) -> Option<u64> {

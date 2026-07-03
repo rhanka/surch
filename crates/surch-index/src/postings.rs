@@ -34,6 +34,20 @@ use postings_segment::PostingsSegment;
 /// whole build — the lesson from the Lot C C0 cliff (5.46 M syscalls,
 /// one per term, cost -43 % indexation throughput) is the reason this
 /// is a hard batching requirement, not an optimization.
+///
+/// Hardening: the whole segment path is BEST-EFFORT. A `_refresh` on the
+/// real deces corpus (1.36 M docs) once paniced inside `build()` because
+/// `encode_postings_blocked` legitimately rejects duplicate doc_ids
+/// (`Value::Array` fields explode into several same-doc_id postings
+/// upstream, and `PostingsBuilder::add` does not deduplicate) and the
+/// call site used to `.expect()` that away. Since a SHADOW feature must
+/// never be able to crash indexation, every failure mode here — tempfile
+/// creation, a term's encode, a field's batched write, a `pread` —
+/// degrades to "no disk coverage" (a sentinel `(0, 0)` descriptor, or a
+/// fully absent segment) instead of panicking. RAM
+/// (`doc_ids_flat`/`freqs_flat`) is unaffected by any of it; see
+/// [`TermDictionary::postings_segment_skipped_terms`] for the gauge that
+/// makes per-term encode failures observable.
 #[cfg(unix)]
 mod postings_segment {
     use std::{
@@ -77,8 +91,20 @@ mod postings_segment {
         path: PathBuf,
     }
 
-    impl Default for PostingsSegment {
-        fn default() -> Self {
+    impl PostingsSegment {
+        /// Best-effort constructor: NEVER panics. A SHADOW feature must
+        /// not be able to crash indexation (the C1a-batché lesson: the
+        /// historical `Default::default()` here `.expect()`'d on tempfile
+        /// creation, which paniced the whole `_refresh` on a real corpus
+        /// when the underlying cause was actually an unrelated encode
+        /// failure further down — see [`PostingsBuilder::build`]).
+        /// Returns `None` on any I/O failure (unwritable `TMPDIR`,
+        /// `ENOSPC`, permissions, ...): the caller then keeps building
+        /// with no segment at all, every term gets a sentinel `(0, 0)`
+        /// descriptor, and RAM (`doc_ids_flat`/`freqs_flat`) stays the
+        /// sole source of truth — exactly as if the segment had never
+        /// existed.
+        pub(crate) fn try_new() -> Option<Self> {
             let path = next_temp_path();
             let file = OpenOptions::new()
                 .read(true)
@@ -86,17 +112,15 @@ mod postings_segment {
                 .create(true)
                 .truncate(true)
                 .open(&path)
-                .expect("failed to create surch postings segment tempfile");
-            Self {
+                .ok()?;
+            Some(Self {
                 file,
                 next_offset: 0,
                 extended_len: 0,
                 path,
-            }
+            })
         }
-    }
 
-    impl PostingsSegment {
         /// Pre-extend the file's logical length past `write_end` in
         /// `EXTEND_CHUNK` steps via the safe `File::set_len` (ftruncate),
         /// so the append below does not pay ext4's per-write size
@@ -117,28 +141,31 @@ mod postings_segment {
         }
 
         /// Append `bytes` as ONE positional write, returning the
-        /// segment-absolute byte offset the payload now starts at.
-        /// Callers batch a whole field's FoR payload into one `Vec<u8>`
-        /// before calling this (see `PostingsBuilder::build`), so in
-        /// steady state this is called ~once per field — never once per
-        /// term.
-        pub(crate) fn append(&mut self, bytes: &[u8]) -> u64 {
+        /// segment-absolute byte offset the payload now starts at, or
+        /// `None` if the write failed (`ENOSPC`, a `tmpfs` gone away,
+        /// ...). Callers batch a whole field's FoR payload into one
+        /// `Vec<u8>` before calling this (see `PostingsBuilder::build`),
+        /// so in steady state this is called ~once per field — never
+        /// once per term. Best-effort: a `None` here must disable the
+        /// segment for the caller, never panic — RAM
+        /// (`doc_ids_flat`/`freqs_flat`) is always still correct.
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> Option<u64> {
             let offset = self.next_offset;
             self.ensure_capacity(offset.saturating_add(bytes.len() as u64));
-            self.file
-                .write_all_at(bytes, offset)
-                .expect("postings segment file should accept positional write");
+            self.file.write_all_at(bytes, offset).ok()?;
             self.next_offset = offset.saturating_add(bytes.len() as u64);
-            offset
+            Some(offset)
         }
 
-        /// Read `length` bytes at `offset` via `pread`.
-        pub(crate) fn read(&self, offset: u64, length: u32) -> Vec<u8> {
+        /// Read `length` bytes at `offset` via `pread`. Returns `None` on
+        /// any I/O failure instead of panicking — this is only ever
+        /// called from the SHADOW round-trip validation and the
+        /// (not-yet-production) cold-path decode, never from a path RAM
+        /// depends on.
+        pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
             let mut buf = vec![0u8; length as usize];
-            self.file
-                .read_exact_at(&mut buf, offset)
-                .expect("postings segment file should accept positional read");
-            buf
+            self.file.read_exact_at(&mut buf, offset).ok()?;
+            Some(buf)
         }
 
         /// Total bytes appended so far — feeds the
@@ -168,16 +195,22 @@ mod postings_segment {
     }
 
     impl PostingsSegment {
-        pub(crate) fn append(&mut self, bytes: &[u8]) -> u64 {
-            let offset = self.buf.len() as u64;
-            self.buf.extend_from_slice(bytes);
-            offset
+        /// Mirrors the Unix constructor's signature; the in-RAM buffer
+        /// never fails to allocate in practice, so this is always `Some`.
+        pub(crate) fn try_new() -> Option<Self> {
+            Some(Self::default())
         }
 
-        pub(crate) fn read(&self, offset: u64, length: u32) -> Vec<u8> {
-            let start = offset as usize;
-            let end = start + length as usize;
-            self.buf[start..end].to_vec()
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> Option<u64> {
+            let offset = self.buf.len() as u64;
+            self.buf.extend_from_slice(bytes);
+            Some(offset)
+        }
+
+        pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
+            let start = usize::try_from(offset).ok()?;
+            let end = start.checked_add(length as usize)?;
+            self.buf.get(start..end).map(<[u8]>::to_vec)
         }
 
         pub(crate) fn bytes_written(&self) -> u64 {
@@ -366,7 +399,16 @@ impl PostingsBuilder {
         // an `Arc`) for the duration of the fields loop below so `append`
         // can take `&mut`; wrapped in `Arc` once, at the very end, for
         // read-only sharing via the returned `TermDictionary`.
-        let mut postings_segment = PostingsSegment::default();
+        //
+        // Hardening (post-C1a-batché crash on the real deces corpus):
+        // best-effort from here on. `try_new()` returns `None` on any I/O
+        // failure instead of panicking, and is downgraded to `None` again,
+        // mid-build, the first time a field's batched `append()` fails
+        // (see below) — the segment is a SHADOW validation write, RAM
+        // (`doc_ids_flat`/`freqs_flat`) is and stays the sole source of
+        // truth, so it must never be able to crash indexation.
+        let mut postings_segment = PostingsSegment::try_new();
+        let mut postings_skipped_terms: u64 = 0;
 
         let mut fields: BTreeMap<String, FieldPostings> = BTreeMap::new();
         for (field, terms) in self.fields {
@@ -497,22 +539,40 @@ impl PostingsBuilder {
                 // self-contained FoR blocks and accumulate into the
                 // FIELD-wide payload buffer — NOT written to disk yet
                 // (see the single `postings_segment.append()` after this
-                // loop). `term_postings` is already sorted ascending by
-                // `doc_id` (the sort at the top of `build()`), matching
-                // `encode_postings_blocked`'s strictly-increasing
-                // contract.
-                let block_payload = encode_postings_blocked(
+                // loop). `term_postings` is USUALLY sorted strictly
+                // ascending by `doc_id` at this point (the sort at the
+                // top of `build()`), matching `encode_postings_blocked`'s
+                // strictly-increasing contract — but `sort_by_key` only
+                // sorts, it does not deduplicate: a term can carry
+                // several postings for the SAME `doc_id` when a source
+                // `Value::Array` field is exploded into several
+                // same-doc_id `(field, value)` pairs upstream
+                // (`indexed_fields_for_document` in surch-api) and
+                // `PostingsBuilder::add` does not deduplicate either (out
+                // of scope here — this is a tolerance hardening, not a
+                // fix of that root cause). `encode_postings_blocked`
+                // rightly rejects that as `NotMonotonic`; best-effort
+                // here means the term just gets NO disk coverage
+                // (sentinel descriptor) instead of crashing the whole
+                // `_refresh` — RAM (`doc_ids_flat`/`freqs_flat`) already
+                // holds every posting regardless of encode success, so
+                // nothing is lost, only the SHADOW segment's coverage of
+                // this one term.
+                match encode_postings_blocked(
                     &doc_ids_flat[doc_ids_start..],
                     &freqs_flat[freqs_start..],
-                )
-                .expect(
-                    "doc_ids_flat[doc_ids_start..] is strictly increasing by construction \
-                     (sorted ascending by doc_id above, and PostingsBuilder::add rejects \
-                     nothing that would violate it)",
-                );
-                let payload_offset = field_payload.len() as u64;
-                field_payload.extend_from_slice(&block_payload);
-                segment_descriptors.push((payload_offset, block_payload.len() as u32));
+                ) {
+                    Ok(block_payload) => {
+                        let payload_offset = field_payload.len() as u64;
+                        field_payload.extend_from_slice(&block_payload);
+                        segment_descriptors.push((payload_offset, block_payload.len() as u32));
+                    }
+                    Err(_) => {
+                        // Sentinel: no disk coverage for this term.
+                        segment_descriptors.push((0, 0));
+                        postings_skipped_terms += 1;
+                    }
+                }
             }
             roaring.shrink_to_fit();
             debug_assert_eq!(segment_descriptors.len(), term_count);
@@ -524,9 +584,50 @@ impl PostingsBuilder {
             // `segment_descriptors` entry recorded above was relative to
             // `field_payload` (starting at 0), so it is rebased to a
             // segment-absolute offset here.
-            let field_base_offset = postings_segment.append(&field_payload);
-            for descriptor in &mut segment_descriptors {
-                descriptor.0 += field_base_offset;
+            //
+            // Best-effort: `field_payload` can be non-empty with no
+            // segment to receive it (creation failed up front) or the
+            // `append()` itself can fail (`ENOSPC`, tmpfs gone away,
+            // ...). Either way every descriptor recorded above for THIS
+            // field collapses to the sentinel `(0, 0)` — RAM is
+            // unaffected, only disk coverage is lost. A write failure
+            // additionally drops `postings_segment` to `None`, which
+            // best-effort-disables the segment for the REST of the
+            // build (an `ENOSPC`-class failure will not un-happen for
+            // the next field either, so there is no point retrying).
+            // These are NOT counted in `postings_skipped_terms` — that
+            // gauge is reserved for genuine per-term encode failures
+            // above, so the two failure modes stay distinguishable at
+            // read time (`skipped_terms > 0` ⇒ duplicate doc_ids;
+            // `skipped_terms == 0` but `postings_segment_bytes() == 0`
+            // ⇒ I/O).
+            let field_base_offset = if field_payload.is_empty() {
+                None
+            } else if let Some(segment) = postings_segment.as_mut() {
+                let appended = segment.append(&field_payload);
+                if appended.is_none() {
+                    postings_segment = None;
+                }
+                appended
+            } else {
+                None
+            };
+            match field_base_offset {
+                Some(base) => {
+                    for descriptor in &mut segment_descriptors {
+                        // A `(0, 0)` sentinel from the per-term encode
+                        // failure above must stay `(0, 0)` — only
+                        // genuinely encoded descriptors get rebased.
+                        if descriptor.1 != 0 {
+                            descriptor.0 += base;
+                        }
+                    }
+                }
+                None => {
+                    for descriptor in &mut segment_descriptors {
+                        *descriptor = (0, 0);
+                    }
+                }
             }
             drop(field_payload);
 
@@ -538,10 +639,11 @@ impl PostingsBuilder {
             // in release builds — `debug_assert!`'s condition, including
             // every `pread` syscall inside `validate_field_segment_round_trip`,
             // is unreachable dead code once `cfg!(debug_assertions)` is
-            // `false`.
+            // `false`. Skips sentinel `(0, 0)` descriptors — see that
+            // function's doc comment.
             debug_assert!(
                 validate_field_segment_round_trip(
-                    &postings_segment,
+                    postings_segment.as_ref(),
                     &segment_descriptors,
                     &offsets,
                     &doc_ids_flat,
@@ -571,7 +673,8 @@ impl PostingsBuilder {
 
         TermDictionary {
             fields,
-            postings_segment: Arc::new(postings_segment),
+            postings_segment: postings_segment.map(Arc::new),
+            postings_skipped_terms,
         }
     }
 }
@@ -582,20 +685,36 @@ impl PostingsBuilder {
 /// [`decode_postings_blocked`], comparing bit-for-bit against the RAM
 /// source of truth (`doc_ids_flat`/`freqs_flat`, sliced by `offsets`).
 /// Returns `false` on the first mismatch or decode error.
+///
+/// Best-effort hardening: `segment` is `None` when the segment could not
+/// be created (or was disabled mid-build) — the whole field is then made
+/// of sentinel descriptors, so there is nothing to validate and this
+/// trivially returns `true`. A sentinel `(0, 0)` descriptor (per-term
+/// encode failure, see [`PostingsBuilder::build`]) is likewise skipped
+/// term-by-term: it was never encoded, so there is no round trip to
+/// check for it.
 fn validate_field_segment_round_trip(
-    segment: &PostingsSegment,
+    segment: Option<&PostingsSegment>,
     segment_descriptors: &[(u64, u32)],
     offsets: &[u32],
     doc_ids_flat: &[u32],
     freqs_flat: &[u32],
 ) -> bool {
+    let Some(segment) = segment else {
+        return true;
+    };
     for (idx, &(offset, len)) in segment_descriptors.iter().enumerate() {
+        if len == 0 {
+            continue;
+        }
         let start = offsets[idx] as usize;
         let end = offsets[idx + 1] as usize;
         let expected_doc_ids = &doc_ids_flat[start..end];
         let expected_freqs = &freqs_flat[start..end];
 
-        let bytes = segment.read(offset, len);
+        let Some(bytes) = segment.read(offset, len) else {
+            return false;
+        };
         let Ok((decoded_doc_ids, decoded_freqs)) =
             decode_postings_blocked(&bytes, expected_doc_ids.len())
         else {
@@ -834,7 +953,25 @@ pub struct TermDictionary {
     /// read path touches it), so sharing via `Arc` needs no interior
     /// mutability. Dropped (and its tempfile removed) once every clone of
     /// the `TermDictionary` that reached this generation is gone.
-    postings_segment: Arc<PostingsSegment>,
+    ///
+    /// Hardening: `None` when the segment could not be created at all
+    /// (tempfile I/O failure) or was disabled mid-build after a failed
+    /// `append()` (best-effort — see [`PostingsBuilder::build`]). Every
+    /// term's `segment_descriptors` entry is then the sentinel `(0, 0)`
+    /// and [`Self::decode_from_segment`] returns `None` for all of them;
+    /// RAM (`doc_ids_flat`/`freqs_flat`) is unaffected either way.
+    postings_segment: Option<Arc<PostingsSegment>>,
+    /// Lot C `C1a-batché` hardening gauge: total number of terms across
+    /// every field whose FoR encode failed (`encode_postings_blocked`
+    /// returned `Err`, most commonly non-strictly-increasing doc_ids from
+    /// an un-deduplicated source `Value::Array` field — see the module
+    /// doc at the top of this file) and therefore carry NO disk coverage
+    /// (sentinel `(0, 0)` descriptor). Feeds
+    /// `surch_index_disk_postings_skipped_terms`; deliberately does NOT
+    /// count terms that lost disk coverage purely because the segment
+    /// itself was absent/disabled (I/O failure) — see
+    /// [`Self::postings_segment_skipped_terms`].
+    postings_skipped_terms: u64,
 }
 
 impl TermDictionary {
@@ -905,10 +1042,20 @@ impl TermDictionary {
     /// scoring/the leapfrog all stay on the RAM buffers. This method
     /// exists for the shadow round-trip test and for a future cold path
     /// (C1b) to build on.
+    ///
+    /// Returns `None` (in addition to the unknown-field/-term cases
+    /// above) when the term's descriptor is the sentinel `(0, 0)` — no
+    /// disk coverage, either because its encode failed at build time or
+    /// because the segment itself was absent/disabled (best-effort — see
+    /// [`PostingsBuilder::build`]) — or when the underlying `pread`
+    /// itself fails.
     pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
         let field_postings = self.fields.get(field)?;
         let ((offset, len), count) = field_postings.segment_slice(term)?;
-        let bytes = self.postings_segment.read(offset, len);
+        if len == 0 {
+            return None;
+        }
+        let bytes = self.postings_segment.as_ref()?.read(offset, len)?;
         decode_postings_blocked(&bytes, count).ok()
     }
 
@@ -920,9 +1067,28 @@ impl TermDictionary {
     /// — it measures bytes on disk (page-cache backed), not RAM the
     /// process holds, so summing it into the RAM total would double-count
     /// against `postings_bytes` (SHADOW: the same postings are, today,
-    /// ALSO fully resident in `doc_ids_flat`/`freqs_flat`).
+    /// ALSO fully resident in `doc_ids_flat`/`freqs_flat`). `0` when the
+    /// segment is absent (best-effort hardening — see
+    /// [`PostingsBuilder::build`]).
     pub fn postings_segment_bytes(&self) -> u64 {
-        self.postings_segment.bytes_written()
+        self.postings_segment
+            .as_ref()
+            .map(|segment| segment.bytes_written())
+            .unwrap_or(0)
+    }
+
+    /// Lot C `C1a-batché` hardening gauge: total number of terms with NO
+    /// disk coverage because their FoR encode failed at build time
+    /// (`surch_index_disk_postings_skipped_terms`) — see the
+    /// `postings_skipped_terms` field doc above. Diagnostic pairing with
+    /// [`Self::postings_segment_bytes`]: `skipped_terms > 0` points at
+    /// duplicate/non-monotonic doc_ids (the C1a-batché crash root
+    /// cause); `skipped_terms == 0` while `postings_segment_bytes() ==
+    /// 0` instead points at an I/O failure (segment never created, or a
+    /// batched `append()` failed and disabled it for the rest of the
+    /// build).
+    pub fn postings_segment_skipped_terms(&self) -> u64 {
+        self.postings_skipped_terms
     }
 
     /// #17 memory accounting: total bytes held by every field's FST term
