@@ -1211,9 +1211,13 @@ impl InMemoryIndex {
     fn term_scoring_stats(&self, field: &str, term: &str) -> TermScoringStats {
         // Postings come from `TermDictionary` in ascending `doc_id` order
         // (see `PostingsBuilder::build`), so a single pass produces a sorted
-        // accumulator without re-sorting. We merge same-doc postings (rare
-        // unless multiple positions push the same doc id repeatedly) by
-        // checking the tail.
+        // accumulator without re-sorting. The same-doc merge below (tail
+        // check) is now a pure defensive no-op: `PostingsBuilder::build()`'s
+        // `dedup_merge_postings` already guarantees at most one posting per
+        // `(field, term, doc_id)` — a multi-valued source field used to be
+        // able to violate that (several array values sharing a doc_id, each
+        // `add`-ed separately) before that fix. Kept here as
+        // belt-and-suspenders in case a future caller bypasses the builder.
         let mut term_freq_by_doc_id: Vec<(u32, u64)> = Vec::new();
         for posting in self.index.postings(field, term).into_iter().flatten() {
             let freq = u64::from(posting.freq);
@@ -1234,12 +1238,13 @@ impl InMemoryIndex {
         //
         // The 128-block alignment between `block_metas` (built from raw
         // postings) and `term_freq_by_doc_id.chunks(128)` (built here)
-        // relies on the `analyzed_terms` invariant in
-        // `DocumentIndex::add_validated_document`: a given
-        // `(doc_id, field, term)` triple produces exactly one posting,
-        // so the merge branch above is a defensive no-op and both Vecs
-        // have the same length. The `debug_assert_eq!` below catches a
-        // regression as soon as it happens.
+        // relies on the `PostingsBuilder::build()` invariant: a given
+        // `(doc_id, field, term)` triple produces exactly one posting
+        // (`dedup_merge_postings` merges any multi-valued-field run before
+        // the block metas are computed), so the merge branch above is a
+        // defensive no-op and both Vecs have the same length. The
+        // `debug_assert_eq!` below catches a regression as soon as it
+        // happens.
         let block_metas = self
             .index
             .block_metas(field, term)
