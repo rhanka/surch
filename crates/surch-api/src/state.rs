@@ -3274,6 +3274,24 @@ impl AppState {
             .map(|data| data.source_store.peak_bytes_written())
     }
 
+    /// Lot C `C1a-batché` : taille on-disk du segment FoR postings SHADOW
+    /// (`surch_index_disk_postings_bytes`), ecrit par
+    /// `PostingsBuilder::build()` (batché par champ). Comme
+    /// `index_memory_usage`, on materialise d'abord le FST en attente
+    /// (`ensure_terms_ready`) pour que la gauge reflete le dernier
+    /// `build()`, pas une generation perimee.
+    pub fn index_disk_postings_bytes(&self, index: &str) -> Option<u64> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.index.postings_segment_bytes())
+    }
+
     /// Doc count for `index`. Returns `None` for an unknown index, so
     /// callers can distinguish "missing" from "empty".
     pub fn index_doc_count(&self, index: &str) -> Option<u64> {

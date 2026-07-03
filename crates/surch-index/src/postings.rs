@@ -1,11 +1,190 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use surch_codec::postings_block::{
-    BlockSkipCursor, BlockSkipEntry, BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
+    decode_postings_blocked, encode_postings_blocked, BlockSkipCursor, BlockSkipEntry,
+    BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
 };
 
 use crate::roaring::RoaringDocSet;
+use postings_segment::PostingsSegment;
+
+/// Lot C `C1a-batché` (`docs/paper/c1b-disk-backed-design-2026-07-02.md`)
+/// SHADOW disk-backed FoR postings segment. Mirrors `DocumentIndex`'s
+/// historical `subfield_store` module (itself mirroring surch-api's
+/// `source_store`): an append-only tempfile under `TMPDIR`, written and
+/// read with SAFE positional I/O (`FileExt::write_all_at`/`read_exact_at`
+/// — no `mmap`, no `posix_fallocate`, both `unsafe`, so `surch-index`
+/// keeps `#![forbid(unsafe_code)]`).
+///
+/// "SHADOW" means the segment is written and round-trip-validated
+/// (`debug_assert!` in [`PostingsBuilder::build`]) but nothing reads from
+/// it on any production path yet: RAM (`doc_ids_flat`/`freqs_flat`
+/// inside [`FieldPostings`]) stays the sole source of truth consumed by
+/// `lookup*`/[`PostingsList`]/scoring/the leapfrog. [`TermDictionary::decode_from_segment`]
+/// exists only for validation and future cold-path use — it is not on
+/// any hot path today.
+///
+/// Writes are batched PER FIELD, not per term: [`PostingsBuilder::build`]
+/// accumulates one field's entire FoR-blocked payload into a single
+/// `Vec<u8>` and calls [`PostingsSegment::append`] exactly once per
+/// field. On a real corpus (a handful to a few dozen indexed fields)
+/// that is on the order of 12-25 `write_all_at` calls TOTAL for the
+/// whole build — the lesson from the Lot C C0 cliff (5.46 M syscalls,
+/// one per term, cost -43 % indexation throughput) is the reason this
+/// is a hard batching requirement, not an optimization.
+#[cfg(unix)]
+mod postings_segment {
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::FileExt,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    /// Logical pre-extension chunk for the segment file, in bytes. Kept
+    /// from the `subfield_store` pattern for parity — a safe `set_len`
+    /// (ftruncate) pre-extension, NOT `posix_fallocate` (which is
+    /// `unsafe`). C1a's writes are already batched per field (a few
+    /// dozen `append()` calls total, not millions), so per-write ext4
+    /// extension is not the cliff risk here; this is cheap insurance
+    /// regardless.
+    const EXTEND_CHUNK: u64 = 64 * 1024 * 1024;
+
+    /// Unique tempfile name without pulling a `uuid` dependency into
+    /// surch-index: pid + a process-global sequence + wall-clock nanos.
+    fn next_temp_path() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("surch-postings-{pid}-{seq}-{nanos}.dat"))
+    }
+
+    /// Append-only FoR-postings segment. `pread`-addressed via the
+    /// `(offset, len)` descriptors [`crate::postings::PostingsBuilder::build`]
+    /// records in `FieldPostings::segment_descriptors`, one descriptor
+    /// per term.
+    #[derive(Debug)]
+    pub(crate) struct PostingsSegment {
+        file: File,
+        next_offset: u64,
+        extended_len: u64,
+        path: PathBuf,
+    }
+
+    impl Default for PostingsSegment {
+        fn default() -> Self {
+            let path = next_temp_path();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .expect("failed to create surch postings segment tempfile");
+            Self {
+                file,
+                next_offset: 0,
+                extended_len: 0,
+                path,
+            }
+        }
+    }
+
+    impl PostingsSegment {
+        /// Pre-extend the file's logical length past `write_end` in
+        /// `EXTEND_CHUNK` steps via the safe `File::set_len` (ftruncate),
+        /// so the append below does not pay ext4's per-write size
+        /// extension. Failure is non-fatal: the file keeps its current
+        /// length and the next write falls back to the ordinary
+        /// per-write extension (slower, still correct).
+        fn ensure_capacity(&mut self, write_end: u64) {
+            if write_end <= self.extended_len {
+                return;
+            }
+            let mut new_len = self.extended_len;
+            while new_len < write_end {
+                new_len = new_len.saturating_add(EXTEND_CHUNK);
+            }
+            if self.file.set_len(new_len).is_ok() {
+                self.extended_len = new_len;
+            }
+        }
+
+        /// Append `bytes` as ONE positional write, returning the
+        /// segment-absolute byte offset the payload now starts at.
+        /// Callers batch a whole field's FoR payload into one `Vec<u8>`
+        /// before calling this (see `PostingsBuilder::build`), so in
+        /// steady state this is called ~once per field — never once per
+        /// term.
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> u64 {
+            let offset = self.next_offset;
+            self.ensure_capacity(offset.saturating_add(bytes.len() as u64));
+            self.file
+                .write_all_at(bytes, offset)
+                .expect("postings segment file should accept positional write");
+            self.next_offset = offset.saturating_add(bytes.len() as u64);
+            offset
+        }
+
+        /// Read `length` bytes at `offset` via `pread`.
+        pub(crate) fn read(&self, offset: u64, length: u32) -> Vec<u8> {
+            let mut buf = vec![0u8; length as usize];
+            self.file
+                .read_exact_at(&mut buf, offset)
+                .expect("postings segment file should accept positional read");
+            buf
+        }
+
+        /// Total bytes appended so far — feeds the
+        /// `surch_index_disk_postings_bytes` gauge.
+        pub(crate) fn bytes_written(&self) -> u64 {
+            self.next_offset
+        }
+    }
+
+    impl Drop for PostingsSegment {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Non-Unix fallback (Windows / unusual dev hosts): the same API backed
+/// by an in-RAM buffer. The release target is Linux distroless and
+/// `pread`/`pwrite` (`FileExt`) are Unix-only, so this keeps the crate
+/// building elsewhere — SHADOW validation still exercises the codec
+/// round-trip, just without a real file underneath.
+#[cfg(not(unix))]
+mod postings_segment {
+    #[derive(Debug, Default)]
+    pub(crate) struct PostingsSegment {
+        buf: Vec<u8>,
+    }
+
+    impl PostingsSegment {
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> u64 {
+            let offset = self.buf.len() as u64;
+            self.buf.extend_from_slice(bytes);
+            offset
+        }
+
+        pub(crate) fn read(&self, offset: u64, length: u32) -> Vec<u8> {
+            let start = offset as usize;
+            let end = start + length as usize;
+            self.buf[start..end].to_vec()
+        }
+
+        pub(crate) fn bytes_written(&self) -> u64 {
+            self.buf.len() as u64
+        }
+    }
+}
 
 /// A1: build a roaring/hybrid bitmap only for terms with more than this many
 /// postings. Below it, the galloping leapfrog already wins and the bitmap RAM
@@ -181,6 +360,14 @@ impl PostingsBuilder {
             }
         }
 
+        // Lot C `C1a-batché`: ONE segment for the WHOLE build (not one per
+        // field — the field is only the write-BATCH unit, see the module
+        // doc on `postings_segment` above). Owned locally (not yet behind
+        // an `Arc`) for the duration of the fields loop below so `append`
+        // can take `&mut`; wrapped in `Arc` once, at the very end, for
+        // read-only sharing via the returned `TermDictionary`.
+        let mut postings_segment = PostingsSegment::default();
+
         let mut fields: BTreeMap<String, FieldPostings> = BTreeMap::new();
         for (field, terms) in self.fields {
             // `BTreeMap` already yields keys in lexicographic order, so
@@ -220,6 +407,19 @@ impl PostingsBuilder {
             let mut roaring: Vec<(u32, RoaringDocSet)> = Vec::new();
             offsets.push(0);
             block_offsets.push(0);
+
+            // Lot C `C1a-batché`: per-term `(offset, len)` descriptor into
+            // the shared `postings_segment`, index-aligned with `offsets`
+            // (`T` entries, one per term — NOT a CSR table, each entry
+            // stands alone). `field_payload` accumulates every term's
+            // `encode_postings_blocked` bytes for THIS field; it is
+            // flushed to the segment with a SINGLE `append()` once the
+            // field is done (see below the loop) — batched by field, not
+            // by term, per the C0 lesson (5.46 M single-term writes cost
+            // -43 % indexation throughput; a few dozen field-sized writes
+            // do not).
+            let mut segment_descriptors: Vec<(u64, u32)> = Vec::with_capacity(term_count);
+            let mut field_payload: Vec<u8> = Vec::with_capacity(total_postings * 3);
 
             // --- Pass 2: fill, draining `terms` term-by-term ------------
             // Transitory-peak mitigation (risk #1 of the flattening): a
@@ -284,6 +484,7 @@ impl PostingsBuilder {
                 // duplication the historical AoS `postings_flat:
                 // Box<[Posting]>` carried (`doc_id` was already stored in
                 // `doc_ids_flat` above).
+                let freqs_start = freqs_flat.len();
                 freqs_flat.extend(term_postings.iter().map(|posting| posting.freq));
                 debug_assert!(
                     freqs_flat.len() <= u32::MAX as usize,
@@ -291,8 +492,63 @@ impl PostingsBuilder {
                      (only relevant well past matchID's 1.36M-doc scale)"
                 );
                 offsets.push(freqs_flat.len() as u32);
+
+                // Lot C `C1a-batché`: encode this term's postings as
+                // self-contained FoR blocks and accumulate into the
+                // FIELD-wide payload buffer — NOT written to disk yet
+                // (see the single `postings_segment.append()` after this
+                // loop). `term_postings` is already sorted ascending by
+                // `doc_id` (the sort at the top of `build()`), matching
+                // `encode_postings_blocked`'s strictly-increasing
+                // contract.
+                let block_payload = encode_postings_blocked(
+                    &doc_ids_flat[doc_ids_start..],
+                    &freqs_flat[freqs_start..],
+                )
+                .expect(
+                    "doc_ids_flat[doc_ids_start..] is strictly increasing by construction \
+                     (sorted ascending by doc_id above, and PostingsBuilder::add rejects \
+                     nothing that would violate it)",
+                );
+                let payload_offset = field_payload.len() as u64;
+                field_payload.extend_from_slice(&block_payload);
+                segment_descriptors.push((payload_offset, block_payload.len() as u32));
             }
             roaring.shrink_to_fit();
+            debug_assert_eq!(segment_descriptors.len(), term_count);
+
+            // Lot C `C1a-batché`: ONE `append()` for the WHOLE field —
+            // this is the batching contract (see the module doc on
+            // `postings_segment`). `field_base_offset` is where this
+            // field's payload starts in the SHARED segment; every
+            // `segment_descriptors` entry recorded above was relative to
+            // `field_payload` (starting at 0), so it is rebased to a
+            // segment-absolute offset here.
+            let field_base_offset = postings_segment.append(&field_payload);
+            for descriptor in &mut segment_descriptors {
+                descriptor.0 += field_base_offset;
+            }
+            drop(field_payload);
+
+            // SHADOW validation (Lot C `C1a-batché`): re-`pread` every
+            // term's just-flushed bytes from the ACTUAL segment file
+            // (not the local buffer) and decode them, comparing
+            // bit-for-bit against the RAM source of truth. This exercises
+            // the codec AND the pwrite/pread path together. Costs nothing
+            // in release builds — `debug_assert!`'s condition, including
+            // every `pread` syscall inside `validate_field_segment_round_trip`,
+            // is unreachable dead code once `cfg!(debug_assertions)` is
+            // `false`.
+            debug_assert!(
+                validate_field_segment_round_trip(
+                    &postings_segment,
+                    &segment_descriptors,
+                    &offsets,
+                    &doc_ids_flat,
+                    &freqs_flat,
+                ),
+                "postings segment blocked round-trip mismatch for field {field:?}"
+            );
 
             let bytes = builder
                 .into_inner()
@@ -308,12 +564,48 @@ impl PostingsBuilder {
                     offsets: offsets.into_boxed_slice(),
                     block_offsets: block_offsets.into_boxed_slice(),
                     roaring,
+                    segment_descriptors: segment_descriptors.into_boxed_slice(),
                 },
             );
         }
 
-        TermDictionary { fields }
+        TermDictionary {
+            fields,
+            postings_segment: Arc::new(postings_segment),
+        }
     }
+}
+
+/// SHADOW validation (Lot C `C1a-batché`, only ever called from inside a
+/// `debug_assert!` in [`PostingsBuilder::build`]): re-`pread`s every
+/// term's just-flushed bytes from `segment` and decodes them via
+/// [`decode_postings_blocked`], comparing bit-for-bit against the RAM
+/// source of truth (`doc_ids_flat`/`freqs_flat`, sliced by `offsets`).
+/// Returns `false` on the first mismatch or decode error.
+fn validate_field_segment_round_trip(
+    segment: &PostingsSegment,
+    segment_descriptors: &[(u64, u32)],
+    offsets: &[u32],
+    doc_ids_flat: &[u32],
+    freqs_flat: &[u32],
+) -> bool {
+    for (idx, &(offset, len)) in segment_descriptors.iter().enumerate() {
+        let start = offsets[idx] as usize;
+        let end = offsets[idx + 1] as usize;
+        let expected_doc_ids = &doc_ids_flat[start..end];
+        let expected_freqs = &freqs_flat[start..end];
+
+        let bytes = segment.read(offset, len);
+        let Ok((decoded_doc_ids, decoded_freqs)) =
+            decode_postings_blocked(&bytes, expected_doc_ids.len())
+        else {
+            return false;
+        };
+        if decoded_doc_ids != expected_doc_ids || decoded_freqs != expected_freqs {
+            return false;
+        }
+    }
+    true
 }
 
 /// Per-field FST term dictionary plus FLAT postings buffers indexed by
@@ -397,6 +689,16 @@ pub struct FieldPostings {
     /// `Vec<Option<RoaringDocSet>>` (one slot per term, `None` almost
     /// everywhere) did.
     roaring: Vec<(u32, RoaringDocSet)>,
+    /// Lot C `C1a-batché` SHADOW: per-term `(offset, len)` descriptor into
+    /// the shared segment (see [`TermDictionary::postings_segment`]),
+    /// index-aligned with `offsets` by FST idx — `T` entries, ONE per
+    /// term (not a CSR table: each descriptor already spans the term's
+    /// whole FoR-blocked payload, so there is no cumulative-offset
+    /// pattern to exploit here). Written once in `PostingsBuilder::build()`,
+    /// read only by [`TermDictionary::decode_from_segment`] (validation /
+    /// future cold paths) — never by `lookup*`/scoring/the leapfrog,
+    /// which stay on `doc_ids_flat`/`freqs_flat` above.
+    segment_descriptors: Box<[(u64, u32)]>,
 }
 
 impl FieldPostings {
@@ -416,6 +718,15 @@ impl FieldPostings {
             self.doc_ids_flat.get(start..end)?,
             self.freqs_flat.get(start..end)?,
         ))
+    }
+
+    /// Lot C `C1a-batché` SHADOW: this term's `(offset, len)` descriptor
+    /// into the shared segment, plus its posting count (`df`, needed by
+    /// [`decode_postings_blocked`] to know where the last block ends).
+    fn segment_slice(&self, term: &str) -> Option<((u64, u32), usize)> {
+        let (idx, start, end) = self.term_range(term)?;
+        let descriptor = *self.segment_descriptors.get(idx)?;
+        Some((descriptor, end - start))
     }
 
     fn lookup_block_metas(&self, term: &str) -> Option<&[BlockMeta]> {
@@ -512,6 +823,18 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 #[derive(Debug, Default, Clone)]
 pub struct TermDictionary {
     fields: BTreeMap<String, FieldPostings>,
+    /// Lot C `C1a-batché` SHADOW disk-backed FoR postings segment (see the
+    /// module doc on `postings_segment` at the top of this file). `Arc`
+    /// because `TermDictionary` derives `Clone` (transitively required by
+    /// `DocumentIndex: Clone`) and any clone must keep sharing the SAME
+    /// underlying tempfile — cloning the `Arc` is a refcount bump, not a
+    /// second segment. The segment is written exactly once, at
+    /// [`PostingsBuilder::build`] time, and is read-only for the rest of
+    /// its life (by [`Self::decode_from_segment`] only — no production
+    /// read path touches it), so sharing via `Arc` needs no interior
+    /// mutability. Dropped (and its tempfile removed) once every clone of
+    /// the `TermDictionary` that reached this generation is gone.
+    postings_segment: Arc<PostingsSegment>,
 }
 
 impl TermDictionary {
@@ -569,6 +892,37 @@ impl TermDictionary {
     /// `(field, term)` pairs without exposing the internal `BTreeMap`.
     pub fn field_names(&self) -> Vec<String> {
         self.fields.keys().cloned().collect()
+    }
+
+    /// Lot C `C1a-batché` SHADOW: decode `(field, term)`'s postings back
+    /// from the disk segment (`pread` + [`decode_postings_blocked`])
+    /// instead of reading `doc_ids_flat`/`freqs_flat` in RAM. Returns
+    /// `None` when the field or the term is unknown, `None` on a
+    /// malformed payload (never observed in practice — `build()` already
+    /// `debug_assert!`s this round-trip for every term at build time).
+    ///
+    /// NOT on any production read path — `lookup*`/[`PostingsList`]/
+    /// scoring/the leapfrog all stay on the RAM buffers. This method
+    /// exists for the shadow round-trip test and for a future cold path
+    /// (C1b) to build on.
+    pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
+        let field_postings = self.fields.get(field)?;
+        let ((offset, len), count) = field_postings.segment_slice(term)?;
+        let bytes = self.postings_segment.read(offset, len);
+        decode_postings_blocked(&bytes, count).ok()
+    }
+
+    /// Lot C `C1a-batché` gauge: total bytes physically written to the
+    /// disk segment so far (`surch_index_disk_postings_bytes`). Mirrors
+    /// `surch_index_disk_segment_bytes` (the `source.dat`/`_source`
+    /// segment in surch-api): a raw disk-footprint measurement, kept
+    /// OUTSIDE [`crate::memory::MemoryUsage`]/`total_bytes()` on purpose
+    /// — it measures bytes on disk (page-cache backed), not RAM the
+    /// process holds, so summing it into the RAM total would double-count
+    /// against `postings_bytes` (SHADOW: the same postings are, today,
+    /// ALSO fully resident in `doc_ids_flat`/`freqs_flat`).
+    pub fn postings_segment_bytes(&self) -> u64 {
+        self.postings_segment.bytes_written()
     }
 
     /// #17 memory accounting: total bytes held by every field's FST term

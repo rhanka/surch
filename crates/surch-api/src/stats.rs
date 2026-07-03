@@ -35,6 +35,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         state.index_state_memory_bytes(index).unwrap_or((0, 0));
     let disk_segment_bytes = state.index_disk_segment_bytes(index).unwrap_or(0);
     let disk_segment_peak_bytes = state.index_disk_segment_peak_bytes(index).unwrap_or(0);
+    let disk_postings_bytes = state.index_disk_postings_bytes(index).unwrap_or(0);
     set_gauges(
         index,
         doc_count,
@@ -43,6 +44,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         state_id_maps,
         disk_segment_bytes,
         disk_segment_peak_bytes,
+        disk_postings_bytes,
     );
     refresh_process_memory_gauges();
     // Lot C Phase 0b : stats internes jemalloc. Appelé ici, donc APRÈS
@@ -269,7 +271,7 @@ pub fn refresh_jemalloc_purge() {}
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
-    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0);
+    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0);
 }
 
 fn set_gauges(
@@ -280,6 +282,7 @@ fn set_gauges(
     state_id_maps: u64,
     disk_segment_bytes: u64,
     disk_segment_peak_bytes: u64,
+    disk_postings_bytes: u64,
 ) {
     let label = [("index", index.to_owned())];
     // P1 mmap M1 + axe disque #19 : taille on-disk effective du segment
@@ -290,6 +293,15 @@ fn set_gauges(
     metrics::gauge!("surch_index_disk_segment_bytes", &label).set(disk_segment_bytes as f64);
     metrics::gauge!("surch_index_disk_segment_peak_bytes", &label)
         .set(disk_segment_peak_bytes as f64);
+    // Lot C `C1a-batché` : segment FoR postings SHADOW (écrit, batché par
+    // champ, mais aucun read path de prod ne le consomme — voir
+    // `surch_index::postings::TermDictionary::decode_from_segment`).
+    // Volontairement HORS `usage.total_bytes()` : ce sont des octets sur
+    // disque (page-cache), pas de la RAM, et les mêmes postings sont
+    // aujourd'hui AUSSI comptés dans `surch_index_postings_bytes` (RAM
+    // reste la source de vérité tant que C1b n'a pas basculé le read
+    // path) — les sommer doublerait le compte.
+    metrics::gauge!("surch_index_disk_postings_bytes", &label).set(disk_postings_bytes as f64);
     metrics::gauge!("surch_index_postings_bytes", &label).set(usage.postings_bytes as f64);
     metrics::gauge!("surch_index_prefix_postings_bytes", &label)
         .set(usage.prefix_postings_bytes as f64);
