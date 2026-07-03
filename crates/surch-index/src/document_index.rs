@@ -293,6 +293,26 @@ impl SubfieldColumn {
             .map(|(idx, &code)| (idx as u32, self.dict[code as usize].as_ref()))
     }
 
+    /// Lot C `C2` : libere `intern_index`. Provably write-only after this
+    /// point (grep audit: the only reader is `intern()` itself, called
+    /// exclusively from the write path `set()`/`add_documents_with_mapping*`
+    /// — `get()`/`iter()` above read `dict`/`codes`, never `intern_index`).
+    /// `dict`/`codes` are left untouched (still required for reads).
+    ///
+    /// Called once per `_refresh` (mirrors `DocumentIndex::finalize_postings`
+    /// dropping `postings_builder`). Safe because the next `set()`/`intern()`
+    /// call — if any — is always preceded by a full `DocumentIndex::clear()`
+    /// (see `surch-api::InMemoryIndex::append_to_index`'s `terms_finalized`
+    /// guard: the first write after ANY refresh always routes through
+    /// `rebuild_index()`, which clears and fully repopulates
+    /// `subfield_values` from every currently-live doc). So clearing
+    /// `intern_index` here never causes a `dict` value to be re-interned
+    /// with a duplicate code across write batches — it only frees memory
+    /// slightly earlier than that guaranteed next `clear()` would anyway.
+    fn finalize(&mut self) {
+        self.intern_index = HashMap::new();
+    }
+
     /// Lot C Phase 1 lever 2 memory accounting: approximate heap bytes
     /// held by this column, for [`crate::memory::document_index_memory_usage`].
     /// `dict`: one `Box<str>` fat-pointer header (16 B on 64-bit) + UTF-8
@@ -760,6 +780,13 @@ impl DocumentIndex {
             self.terms_build_count.fetch_add(1, Ordering::Relaxed);
         } else {
             self.postings_builder = PostingsBuilder::new();
+        }
+        // Lot C `C2` : meme mouvement pour le builder d'interning des
+        // sub-fields — voir `SubfieldColumn::finalize` pour la preuve
+        // qu'il est sans danger de le vider ici (write-only, toujours
+        // repeuple depuis zero par le prochain write via `clear()`).
+        for column in self.subfield_values.values_mut() {
+            column.finalize();
         }
     }
 
