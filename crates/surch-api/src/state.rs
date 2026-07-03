@@ -1,10 +1,11 @@
 use std::{
     cell::RefCell,
-    collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, RwLock},
 };
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+use fst::{Map, MapBuilder};
 use rayon::prelude::*;
 use serde_json::Value;
 use surch_index::{
@@ -467,57 +468,129 @@ struct MemoryStore {
 // `next_offset` et les `OnDisk { offset, length }`). Le derive Clone
 // originel n'etait pas utilise (verification par grep) — on le retire
 // pour eviter un piege future.
+/// Lot C `C2` : snapshot immuable et dense des 3 anciennes `BTreeMap`
+/// (`documents`, `document_ids`, `reverse_document_ids`), materialise a
+/// chaque `_refresh` par [`InMemoryIndex::densify`]. Remplace jusqu'a
+/// ~1,36 M allocations `Arc<str>` + nœuds `BTreeMap` individuelles (la
+/// source de fragmentation interne mesuree — cf. commit "gauges internes
+/// jemalloc pour expliquer le gap heap anon") par des buffers contigus :
+/// - `forward` : FST `uid -> doc_id`. Zero allocation par UID — les
+///   octets sont encodes dans le graphe FST partage-prefixe (meme
+///   crate/pattern que `TermDictionary`, cf. `surch-index::postings`).
+/// - `reverse_uids` / `reverse_offsets` : `doc_id -> uid` empaquetes en
+///   UN buffer `Box<[u8]>` + une table d'offsets CSR (`len = doc_count +
+///   1`), indexee directement par `doc_id`. Un "trou" (doc_id supprime
+///   avant ce densify) est encode par `offsets[i] == offsets[i+1]` (span
+///   vide) — sans collision possible avec un UID legitime car
+///   `document_handler` rejette tout id vide en amont
+///   (`document.rs::document_handler`: "document id must not be empty").
+/// - `documents` : `_source` (`SourceBlob`) indexe par `doc_id`, `Option`
+///   pour distinguer un trou (`None`) d'un blob present.
+///
+/// `doc_id` n'est **jamais reutilise** (`InMemoryIndex::next_doc_id` ne
+/// fait qu'incrementer ; un uid absent — y compris un uid precedemment
+/// supprime — reçoit toujours un id neuf, voir
+/// [`InMemoryIndex::upsert_document_deferred`]) : un trou reste un trou a
+/// vie, il n'est jamais "re-rempli" en place, seulement omis du PROCHAIN
+/// snapshot dense.
+#[derive(Debug, Default)]
+struct DenseIdMaps {
+    forward: Option<Map<Vec<u8>>>,
+    reverse_uids: Box<[u8]>,
+    reverse_offsets: Box<[u32]>,
+    documents: Box<[Option<SourceBlob>]>,
+}
+
+impl DenseIdMaps {
+    /// Nombre de `doc_id` couverts par ce snapshot (vivants ou trous).
+    fn doc_count(&self) -> u32 {
+        self.reverse_offsets.len().saturating_sub(1) as u32
+    }
+
+    /// UID pour `doc_id` ; `None` si hors bornes ou trou (doc supprime
+    /// avant ce densify).
+    fn uid(&self, doc_id: u32) -> Option<&str> {
+        let idx = doc_id as usize;
+        let start = *self.reverse_offsets.get(idx)?;
+        let end = *self.reverse_offsets.get(idx + 1)?;
+        if start == end {
+            return None;
+        }
+        std::str::from_utf8(&self.reverse_uids[start as usize..end as usize]).ok()
+    }
+
+    /// `_source` stocke pour `doc_id` ; `None` si hors bornes ou trou.
+    fn blob(&self, doc_id: u32) -> Option<&SourceBlob> {
+        self.documents.get(doc_id as usize)?.as_ref()
+    }
+
+    /// `doc_id` pour `uid` dans CE snapshot, sans tenir compte des
+    /// suppressions posterieures — voir [`InMemoryIndex::resolve_uid`]
+    /// pour la resolution complete (dirty + tombstones + dense).
+    fn forward_get(&self, uid: &str) -> Option<u32> {
+        self.forward
+            .as_ref()?
+            .get(uid.as_bytes())
+            .map(|value| value as u32)
+    }
+}
+
 #[derive(Debug, Default)]
 struct InMemoryIndex {
-    /// `_source` payloads, refcounted so the search hot path
-    /// (`build_hit`, `score_documents`, `lookup_sort_value`, …) can
-    /// hand each reader a fresh [`StoredDocument`] without cloning
-    /// the entire JSON. Multiple concurrent reads on the same doc
-    /// share the same `Arc<Value>`; writes always allocate a fresh
-    /// `Arc` so an in-flight reader's snapshot stays untouched. The
-    /// Prometheus gauge `surch_index_stored_fields_bytes` keeps
-    /// counting the `Value` payload size once (regardless of the
-    /// strong count), so the gauge tracks unique stored bytes —
-    /// which is what capacity planning cares about.
-    /// #15 memory: the `_source` is stored as the SERIALIZED JSON bytes,
-    /// NOT a parsed `serde_json::Value` tree (the deces breakdown
-    /// showed the parsed `Value` is the dominant RSS term — ~2-3× the serialized
-    /// size). It is parsed back to a `Value` on access via [`Self::parsed_source`]
-    /// — cheap because reads hydrate only the top-K window (~20 docs/query).
-    ///
-    /// Campagne mémoire option B (cf. `docs/paper/memory-pivot-decision.md`)
-    /// composee avec `mmap M1` (P1 persistance) : la valeur est un
-    /// [`SourceBlob`] qui peut être `OnDisk { offset, length }` (chemin
-    /// INSERT bulk — pointeur dans `source_store`, page-cache OS) ou
-    /// `Compressed(Arc<[u8]>)` (état après [`Self::compact_after_refresh`]).
-    /// La voie d'INSERT et
-    /// la voie `append_to_index` voient EXCLUSIVEMENT `OnDisk`, donc le
-    /// gate indexation reste intact par construction. Le decode payé
-    /// sur la voie search post-refresh (~5-10 µs / blob) ne touche que
-    /// les ~20 docs du top-K.
-    /// Lot C Phase 1 levier 3 : la clé est un `Arc<str>` PARTAGÉ avec
-    /// `document_ids` (clé) et `reverse_document_ids` (valeur) — les 3
-    /// maps portent le même buffer UTF-8 alloué UNE SEULE fois par
-    /// document, au lieu de 3 `String` dupliquées (~44 o/UID × 1,36 M ×
-    /// 2 copies redondantes sur le corpus deces). Voir
-    /// [`Self::upsert_document_deferred`] pour le point d'insertion
-    /// partagée (un seul `Arc::from`, deux `Arc::clone`).
-    documents: BTreeMap<Arc<str>, SourceBlob>,
+    /// Lot C `C2` : snapshot immuable, dense, materialise au dernier
+    /// `_refresh` — voir [`DenseIdMaps`]. Les ecritures posterieures a ce
+    /// snapshot vivent dans les 4 champs `*_dirty` / `deleted_since_dense`
+    /// ci-dessous jusqu'au PROCHAIN `_refresh` ([`InMemoryIndex::densify`],
+    /// appele par [`InMemoryIndex::finalize_terms_for_refresh`]). Toute
+    /// lecture (`_id` GET, `_source`, scoring, `_count`) doit passer par
+    /// [`InMemoryIndex::resolve_uid`] / [`InMemoryIndex::uid_for_doc_id`] /
+    /// [`InMemoryIndex::blob_for_doc_id`], qui fusionnent les deux
+    /// couches — ne JAMAIS lire `dense` directement hors de ces helpers,
+    /// une lecture directe verrait un etat perime des l'instant ou une
+    /// ecriture arrive apres le dernier `_refresh` (le cas courant sur le
+    /// hot path bulk : `ensure_terms_ready` materialise les postings
+    /// SANS `_refresh`, donc une recherche peut voir des docs encore
+    /// uniquement `*_dirty`).
+    dense: DenseIdMaps,
+    /// UID -> doc_id pour les documents INSERES depuis le dernier
+    /// densify (absents de `dense.forward`). Une mise a jour d'un
+    /// document DEJA densifie ne touche PAS cette map (le doc_id ne
+    /// change jamais) — seul `documents_dirty` change alors. Retire
+    /// l'entree d'un uid frais supprime (voir
+    /// `delete_document_deferred`). Cle `Arc<str>` partagee avec
+    /// `reverse_dirty` (meme trick "levier 3" que l'ancien design : un
+    /// seul alloc par UID frais, pas deux).
+    forward_dirty: HashMap<Arc<str>, u32>,
+    /// doc_id -> UID, miroir de `forward_dirty` (memes instances
+    /// `Arc<str>`, `Arc::clone`). Ne couvre QUE les doc_id frais (jamais
+    /// densifies) — un doc deja densifie garde son UID dans `dense`,
+    /// jamais duplique ici meme apres update.
+    reverse_dirty: HashMap<u32, Arc<str>>,
+    /// doc_id -> `_source`, pour les inserts frais ET les updates d'un
+    /// doc deja densifie (le blob change, le doc_id jamais). Prioritaire
+    /// sur `dense.documents` a la lecture (voir `blob_for_doc_id`).
+    documents_dirty: HashMap<u32, SourceBlob>,
+    /// doc_id du snapshot `dense` (`< dense.doc_count()`) supprimes
+    /// depuis ce densify. Verifie EN PREMIER par toute lecture
+    /// doc_id-keyed (`uid_for_doc_id` / `blob_for_doc_id`) avant de
+    /// consulter `*_dirty` / `dense` : un doc_id tombstonne ne peut
+    /// jamais redevenir vivant (voir la garantie "jamais reutilise" sur
+    /// [`DenseIdMaps`]), donc cet ordre est correct par construction,
+    /// pas seulement grace au nettoyage best-effort fait par
+    /// `delete_document_deferred`. Vide a chaque densify (les trous sont
+    /// alors codes en dur dans le nouveau `dense.reverse_offsets`).
+    deleted_since_dense: HashSet<u32>,
+    /// Nombre de documents vivants, maintenu de façon incrementale (+1
+    /// sur un insert frais, -1 sur un delete reussi, inchange sur un
+    /// update) pour eviter un scan O(doc_count) a chaque `_count` /
+    /// `document_count` (contrat deja documente sur
+    /// [`AppState::document_count`] : "Avoids the O(N) clone…").
+    live_count: u32,
     /// `mmap M1` — segment `source.dat` file-backed sous `TMPDIR`,
     /// pre-alloue par `posix_fallocate(64 MiB)`. Append-only pendant le
-    /// bulk, truncate a 0 a la fin de `compact_after_refresh` une fois
-    /// tous les blobs migres en `Compressed`. Le store est cree
-    /// paresseusement via `Default` (un tempfile par index) ; il est
-    /// supprime au `Drop` de `InMemoryIndex`.
+    /// bulk. Le store est cree paresseusement via `Default` (un tempfile
+    /// par index) ; il est supprime au `Drop` de `InMemoryIndex`.
     source_store: SourceStore,
-    /// Lot C Phase 1 levier 3 : clé `Arc<str>` partagée avec `documents`
-    /// (clé) et `reverse_document_ids` (valeur) — même buffer, pas de
-    /// copie des octets UTF-8 de l'UID.
-    document_ids: BTreeMap<Arc<str>, u32>,
-    /// Lot C Phase 1 levier 3 : valeur `Arc<str>` partagée avec
-    /// `documents` et `document_ids` (mêmes instances, `Arc::clone`
-    /// uniquement).
-    reverse_document_ids: BTreeMap<u32, Arc<str>>,
     next_doc_id: u32,
     mapping: IndexMapping,
     settings: Value,
@@ -723,56 +796,110 @@ impl InMemoryIndex {
         self.rebuild_index();
     }
 
-    fn upsert_document_deferred(&mut self, id: &str, source: Value) {
-        // Lot C Phase 1 levier 3 : un SEUL `Arc<str>` porte l'UID, partagé
-        // entre `documents` (clé), `document_ids` (clé) et
-        // `reverse_document_ids` (valeur) via `Arc::clone` — les 3 handles
-        // pointent sur le MEME buffer alloué une fois. `entry()` consomme
-        // toujours le buffer `Arc::from(id)` construit ci-dessous : sur un
-        // INSERT (`Entry::Vacant`) il devient la clé stockée ; sur un
-        // UPDATE (`Entry::Occupied`, id déjà présent) il est droppé et on
-        // réutilise `Arc::clone(occupied.key())` — le buffer déjà partagé
-        // par `document_ids`/`reverse_document_ids` — pour que `documents`
-        // reste aligné sur la MEME instance (partage vrai y compris sur
-        // update, pas seulement sur le chemin append-only dominant du
-        // bulk matchID).
-        let uid: Arc<str> = match self.document_ids.entry(Arc::from(id)) {
-            Entry::Vacant(entry) => {
-                let doc_id = self.next_doc_id;
-                self.next_doc_id += 1;
-                let uid = Arc::clone(entry.key());
-                self.reverse_document_ids.insert(doc_id, Arc::clone(&uid));
-                entry.insert(doc_id);
-                uid
-            }
-            Entry::Occupied(entry) => Arc::clone(entry.key()),
-        };
+    /// Lot C `C2` : resout `id` vers son `doc_id` VIVANT courant, en
+    /// fusionnant la couche mutable (`forward_dirty`) et le snapshot
+    /// dense (`dense.forward`, filtre par `deleted_since_dense`). Source
+    /// de verite UNIQUE pour la decision insert-vs-update de
+    /// [`Self::upsert_document_deferred`] ET pour toute lecture publique
+    /// (`has_document`, `parsed_source`, `internal_doc_ids`) — ne JAMAIS
+    /// interroger `dense.forward`/`forward_dirty` directement ailleurs.
+    fn resolve_uid(&self, id: &str) -> Option<u32> {
+        if let Some(&doc_id) = self.forward_dirty.get(id) {
+            return Some(doc_id);
+        }
+        let doc_id = self.dense.forward_get(id)?;
+        if self.deleted_since_dense.contains(&doc_id) {
+            None
+        } else {
+            Some(doc_id)
+        }
+    }
 
+    /// Lot C `C2` : UID public pour `doc_id`, fusionnant les deux
+    /// couches. Le tombstone est verifie EN PREMIER (voir le commentaire
+    /// sur `deleted_since_dense`) : un `doc_id` retire ne peut jamais
+    /// redevenir vivant, donc court-circuiter ici est correct meme si un
+    /// override `*_dirty` obsolete traine encore.
+    fn uid_for_doc_id(&self, doc_id: u32) -> Option<&str> {
+        if self.deleted_since_dense.contains(&doc_id) {
+            return None;
+        }
+        if let Some(uid) = self.reverse_dirty.get(&doc_id) {
+            return Some(uid.as_ref());
+        }
+        self.dense.uid(doc_id)
+    }
+
+    /// Lot C `C2` : `_source` stocke pour `doc_id`, fusionnant les deux
+    /// couches (meme ordre de priorite que `uid_for_doc_id`).
+    fn blob_for_doc_id(&self, doc_id: u32) -> Option<&SourceBlob> {
+        if self.deleted_since_dense.contains(&doc_id) {
+            return None;
+        }
+        if let Some(blob) = self.documents_dirty.get(&doc_id) {
+            return Some(blob);
+        }
+        self.dense.blob(doc_id)
+    }
+
+    /// Lot C `C2` : `doc_id`s vivants en ordre ascendant (`0..next_doc_id`,
+    /// trous sautes). C'est l'ordre d'INSERTION (le seul ordre naturel
+    /// qu'un `doc_id` dense supporte), PAS l'ancien ordre lexicographique
+    /// sur l'uid public que la `BTreeMap<Arc<str>, _>` produisait — voir
+    /// le changement de contrat documente sur `AppState::documents`/
+    /// `AppState::documents_paginated`.
+    fn live_doc_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.next_doc_id).filter(move |&doc_id| !self.deleted_since_dense.contains(&doc_id))
+    }
+
+    fn upsert_document_deferred(&mut self, id: &str, source: Value) {
         // `mmap M1` + option B : on serialise puis on append au segment
         // `source.dat` file-backed (cf. module `source_store`). Le slot
-        // `documents` stocke `OnDisk { offset, length }` — 12 octets en
-        // RAM au lieu des bytes JSON eux-memes. La compression a lieu a
-        // `_refresh` via `compact_after_refresh` (option B), qui
-        // migrera ces blobs vers `Compressed(Arc<[u8]>)` puis truncate
-        // le segment.
+        // stocke `OnDisk { offset, length }` — 12 octets en RAM au lieu
+        // des bytes JSON eux-memes.
         //
         // Coût bulk : 1× pwrite (~5 µs amorti grace au
-        // `posix_fallocate` qui evite l'extension ext4 par bloc 4 KiB)
-        // au lieu de 1× `Arc::from` + insertion BTreeMap. Gate
-        // indexation >= 14 000 docs/s preserve.
+        // `posix_fallocate` qui evite l'extension ext4 par bloc 4 KiB).
+        // Gate indexation >= 14 000 docs/s preserve.
         //
-        // `ensure_fields` a besoin du `Value` parse, donc analyse
-        // AVANT serialisation. Updates (meme `id`) ecrasent le slot
-        // `documents` — les bytes precedents dans `source.dat` sont
-        // orphelins (acceptable pour P1 ; P2/P3 ajoutent une
-        // compaction segments). En pratique le bulk matchID est
-        // append-only par construction, donc zero orphelin.
+        // `ensure_fields` a besoin du `Value` parse, donc analyse AVANT
+        // serialisation. Updates (meme `id`) ecrasent le slot dirty — les
+        // bytes precedents dans `source.dat` sont orphelins (acceptable
+        // pour P1 ; P2/P3 ajoutent une compaction segments). En pratique
+        // le bulk matchID est append-only par construction, donc zero
+        // orphelin.
         self.mapping.ensure_fields(&source);
         let serialized =
             serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
         let (offset, length) = self.source_store.append(&serialized);
-        self.documents
-            .insert(uid, SourceBlob::OnDisk { offset, length });
+        let blob = SourceBlob::OnDisk { offset, length };
+
+        if let Some(doc_id) = self.resolve_uid(id) {
+            // Update : le `doc_id` ne change JAMAIS, seul le blob
+            // stocke change. Va dans l'overlay dirty que le doc soit deja
+            // densifie (`doc_id < dense.doc_count()`) ou encore frais —
+            // `blob_for_doc_id` regarde `documents_dirty` avant `dense`
+            // dans les deux cas.
+            self.documents_dirty.insert(doc_id, blob);
+            return;
+        }
+
+        // Insert frais — un uid jamais vu, OU un uid deja vu mais
+        // supprime depuis (voir `resolve_uid` : un `doc_id` tombstonne
+        // reste tombstonne pour toujours, donc ceci mint TOUJOURS un
+        // `doc_id` neuf, jamais une resurrection de l'ancien).
+        //
+        // Lot C `C2` (mirroir de l'ancien "levier 3") : un SEUL
+        // `Arc<str>` porte l'UID, partage entre `forward_dirty` (clé) et
+        // `reverse_dirty` (valeur) via `Arc::clone` — un seul alloc pour
+        // les deux handles.
+        let doc_id = self.next_doc_id;
+        self.next_doc_id += 1;
+        let uid: Arc<str> = Arc::from(id);
+        self.reverse_dirty.insert(doc_id, Arc::clone(&uid));
+        self.forward_dirty.insert(uid, doc_id);
+        self.documents_dirty.insert(doc_id, blob);
+        self.live_count += 1;
     }
 
     fn delete_document(&mut self, id: &str) {
@@ -782,12 +909,26 @@ impl InMemoryIndex {
     }
 
     fn delete_document_deferred(&mut self, id: &str) -> bool {
-        if let Some(doc_id) = self.document_ids.remove(id) {
-            self.documents.remove(id);
-            self.reverse_document_ids.remove(&doc_id);
-            return true;
+        let Some(doc_id) = self.resolve_uid(id) else {
+            return false;
+        };
+        // Retire tout override dirty pour ce doc_id/uid — couvre a la
+        // fois un insert frais jamais densifie (retraction complete,
+        // aucun tombstone requis puisqu'il n'a jamais existe dans
+        // `dense`) ET un doc deja densifie mis a jour puis supprime dans
+        // la meme fenetre (no-op si aucun override n'existait).
+        self.forward_dirty.remove(id);
+        self.reverse_dirty.remove(&doc_id);
+        self.documents_dirty.remove(&doc_id);
+        // Un `doc_id` du snapshot dense doit etre tombstonne
+        // explicitement (le buffer `dense` est immuable jusqu'au
+        // prochain densify) ; un `doc_id` frais (jamais densifie) n'a
+        // besoin de rien de plus, la retraction ci-dessus suffit.
+        if doc_id < self.dense.doc_count() {
+            self.deleted_since_dense.insert(doc_id);
         }
-        false
+        self.live_count -= 1;
+        true
     }
 
     fn mapping_value(&self) -> Value {
@@ -799,27 +940,23 @@ impl InMemoryIndex {
     }
 
     fn has_document(&self, id: &str) -> bool {
-        self.document_ids.contains_key(id)
+        self.resolve_uid(id).is_some()
     }
 
     fn rebuild_index(&mut self) {
         self.index.clear();
-        let store_ref = &self.source_store;
-        let documents = self
-            .documents
-            .iter()
-            .filter_map(|(id, blob)| {
-                self.document_ids.get(id).map(|doc_id| {
-                    // #15 + `mmap M1` : on parse le `_source` stocke
-                    // (OnDisk -> pread sur le segment file-backed,
-                    // Compressed -> decode thread-local). Seul chemin
-                    // d'INDEXATION qui touche le decode/pread ; pas le
-                    // hot path bulk steady-state.
-                    let parsed = parse_source_blob(blob, store_ref);
-                    (*doc_id, indexed_fields_for_document(&parsed, &self.mapping))
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut documents: Vec<(u32, Vec<(String, String)>)> = Vec::new();
+        for doc_id in 0..self.next_doc_id {
+            let Some(blob) = self.blob_for_doc_id(doc_id) else {
+                continue;
+            };
+            // #15 + `mmap M1` : on parse le `_source` stocke (OnDisk ->
+            // pread sur le segment file-backed, Compressed -> decode
+            // thread-local). Seul chemin d'INDEXATION qui touche le
+            // decode/pread ; pas le hot path bulk steady-state.
+            let parsed = parse_source_blob(blob, &self.source_store);
+            documents.push((doc_id, indexed_fields_for_document(&parsed, &self.mapping)));
+        }
         // Lot 1.6: defer the FST rebuild. The bulk path then chains
         // several rebuild/append calls without paying the per-call
         // build cost; the next `_refresh` or first search will
@@ -870,24 +1007,29 @@ impl InMemoryIndex {
         // Étape 1 du plan indexation 2× ES : parallélisation tokenization.
         // À ce point, `ensure_fields` a déjà été appelé pour CHAQUE doc du
         // batch (via `upsert_document_deferred`), donc `self.mapping` est
-        // stable pour la suite. `parsed_source` et `indexed_fields_for_document`
-        // ne touchent que des structures immutables (`documents` BTreeMap,
-        // `mapping`, `reverse_document_ids`), donc l'itération `rayon::par_iter`
-        // est thread-safe.
+        // stable pour la suite. `blob_for_doc_id` et
+        // `indexed_fields_for_document` ne touchent que des structures
+        // lues par reference (`dense`, `documents_dirty`, `mapping`),
+        // donc l'itération `rayon::par_iter` est thread-safe.
         //
-        // `mmap M1` : sur le hot path bulk steady-state, `parsed_source`
-        // emprunte la voie `OnDisk` → `pread` sur le segment `source.dat`
-        // file-backed (les bytes viennent juste d'etre ecrits par
+        // `mmap M1` : sur le hot path bulk steady-state, le blob resolu
+        // est `OnDisk` → `pread` sur le segment `source.dat` file-backed
+        // (les bytes viennent juste d'etre ecrits par
         // `upsert_document_deferred`, page-cache OS chaud). Aucun decode
         // codec ici. Chaque worker thread partage `Arc<File>` (Sync), le
         // `pread` syscall est concurrent-safe par construction. Cout
         // per-doc dominant ≈ 50 %, gain attendu ~1.4× sur 2 cores W=2.
+        //
+        // Lot C `C2` : resolution DIRECTE par `doc_id` (plus de detour
+        // par l'uid public) — `blob_for_doc_id` est deja un lookup
+        // doc_id-keyed, ce que `reverse_document_ids.get` +
+        // `parsed_source(uid)` faisait en deux temps auparavant.
         let self_ref = &*self;
         let documents = new_doc_ids
             .par_iter()
             .filter_map(|&doc_id| {
-                let id = self_ref.reverse_document_ids.get(&doc_id)?;
-                let source = self_ref.parsed_source(id)?;
+                let blob = self_ref.blob_for_doc_id(doc_id)?;
+                let source = parse_source_blob(blob, &self_ref.source_store);
                 Some((
                     doc_id,
                     indexed_fields_for_document(&source, &self_ref.mapping),
@@ -916,8 +1058,27 @@ impl InMemoryIndex {
     /// doc, then drop the builder.
     fn finalize_terms_for_refresh(&mut self) {
         if self.terms_finalized {
+            // Invariant : `terms_finalized == true` only happens right
+            // after this method ran (and every write path resets it to
+            // `false` again via `rebuild_index`/`append_to_index` — see
+            // their doc comments), so the 4 `densify` overlays below are
+            // necessarily already empty here; nothing pending to fold in.
+            debug_assert!(
+                self.forward_dirty.is_empty()
+                    && self.reverse_dirty.is_empty()
+                    && self.documents_dirty.is_empty()
+                    && self.deleted_since_dense.is_empty(),
+                "terms_finalized=true but id-map overlays are non-empty — \
+                 a write path bypassed rebuild_index/append_to_index's \
+                 terms_finalized reset"
+            );
             return;
         }
+        // Lot C `C2` : densifie les id maps dans le meme mouvement que la
+        // finalisation des postings ci-dessous — les deux "builders"
+        // (postings_builder ici, les 4 overlays dirty pour `densify`)
+        // sont draines ensemble a chaque refresh.
+        self.densify();
         // Lot C Phase 0 : méthode combinée sans clone du builder — évite le
         // pic transitoire ~1,3 GiB (builder + clone) au refresh, prérequis
         // anti-OOM sous limite mémoire. Cf. document_index.rs.
@@ -931,7 +1092,150 @@ impl InMemoryIndex {
         // Voir docs/paper/persistence-iceberg-architecture.md.
     }
 
-    /// Convertit en bloc tous les `SourceBlob::OnDisk` du `documents` en
+    /// Lot C `C2` : fusionne les 4 overlays mutables
+    /// (`forward_dirty`/`reverse_dirty`/`documents_dirty`/
+    /// `deleted_since_dense`) dans un `DenseIdMaps` frais, puis vide les
+    /// overlays. Appelee par [`Self::finalize_terms_for_refresh`] — le
+    /// "builder" des id maps est ces 4 champs, exactement comme
+    /// `postings_builder` est le builder du dictionnaire de termes ;
+    /// cette methode est leur `materialize_terms_and_finalize_postings`.
+    ///
+    /// O(doc courant vivant + trous) : meme ordre de grandeur que le
+    /// rescan complet deja paye par `rebuild_index()` sur un delete/update
+    /// et que la reconstruction FST des postings a chaque refresh — pas
+    /// un cout nouveau de nature, juste un cout supplementaire du meme
+    /// ordre.
+    ///
+    /// Cout transitoire assume : le nouveau snapshot est construit
+    /// PENDANT que l'ancien `self.dense` reste alloue (il est lu tout du
+    /// long), donc le pic memoire pendant `densify()` est
+    /// `ancien dense + nouveau dense` — un doublement transitoire, borne
+    /// et libere des la sortie de cette methode (`self.dense = ...`
+    /// droppe l'ancien). Le remplacement en place façon "Phase 0a" (sans
+    /// double-detention) demanderait un merge incremental plus complexe ;
+    /// laisse en amelioration future si ce pic s'avere genant en
+    /// pratique (id maps est un poste petit relativement a
+    /// `stored_fields`/`postings`).
+    fn densify(&mut self) {
+        if self.forward_dirty.is_empty()
+            && self.deleted_since_dense.is_empty()
+            && self.documents_dirty.is_empty()
+        {
+            // Rien de neuf depuis le dernier densify (ex: deux
+            // `_refresh` consecutifs sans ecriture) — `self.dense` est
+            // deja a jour, evite un rescan O(doc_count) inutile.
+            return;
+        }
+
+        let doc_count = self.next_doc_id;
+        // `live_uids[i]` correspond a `documents[i]` par construction (la
+        // meme condition `Some(blob) && Some(uid)` remplit les deux au
+        // meme rang) — voir le `debug_assert!` plus bas.
+        let mut live_uids: Vec<(u32, Arc<str>)> = Vec::new();
+        let mut documents: Vec<Option<SourceBlob>> = Vec::with_capacity(doc_count as usize);
+        for doc_id in 0..doc_count {
+            if self.deleted_since_dense.contains(&doc_id) {
+                documents.push(None);
+                continue;
+            }
+            let blob = self
+                .documents_dirty
+                .get(&doc_id)
+                .cloned()
+                .or_else(|| self.dense.blob(doc_id).cloned());
+            let uid: Option<Arc<str>> = match self.reverse_dirty.get(&doc_id) {
+                Some(uid) => Some(Arc::clone(uid)),
+                None => match self.dense.uid(doc_id) {
+                    Some(uid) => {
+                        let owned: Arc<str> = Arc::from(uid);
+                        Some(owned)
+                    }
+                    None => None,
+                },
+            };
+            match (blob, uid) {
+                (Some(blob), Some(uid)) => {
+                    live_uids.push((doc_id, uid));
+                    documents.push(Some(blob));
+                }
+                // Defensif : un `doc_id < doc_count` non tombstonne doit
+                // toujours avoir un blob ET un uid (invariant maintenu
+                // par `upsert_document_deferred`/`delete_document_deferred`).
+                // Ne devrait jamais arriver ; on reste sur `None` plutot
+                // que de paniquer sur un etat interne incoherent.
+                _ => documents.push(None),
+            }
+        }
+        debug_assert_eq!(
+            documents.len(),
+            doc_count as usize,
+            "densify must produce exactly one documents slot per doc_id in 0..next_doc_id"
+        );
+
+        // Reverse (doc_id -> uid), empaquete, positionnel par
+        // construction : `live_uids` est deja en ordre de doc_id
+        // croissant (boucle ci-dessus), donc un simple parcours en
+        // parallele avec `0..doc_count` place chaque uid au bon offset,
+        // un "trou" (doc_id absent de `live_uids`) obtenant un span vide.
+        let mut reverse_uids: Vec<u8> = Vec::new();
+        let mut reverse_offsets: Vec<u32> = Vec::with_capacity(doc_count as usize + 1);
+        reverse_offsets.push(0);
+        let mut live_iter = live_uids.iter().peekable();
+        for doc_id in 0..doc_count {
+            if let Some((next_id, uid)) = live_iter.peek() {
+                if *next_id == doc_id {
+                    reverse_uids.extend_from_slice(uid.as_bytes());
+                    reverse_offsets.push(reverse_uids.len() as u32);
+                    live_iter.next();
+                    continue;
+                }
+            }
+            reverse_offsets.push(reverse_uids.len() as u32);
+        }
+
+        // Forward (uid -> doc_id) : le `fst::MapBuilder` exige des cles
+        // strictement croissantes, donc on trie `live_uids` par octets
+        // d'uid (il est actuellement en ordre de doc_id).
+        let mut by_uid = live_uids;
+        by_uid.sort_unstable_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+        debug_assert!(
+            by_uid
+                .windows(2)
+                .all(|pair| pair[0].1.as_bytes() < pair[1].1.as_bytes()),
+            "two live doc_ids resolved to the same uid — forward resolution invariant violated"
+        );
+        let forward = if by_uid.is_empty() {
+            None
+        } else {
+            let mut builder = MapBuilder::memory();
+            for (doc_id, uid) in &by_uid {
+                builder
+                    .insert(uid.as_bytes(), u64::from(*doc_id))
+                    .expect("live uids are unique and were just sorted ascending");
+            }
+            let bytes = builder
+                .into_inner()
+                .expect("fst::MapBuilder memory writer never fails I/O");
+            Some(Map::new(bytes).expect("fst::Map from valid MapBuilder bytes"))
+        };
+
+        self.dense = DenseIdMaps {
+            forward,
+            reverse_uids: reverse_uids.into_boxed_slice(),
+            reverse_offsets: reverse_offsets.into_boxed_slice(),
+            documents: documents.into_boxed_slice(),
+        };
+        self.forward_dirty.clear();
+        self.forward_dirty.shrink_to_fit();
+        self.reverse_dirty.clear();
+        self.reverse_dirty.shrink_to_fit();
+        self.documents_dirty.clear();
+        self.documents_dirty.shrink_to_fit();
+        self.deleted_since_dense.clear();
+        self.deleted_since_dense.shrink_to_fit();
+    }
+
+    /// Convertit en bloc tous les `SourceBlob::OnDisk` vivants en
     /// `SourceBlob::Compressed` (deflate). Appelée UNE SEULE FOIS par
     /// `_refresh`, en dehors du hot path bulk : c'est le contrat de
     /// l'option B (cf. `docs/paper/memory-pivot-decision.md`) compose
@@ -945,54 +1249,44 @@ impl InMemoryIndex {
     /// Une fois TOUS les blobs migres en `Compressed`, on tronque le
     /// segment `source.dat` a 0 (`source_store.reset()`) — les bytes
     /// du fichier sont alors orphelins, et la prochaine vague de bulk
-    /// recommencera a offset 0. Sur deces post-refresh : segment
-    /// `source.dat` 0 octets, RAM compressed ~400 MiB.
-    ///
-    /// Budget chiffré : ~5-10 µs / blob compression (Compress
-    /// thread-local) + ~5-10 µs / blob pread (SSD NVMe). Sur deces
-    /// 1.36 M docs : ~15-25 s ajoutes au `_refresh` ; gate non-bloquant
-    /// (le `_refresh` n'est pas dans le hot path latence).
-    ///
-    /// Gain RAM cumule (`mmap M1` + option B) : `stored_fields_bytes`
-    /// gauge passe de 1187 MiB en RAM heap → ~400 MiB en RAM compressed
-    /// + 0 octet on-disk (segment truncate). RSS attendu deces 6621 → ~5500 MiB.
+    /// recommencera a offset 0.
     ///
     /// NOTE: Plus appelée depuis `finalize_terms_for_refresh` — avec P1
     /// mmap M1 actif les blobs OnDisk restent sur disque (pread O(1)) et
     /// le heap baisse plus que via la compression option B. Conservée pour
     /// usage manuel/test et resurrection éventuelle (`P2 manifest` notamment).
+    /// Lot C `C2` : adaptee aux structures dense/dirty — parcourt les
+    /// deux (le dense snapshot ET l'overlay dirty), en ignorant les trous
+    /// (`None`).
     #[allow(dead_code)]
     fn compact_after_refresh(&mut self) {
-        // Itération sur les clés pour eviter une re-clone du blob ;
-        // `get_mut` puis remplacement sur place via `*slot = ...` evite
-        // un re-hash dans `BTreeMap`.
-        // Lot C Phase 1 levier 3 : `id.clone()` clone l'`Arc<str>` partagé
-        // (bump du strong_count, pas de recopie d'octets).
-        let ids: Vec<Arc<str>> = self
-            .documents
-            .iter()
-            .filter_map(|(id, blob)| match blob {
-                SourceBlob::OnDisk { .. } => Some(Arc::clone(id)),
-                SourceBlob::Compressed(_) => None,
-            })
-            .collect();
-        for id in ids {
-            let Some(slot) = self.documents.get_mut(&id) else {
+        for slot in self.dense.documents.iter_mut() {
+            let Some(SourceBlob::OnDisk { offset, length }) = *slot else {
                 continue;
             };
-            if let SourceBlob::OnDisk { offset, length } = *slot {
-                let raw_bytes = self.source_store.read(offset, length);
-                let compressed = SourceBlob::encode_for_compact(&raw_bytes);
-                *slot = SourceBlob::Compressed(Arc::from(compressed.into_boxed_slice()));
-            }
+            let raw_bytes = self.source_store.read(offset, length);
+            let compressed = SourceBlob::encode_for_compact(&raw_bytes);
+            *slot = Some(SourceBlob::Compressed(Arc::from(
+                compressed.into_boxed_slice(),
+            )));
+        }
+        for blob in self.documents_dirty.values_mut() {
+            let SourceBlob::OnDisk { offset, length } = *blob else {
+                continue;
+            };
+            let raw_bytes = self.source_store.read(offset, length);
+            let compressed = SourceBlob::encode_for_compact(&raw_bytes);
+            *blob = SourceBlob::Compressed(Arc::from(compressed.into_boxed_slice()));
         }
         // Tous les `OnDisk` sont desormais migres ; les bytes du
-        // segment `source.dat` n'ont plus de reference depuis
-        // `documents`. On tronque a 0 + re-fallocate le chunk initial
-        // pour la prochaine vague bulk.
+        // segment `source.dat` n'ont plus de reference. On tronque a 0 +
+        // re-fallocate le chunk initial pour la prochaine vague bulk.
         let still_on_disk = self
+            .dense
             .documents
-            .values()
+            .iter()
+            .flatten()
+            .chain(self.documents_dirty.values())
             .any(|blob| matches!(blob, SourceBlob::OnDisk { .. }));
         if !still_on_disk {
             self.source_store.reset();
@@ -1028,11 +1322,7 @@ impl InMemoryIndex {
                 .map(|(doc_ids, _freqs)| doc_ids)
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|doc_id| {
-                    self.reverse_document_ids
-                        .get(&doc_id)
-                        .map(|s| s.to_string())
-                })
+                .filter_map(|doc_id| self.uid_for_doc_id(doc_id).map(str::to_string))
                 .collect();
         }
 
@@ -1040,15 +1330,11 @@ impl InMemoryIndex {
             .postings(field, &token)
             .into_iter()
             .flat_map(|postings| postings.map(|posting| posting.doc_id))
-            // Lot C Phase 1 levier 3: `reverse_document_ids` value is now a
-            // shared `Arc<str>`; `term_hits` keeps its public `Vec<String>`
+            // Lot C `C2`: `uid_for_doc_id` fuses the dense snapshot and the
+            // dirty overlay; `term_hits` keeps its public `Vec<String>`
             // contract, so the public id is materialised here (bounded by
             // the matched-doc set, not the full corpus).
-            .filter_map(|doc_id| {
-                self.reverse_document_ids
-                    .get(&doc_id)
-                    .map(|s| s.to_string())
-            })
+            .filter_map(|doc_id| self.uid_for_doc_id(doc_id).map(str::to_string))
             .collect()
     }
 
@@ -1128,9 +1414,7 @@ impl InMemoryIndex {
                 .prefix_postings(field, &normalized)
                 .map(|set| {
                     set.iter()
-                        .filter_map(|doc_id| {
-                            self.reverse_document_ids.get(doc_id).map(|s| s.to_string())
-                        })
+                        .filter_map(|&doc_id| self.uid_for_doc_id(doc_id).map(str::to_string))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -1154,9 +1438,7 @@ impl InMemoryIndex {
                 let doc_ids = self.index.term_prefix_doc_ids(field, &normalized);
                 let hits = doc_ids
                     .iter()
-                    .filter_map(|doc_id| {
-                        self.reverse_document_ids.get(doc_id).map(|s| s.to_string())
-                    })
+                    .filter_map(|&doc_id| self.uid_for_doc_id(doc_id).map(str::to_string))
                     .collect::<Vec<_>>();
                 Some(hits)
             }
@@ -1338,11 +1620,7 @@ impl InMemoryIndex {
     fn match_hits(&self, field: &str, value: &str, require_all_terms: bool) -> Vec<String> {
         self.match_hits_internal(field, value, require_all_terms)
             .into_iter()
-            .filter_map(|doc_id| {
-                self.reverse_document_ids
-                    .get(&doc_id)
-                    .map(|s| s.to_string())
-            })
+            .filter_map(|doc_id| self.uid_for_doc_id(doc_id).map(str::to_string))
             .collect()
     }
 
@@ -1607,21 +1885,23 @@ impl InMemoryIndex {
     /// un decode thread-local (~5-10 µs) sur la voie search
     /// post-refresh.
     fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
-        let blob = self.documents.get(id)?;
+        let doc_id = self.resolve_uid(id)?;
+        let blob = self.blob_for_doc_id(doc_id)?;
         Some(Arc::new(parse_source_blob(blob, &self.source_store)))
     }
 
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
         internal_ids
             .iter()
-            .filter_map(|doc_id| {
-                let id = self.reverse_document_ids.get(doc_id)?;
-                self.parsed_source(id).map(|source| StoredDocument {
+            .filter_map(|&doc_id| {
+                // Lot C `C2`: doc_id-keyed lookups on both sides — no more
+                // detour through the public uid to re-derive a doc_id that
+                // was already known.
+                let id = self.uid_for_doc_id(doc_id)?;
+                let blob = self.blob_for_doc_id(doc_id)?;
+                let source = Arc::new(parse_source_blob(blob, &self.source_store));
+                Some(StoredDocument {
                     index: index.to_owned(),
-                    // Lot C Phase 1 levier 3: `id` borrows the shared
-                    // `Arc<str>`; `StoredDocument::id` stays a plain
-                    // `String` (no serde `rc` feature enabled), so it is
-                    // materialised here for this hydrated document only.
                     id: id.to_string(),
                     source,
                 })
@@ -1644,17 +1924,17 @@ impl InMemoryIndex {
         internal_ids
             .iter()
             .filter_map(|&doc_id| {
-                let id = self.reverse_document_ids.get(&doc_id)?;
-                self.parsed_source(id).map(|source| {
-                    (
-                        doc_id,
-                        StoredDocument {
-                            index: index.to_owned(),
-                            id: id.to_string(),
-                            source,
-                        },
-                    )
-                })
+                let id = self.uid_for_doc_id(doc_id)?;
+                let blob = self.blob_for_doc_id(doc_id)?;
+                let source = Arc::new(parse_source_blob(blob, &self.source_store));
+                Some((
+                    doc_id,
+                    StoredDocument {
+                        index: index.to_owned(),
+                        id: id.to_string(),
+                        source,
+                    },
+                ))
             })
             .collect()
     }
@@ -1745,7 +2025,7 @@ impl<'a> IndexReader<'a> {
     pub fn internal_doc_ids(&self, public_ids: &[&str]) -> Vec<Option<u32>> {
         public_ids
             .iter()
-            .map(|id| self.data.document_ids.get(*id).copied())
+            .map(|id| self.data.resolve_uid(id))
             .collect()
     }
 }
@@ -2268,7 +2548,7 @@ impl AppState {
                     touched.insert(index.clone());
                     if was_present {
                         needs_full_rebuild.insert(index.clone());
-                    } else if let Some(&doc_id) = data.document_ids.get(id.as_str()) {
+                    } else if let Some(doc_id) = data.resolve_uid(&id) {
                         new_doc_ids_per_index
                             .entry(index.clone())
                             .or_default()
@@ -2293,7 +2573,7 @@ impl AppState {
                     } else {
                         data.upsert_document_deferred(&id, source);
                         touched.insert(index.clone());
-                        if let Some(&doc_id) = data.document_ids.get(id.as_str()) {
+                        if let Some(doc_id) = data.resolve_uid(&id) {
                             new_doc_ids_per_index
                                 .entry(index.clone())
                                 .or_default()
@@ -2364,7 +2644,7 @@ impl AppState {
         store
             .indices
             .get(index)
-            .map_or(0, |index| index.documents.len() as u64)
+            .map_or(0, |index| u64::from(index.live_count))
     }
 
     pub fn mapping(&self, index: &str) -> Option<Value> {
@@ -2428,8 +2708,7 @@ impl AppState {
         let projection = column
             .iter()
             .filter_map(|(doc_id, value)| {
-                data.reverse_document_ids
-                    .get(&doc_id)
+                data.uid_for_doc_id(doc_id)
                     .map(|public_id| (public_id.to_string(), value.to_owned()))
             })
             .collect();
@@ -2645,6 +2924,15 @@ impl AppState {
             .and_then(|data| data.parsed_source(id).map(|source| (*source).clone()))
     }
 
+    /// Lot C `C2` : ordre d'iteration change de l'ordre lexicographique
+    /// sur l'uid public (ancienne `BTreeMap<Arc<str>, _>` key order) vers
+    /// l'ordre d'INSERTION (`doc_id` ascendant, trous sautes) — le seul
+    /// ordre qu'une structure dense indexee par `doc_id` supporte sans
+    /// re-trier. Aucun test n'epinglait l'ordre lexicographique (verifie
+    /// par grep avant ce refactor) ; cet ordre est d'ailleurs plus proche
+    /// du comportement reel d'OpenSearch pour `match_all` sans `sort`
+    /// explicite (ordre Lucene interne par segment, PAS un tri sur
+    /// `_id`) — a reverifier neanmoins via le gate oracle.
     pub fn documents(&self, index: &str) -> Vec<StoredDocument> {
         let store = self
             .store
@@ -2657,11 +2945,13 @@ impl AppState {
             .flat_map(|data| {
                 // #15: full scan re-parses each stored `_source` (admin/agg
                 // path; the hot top-K path parses only the window).
-                data.documents.keys().filter_map(move |id| {
-                    data.parsed_source(id).map(|source| StoredDocument {
+                data.live_doc_ids().filter_map(move |doc_id| {
+                    let id = data.uid_for_doc_id(doc_id)?;
+                    let blob = data.blob_for_doc_id(doc_id)?;
+                    Some(StoredDocument {
                         index: index.to_owned(),
                         id: id.to_string(),
-                        source,
+                        source: Arc::new(parse_source_blob(blob, &data.source_store)),
                     })
                 })
             })
@@ -2680,15 +2970,17 @@ impl AppState {
         store
             .indices
             .get(index)
-            .map_or(0, |data| data.documents.len() as u64)
+            .map_or(0, |data| u64::from(data.live_count))
     }
 
     /// Returns documents at positions `[from, from + size)` in the
-    /// index's stable iteration order (BTreeMap key order on the
-    /// public `_id`). Only the requested window is cloned, so the
-    /// `match_all` top-K shortcut clones K sources instead of N.
-    /// Returns an empty vec when `index` does not exist or when `from`
-    /// lands past the last document.
+    /// index's stable iteration order — Lot C `C2` : `doc_id` ascendant
+    /// (insertion order), see [`Self::documents`]'s doc comment for the
+    /// ordering-contract change from the previous `_id`-lexicographic
+    /// order. Only the requested window is cloned, so the `match_all`
+    /// top-K shortcut clones K sources instead of N. Returns an empty vec
+    /// when `index` does not exist or when `from` lands past the last
+    /// document.
     pub fn documents_paginated(
         &self,
         index: &str,
@@ -2705,18 +2997,21 @@ impl AppState {
         let Some(data) = store.indices.get(index) else {
             return Vec::new();
         };
-        data.documents
-            .iter()
+        data.live_doc_ids()
             .skip(from)
             .take(size)
-            .map(|(id, blob)| StoredDocument {
-                index: index.to_owned(),
-                id: id.to_string(),
-                // #15 + option B + `mmap M1` : parse le `_source`
-                // stocke (OnDisk -> pread, Compressed -> decode
-                // thread-local) en `Value` ; cette voie ne traite que
-                // la fenetre `[from..from+size)`.
-                source: Arc::new(parse_source_blob(blob, &data.source_store)),
+            .filter_map(|doc_id| {
+                let id = data.uid_for_doc_id(doc_id)?;
+                let blob = data.blob_for_doc_id(doc_id)?;
+                Some(StoredDocument {
+                    index: index.to_owned(),
+                    id: id.to_string(),
+                    // #15 + option B + `mmap M1` : parse le `_source`
+                    // stocke (OnDisk -> pread, Compressed -> decode
+                    // thread-local) en `Value` ; cette voie ne traite que
+                    // la fenetre `[from..from+size)`.
+                    source: Arc::new(parse_source_blob(blob, &data.source_store)),
+                })
             })
             .collect()
     }
@@ -3442,10 +3737,7 @@ impl AppState {
         let Some(data) = store.indices.get(index) else {
             return vec![None; public_ids.len()];
         };
-        public_ids
-            .iter()
-            .map(|id| data.document_ids.get(*id).copied())
-            .collect()
+        public_ids.iter().map(|id| data.resolve_uid(id)).collect()
     }
 
     pub fn term_scoring_stats(&self, index: &str, field: &str, term: &str) -> TermScoringStats {
@@ -3537,58 +3829,43 @@ impl AppState {
         // post-bulk avant refresh : ~0 MiB (tout est OnDisk).
         // Post-refresh : ~400 MiB compresses. Avant `mmap M1` la
         // meme gauge valait 1187 MiB en RAM avant refresh.
+        // Lot C `C2` : plus de `documents: BTreeMap<Arc<str>, SourceBlob>`
+        // a `.values()`-scanner — `live_doc_ids()` fusionne le snapshot
+        // dense (trous exclus) et l'overlay dirty (inserts/updates depuis
+        // le dernier `_refresh`), meme resolution que toute lecture
+        // (`blob_for_doc_id`) donc pas de double-comptage d'un doc mis a
+        // jour (le blob perime en `dense` est ignore au profit du blob
+        // dirty courant).
         usage.stored_fields_bytes = data
-            .documents
-            .values()
+            .live_doc_ids()
+            .filter_map(|doc_id| data.blob_for_doc_id(doc_id))
             .map(|blob| blob.payload_len() as u64)
             .sum();
         Some(usage)
     }
 
     /// API-side state overhead for `index` — the bytes NOT already counted by
-    /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)` where
-    /// `documents_overhead` is the per-entry overhead of `documents:
-    /// BTreeMap<Arc<str>, SourceBlob>` ON TOP OF the `_source` payload
-    /// (already reported via `stored_fields_bytes`): the UID's heap bytes,
-    /// plus the `Arc` control-block header, l'enum discriminant + payload du
-    /// `SourceBlob` (16 octets en inline pour `OnDisk { u64, u32 }`, 16
-    /// octets `Arc<[u8]>` header pour `Compressed`), et un coût
-    /// `BTreeMap` approximatif par entrée. `id_maps` couvre `document_ids`
-    /// et `reverse_document_ids`.
+    /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)`.
     ///
-    /// Lot C Phase 1 levier 3 : les 3 maps (`documents`, `document_ids`,
-    /// `reverse_document_ids`) partagent le MEME `Arc<str>` par UID (voir
-    /// [`InMemoryIndex::upsert_document_deferred`]) — le buffer UTF-8 de
-    /// l'UID + son en-tête `Arc` (strong/weak `AtomicUsize`, 16 octets) ne
-    /// doivent donc être comptés QU'UNE SEULE FOIS, via `documents` (la map
-    /// qui existe 1:1 avec les deux autres, y compris sur les updates —
-    /// cf. le commentaire de `upsert_document_deferred` sur la réutilisation
-    /// de l'`Arc` existant). `document_ids` et `reverse_document_ids` ne
-    /// portent plus, chacun, qu'un HANDLE vers ce même buffer : un fat
-    /// pointer `Arc<str>` (ptr + len, 16 octets) stocké inline dans le
-    /// nœud `BTreeMap`, à la place de l'ancienne `String` indépendante
-    /// (24 octets ptr+len+cap + ses propres octets UTF-8 heap-alloués).
-    /// Ce fat pointer plus petit reste absorbé dans le lump-sum
-    /// `BTREE_NODE_OVERHEAD` (déjà une approximation grossière qui ne
-    /// détaillait pas la taille inline de la clé/valeur) — inutile de
-    /// rajouter un terme fixe dédié. Ce qui compte est la SUPPRESSION du
-    /// terme `key.len()`/`value.len()` : compter les octets UTF-8 de l'UID
-    /// une deuxième et une troisième fois — comme avant ce levier, quand
-    /// chaque map détenait sa propre `String` — sur-compterait la même
-    /// mémoire 3× alors qu'elle n'est plus allouée qu'une fois : la gauge
-    /// ne refléterait pas le gain réel. Sur le corpus deces (UID matchID
-    /// du type `ins_20240113_11_01004_2`, ~22-24 octets), le gain net
-    /// attendu sur `documents_overhead + id_maps` est de l'ordre de
-    /// `2 × UID_len - ARC_HEADER` ≈ 30-32 octets/document, soit
-    /// ~40-45 MiB sur 1,36 M docs pour cette seule gauge — un plancher
-    /// conservateur : le gain RÉEL en RSS est plus élevé car cette
-    /// approximation ignore l'arrondi par classe de taille de
-    /// l'allocateur (jemalloc), qui pénalise davantage les 3 petites
-    /// allocations séparées de l'ancien design que l'unique allocation
-    /// partagée du nouveau (cf. l'estimation ~90-180 MiB côté RSS réel).
-    /// `strong_count`/`weak_count` ne sont PAS des allocations
-    /// supplémentaires (juste des compteurs dans l'en-tête déjà compté)
-    /// donc non pertinents ici.
+    /// Lot C `C2` : les 3 anciennes `BTreeMap` ont disparu. `documents_overhead`
+    /// couvre maintenant `dense.documents: Box<[Option<SourceBlob>]>` (un
+    /// slot par `doc_id`, ZERO overhead par-entree au-dela du slot
+    /// lui-meme — plus de nœud `BTreeMap`, plus de cle `Arc<str>`
+    /// dupliquee) plus l'overlay `documents_dirty: HashMap<u32,
+    /// SourceBlob>` (borne par la taille d'un batch bulk, pas par le
+    /// corpus). `id_maps` couvre le snapshot dense (`reverse_uids` +
+    /// `reverse_offsets` empaquetes, `forward` FST) plus les 3 overlays
+    /// UID (`forward_dirty`/`reverse_dirty`/`deleted_since_dense`).
+    ///
+    /// Le FST `forward` et le buffer `reverse_uids` ENCODENT chacun les
+    /// octets UTF-8 des UID separement (pas de partage entre les deux
+    /// representations, contrairement a l'ancien "levier 3" qui partageait
+    /// un seul `Arc<str>` entre 3 `BTreeMap`) — mais chacun le fait dans
+    /// UN buffer contigu par index au lieu d'~1,36 M allocations
+    /// individuelles : c'est l'echange qui tue la fragmentation interne
+    /// mesuree (~671 MiB, cf. commit "gauges internes jemalloc"), au prix
+    /// d'un doublement logique des octets UID bruts (~60 MiB sur deces,
+    /// negligeable face au gain de fragmentation).
     ///
     /// #17b: the structured index gauges only account for ~2.8 GiB of the
     /// inc1 RSS (~7.97 GiB). The remaining ~5.2 GiB is the target of this
@@ -3599,53 +3876,50 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
-        // BTreeMap node overhead per entry: rough approximation that lumps the
-        // balancing metadata together. The exact figure is implementation
-        // defined, but the order of magnitude is enough to compare against
-        // jemalloc allocated.
-        const BTREE_NODE_OVERHEAD: u64 = 48;
-        // `mmap M1` : taille en RAM de `SourceBlob` lui-meme (sans le
-        // payload Compressed, qui est compte par `stored_fields_bytes`).
-        // L'enum est dimensionne par la plus grande variante : OnDisk
-        // = 12 octets (u64 + u32) ; Compressed = 16 octets (Arc<[u8]>
-        // fat pointer = ptr + len). Avec discriminant + alignement,
-        // l'enum total ≈ 24 octets. On approxime a 24 pour les deux
-        // variantes (OnDisk allocate 0 sur le heap, Compressed allocate
-        // les bytes deja comptes par la gauge).
-        const SOURCE_BLOB_INLINE: u64 = 24;
-        // Lot C Phase 1 levier 3 : en-tête `ArcInner` (strong: AtomicUsize
-        // + weak: AtomicUsize = 16 octets sur 64 bits) du buffer `Arc<str>`
-        // partagé — compté UNE FOIS ici, avec les octets UTF-8 de l'UID.
-        // C'est un coût RÉEL et NOUVEAU par rapport à l'ancien `String`
-        // (qui n'a pas d'en-tête de comptage de références), donc on
-        // l'itemise explicitement au lieu de le laisser dans le lump-sum
-        // `BTREE_NODE_OVERHEAD`.
+        // Overhead approximatif par entree `HashMap` (hashbrown : 1 octet
+        // de controle + slack de bucket) — meme ordre de grandeur que
+        // l'ancien `BTREE_NODE_OVERHEAD`, reutilise ici pour les 4
+        // overlays dirty (bulk-batch sized, PAS O(corpus)).
+        const HASH_ENTRY_OVERHEAD: u64 = 48;
+        // Lot C Phase 1 levier 3 (reutilise) : en-tête `ArcInner` (strong +
+        // weak `AtomicUsize`, 16 octets) d'un buffer `Arc<str>` — seuls
+        // les UID encore dans un overlay dirty (pas densifies) en paient
+        // le cout ici.
         const ARC_HEADER: u64 = 16;
-        let mut documents_overhead: u64 = 0;
-        for key in data.documents.keys() {
-            documents_overhead = documents_overhead
-                .saturating_add(BTREE_NODE_OVERHEAD)
-                .saturating_add(SOURCE_BLOB_INLINE)
-                .saturating_add(ARC_HEADER)
-                .saturating_add(key.len() as u64);
-        }
-        // Lot C Phase 1 levier 3 : `document_ids` et `reverse_document_ids`
-        // ne portent plus qu'un HANDLE (`Arc<str>` fat pointer, 16 octets)
-        // vers le buffer déjà compté ci-dessus au lieu d'une `String`
-        // indépendante (24 octets ptr+len+cap) — comme l'ancien
-        // `BTREE_NODE_OVERHEAD` ne détaillait déjà pas la taille inline de
-        // la clé/valeur (lump-sum approximatif, cf. commentaire plus haut),
-        // le fat pointer plus petit reste couvert par ce même lump-sum : on
-        // ne rajoute PAS de terme fixe supplémentaire ici. Le point qui
-        // compte est la SUPPRESSION du terme `key.len()`/`value.len()` —
-        // ces deux maps ne recopient plus les octets UTF-8 de l'UID, d'où
-        // la baisse de la gauge. Le coût par entrée est désormais CONSTANT
-        // (indépendant de la longueur de l'UID), donc une multiplication
-        // par `.len()` remplace la boucle O(n) devenue inutile.
-        const ID_MAP_ENTRY_OVERHEAD: u64 = BTREE_NODE_OVERHEAD + 4;
-        let id_maps = (data.document_ids.len() as u64)
-            .saturating_add(data.reverse_document_ids.len() as u64)
-            .saturating_mul(ID_MAP_ENTRY_OVERHEAD);
+        let source_blob_slot = std::mem::size_of::<Option<SourceBlob>>() as u64;
+        let u32_size = std::mem::size_of::<u32>() as u64;
+
+        let dense_documents_bytes =
+            (data.dense.documents.len() as u64).saturating_mul(source_blob_slot);
+        let dirty_documents_bytes = (data.documents_dirty.len() as u64)
+            .saturating_mul(HASH_ENTRY_OVERHEAD + u32_size + source_blob_slot);
+        let documents_overhead = dense_documents_bytes.saturating_add(dirty_documents_bytes);
+
+        let dense_reverse_bytes = (data.dense.reverse_uids.len() as u64)
+            .saturating_add((data.dense.reverse_offsets.len() as u64).saturating_mul(u32_size));
+        let dense_forward_bytes = data
+            .dense
+            .forward
+            .as_ref()
+            .map_or(0, |map| map.as_fst().as_bytes().len() as u64);
+        // `forward_dirty` porte les octets UTF-8 de l'UID (cle) ; `reverse_dirty`
+        // partage le MEME `Arc<str>` (voir `upsert_document_deferred`) donc ne
+        // recompte que son en-tête `Arc`/overhead de bucket, pas les octets.
+        let forward_dirty_bytes: u64 = data
+            .forward_dirty
+            .keys()
+            .map(|uid| HASH_ENTRY_OVERHEAD + ARC_HEADER + uid.len() as u64)
+            .sum();
+        let reverse_dirty_bytes =
+            (data.reverse_dirty.len() as u64).saturating_mul(HASH_ENTRY_OVERHEAD + u32_size);
+        let deleted_since_dense_bytes =
+            (data.deleted_since_dense.len() as u64).saturating_mul(HASH_ENTRY_OVERHEAD + u32_size);
+
+        let id_maps = dense_reverse_bytes
+            .saturating_add(dense_forward_bytes)
+            .saturating_add(forward_dirty_bytes)
+            .saturating_add(reverse_dirty_bytes)
+            .saturating_add(deleted_since_dense_bytes);
         Some((documents_overhead, id_maps))
     }
 
@@ -3727,7 +4001,7 @@ impl AppState {
         store
             .indices
             .get(index)
-            .map(|data| data.documents.len() as u64)
+            .map(|data| u64::from(data.live_count))
     }
 
     pub fn term_matches_count(&self, index: &str, field: &str, value: &str) -> usize {
