@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use surch_codec::postings_block::{
-    decode_postings_blocked, encode_postings_blocked, BlockSkipCursor, BlockSkipEntry,
-    BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
+    block_directory, decode_block, decode_postings_blocked, encode_postings_blocked, BlockDirEntry,
+    BlockSkipCursor, BlockSkipEntry, BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
 };
 
 use crate::roaring::RoaringDocSet;
@@ -1122,6 +1122,31 @@ impl TermDictionary {
         decode_postings_blocked(&bytes, count).ok()
     }
 
+    /// Lot C `C1b` sous-pas 1: build a [`DiskPostingsCursor`] over
+    /// `(field, term)`'s payload inside the disk segment. PURELY
+    /// ADDITIVE — see the type's doc comment: no production read path
+    /// calls this today, `lookup*`/[`PostingsList`]/
+    /// [`PostingsBlockSkipIter`]/scoring/the conjunction leapfrog are all
+    /// untouched by this method's existence. Exists so
+    /// `disk_cursor_matches_ram_leapfrog`
+    /// (`crates/surch-index/tests/postings.rs`) can drive the cursor
+    /// against a real segment built the ordinary way, through the same
+    /// descriptor lookup [`Self::decode_from_segment`] uses.
+    ///
+    /// Returns `None` for the same reasons [`Self::decode_from_segment`]
+    /// does: unknown field/term, the sentinel `(0, 0)` descriptor (no
+    /// disk coverage), an absent segment, or a directory-computation
+    /// failure inside [`DiskPostingsCursor::open`].
+    pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
+        let field_postings = self.fields.get(field)?;
+        let ((offset, len), count) = field_postings.segment_slice(term)?;
+        if len == 0 {
+            return None;
+        }
+        let segment = self.postings_segment.as_ref()?;
+        DiskPostingsCursor::open(segment, offset, len, count)
+    }
+
     /// Lot C `C1a-batché` gauge: total bytes physically written to the
     /// disk segment so far (`surch_index_disk_postings_bytes`). Mirrors
     /// `surch_index_disk_segment_bytes` (the `source.dat`/`_source`
@@ -1513,5 +1538,175 @@ impl Iterator for PostingsBlockSkipIter<'_> {
         let doc_id = *self.doc_ids.get(self.position)?;
         self.position += 1;
         Some(doc_id)
+    }
+}
+
+/// Lot C `C1b` sous-pas 1 — pread-addressed leapfrog cursor prototype
+/// (`docs/paper/c1b-disk-backed-design-2026-07-02.md`). PURELY ADDITIVE:
+/// no production read path constructs or consumes this type as of this
+/// commit — `lookup*`/[`PostingsList`]/[`PostingsBlockSkipIter`]/scoring/
+/// the conjunction leapfrog all keep reading the RAM `doc_ids_flat`/
+/// `freqs_flat` buffers exactly as before. `DiskPostingsCursor` exists to
+/// validate, ahead of the read-path bascule (a later C1b sous-pas), that
+/// a block-addressed `pread` + [`decode_block`] walk driven by a
+/// directory of `(byte_offset, count, max_doc_id)` entries
+/// ([`BlockDirEntry`], via [`block_directory`]) reproduces
+/// [`PostingsBlockSkipIter::advance_to`]'s RAM leapfrog semantics
+/// bit-for-bit — see `disk_cursor_matches_ram_leapfrog` in
+/// `crates/surch-index/tests/postings.rs`.
+///
+/// Every block is `pread`'d and [`decode_block`]-decoded AT MOST ONCE:
+/// the cursor caches the current block's decoded `(doc_ids, freqs)` and
+/// only replaces that cache once `advance_to` walks past the block.
+/// Blocks whose `max_doc_id < target` are skipped purely through the
+/// directory (a `u32` comparison), with NO `pread` and NO decode at all
+/// — exactly the property C1b's disk-backed read path needs on the
+/// common-term conjunction tail.
+#[derive(Debug)]
+pub struct DiskPostingsCursor<'seg> {
+    segment: &'seg PostingsSegment,
+    /// Segment-absolute byte offset of this term's payload start (the
+    /// `offset` half of the term's `FieldPostings::segment_descriptors`
+    /// entry).
+    term_base_offset: u64,
+    /// Total byte length of this term's payload in the segment (the
+    /// `len` half of the same descriptor) — the exclusive upper bound
+    /// used to size the pread of the LAST block.
+    term_payload_len: u32,
+    /// Per-block directory, computed once at [`Self::open`] time (sous-pas
+    /// 1: ad hoc, not persisted — see [`block_directory`]'s doc comment).
+    directory: Vec<BlockDirEntry>,
+    /// Index into `directory` of the block currently under consideration.
+    /// Monotonic — only ever increases, mirroring [`BlockSkipCursor`]'s
+    /// `position`.
+    block_cursor: usize,
+    /// The decoded `(block_index, doc_ids, freqs)` currently cached, if
+    /// any. `block_index` matches `block_cursor` while that block is
+    /// still being consumed; moving past it replaces the cache with the
+    /// next block's decode — never re-decodes a block already advanced
+    /// past.
+    loaded: Option<(usize, Vec<u32>, Vec<u32>)>,
+    /// Index into `loaded`'s `doc_ids`/`freqs` to resume scanning from on
+    /// the NEXT `advance_to` call — one past the last returned entry.
+    local_pos: usize,
+    /// `freq` of the doc_id most recently returned by [`Self::advance_to`].
+    last_freq: u32,
+}
+
+impl<'seg> DiskPostingsCursor<'seg> {
+    /// Build a cursor over one term's payload inside `segment`. Computes
+    /// the block directory (sous-pas 1: ad hoc, NOT persisted — see
+    /// [`block_directory`]) via a single `pread` of the whole term
+    /// payload; every SUBSEQUENT block is `pread`'d and decoded
+    /// individually, on demand, by [`Self::advance_to`].
+    ///
+    /// `term_base_offset`/`term_payload_len` are the term's
+    /// `FieldPostings::segment_descriptors` entry; `total_count` is the
+    /// term's `df` (`offsets[i + 1] - offsets[i]`) — exactly the
+    /// arguments [`TermDictionary::disk_cursor`] passes through from
+    /// [`FieldPostings::segment_slice`].
+    ///
+    /// Returns `None` if the initial `pread` or the directory computation
+    /// fails (a malformed payload — should never happen for a term the
+    /// build-time segment round-trip already validated).
+    ///
+    /// `pub(crate)`, not `pub`: [`PostingsSegment`] itself is a
+    /// crate-private type (the `postings_segment` submodule is not
+    /// `pub`), so a fully `pub fn` naming it as a parameter would leak a
+    /// more-private type through a public signature (the
+    /// `private_interfaces` lint). External callers reach a cursor
+    /// exclusively through [`TermDictionary::disk_cursor`], which never
+    /// names `PostingsSegment` in ITS signature.
+    pub(crate) fn open(
+        segment: &'seg PostingsSegment,
+        term_base_offset: u64,
+        term_payload_len: u32,
+        total_count: usize,
+    ) -> Option<Self> {
+        let payload = segment.read(term_base_offset, term_payload_len)?;
+        let directory = block_directory(&payload, total_count).ok()?;
+        Some(Self {
+            segment,
+            term_base_offset,
+            term_payload_len,
+            directory,
+            block_cursor: 0,
+            loaded: None,
+            local_pos: 0,
+            last_freq: 0,
+        })
+    }
+
+    /// Advance to the first `doc_id >= target`, `pread`+decoding at most
+    /// one NEW block to get there. `target` must be non-decreasing across
+    /// calls — same contract, same return-and-consume semantics, as
+    /// [`PostingsBlockSkipIter::advance_to`]. Returns `None` once the
+    /// term's postings are exhausted.
+    pub fn advance_to(&mut self, target: u32) -> Option<u32> {
+        loop {
+            let entry = *self.directory.get(self.block_cursor)?;
+            if entry.max_doc_id < target {
+                // Skip this whole block: directory-only, no pread, no
+                // decode.
+                self.block_cursor += 1;
+                continue;
+            }
+
+            if self.loaded.as_ref().map(|(idx, ..)| *idx) != Some(self.block_cursor) {
+                let block_end = self
+                    .directory
+                    .get(self.block_cursor + 1)
+                    .map(|next| next.byte_offset_in_term_payload)
+                    .unwrap_or(self.term_payload_len);
+                let block_len = block_end.checked_sub(entry.byte_offset_in_term_payload)?;
+                let block_bytes = self.segment.read(
+                    self.term_base_offset + u64::from(entry.byte_offset_in_term_payload),
+                    block_len,
+                )?;
+                let (doc_ids, freqs) = decode_block(&block_bytes, entry.count as usize).ok()?;
+                self.loaded = Some((self.block_cursor, doc_ids, freqs));
+                self.local_pos = 0;
+            }
+
+            // `.unwrap()` is safe: the branch above just ensured `loaded`
+            // holds `block_cursor`'s decode.
+            let (_, doc_ids, freqs) = self.loaded.as_ref().unwrap();
+            if self.local_pos >= doc_ids.len() {
+                // This block is fully consumed even though its
+                // `max_doc_id >= target` (target caught up with an
+                // already-returned entry) — move on to the next block.
+                self.block_cursor += 1;
+                continue;
+            }
+
+            // Bounded exponential gallop + `partition_point`, same shape
+            // as `PostingsBlockSkipIter::advance_to`'s scan — bounded
+            // here to the decoded block (<= `FOR_BLOCK_SIZE` entries)
+            // rather than the whole term, per the design's "galope dans
+            // les <=128 entrées décodées" contract. Same result either
+            // way: the landed block's `max_doc_id >= target` guarantees a
+            // match exists at or before the block's last entry, so this
+            // gallop always finds one — no "exhausted" branch needed.
+            let rest = &doc_ids[self.local_pos..];
+            let mut hi = 1usize;
+            while hi < rest.len() && rest[hi] < target {
+                hi <<= 1;
+            }
+            let lo = hi >> 1;
+            let hi = hi.min(rest.len());
+            let offset = lo + rest[lo..hi].partition_point(|&doc_id| doc_id < target);
+            let found_index = self.local_pos + offset;
+            self.local_pos = found_index + 1;
+            self.last_freq = freqs[found_index];
+            return Some(doc_ids[found_index]);
+        }
+    }
+
+    /// `freq` of the doc_id most recently returned by [`Self::advance_to`].
+    /// Meaningless before the first successful `advance_to` call (reads
+    /// `0`) — same implicit precondition as the RAM side's
+    /// `freqs()[position() - 1]`.
+    pub fn freq(&self) -> u32 {
+        self.last_freq
     }
 }

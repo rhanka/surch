@@ -104,6 +104,79 @@ fn skip_iter_advance_to_matches_naive_linear_walk() {
 }
 
 #[test]
+fn disk_cursor_matches_ram_leapfrog() {
+    // Lot C `C1b` sous-pas 1 parity guard
+    // (`docs/paper/c1b-disk-backed-design-2026-07-02.md`): the new,
+    // purely-additive `DiskPostingsCursor` (`pread` + block-directory
+    // skip, decoding at most one NEW block per call) must reproduce
+    // `PostingsBlockSkipIter` (the RAM leapfrog conjunction/scan already
+    // in production) bit-for-bit, INCLUDING the matched `freq`, for
+    // every target in a non-decreasing sequence. Same corpus shape (3
+    // full blocks + one partial trailing block, irregular gaps) as
+    // `skip_iter_advance_to_matches_naive_linear_walk` above, so both
+    // tests exercise the same skip-list block boundaries — only the
+    // comparison target differs (disk cursor vs RAM leapfrog here,
+    // RAM leapfrog vs naive walk there).
+    let mut builder = PostingsBuilder::new();
+    let total: u32 = (BLOCK_SIZE * 3 + 17) as u32;
+    // i*7 + i%5: strictly increasing (min step 3), irregular gaps (3 or
+    // 8) so the block-local delta reset AND the directory's byte offsets
+    // are genuinely exercised, not just a constant stride.
+    let doc_ids: Vec<u32> = (0..total).map(|i| i * 7 + i % 5).collect();
+    for (i, &doc_id) in doc_ids.iter().enumerate() {
+        // Variable freq (1..=5) so the freq channel — decoded from the
+        // SAME block payload, right after the doc_id deltas — is
+        // genuinely exercised too, not just a constant 1 everywhere.
+        let freq_len = (i as u32 % 5) + 1;
+        let positions: Vec<u32> = (0..freq_len).collect();
+        builder
+            .add("body", "t", doc_id, positions)
+            .expect("add posting");
+    }
+    let dictionary = builder.build();
+
+    let list = dictionary
+        .postings_with_block_metas("body", "t")
+        .expect("postings list");
+    let mut ram_iter = list
+        .skip_iter()
+        .expect("block skip list builds")
+        .expect("non-empty postings");
+    let mut disk_cursor = dictionary
+        .disk_cursor("body", "t")
+        .expect("strictly-increasing doc_ids get full disk coverage");
+
+    // Non-decreasing target stream: every doc_id, plus near-misses
+    // around it (testing landing in a gap, since the sequence above has
+    // real gaps of 3 or 8), plus a past-the-end probe.
+    let mut targets: Vec<u32> = Vec::new();
+    for &doc_id in &doc_ids {
+        targets.push(doc_id.saturating_sub(1));
+        targets.push(doc_id);
+        targets.push(doc_id + 1);
+    }
+    targets.push(doc_ids.last().unwrap() + 1000);
+    targets.sort_unstable();
+
+    for &target in &targets {
+        let ram_doc_id = ram_iter.advance_to(target);
+        let disk_doc_id = disk_cursor.advance_to(target);
+        assert_eq!(
+            disk_doc_id, ram_doc_id,
+            "advance_to({target}) diverged between the disk cursor and the RAM leapfrog"
+        );
+        if ram_doc_id.is_some() {
+            let ram_freq = list.freqs()[ram_iter.position() - 1];
+            assert_eq!(
+                disk_cursor.freq(),
+                ram_freq,
+                "freq diverged at doc_id {ram_doc_id:?} for target {target}"
+            );
+        }
+    }
+}
+
+#[test]
 fn postings_builder_derives_frequency_one_when_positions_are_absent() {
     let mut builder = PostingsBuilder::new();
 
