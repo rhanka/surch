@@ -67,8 +67,18 @@ disk / PVC), et **mesurer l'anon SOUS limite cgroup** au gate.
   Lucene compte un doc une fois, pas N ; à valider oracle car ça touche l'idf), soit (b) fallback RAM
   pour ces termes. La dédup est préférable (corrige aussi une inflation df latente du chemin RAM).
 
+## ✅ Dédup (term,doc_id) VALIDÉE (commit 22b2747, gates verts)
+Fix de correction Lucene multi-valué (`dedup_merge_postings` au build, freq=somme, positions non
+stockées donc rien à merger). Corrigeait un df/tf latent-FAUX que `term_scoring_view` calculait sur
+les 12 266 termes à doublons.
+- **ci-k8s b1-oracle-gate : `divergence_count: 0`** (parité deces vs OpenSearch PARFAITE, 0 divergence).
+- **ci-k8s ndcg-gate : vert** (BEIR scifact + TREC-COVID NDCG@10 tenus — cross-corpus intact).
+- **bench deces : `skipped_terms` → 0** (tous FoR-encodables, C1b débloqué), count PASS, indexation
+  13 630 doc/s, latence p95 match/bool/full 1,8/1,5/1,5 ms (marginalement meilleure). Mono-valué byte-identique.
+
 ## Séquence + flag + revert
-1. **C1a-batché** ✅ FAIT (voir ci-dessus) : writer par-champ best-effort au refresh + gauges
+0. **Dédup** ✅ FAIT (voir ci-dessus) — prérequis C1b : plus aucun terme non-encodable.
+1. **C1a-batché** ✅ FAIT (voir plus haut) : writer par-champ best-effort au refresh + gauges
    (`disk_postings_bytes`, `disk_postings_skipped_terms`). Prochain sous-pas AVANT C1b :
    **dédup `(term, doc_id)`** (résout les 12 266 skips + corrige le df), bench-gate parité oracle.
 2. **C1b sous flag runtime `SURCH_POSTINGS_DISK`** : conditionne le build (matérialiser les flats RAM ou
