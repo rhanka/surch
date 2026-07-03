@@ -55,10 +55,22 @@
 **anon NON-évictables** → tout le gain RAM est FICTIF. Forcer un chemin disque réel (emptyDir medium
 disk / PVC), et **mesurer l'anon SOUS limite cgroup** au gate.
 
+## ✅ C1a-batché VALIDÉ (bench 28636114241, HEAD 51a4f70)
+- `count` 1 355 728 = docs, **verdict PASS** (refresh ne crashe plus). Indexation **12 179 doc/s**
+  (~parité ES, la batche ne coûte rien). Codec round-trip vert en CI.
+- **Ratio FoR 3,36×** : postings **518 MiB RAM → 154 MiB disque** (page-cache évictable). Prémisse
+  disk-backed validée : 518 MiB sortent de l'anon en C1b.
+- **`skipped_terms` = 12 266** (~0,2% des ~5,46 M termes) : des termes ont des doc_id NON strictement
+  croissants (champs `Value::Array` ES éclatés sans dédup → doublons). Rendu best-effort (segment
+  shadow ne crashe jamais l'indexation). **Enjeu C1b** : ces termes n'ont pas de couverture disque →
+  il faut soit (a) **dédupliquer `(term, doc_id)` dans `PostingsBuilder`** (fix de CORRECTION : le df
+  Lucene compte un doc une fois, pas N ; à valider oracle car ça touche l'idf), soit (b) fallback RAM
+  pour ces termes. La dédup est préférable (corrige aussi une inflation df latente du chemin RAM).
+
 ## Séquence + flag + revert
-1. **C1a-batché** (le pas sûr) : writer par-champ au refresh + gauges (bytes segment, temps write) +
-   shadow decode `debug_assert(decode_blocked == RAM)` (CI) + criterion décode/bloc. Gate : indexation
-   ≥ −5%, round-trip vert. Risque ~nul, RAM reste source de vérité.
+1. **C1a-batché** ✅ FAIT (voir ci-dessus) : writer par-champ best-effort au refresh + gauges
+   (`disk_postings_bytes`, `disk_postings_skipped_terms`). Prochain sous-pas AVANT C1b :
+   **dédup `(term, doc_id)`** (résout les 12 266 skips + corrige le df), bench-gate parité oracle.
 2. **C1b sous flag runtime `SURCH_POSTINGS_DISK`** : conditionne le build (matérialiser les flats RAM ou
    pas) ET le read path. Bench A/B même image : decompose warm ET cold (fadvise DONTNEED), parité oracle,
    anon ventilé SOUS limite. Gate : parité bit-identique ; warm bool p95 ≤ 2,3 / full ≤ 2,0 (garde <ES) ;
