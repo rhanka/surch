@@ -384,6 +384,69 @@ pub fn decode_postings_blocked(
     Ok((doc_ids, freqs))
 }
 
+/// Directory entry describing where one block lives inside a term's
+/// [`encode_postings_blocked`] payload — the input `DiskPostingsCursor`
+/// (`surch-index`, Lot C C1b sous-pas 1,
+/// `docs/paper/c1b-disk-backed-design-2026-07-02.md`) needs to skip whole
+/// blocks using ONLY a `max_doc_id` comparison, no `pread`, no decode,
+/// before landing on the single block that actually has to be read.
+///
+/// Deliberately does NOT carry `min_doc_id`: the eventual persisted
+/// on-disk directory (design decision 4) only stores `max_doc_id` per
+/// block to halve its footprint — a conservative `min` (`max[j-1] + 1`)
+/// is enough for a skip decision, and `advance_to` never needs it at all
+/// since it only ever compares against `max_doc_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDirEntry {
+    /// Byte offset of this block's first byte, relative to the START of
+    /// the term's own `encode_postings_blocked` payload — NOT
+    /// segment-absolute. Callers add the term's own base offset in the
+    /// shared segment separately.
+    pub byte_offset_in_term_payload: u32,
+    /// Number of postings encoded in this block ([`FOR_BLOCK_SIZE`] for
+    /// every block but possibly the last).
+    pub count: u16,
+    /// The last (greatest) doc_id decoded from this block.
+    pub max_doc_id: u32,
+}
+
+/// Compute the per-block directory of a term's [`encode_postings_blocked`]
+/// payload: walks the payload block by block (the same shape as
+/// [`decode_postings_blocked`]) and records only `(byte_offset, count,
+/// max_doc_id)` per block, discarding each block's decoded doc_ids/freqs
+/// once its last doc_id has been read off.
+///
+/// This is NOT a zero-cost operation — every block's varints are still
+/// decoded once to find its `max_doc_id` — it is the ad hoc,
+/// not-yet-persisted stand-in for the on-disk directory a later C1b
+/// sous-pas will materialise once at build time instead of recomputing
+/// it here on every open. Only this function's OUTPUT (the returned
+/// `Vec<BlockDirEntry>`) is meant to ship forward; the walk itself is a
+/// sous-pas-1 scaffolding cost.
+pub fn block_directory(
+    bytes: &[u8],
+    total_count: usize,
+) -> Result<Vec<BlockDirEntry>, PostingsBlockError> {
+    let mut position = 0;
+    let mut remaining = total_count;
+    let mut entries = Vec::with_capacity(total_count.div_ceil(FOR_BLOCK_SIZE));
+    while remaining > 0 {
+        let block_count = remaining.min(FOR_BLOCK_SIZE);
+        let byte_offset = position;
+        let (doc_ids, _freqs) = decode_block_at(bytes, &mut position, block_count)?;
+        let max_doc_id = *doc_ids
+            .last()
+            .expect("block_count > 0 (remaining > 0 guard) guarantees a non-empty block");
+        entries.push(BlockDirEntry {
+            byte_offset_in_term_payload: byte_offset as u32,
+            count: block_count as u16,
+            max_doc_id,
+        });
+        remaining -= block_count;
+    }
+    Ok(entries)
+}
+
 /// Inspect the encoded postings payload block-by-block without fully
 /// materialising any intermediate posting structs.
 pub fn inspect_postings_blocks(bytes: &[u8]) -> Result<Vec<PostingsBlockMeta>, PostingsBlockError> {
@@ -1079,6 +1142,67 @@ mod tests {
             decode_postings_blocked(&encoded, doc_ids.len()).unwrap();
         assert_eq!(decoded_doc_ids, doc_ids);
         assert_eq!(decoded_freqs, freqs);
+    }
+
+    #[test]
+    fn block_directory_matches_chunk_boundaries_and_max_doc_id() {
+        // Same multi-block corpus as `blocked_roundtrip` (three full
+        // blocks + one partial trailing block, irregular gaps). The
+        // directory must report one entry per `chunks(FOR_BLOCK_SIZE)`
+        // chunk, with `count`/`max_doc_id` matching that chunk exactly
+        // and `byte_offset_in_term_payload` pointing at genuinely
+        // independent, growing byte ranges (each block's own
+        // `encode_postings_blocked` output, re-decoded standalone via
+        // `decode_block`, must match the chunk too — the same
+        // "decodable in isolation" property `blocked_roundtrip` checks
+        // for `decode_block`, now checked for the directory's offsets).
+        let total: u32 = (FOR_BLOCK_SIZE * 3 + 17) as u32;
+        let doc_ids: Vec<u32> = (0..total).map(|i| i * 7 + (i % 5)).collect();
+        let freqs: Vec<u32> = (0..total).map(|i| (i % 16) + 1).collect();
+        let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+
+        let directory = block_directory(&encoded, doc_ids.len()).unwrap();
+        assert_eq!(
+            directory.len(),
+            4,
+            "3 full blocks + 1 partial trailing block"
+        );
+
+        let mut previous_end: Option<u32> = None;
+        for (dir_entry, (doc_chunk, freq_chunk)) in directory.iter().zip(
+            doc_ids
+                .chunks(FOR_BLOCK_SIZE)
+                .zip(freqs.chunks(FOR_BLOCK_SIZE)),
+        ) {
+            assert_eq!(dir_entry.count as usize, doc_chunk.len());
+            assert_eq!(dir_entry.max_doc_id, *doc_chunk.last().unwrap());
+            // Byte ranges strictly grow block over block (no overlap).
+            if let Some(prev) = previous_end {
+                assert!(dir_entry.byte_offset_in_term_payload >= prev);
+            }
+            previous_end = Some(dir_entry.byte_offset_in_term_payload);
+
+            // The directory's offset genuinely lands on this block's own
+            // bytes: decoding from that offset (to the end of the
+            // payload, per `decode_block`'s "remainder of the term's
+            // payload" contract) reproduces the chunk exactly.
+            let from_offset = &encoded[dir_entry.byte_offset_in_term_payload as usize..];
+            let (block_doc_ids, block_freqs) =
+                decode_block(from_offset, dir_entry.count as usize).unwrap();
+            assert_eq!(block_doc_ids, doc_chunk);
+            assert_eq!(block_freqs, freq_chunk);
+        }
+    }
+
+    #[test]
+    fn block_directory_rejects_truncated_payload() {
+        let doc_ids: Vec<u32> = (0..130).collect();
+        let freqs: Vec<u32> = vec![1; 130];
+        let mut encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        encoded.pop();
+
+        let err = block_directory(&encoded, doc_ids.len()).unwrap_err();
+        assert_eq!(err, PostingsBlockError::UnexpectedEof);
     }
 
     #[test]
