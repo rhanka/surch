@@ -1028,7 +1028,11 @@ mod tests {
         // i.e. blocks are genuinely self-contained, not just an artifact
         // of decoding sequentially from offset 0.
         let total: u32 = (FOR_BLOCK_SIZE * 3 + 17) as u32;
-        let doc_ids: Vec<u32> = (0..total).map(|i| i * 3 + (i % 7)).collect();
+        // `i*7 + i%5`: strictly increasing (min step 7 + (%5 delta) = 3),
+        // irregular gaps (3 or 8) so the block-local delta reset is exercised.
+        // NOT `i*3 + i%7` — that DECREASES at i≡6 mod 7 (step 3-6 = -3), which
+        // `encode_postings_blocked` rightly rejects as non-monotonic.
+        let doc_ids: Vec<u32> = (0..total).map(|i| i * 7 + (i % 5)).collect();
         let freqs: Vec<u32> = (0..total).map(|i| (i % 16) + 1).collect();
 
         let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();

@@ -274,6 +274,11 @@ pub fn clear_memory_gauges(index: &str) {
     set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0);
 }
 
+// Internal gauge-fan-out helper: one positional arg per Prometheus gauge
+// family. The list grows by one each time a new disk/RAM accounting gauge
+// is added (C1a added `disk_postings_bytes`); bundling into a struct would
+// just move the same fields around without improving the single call site.
+#[allow(clippy::too_many_arguments)]
 fn set_gauges(
     index: &str,
     doc_count: u64,
