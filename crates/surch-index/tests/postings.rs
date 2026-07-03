@@ -461,6 +461,77 @@ fn term_dictionary_block_metas_max_freq_per_block() {
 }
 
 #[test]
+fn postings_segment_blocked_roundtrip_matches_ram() {
+    // Lot C `C1a-batché` SHADOW segment: every term's FoR-blocked payload
+    // must decode back bit-identical to the RAM source of truth
+    // (`doc_ids_flat`/`freqs_flat`), across multiple fields, including a
+    // term spanning >= 3 blocks (full + full + full + partial) to exercise
+    // the block-boundary delta reset.
+    let mut builder = PostingsBuilder::new();
+
+    // Small single-block terms, spread across two fields.
+    builder
+        .add("title", "surch", 1, vec![0])
+        .expect("title/surch");
+    builder
+        .add("title", "rust", 2, vec![0, 1])
+        .expect("title/rust");
+    builder
+        .add("body", "engine", 3, vec![0])
+        .expect("body/engine");
+
+    // A term spanning >= 3 blocks: BLOCK_SIZE*3+17 postings with DISTINCT
+    // doc_ids, inserted out of order. Multiplier MUST be coprime with the
+    // doc count so the modulo stays a bijection (see
+    // `term_dictionary_block_metas_match_postings_chunks` above for why a
+    // non-coprime multiplier would collapse to duplicate doc_ids).
+    let total_docs: u32 = (BLOCK_SIZE as u32) * 3 + 17;
+    for offset in 0..total_docs {
+        let doc_id = (offset * 11 + 3) % total_docs;
+        builder
+            .add("body", "wide", doc_id, vec![0, 1])
+            .expect("wide posting");
+    }
+
+    let dictionary = builder.build();
+
+    for (field, term) in [
+        ("title", "surch"),
+        ("title", "rust"),
+        ("body", "engine"),
+        ("body", "wide"),
+    ] {
+        let expected: Vec<_> = dictionary
+            .postings(field, term)
+            .unwrap_or_else(|| panic!("{field}/{term} postings"))
+            .collect();
+        let expected_doc_ids: Vec<u32> = expected.iter().map(|p| p.doc_id).collect();
+        let expected_freqs: Vec<u32> = expected.iter().map(|p| p.freq).collect();
+
+        let (decoded_doc_ids, decoded_freqs) = dictionary
+            .decode_from_segment(field, term)
+            .unwrap_or_else(|| panic!("{field}/{term} segment decode"));
+
+        assert_eq!(
+            decoded_doc_ids, expected_doc_ids,
+            "{field}/{term} doc_ids mismatch between segment and RAM"
+        );
+        assert_eq!(
+            decoded_freqs, expected_freqs,
+            "{field}/{term} freqs mismatch between segment and RAM"
+        );
+    }
+
+    // Unknown field/term yields `None`, consistent with `postings()`.
+    assert!(dictionary.decode_from_segment("body", "missing").is_none());
+    assert!(dictionary.decode_from_segment("missing", "wide").is_none());
+
+    // The segment actually received bytes (batched per field — the
+    // gauge exists precisely to make this observable in production).
+    assert!(dictionary.postings_segment_bytes() > 0);
+}
+
+#[test]
 fn term_dictionary_fst_terms_returns_lex_sorted() {
     // Insert terms in non-lexicographic order; the FST builder
     // contract requires lex order on the way in, so this test

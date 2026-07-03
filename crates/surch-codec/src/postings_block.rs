@@ -251,6 +251,139 @@ pub fn decode_postings_doc_id_freq(
     Ok((doc_ids, freqs))
 }
 
+/// Encode `(doc_ids, freqs)` as a sequence of self-contained FoR blocks of
+/// up to [`FOR_BLOCK_SIZE`] postings each — the Lot C `C1a-batché` segment
+/// format (`docs/paper/c1b-disk-backed-design-2026-07-02.md`).
+///
+/// Unlike [`encode_postings_doc_id_freq`] (whose delta chain spans the
+/// whole term, so decoding block `j` requires re-walking blocks `0..j`
+/// first), every block here resets its delta base to `0` at the block
+/// boundary: the first doc_id of a block is written as an ABSOLUTE varint
+/// (delta from `0`), the remaining doc_ids of the block are deltas within
+/// that block, followed by the block's `freq` varints. A block is
+/// therefore decodable in isolation via [`decode_block`] given only its
+/// own bytes and its posting count — no predecessor block needs to be
+/// read first. That is the property the future pread-addressed read path
+/// (C1b) needs: a block's byte range, looked up from a directory, can be
+/// `pread`'d and decoded on its own.
+///
+/// Layout — no overall length header, since callers already know
+/// `doc_ids.len()` (the CSR term range length) and derive the block
+/// count via `doc_ids.len().div_ceil(FOR_BLOCK_SIZE)`:
+///
+/// ```text
+/// for each block of up to FOR_BLOCK_SIZE postings:
+///     block-local delta-varint doc ids (first one absolute, delta from 0)
+///     block-local varint freqs
+/// ```
+///
+/// `doc_ids` and `freqs` must have the same length and `doc_ids` must be
+/// strictly increasing (same contract as [`encode_postings_doc_id_freq`]);
+/// violations return [`PostingsBlockError::NotMonotonic`] (the variant is
+/// reused rather than adding a breaking enum change, mirroring the
+/// existing length-mismatch handling on the sibling encoder).
+pub fn encode_postings_blocked(
+    doc_ids: &[u32],
+    freqs: &[u32],
+) -> Result<Vec<u8>, PostingsBlockError> {
+    if doc_ids.len() != freqs.len() {
+        return Err(PostingsBlockError::NotMonotonic);
+    }
+    validate_strictly_increasing(doc_ids)?;
+
+    // Same ~1.5 B/delta + ~1 B/freq heuristic as `encode_postings_doc_id_freq`.
+    let mut out = Vec::with_capacity(doc_ids.len() * 3);
+    for (doc_chunk, freq_chunk) in doc_ids
+        .chunks(FOR_BLOCK_SIZE)
+        .zip(freqs.chunks(FOR_BLOCK_SIZE))
+    {
+        let mut previous: u32 = 0;
+        for &value in doc_chunk {
+            let delta = value - previous; // safe: validate_* above guarantees value >= previous.
+            write_varint_u32(&mut out, delta);
+            previous = value;
+        }
+        for &freq in freq_chunk {
+            write_varint_u32(&mut out, freq);
+        }
+    }
+    Ok(out)
+}
+
+/// Shared block-decoding core for [`decode_block`] and
+/// [`decode_postings_blocked`]: reads `count` delta-varint doc ids (the
+/// first one absolute, per the block-local reset [`encode_postings_blocked`]
+/// performs) followed by `count` varint freqs, starting at `*position`,
+/// advancing `*position` past whatever it consumed.
+fn decode_block_at(
+    bytes: &[u8],
+    position: &mut usize,
+    count: usize,
+) -> Result<(Vec<u32>, Vec<u32>), PostingsBlockError> {
+    let mut doc_ids = Vec::with_capacity(count);
+    let mut previous: u32 = 0;
+    for i in 0..count {
+        let delta = read_varint_u32(bytes, position)?;
+        if i > 0 && delta == 0 {
+            return Err(PostingsBlockError::NotMonotonic);
+        }
+        let value = previous
+            .checked_add(delta)
+            .ok_or(PostingsBlockError::NotMonotonic)?;
+        doc_ids.push(value);
+        previous = value;
+    }
+
+    let mut freqs = Vec::with_capacity(count);
+    for _ in 0..count {
+        freqs.push(read_varint_u32(bytes, position)?);
+    }
+    Ok((doc_ids, freqs))
+}
+
+/// Decode a single self-contained block produced by
+/// [`encode_postings_blocked`]. `count` is the number of postings in the
+/// block — known ahead of time by the caller from context (the CSR term
+/// length and the block index determine it exactly: [`FOR_BLOCK_SIZE`]
+/// for every block but the last, and the remainder — or [`FOR_BLOCK_SIZE`]
+/// itself when the remainder is `0` — for the last one; the same
+/// arithmetic `doc_ids.chunks(FOR_BLOCK_SIZE)` already performs
+/// elsewhere in this codebase). `bytes` must start at the block's first
+/// byte; trailing bytes belonging to a following block are simply
+/// ignored (decoding stops once `count` doc ids and `count` freqs have
+/// been consumed), so callers may pass either the block's exact byte
+/// range or the remainder of the term's payload.
+pub fn decode_block(
+    bytes: &[u8],
+    count: usize,
+) -> Result<(Vec<u32>, Vec<u32>), PostingsBlockError> {
+    let mut position = 0;
+    decode_block_at(bytes, &mut position, count)
+}
+
+/// Decode the full payload produced by [`encode_postings_blocked`] for a
+/// term with `total_count` postings, walking block by block and
+/// concatenating the results. Used by the shadow round-trip validation
+/// (`PostingsBuilder::build`'s `debug_assert`) and by cold paths that
+/// need a term fully materialized rather than block-by-block.
+pub fn decode_postings_blocked(
+    bytes: &[u8],
+    total_count: usize,
+) -> Result<(Vec<u32>, Vec<u32>), PostingsBlockError> {
+    let mut position = 0;
+    let mut doc_ids = Vec::with_capacity(total_count);
+    let mut freqs = Vec::with_capacity(total_count);
+    let mut remaining = total_count;
+    while remaining > 0 {
+        let block_count = remaining.min(FOR_BLOCK_SIZE);
+        let (block_doc_ids, block_freqs) = decode_block_at(bytes, &mut position, block_count)?;
+        doc_ids.extend(block_doc_ids);
+        freqs.extend(block_freqs);
+        remaining -= block_count;
+    }
+    Ok((doc_ids, freqs))
+}
+
 /// Inspect the encoded postings payload block-by-block without fully
 /// materialising any intermediate posting structs.
 pub fn inspect_postings_blocks(bytes: &[u8]) -> Result<Vec<PostingsBlockMeta>, PostingsBlockError> {
@@ -881,6 +1014,93 @@ mod tests {
 
         let err = inspect_postings_blocks(&encoded).unwrap_err();
         assert_eq!(err, PostingsBlockError::UnexpectedEof);
+    }
+
+    #[test]
+    fn blocked_roundtrip() {
+        // Multi-block corpus: FOR_BLOCK_SIZE*3 + 17 postings (three full
+        // blocks + one partial trailing block), irregular gaps so the
+        // block-local delta reset is actually exercised (not just a
+        // constant stride). `encode_postings_blocked` + `decode_postings_blocked`
+        // must round-trip bit-identically to the RAM source, AND
+        // `decode_block` on each individual block byte range must match
+        // the corresponding chunk decoded via `decode_postings_blocked` —
+        // i.e. blocks are genuinely self-contained, not just an artifact
+        // of decoding sequentially from offset 0.
+        let total: u32 = (FOR_BLOCK_SIZE * 3 + 17) as u32;
+        let doc_ids: Vec<u32> = (0..total).map(|i| i * 3 + (i % 7)).collect();
+        let freqs: Vec<u32> = (0..total).map(|i| (i % 16) + 1).collect();
+
+        let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        let (decoded_doc_ids, decoded_freqs) =
+            decode_postings_blocked(&encoded, doc_ids.len()).unwrap();
+        assert_eq!(decoded_doc_ids, doc_ids);
+        assert_eq!(decoded_freqs, freqs);
+
+        // Per-block random access: re-encode each chunk on its own via
+        // `encode_postings_blocked` (single block in, single block out —
+        // the delta base resets to 0 either way) and check `decode_block`
+        // on that standalone payload matches the corresponding chunk of
+        // the full decode. This is the "decodable without predecessors"
+        // property C1b's pread path depends on.
+        for (doc_chunk, freq_chunk) in doc_ids
+            .chunks(FOR_BLOCK_SIZE)
+            .zip(freqs.chunks(FOR_BLOCK_SIZE))
+        {
+            let block_bytes = encode_postings_blocked(doc_chunk, freq_chunk).unwrap();
+            let (block_doc_ids, block_freqs) = decode_block(&block_bytes, doc_chunk.len()).unwrap();
+            assert_eq!(block_doc_ids, doc_chunk);
+            assert_eq!(block_freqs, freq_chunk);
+        }
+    }
+
+    #[test]
+    fn blocked_roundtrip_empty() {
+        let doc_ids: [u32; 0] = [];
+        let freqs: [u32; 0] = [];
+        let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        assert!(encoded.is_empty());
+        let (decoded_doc_ids, decoded_freqs) = decode_postings_blocked(&encoded, 0).unwrap();
+        assert!(decoded_doc_ids.is_empty() && decoded_freqs.is_empty());
+    }
+
+    #[test]
+    fn blocked_roundtrip_exact_block_boundary() {
+        // Exactly FOR_BLOCK_SIZE postings: a single full block, no
+        // trailing partial block.
+        let doc_ids: Vec<u32> = (0..FOR_BLOCK_SIZE as u32).map(|i| i * 2).collect();
+        let freqs: Vec<u32> = vec![1; FOR_BLOCK_SIZE];
+        let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        let (decoded_doc_ids, decoded_freqs) =
+            decode_postings_blocked(&encoded, doc_ids.len()).unwrap();
+        assert_eq!(decoded_doc_ids, doc_ids);
+        assert_eq!(decoded_freqs, freqs);
+    }
+
+    #[test]
+    fn blocked_rejects_length_mismatch() {
+        let err = encode_postings_blocked(&[1, 2], &[1]).unwrap_err();
+        assert_eq!(err, PostingsBlockError::NotMonotonic);
+    }
+
+    #[test]
+    fn blocked_rejects_non_monotonic() {
+        let err = encode_postings_blocked(&[5, 4], &[1, 1]).unwrap_err();
+        assert_eq!(err, PostingsBlockError::NotMonotonic);
+    }
+
+    #[test]
+    fn blocked_first_doc_id_may_be_zero_only_at_block_start() {
+        // Doc id 0 is legal as the very first element (delta 0 from the
+        // block-local base), but nowhere else — same rule as
+        // `encode_doc_ids_delta_varint`, just re-applied per block here.
+        let doc_ids = [0_u32, 1, 2];
+        let freqs = [1_u32, 1, 1];
+        let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        let (decoded_doc_ids, decoded_freqs) =
+            decode_postings_blocked(&encoded, doc_ids.len()).unwrap();
+        assert_eq!(decoded_doc_ids, doc_ids);
+        assert_eq!(decoded_freqs, freqs);
     }
 
     fn skip_entries(ranges: &[(usize, u32, u32)]) -> Vec<BlockSkipEntry> {

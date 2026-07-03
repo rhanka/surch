@@ -845,6 +845,17 @@ impl DocumentIndex {
         self.terms.postings_capacity_slack_bytes()
     }
 
+    /// Lot C `C1a-batché`: bytes physically written to the SHADOW disk
+    /// postings segment (`surch_index_disk_postings_bytes`). See
+    /// [`crate::postings::TermDictionary::postings_segment_bytes`] — this
+    /// is a raw disk-footprint measurement, deliberately NOT part of
+    /// [`crate::memory::MemoryUsage`] (the segment is SHADOW: the same
+    /// bytes are, today, ALSO fully resident via `postings_bytes`, so
+    /// adding this in would double-count against the RAM total).
+    pub fn postings_segment_bytes(&self) -> u64 {
+        self.terms.postings_segment_bytes()
+    }
+
     /// #17c memory accounting: taille on-heap du `PostingsBuilder` retenu.
     /// Lot 1.5 garde le builder live entre rebuilds incrémentaux, donc
     /// pour 1.36 M docs ça peut peser GROS et n'était pas compté ailleurs.
