@@ -532,6 +532,73 @@ fn postings_segment_blocked_roundtrip_matches_ram() {
 }
 
 #[test]
+fn postings_segment_tolerates_duplicate_doc_ids() {
+    // Hardening regression for the C1a-batché crash observed on the real
+    // deces corpus (1.36 M docs, bulk OK, `count: 0` after `_refresh`):
+    // a source `Value::Array` field gets exploded into several `(field,
+    // value)` pairs of the SAME doc_id upstream
+    // (`indexed_fields_for_document` in surch-api), and
+    // `PostingsBuilder::add` does not deduplicate — so a term can carry
+    // duplicate doc_ids. `encode_postings_blocked` rightly rejects that
+    // as non-monotonic once sorted (`sort_by_key` sorts, it does not
+    // dedup). The SHADOW segment write must never be able to crash
+    // indexation over this: `build()` must NOT panic, RAM must stay the
+    // fully correct source of truth (duplicates included — deduplicating
+    // them is a separate, out-of-scope fix), and only the offending
+    // term's disk coverage is dropped (sentinel descriptor), observable
+    // via the public `postings_segment_skipped_terms()` counter.
+    let mut builder = PostingsBuilder::new();
+
+    // A normal term: gets full disk coverage, unaffected by the other
+    // term's encode failure in the same field.
+    builder
+        .add("body", "clean", 1, vec![0])
+        .expect("clean posting");
+
+    // A term with TWO postings for the SAME doc_id (5) — the duplicate
+    // doc_id that used to make `encode_postings_blocked(...).expect(...)`
+    // panic inside `PostingsBuilder::build()`.
+    builder
+        .add("body", "dup", 5, vec![0])
+        .expect("dup posting #1");
+    builder
+        .add("body", "dup", 5, vec![1, 2])
+        .expect("dup posting #2 (same doc_id as #1)");
+
+    // The panic this test guards against would fire inside `build()`.
+    let dictionary = builder.build();
+
+    // RAM stays authoritative and fully correct: both postings for
+    // "dup" are present, duplicate doc_id included.
+    let dup_postings: Vec<_> = dictionary
+        .postings("body", "dup")
+        .expect("dup postings")
+        .collect();
+    assert_eq!(dup_postings.len(), 2);
+    assert!(dup_postings.iter().all(|posting| posting.doc_id == 5));
+
+    // The unrelated "clean" term is unaffected.
+    let clean_postings: Vec<_> = dictionary
+        .postings("body", "clean")
+        .expect("clean postings")
+        .collect();
+    assert_eq!(clean_postings.len(), 1);
+    assert_eq!(clean_postings[0].doc_id, 1);
+
+    // "dup" has NO disk coverage (sentinel descriptor): the SHADOW
+    // segment decode returns `None` for it...
+    assert!(dictionary.decode_from_segment("body", "dup").is_none());
+    // ...while "clean" still round-trips through the segment normally.
+    assert!(dictionary.decode_from_segment("body", "clean").is_some());
+
+    // Exactly one term failed to encode — observable through the public
+    // counter backing `surch_index_disk_postings_skipped_terms`. This is
+    // the signal that distinguishes "duplicate doc_ids" from an
+    // unrelated IO/tmpfs failure (which would leave this at 0).
+    assert_eq!(dictionary.postings_segment_skipped_terms(), 1);
+}
+
+#[test]
 fn term_dictionary_fst_terms_returns_lex_sorted() {
     // Insert terms in non-lexicographic order; the FST builder
     // contract requires lex order on the way in, so this test
