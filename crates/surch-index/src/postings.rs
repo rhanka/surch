@@ -624,9 +624,7 @@ impl PostingsBuilder {
                     }
                 }
                 None => {
-                    for descriptor in &mut segment_descriptors {
-                        *descriptor = (0, 0);
-                    }
+                    segment_descriptors.fill((0, 0));
                 }
             }
             drop(field_payload);
