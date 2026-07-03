@@ -50,10 +50,15 @@
   suffisant : id_maps ~2,8 GiB (linéaire) = **C2 obligatoire**. Le directory doit être SÉCABLE (garder en
   RAM une couche skip grossière, externaliser min/max/offset en skip-file) — à concevoir dès maintenant.
 
-## 🚨 CATCH CRITIQUE (Fable) : le segment ne doit PAS atterrir sur tmpfs
-`source_store` utilise `std::env::temp_dir()`. Si `/tmp` est tmpfs dans le conteneur, les pages sont
-**anon NON-évictables** → tout le gain RAM est FICTIF. Forcer un chemin disque réel (emptyDir medium
-disk / PVC), et **mesurer l'anon SOUS limite cgroup** au gate.
+## CATCH tmpfs (Fable) — VÉRIFIÉ BÉNIN
+`PostingsSegment` (postings.rs:87) et `source.dat` (state.rs:82) écrivent dans `std::env::temp_dir()`
+(`/tmp`). Risque : si `/tmp` était tmpfs, les pages seraient anon NON-évictables → gain RAM fictif.
+**Vérifié bénin** : (1) les manifestes k8s (`deploy/k8s/jobs/*.yaml`) ne montent PAS `/tmp` en tmpfs
+(seul un PVC `scratch` sur `/var/surch` + de petits emptyDir disque) ; (2) surtout, les mesures deces
+existantes caractérisent le page cache de `source.dat` comme **évictable** (delta `process_rss` −
+`jemalloc anon` = page cache), ce qui PROUVE que `/tmp` est un fs disque (overlay), pas tmpfs. Donc le
+gain RAM de C1b sera RÉEL. Robustesse optionnelle : pointer explicitement vers `/var/surch` (PVC) via
+un env `SURCH_DATA_DIR` (non bloquant). Toujours **mesurer l'anon ET le container RSS SOUS limite** au gate C1b.
 
 ## ✅ C1a-batché VALIDÉ (bench 28636114241, HEAD 51a4f70)
 - `count` 1 355 728 = docs, **verdict PASS** (refresh ne crashe plus). Indexation **12 179 doc/s**
