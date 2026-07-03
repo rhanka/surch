@@ -12,6 +12,9 @@ surch-analysis = { path = "../surch-analysis" }
 surch-index = { path = "../surch-index" }
 surch-search = { path = "../surch-search" }
 surch-types = { path = "../surch-types" }
+# C2: dense id maps use an FST for uid -> doc_id (kills the ~1.36M per-uid
+# Arc<str>). Same fst version as surch-index (workspace-pinned 0.4).
+fst = { workspace = true }
 # Track A wp-a-perf-followups.md Lot 1.7: jemalloc returns freed
 # heap pages to the OS aggressively when paired with the
 # MALLOC_CONF tuning shipped in the Dockerfile (dirty_decay_ms=0,
