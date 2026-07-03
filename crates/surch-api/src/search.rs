@@ -3041,9 +3041,14 @@ fn lookup_text_field(source: &Value, field: &str) -> Option<String> {
 /// [`TermScoringView`]'s fields stay PLAIN `&'a [u32]` (unchanged from
 /// the RAM path) even though, under disk mode, `'a` now points at this
 /// arena instead of the index's read guard.
+/// One owned, decoded term inside the [`ScoringArena`]: `doc_ids`, `freqs`,
+/// and the per-block `BlockMeta` (max-freq), each boxed so the arena can hand
+/// back stable `&'a [_]` slices for the query's lifetime.
+type ScoringArenaEntry = (Box<[u32]>, Box<[u32]>, Box<[BlockMeta]>);
+
 #[derive(Debug, Default)]
 struct ScoringArena {
-    entries: Vec<(Box<[u32]>, Box<[u32]>, Box<[BlockMeta]>)>,
+    entries: Vec<ScoringArenaEntry>,
 }
 
 impl ScoringArena {
