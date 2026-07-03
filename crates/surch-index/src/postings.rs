@@ -235,6 +235,44 @@ mod postings_segment {
 const TERM_ROARING_THRESHOLD: usize = 4_096;
 use thiserror::Error;
 
+/// Lot C `C1b` sous-pas 2 (`docs/paper/c1b-disk-backed-design-2026-07-02.md`
+/// §"Séquence + flag + revert"): process-wide default for the disk-backed
+/// postings read path. `true` when `SURCH_POSTINGS_DISK` is `"1"` or
+/// case-insensitively `"true"`; `false` (the 100 % in-RAM engine,
+/// unconditionally safe) otherwise, including when the variable is unset.
+///
+/// Read ONCE per process via `OnceLock` — the value must stay stable for
+/// the process's whole lifetime, since a `TermDictionary`'s RAM/disk
+/// layout is fixed forever at the [`PostingsBuilder::build`] call that
+/// produced it (flag ON empties `doc_ids_flat`/`freqs_flat`; flag OFF
+/// never touches the disk read path). This is why the actual read-path
+/// decision downstream is NOT a repeated call to this function: it is
+/// [`TermDictionary::disk_backed`], a bit baked into the built
+/// dictionary itself (see [`PostingsBuilder::build_with_disk_flag`]) —
+/// that is both more correct (a dictionary's contents cannot silently
+/// disagree with what its own read path assumes) and independently
+/// solves a testability problem this `OnceLock` would otherwise create:
+/// a single test process cannot flip a `OnceLock`-cached global mid-run,
+/// so a same-process flag-ON == flag-OFF parity test
+/// (`crates/surch-api/tests/postings_disk_parity.rs`) instead builds two
+/// indices with an explicit per-index override
+/// (`DocumentIndex::set_postings_disk_enabled`) that bypasses this
+/// function entirely.
+///
+/// Revert story: turning the flag back off needs no rebuild of the disk
+/// segment itself — `postings.dat` is written unconditionally regardless
+/// of this flag (Lot C `C1a-batché`) — only the NEXT
+/// [`PostingsBuilder::build`] (the next `_refresh`/materialize) picks up
+/// the new value.
+pub fn postings_disk_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("SURCH_POSTINGS_DISK")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 pub type Result<T> = std::result::Result<T, PostingsError>;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -438,7 +476,31 @@ impl PostingsBuilder {
         Ok(())
     }
 
-    pub fn build(mut self) -> TermDictionary {
+    /// Build the [`TermDictionary`], reading the process-wide
+    /// [`postings_disk_enabled`] flag for the RAM-vs-disk-backed decision.
+    /// Every production call site (`surch-index::document_index`) uses
+    /// this. Tests that need BOTH a flag-ON and a flag-OFF
+    /// `TermDictionary` in the SAME process (the `OnceLock` behind
+    /// [`postings_disk_enabled`] cannot flip mid-run — see its doc
+    /// comment) call [`Self::build_with_disk_flag`] directly instead.
+    pub fn build(self) -> TermDictionary {
+        let disk_enabled = postings_disk_enabled();
+        self.build_with_disk_flag(disk_enabled)
+    }
+
+    /// Lot C `C1b` sous-pas 2: [`Self::build`] with an explicit
+    /// `disk_enabled` override instead of the process-wide
+    /// [`postings_disk_enabled`] flag. `disk_enabled == false` reproduces
+    /// [`Self::build`]'s historical behaviour byte-for-byte (the branch
+    /// below is the SAME code [`Self::build`] always ran, now reached via
+    /// `postings_disk_enabled() == false` instead of unconditionally).
+    /// `disk_enabled == true` empties `doc_ids_flat`/`freqs_flat`/
+    /// `block_metas_flat` (RAM freed — the disk segment, written
+    /// unconditionally since Lot C `C1a-batché`, becomes the sole source
+    /// of truth) and persists the per-block directory
+    /// ([`FieldPostings::block_directory`]) so the disk read path never
+    /// re-decodes a whole term just to skip blocks.
+    pub fn build_with_disk_flag(mut self, disk_enabled: bool) -> TermDictionary {
         // Sort each posting list by ascending doc_id (the query engine
         // relies on this to do single-pass conjunctions and unions), then
         // merge same-doc_id runs into a single Lucene-shaped posting: see
@@ -495,9 +557,19 @@ impl PostingsBuilder {
                 .map(|postings| postings.len().div_ceil(BLOCK_SIZE))
                 .sum();
 
-            let mut freqs_flat: Vec<u32> = Vec::with_capacity(total_postings);
-            let mut doc_ids_flat: Vec<u32> = Vec::with_capacity(total_postings);
-            let mut block_metas_flat: Vec<BlockMeta> = Vec::with_capacity(total_blocks);
+            // Lot C `C1b` sous-pas 2: when `disk_enabled`, these three
+            // channels are NEVER populated below (the per-term loop takes
+            // the disk-mode branch instead) — sizing their capacity to 0
+            // rather than `total_postings`/`total_blocks` avoids paying
+            // for an allocation that would otherwise sit empty for the
+            // dictionary's whole life. `disk_enabled == false` reserves
+            // the EXACT SAME capacity as before this sous-pas.
+            let mut freqs_flat: Vec<u32> =
+                Vec::with_capacity(if disk_enabled { 0 } else { total_postings });
+            let mut doc_ids_flat: Vec<u32> =
+                Vec::with_capacity(if disk_enabled { 0 } else { total_postings });
+            let mut block_metas_flat: Vec<BlockMeta> =
+                Vec::with_capacity(if disk_enabled { 0 } else { total_blocks });
             let mut offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
             let mut block_offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
             // Sparse side table: only terms with df > TERM_ROARING_THRESHOLD
@@ -521,6 +593,18 @@ impl PostingsBuilder {
             let mut segment_descriptors: Vec<(u64, u32)> = Vec::with_capacity(term_count);
             let mut field_payload: Vec<u8> = Vec::with_capacity(total_postings * 3);
 
+            // Lot C `C1b` sous-pas 2: persisted per-block directory —
+            // built ONLY when `disk_enabled` (see
+            // `FieldPostings::block_directory`'s doc comment). Left as an
+            // untouched, unallocated `Vec::new()` when the flag is off:
+            // `into_boxed_slice()` on it allocates nothing.
+            let mut block_directory_flat: Vec<BlockDirEntry> = Vec::new();
+            let mut block_dir_offsets: Vec<u32> =
+                Vec::with_capacity(if disk_enabled { term_count + 1 } else { 0 });
+            if disk_enabled {
+                block_dir_offsets.push(0);
+            }
+
             // --- Pass 2: fill, draining `terms` term-by-term ------------
             // Transitory-peak mitigation (risk #1 of the flattening): a
             // naive "collect everything into Vec<Vec<_>>, then flatten"
@@ -541,95 +625,164 @@ impl PostingsBuilder {
                     .insert(term.as_bytes(), idx as u64)
                     .expect("fst::MapBuilder accepts lex-sorted keys");
 
-                // Per-block stats are computed once here, against the
-                // ascending-doc_id postings, then read back in O(1) by
-                // `maxscore_match` instead of being recomputed at every
-                // query.
-                block_metas_flat.extend(build_block_metas(&term_postings));
-                debug_assert!(
-                    block_metas_flat.len() <= u32::MAX as usize,
-                    "block_metas_flat offset overflowed u32 — switch block_offsets to u64 \
-                     (only relevant well past matchID's 1.36M-doc scale)"
-                );
-                block_offsets.push(block_metas_flat.len() as u32);
+                if disk_enabled {
+                    // Lot C `C1b` sous-pas 2: disk-backed path. Encode
+                    // straight from `term_postings` (owned, transient —
+                    // dropped at the end of this loop iteration) instead of
+                    // slicing `doc_ids_flat`/`freqs_flat`, which stay EMPTY
+                    // for the whole field: the disk segment + the persisted
+                    // directory built below are the sole source of truth for
+                    // this term's postings, RAM is freed. Mirrors the
+                    // flag-off branch's CSR bookkeeping (`offsets`,
+                    // `block_offsets`, `roaring`, `segment_descriptors`)
+                    // exactly, just sourced differently.
+                    let term_doc_ids: Vec<u32> =
+                        term_postings.iter().map(|posting| posting.doc_id).collect();
+                    let term_freqs: Vec<u32> =
+                        term_postings.iter().map(|posting| posting.freq).collect();
 
-                // Compact doc_id channel for the conjunction leapfrog (same
-                // ascending order as `term_postings`, so index-aligned with
-                // the `freqs_flat` slice pushed below).
-                let doc_ids_start = doc_ids_flat.len();
-                doc_ids_flat.extend(term_postings.iter().map(|posting| posting.doc_id));
+                    block_offsets.push(
+                        block_offsets.last().copied().unwrap_or(0)
+                            + term_postings.len().div_ceil(BLOCK_SIZE) as u32,
+                    );
 
-                // A1: precompute a roaring/hybrid bitmap for high-`df` terms so
-                // the conjunction of two common terms ANDs word-parallel bitmaps
-                // instead of walking O(df_rare) scalar-ly. Below the threshold
-                // the galloping leapfrog already wins, so we skip the RAM. We
-                // iterate `idx` in strictly increasing order (the drained
-                // `BTreeMap` yields terms in FST order), so appending here
-                // keeps `roaring` sorted by term idx for free — `lookup`
-                // below can `binary_search` it directly.
-                if term_postings.len() > TERM_ROARING_THRESHOLD {
-                    roaring.push((
-                        idx as u32,
-                        RoaringDocSet::from_sorted(&doc_ids_flat[doc_ids_start..]),
-                    ));
-                }
-
-                // SoA freq channel (Lot C Phase 1 levier 5), index-aligned
-                // with `doc_ids_flat` via the same `offsets` CSR table —
-                // this is the last use of the source `Vec<Posting>` the
-                // drained `BTreeMap` entry owned (only borrowed here, via
-                // `.iter()`), so it drops and frees its heap allocation at
-                // the end of this loop iteration (see the transitory-peak
-                // mitigation note above). Eliminates the `doc_id`
-                // duplication the historical AoS `postings_flat:
-                // Box<[Posting]>` carried (`doc_id` was already stored in
-                // `doc_ids_flat` above).
-                let freqs_start = freqs_flat.len();
-                freqs_flat.extend(term_postings.iter().map(|posting| posting.freq));
-                debug_assert!(
-                    freqs_flat.len() <= u32::MAX as usize,
-                    "freqs_flat offset overflowed u32 — switch offsets to u64 \
-                     (only relevant well past matchID's 1.36M-doc scale)"
-                );
-                offsets.push(freqs_flat.len() as u32);
-
-                // Lot C `C1a-batché`: encode this term's postings as
-                // self-contained FoR blocks and accumulate into the
-                // FIELD-wide payload buffer — NOT written to disk yet
-                // (see the single `postings_segment.append()` after this
-                // loop). `term_postings` is now GUARANTEED strictly
-                // ascending by `doc_id` at this point: the sort at the
-                // top of `build()` plus `dedup_merge_postings` right
-                // after it (Correction fix) sort AND merge every
-                // same-doc_id run into one posting, matching
-                // `encode_postings_blocked`'s strictly-increasing
-                // contract exactly. Same-doc_id runs used to come from a
-                // source `Value::Array` field exploded into several
-                // same-doc_id `(field, value)` pairs upstream
-                // (`indexed_fields_for_document` in surch-api), each
-                // `add`-ed separately — `dedup_merge_postings` is what
-                // now collapses them. The `NotMonotonic` branch below is
-                // kept as defense-in-depth for any other bug that could
-                // still produce non-monotonic doc_ids; best-effort here
-                // means such a term just gets NO disk coverage (sentinel
-                // descriptor) instead of crashing the whole `_refresh` —
-                // RAM (`doc_ids_flat`/`freqs_flat`) already holds every
-                // posting regardless of encode success, so nothing is
-                // lost, only the SHADOW segment's coverage of this one
-                // term.
-                match encode_postings_blocked(
-                    &doc_ids_flat[doc_ids_start..],
-                    &freqs_flat[freqs_start..],
-                ) {
-                    Ok(block_payload) => {
-                        let payload_offset = field_payload.len() as u64;
-                        field_payload.extend_from_slice(&block_payload);
-                        segment_descriptors.push((payload_offset, block_payload.len() as u32));
+                    if term_postings.len() > TERM_ROARING_THRESHOLD {
+                        roaring.push((idx as u32, RoaringDocSet::from_sorted(&term_doc_ids)));
                     }
-                    Err(_) => {
-                        // Sentinel: no disk coverage for this term.
-                        segment_descriptors.push((0, 0));
-                        postings_skipped_terms += 1;
+
+                    offsets.push(offsets.last().copied().unwrap_or(0) + term_doc_ids.len() as u32);
+
+                    match encode_postings_blocked(&term_doc_ids, &term_freqs) {
+                        Ok(block_payload) => {
+                            // SHADOW validation, disk-mode counterpart of the
+                            // flag-off branch's post-loop
+                            // `validate_field_segment_round_trip` (which
+                            // cannot run here: `doc_ids_flat`/`freqs_flat`
+                            // stay empty under disk mode, so there is nothing
+                            // in RAM to compare the pread'd bytes against).
+                            // Checked here instead, against the transient
+                            // `term_doc_ids`/`term_freqs` this iteration
+                            // owns, before they are dropped. Compiled out in
+                            // release builds like every other `debug_assert!`
+                            // in this file.
+                            debug_assert!(
+                            decode_postings_blocked(&block_payload, term_doc_ids.len())
+                                .is_ok_and(|(decoded_ids, decoded_freqs)| {
+                                    decoded_ids == term_doc_ids && decoded_freqs == term_freqs
+                                }),
+                            "disk-mode blocked encode round-trip mismatch for field {field:?} term {term:?}"
+                        );
+                            let payload_offset = field_payload.len() as u64;
+                            // Lot C `C1b` sous-pas 2: persist the per-block
+                            // directory computed once here (build time), so a
+                            // query-time `disk_cursor` never re-preads +
+                            // re-decodes the whole term payload just to find
+                            // block boundaries (sous-pas 1's ad hoc fallback).
+                            if let Ok(directory) =
+                                block_directory(&block_payload, term_doc_ids.len())
+                            {
+                                block_directory_flat.extend(directory);
+                            }
+                            field_payload.extend_from_slice(&block_payload);
+                            segment_descriptors.push((payload_offset, block_payload.len() as u32));
+                        }
+                        Err(_) => {
+                            segment_descriptors.push((0, 0));
+                            postings_skipped_terms += 1;
+                        }
+                    }
+                    block_dir_offsets.push(block_directory_flat.len() as u32);
+                } else {
+                    // Per-block stats are computed once here, against the
+                    // ascending-doc_id postings, then read back in O(1) by
+                    // `maxscore_match` instead of being recomputed at every
+                    // query.
+                    block_metas_flat.extend(build_block_metas(&term_postings));
+                    debug_assert!(
+                        block_metas_flat.len() <= u32::MAX as usize,
+                        "block_metas_flat offset overflowed u32 — switch block_offsets to u64 \
+                     (only relevant well past matchID's 1.36M-doc scale)"
+                    );
+                    block_offsets.push(block_metas_flat.len() as u32);
+
+                    // Compact doc_id channel for the conjunction leapfrog (same
+                    // ascending order as `term_postings`, so index-aligned with
+                    // the `freqs_flat` slice pushed below).
+                    let doc_ids_start = doc_ids_flat.len();
+                    doc_ids_flat.extend(term_postings.iter().map(|posting| posting.doc_id));
+
+                    // A1: precompute a roaring/hybrid bitmap for high-`df` terms so
+                    // the conjunction of two common terms ANDs word-parallel bitmaps
+                    // instead of walking O(df_rare) scalar-ly. Below the threshold
+                    // the galloping leapfrog already wins, so we skip the RAM. We
+                    // iterate `idx` in strictly increasing order (the drained
+                    // `BTreeMap` yields terms in FST order), so appending here
+                    // keeps `roaring` sorted by term idx for free — `lookup`
+                    // below can `binary_search` it directly.
+                    if term_postings.len() > TERM_ROARING_THRESHOLD {
+                        roaring.push((
+                            idx as u32,
+                            RoaringDocSet::from_sorted(&doc_ids_flat[doc_ids_start..]),
+                        ));
+                    }
+
+                    // SoA freq channel (Lot C Phase 1 levier 5), index-aligned
+                    // with `doc_ids_flat` via the same `offsets` CSR table —
+                    // this is the last use of the source `Vec<Posting>` the
+                    // drained `BTreeMap` entry owned (only borrowed here, via
+                    // `.iter()`), so it drops and frees its heap allocation at
+                    // the end of this loop iteration (see the transitory-peak
+                    // mitigation note above). Eliminates the `doc_id`
+                    // duplication the historical AoS `postings_flat:
+                    // Box<[Posting]>` carried (`doc_id` was already stored in
+                    // `doc_ids_flat` above).
+                    let freqs_start = freqs_flat.len();
+                    freqs_flat.extend(term_postings.iter().map(|posting| posting.freq));
+                    debug_assert!(
+                        freqs_flat.len() <= u32::MAX as usize,
+                        "freqs_flat offset overflowed u32 — switch offsets to u64 \
+                     (only relevant well past matchID's 1.36M-doc scale)"
+                    );
+                    offsets.push(freqs_flat.len() as u32);
+
+                    // Lot C `C1a-batché`: encode this term's postings as
+                    // self-contained FoR blocks and accumulate into the
+                    // FIELD-wide payload buffer — NOT written to disk yet
+                    // (see the single `postings_segment.append()` after this
+                    // loop). `term_postings` is now GUARANTEED strictly
+                    // ascending by `doc_id` at this point: the sort at the
+                    // top of `build()` plus `dedup_merge_postings` right
+                    // after it (Correction fix) sort AND merge every
+                    // same-doc_id run into one posting, matching
+                    // `encode_postings_blocked`'s strictly-increasing
+                    // contract exactly. Same-doc_id runs used to come from a
+                    // source `Value::Array` field exploded into several
+                    // same-doc_id `(field, value)` pairs upstream
+                    // (`indexed_fields_for_document` in surch-api), each
+                    // `add`-ed separately — `dedup_merge_postings` is what
+                    // now collapses them. The `NotMonotonic` branch below is
+                    // kept as defense-in-depth for any other bug that could
+                    // still produce non-monotonic doc_ids; best-effort here
+                    // means such a term just gets NO disk coverage (sentinel
+                    // descriptor) instead of crashing the whole `_refresh` —
+                    // RAM (`doc_ids_flat`/`freqs_flat`) already holds every
+                    // posting regardless of encode success, so nothing is
+                    // lost, only the SHADOW segment's coverage of this one
+                    // term.
+                    match encode_postings_blocked(
+                        &doc_ids_flat[doc_ids_start..],
+                        &freqs_flat[freqs_start..],
+                    ) {
+                        Ok(block_payload) => {
+                            let payload_offset = field_payload.len() as u64;
+                            field_payload.extend_from_slice(&block_payload);
+                            segment_descriptors.push((payload_offset, block_payload.len() as u32));
+                        }
+                        Err(_) => {
+                            // Sentinel: no disk coverage for this term.
+                            segment_descriptors.push((0, 0));
+                            postings_skipped_terms += 1;
+                        }
                     }
                 }
             }
@@ -699,16 +852,26 @@ impl PostingsBuilder {
             // is unreachable dead code once `cfg!(debug_assertions)` is
             // `false`. Skips sentinel `(0, 0)` descriptors — see that
             // function's doc comment.
-            debug_assert!(
-                validate_field_segment_round_trip(
-                    postings_segment.as_ref(),
-                    &segment_descriptors,
-                    &offsets,
-                    &doc_ids_flat,
-                    &freqs_flat,
-                ),
-                "postings segment blocked round-trip mismatch for field {field:?}"
-            );
+            //
+            // Lot C `C1b` sous-pas 2: skipped entirely when `disk_enabled`
+            // — `doc_ids_flat`/`freqs_flat` are intentionally empty then
+            // (RAM freed), so there is no RAM source of truth left to
+            // compare the pread'd bytes against; the disk-mode per-term
+            // round trip is instead checked inline, per term, right after
+            // each `encode_postings_blocked` call above (see the
+            // `disk_enabled` branch of the per-term loop).
+            if !disk_enabled {
+                debug_assert!(
+                    validate_field_segment_round_trip(
+                        postings_segment.as_ref(),
+                        &segment_descriptors,
+                        &offsets,
+                        &doc_ids_flat,
+                        &freqs_flat,
+                    ),
+                    "postings segment blocked round-trip mismatch for field {field:?}"
+                );
+            }
 
             let bytes = builder
                 .into_inner()
@@ -725,6 +888,8 @@ impl PostingsBuilder {
                     block_offsets: block_offsets.into_boxed_slice(),
                     roaring,
                     segment_descriptors: segment_descriptors.into_boxed_slice(),
+                    block_directory: block_directory_flat.into_boxed_slice(),
+                    block_dir_offsets: block_dir_offsets.into_boxed_slice(),
                 },
             );
         }
@@ -733,6 +898,7 @@ impl PostingsBuilder {
             fields,
             postings_segment: postings_segment.map(Arc::new),
             postings_skipped_terms,
+            disk_enabled,
         }
     }
 }
@@ -876,6 +1042,23 @@ pub struct FieldPostings {
     /// future cold paths) — never by `lookup*`/scoring/the leapfrog,
     /// which stay on `doc_ids_flat`/`freqs_flat` above.
     segment_descriptors: Box<[(u64, u32)]>,
+    /// Lot C `C1b` sous-pas 2: per-block directory (`max_doc_id` per FoR
+    /// block, [`BlockDirEntry`]), persisted ONCE at
+    /// [`PostingsBuilder::build_with_disk_flag`] time — CSR-indexed by
+    /// [`Self::block_dir_offsets`], concatenated across every term in FST
+    /// idx order (same shape as `block_metas_flat`/`block_offsets`).
+    /// Built ONLY when the disk flag is on for this build; `Box::default()`
+    /// (empty, zero heap) otherwise, so the RAM-only engine pays nothing
+    /// for it. Lets [`TermDictionary::disk_cursor`] open a block-addressed
+    /// cursor in O(term's block count) — a directory LOOKUP — instead of
+    /// `pread`-ing and decoding the term's WHOLE payload just to compute
+    /// the directory (sous-pas 1's ad hoc fallback, still used when this
+    /// is empty — e.g. a `TermDictionary` built with the flag off).
+    block_directory: Box<[BlockDirEntry]>,
+    /// CSR offsets into `block_directory`, length `T + 1` when the disk
+    /// flag was on for this build, empty (`Box::default()`) otherwise —
+    /// same shape/contract as `offsets`/`block_offsets`.
+    block_dir_offsets: Box<[u32]>,
 }
 
 impl FieldPostings {
@@ -904,6 +1087,18 @@ impl FieldPostings {
         let (idx, start, end) = self.term_range(term)?;
         let descriptor = *self.segment_descriptors.get(idx)?;
         Some((descriptor, end - start))
+    }
+
+    /// Lot C `C1b` sous-pas 2: this term's persisted per-block directory
+    /// slice, if one was built (disk flag was on at build time). `None`
+    /// when `block_dir_offsets` is empty (flag was off) — the CSR lookup
+    /// then naturally misses regardless of `idx`, so [`TermDictionary::disk_cursor`]
+    /// falls back to sous-pas 1's ad hoc directory computation.
+    fn persisted_block_directory(&self, term: &str) -> Option<&[BlockDirEntry]> {
+        let idx = self.fst.get(term.as_bytes())? as usize;
+        let start = *self.block_dir_offsets.get(idx)? as usize;
+        let end = *self.block_dir_offsets.get(idx + 1)? as usize;
+        self.block_directory.get(start..end)
     }
 
     fn lookup_block_metas(&self, term: &str) -> Option<&[BlockMeta]> {
@@ -1035,9 +1230,28 @@ pub struct TermDictionary {
     /// can no longer occur — this gauge is expected to read 0 in steady
     /// state and now only guards against an unrelated future regression.
     postings_skipped_terms: u64,
+    /// Lot C `C1b` sous-pas 2: whether THIS `TermDictionary` was built
+    /// with the disk-backed postings read path
+    /// ([`PostingsBuilder::build_with_disk_flag`]). `false` by default
+    /// (`derive(Default)`), matching the 100 % in-RAM engine. Baked in
+    /// once at build time rather than re-read from the process-wide
+    /// [`postings_disk_enabled`] flag on every query — see that
+    /// function's doc comment for why: a dictionary's own RAM/disk
+    /// layout must never disagree with what its read path assumes, and
+    /// re-reading a `OnceLock`-cached global here would also make a
+    /// same-process flag-ON/flag-OFF parity test impossible.
+    disk_enabled: bool,
 }
 
 impl TermDictionary {
+    /// Lot C `C1b` sous-pas 2: whether this dictionary's postings are
+    /// disk-backed (`doc_ids_flat`/`freqs_flat` empty, the segment +
+    /// persisted block directory are the sole source of truth) or
+    /// resident in RAM. Read-path callers (`surch-api`) branch on this
+    /// instead of the process-wide [`postings_disk_enabled`] flag.
+    pub fn disk_backed(&self) -> bool {
+        self.disk_enabled
+    }
     /// Returns the terms of `field` in lexicographic order. Terms are
     /// materialized into owned `String`s because the FST stores them
     /// as compressed bytes; this is fine in practice as `terms()` is
@@ -1123,15 +1337,26 @@ impl TermDictionary {
     }
 
     /// Lot C `C1b` sous-pas 1: build a [`DiskPostingsCursor`] over
-    /// `(field, term)`'s payload inside the disk segment. PURELY
-    /// ADDITIVE — see the type's doc comment: no production read path
-    /// calls this today, `lookup*`/[`PostingsList`]/
-    /// [`PostingsBlockSkipIter`]/scoring/the conjunction leapfrog are all
-    /// untouched by this method's existence. Exists so
-    /// `disk_cursor_matches_ram_leapfrog`
-    /// (`crates/surch-index/tests/postings.rs`) can drive the cursor
-    /// against a real segment built the ordinary way, through the same
-    /// descriptor lookup [`Self::decode_from_segment`] uses.
+    /// `(field, term)`'s payload inside the disk segment. Originally
+    /// PURELY ADDITIVE (no production read path called this) — sous-pas
+    /// 2 (`docs/paper/c1b-disk-backed-design-2026-07-02.md`) turns it
+    /// into the production entry point for the conjunction/leapfrog
+    /// read path (`surch-api::state`'s `conjunction_hits_internal`,
+    /// `fused_conjunction_scores`, `conjunction_of_matches`) when the
+    /// disk flag is on. `disk_cursor_matches_ram_leapfrog`
+    /// (`crates/surch-index/tests/postings.rs`) still drives it directly
+    /// too.
+    ///
+    /// Fast path (sous-pas 2): when `(field, term)` has a PERSISTED
+    /// per-block directory ([`FieldPostings::persisted_block_directory`]
+    /// — built at [`PostingsBuilder::build_with_disk_flag`] time when the
+    /// disk flag was on), the cursor opens from it directly
+    /// ([`DiskPostingsCursor::open_with_directory`]) — no `pread` of the
+    /// term's payload just to compute the directory. Falls back to
+    /// sous-pas 1's ad hoc [`DiskPostingsCursor::open`] (one whole-payload
+    /// `pread` + directory recompute) when no persisted directory exists
+    /// — e.g. a `TermDictionary` built with the flag off, exactly
+    /// reproducing this method's pre-sous-pas-2 behaviour.
     ///
     /// Returns `None` for the same reasons [`Self::decode_from_segment`]
     /// does: unknown field/term, the sentinel `(0, 0)` descriptor (no
@@ -1144,6 +1369,14 @@ impl TermDictionary {
             return None;
         }
         let segment = self.postings_segment.as_ref()?;
+        if let Some(directory) = field_postings.persisted_block_directory(term) {
+            return Some(DiskPostingsCursor::open_with_directory(
+                segment,
+                offset,
+                len,
+                directory.to_vec(),
+            ));
+        }
         DiskPostingsCursor::open(segment, offset, len, count)
     }
 
@@ -1637,6 +1870,33 @@ impl<'seg> DiskPostingsCursor<'seg> {
         })
     }
 
+    /// Lot C `C1b` sous-pas 2: build a cursor from an ALREADY-COMPUTED
+    /// directory (`FieldPostings::block_directory`, persisted at
+    /// [`PostingsBuilder::build_with_disk_flag`] time) instead of
+    /// `pread`-ing the whole term payload to compute it fresh — the
+    /// production fast path [`TermDictionary::disk_cursor`] takes when a
+    /// persisted directory is available. Infallible: the directory was
+    /// already validated once, at build time (the per-term
+    /// `debug_assert!` round trip in `PostingsBuilder::build_with_disk_flag`'s
+    /// disk-mode branch).
+    pub(crate) fn open_with_directory(
+        segment: &'seg PostingsSegment,
+        term_base_offset: u64,
+        term_payload_len: u32,
+        directory: Vec<BlockDirEntry>,
+    ) -> Self {
+        Self {
+            segment,
+            term_base_offset,
+            term_payload_len,
+            directory,
+            block_cursor: 0,
+            loaded: None,
+            local_pos: 0,
+            last_freq: 0,
+        }
+    }
+
     /// Advance to the first `doc_id >= target`, `pread`+decoding at most
     /// one NEW block to get there. `target` must be non-decreasing across
     /// calls — same contract, same return-and-consume semantics, as
@@ -1708,5 +1968,19 @@ impl<'seg> DiskPostingsCursor<'seg> {
     /// `freqs()[position() - 1]`.
     pub fn freq(&self) -> u32 {
         self.last_freq
+    }
+
+    /// Lot C `C1b` sous-pas 2: total posting count (`df`) for this term,
+    /// summed from the directory's per-block `count`s — O(blocks), not
+    /// O(postings), and available without advancing the cursor at all.
+    /// Used by the disk-mode conjunction/scoring read path
+    /// (`surch-api::state`) to pick the rarest driver term and to
+    /// compute `idf`, mirroring what `PostingsList::doc_freq_from_block_metas`
+    /// gives the RAM path.
+    pub fn doc_freq(&self) -> usize {
+        self.directory
+            .iter()
+            .map(|entry| entry.count as usize)
+            .sum()
     }
 }

@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
-    BlockMeta, PostingsBuilder, PostingsEnum, PostingsError, PostingsList, TermDictionary,
-    TermsEnum,
+    postings_disk_enabled, BlockMeta, DiskPostingsCursor, PostingsBuilder, PostingsEnum,
+    PostingsError, PostingsList, TermDictionary, TermsEnum,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
@@ -183,6 +183,18 @@ pub struct DocumentIndex {
     /// `bulk_router_*` test snapshots the counter pre-bulk and asserts
     /// the rebuild count stayed ~constant across many chunks.
     terms_build_count: Arc<AtomicU64>,
+    /// Lot C `C1b` sous-pas 2: per-index override for the disk-backed
+    /// postings read path, bypassing the process-wide
+    /// [`crate::postings::postings_disk_enabled`] flag. `None`
+    /// (`derive(Default)`) means "use the process-wide flag" — the
+    /// production default, unchanged from before this override existed.
+    /// `Some(_)` is set via [`Self::set_postings_disk_enabled`], primarily
+    /// by tests that need a flag-ON and a flag-OFF index side by side in
+    /// the SAME process (the global `OnceLock` cannot flip mid-run — see
+    /// `postings_disk_enabled`'s doc comment). Consulted by
+    /// [`Self::resolved_postings_disk_enabled`] at every
+    /// `PostingsBuilder::build_with_disk_flag` call site.
+    postings_disk_enabled_override: Option<bool>,
 }
 
 /// Lot C Phase 1 lever 2: dense, dict-interned column backing
@@ -652,7 +664,10 @@ impl DocumentIndex {
             // Legacy path: materialize immediately so direct callers
             // (single-doc paths and unit tests) can read `terms` /
             // `postings` without an explicit `materialize_terms()`.
-            self.terms = self.postings_builder.clone().build();
+            self.terms = self
+                .postings_builder
+                .clone()
+                .build_with_disk_flag(self.resolved_postings_disk_enabled());
             self.terms_dirty = false;
             self.terms_build_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -677,7 +692,10 @@ impl DocumentIndex {
         if !self.terms_dirty {
             return;
         }
-        self.terms = self.postings_builder.clone().build();
+        self.terms = self
+            .postings_builder
+            .clone()
+            .build_with_disk_flag(self.resolved_postings_disk_enabled());
         self.terms_dirty = false;
         self.terms_build_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -737,7 +755,7 @@ impl DocumentIndex {
     pub fn materialize_terms_and_finalize_postings(&mut self) {
         if self.terms_dirty {
             let builder = std::mem::replace(&mut self.postings_builder, PostingsBuilder::new());
-            self.terms = builder.build();
+            self.terms = builder.build_with_disk_flag(self.resolved_postings_disk_enabled());
             self.terms_dirty = false;
             self.terms_build_count.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -794,6 +812,60 @@ impl DocumentIndex {
     /// both zero-copy from the live term dictionary.
     pub fn postings_with_block_metas(&self, field: &str, term: &str) -> Option<PostingsList<'_>> {
         self.terms.postings_with_block_metas(field, term)
+    }
+
+    /// Lot C `C1b` sous-pas 2: whether THIS index's currently-built
+    /// `TermDictionary` is disk-backed (`doc_ids_flat`/`freqs_flat`
+    /// empty, the segment + persisted block directory are the sole
+    /// source of truth). Read-path callers (`surch-api::state`) branch
+    /// on this — not on the process-wide
+    /// [`crate::postings::postings_disk_enabled`] flag — so a query
+    /// always agrees with what the dictionary it is about to read
+    /// actually contains.
+    pub fn postings_disk_backed(&self) -> bool {
+        self.terms.disk_backed()
+    }
+
+    /// Lot C `C1b` sous-pas 2: block-addressed disk cursor over
+    /// `(field, term)`'s postings — the production read path for the
+    /// conjunction/leapfrog functions in `surch-api::state` when
+    /// [`Self::postings_disk_backed`] is `true`. See
+    /// [`crate::postings::TermDictionary::disk_cursor`].
+    pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
+        self.terms.disk_cursor(field, term)
+    }
+
+    /// Lot C `C1b` sous-pas 2: decode `(field, term)`'s FULL postings
+    /// from the disk segment into owned `Vec`s — the production read
+    /// path for the OR-match scoring arena (`SearchScoringContext`,
+    /// surch-api) and for candidate-resolution helpers that already
+    /// collect into an owned structure (`match_hits_internal`,
+    /// `conjunction_of_matches`) when [`Self::postings_disk_backed`] is
+    /// `true`. See [`crate::postings::TermDictionary::decode_from_segment`].
+    pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
+        self.terms.decode_from_segment(field, term)
+    }
+
+    /// Lot C `C1b` sous-pas 2: per-index override for the disk-backed
+    /// postings flag, bypassing the process-wide
+    /// [`crate::postings::postings_disk_enabled`] `OnceLock` — see
+    /// `postings_disk_enabled_override`'s field doc. MUST be called
+    /// before any document is indexed: it only takes effect at the next
+    /// `PostingsBuilder::build_with_disk_flag` call (the next
+    /// materialize/`_refresh`), and does not retroactively convert an
+    /// already-built `TermDictionary`'s RAM/disk layout.
+    pub fn set_postings_disk_enabled(&mut self, enabled: bool) {
+        self.postings_disk_enabled_override = Some(enabled);
+    }
+
+    /// Lot C `C1b` sous-pas 2: the disk-backed flag value the NEXT
+    /// `PostingsBuilder::build_with_disk_flag` call should use — the
+    /// per-index override if one was set, otherwise the process-wide
+    /// [`crate::postings::postings_disk_enabled`] flag (the historical,
+    /// unoverridden default).
+    fn resolved_postings_disk_enabled(&self) -> bool {
+        self.postings_disk_enabled_override
+            .unwrap_or_else(postings_disk_enabled)
     }
 
     pub fn field_stats(&self, field: &str) -> Option<&FieldLengthStats> {

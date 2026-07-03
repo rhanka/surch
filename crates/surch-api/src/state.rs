@@ -11,7 +11,7 @@ use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
-    postings::{BlockMeta, PostingsBlockSkipIter, PostingsList},
+    postings::{BlockMeta, DiskPostingsCursor, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
 };
 
@@ -1014,6 +1014,28 @@ impl InMemoryIndex {
             return Vec::new();
         }
 
+        // Lot C `C1b` sous-pas 2: disk-backed path — `self.index.postings`
+        // reads the RAM `doc_ids_flat` channel, intentionally empty when
+        // the disk flag is on (see `FieldPostings`'s doc comment); decode
+        // the term from the disk segment instead. `term_hits` is not a
+        // hot conjunction path (it collects into an owned `Vec<String>`
+        // regardless), so a full-term decode here is the design's
+        // sanctioned "correct first" fallback, not a block-addressing gap.
+        if self.index.postings_disk_backed() {
+            return self
+                .index
+                .decode_from_segment(field, &token)
+                .map(|(doc_ids, _freqs)| doc_ids)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|doc_id| {
+                    self.reverse_document_ids
+                        .get(&doc_id)
+                        .map(|s| s.to_string())
+                })
+                .collect();
+        }
+
         self.index
             .postings(field, &token)
             .into_iter()
@@ -1045,6 +1067,15 @@ impl InMemoryIndex {
         let token = normalized_term_for_field(value, field, &self.mapping);
         if token.is_empty() {
             return Vec::new();
+        }
+        // Lot C `C1b` sous-pas 2: see `term_hits`'s disk branch above —
+        // same rationale, this method already returns owned `Vec<u32>`.
+        if self.index.postings_disk_backed() {
+            return self
+                .index
+                .decode_from_segment(field, &token)
+                .map(|(doc_ids, _freqs)| doc_ids)
+                .unwrap_or_default();
         }
         self.index
             .postings(field, &token)
@@ -1325,6 +1356,13 @@ impl InMemoryIndex {
             return Vec::new();
         }
 
+        // Lot C `C1b` sous-pas 2: disk-backed path — `self.index.postings`
+        // reads the RAM `doc_ids_flat` channel below, intentionally empty
+        // when the disk flag is on (see `FieldPostings`'s doc comment).
+        if self.index.postings_disk_backed() {
+            return Self::match_hits_disk(&self.index, field, &terms, require_all_terms);
+        }
+
         // Single-token fast path: postings are stored ascending by doc_id with
         // exactly one entry per doc (the `analyzed_terms` invariant), so the
         // matched doc set IS the posting list — collecting straight into a Vec
@@ -1370,6 +1408,51 @@ impl InMemoryIndex {
         matches.unwrap_or_default().into_iter().collect()
     }
 
+    /// Lot C `C1b` sous-pas 2: disk-backed counterpart of
+    /// [`Self::match_hits_internal`]'s RAM path, byte-for-byte the same
+    /// shape (single-token fast path, then OR/AND accumulation), sourced
+    /// from [`DocumentIndex::decode_from_segment`] instead of
+    /// [`DocumentIndex::postings`].
+    fn match_hits_disk(
+        index: &DocumentIndex,
+        field: &str,
+        terms: &[String],
+        require_all_terms: bool,
+    ) -> Vec<u32> {
+        if terms.len() == 1 {
+            return index
+                .decode_from_segment(field, &terms[0])
+                .map(|(doc_ids, _freqs)| doc_ids)
+                .unwrap_or_default();
+        }
+
+        let mut matches: Option<BTreeSet<u32>> = None;
+        for term in terms {
+            let current: BTreeSet<u32> = index
+                .decode_from_segment(field, term)
+                .map(|(doc_ids, _freqs)| doc_ids.into_iter().collect())
+                .unwrap_or_default();
+
+            matches = Some(match matches {
+                None => current,
+                Some(mut previous) if require_all_terms => {
+                    previous.retain(|doc_id| current.contains(doc_id));
+                    previous
+                }
+                Some(mut previous) => {
+                    previous.extend(current);
+                    previous
+                }
+            });
+
+            if require_all_terms && matches.as_ref().is_some_and(BTreeSet::is_empty) {
+                break;
+            }
+        }
+
+        matches.unwrap_or_default().into_iter().collect()
+    }
+
     /// Optimisation #11 (beat-ES): leapfrog/galloping intersection of several
     /// single-term posting lists WITHOUT materialising any of them. Drives the
     /// rarest term and `advance_to`s the others over their block skip-lists
@@ -1384,6 +1467,13 @@ impl InMemoryIndex {
     fn conjunction_hits_internal(&self, terms: &[(String, String)]) -> Vec<u32> {
         if terms.is_empty() {
             return Vec::new();
+        }
+        // Lot C `C1b` sous-pas 2: disk-backed path — MUST stay
+        // block-addressed (a full per-term materialisation here would
+        // reintroduce the exact regression this design avoids on the
+        // deces bool/full common-term tail). See `Self::conjunction_hits_disk`.
+        if self.index.postings_disk_backed() {
+            return Self::conjunction_hits_disk(&self.index, terms);
         }
         // Resolve every required term's posting list; a missing/empty term
         // makes the whole AND empty.
@@ -1432,6 +1522,55 @@ impl InMemoryIndex {
         // never needs `freq` here.
         'docs: for &target in lists[0].doc_ids() {
             for (i, it) in iters.iter_mut().enumerate() {
+                if cur[i].is_some_and(|c| c < target) {
+                    cur[i] = it.advance_to(target);
+                }
+                if cur[i] != Some(target) {
+                    continue 'docs;
+                }
+            }
+            out.push(target);
+        }
+        out
+    }
+
+    /// Lot C `C1b` sous-pas 2: disk-backed counterpart of
+    /// [`Self::conjunction_hits_internal`]. Block-addressed
+    /// leapfrog-join over one [`DiskPostingsCursor`] per term — a
+    /// classic Lucene `ConjunctionScorer` leapfrog generalised to N
+    /// terms (the RAM path's driver + N-1 followers shape doesn't
+    /// directly apply here: `DiskPostingsCursor` has no plain `&[u32]`
+    /// slice to drive a `for` loop over, only `advance_to`, so cursor 0
+    /// is walked via repeated `advance_to(next_probe)` calls instead —
+    /// same "return-and-consume" discipline as the RAM followers below
+    /// it). A missing/uncovered term (no disk coverage — best-effort,
+    /// should not happen post Correction fix) makes the whole AND empty,
+    /// matching the RAM path's `_ => return Vec::new()` for an unknown
+    /// term.
+    fn conjunction_hits_disk(index: &DocumentIndex, terms: &[(String, String)]) -> Vec<u32> {
+        let mut cursors: Vec<DiskPostingsCursor<'_>> = Vec::with_capacity(terms.len());
+        for (field, term) in terms {
+            match index.disk_cursor(field, term) {
+                Some(cursor) => cursors.push(cursor),
+                None => return Vec::new(),
+            }
+        }
+        if cursors.is_empty() {
+            return Vec::new();
+        }
+        let (driver, followers) = cursors.split_at_mut(1);
+        let driver = &mut driver[0];
+
+        // Same `cur[i]` "hold the last returned doc_id, only re-advance
+        // when behind" discipline as the RAM leapfrog — `advance_to`
+        // returns-and-consumes, so re-calling it with the SAME target
+        // would skip past the very entry it just returned.
+        let mut cur: Vec<Option<u32>> = followers.iter_mut().map(|it| it.advance_to(0)).collect();
+        let mut out = Vec::new();
+        let mut next_probe = 0u32;
+        'docs: while let Some(target) = driver.advance_to(next_probe) {
+            next_probe = target.saturating_add(1);
+            for (i, it) in followers.iter_mut().enumerate() {
                 if cur[i].is_some_and(|c| c < target) {
                     cur[i] = it.advance_to(target);
                 }
@@ -1561,6 +1700,24 @@ impl<'a> IndexReader<'a> {
     /// dictionary instead of copied into owned `Vec`s.
     pub fn term_scoring_view(&self, field: &str, term: &str) -> TermScoringView<'a> {
         self.data.term_scoring_view(field, term)
+    }
+
+    /// Lot C `C1b` sous-pas 2: whether this index's term dictionary was
+    /// built with disk-backed postings. `SearchScoringContext`
+    /// (surch-api `search.rs`) branches on this instead of
+    /// [`Self::term_scoring_view`] (which reads the RAM channels,
+    /// intentionally empty under disk mode) when deciding how to
+    /// populate its OR-match scoring arena.
+    pub fn postings_disk_backed(&self) -> bool {
+        self.data.index.postings_disk_backed()
+    }
+
+    /// Lot C `C1b` sous-pas 2: decode `(field, term)`'s full postings
+    /// from the disk segment — the OR-match scoring arena's data source
+    /// when [`Self::postings_disk_backed`] is `true`. `None` when the
+    /// field/term is unknown or carries no disk coverage.
+    pub fn decode_term_for_scoring(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
+        self.data.index.decode_from_segment(field, term)
     }
 
     /// Internal candidate ids for an OR/AND `match` over `field`.
@@ -1732,6 +1889,27 @@ impl AppState {
         // the index from the moment it exists rather than only after the
         // first write.
         refresh_memory_gauges(self, index);
+    }
+
+    /// Lot C `C1b` sous-pas 2 test/ops hook: pin `index`'s disk-backed
+    /// postings read path independently of the process-wide
+    /// `SURCH_POSTINGS_DISK` env flag (`postings_disk_enabled` in
+    /// `surch_index::postings`, latched for the process's lifetime by its
+    /// `OnceLock` — a single test binary cannot flip it mid-run). MUST be
+    /// called before any document is indexed into `index`: the override
+    /// only takes effect at the next `PostingsBuilder::build_with_disk_flag`
+    /// call (the next materialize/`_refresh`), and does not retroactively
+    /// convert an already-built `TermDictionary`'s RAM/disk layout. See
+    /// `crates/surch-api/tests/postings_disk_parity.rs` for the flag-ON ==
+    /// flag-OFF parity gate this unlocks. No-op if `index` does not exist.
+    pub fn set_postings_disk_enabled(&self, index: &str, enabled: bool) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if let Some(data) = store.indices.get_mut(index) {
+            data.index.set_postings_disk_enabled(enabled);
+        }
     }
 
     pub fn put_index_template(
@@ -2734,6 +2912,14 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
 
+        // Lot C `C1b` sous-pas 2: disk-backed path — MUST stay
+        // block-addressed (same rationale as `InMemoryIndex::conjunction_hits_disk`:
+        // this is the deces bool/full scoring tail). See
+        // `Self::fused_conjunction_scores_disk`.
+        if data.index.postings_disk_backed() {
+            return Self::fused_conjunction_scores_disk(data, clauses);
+        }
+
         // Per-term: field stats + the SoA doc_ids/freqs channels (Lot C Phase 1
         // levier 5 — `doc_id` is only ever stored once, in `doc_ids`; `freqs` is
         // index-aligned with it so the matched `freq` is still an O(1) lookup at
@@ -2887,6 +3073,110 @@ impl AppState {
         Some(scored)
     }
 
+    /// Lot C `C1b` sous-pas 2: disk-backed counterpart of
+    /// [`Self::fused_conjunction_scores`]. Same shape as
+    /// [`InMemoryIndex::conjunction_hits_disk`] (driver walked via
+    /// repeated `advance_to(next_probe)`, followers held in `cur[i]`),
+    /// with BM25 scoring folded in via `DiskPostingsCursor::freq()` at
+    /// the position each `advance_to` just landed on — mirrors the RAM
+    /// path's `freqs[idx]` O(1) lookup at the galloping cursor's matched
+    /// index. Does NOT include the RAM path's 2-term roaring fast path
+    /// (roaring bitmaps carry no `freq`, so that path only ever helped
+    /// pure recall — sous-pas 3 territory if it proves hot here).
+    fn fused_conjunction_scores_disk(
+        data: &InMemoryIndex,
+        clauses: &[(&str, &str)],
+    ) -> Option<Vec<(f64, u32)>> {
+        struct DiskTermCtx<'a> {
+            field_stats: FieldScoringStats<'a>,
+            doc_freq: u64,
+            cursor: DiskPostingsCursor<'a>,
+        }
+        let mut terms: Vec<DiskTermCtx<'_>> = Vec::with_capacity(clauses.len());
+        for &(field, value) in clauses {
+            let recall = normalized_terms_for_field(value, field, &data.mapping);
+            if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
+                return None;
+            }
+            let token = recall.into_iter().next().expect("len checked == 1");
+            let Some(cursor) = data.index.disk_cursor(field, &token) else {
+                // A required term with no postings/no disk coverage ⇒ the
+                // intersection is empty.
+                return Some(Vec::new());
+            };
+            let field_stats = data.field_scoring_stats(field)?;
+            let doc_freq = cursor.doc_freq() as u64;
+            terms.push(DiskTermCtx {
+                field_stats,
+                doc_freq,
+                cursor,
+            });
+        }
+
+        // Drive the rarest term; gallop the others — same ordering
+        // rationale as the RAM path.
+        terms.sort_by_key(|t| t.doc_freq);
+        let config = Bm25Config::default();
+
+        // Same `term_contrib` closure as the RAM path, just taking the
+        // already-widened `doc_freq`/`freq` values directly instead of
+        // reading them off a `TermCtx`.
+        let term_contrib =
+            |field_stats: &FieldScoringStats<'_>, doc_freq: u64, doc_id: u32, freq: u32| -> f64 {
+                if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
+                    return 0.0;
+                }
+                let doc_len = if field_stats.norms_enabled {
+                    match field_stats.doc_len(doc_id) {
+                        Some(len) => len,
+                        None => return 0.0,
+                    }
+                } else {
+                    1
+                };
+                match bm25_score(
+                    config,
+                    field_stats.doc_count,
+                    doc_freq,
+                    u64::from(freq),
+                    doc_len,
+                    field_stats.avg_doc_len,
+                ) {
+                    Ok(score) if score != 1.0 => score,
+                    _ => 0.0,
+                }
+            };
+
+        let (driver, followers) = terms.split_at_mut(1);
+        let driver = &mut driver[0];
+        let mut cur: Vec<Option<u32>> = followers
+            .iter_mut()
+            .map(|t| t.cursor.advance_to(0))
+            .collect();
+        let mut scored: Vec<(f64, u32)> = Vec::new();
+        let mut next_probe = 0u32;
+        'docs: while let Some(doc_id) = driver.cursor.advance_to(next_probe) {
+            next_probe = doc_id.saturating_add(1);
+            let mut sum = term_contrib(
+                &driver.field_stats,
+                driver.doc_freq,
+                doc_id,
+                driver.cursor.freq(),
+            );
+            for (i, t) in followers.iter_mut().enumerate() {
+                if cur[i].is_some_and(|c| c < doc_id) {
+                    cur[i] = t.cursor.advance_to(doc_id);
+                }
+                if cur[i] != Some(doc_id) {
+                    continue 'docs;
+                }
+                sum += term_contrib(&t.field_stats, t.doc_freq, doc_id, t.cursor.freq());
+            }
+            scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+        }
+        Some(scored)
+    }
+
     /// Candidate set of a `should`-all-required conjunction of `match` clauses
     /// WITHOUT materialising any clause's full token union — the deces bool/full
     /// tail (#20: `posting_candidate_ids` spent ~7.5ms p95 building the
@@ -2913,6 +3203,15 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
+
+        // Lot C `C1b` sous-pas 2: disk-backed path. See
+        // `Self::conjunction_of_matches_disk`'s doc comment for why this
+        // one (unlike `conjunction_hits_internal`/`fused_conjunction_scores`)
+        // takes the design's sanctioned "decode owned, correct first"
+        // fallback rather than a pure block-addressed multi-cursor merge.
+        if data.index.postings_disk_backed() {
+            return Self::conjunction_of_matches_disk(data, clauses);
+        }
 
         // Per clause: its tokens' ascending doc_id slices + the operator.
         struct ClauseTokens<'a> {
@@ -2991,6 +3290,107 @@ impl AppState {
         };
 
         // Keep driver docs that are members of every OTHER clause.
+        let out: Vec<u32> = driver_docs
+            .into_iter()
+            .filter(|&doc_id| {
+                clause_tokens
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| i == driver_idx || clause_contains(c, doc_id))
+            })
+            .collect();
+        Some(out)
+    }
+
+    /// Lot C `C1b` sous-pas 2: disk-backed counterpart of
+    /// [`Self::conjunction_of_matches`]. Unlike the pure leapfrog
+    /// conjunctions (`InMemoryIndex::conjunction_hits_disk`,
+    /// `Self::fused_conjunction_scores_disk`), this function's per-clause
+    /// OR-of-tokens shape does not reduce to a single monotonic cursor as
+    /// directly: a clause can match via ANY of several tokens, so
+    /// testing "does clause C contain doc_id X" is not one cursor's
+    /// `advance_to` but a small union/intersection over several. Rather
+    /// than hand-roll a new multi-cursor merge for this one candidate-
+    /// resolution helper, every needed token is decoded ONCE, in full,
+    /// via [`DocumentIndex::decode_from_segment`] — the design's
+    /// sanctioned "decode owned, correct first" fallback — and the REST
+    /// of the algorithm below is byte-for-byte [`Self::conjunction_of_matches`]'s,
+    /// just sourced from owned `Vec<u32>` instead of
+    /// `PostingsList::doc_ids()`. A future sous-pas can revisit this with
+    /// a block-addressed multi-cursor merge if it proves hot under disk
+    /// mode.
+    fn conjunction_of_matches_disk(
+        data: &InMemoryIndex,
+        clauses: &[(&str, &str, bool)],
+    ) -> Option<Vec<u32>> {
+        struct ClauseTokensOwned {
+            require_all: bool,
+            token_doc_ids: Vec<Vec<u32>>,
+        }
+        let mut clause_tokens: Vec<ClauseTokensOwned> = Vec::with_capacity(clauses.len());
+        for &(field, value, require_all) in clauses {
+            let tokens = normalized_terms_for_field(value, field, &data.mapping);
+            if tokens.is_empty() {
+                return Some(Vec::new());
+            }
+            let mut token_doc_ids: Vec<Vec<u32>> = Vec::with_capacity(tokens.len());
+            for token in &tokens {
+                match data.index.decode_from_segment(field, token) {
+                    Some((doc_ids, _freqs)) => token_doc_ids.push(doc_ids),
+                    None if require_all => return Some(Vec::new()),
+                    None => {}
+                }
+            }
+            if token_doc_ids.is_empty() {
+                return Some(Vec::new());
+            }
+            clause_tokens.push(ClauseTokensOwned {
+                require_all,
+                token_doc_ids,
+            });
+        }
+
+        let estimate = |c: &ClauseTokensOwned| -> usize {
+            if c.require_all {
+                c.token_doc_ids.iter().map(Vec::len).min().unwrap_or(0)
+            } else {
+                c.token_doc_ids.iter().map(Vec::len).sum()
+            }
+        };
+        let driver_idx = (0..clause_tokens.len())
+            .min_by_key(|&i| estimate(&clause_tokens[i]))
+            .expect("clause_tokens is non-empty");
+
+        let clause_contains = |c: &ClauseTokensOwned, doc_id: u32| -> bool {
+            if c.require_all {
+                c.token_doc_ids
+                    .iter()
+                    .all(|s| s.binary_search(&doc_id).is_ok())
+            } else {
+                c.token_doc_ids
+                    .iter()
+                    .any(|s| s.binary_search(&doc_id).is_ok())
+            }
+        };
+
+        let driver = &clause_tokens[driver_idx];
+        let driver_docs: Vec<u32> = if driver.token_doc_ids.len() == 1 {
+            driver.token_doc_ids[0].clone()
+        } else if driver.require_all {
+            let mut acc: BTreeSet<u32> = driver.token_doc_ids[0].iter().copied().collect();
+            for s in &driver.token_doc_ids[1..] {
+                let next: BTreeSet<u32> = s.iter().copied().collect();
+                acc.retain(|d| next.contains(d));
+            }
+            acc.into_iter().collect()
+        } else {
+            let mut acc: BTreeSet<u32> = BTreeSet::new();
+            for s in &driver.token_doc_ids {
+                acc.extend(s.iter().copied());
+            }
+            acc.into_iter().collect()
+        };
+
         let out: Vec<u32> = driver_docs
             .into_iter()
             .filter(|&doc_id| {
