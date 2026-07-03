@@ -81,6 +81,29 @@ les 12 266 termes à doublons.
 - **bench deces : `skipped_terms` → 0** (tous FoR-encodables, C1b débloqué), count PASS, indexation
   13 630 doc/s, latence p95 match/bool/full 1,8/1,5/1,5 ms (marginalement meilleure). Mono-valué byte-identique.
 
+## ✅✅ C1b FONCTIONNEL + MESURÉ (flag-ON, bench 28651348936, sha-94e11a8)
+Read-path disk-backed câblé derrière `SURCH_POSTINGS_DISK`, dual-path, **parité flag-ON==flag-OFF
+bit-identique** (test `postings_disk_parity` vert). Mesure flag-ON sur deces 1,36 M :
+
+| axe | flag-OFF (RAM) | **flag-ON (disque)** | ES |
+|---|---:|---:|---:|
+| RAM anon (jemalloc resident) | 1916 | **1446 MiB = 0,86× ES** | 1685 |
+| jemalloc allocated (live) | 1119 | **731** | — |
+| match / bool / full p95 (ms) | 1,8 / 1,5 / 1,5 | **2,0 / 2,6 / 2,5** | 4,3 / 3,5 / 3,0 |
+| indexation doc/s | ~13 000 | 13 222 | ~12 000 |
+| skipped_terms | — | 0 | — |
+
+**PREMIÈRE FOIS : Surch passe SOUS ES sur la RAM *honnêtement* (disk-backed, pas tout-en-RAM), tout
+en restant SOUS ES en latence sur les 3 types.** Les 518 MiB de postings → 160 MiB de page-cache
+disque évictable. Latence +0,2..+1,1 ms (coût décode), conforme (« ≤ES/2 latence non bankable disk-backed »).
+
+**Barrage vers ≤ES/2 (843) = fragmentation jemalloc ~715 MiB** (resident 1446 − allocated 731). Ce
+n'est PAS du dirty/muzzy (MALLOC_CONF déjà `dirty=0,muzzy=0,background_thread` + purge explicite) : c'est
+de la VRAIE frag (extents retenus du churn PostingsBuilder). `allocated`=731 est DÉJÀ ≤843 → si on tuait
+la frag, on passerait ≤ES/2. La réduire = **arène jemalloc dédiée aux allocs transitoires du build,
+détruite après** (retourne tout l'extent), OU bump-alloc du builder. Dur + incertain. C0-retry subfields
+(−118 live) + C2 id_maps (−134 live, requis pour 28 M) aident mais ne suffisent pas seuls (la frag reste).
+
 ## Séquence + flag + revert
 0. **Dédup** ✅ FAIT (voir ci-dessus) — prérequis C1b : plus aucun terme non-encodable.
 1. **C1a-batché** ✅ FAIT (voir plus haut) : writer par-champ best-effort au refresh + gauges
