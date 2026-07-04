@@ -161,7 +161,7 @@ run_engine(){
   docker run --rm --network "$NET" -v "$BULK:/bulk.ndjson:ro" curlimages/curl:8.10.1 sh -c "
     BASE='$BASE'; REFRESH_EACH='$REFRESH_EACH'; MAXTRY='$BULK_RETRIES'
     split -l 20000 -a 4 /bulk.ndjson /tmp/chunk_   # -a 4 : >676 chunks au 28M (57,8M lignes = 2892 chunks)
-    indexed=0; item_err=0; hard=0; failed=''; n=0
+    indexed=0; item_err=0; hard=0; failed=''; n=0; dead=0
     for c in /tmp/chunk_*; do
       n=\$((n+1)); lines=\$(wc -l < \"\$c\"); docs=\$((lines/2)); ok=0; try=0
       while [ \$try -lt \$MAXTRY ]; do
@@ -188,6 +188,12 @@ run_engine(){
         hard=1; failed=\"\$failed \$n(code\$code)\"
         echo \"[chunk \$n] ECHEC DUR apres \$MAXTRY tentatives code=\$code\" >&2
         echo \"  resp head: \$(head -c 300 /tmp/resp.json 2>/dev/null)\" >&2
+        # moteur MORT (code 000 = connexion refusee/reset, ex. OOM-kill) 3 chunks d'affilee :
+        # inutile de moudre les milliers de chunks restants (2892 au 28M) -> arret anticipe.
+        case \$code in 000) dead=\$((dead+1));; *) dead=0;; esac
+        if [ \$dead -ge 3 ]; then echo '[abort] moteur injoignable (3 chunks code=000 consecutifs) — arret anticipe' >&2; break; fi
+      else
+        dead=0
       fi
       [ \"\$REFRESH_EACH\" = '1' ] && curl -s -XPOST \"\$BASE/deces_bench/_refresh\" >/dev/null
     done
