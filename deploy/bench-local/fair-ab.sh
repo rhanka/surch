@@ -160,7 +160,7 @@ run_engine(){
   t0=$(date +%s.%N)
   docker run --rm --network "$NET" -v "$BULK:/bulk.ndjson:ro" curlimages/curl:8.10.1 sh -c "
     BASE='$BASE'; REFRESH_EACH='$REFRESH_EACH'; MAXTRY='$BULK_RETRIES'
-    split -l 20000 /bulk.ndjson /tmp/chunk_
+    split -l 20000 -a 4 /bulk.ndjson /tmp/chunk_   # -a 4 : >676 chunks au 28M (57,8M lignes = 2892 chunks)
     indexed=0; item_err=0; hard=0; failed=''; n=0
     for c in /tmp/chunk_*; do
       n=\$((n+1)); lines=\$(wc -l < \"\$c\"); docs=\$((lines/2)); ok=0; try=0
