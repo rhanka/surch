@@ -41,7 +41,38 @@ ES ne peut déborder ni mémoire ni CPU (il déborde tant qu'il peut sinon). RSS
    Zen5 pinné) pour LES DEUX.
 5. 659k ≠ 1,36 M ≠ 28 M. Le plancher mémoire scale avec le corpus (surch OOMait 843m à 1,36M sur SCW).
 
-## Ce qui EST acquis
-Un harnais A/B local **équitable et session-safe** (OOM conteneur contenu), qui mesure les 4 axes sous
-CPU+RAM pinnés identiques — reproductible sans SCW (coût). Prochain pas pour un chiffre RÉEL : indexer le
-**vrai schéma deces** (docs riches) à 1,36 M puis 28 M sous caps, et **corriger le drop 10k surch** d'abord.
+## 🎯 VERDICT — VRAI corpus deces 1,36 M (28 champs, mapping matchID réel), A/B équitable pinné
+Corpus `deces-1.36M.ndjson` (1 360 000 docs, mapping matchID `deces_index.yml` : norm/edge_ngram/.raw/dates),
+harnais robuste (undercount corrigé). Sweep mémoire, 8 cœurs pinnés chacun, caps égaux, surch disk-backed.
+
+**Plancher de survie mémoire (LE résultat) :**
+| cap | ES | Surch |
+|---|---|---|
+| 768m | ❌ OOM boot | ❌ |
+| 1536m | ✅ **survit** | ❌ OOM |
+| 2g | ✅ | ❌ **OOM à l'indexation** (count=0) |
+| 3g | ✅ | ✅ **survit** |
+
+→ **ES survit à 1536m ; Surch exige 3g** (OOM à ≤2g, tué par le PIC d'indexation). **Sur le vrai corpus,
+sous caps égaux, Surch a besoin de ~2× la mémoire d'ES pour survivre.** L'objectif RAM ≤ES/2 est non
+seulement non tenu, il est **INVERSÉ** — c'est ES qui tient à ≤ moitié de la RAM de Surch.
+
+**Comparaison à 3g (les deux survivent) :**
+| axe | ES | Surch | Surch vs ES |
+|---|---:|---:|:--|
+| plancher survie | 1536m | 3072m | ❌ **ES 2× mieux** (survit à moitié) |
+| RSS steady-state @3g | 2197 MiB | 688 MiB | Surch 0,31× (steady bas) |
+| latence p50/95/99 | 1,30/1,81/2,10 ms | 0,39/0,57/0,63 ms | ✅ **Surch ~0,30× (3,3× + rapide, ≤ES/2)** |
+| indexation | 28 513 doc/s | 29 842 doc/s | ~parité (1,05×) |
+| disque index | 653 MiB | 744 MiB | ❌ Surch 1,14× (pire) |
+
+## CONCLUSION HONNÊTE (objectif = battre ES ≥2× sur CHAQUE axe)
+- **RAM ❌ INVERSÉ** : Surch exige 2× la RAM d'ES pour survivre (pic d'indexation). Steady-state bas (688)
+  mais le pic build (OOM à 2g) impose le cap haut. C'est LE point dur, cohérent avec SCW (OOM 843m à 1,36M).
+- **Latence ✅** : le SEUL axe réellement gagné ≥2× (3,3× plus rapide, ≤ES/2). Solide.
+- **Indexation ❌** : parité (1,05×), pas 2×.
+- **Disque ❌** : Surch un peu pire (1,14×).
+Verdict : sur le vrai corpus en conditions loyales, **Surch gagne franchement la LATENCE (≥2×), perd la RAM
+(inversée), égale l'indexation, perd un peu le disque.** L'objectif « ≥2× sur chaque axe » n'est PAS atteint ;
+le blocage central reste le **pic mémoire d'indexation** (build tout-en-RAM avant écriture segments) — à
+casser (build streamé/segmenté) pour espérer la RAM. `powersave` (biais égal), 28M non lancé (procédure prête).
