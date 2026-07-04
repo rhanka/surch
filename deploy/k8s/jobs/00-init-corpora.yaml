@@ -83,7 +83,7 @@ spec:
       # Schedule on the dedicated Scaleway burst pool. Keep the toleration
       # for clusters that also taint burst nodes with pool=burst.
       nodeSelector:
-        k8s.scaleway.com/pool-name: burst
+        k8s.scaleway.com/pool-name: burst-rwx
       tolerations:
         - key: pool
           operator: Equal
