@@ -36,7 +36,7 @@ spec:
       restartPolicy: OnFailure
       serviceAccountName: surch
       nodeSelector:
-        k8s.scaleway.com/pool-name: burst
+        k8s.scaleway.com/pool-name: burst-rwx
       tolerations:
         - key: pool
           operator: Equal

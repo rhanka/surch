@@ -48,7 +48,7 @@ spec:
           value: burst
           effect: NoSchedule
       nodeSelector:
-        k8s.scaleway.com/pool-name: burst
+        k8s.scaleway.com/pool-name: burst-rwx
       volumes:
         - name: scratch
           persistentVolumeClaim:
