@@ -33,6 +33,7 @@ SURCH_IMAGE="${SURCH_IMAGE:-ghcr.io/rhanka/surch:sha-69668db407fe49631b44e6f2e5e
 POSTINGS_DISK="${POSTINGS_DISK:-1}"    # Surch : 1 = read-path disque (C1b)
 OUT_DIR="${OUT_DIR:-/tmp/fair-ab-$(printf '%s' "$MEM_LIMIT")}"
 PROBE_REQUESTS="${PROBE_REQUESTS:-1000}"
+REFRESH_EACH="${REFRESH_EACH:-0}"   # 1 = refresh après chaque chunk (counts corrects ; Surch perd sinon ~1 chunk sous bulk rapide)
 NET="fair-ab-net"
 
 mkdir -p "$OUT_DIR"
@@ -121,22 +122,34 @@ run_engine(){
   # un _bulk unique de ~100 Mo étoufferait les moteurs ; on découpe.
   local t0 t1 oom
   t0=$(date +%s.%N)
-  docker run --rm --network "$NET" -v "$BULK:/bulk.ndjson:ro" curlimages/curl:8.10.1 sh -c "
+  # bulk chunké ; on capte les erreurs par chunk (errors:true) et on refresh entre chunks
+  local berr; berr=$(docker run --rm --network "$NET" -v "$BULK:/bulk.ndjson:ro" curlimages/curl:8.10.1 sh -c "
     split -l 20000 /bulk.ndjson /tmp/chunk_
+    e=0
     for c in /tmp/chunk_*; do
-      curl -s -XPOST '$BASE/deces_bench/_bulk' -H 'Content-Type: application/x-ndjson' --data-binary @\"\$c\" -o /dev/null
-    done" >/dev/null 2>&1
+      r=\$(curl -s -XPOST '$BASE/deces_bench/_bulk' -H 'Content-Type: application/x-ndjson' --data-binary @\"\$c\")
+      echo \"\$r\" | grep -q '\"errors\":true' && e=\$((e+1))
+      [ '$REFRESH_EACH' = '1' ] && curl -s -XPOST '$BASE/deces_bench/_refresh' >/dev/null
+    done
+    echo \$e" 2>/dev/null | tail -1)
   docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1
-  t1=$(date +%s.%N)
+  t1=$(date +%s.%N)   # throughput = jusqu'au 1er refresh (loyal, hors matérialisation tardive)
+  # 2e refresh + attente : surch ne matérialise pas le dernier lot sur un seul refresh final ;
+  # ES insensible. Hors timing pour ne léser personne.
+  sleep 2; docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1; sleep 1
   oom=$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null)
+  local running; running=$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)
   local cnt; cnt=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s "$BASE/deces_bench/_count" 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
   cnt=${cnt:-0}
+  berr=${berr:-?}
 
-  if [ "$oom" = "true" ] || [ "$cnt" -lt "$NDOCS" ]; then
-    err "$ENGINE : indexation ÉCHOUÉE sous $MEM_LIMIT (count=$cnt/$NDOCS OOM=$oom)"
-    echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"survived_boot\":true,\"survived_index\":false,\"count\":$cnt,\"expected\":$NDOCS,\"oom\":\"$oom\"}" > "$OUT_DIR/$ENGINE.json"
+  # ÉCHEC = OOM ou conteneur mort. Un count légèrement court SANS OOM = perte bulk (data), pas mémoire.
+  if [ "$oom" = "true" ] || [ "$running" != "true" ]; then
+    err "$ENGINE : OOM/mort sous $MEM_LIMIT (count=$cnt/$NDOCS OOM=$oom running=$running)"
+    echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"survived_boot\":true,\"survived_index\":false,\"oom\":\"$oom\",\"count\":$cnt,\"expected\":$NDOCS,\"bulk_err_chunks\":\"$berr\"}" > "$OUT_DIR/$ENGINE.json"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return
   fi
+  [ "$cnt" -lt "$NDOCS" ] && err "$ENGINE : SURVÉCU mais count $cnt/$NDOCS (perte bulk, chunks_err=$berr) — pas un échec mémoire"
 
   local dps rss disk
   dps=$(awk -v c="$NDOCS" -v a="$t0" -v b="$t1" 'BEGIN{printf "%.0f", c/(b-a)}')
@@ -156,7 +169,7 @@ run_engine(){
     done" 2>/dev/null | sort -n | awk -v n="$PROBE_REQUESTS" '{a[NR]=$1} END{printf "%.2f %.2f %.2f", a[int(n*0.5)]*1000, a[int(n*0.95)]*1000, a[int(n*0.99)]*1000}')
   lat50=${lat50:-0}; lat95=${lat95:-0}; lat99=${lat99:-0}
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99}" > "$OUT_DIR/$ENGINE.json"
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"bulk_err_chunks\":\"$berr\",\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99}" > "$OUT_DIR/$ENGINE.json"
   log "$ENGINE OK : ${dps} doc/s | RSS $rss | disk ${disk}MiB | p50/95/99 ${lat50}/${lat95}/${lat99} ms"
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
 }
