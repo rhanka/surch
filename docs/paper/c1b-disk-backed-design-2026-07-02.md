@@ -118,9 +118,16 @@ La comparaison honnête = **RSS conteneur vs RSS conteneur** (mesuré, bench 286
 
 **Ce qui EST réel** : l'archi disk-backed fonctionne, parité bit-parfaite, anon non-évictable 3797→881
 (−77%). **Ce qui N'EST PAS tenu** : RAM ≤ES/2 (le disk-backed remplace l'anon par du page-cache → RSS
-conteneur PIRE qu'ES sans limite ; et l'anon 881 > 843 → OOM sous limite 843, JAMAIS testé sous limite).
-Latence/indexation/disque loin du barème 2×. **Prochain gate honnête obligatoire : tourner Surch sous
-limite cgroup (843, 1024, …) et mesurer tient/latence — c'est LE test ≤ES/2, non fait.**
+conteneur PIRE qu'ES sans limite ; et l'anon 881 > 843).
+
+### 🔴 TEST SOUS LIMITE cgroup — MESURÉ (bench 28690721825, flag-ON, `--memory=843m`)
+**Surch OOM à l'indexation : `count: 0` (bulk_failures 0, verdict fail) sous 843 MiB.** Le pic d'indexation
+(peak RSS non contraint = **3264 MiB**) dépasse largement la limite → OOM-kill pendant le refresh/build.
+**Conclusion définitive : RAM ≤ES/2 = NON TENU.** Surch ne survit pas à une limite mémoire ES/2. Le page-cache
+n'aide qu'en lecture stable ; le PIC d'indexation (transitoires du build + fichiers) reste énorme. Il faudrait
+un build à faible pic mémoire (streaming, arène jemalloc dédiée détruite après — jugé dur/incertain au
+consensus frag) AVANT de reparler de ≤ES/2. À tester ensuite : sous quelle limite Surch survit-il réellement
+(1024 ? 1536 ?) et à quelle latence de lecture sous pression page-cache.
 
 ## ✅✅ C1b FONCTIONNEL + MESURÉ (flag-ON, bench 28651348936, sha-94e11a8)
 Read-path disk-backed câblé derrière `SURCH_POSTINGS_DISK`, dual-path, **parité flag-ON==flag-OFF
