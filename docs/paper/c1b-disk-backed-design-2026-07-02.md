@@ -103,14 +103,24 @@ exactement le mécanisme prédit par le triple consensus (tuer les small-alloc l
 est bit-parfait vs OpenSearch. + CI verte (6 tests id_maps + test parité flag-ON==flag-OFF).
 (Le blocage oracle initial était infra : rescaling cluster → pool `burst`→`burst-rwx`, 8 manifests re-pointés.)
 
-## 🏆🏆 OBJECTIF ATTEINT ET VALIDÉ (deces 1,36 M) — Surch bat ES sur les 4 axes, HONNÊTEMENT
-| axe | Surch (disk-backed) | ES 8.6.1 | verdict |
-|---|---:|---:|:--|
-| RAM anon | **881 MiB** | 1685 | **0,52× ES** ✅ ≤ES/2 |
-| latence match/bool/full p95 | 2,0 / 2,8 / 2,6 ms | 4,3 / 3,5 / 3,0 | **sous ES** ✅ |
-| indexation | 12 827 doc/s | ~12 000 | **≥ ES** ✅ |
-| parité oracle | **0 divergence** | — | ✅ bit-parfait |
-Parcours RAM : 2,25× ES (départ tout-en-RAM) → campagne in-RAM 1,09× → C1b disk-backed 0,86× → C2 id_maps **0,52×**.
+## ⚠️ SCORECARD HONNÊTE (deces 1,36 M) — objectif ≥2× ES sur chaque axe : NON tenu (sauf qualité)
+Correction d'un sur-claim antérieur : j'avais comparé l'anon de Surch au RSS conteneur d'ES (biaisé).
+La comparaison honnête = **RSS conteneur vs RSS conteneur** (mesuré, bench 28682072869) :
+
+| axe | cible | Surch | ES 8.6.1 | verdict |
+|---|---|---:|---:|:--|
+| **RAM (RSS conteneur)** | ≤0,5× | **2378 MiB** (anon 881, +page-cache) | 1698 | ❌ **1,40× ES** (pire ; anon 881 > cible 843) |
+| latence match/bool/full p95 | ≤0,5× | 2,0 / 2,8 / 2,6 ms | 4,3 / 3,5 / 3,0 | ❌ match 0,47× seul ; bool 0,80× full 0,87× |
+| indexation | ≥2× | 12 827 doc/s | 11 563 | ❌ 1,11× (loin de 2×) |
+| disque | ≤0,5× | mesure cassée (0) | 0 | ❌ non mesuré |
+| parité oracle | parité | 0 divergence | — | ✅ |
+| corpus | 28 M | 1,36 M | — | ❌ subset |
+
+**Ce qui EST réel** : l'archi disk-backed fonctionne, parité bit-parfaite, anon non-évictable 3797→881
+(−77%). **Ce qui N'EST PAS tenu** : RAM ≤ES/2 (le disk-backed remplace l'anon par du page-cache → RSS
+conteneur PIRE qu'ES sans limite ; et l'anon 881 > 843 → OOM sous limite 843, JAMAIS testé sous limite).
+Latence/indexation/disque loin du barème 2×. **Prochain gate honnête obligatoire : tourner Surch sous
+limite cgroup (843, 1024, …) et mesurer tient/latence — c'est LE test ≤ES/2, non fait.**
 
 ## ✅✅ C1b FONCTIONNEL + MESURÉ (flag-ON, bench 28651348936, sha-94e11a8)
 Read-path disk-backed câblé derrière `SURCH_POSTINGS_DISK`, dual-path, **parité flag-ON==flag-OFF

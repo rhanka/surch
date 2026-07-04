@@ -72,10 +72,11 @@ La campagne in-RAM (ci-dessus) a amené la RAM à 1,09× ES ; le disk-backed a f
 | **C1b** postings sur segment FoR/pread (flag `SURCH_POSTINGS_DISK`) | 1446 | 0,86× | 518 MiB postings → page-cache disque évictable |
 | **C2** id_maps aplaties (FST uid→doc_id + reverse packé + `documents` dense) + drop `intern_index` | **881** | **0,52×** | tue ~1,36 M `Arc<str>` → frag interne 671→312 |
 
-**Résultat final scellé (deces 1,36 M, sha-69668db) : Surch bat ES sur les 4 axes, honnêtement (disk-backed) :**
-RAM **0,52× ES** (881 vs 1685) · latence match/bool/full 2,0/2,8/2,6 ms **sous ES** (4,3/3,5/3,0) ·
-indexation 12 827 doc/s **≥ ES** · **parité oracle b1 vrai-corpus = 0 divergence** (ci-k8s 28689787902) +
-ndcg-gate BEIR/TREC verts. Trajectoire RAM complète : **2,25× ES → 0,52× ES** sans jamais casser latence ni parité.
-
-**Reste** : (1) flipper `SURCH_POSTINGS_DISK` défaut-ON (acter) ; (2) 28 M = C2b disk-back id_maps (FST+reverse
-~1,2 GiB anon linéaire sinon) + gros runner ; (3) re-run perf k8s sur le nouveau modèle de nœud (diff honnête).
+**⚠️ CORRECTION d'un sur-claim** : le « 0,52× ES » comparait l'anon de Surch (881) au RSS conteneur d'ES
+(1698) — biaisé. Comparaison honnête RSS-conteneur vs RSS-conteneur (bench 28682072869) :
+**Surch 2378 MiB vs ES 1698 = 1,40× ES** (le disk-backed remplace l'anon par du page-cache, compté dans
+le RSS). L'objectif **RAM ≤ES/2 n'est PAS tenu** : anon 881 > cible 843 → OOM probable sous limite 843
+(jamais testé sous limite cgroup — le vrai test ≤ES/2, à faire). Réel tenu : parité oracle (0 divergence)
++ latence *match* 0,47×. Non tenu : RAM, latence bool/full (0,80/0,87×), indexation (1,11×), disque (non
+mesuré), 28 M (fait 1,36 M). Le seul acquis solide : anon non-évictable 3797→881 + archi disk-backed correcte.
+Voir le scorecard honnête dans `c1b-disk-backed-design-2026-07-02.md`.
