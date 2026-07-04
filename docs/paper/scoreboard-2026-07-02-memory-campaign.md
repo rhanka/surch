@@ -61,3 +61,21 @@ vert à chaque étape).
 
 Verdict consensus : parité ES RAM atteignable à 1,36 M avec les leviers in-RAM ; le VRAI gain
 (≤ES/2) et le 28 M exigent le disk-backed. Les 4 leviers livrés valident la trajectoire.
+
+## 🏆 SUITE LIVRÉE — disk-backed (voir `c1b-disk-backed-design-2026-07-02.md`) : OBJECTIF ≤ES/2 ATTEINT
+
+La campagne in-RAM (ci-dessus) a amené la RAM à 1,09× ES ; le disk-backed a fini le travail :
+
+| étape | RAM anon | vs ES | quoi |
+|---|---:|---:|---|
+| Campagne in-RAM (6 leviers) | 1836 | 1,09× | plafond du tout-en-RAM |
+| **C1b** postings sur segment FoR/pread (flag `SURCH_POSTINGS_DISK`) | 1446 | 0,86× | 518 MiB postings → page-cache disque évictable |
+| **C2** id_maps aplaties (FST uid→doc_id + reverse packé + `documents` dense) + drop `intern_index` | **881** | **0,52×** | tue ~1,36 M `Arc<str>` → frag interne 671→312 |
+
+**Résultat final scellé (deces 1,36 M, sha-69668db) : Surch bat ES sur les 4 axes, honnêtement (disk-backed) :**
+RAM **0,52× ES** (881 vs 1685) · latence match/bool/full 2,0/2,8/2,6 ms **sous ES** (4,3/3,5/3,0) ·
+indexation 12 827 doc/s **≥ ES** · **parité oracle b1 vrai-corpus = 0 divergence** (ci-k8s 28689787902) +
+ndcg-gate BEIR/TREC verts. Trajectoire RAM complète : **2,25× ES → 0,52× ES** sans jamais casser latence ni parité.
+
+**Reste** : (1) flipper `SURCH_POSTINGS_DISK` défaut-ON (acter) ; (2) 28 M = C2b disk-back id_maps (FST+reverse
+~1,2 GiB anon linéaire sinon) + gros runner ; (3) re-run perf k8s sur le nouveau modèle de nœud (diff honnête).
