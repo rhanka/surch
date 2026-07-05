@@ -32,7 +32,7 @@ pub enum DocumentIndexError {
     Postings(#[from] PostingsError),
 }
 
-/// Lot C Phase 1 lever A: dense bit-vector backing [`DocumentIndex::live_docs`].
+/// Lot C Phase 1 lever A: dense bit-vector backing `Segment::live_docs`.
 ///
 /// `doc_id`s are dense (`0..next_doc_id`), so `bits[doc_id / 64]` bit
 /// `doc_id % 64` records presence — one bit per doc_id instead of the
@@ -111,61 +111,43 @@ impl LiveDocsBitset {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct DocumentIndex {
-    /// Live document ids in this generation. The full source is held by
-    /// the caller (surch-api `InMemoryIndex`) so this is just a presence
-    /// set, not a copy of `StoredDocument`.
+    /// Sealed, per-generation index state — see [`Segment`] for what it
+    /// bundles and why.
     ///
-    /// Lot C Phase 1 lever A: `doc_id`s are dense (`0..next_doc_id`, see
-    /// `surch-api::InMemoryIndex::next_doc_id`), so a `BTreeSet<u32>`
-    /// (~32 B/entry incl. node overhead — ~43 MiB on the deces 1.36 M
-    /// corpus) is massively oversized for what is really "is this bit
-    /// set". [`LiveDocsBitset`] replaces it with a dense bit-vector (1
-    /// bit/doc_id, resized to the highest doc_id seen), ~1/256th the
-    /// size, while preserving the same `insert`/`contains`/ascending
-    /// `iter` contract every call site below relies on.
-    live_docs: LiveDocsBitset,
+    /// Plan segments **S1** (`docs/paper/design-segments-pic-borne-2026-07-05.md`):
+    /// `DocumentIndex` always holds `Vec<Arc<Segment>>` of length
+    /// EXACTLY 1 for now — this is the pure structural refactor step,
+    /// bit-identical to the pre-segment layout by construction (a single
+    /// segment IS the whole index, so every aggregate below is a `Σ`
+    /// over one term). S2 introduces budget-triggered flush, at which
+    /// point `segments.len()` can exceed 1.
+    ///
+    /// Every write (`merge_analyzed`) mutates `segments[0]` in place via
+    /// `Arc::make_mut` (never clones in S1: nothing else ever holds a
+    /// second strong reference to a segment), so this costs nothing
+    /// extra over the previous direct-field layout. Every read goes
+    /// through [`Self::segment`] (single-segment passthrough — the right
+    /// shape for data that can only be merged with real cross-segment
+    /// logic, e.g. postings enumeration, deferred to S2) or, where the
+    /// aggregation is meaningful today (BM25 doc_count/avg_doc_len, byte
+    /// accounting, `live_doc_count`), a real `Σ` over `segments.iter()`.
+    segments: Vec<Arc<Segment>>,
     postings_builder: PostingsBuilder,
-    terms: TermDictionary,
-    field_stats: BTreeMap<String, FieldLengthStats>,
     /// A6 phase 2: per-field write-time prefix expansion. Populated only for
     /// fields whose `FieldMapping::index_prefixes` is `Some(_)`. The inner map
     /// is keyed by the normalized prefix (length in `[min_chars..=max_chars]`)
     /// and the value is the set of doc ids that contain at least one token
     /// starting with that prefix. Kept separate from the regular postings so
     /// the BM25 hot path (`doc_freq`, `term_freq`, norms) is unaffected.
+    ///
+    /// Deliberately NOT part of [`Segment`] for S1: the design's sealed
+    /// bundle scopes to term dictionary / length stats / sub-fields /
+    /// live-docs — prefix postings stay a plain `DocumentIndex` field,
+    /// same as before this refactor (a documented, deliberately narrow
+    /// scope decision — see the S1 write-up).
     prefix_postings: BTreeMap<String, BTreeMap<String, BTreeSet<u32>>>,
-    /// A10 (Phase 4): write-time fan-out of multi-field sub-fields. When a
-    /// parent field declares `fields: { <sub>: { … } }` (matchID's
-    /// `NOM.raw: { type: keyword, normalizer: norm }`), the parent's source
-    /// value is stored here under the qualified `parent.sub` path with the
-    /// sub-field's analyzer/normalizer already applied (see
-    /// [`subfield_terms`]).
-    ///
-    /// Outer key is the qualified field path (`"NOM.raw"`). This is the
-    /// durable storage the query side (`sort: NOM.raw`, `agg.cardinality` on
-    /// `.raw`) reads directly, instead of aliasing the sub-field path back
-    /// to the parent's `_source` and normalizing on read. Sub-field tokens
-    /// are ALSO indexed into the regular postings (under the same qualified
-    /// path) so a `term`/`match` on the sub-field resolves through the FST
-    /// like any other field. This side-table only holds the per-doc
-    /// projected value for the read paths that need a stored value rather
-    /// than postings.
-    ///
-    /// Lot C Phase 1 lever 2: was `BTreeMap<String, BTreeMap<u32, String>>`
-    /// — on the matchID deces 1.36 M corpus (4 sub-fields × ~1.36 M docs)
-    /// that is ~4 M `BTreeMap` nodes (48 B/node) PLUS one heap `String`
-    /// allocation per entry, for values that are extremely repetitive
-    /// French surnames/given names/prefixes. [`SubfieldColumn`] replaces
-    /// the inner `BTreeMap<u32, String>` with a dense `Vec<u32>` indexed
-    /// directly by `doc_id` (mirrors the `doc_len_dense` pattern in
-    /// [`FieldLengthStats`]: same resize-on-write growth, `u32::MAX` as the
-    /// "absent" sentinel instead of `0`) plus a deduplicated `Vec<Box<str>>`
-    /// dictionary of the distinct values (dict-interning). Measured gain:
-    /// ~200-400 MiB of jemalloc-resident heap on the deces corpus (see
-    /// `docs/paper/` Lot C Phase 1 notes).
-    subfield_values: BTreeMap<String, SubfieldColumn>,
     /// Track A `wp-a-perf-followups.md` Lot 1.6: deferred-FST-build flag.
     /// `true` when `postings_builder` has accumulated writes that the
     /// `terms` FST does not yet reflect. A subsequent
@@ -197,8 +179,57 @@ pub struct DocumentIndex {
     postings_disk_enabled_override: Option<bool>,
 }
 
+impl Default for DocumentIndex {
+    fn default() -> Self {
+        Self {
+            segments: vec![Arc::new(Segment::default())],
+            postings_builder: PostingsBuilder::new(),
+            prefix_postings: BTreeMap::new(),
+            terms_dirty: false,
+            terms_build_count: Arc::new(AtomicU64::new(0)),
+            postings_disk_enabled_override: None,
+        }
+    }
+}
+
+/// Plan segments **S1** (`docs/paper/design-segments-pic-borne-2026-07-05.md`):
+/// an immutable-per-generation bundle of the index state that is safe to
+/// seal and share. Groups exactly the four pieces of state the design
+/// calls "sealed at refresh": the term dictionary (with its disk-backed
+/// postings segment), the per-field BM25 length stats, the sub-field
+/// projection columns, and the live-doc presence bitset.
+///
+/// S1 scope: `DocumentIndex` always holds `Vec<Arc<Segment>>` of length
+/// EXACTLY 1 — the pure structural refactor step, bit-identical to the
+/// pre-segment layout by construction (a single segment IS the whole
+/// index). S2 introduces budget-triggered flush, at which point
+/// `segments.len()` can exceed 1 and this type becomes genuinely
+/// immutable-and-shared across a background merge (doc_ids
+/// local-per-segment + `doc_base`, per the design's divergence note).
+/// `prefix_postings` is deliberately NOT part of this bundle for S1 (see
+/// `DocumentIndex::prefix_postings`'s field doc).
+#[derive(Debug, Default, Clone)]
+struct Segment {
+    /// Term dictionary: FST + postings (RAM or disk-backed), sealed by
+    /// the last `materialize_terms` / `materialize_terms_and_finalize_postings`.
+    terms: TermDictionary,
+    /// Per-field BM25 length stats. Unlike `terms`, updated eagerly by
+    /// every `merge_analyzed` call (never deferred behind `terms_dirty`)
+    /// — moving it into `Segment` does not change when it becomes
+    /// visible to readers, only where it physically lives.
+    field_stats: BTreeMap<String, FieldLengthStats>,
+    /// A10 (Phase 4) write-time sub-field projections (see
+    /// [`SubfieldColumn`]'s doc comment for the full per-doc contract) —
+    /// unchanged behaviour, only relocated from `DocumentIndex`.
+    subfield_values: BTreeMap<String, SubfieldColumn>,
+    /// Live document ids in this generation (presence bitset) — see
+    /// [`LiveDocsBitset`]'s doc comment for the encoding. Updated eagerly
+    /// by `merge_analyzed`, same as `field_stats`.
+    live_docs: LiveDocsBitset,
+}
+
 /// Lot C Phase 1 lever 2: dense, dict-interned column backing
-/// [`DocumentIndex::subfield_values`] for ONE qualified sub-field path
+/// `Segment::subfield_values` for ONE qualified sub-field path
 /// (`"NOM.raw"`).
 ///
 /// Replaces `BTreeMap<u32, String>` (one B-tree node + one heap `String`
@@ -550,9 +581,73 @@ pub fn decode_doc_len_byte(byte: u8) -> u64 {
     }
 }
 
+/// Plan segments S1: `Σ`-aggregated BM25 length stats for one field,
+/// across every sealed segment — see
+/// [`DocumentIndex::field_stats_aggregated`]. `doc_count`/`total_terms`
+/// are the raw sums (same domain as [`FieldLengthStats::doc_count`] /
+/// `total_terms`); [`Self::avg_doc_len`] reproduces
+/// [`FieldLengthStats::avg_doc_len`]'s exact formula (`total_terms as
+/// f64 / doc_count as f64`, same guard), just fed the summed inputs —
+/// with one segment the sum is a no-op, so the division is the SAME
+/// single floating-point operation, bit-for-bit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AggregatedFieldStats {
+    pub doc_count: u64,
+    pub total_terms: u64,
+    /// `0` means "no segment recorded a length" (norms disabled or no
+    /// docs), mirroring [`FieldLengthStats::min_doc_len`]'s sentinel.
+    pub min_doc_len: u64,
+}
+
+impl AggregatedFieldStats {
+    /// Same formula and guard as [`FieldLengthStats::avg_doc_len`]:
+    /// `None` unless both the doc count and the term count are
+    /// positive.
+    pub fn avg_doc_len(&self) -> Option<f64> {
+        (self.doc_count > 0 && self.total_terms > 0)
+            .then(|| self.total_terms as f64 / self.doc_count as f64)
+    }
+
+    /// `None` when no segment ever recorded a length (mirrors
+    /// [`FieldLengthStats::min_doc_len`]).
+    pub fn min_doc_len(&self) -> Option<u64> {
+        (self.min_doc_len > 0).then_some(self.min_doc_len)
+    }
+}
+
 impl DocumentIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Plan segments S1: read-only handle on the (single, for now)
+    /// sealed segment. Every borrowing read method below goes through
+    /// this instead of touching `self.segments[0]` inline, so the S1
+    /// invariant is asserted in exactly one place.
+    fn segment(&self) -> &Segment {
+        debug_assert_eq!(
+            self.segments.len(),
+            1,
+            "S1 invariant: DocumentIndex must always hold exactly one segment \
+             (multi-segment fan-out lands in S2)"
+        );
+        &self.segments[0]
+    }
+
+    /// Plan segments S1: mutable handle on the (single, for now) active
+    /// segment, used by every write path. `Arc::make_mut` is used purely
+    /// as the ownership container here — in S1 nothing ever clones
+    /// `segments[0]`'s `Arc` out to a second owner, so `strong_count` is
+    /// always 1 and this never actually clones the `Segment` (no new
+    /// allocation over the pre-segment direct-field layout).
+    fn segment_mut(&mut self) -> &mut Segment {
+        debug_assert_eq!(
+            self.segments.len(),
+            1,
+            "S1 invariant: DocumentIndex must always hold exactly one segment \
+             (multi-segment fan-out lands in S2)"
+        );
+        Arc::make_mut(&mut self.segments[0])
     }
 
     pub fn add_document<I, K, V>(&mut self, doc_id: u32, fields: I) -> Result<()>
@@ -637,7 +732,7 @@ impl DocumentIndex {
         let documents = documents
             .into_iter()
             .map(|(doc_id, fields)| {
-                if self.live_docs.contains(doc_id) || !seen.insert(doc_id) {
+                if self.segment().live_docs.contains(doc_id) || !seen.insert(doc_id) {
                     return Err(DocumentIndexError::DuplicateDocId { doc_id });
                 }
 
@@ -684,10 +779,12 @@ impl DocumentIndex {
             // Legacy path: materialize immediately so direct callers
             // (single-doc paths and unit tests) can read `terms` /
             // `postings` without an explicit `materialize_terms()`.
-            self.terms = self
+            let disk_enabled = self.resolved_postings_disk_enabled();
+            let new_terms = self
                 .postings_builder
                 .clone()
-                .build_with_disk_flag(self.resolved_postings_disk_enabled());
+                .build_with_disk_flag(disk_enabled);
+            self.segment_mut().terms = new_terms;
             self.terms_dirty = false;
             self.terms_build_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -712,10 +809,12 @@ impl DocumentIndex {
         if !self.terms_dirty {
             return;
         }
-        self.terms = self
+        let disk_enabled = self.resolved_postings_disk_enabled();
+        let new_terms = self
             .postings_builder
             .clone()
-            .build_with_disk_flag(self.resolved_postings_disk_enabled());
+            .build_with_disk_flag(disk_enabled);
+        self.segment_mut().terms = new_terms;
         self.terms_dirty = false;
         self.terms_build_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -774,8 +873,10 @@ impl DocumentIndex {
     /// cycle de refresh) — sur le chemin search, utiliser `materialize_terms()`.
     pub fn materialize_terms_and_finalize_postings(&mut self) {
         if self.terms_dirty {
+            let disk_enabled = self.resolved_postings_disk_enabled();
             let builder = std::mem::replace(&mut self.postings_builder, PostingsBuilder::new());
-            self.terms = builder.build_with_disk_flag(self.resolved_postings_disk_enabled());
+            let new_terms = builder.build_with_disk_flag(disk_enabled);
+            self.segment_mut().terms = new_terms;
             self.terms_dirty = false;
             self.terms_build_count.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -785,28 +886,42 @@ impl DocumentIndex {
         // sub-fields — voir `SubfieldColumn::finalize` pour la preuve
         // qu'il est sans danger de le vider ici (write-only, toujours
         // repeuple depuis zero par le prochain write via `clear()`).
-        for column in self.subfield_values.values_mut() {
+        //
+        // Plan segments S1 : ce scellement produit LE segment unique
+        // (`segments[0]`, remplace son `terms` en place via
+        // `Arc::make_mut` — voir `Self::segment_mut`).
+        for column in self.segment_mut().subfield_values.values_mut() {
             column.finalize();
         }
     }
 
     pub fn clear(&mut self) {
-        self.live_docs.clear();
         self.postings_builder = PostingsBuilder::new();
-        self.terms = TermDictionary::default();
-        self.field_stats.clear();
         self.prefix_postings.clear();
-        self.subfield_values.clear();
         // The fresh `TermDictionary::default()` is in sync with the
         // fresh `PostingsBuilder::new()` (both empty), so the index is
         // clean as far as the deferred-rebuild contract is concerned.
         // Keep the per-index counter (an `Arc<AtomicU64>`) untouched
         // so cumulative diagnostics across rebuilds remain coherent.
         self.terms_dirty = false;
+        // Plan segments S1: reset the single sealed segment's contents
+        // in place (through `Arc::make_mut`, same no-clone guarantee as
+        // every other write path) rather than replacing `segments[0]`
+        // wholesale, so `live_docs`' bitmap keeps its allocated capacity
+        // across a `rebuild_index()` cycle exactly like before this
+        // refactor (`LiveDocsBitset::clear()` does not deallocate).
+        let segment = self.segment_mut();
+        segment.live_docs.clear();
+        segment.terms = TermDictionary::default();
+        segment.field_stats.clear();
+        segment.subfield_values.clear();
     }
 
     pub fn doc_ids(&self) -> Vec<u32> {
-        self.live_docs.iter().collect()
+        self.segments
+            .iter()
+            .flat_map(|segment| segment.live_docs.iter())
+            .collect()
     }
 
     /// Stored field retrieval is the caller's responsibility (sources live
@@ -818,27 +933,36 @@ impl DocumentIndex {
         None
     }
 
+    /// Plan segments S1: single-segment passthrough. Enumerating terms
+    /// across N real segments needs a genuine k-way-merged `TermsEnum`
+    /// (streaming FST merge, S3) — out of scope while `segments.len()`
+    /// is asserted to be 1, so this borrows straight from the one
+    /// sealed segment, exactly as it did before `Segment` existed.
     pub fn terms(&self, field: &str) -> TermsEnum {
-        self.terms.terms(field)
+        self.segment().terms.terms(field)
     }
 
+    /// Plan segments S1: single-segment passthrough — see [`Self::terms`]'s
+    /// doc for why a real cross-segment merge is deferred to S2+.
     pub fn postings(&self, field: &str, term: &str) -> Option<PostingsEnum<'_>> {
-        self.terms.postings(field, term)
+        self.segment().terms.postings(field, term)
     }
 
     /// Returns the pre-computed per-block stats for `(field, term)`,
     /// aligned with [`postings`] chunks of 128 entries. See
-    /// [`crate::postings::BlockMeta`] for the schema.
+    /// [`crate::postings::BlockMeta`] for the schema. Plan segments S1:
+    /// single-segment passthrough, see [`Self::terms`]'s doc.
     pub fn block_metas(&self, field: &str, term: &str) -> Option<&[BlockMeta]> {
-        self.terms.block_metas(field, term)
+        self.segment().terms.block_metas(field, term)
     }
 
     /// Runtime view that ties a term's postings to its FoR-aligned block
     /// metadata in a single lookup. The search scoring path prefers this
     /// over separate [`postings`]/[`block_metas`] calls so it can borrow
-    /// both zero-copy from the live term dictionary.
+    /// both zero-copy from the live term dictionary. Plan segments S1:
+    /// single-segment passthrough, see [`Self::terms`]'s doc.
     pub fn postings_with_block_metas(&self, field: &str, term: &str) -> Option<PostingsList<'_>> {
-        self.terms.postings_with_block_metas(field, term)
+        self.segment().terms.postings_with_block_metas(field, term)
     }
 
     /// Lot C `C1b` sous-pas 2: whether THIS index's currently-built
@@ -848,18 +972,21 @@ impl DocumentIndex {
     /// on this — not on the process-wide
     /// [`crate::postings::postings_disk_enabled`] flag — so a query
     /// always agrees with what the dictionary it is about to read
-    /// actually contains.
+    /// actually contains. Plan segments S1: single-segment passthrough
+    /// (every segment shares the same disk/RAM layout decision until S2
+    /// makes per-segment flush possible).
     pub fn postings_disk_backed(&self) -> bool {
-        self.terms.disk_backed()
+        self.segment().terms.disk_backed()
     }
 
     /// Lot C `C1b` sous-pas 2: block-addressed disk cursor over
     /// `(field, term)`'s postings — the production read path for the
     /// conjunction/leapfrog functions in `surch-api::state` when
     /// [`Self::postings_disk_backed`] is `true`. See
-    /// [`crate::postings::TermDictionary::disk_cursor`].
+    /// [`crate::postings::TermDictionary::disk_cursor`]. Plan segments
+    /// S1: single-segment passthrough, see [`Self::terms`]'s doc.
     pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
-        self.terms.disk_cursor(field, term)
+        self.segment().terms.disk_cursor(field, term)
     }
 
     /// Lot C `C1b` sous-pas 2: decode `(field, term)`'s FULL postings
@@ -869,8 +996,9 @@ impl DocumentIndex {
     /// collect into an owned structure (`match_hits_internal`,
     /// `conjunction_of_matches`) when [`Self::postings_disk_backed`] is
     /// `true`. See [`crate::postings::TermDictionary::decode_from_segment`].
+    /// Plan segments S1: single-segment passthrough, see [`Self::terms`]'s doc.
     pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
-        self.terms.decode_from_segment(field, term)
+        self.segment().terms.decode_from_segment(field, term)
     }
 
     /// Lot C `C1b` sous-pas 2: per-index override for the disk-backed
@@ -895,91 +1023,164 @@ impl DocumentIndex {
             .unwrap_or_else(postings_disk_enabled)
     }
 
+    /// Plan segments S1: single-segment passthrough — see [`Self::terms`]'s
+    /// doc. The BM25-facing aggregate (`Σ doc_count` /
+    /// `Σ total_terms / Σ doc_count`) lives on [`Self::field_stats_aggregated`];
+    /// this accessor stays for the zero-copy `doc_len_dense` borrow that
+    /// only makes sense scoped to one segment (S1: the only one).
     pub fn field_stats(&self, field: &str) -> Option<&FieldLengthStats> {
-        self.field_stats.get(field)
+        self.segment().field_stats.get(field)
+    }
+
+    /// BM25 stats aggregated GLOBALLY across every sealed segment —
+    /// `Σ doc_count`, `Σ total_terms / Σ doc_count` for `avg_doc_len`,
+    /// min-of-mins for `min_doc_len`. Non-negotiable for oracle parity
+    /// once `segments.len() > 1` (S2+): the design mandates BM25 idf/avg
+    /// be computed over the WHOLE corpus, not per segment. With exactly
+    /// one segment (S1) every `Σ` reduces to that segment's own value —
+    /// same single addition/division operation `FieldLengthStats`'s own
+    /// `avg_doc_len()`/`min_doc_len()` used to perform directly, so the
+    /// result is bit-for-bit identical to the pre-segment code path.
+    /// Returns `None` when no segment has ever recorded stats for
+    /// `field` (mirrors the previous `field_stats(field)?` early-return).
+    pub fn field_stats_aggregated(&self, field: &str) -> Option<AggregatedFieldStats> {
+        let mut doc_count = 0u64;
+        let mut total_terms = 0u64;
+        let mut min_doc_len = 0u64;
+        let mut found = false;
+        for segment in &self.segments {
+            let Some(stats) = segment.field_stats.get(field) else {
+                continue;
+            };
+            found = true;
+            doc_count += stats.doc_count;
+            total_terms += stats.total_terms;
+            if let Some(segment_min) = stats.min_doc_len() {
+                min_doc_len = if min_doc_len == 0 {
+                    segment_min
+                } else {
+                    min_doc_len.min(segment_min)
+                };
+            }
+        }
+        found.then_some(AggregatedFieldStats {
+            doc_count,
+            total_terms,
+            min_doc_len,
+        })
     }
 
     /// Returns the in-memory `field -> FieldLengthStats` map. Used by the
     /// memory accounting helper (`crate::memory`) to size the BM25 norms
     /// payload without exposing the underlying `BTreeMap` everywhere.
+    /// Plan segments S1: single-segment passthrough, see [`Self::terms`]'s
+    /// doc — a genuine per-field merge across segments would need an
+    /// owned map, out of scope for a `&BTreeMap` accessor.
     pub fn field_stats_map(&self) -> &BTreeMap<String, FieldLengthStats> {
-        &self.field_stats
+        &self.segment().field_stats
     }
 
     /// Returns the names of every field that currently has indexed
     /// postings, in lexicographic order. Used by the memory accounting
-    /// helper to enumerate every `(field, term)` pair.
+    /// helper to enumerate every `(field, term)` pair. Plan segments S1:
+    /// single-segment passthrough, see [`Self::terms`]'s doc.
     pub fn field_names(&self) -> Vec<String> {
-        self.terms.field_names()
+        self.segment().terms.field_names()
     }
 
-    /// #17 memory accounting: total FST byte size across fields.
+    /// #17 memory accounting: total FST byte size across fields, summed
+    /// over every sealed segment (Σ — with one segment, S1, this is that
+    /// segment's own byte count, unchanged from before this refactor).
     pub fn fst_bytes(&self) -> u64 {
-        self.terms.fst_bytes()
+        self.segments.iter().map(|s| s.terms.fst_bytes()).sum()
     }
 
     /// Lot C Phase 1 memory accounting: real bytes held by the flat
     /// postings buffers (term strings + `doc_ids_flat` + `freqs_flat`,
-    /// summed over fields). See [`crate::postings::TermDictionary::postings_bytes`].
+    /// summed over fields AND over every sealed segment). See
+    /// [`crate::postings::TermDictionary::postings_bytes`].
     pub fn postings_bytes(&self) -> u64 {
-        self.terms.postings_bytes()
+        self.segments.iter().map(|s| s.terms.postings_bytes()).sum()
     }
 
-    /// #17 memory accounting: total bytes held by precomputed roaring bitmaps.
+    /// #17 memory accounting: total bytes held by precomputed roaring
+    /// bitmaps, summed over every sealed segment.
     pub fn roaring_bytes(&self) -> u64 {
-        self.terms.roaring_bytes()
+        self.segments.iter().map(|s| s.terms.roaring_bytes()).sum()
     }
 
-    /// #17 memory accounting: per-term `Vec<BlockMeta>` capacity bytes.
+    /// #17 memory accounting: per-term `Vec<BlockMeta>` capacity bytes,
+    /// summed over every sealed segment.
     pub fn block_metas_bytes(&self) -> u64 {
-        self.terms.block_metas_bytes()
+        self.segments
+            .iter()
+            .map(|s| s.terms.block_metas_bytes())
+            .sum()
     }
 
     /// #17c memory accounting: Vec capacity slack across every term's
     /// `Vec<Posting>` and `Vec<u32>` channels. Surfaces the bytes
     /// allocated-but-unused after the FST build — typically up to ~50 %
     /// of the live `postings_bytes` because of `Vec`'s geometric growth
-    /// (~doubling) leaving the last realloc half-filled.
+    /// (~doubling) leaving the last realloc half-filled. Summed over
+    /// every sealed segment.
     pub fn postings_capacity_slack_bytes(&self) -> u64 {
-        self.terms.postings_capacity_slack_bytes()
+        self.segments
+            .iter()
+            .map(|s| s.terms.postings_capacity_slack_bytes())
+            .sum()
     }
 
     /// Lot C `C1a-batché`: bytes physically written to the SHADOW disk
-    /// postings segment (`surch_index_disk_postings_bytes`). See
+    /// postings segment (`surch_index_disk_postings_bytes`), summed over
+    /// every sealed segment. See
     /// [`crate::postings::TermDictionary::postings_segment_bytes`] — this
     /// is a raw disk-footprint measurement, deliberately NOT part of
     /// [`crate::memory::MemoryUsage`] (the segment is SHADOW: the same
     /// bytes are, today, ALSO fully resident via `postings_bytes`, so
     /// adding this in would double-count against the RAM total).
     pub fn postings_segment_bytes(&self) -> u64 {
-        self.terms.postings_segment_bytes()
+        self.segments
+            .iter()
+            .map(|s| s.terms.postings_segment_bytes())
+            .sum()
     }
 
     /// Lot C `C1a-batché` hardening: number of terms with no disk
     /// coverage because their FoR encode failed at build time
-    /// (`surch_index_disk_postings_skipped_terms`). See
+    /// (`surch_index_disk_postings_skipped_terms`), summed over every
+    /// sealed segment. See
     /// [`crate::postings::TermDictionary::postings_segment_skipped_terms`]
     /// for the diagnostic pairing with [`Self::postings_segment_bytes`].
     pub fn postings_segment_skipped_terms(&self) -> u64 {
-        self.terms.postings_segment_skipped_terms()
+        self.segments
+            .iter()
+            .map(|s| s.terms.postings_segment_skipped_terms())
+            .sum()
     }
 
     /// #17c memory accounting: taille on-heap du `PostingsBuilder` retenu.
     /// Lot 1.5 garde le builder live entre rebuilds incrémentaux, donc
     /// pour 1.36 M docs ça peut peser GROS et n'était pas compté ailleurs.
     /// Suspect #1 du gap heap ~4 GiB sur deces (cf docs/paper/scoreboard-2026-06-10-mesured.md).
+    /// Unaffected by the segments refactor: `postings_builder` is the
+    /// active builder, not sealed segment state.
     pub fn postings_builder_bytes(&self) -> u64 {
         self.postings_builder.memory_bytes()
     }
 
     /// #17c walker complet: real heap bytes held by the `live_docs`
-    /// presence bitmap (Lot C Phase 1 lever A). One bit per doc_id,
-    /// resized to the highest doc_id seen — replaces the previous
-    /// `BTreeSet<u32>` lazy approximation (~32 B/entry incl. node
-    /// overhead, ~43 MiB on the deces 1.36 M corpus) with an exact
-    /// `bits.capacity()` read (~170 KiB on the same corpus).
+    /// presence bitmap (Lot C Phase 1 lever A), summed over every sealed
+    /// segment. One bit per doc_id, resized to the highest doc_id seen —
+    /// replaces the previous `BTreeSet<u32>` lazy approximation (~32
+    /// B/entry incl. node overhead, ~43 MiB on the deces 1.36 M corpus)
+    /// with an exact `bits.capacity()` read (~170 KiB on the same
+    /// corpus).
     pub fn live_docs_bytes(&self) -> u64 {
-        self.live_docs.memory_bytes()
+        self.segments
+            .iter()
+            .map(|s| s.live_docs.memory_bytes())
+            .sum()
     }
 
     /// Returns the in-memory prefix-postings side table. Empty for fields
@@ -1011,12 +1212,22 @@ impl DocumentIndex {
     /// [`TermDictionary::prefix_doc_ids`]; see that method for the cost
     /// model. The keyword-prefix iterator uses this on fields that did
     /// not declare `index_prefixes` (e.g. matchID's `DATE_NAISSANCE`).
+    /// Plan segments S1: genuine union over every sealed segment's own
+    /// `BTreeSet<u32>` — with one segment (S1) this collects exactly the
+    /// same set the previous direct-field call returned (a `BTreeSet`
+    /// built from one source is identical to that source).
     pub fn term_prefix_doc_ids(&self, field: &str, prefix: &str) -> BTreeSet<u32> {
-        self.terms.prefix_doc_ids(field, prefix)
+        self.segments
+            .iter()
+            .flat_map(|segment| segment.terms.prefix_doc_ids(field, prefix))
+            .collect()
     }
 
+    /// Plan segments S1: `Σ` over every sealed segment's live-doc count
+    /// — with one segment this is that segment's own `count()`, O(1),
+    /// unchanged from before this refactor.
     pub fn live_doc_count(&self) -> usize {
-        self.live_docs.count()
+        self.segments.iter().map(|s| s.live_docs.count()).sum()
     }
 
     pub fn live_docs(&self) -> Vec<u32> {
@@ -1029,13 +1240,26 @@ impl DocumentIndex {
     /// stays serial; the CPU-heavy analysis runs in parallel beforehand. The
     /// merge is cheap (inserts of already-computed terms) and preserves the
     /// previous serial path's output exactly (documents merged in input order).
+    ///
+    /// Plan segments S1: `subfield_values`/`field_stats`/`live_docs` now
+    /// live on the single active [`Segment`] (mutated in place via
+    /// [`Self::segment_mut`]); `prefix_postings`/`postings_builder` stay
+    /// direct `DocumentIndex` fields, untouched. The two `segment_mut()`
+    /// calls below are scoped to their own block so each mutable borrow
+    /// ends before the next `self.prefix_postings`/`self.postings_builder`
+    /// statement — same field-mutation order as before this refactor, so
+    /// the merged state is identical.
     fn merge_analyzed(&mut self, document: AnalyzedDocument) -> Result<()> {
         let doc_id = document.doc_id;
-        for (path, stored) in document.subfield_values {
-            self.subfield_values
-                .entry(path)
-                .or_default()
-                .set(doc_id, stored);
+        {
+            let segment = self.segment_mut();
+            for (path, stored) in document.subfield_values {
+                segment
+                    .subfield_values
+                    .entry(path)
+                    .or_default()
+                    .set(doc_id, stored);
+            }
         }
         for (field, prefix) in document.prefixes {
             self.prefix_postings
@@ -1048,14 +1272,17 @@ impl DocumentIndex {
         for (field, term, positions) in document.postings {
             self.postings_builder.add(field, term, doc_id, positions)?;
         }
-        for (field, doc_len, norms_enabled) in document.field_lengths {
-            self.field_stats.entry(field).or_default().record_doc_len(
-                doc_id,
-                doc_len,
-                norms_enabled,
-            );
+        {
+            let segment = self.segment_mut();
+            for (field, doc_len, norms_enabled) in document.field_lengths {
+                segment
+                    .field_stats
+                    .entry(field)
+                    .or_default()
+                    .record_doc_len(doc_id, doc_len, norms_enabled);
+            }
+            segment.live_docs.insert(doc_id);
         }
-        self.live_docs.insert(doc_id);
         Ok(())
     }
 
@@ -1066,23 +1293,33 @@ impl DocumentIndex {
     /// doc, with the sub-field's analyzer/normalizer already applied. The
     /// query side uses this for `sort`/`agg`/`composite` on `.raw`/`.norm`
     /// without re-normalizing the parent's `_source` on read. Returns `None`
-    /// for top-level fields and for docs missing the sub-field value.
+    /// for top-level fields and for docs missing the sub-field value. Plan
+    /// segments S1: single-segment passthrough — `doc_id` stays a global
+    /// id resolved directly in the one sealed segment (S1 does not touch
+    /// doc_id semantics at all, see the design's S1 scope).
     pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<&str> {
-        self.subfield_values.get(field_path)?.get(doc_id)
+        self.segment().subfield_values.get(field_path)?.get(doc_id)
     }
 
     /// A10 (Phase 4): whether `field_path` carries write-time fanned-out
     /// sub-field projections. Used by the query side to choose between the
     /// stored sub-field and the legacy `lookup_sort_value` parent alias.
+    /// Plan segments S1: true iff ANY segment carries the path (with one
+    /// segment, identical to the previous single-map lookup).
     pub fn has_subfield_values(&self, field_path: &str) -> bool {
-        self.subfield_values.contains_key(field_path)
+        self.segments
+            .iter()
+            .any(|segment| segment.subfield_values.contains_key(field_path))
     }
 
     /// A10 (Phase 4): the full per-doc stored sub-field projection map.
     /// Empty when no field in the mapping declared sub-fields. Exposed for
     /// memory accounting and for the query side to enumerate projections.
+    /// Plan segments S1: single-segment passthrough, see [`Self::terms`]'s
+    /// doc — a genuine per-path merge across segments would need an owned
+    /// map, out of scope for a `&BTreeMap` accessor.
     pub fn subfield_values_map(&self) -> &BTreeMap<String, SubfieldColumn> {
-        &self.subfield_values
+        &self.segment().subfield_values
     }
 }
 
@@ -1549,5 +1786,80 @@ mod tests {
         assert!(!index.has_subfield_values("NOM.raw"));
         assert!(index.subfield_value("NOM.raw", 1).is_none());
         assert!(index.subfield_values_map().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Plan segments S1: `Vec<Arc<Segment>>` structural gate.
+    // ---------------------------------------------------------------------
+
+    /// After any build/refresh, `DocumentIndex` must hold EXACTLY one
+    /// segment (S1 scope — see `docs/paper/design-segments-pic-borne-2026-07-05.md`),
+    /// and the read-path aggregates must equal that single segment's own
+    /// values via the identical arithmetic (Σ of one term / a single
+    /// division), never a different computation that merely happens to
+    /// agree numerically.
+    #[test]
+    fn single_segment_invariant_and_aggregated_stats_match_the_segment() {
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("name", "dupont martin")], &IndexMapping::default())
+            .expect("doc 1");
+        index
+            .add_document_with_mapping(2, [("name", "dupre")], &IndexMapping::default())
+            .expect("doc 2");
+
+        assert_eq!(
+            index.segments.len(),
+            1,
+            "S1: DocumentIndex must always hold exactly one segment"
+        );
+        let segment = &index.segments[0];
+
+        let field_stats = segment
+            .field_stats
+            .get("name")
+            .expect("segment recorded stats for \"name\"");
+        let aggregated = index
+            .field_stats_aggregated("name")
+            .expect("aggregated stats for \"name\"");
+
+        assert_eq!(aggregated.doc_count, field_stats.doc_count);
+        assert_eq!(aggregated.total_terms, field_stats.total_terms);
+        assert_eq!(aggregated.avg_doc_len(), field_stats.avg_doc_len());
+        assert_eq!(aggregated.min_doc_len(), field_stats.min_doc_len());
+
+        // Every other read-path aggregate agrees with the single sealed
+        // segment's own value too (Σ over one term).
+        assert_eq!(index.live_doc_count(), segment.live_docs.count());
+        assert_eq!(
+            index.doc_ids(),
+            segment.live_docs.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(index.fst_bytes(), segment.terms.fst_bytes());
+        assert_eq!(index.postings_bytes(), segment.terms.postings_bytes());
+        assert_eq!(index.live_docs_bytes(), segment.live_docs.memory_bytes());
+    }
+
+    /// `clear()` must reset the single segment's contents (not shrink
+    /// `segments` itself) so the S1 invariant holds even across a full
+    /// `rebuild_index()` cycle (delete/update on the surch-api side).
+    #[test]
+    fn clear_keeps_single_segment_invariant_and_empties_it() {
+        let mut index = DocumentIndex::new();
+        index
+            .add_document_with_mapping(1, [("name", "dupont")], &IndexMapping::default())
+            .expect("doc 1");
+        assert_eq!(index.segments.len(), 1);
+
+        index.clear();
+
+        assert_eq!(
+            index.segments.len(),
+            1,
+            "clear() must not drop below the S1 invariant of exactly one segment"
+        );
+        assert_eq!(index.live_doc_count(), 0);
+        assert!(index.field_stats("name").is_none());
+        assert!(index.field_stats_aggregated("name").is_none());
     }
 }
