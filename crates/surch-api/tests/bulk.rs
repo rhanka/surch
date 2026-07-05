@@ -1,8 +1,31 @@
 use serde_json::json;
 use surch_api::{
     bulk::{build_bulk_response, BulkResponse},
-    parse_bulk_ndjson, BulkOperation, BulkParseError,
+    parse_bulk_ndjson, BulkItemParseResult, BulkOperation, BulkParseError,
 };
+
+/// Expects every parsed item to be a valid operation, in order. Panics
+/// (printing the offending parse error) if any item failed to parse —
+/// used by tests that only exercise the happy path.
+fn expect_operations(items: Vec<BulkItemParseResult>) -> Vec<BulkOperation> {
+    items
+        .into_iter()
+        .map(|item| item.expect("bulk item should parse into a valid operation"))
+        .collect()
+}
+
+/// Expects exactly one parsed item and expects it to be a parse error,
+/// returning the underlying `BulkParseError` — used by tests that exercise
+/// a single malformed action/source pair with nothing else in the body.
+fn expect_single_error(items: Vec<BulkItemParseResult>) -> BulkParseError {
+    assert_eq!(items.len(), 1, "expected exactly one parsed item");
+    items
+        .into_iter()
+        .next()
+        .expect("one item")
+        .expect_err("expected a parse error")
+        .error
+}
 
 #[test]
 fn bulk_parses_index_and_delete_operations_in_order() {
@@ -12,7 +35,7 @@ fn bulk_parses_index_and_delete_operations_in_order() {
         + "\n"
         + r#"{"delete":{"_index":"books","_id":"2"}}"#
         + "\n";
-    let operations = parse_bulk_ndjson(&body).expect("bulk request should parse");
+    let operations = expect_operations(parse_bulk_ndjson(&body));
 
     assert_eq!(operations.len(), 2);
     assert_eq!(
@@ -37,15 +60,16 @@ fn bulk_accepts_request_without_final_newline() {
     let body = r#"{"index":{"_index":"books","_id":"1"}}"#.to_owned()
         + "\n"
         + r#"{"title":"Rust Search"}"#;
-    let operations = parse_bulk_ndjson(&body).expect("final newline is optional");
+    let operations = expect_operations(parse_bulk_ndjson(&body));
 
     assert_eq!(operations.len(), 1);
 }
 
 #[test]
 fn bulk_rejects_source_required_action_without_source_line() {
-    let err = parse_bulk_ndjson(r#"{"index":{"_index":"books","_id":"1"}}"#)
-        .expect_err("index action requires source line");
+    let err = expect_single_error(parse_bulk_ndjson(
+        r#"{"index":{"_index":"books","_id":"1"}}"#,
+    ));
 
     assert!(matches!(
         err,
@@ -58,8 +82,9 @@ fn bulk_rejects_source_required_action_without_source_line() {
 
 #[test]
 fn bulk_rejects_unknown_action() {
-    let err = parse_bulk_ndjson(r#"{"noop":{"_index":"books","_id":"1"}}"#)
-        .expect_err("unknown bulk action should be rejected");
+    let err = expect_single_error(parse_bulk_ndjson(
+        r#"{"noop":{"_index":"books","_id":"1"}}"#,
+    ));
 
     assert!(matches!(
         err,
@@ -72,8 +97,7 @@ fn bulk_rejects_unknown_action() {
 
 #[test]
 fn bulk_rejects_invalid_action_json() {
-    let err = parse_bulk_ndjson(r#"{"index":{"_index":"books""#)
-        .expect_err("invalid action json should be rejected");
+    let err = expect_single_error(parse_bulk_ndjson(r#"{"index":{"_index":"books""#));
 
     assert!(matches!(
         err,
@@ -89,7 +113,7 @@ fn bulk_delete_does_not_consume_following_source_line() {
         + "\n"
         + r#"{"title":"Rust Search"}"#;
 
-    let operations = parse_bulk_ndjson(&body).expect("delete should not consume a source line");
+    let operations = expect_operations(parse_bulk_ndjson(&body));
 
     assert_eq!(
         operations,
@@ -116,7 +140,7 @@ fn bulk_parses_create_and_update_operations() {
         + r#"{"update":{"_index":"books","_id":"2"}}"#
         + "\n"
         + r#"{"doc":{"title":"Rust Search 2"}}"#;
-    let operations = parse_bulk_ndjson(&body).expect("create and update should parse");
+    let operations = expect_operations(parse_bulk_ndjson(&body));
 
     assert_eq!(
         operations,
@@ -140,7 +164,7 @@ fn bulk_rejects_non_json_source_line() {
     let body = r#"{"update":{"_index":"books","_id":"1"}}"#.to_owned()
         + "\n"
         + r#"{"doc":"missing end quote}"#;
-    let err = parse_bulk_ndjson(&body).expect_err("invalid source json should be rejected");
+    let err = expect_single_error(parse_bulk_ndjson(&body));
 
     assert!(matches!(
         err,
@@ -151,7 +175,7 @@ fn bulk_rejects_non_json_source_line() {
 #[test]
 fn bulk_rejects_non_object_source_line() {
     let body = "{\"create\":{\"_index\":\"books\",\"_id\":\"1\"}}\n123\n".to_owned();
-    let err = parse_bulk_ndjson(&body).expect_err("bulk action source must be an object");
+    let err = expect_single_error(parse_bulk_ndjson(&body));
 
     assert!(matches!(
         err,
@@ -167,8 +191,7 @@ fn bulk_rejects_invalid_index_name_in_metadata() {
     let body = r#"{"index":{"_index":"InvalidIndex","_id":"1"}}"#.to_owned()
         + "\n"
         + r#"{"title":"Rust Search"}"#;
-    let err =
-        parse_bulk_ndjson(&body).expect_err("bulk action with invalid index should be rejected");
+    let err = expect_single_error(parse_bulk_ndjson(&body));
 
     assert!(matches!(
         err,
@@ -179,6 +202,25 @@ fn bulk_rejects_invalid_index_name_in_metadata() {
     ));
 }
 
+/// The action name ("index") was recovered even though its `_index`
+/// metadata was invalid, so the parser knows a source line was expected
+/// and discards the orphaned `{"title":"Rust Search"}` line above instead
+/// of misreading it as a fresh (and then unknown) action line. Without
+/// that resync, this body would surface two errors instead of one.
+#[test]
+fn bulk_invalid_metadata_resyncs_by_discarding_its_paired_source_line() {
+    let body = r#"{"index":{"_index":"InvalidIndex","_id":"1"}}"#.to_owned()
+        + "\n"
+        + r#"{"title":"Rust Search"}"#;
+    let items = parse_bulk_ndjson(&body);
+
+    assert_eq!(
+        items.len(),
+        1,
+        "the orphaned source line must not surface as a second error item"
+    );
+}
+
 #[test]
 fn bulk_builds_opensearch_compatible_response_from_classic_fixture() {
     let body = include_str!("../../../tests/opensearch_compat/bulk/classic_bulk.ndjson");
@@ -186,7 +228,7 @@ fn bulk_builds_opensearch_compatible_response_from_classic_fixture() {
         "../../../tests/opensearch_compat/bulk/classic_bulk_response.json"
     ))
     .expect("response fixture should be valid json");
-    let operations = parse_bulk_ndjson(body).expect("classic bulk fixture should parse");
+    let operations = parse_bulk_ndjson(body);
 
     let response = build_bulk_response(&operations, 7);
 
