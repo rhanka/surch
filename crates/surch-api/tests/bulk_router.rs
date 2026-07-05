@@ -486,6 +486,163 @@ async fn bulk_router_rejects_non_object_source_with_parse_error() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// S0 fix (design-segments-pic-borne): a malformed source line for one doc
+/// in the middle of a batch must only fail that one item — the rest of
+/// the batch is applied normally, matching OpenSearch's per-item `_bulk`
+/// semantics instead of discarding the whole request (the measured
+/// production bug: 10 000 docs lost for one bad JSON line).
+#[tokio::test]
+async fn bulk_router_recovers_from_invalid_source_json_mid_batch() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"1"}}
+{"title":"doc one"}
+{"index":{"_id":"2"}}
+{"title":"doc two"
+{"index":{"_id":"3"}}
+{"title":"doc three"}
+{"index":{"_id":"4"}}
+{"title":"doc four"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["errors"], true);
+
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        4,
+        "the malformed doc still reserves its position"
+    );
+    assert_eq!(items[0]["index"]["status"], 201);
+    assert_eq!(items[1]["index"]["status"], 400);
+    assert_eq!(items[1]["index"]["error"]["type"], "parse_exception");
+    assert_eq!(items[2]["index"]["status"], 201);
+    assert_eq!(items[3]["index"]["status"], 201);
+}
+
+/// S0 fix: same guarantee as above, but the malformed line is the action
+/// line itself. Since the action JSON is unrecoverable, the parser cannot
+/// know whether a source line was expected, so it resyncs by resuming at
+/// the very next line — which here is a fresh, valid action line rather
+/// than an orphaned source line.
+#[tokio::test]
+async fn bulk_router_recovers_from_invalid_action_line_mid_batch() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"1"}}
+{"title":"doc one"}
+{"index":{"_id":"2""}
+{"index":{"_id":"3"}}
+{"title":"doc three"}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["errors"], true);
+
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        3,
+        "the malformed action line still reserves its position"
+    );
+    assert_eq!(items[0]["index"]["status"], 201);
+    assert_eq!(items[1]["index"]["status"], 400);
+    assert_eq!(items[1]["index"]["error"]["type"], "parse_exception");
+    assert_eq!(items[2]["index"]["status"], 201);
+}
+
+/// S0 fix: a body where nothing at all could be parsed (no NDJSON action
+/// line recognizable) is the sole remaining case that still fails the
+/// whole request with a top-level 400 — there is nothing partial to
+/// apply, so this preserves the prior tout-ou-rien behavior exactly.
+#[tokio::test]
+async fn bulk_router_rejects_wholly_invalid_body_as_global_bad_request() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from("not ndjson at all\nneither is this\n"))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], 400);
+    assert_eq!(body["error"]["type"], "parse_exception");
+}
+
+/// S0 fix edge case: the invalid doc sits in the LAST position, past the
+/// last valid pair, with no trailing source line at all (end of input).
+/// Resync must not panic or infinite-loop on the exhausted line iterator,
+/// and the earlier valid docs must still be applied.
+#[tokio::test]
+async fn bulk_router_recovers_from_invalid_doc_at_last_position() {
+    let response = app_router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/catalog/_bulk")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    r#"{"index":{"_id":"1"}}
+{"title":"doc one"}
+{"index":{"_id":"2"}}
+{"title":"doc two"}
+{"index":{"_id":"3"}}
+"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["errors"], true);
+
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(
+        items.len(),
+        3,
+        "the trailing action without a source line still reserves its position"
+    );
+    assert_eq!(items[0]["index"]["status"], 201);
+    assert_eq!(items[1]["index"]["status"], 201);
+    assert_eq!(items[2]["index"]["status"], 400);
+    assert_eq!(items[2]["index"]["error"]["type"], "parse_exception");
+    assert_eq!(
+        items[2]["index"]["error"]["reason"],
+        "missing source line after `index` action at line 5"
+    );
+}
+
 /// Guards Track A `wp-a-perf-followups.md` Lot 1.6: N sequential
 /// `_bulk` POSTs followed by a single `_refresh` must trigger ONE
 /// FST rebuild — not N. The previous behaviour rebuilt the term

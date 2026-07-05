@@ -38,7 +38,7 @@ pub mod stats;
 pub mod telemetry;
 mod topn;
 
-pub use bulk::{parse_bulk_ndjson, BulkOperation, BulkParseError};
+pub use bulk::{parse_bulk_ndjson, BulkItemParseResult, BulkOperation, BulkParseError};
 pub use error::OpenSearchError;
 
 const BULK_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
