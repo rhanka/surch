@@ -66,6 +66,29 @@ seulement non tenu, il est **INVERSÉ** — c'est ES qui tient à ≤ moitié de
 | indexation | 28 513 doc/s | 29 842 doc/s | ~parité (1,05×) |
 | disque index | 653 MiB | 744 MiB | ❌ Surch 1,14× (pire) |
 
+## 🎯🎯 VERDICT FULL CORPUS 28M (28 917 511 docs riches, mapping matchID) — sweep mémoire constante
+Corpus `~/surch-bench-data/deces-28M.ndjson` (56 fichiers INSEE publics 1970-2025, IDs vérifiés sur la
+passe complète). Mêmes bornes : 8 cœurs pinnés chacun, `--memory=--memory-swap`, ES Xmx=M/2, surch disk-backed.
+
+| cap | ES | Surch |
+|---|---|---|
+| **16g** | ✅ 22 719 doc/s · RSS 10,26 GiB · disk 11,6 GiB · lat 0,91/1,41/2,03 ms · count 28 917 511 | ❌ **OOM indexation** |
+| **8g** | ✅ 25 180 doc/s · RSS 6,54 GiB · disk 12,2 GiB · lat 0,91/1,40/2,12 | ❌ OOM (~11,2M docs avant mort) |
+| **4g** | ✅ 24 468 doc/s · RSS 3,24 GiB · disk 12,6 GiB · lat 0,90/1,33/2,93 | ❌ OOM (~5,1M docs avant mort) |
+
+**Lecture :**
+1. **ES indexe et sert le full 28,9M à TOUS les budgets jusqu'à 4 GiB** (plancher réel ≤4g), débit stable
+   ~22-25k doc/s, latence quasi-inchangée. Son RSS **s'adapte élastiquement au budget** (10,3 → 6,5 → 3,2 GiB) :
+   architecture segments-disque + heap borné = dégradation gracieuse.
+2. **Surch ne survit à AUCUN budget testé jusqu'à 16 GiB.** Progression ~1,4M docs/GiB avant OOM (5,1M@4g,
+   11,2M@8g) → plancher extrapolé ~**24-32 GiB** pour 28,9M (pic bulk + pic refresh). Le build tout-en-RAM
+   ne dégrade pas : il meurt.
+3. **À mémoire constante sur le full corpus, l'axe RAM est ≥4× en faveur d'ES** (4 vs >16 GiB), et les axes
+   latence/indexation/disque de Surch sont NON MESURABLES à 28M (jamais réussi à construire l'index).
+4. La latence 3,3×+rapide de Surch (réelle à 1,36M) ne compte que si l'index tient — à 28M il ne tient pas.
+   Conclusion architecturale : **l'indexation streaming-vers-segments à pic borné est LE prérequis** de tout
+   objectif à l'échelle ; sans elle, aucun autre axe n'existe au-delà de ~2M docs/GiB de budget.
+
 ## CONCLUSION HONNÊTE (objectif = battre ES ≥2× sur CHAQUE axe)
 - **RAM ❌ INVERSÉ** : Surch exige 2× la RAM d'ES pour survivre (pic d'indexation). Steady-state bas (688)
   mais le pic build (OOM à 2g) impose le cap haut. C'est LE point dur, cohérent avec SCW (OOM 843m à 1,36M).
