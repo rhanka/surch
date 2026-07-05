@@ -1488,32 +1488,47 @@ impl InMemoryIndex {
     }
 
     fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats<'_>> {
-        let stats = self.index.field_stats(field)?;
+        // Plan segments S1 (docs/paper/design-segments-pic-borne-2026-07-05.md):
+        // BM25 `doc_count`/`avg_doc_len`/`min_doc_len` are the GLOBAL
+        // aggregate across every sealed segment (Σ doc_count, Σ
+        // total_terms / Σ doc_count) — non-negotiable for oracle parity
+        // once `segments.len() > 1` (S2+). With exactly one segment (S1)
+        // this reduces to the same single division
+        // `FieldLengthStats::avg_doc_len()` performed directly, so the
+        // value is bit-for-bit identical to the pre-segment code path.
+        let aggregated = self.index.field_stats_aggregated(field)?;
         let norms_enabled = self.mapping.norms_enabled(field);
         let avg_doc_len = if norms_enabled {
-            stats.avg_doc_len()?
+            aggregated.avg_doc_len()?
         } else {
             1.0
         };
-        // Borrow the index's dense slice zero-copy — no per-query allocation,
-        // O(1) cache-friendly doc_id indexing in the hot loop. Bytes are
-        // Lucene `SmallFloat`-quantized lengths; reconstruction is folded
-        // into `FieldScoringStats::doc_len` and the hot-path call sites
-        // (search.rs / state.rs `bm25_field_score`).
+        // Borrow the dense per-doc slice zero-copy — no per-query
+        // allocation, O(1) cache-friendly doc_id indexing in the hot
+        // loop. `field_stats` is the (S1: single, so always the right
+        // one) segment's own `FieldLengthStats`; routing a `doc_id` to
+        // ITS segment for this borrow is an S2 concern (local doc_ids +
+        // doc_base), out of scope while `segments.len()` is asserted to
+        // be 1. Bytes are Lucene `SmallFloat`-quantized lengths;
+        // reconstruction is folded into `FieldScoringStats::doc_len` and
+        // the hot-path call sites (search.rs / state.rs `bm25_field_score`).
         let doc_len_dense: &[u8] = if norms_enabled {
-            stats.doc_len_dense()
+            self.index
+                .field_stats(field)
+                .map(|stats| stats.doc_len_dense())
+                .unwrap_or(&[])
         } else {
             &[]
         };
 
         let min_doc_len = if norms_enabled {
-            stats.min_doc_len().unwrap_or(0)
+            aggregated.min_doc_len().unwrap_or(0)
         } else {
             0
         };
 
         Some(FieldScoringStats {
-            doc_count: stats.doc_count,
+            doc_count: aggregated.doc_count,
             avg_doc_len,
             norms_enabled,
             doc_len_dense,
