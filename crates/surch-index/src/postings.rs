@@ -877,6 +877,15 @@ impl PostingsBuilder {
                 .into_inner()
                 .expect("fst::MapBuilder memory writer never fails I/O");
             let fst = Map::new(bytes).expect("fst::Map from valid MapBuilder bytes");
+            // Plan segments S5: best-effort disk-back of this field's
+            // descriptors — see `persist_or_keep_descriptors`'s doc
+            // comment. No-op (returns the resident slice unchanged,
+            // `directory: None`) when `disk_enabled` is `false`.
+            let (segment_descriptors, segment_descriptors_directory) = persist_or_keep_descriptors(
+                segment_descriptors,
+                disk_enabled,
+                &mut postings_segment,
+            );
             fields.insert(
                 field,
                 FieldPostings {
@@ -887,7 +896,8 @@ impl PostingsBuilder {
                     offsets: offsets.into_boxed_slice(),
                     block_offsets: block_offsets.into_boxed_slice(),
                     roaring,
-                    segment_descriptors: segment_descriptors.into_boxed_slice(),
+                    segment_descriptors,
+                    segment_descriptors_directory,
                     block_directory: block_directory_flat.into_boxed_slice(),
                     block_dir_offsets: block_dir_offsets.into_boxed_slice(),
                 },
@@ -899,6 +909,58 @@ impl PostingsBuilder {
             postings_segment: postings_segment.map(Arc::new),
             postings_skipped_terms,
             disk_enabled,
+        }
+    }
+}
+
+/// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §"Dimensionnement S5"): best-effort disk-back of a field's (already
+/// rebased) `segment_descriptors` — shared by both producers
+/// ([`PostingsBuilder::build_with_disk_flag`] and
+/// [`FieldMergeAccumulator::finish`]) so the on-disk layout stays a
+/// single source of truth. When `disk_enabled` and `descriptors` is
+/// non-empty, packs every descriptor into
+/// [`DESCRIPTOR_ENCODED_LEN`]-byte records ([`encode_descriptor`]) and
+/// appends them to `postings_segment` in ONE extra `append()` call (same
+/// per-field batching contract as the field's own FoR payload) — this is
+/// what lets [`FieldPostings::segment_descriptors`] drop to `Box::default()`
+/// (zero heap) instead of staying resident at 16 B/term.
+///
+/// Falls back to keeping `descriptors` fully resident (returning
+/// `directory: None`) whenever the disk flag is off (unchanged default),
+/// the field carries no descriptors at all, or the `append()` itself
+/// fails (`ENOSPC`, …) — matching every other best-effort segment-write
+/// failure mode in this file: correctness never depends on this
+/// succeeding, only the RAM saving does.
+fn persist_or_keep_descriptors(
+    descriptors: Vec<(u64, u32)>,
+    disk_enabled: bool,
+    postings_segment: &mut Option<PostingsSegment>,
+) -> (Box<[(u64, u32)]>, Option<(u64, u32)>) {
+    if !disk_enabled || descriptors.is_empty() {
+        return (descriptors.into_boxed_slice(), None);
+    }
+    let term_count = descriptors.len() as u32;
+    let mut encoded = Vec::with_capacity(descriptors.len() * DESCRIPTOR_ENCODED_LEN as usize);
+    for &(offset, len) in &descriptors {
+        encoded.extend_from_slice(&encode_descriptor(offset, len));
+    }
+    let Some(segment) = postings_segment.as_mut() else {
+        return (descriptors.into_boxed_slice(), None);
+    };
+    match segment.append(&encoded) {
+        Some(dir_base) => (
+            Vec::<(u64, u32)>::new().into_boxed_slice(),
+            Some((dir_base, term_count)),
+        ),
+        None => {
+            // The batched `append()` failed (e.g. `ENOSPC`): mirror the
+            // existing per-field FoR-payload failure handling and
+            // disable the segment for the rest of the build rather than
+            // risk a half-written directory some OTHER field's
+            // descriptors might still reference.
+            *postings_segment = None;
+            (descriptors.into_boxed_slice(), None)
         }
     }
 }
@@ -1126,6 +1188,14 @@ impl FieldMergeAccumulator {
             .into_inner()
             .expect("fst::MapBuilder memory writer never fails I/O");
         let fst = Map::new(bytes).expect("fst::Map from valid MapBuilder bytes");
+        // Plan segments S5: same best-effort disk-back as
+        // `PostingsBuilder::build_with_disk_flag` — see
+        // `persist_or_keep_descriptors`'s doc comment.
+        let (segment_descriptors, segment_descriptors_directory) = persist_or_keep_descriptors(
+            self.segment_descriptors,
+            self.disk_enabled,
+            postings_segment,
+        );
         (
             FieldPostings {
                 fst,
@@ -1135,7 +1205,8 @@ impl FieldMergeAccumulator {
                 offsets: self.offsets.into_boxed_slice(),
                 block_offsets: self.block_offsets.into_boxed_slice(),
                 roaring: self.roaring,
-                segment_descriptors: self.segment_descriptors.into_boxed_slice(),
+                segment_descriptors,
+                segment_descriptors_directory,
                 block_directory: self.block_directory_flat.into_boxed_slice(),
                 block_dir_offsets: self.block_dir_offsets.into_boxed_slice(),
             },
@@ -1236,11 +1307,14 @@ pub(crate) fn merge_term_dictionaries(
                 let start = fp.offsets[term_idx] as usize;
                 let end = fp.offsets[term_idx + 1] as usize;
                 if source.disk_backed() {
-                    let (offset, len) = fp.segment_descriptors[term_idx];
+                    let segment = source.postings_segment.as_deref();
+                    let Some((offset, len)) = fp.descriptor_at(term_idx, segment) else {
+                        continue;
+                    };
                     if len == 0 {
                         continue;
                     }
-                    let Some(segment) = source.postings_segment.as_deref() else {
+                    let Some(segment) = segment else {
                         continue;
                     };
                     let Some(bytes) = segment.read(offset, len) else {
@@ -1349,6 +1423,7 @@ fn validate_field_segment_round_trip(
 /// leapfrog / `PostingsBlockSkipIter` walks, so its cache footprint is
 /// unchanged), and `freqs_flat` below carries just the `freq` values,
 /// index-aligned with `doc_ids_flat` via the same `offsets` table.
+///
 /// `lookup*` hands back the two slices together instead of one
 /// `&[Posting]`; scoring reads `doc_id` from `doc_ids_flat[i]` and `freq`
 /// from `freqs_flat[i]`.
@@ -1410,7 +1485,33 @@ pub struct FieldPostings {
     /// read only by [`TermDictionary::decode_from_segment`] (validation /
     /// future cold paths) — never by `lookup*`/scoring/the leapfrog,
     /// which stay on `doc_ids_flat`/`freqs_flat` above.
+    ///
+    /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §"Dimensionnement S5"): this `T`-scaled array was identified as the
+    /// single largest previously-ungauged RAM component (16 B/term after
+    /// Rust struct padding — a field with high term cardinality, e.g. an
+    /// `edge_ngram`/`autocomplete` analyzer or `index_prefixes`, can push
+    /// `T` into the millions even on a modest doc count). `Box::default()`
+    /// (empty) when [`Self::segment_descriptors_directory`] is `Some(_)` —
+    /// see that field's doc comment for the disk-backed replacement.
     segment_descriptors: Box<[(u64, u32)]>,
+    /// Plan segments S5: when `Some((dir_base, term_count))`, the array
+    /// above is EMPTY and every term's descriptor instead lives in the
+    /// SHARED `postings_segment` file as a packed 12-byte record
+    /// (`u64` offset + `u32` len, both little-endian — see
+    /// [`encode_descriptor`]/[`decode_descriptor`]) at byte
+    /// `dir_base + term_idx * DESCRIPTOR_ENCODED_LEN`, written ONCE by
+    /// [`PostingsBuilder::build_with_disk_flag`] / [`FieldMergeAccumulator::finish`]
+    /// right after the field's own FoR payload (same per-field batching
+    /// contract, one extra `append()`). Resolved by [`FieldPostings::descriptor_at`]
+    /// with one extra `pread` instead of an O(1) RAM index — the S5
+    /// trade-off already accepted for the FoR payload itself (C1b).
+    /// `None` when the postings-disk flag (`SURCH_POSTINGS_DISK`) was off
+    /// at build time (the unchanged, 100 %-resident default) or when
+    /// persisting the directory failed (best-effort: falls back to the
+    /// resident `segment_descriptors` above, same philosophy as every
+    /// other segment-write failure in this file).
+    segment_descriptors_directory: Option<(u64, u32)>,
     /// Lot C `C1b` sous-pas 2: per-block directory (`max_doc_id` per FoR
     /// block, [`BlockDirEntry`]), persisted ONCE at
     /// [`PostingsBuilder::build_with_disk_flag`] time — CSR-indexed by
@@ -1428,6 +1529,36 @@ pub struct FieldPostings {
     /// flag was on for this build, empty (`Box::default()`) otherwise —
     /// same shape/contract as `offsets`/`block_offsets`.
     block_dir_offsets: Box<[u32]>,
+}
+
+/// Plan segments S5: on-disk encoded length of one
+/// [`FieldPostings::segment_descriptors_directory`] entry — 8 bytes for
+/// the `u64` offset plus 4 for the `u32` len, packed with NO padding (the
+/// in-RAM tuple `(u64, u32)` pads to 16 bytes on `size_of`-driven gauges;
+/// the on-disk format is deliberately the tight 12 bytes since it is only
+/// ever read back through [`decode_descriptor`], never transmuted).
+const DESCRIPTOR_ENCODED_LEN: u64 = 12;
+
+/// Plan segments S5: pack one `(offset, len)` descriptor into the tight
+/// 12-byte on-disk format (`DESCRIPTOR_ENCODED_LEN`), little-endian.
+fn encode_descriptor(offset: u64, len: u32) -> [u8; DESCRIPTOR_ENCODED_LEN as usize] {
+    let mut buf = [0u8; DESCRIPTOR_ENCODED_LEN as usize];
+    buf[0..8].copy_from_slice(&offset.to_le_bytes());
+    buf[8..12].copy_from_slice(&len.to_le_bytes());
+    buf
+}
+
+/// Plan segments S5: inverse of [`encode_descriptor`]. Returns `None` if
+/// `bytes` is shorter than [`DESCRIPTOR_ENCODED_LEN`] (a truncated
+/// `pread`, treated the same as every other best-effort I/O failure in
+/// this file: the caller sees "no disk coverage" for that term).
+fn decode_descriptor(bytes: &[u8]) -> Option<(u64, u32)> {
+    let offset_bytes: [u8; 8] = bytes.get(0..8)?.try_into().ok()?;
+    let len_bytes: [u8; 4] = bytes.get(8..12)?.try_into().ok()?;
+    Some((
+        u64::from_le_bytes(offset_bytes),
+        u32::from_le_bytes(len_bytes),
+    ))
 }
 
 impl FieldPostings {
@@ -1452,10 +1583,42 @@ impl FieldPostings {
     /// Lot C `C1a-batché` SHADOW: this term's `(offset, len)` descriptor
     /// into the shared segment, plus its posting count (`df`, needed by
     /// [`decode_postings_blocked`] to know where the last block ends).
-    fn segment_slice(&self, term: &str) -> Option<((u64, u32), usize)> {
+    /// `segment` is only consulted when [`Self::segment_descriptors_directory`]
+    /// is `Some(_)` (plan segments S5, disk-backed descriptors) — pass
+    /// `None` when no segment is available, which then makes this method
+    /// return `None` for such a term, matching every other best-effort
+    /// I/O failure in this file.
+    fn segment_slice(
+        &self,
+        term: &str,
+        segment: Option<&PostingsSegment>,
+    ) -> Option<((u64, u32), usize)> {
         let (idx, start, end) = self.term_range(term)?;
-        let descriptor = *self.segment_descriptors.get(idx)?;
+        let descriptor = self.descriptor_at(idx, segment)?;
         Some((descriptor, end - start))
+    }
+
+    /// Plan segments S5: resolve term idx `idx`'s `(offset, len)`
+    /// descriptor, either from the resident [`Self::segment_descriptors`]
+    /// slice (postings-disk flag was off at build time, or persisting the
+    /// directory failed — see that field's doc comment) or via one extra
+    /// `pread` into the shared `postings_segment` directory
+    /// ([`Self::segment_descriptors_directory`], flag on). Shared by
+    /// [`Self::segment_slice`] and [`merge_term_dictionaries`] (which
+    /// needs a SOURCE dictionary's own descriptor while merging, not just
+    /// the merged dictionary's).
+    fn descriptor_at(&self, idx: usize, segment: Option<&PostingsSegment>) -> Option<(u64, u32)> {
+        match self.segment_descriptors_directory {
+            Some((dir_base, term_count)) => {
+                if idx as u32 >= term_count {
+                    return None;
+                }
+                let byte_offset = dir_base + (idx as u64) * DESCRIPTOR_ENCODED_LEN;
+                let bytes = segment?.read(byte_offset, DESCRIPTOR_ENCODED_LEN as u32)?;
+                decode_descriptor(&bytes)
+            }
+            None => self.segment_descriptors.get(idx).copied(),
+        }
     }
 
     /// Lot C `C1b` sous-pas 2: this term's persisted per-block directory
@@ -1697,11 +1860,12 @@ impl TermDictionary {
     /// itself fails.
     pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
         let field_postings = self.fields.get(field)?;
-        let ((offset, len), count) = field_postings.segment_slice(term)?;
+        let segment = self.postings_segment.as_deref();
+        let ((offset, len), count) = field_postings.segment_slice(term, segment)?;
         if len == 0 {
             return None;
         }
-        let bytes = self.postings_segment.as_ref()?.read(offset, len)?;
+        let bytes = segment?.read(offset, len)?;
         decode_postings_blocked(&bytes, count).ok()
     }
 
@@ -1733,11 +1897,12 @@ impl TermDictionary {
     /// failure inside [`DiskPostingsCursor::open`].
     pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
         let field_postings = self.fields.get(field)?;
-        let ((offset, len), count) = field_postings.segment_slice(term)?;
+        let segment = self.postings_segment.as_deref();
+        let ((offset, len), count) = field_postings.segment_slice(term, segment)?;
         if len == 0 {
             return None;
         }
-        let segment = self.postings_segment.as_ref()?;
+        let segment = segment?;
         if let Some(directory) = field_postings.persisted_block_directory(term) {
             return Some(DiskPostingsCursor::open_with_directory(
                 segment,
@@ -1822,6 +1987,42 @@ impl TermDictionary {
         self.fields
             .values()
             .map(|fp| fp.block_metas_flat.len() as u64 * meta_size)
+            .sum()
+    }
+
+    /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §"Dimensionnement S5"): total bytes held by the per-term CSR/directory
+    /// metadata NO OTHER gauge counted before this — `offsets`,
+    /// `block_offsets`, `segment_descriptors` (when resident — see
+    /// [`FieldPostings::segment_descriptors_directory`]'s doc comment: the
+    /// S5 disk-back drops this component to ~0 once `SURCH_POSTINGS_DISK`
+    /// is on), `block_directory`, and `block_dir_offsets`. Summed over
+    /// every field.
+    ///
+    /// Scales with the DISTINCT TERM COUNT (`T`), not the doc count — an
+    /// `edge_ngram`/`autocomplete` analyzer or an `index_prefixes` field
+    /// can push `T` into the millions even on a modest doc count. This was
+    /// the strongest identified candidate for the ~295 MiB gap between
+    /// jemalloc `allocated` and the sum of every other
+    /// `surch_index_*`/`surch_state_*` gauge measured on the 1,36 M
+    /// matchID corpus (design doc's dimensioning table): at ~28-36 B/term
+    /// (16 B `segment_descriptors` + 4 B×3 CSR/directory offset arrays)
+    /// against `fst_bytes`'s few-B/term COMPRESSED footprint, a `T` in
+    /// the low tens of millions accounts for the observed order of
+    /// magnitude.
+    pub fn postings_directory_bytes(&self) -> u64 {
+        let u32_size = std::mem::size_of::<u32>() as u64;
+        let descriptor_size = std::mem::size_of::<(u64, u32)>() as u64;
+        let block_dir_entry_size = std::mem::size_of::<BlockDirEntry>() as u64;
+        self.fields
+            .values()
+            .map(|fp| {
+                (fp.offsets.len() as u64).saturating_mul(u32_size)
+                    + (fp.block_offsets.len() as u64).saturating_mul(u32_size)
+                    + (fp.segment_descriptors.len() as u64).saturating_mul(descriptor_size)
+                    + (fp.block_directory.len() as u64).saturating_mul(block_dir_entry_size)
+                    + (fp.block_dir_offsets.len() as u64).saturating_mul(u32_size)
+            })
             .sum()
     }
 
@@ -2351,5 +2552,88 @@ impl<'seg> DiskPostingsCursor<'seg> {
             .iter()
             .map(|entry| entry.count as usize)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §"Dimensionnement S5"): white-box counterpart to
+    /// `crates/surch-index/tests/postings.rs`'s
+    /// `postings_disk_backed_descriptors_match_resident_descriptors` — that
+    /// integration test can only observe PUBLIC behaviour (read parity);
+    /// this one has access to the private `FieldPostings` fields and
+    /// directly asserts the RAM-shrink claim the S5 disk-back is FOR:
+    /// `segment_descriptors` drops to empty (`Box::default()`, zero heap)
+    /// and `segment_descriptors_directory` becomes `Some(_)` once the
+    /// postings-disk flag is on, for a field that carries terms. Flag off
+    /// stays BYTE-IDENTICAL to the pre-S5 shape: `segment_descriptors.len()
+    /// == the field's term count` and `segment_descriptors_directory ==
+    /// None`.
+    ///
+    /// Deliberately does NOT compare the aggregate
+    /// [`TermDictionary::postings_directory_bytes`] gauge between flag off
+    /// and flag on here: that comparison also mixes in the PRE-EXISTING
+    /// (C1b sous-pas 2) `block_directory`/`block_dir_offsets` disk-mode
+    /// cost, which for single-block terms (as below) exactly offsets the
+    /// 16 B/term this change saves — see that method's doc comment. The
+    /// claim this test makes instead, `segment_descriptors` itself goes to
+    /// zero, is the one this change actually delivers.
+    #[test]
+    fn segment_descriptors_move_off_heap_when_disk_flag_is_on() {
+        let mut builder_off = PostingsBuilder::new();
+        let mut builder_on = PostingsBuilder::new();
+        for i in 0..50u32 {
+            builder_off
+                .add("body", format!("term{i}"), i, vec![0])
+                .expect("add (flag off)");
+            builder_on
+                .add("body", format!("term{i}"), i, vec![0])
+                .expect("add (flag on)");
+        }
+
+        let dict_off = builder_off.build_with_disk_flag(false);
+        let field_off = dict_off.fields.get("body").expect("body field (flag off)");
+        assert_eq!(
+            field_off.segment_descriptors.len(),
+            50,
+            "flag off must keep every term's descriptor resident (unchanged default)"
+        );
+        assert!(
+            field_off.segment_descriptors_directory.is_none(),
+            "flag off must never persist a directory"
+        );
+
+        let dict_on = builder_on.build_with_disk_flag(true);
+        let field_on = dict_on.fields.get("body").expect("body field (flag on)");
+        assert!(
+            field_on.segment_descriptors.is_empty(),
+            "flag on should shed the resident segment_descriptors entirely"
+        );
+        assert!(
+            field_on.segment_descriptors_directory.is_some(),
+            "flag on should persist a directory instead"
+        );
+    }
+
+    /// Plan segments S5: [`encode_descriptor`]/[`decode_descriptor`]
+    /// round-trip, including the boundary values a real segment can
+    /// produce (offset `0`, a large `u64` offset past 4 GiB, and `len ==
+    /// 0` — the sentinel "no disk coverage" descriptor).
+    #[test]
+    fn descriptor_encoding_round_trips() {
+        for &(offset, len) in &[(0u64, 0u32), (12, 512), (u32::MAX as u64 + 1, u32::MAX)] {
+            let encoded = encode_descriptor(offset, len);
+            assert_eq!(encoded.len(), DESCRIPTOR_ENCODED_LEN as usize);
+            let decoded = decode_descriptor(&encoded).expect("full-length buffer decodes");
+            assert_eq!(decoded, (offset, len));
+        }
+        assert_eq!(
+            decode_descriptor(&[0u8; 4]),
+            None,
+            "truncated buffer must not decode"
+        );
     }
 }

@@ -93,6 +93,20 @@ pub struct MemoryUsage {
     /// docs de la generation courante). 1.36M entrees sur deces = ~45 MiB
     /// avec overhead BTreeSet inclus.
     pub live_docs_bytes: u64,
+    /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §"Dimensionnement S5"): per-term CSR/directory metadata — `offsets`,
+    /// `block_offsets`, `segment_descriptors` (until the S5 disk-back —
+    /// see `postings::FieldPostings::segment_descriptors_directory` —
+    /// drops it to ~0 under `SURCH_POSTINGS_DISK`), `block_directory`, and
+    /// `block_dir_offsets`. Scales with the DISTINCT TERM COUNT, not the
+    /// doc count, so an `edge_ngram`/`autocomplete` analyzer or an
+    /// `index_prefixes` field can make this dominate. Identified as the
+    /// strongest candidate for the ~295 MiB gap between jemalloc
+    /// `allocated` and the sum of every other gauge measured on the
+    /// 1,36 M matchID corpus (design doc's dimensioning table) — see
+    /// `postings::TermDictionary::postings_directory_bytes` for the full
+    /// byte-cost breakdown.
+    pub postings_directory_bytes: u64,
 }
 
 impl MemoryUsage {
@@ -110,6 +124,7 @@ impl MemoryUsage {
             .saturating_add(self.postings_capacity_slack_bytes)
             .saturating_add(self.postings_builder_bytes)
             .saturating_add(self.live_docs_bytes)
+            .saturating_add(self.postings_directory_bytes)
     }
 }
 
@@ -137,6 +152,7 @@ pub fn document_index_memory_usage(doc_index: &DocumentIndex) -> MemoryUsage {
         postings_capacity_slack_bytes: doc_index.postings_capacity_slack_bytes(),
         postings_builder_bytes: doc_index.postings_builder_bytes(),
         live_docs_bytes: doc_index.live_docs_bytes(),
+        postings_directory_bytes: doc_index.postings_directory_bytes(),
     }
 }
 

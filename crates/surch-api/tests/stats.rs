@@ -195,6 +195,55 @@ async fn stats_grows_with_documents() {
     assert!(grand_total >= total);
 }
 
+/// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §"Dimensionnement S5"): `postings_directory_bytes` — the per-term
+/// CSR/directory metadata (`offsets`/`block_offsets`/`segment_descriptors`/
+/// `block_directory`/`block_dir_offsets`) identified as the strongest
+/// candidate for the ~295 MiB gap between jemalloc `allocated` and the sum
+/// of every other gauge measured on the 1,36 M matchID corpus — must be
+/// non-zero once the index carries a meaningful number of DISTINCT terms,
+/// and must be part of `total_bytes` (end-to-end wiring: `state.rs` ->
+/// `surch-index::memory` -> this endpoint's JSON).
+#[tokio::test]
+async fn postings_directory_bytes_grows_with_distinct_term_count() {
+    let router = app_router();
+
+    // 200 docs, each contributing its OWN distinct term — mirrors, at test
+    // scale, the high term cardinality an `edge_ngram`/`autocomplete`
+    // analyzer or an `index_prefixes` field produces on the real corpus.
+    for i in 0..200 {
+        index_one(
+            &router,
+            "terms",
+            &format!("d{i}"),
+            &format!(r#"{{"tag":"uniqueterm{i}"}}"#),
+        )
+        .await;
+    }
+
+    let (status, body) = fetch_stats(&router, "index=terms").await;
+    assert_eq!(status, StatusCode::OK);
+    let memory = body
+        .pointer("/indices/terms/memory")
+        .expect("memory report for 'terms'");
+    let directory = memory
+        .get("postings_directory_bytes")
+        .and_then(Value::as_u64)
+        .expect("postings_directory_bytes");
+    let total = memory
+        .get("total_bytes")
+        .and_then(Value::as_u64)
+        .expect("total_bytes");
+    assert!(
+        directory > 0,
+        "200 distinct terms should carry non-zero per-term CSR/directory metadata"
+    );
+    assert!(
+        directory <= total,
+        "postings_directory_bytes must be part of total_bytes: directory={directory} total={total}"
+    );
+}
+
 /// Unknown index → 200 with an empty `indices` object. We deliberately
 /// chose this shape (rather than 404) so dashboards that always scrape
 /// `?index=<name>` stay green when an index has not been created yet.
@@ -252,6 +301,10 @@ async fn prometheus_exposes_memory_gauges_after_indexing() {
         "surch_index_field_stats_bytes",
         "surch_index_total_bytes",
         "surch_index_doc_count",
+        // Plan segments S5: per-term CSR/directory metadata gauge (the
+        // identified candidate for the ~295 MiB non-gaugé gap — see
+        // `surch_index::memory::MemoryUsage::postings_directory_bytes`).
+        "surch_index_postings_directory_bytes",
     ] {
         assert!(
             body.contains(metric),

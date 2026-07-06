@@ -772,3 +772,81 @@ fn term_dictionary_fst_terms_returns_lex_sorted() {
     let missing = dictionary.terms("nope").collect::<Vec<_>>();
     assert!(missing.is_empty());
 }
+
+/// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §"Dimensionnement S5"): `segment_descriptors` was identified as the
+/// single largest previously-ungauged, per-term (`T`-scaled) RAM
+/// component — 16 B/term after Rust struct padding, invisible to every
+/// existing gauge. Read-parity gate for its disk-back: builds the SAME
+/// postings twice (flag off, then flag on, via `build_with_disk_flag` —
+/// the per-call override, since the process-wide `SURCH_POSTINGS_DISK`
+/// `OnceLock` cannot flip mid-process) and asserts every term's
+/// `decode_from_segment` result stays bit-identical between the resident
+/// array (flag off, UNCHANGED default) and the new disk-backed directory
+/// + one extra `pread` (flag on). The companion white-box test
+/// `segment_descriptors_move_off_heap_when_disk_flag_is_on` (in
+/// `crates/surch-index/src/postings.rs`'s own `#[cfg(test)]` module, which
+/// has access to the private `FieldPostings` fields) covers the actual
+/// RAM-shrink claim from the inside — the aggregate
+/// `postings_directory_bytes()` gauge also carries the PRE-EXISTING C1b
+/// `block_directory`/`block_dir_offsets` disk-mode cost, which is
+/// orthogonal to this change and can outweigh it for single-block terms,
+/// so comparing that gauge flag-off vs flag-on here would be misleading.
+#[test]
+fn postings_disk_backed_descriptors_match_resident_descriptors() {
+    // 200 DISTINCT terms per field (T = 200) so the per-term CSR/directory
+    // metadata is not noise — mirrors, at unit-test scale, the high term
+    // cardinality an `edge_ngram`/`autocomplete` analyzer or
+    // `index_prefixes` field produces on the real matchID corpus.
+    fn populate(builder: &mut PostingsBuilder) {
+        for i in 0..200u32 {
+            builder
+                .add("body", format!("term{i}"), i, vec![0])
+                .expect("distinct term per doc");
+            builder
+                .add("title", format!("alt{i}"), i, vec![0, 1])
+                .expect("distinct term per doc, second field");
+        }
+    }
+
+    let mut builder_off = PostingsBuilder::new();
+    populate(&mut builder_off);
+    let dict_off = builder_off.build_with_disk_flag(false);
+
+    let mut builder_on = PostingsBuilder::new();
+    populate(&mut builder_on);
+    let dict_on = builder_on.build_with_disk_flag(true);
+
+    // Sanity: the flag-off dictionary carries the resident directory
+    // metadata this whole mission is about (non-zero).
+    assert!(
+        dict_off.postings_directory_bytes() > 0,
+        "flag-off dictionary should carry non-zero directory bytes (resident segment_descriptors)"
+    );
+
+    // Read parity: the disk-backed descriptor lookup (one extra `pread`)
+    // must resolve to the exact same bytes the resident array would have,
+    // for every term in both fields.
+    for i in 0..200u32 {
+        let term = format!("term{i}");
+        let off = dict_off
+            .decode_from_segment("body", &term)
+            .unwrap_or_else(|| panic!("flag-off decode body/{term}"));
+        let on = dict_on
+            .decode_from_segment("body", &term)
+            .unwrap_or_else(|| panic!("flag-on decode body/{term}"));
+        assert_eq!(off, on, "decode_from_segment diverged for body/{term}");
+
+        let alt = format!("alt{i}");
+        let off_alt = dict_off
+            .decode_from_segment("title", &alt)
+            .unwrap_or_else(|| panic!("flag-off decode title/{alt}"));
+        let on_alt = dict_on
+            .decode_from_segment("title", &alt)
+            .unwrap_or_else(|| panic!("flag-on decode title/{alt}"));
+        assert_eq!(
+            off_alt, on_alt,
+            "decode_from_segment diverged for title/{alt}"
+        );
+    }
+}

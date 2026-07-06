@@ -349,6 +349,13 @@ fn set_gauges(
         .set(usage.subfield_values_bytes as f64);
     // #17c walker complet : live_docs BTreeSet<u32>.
     metrics::gauge!("surch_index_live_docs_bytes", &label).set(usage.live_docs_bytes as f64);
+    // Plan segments S5 : per-term CSR/directory metadata (offsets,
+    // block_offsets, segment_descriptors, block_directory,
+    // block_dir_offsets) — le poste identifié comme le plus fort candidat
+    // pour le gap ~295 MiB non gaugé mesuré à 1,36 M (cf. design doc §S5).
+    // Scale avec le nombre de termes DISTINCTS, pas le nombre de docs.
+    metrics::gauge!("surch_index_postings_directory_bytes", &label)
+        .set(usage.postings_directory_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
     // #17c walker complet : exposer en clair les gaps qui restent à traquer.
     // `unaccounted` = ce qui est dans le heap mais pas dans nos gauges
@@ -406,6 +413,11 @@ pub struct MemoryReport {
     pub postings_builder_bytes: u64,
     // #17c walker complet: A10 multi-field side-table (PRENOM.raw etc.).
     pub subfield_values_bytes: u64,
+    // Plan segments S5: per-term CSR/directory metadata (offsets,
+    // block_offsets, segment_descriptors, block_directory,
+    // block_dir_offsets) — see `surch_index::memory::MemoryUsage`'s
+    // `postings_directory_bytes` doc comment.
+    pub postings_directory_bytes: u64,
     pub total_bytes: u64,
 }
 
@@ -423,6 +435,7 @@ impl From<MemoryUsage> for MemoryReport {
             postings_capacity_slack_bytes: value.postings_capacity_slack_bytes,
             postings_builder_bytes: value.postings_builder_bytes,
             subfield_values_bytes: value.subfield_values_bytes,
+            postings_directory_bytes: value.postings_directory_bytes,
             total_bytes: value.total_bytes(),
         }
     }
