@@ -83,6 +83,15 @@ indexées par `doc_id − doc_base` (compatible : plages contiguës).
   doc_len — + id_maps globales) = la **maladie B**. Extrapolé 28M ≈ ~12,6 GiB resident → confirme S5
   comme lift existentiel ; le smoke S3.5 (28M@16g) devrait passer SANS S5 (12,6 < 16g) — à mesurer.
 
+## 🏆 S3 MERGÉ + S3.5 SMOKE PASS (2026-07-06, sha ac3f12a) — SURCH SERT LE FULL 28,9M (1re fois)
+- S3 CI verte 1er coup (parité 3-voies mono/multi/mergé) ; oracle-local merges actifs 0 divergence.
+- **SMOKE 28M@16g (budget 256M, fanin 8) : count COMPLET 28 917 511**, 22 388 doc/s (parité ES 22 719 —
+  et NOS doc/s incluent les merges inline, per C6), **RSS 6,95 GiB vs ES 10,26 (0,68×)**, latence
+  **0,38/0,49/0,57 ms vs ES 0,91/1,41/2,03 (~2,5-3,5×)**, disque 15,4 vs 11,6 GiB (1,33× — write-amp).
+- Resident réel BIEN sous l'extrapolation maladie B (6,95 mesuré vs ~12,6 projeté) : colonnes locales
+  doc_base + FoR page-cache évictable font mieux que prévu. Sweep plancher 28M (8g/4g) pour le verdict
+  mémoire-constante complet ; S5 reste pertinent pour viser ≤4g (plancher ES).
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
