@@ -127,6 +127,14 @@ même < ES@4g 3,24 !), 23,2k doc/s, latence 0,37/0,55/0,73 ms. Le refresh final 
 append-only par tranches (SURCH_DENSIFY_BUDGET_DOCS) + FST de merge streaming. Test @4g (= plancher ES)
 en cours — s'il passe, parité de plancher au full corpus.
 
+## 📊 PLANCHER 28M FINAL (session 2026-07-06) : ]4g, 8g]
+@4g : OOM à 27,1M/28,9M (94%) avec budgets 256M/1M ; budgets resserrés 128M/500k = PIRE (mort à 19M —
+plus de segments → plus de merges → le transient du MERGE des grands tiers est le mur : les colonnes
+résidentes du segment fusionné ~28M se construisent pendant le merge). Piste suivante identifiée :
+S3b copie verbatim (merge quasi-I/O-bound) et/ou plafonner la taille de segment mergé (cap tier).
+**Verdict full corpus à ce jour : plancher surch 8g (RSS steady 3,10 GiB) vs ES ≤4g (RSS 3,24) —
+écart ≤2× ; à 8g surch bat ES sur RAM steady, latence (2,5-3,5×) et débit (parité, merges inclus).**
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
