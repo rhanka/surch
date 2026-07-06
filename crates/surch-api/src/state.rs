@@ -2859,33 +2859,22 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
-        // Plan segments S2: `subfield_values_maps()` walks every sealed
-        // segment; `SubfieldColumn::iter()` yields `doc_id`s LOCAL to
-        // their owning segment (see `surch_index::Segment`'s doc), so
-        // each is translated back to a GLOBAL id (`local + doc_base`)
-        // before `uid_for_doc_id` — which only ever resolves globals —
-        // is called. With one segment `doc_base == 0`, so this is
-        // bit-identical to the pre-S2 single-map walk.
-        let mut found = false;
+        // Plan segments S5c (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+        // §S5c): `DocumentIndex::subfield_projection` now owns the
+        // "walk every sealed segment, materialize a disk-spilled column,
+        // translate its LOCAL doc_ids back to GLOBAL" plumbing (it needs
+        // the owning segment's `subfield_segment` file handle, which
+        // `subfield_values_maps()` never exposed cross-crate) — this
+        // layer only maps the GLOBAL doc_id to the public `_id`, exactly
+        // as before.
+        let pairs = data.index.subfield_projection(field_path)?;
         let mut projection = BTreeMap::new();
-        for (doc_base, map) in data.index.subfield_values_maps() {
-            let Some(column) = map.get(field_path) else {
-                continue;
-            };
-            found = true;
-            // Lot C Phase 1 lever 2: `column.iter()` yields owned `doc_id: u32`
-            // (dense-array index) + borrowed `&str` (dict-interned, zero-copy)
-            // instead of the previous `BTreeMap<u32, String>::iter()` pairs of
-            // borrowed `&u32`/`&String` — same ascending-doc_id, absent-omitted
-            // contract, so the resulting projection is unchanged.
-            for (local_doc_id, value) in column.iter() {
-                let doc_id = doc_base + local_doc_id;
-                if let Some(public_id) = data.uid_for_doc_id(doc_id) {
-                    projection.insert(public_id.to_string(), value.to_owned());
-                }
+        for (doc_id, value) in pairs {
+            if let Some(public_id) = data.uid_for_doc_id(doc_id) {
+                projection.insert(public_id.to_string(), value);
             }
         }
-        found.then_some(projection)
+        Some(projection)
     }
 
     pub fn index_metadata(&self, index: &str) -> Option<IndexMetadata> {
@@ -4271,6 +4260,23 @@ impl AppState {
             .indices
             .get(index)
             .map(|data| data.index.postings_segment_skipped_terms())
+    }
+
+    /// Plan segments S5c : taille on-disk des segments de spill sub-field
+    /// (`surch_index_disk_subfield_values_bytes`), ecrite par
+    /// `Segment::seal_subfield_columns` (batché par colonne). Meme
+    /// pattern que `index_disk_postings_bytes` (materialise le FST en
+    /// attente avant de lire, pour refleter le dernier scellement).
+    pub fn index_disk_subfield_values_bytes(&self, index: &str) -> Option<u64> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.index.subfield_segment_bytes())
     }
 
     /// Doc count for `index`. Returns `None` for an unknown index, so
