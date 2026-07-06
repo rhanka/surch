@@ -1,7 +1,7 @@
 //! Plan segments S2 gate
 //! (`docs/paper/design-segments-pic-borne-2026-07-05.md`): flush-by-budget
-//! must produce REAL multi-segment indexing (`DocumentIndex::segments.len()
-//! > 1`) while staying BIT-IDENTICAL — same doc-id sets, same BM25 scores,
+//! must produce REAL multi-segment indexing (`DocumentIndex::segments.len()`
+//! exceeding 1) while staying BIT-IDENTICAL — same doc-id sets, same BM25 scores,
 //! same ranking order — to the mono-segment engine (`SURCH_FLUSH_BUDGET_BYTES`
 //! unset, the S1 reversibility flag).
 //!
@@ -53,7 +53,11 @@ fn corpus_chunks() -> Vec<String> {
                 1 => "beta widget",
                 _ => "gamma gadget",
             };
-            let category = if doc_id % 2 == 0 { "tools" } else { "toys" };
+            let category = if doc_id.is_multiple_of(2) {
+                "tools"
+            } else {
+                "toys"
+            };
             out.push_str(&format!(
                 "{{\"index\":{{\"_id\":\"{doc_id}\"}}}}\n\
                  {{\"title\":\"{title}\",\"category\":\"{category}\",\"body\":\"common lorem ipsum doc{doc_id}\"}}\n"
