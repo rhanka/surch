@@ -115,6 +115,12 @@ Oracle 0 divergence (merges actifs). fair-ab 1,36M @1536m : **RSS 618 → 363,6 
 À 1,36M mémoire constante 1536m : **RSS surch 0,27× ES.** Prochain : plancher 28M re-mesuré (@8g), puis
 S5c subfields (80 MiB) + S5d fst (49).
 
+## ✅ S5c MERGÉ + GATES PASS (sha 2a83d04) — subfields spillés
+Oracle 0 div. fair-ab 1,36M @1536m : **RSS 363,6 → 187 MiB (−177)**, 27,1k doc/s (↑), lat 0,34/0,51/0,59.
+**Trajectoire RSS @1536m : 618 (S2) → 364 (S5b) → 187 MiB (S5c) = 0,14× ES.**
+28M : bulk ENTIER passe @8g (28,9M indexés) mais **OOM au refresh final** = transient C1 (densify
+double-détention/overlay O(corpus) + FST du grand merge en RAM) → fix C1 en cours, PUIS re-test @8g/@4g.
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
