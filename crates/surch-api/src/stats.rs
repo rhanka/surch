@@ -37,6 +37,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     let disk_segment_peak_bytes = state.index_disk_segment_peak_bytes(index).unwrap_or(0);
     let disk_postings_bytes = state.index_disk_postings_bytes(index).unwrap_or(0);
     let disk_postings_skipped_terms = state.index_disk_postings_skipped_terms(index).unwrap_or(0);
+    let disk_subfield_values_bytes = state.index_disk_subfield_values_bytes(index).unwrap_or(0);
     let segment_count = state.index_segment_count(index);
     set_gauges(
         index,
@@ -48,6 +49,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         disk_segment_peak_bytes,
         disk_postings_bytes,
         disk_postings_skipped_terms,
+        disk_subfield_values_bytes,
         segment_count,
     );
     refresh_process_memory_gauges();
@@ -275,7 +277,7 @@ pub fn refresh_jemalloc_purge() {}
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
-    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0, 0, 0);
+    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Internal gauge-fan-out helper: one positional arg per Prometheus gauge
@@ -294,6 +296,7 @@ fn set_gauges(
     disk_segment_peak_bytes: u64,
     disk_postings_bytes: u64,
     disk_postings_skipped_terms: u64,
+    disk_subfield_values_bytes: u64,
     segment_count: usize,
 ) {
     let label = [("index", index.to_owned())];
@@ -345,8 +348,17 @@ fn set_gauges(
     // dans `MemoryUsage` mais jamais exposée en gauge (suspect #2 confirmé
     // sur deces : 426 MiB = ~10 % du RSS). Inclut tous les `.raw`
     // subfields (PRENOM.raw + NOM.raw côté matchID).
+    // Plan segments S5c : `dict`+`codes` de chaque `SubfieldColumn` sont
+    // spillés dans un segment pread partagé par segment sous
+    // SURCH_POSTINGS_DISK (même flag que S5a/S5b, pas de nouveau knob) —
+    // cette gauge doit lire ~0 flag on (colonnes vidées, voir
+    // `SubfieldColumn::spill`) ; les octets déplacés apparaissent dans
+    // `surch_index_disk_subfield_values_bytes` ci-dessous (footprint
+    // disque/page-cache, PAS de la RAM).
     metrics::gauge!("surch_index_subfield_values_bytes", &label)
         .set(usage.subfield_values_bytes as f64);
+    metrics::gauge!("surch_index_disk_subfield_values_bytes", &label)
+        .set(disk_subfield_values_bytes as f64);
     // #17c walker complet : live_docs BTreeSet<u32>.
     metrics::gauge!("surch_index_live_docs_bytes", &label).set(usage.live_docs_bytes as f64);
     // Plan segments S5 : per-term CSR/directory metadata RÉSIDENTE

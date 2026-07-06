@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -110,6 +111,175 @@ impl LiveDocsBitset {
         (self.bits.capacity() * std::mem::size_of::<u64>()) as u64
     }
 }
+
+/// Plan segments **S5c** (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §S5c, following the S5a/S5b template — see `crate::postings`'s
+/// `postings_segment` module doc for the shared rationale): append-only,
+/// `pread`-addressed tempfile backing every disk-spilled [`SubfieldColumn`]
+/// of ONE sealed [`Segment`]. A single file is shared by every sub-field
+/// path that segment declares (a handful of `.raw`/`.norm` columns per
+/// index in practice), never one file per column.
+///
+/// SAFE positional I/O only (`FileExt::write_all_at`/`read_exact_at` — no
+/// `mmap`, no `posix_fallocate`), keeping `#![forbid(unsafe_code)]` intact.
+/// Writes are BATCHED PER COLUMN ([`SubfieldColumn::spill`], ONE `append()`
+/// per path — a handful of calls per segment seal, never per document):
+/// the historical `C0` attempt (commit `af94e52`, reverted the same day)
+/// instead called `append` once per VALUE from `merge_analyzed` — 5.46 M+
+/// syscalls on the deces 1.36 M corpus, -43 % indexation throughput. That
+/// regression is structurally impossible here: nothing calls `append` from
+/// the write path (`merge_analyzed`/`SubfieldColumn::set`) — only
+/// [`Segment::seal_subfield_columns`], once a column is fully built and
+/// about to become read-only.
+#[cfg(unix)]
+mod subfield_segment {
+    use std::{
+        fs::{File, OpenOptions},
+        os::unix::fs::FileExt,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    /// Logical pre-extension chunk for the segment file, in bytes — same
+    /// safe `set_len` (ftruncate) pre-extension idiom as
+    /// `postings::postings_segment`, NOT `posix_fallocate` (`unsafe`).
+    const EXTEND_CHUNK: u64 = 64 * 1024 * 1024;
+
+    /// Unique tempfile name, same scheme as `postings::postings_segment`
+    /// (pid + a process-global sequence + wall-clock nanos), distinct
+    /// filename prefix so the two segment kinds never collide on disk.
+    fn next_temp_path() -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("surch-subfields-{pid}-{seq}-{nanos}.dat"))
+    }
+
+    /// Append-only, `pread`-addressed sub-field segment — see the module
+    /// doc above for the on-disk layout and the batching contract.
+    #[derive(Debug)]
+    pub(crate) struct SubfieldSegment {
+        file: File,
+        next_offset: u64,
+        extended_len: u64,
+        path: PathBuf,
+    }
+
+    impl SubfieldSegment {
+        /// Best-effort constructor: NEVER panics — a SHADOW/best-effort
+        /// feature must not be able to crash indexation. Returns `None` on
+        /// any I/O failure (unwritable `TMPDIR`, `ENOSPC`, permissions…):
+        /// the caller then keeps every column fully resident, exactly as
+        /// if this feature did not exist.
+        pub(crate) fn try_new() -> Option<Self> {
+            let path = next_temp_path();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .ok()?;
+            Some(Self {
+                file,
+                next_offset: 0,
+                extended_len: 0,
+                path,
+            })
+        }
+
+        /// Pre-extend the file's logical length past `write_end` in
+        /// `EXTEND_CHUNK` steps via the safe `File::set_len`. Failure is
+        /// non-fatal: the next write falls back to ordinary per-write
+        /// extension (slower, still correct).
+        fn ensure_capacity(&mut self, write_end: u64) {
+            if write_end <= self.extended_len {
+                return;
+            }
+            let mut new_len = self.extended_len;
+            while new_len < write_end {
+                new_len = new_len.saturating_add(EXTEND_CHUNK);
+            }
+            if self.file.set_len(new_len).is_ok() {
+                self.extended_len = new_len;
+            }
+        }
+
+        /// Append `bytes` as ONE positional write, returning the
+        /// segment-absolute byte offset the payload now starts at, or
+        /// `None` if the write failed. Callers batch a whole column's
+        /// `dict`+`codes` payload into one `Vec<u8>` before calling this
+        /// (see [`SubfieldColumn::spill`]) — never one write per value.
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> Option<u64> {
+            let offset = self.next_offset;
+            self.ensure_capacity(offset.saturating_add(bytes.len() as u64));
+            self.file.write_all_at(bytes, offset).ok()?;
+            self.next_offset = offset.saturating_add(bytes.len() as u64);
+            Some(offset)
+        }
+
+        /// Read `length` bytes at `offset` via `pread`. Returns `None` on
+        /// any I/O failure instead of panicking (best-effort read, see
+        /// [`SubfieldColumn::materialized`]).
+        pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
+            let mut buf = vec![0u8; length as usize];
+            self.file.read_exact_at(&mut buf, offset).ok()?;
+            Some(buf)
+        }
+
+        /// Total bytes appended so far — feeds the disk-footprint gauge
+        /// (`surch_index_disk_subfield_values_bytes`, mirrors
+        /// `postings::TermDictionary::postings_segment_bytes`).
+        pub(crate) fn bytes_written(&self) -> u64 {
+            self.next_offset
+        }
+    }
+
+    impl Drop for SubfieldSegment {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Non-Unix fallback (Windows / unusual dev hosts): the same API backed by
+/// an in-RAM buffer — mirrors `postings::postings_segment`'s fallback so
+/// the crate keeps building on non-Linux dev hosts.
+#[cfg(not(unix))]
+mod subfield_segment {
+    #[derive(Debug, Default)]
+    pub(crate) struct SubfieldSegment {
+        buf: Vec<u8>,
+    }
+
+    impl SubfieldSegment {
+        pub(crate) fn try_new() -> Option<Self> {
+            Some(Self::default())
+        }
+
+        pub(crate) fn append(&mut self, bytes: &[u8]) -> Option<u64> {
+            let offset = self.buf.len() as u64;
+            self.buf.extend_from_slice(bytes);
+            Some(offset)
+        }
+
+        pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
+            let start = usize::try_from(offset).ok()?;
+            let end = start.checked_add(length as usize)?;
+            self.buf.get(start..end).map(<[u8]>::to_vec)
+        }
+
+        pub(crate) fn bytes_written(&self) -> u64 {
+            self.buf.len() as u64
+        }
+    }
+}
+
+use subfield_segment::SubfieldSegment;
 
 #[derive(Debug, Clone)]
 pub struct DocumentIndex {
@@ -348,6 +518,70 @@ struct Segment {
     /// Meaningless (`0`) for the currently-active (not yet sealed)
     /// segment — nothing reads it until sealing sets it.
     doc_count: u32,
+    /// Plan segments S5c: shared, `pread`-addressed file backing every
+    /// disk-spilled column of `subfield_values` (`None` while the column
+    /// is being written, while `SURCH_POSTINGS_DISK` is off, or if no
+    /// column of this segment was actually spilled — see
+    /// [`Self::seal_subfield_columns`]). Exactly one instance per sealed
+    /// segment, `Arc`-shared the same way `TermDictionary::postings_segment`
+    /// is, dropped (and its tempfile removed) once no `Segment` still
+    /// references it.
+    subfield_segment: Option<Arc<SubfieldSegment>>,
+}
+
+impl Segment {
+    /// Plan segments S5c (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §S5c): finalize (clear write-time interning, matches every other
+    /// sealed segment's contract) and, best-effort, disk-back every column
+    /// of `self.subfield_values` into ONE shared per-segment file. Shared
+    /// by the ordinary seal path
+    /// (`DocumentIndex::materialize_active_segment_terms`) and the S3
+    /// merge path (`DocumentIndex::merge_segments_run`) so the on-disk
+    /// layout has a single producer.
+    ///
+    /// Idempotent: calling this twice on an already-sealed segment is a
+    /// strict no-op — every column's `intern_index` is already empty, and
+    /// the `needs_spill` gate below sees nothing left to spill, so no file
+    /// is even created (a `_refresh` with no write in between must not
+    /// churn a tempfile per call).
+    ///
+    /// A segment that ALREADY holds a `subfield_segment` file never spills
+    /// again either: its spilled columns' descriptors point into THAT
+    /// file, and replacing it with a fresh one would silently corrupt
+    /// their offsets. (Unreachable anyway — a sealed segment never gains
+    /// new column data, see [`SubfieldColumn::set`]'s guard — but the gate
+    /// makes the corruption structurally impossible rather than merely
+    /// unreached.)
+    ///
+    /// `disk_enabled == false` (the flag-off default) makes this exactly
+    /// the historical `column.finalize()` loop: no file is even created,
+    /// every column stays fully resident, bit-identical to before this
+    /// feature existed.
+    fn seal_subfield_columns(&mut self, disk_enabled: bool) {
+        let needs_spill = disk_enabled
+            && self.subfield_segment.is_none()
+            && self
+                .subfield_values
+                .values()
+                .any(|column| column.disk.is_none() && !column.dict.is_empty());
+        let mut store = if needs_spill {
+            SubfieldSegment::try_new()
+        } else {
+            None
+        };
+        let mut any_spilled = false;
+        for column in self.subfield_values.values_mut() {
+            column.finalize();
+            if let Some(store) = store.as_mut() {
+                if column.spill(store) {
+                    any_spilled = true;
+                }
+            }
+        }
+        if any_spilled {
+            self.subfield_segment = store.map(Arc::new);
+        }
+    }
 }
 
 /// Lot C Phase 1 lever 2: dense, dict-interned column backing
@@ -380,11 +614,60 @@ struct Segment {
 /// MUST stay `ABSENT`, never an interned empty string — sort/agg parity
 /// with the ES oracle depends on distinguishing "no value" from "empty
 /// string value" (flagged in the Lot C Phase 1 lever 2 triple consensus).
+///
+/// Plan segments **S5c** (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §S5c): once a segment is sealed, `dict`+`codes` are BOTH
+/// `O(corpus)`-adjacent RESIDENT arrays — `codes` is genuinely `O(docs ×
+/// columns)` (a dense, doc-indexed array; the "maladie B" driver this
+/// whole S5 lift targets), while `dict` is `O(distinct values)`, bounded
+/// by the real-world vocabulary (surnames/communes/dates saturate long
+/// before the corpus does) rather than by doc count. Every real consumer
+/// (`DocumentIndex::subfield_projection`'s sort/agg reader, the S3 merge)
+/// reads the WHOLE column in one sequential pass, never a single random
+/// `doc_id` — see the design doc's access-pattern study — so `dict` and
+/// `codes` are spilled TOGETHER, in one batched `append()` per column
+/// ([`Self::spill`]), rather than splitting them across two files/regions:
+/// they are always consumed together, and `dict` is small enough that
+/// separating it would only add bookkeeping for no query-time benefit.
+/// `disk` records the resulting `pread` descriptor; `dict`/`codes` are
+/// then emptied (`Vec::new()`, 0 bytes) and every read goes through
+/// [`Self::materialized`] instead.
 #[derive(Debug, Default, Clone)]
 pub struct SubfieldColumn {
     dict: Vec<Box<str>>,
     codes: Vec<u32>,
     intern_index: HashMap<Box<str>, u32>,
+    /// `Some(_)` once this column's `dict`+`codes` have been spilled (see
+    /// [`Self::spill`]) — `None` is the flag-off default AND the state of
+    /// every column still being written to (a column is only ever spilled
+    /// once, at seal time, by [`Segment::seal_subfield_columns`]).
+    disk: Option<SubfieldColumnDisk>,
+}
+
+/// Plan segments S5c: `pread` descriptor for one disk-spilled
+/// [`SubfieldColumn`]. All fields are `u32`/`u64` SCALARS — O(1) per
+/// column (a handful of `.raw`/`.norm` paths per index), never O(docs) or
+/// O(distinct values): this descriptor is the ENTIRE resident cost of a
+/// spilled column.
+#[derive(Debug, Clone, Copy, Default)]
+struct SubfieldColumnDisk {
+    /// Segment-absolute byte offset of the `(dict_len + 1)`-entry `u32`
+    /// LE CSR offsets table (`dict_offsets[i]..dict_offsets[i+1]` spans
+    /// dict entry `i`'s bytes inside `dict_bytes`).
+    dict_offsets_base: u64,
+    /// Number of distinct values (`dict.len()` at spill time).
+    dict_len: u32,
+    /// Segment-absolute byte offset of the concatenated UTF-8 dict bytes.
+    dict_bytes_base: u64,
+    /// Total byte length of the concatenated dict bytes.
+    dict_bytes_len: u32,
+    /// Segment-absolute byte offset of the `codes` table (`codes_len` LE
+    /// `u32` entries, same values `SubfieldColumn::codes` held —
+    /// `ABSENT` sentinel included).
+    codes_base: u64,
+    /// Number of `u32` entries in the codes table (`codes.len()` at spill
+    /// time).
+    codes_len: u32,
 }
 
 impl SubfieldColumn {
@@ -398,6 +681,19 @@ impl SubfieldColumn {
     /// previous length and `doc_id` that has no explicit `set()` call
     /// stays `ABSENT`.
     fn set(&mut self, doc_id: u32, value: String) {
+        // Plan segments S5c: writing into an already-spilled column would
+        // be silently INVISIBLE to reads (`materialized` ignores the
+        // resident `dict`/`codes` once `disk` is `Some`). Unreachable by
+        // the same guarantee that makes `finalize()`'s intern-index drop
+        // safe (the first write after ANY seal targets either a FRESH
+        // active segment's brand-new column, or follows a full
+        // `DocumentIndex::clear()` — see `finalize()`'s doc comment), so
+        // this is a loud debug-build guard, not a release branch.
+        debug_assert!(
+            self.disk.is_none(),
+            "SubfieldColumn::set on a disk-spilled (sealed) column — writes must \
+             target the fresh active segment's own column"
+        );
         let code = self.intern(value);
         let idx = doc_id as usize;
         if idx >= self.codes.len() {
@@ -470,8 +766,165 @@ impl SubfieldColumn {
     /// segment's own brand-new column (`entry(path).or_default()` on an
     /// empty map), never this sealed one — a sealed segment's columns are
     /// immutable for the rest of their life.
+    ///
+    /// Plan segments S5c: called from [`Segment::seal_subfield_columns`]
+    /// (the single place that now seals a segment's whole
+    /// `subfield_values` map), immediately before that same call
+    /// best-effort attempts [`Self::spill`] — `intern_index` must already
+    /// be empty by the time `spill` runs so its byte accounting
+    /// (`memory_bytes`) is exact.
     fn finalize(&mut self) {
         self.intern_index = HashMap::new();
+    }
+
+    /// Plan segments S5c (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §S5c, following the S5a/S5b template): best-effort disk-back the
+    /// WHOLE column (`dict` + `codes`) into `store` with exactly ONE
+    /// `append()` call. The C0 lesson (commit `af94e52`, reverted the same
+    /// day: one `pwrite` PER VALUE cost -43 % indexation throughput) is
+    /// why this is called ONCE PER COLUMN, only from
+    /// [`Segment::seal_subfield_columns`] at seal time — never from the
+    /// write path (`merge_analyzed`/[`Self::set`]).
+    ///
+    /// Layout: `[dict_offsets: (dict.len()+1) × u32 LE CSR] [dict_bytes:
+    /// UTF-8, concatenated] [codes: codes.len() × u32 LE]`. The three
+    /// region boundaries are cheap scalars kept resident in
+    /// [`SubfieldColumnDisk`] — O(columns), not O(corpus).
+    ///
+    /// No-op (`false`, stays fully resident) when already spilled or
+    /// empty (nothing to gain — an empty column costs 0 bytes already).
+    /// On an `append` failure the column ALSO stays resident: best-effort,
+    /// matches `postings::persist_or_keep_term_directory`'s contract — a
+    /// disk-back feature must never lose data or panic.
+    fn spill(&mut self, store: &mut subfield_segment::SubfieldSegment) -> bool {
+        if self.disk.is_some() || self.dict.is_empty() {
+            return false;
+        }
+        // The descriptor's length fields — and [`SubfieldSegment::read`]'s
+        // `length` parameter — are `u32`: a column whose dict bytes,
+        // offsets-table bytes (`(dict.len()+1) × 4`) or codes-table bytes
+        // (`codes.len() × 4`) could not round-trip through a `u32` must
+        // REFUSE to spill (stay resident, still correct) rather than
+        // saturate the offsets below into a blob [`Self::read_spilled`]
+        // could never read back whole. Unreachable on real corpora (a
+        // segment's codes are bounded by its own doc_count, and gigabytes
+        // of DISTINCT value bytes in one column dwarf every observed
+        // dict), so this is a guard, not a branch that ever costs
+        // anything.
+        let max_u32 = u32::MAX as usize;
+        let dict_total_bytes: usize = self.dict.iter().map(|value| value.len()).sum();
+        if dict_total_bytes > max_u32
+            || self.dict.len() >= max_u32 / 4
+            || self.codes.len() > max_u32 / 4
+        {
+            return false;
+        }
+        let mut dict_offsets: Vec<u32> = Vec::with_capacity(self.dict.len() + 1);
+        let mut dict_bytes: Vec<u8> = Vec::new();
+        let mut offset = 0u32;
+        dict_offsets.push(0);
+        for value in &self.dict {
+            offset = offset.saturating_add(value.len() as u32);
+            dict_offsets.push(offset);
+            dict_bytes.extend_from_slice(value.as_bytes());
+        }
+        let codes_len = self.codes.len();
+        let mut blob = Vec::with_capacity(
+            dict_offsets
+                .len()
+                .saturating_mul(4)
+                .saturating_add(dict_bytes.len())
+                .saturating_add(codes_len.saturating_mul(4)),
+        );
+        for entry in &dict_offsets {
+            blob.extend_from_slice(&entry.to_le_bytes());
+        }
+        blob.extend_from_slice(&dict_bytes);
+        for &code in &self.codes {
+            blob.extend_from_slice(&code.to_le_bytes());
+        }
+        let Some(base) = store.append(&blob) else {
+            return false;
+        };
+        let dict_offsets_len = (dict_offsets.len() as u64).saturating_mul(4);
+        let dict_bytes_base = base.saturating_add(dict_offsets_len);
+        let codes_base = dict_bytes_base.saturating_add(dict_bytes.len() as u64);
+        self.disk = Some(SubfieldColumnDisk {
+            dict_offsets_base: base,
+            dict_len: self.dict.len() as u32,
+            dict_bytes_base,
+            dict_bytes_len: dict_bytes.len() as u32,
+            codes_base,
+            codes_len: codes_len as u32,
+        });
+        self.dict = Vec::new();
+        self.codes = Vec::new();
+        true
+    }
+
+    /// Plan segments S5c: resident-or-`pread` accessor — mirrors
+    /// `postings::FieldPostings::term_entry`'s single-accessor pattern.
+    /// Returns a zero-copy borrow when this column was never spilled
+    /// (`disk.is_none()`: the flag-off default, or a column too small to
+    /// have been spilled), otherwise reads the WHOLE `dict`+`codes` blob
+    /// back with exactly THREE grouped `pread`s (offsets, dict bytes,
+    /// codes — never one `pread` per value): matches the full-column-scan
+    /// access pattern of every real consumer
+    /// (`DocumentIndex::subfield_projection`'s sort/agg reader and the S3
+    /// merge, see the design doc's §S5c access-pattern study). A `pread`
+    /// failure (file gone, truncated…) degrades to an EMPTY column
+    /// (`Cow::Owned(SubfieldColumn::default())`) rather than panicking —
+    /// same best-effort contract as every other disk-backed read in this
+    /// crate. `store` is `None` when the owning segment's file failed to
+    /// open or disk-back is off, in which case a spilled column cannot
+    /// legitimately exist in practice.
+    fn materialized(
+        &self,
+        store: Option<&subfield_segment::SubfieldSegment>,
+    ) -> Cow<'_, SubfieldColumn> {
+        let Some(disk) = self.disk else {
+            return Cow::Borrowed(self);
+        };
+        let rebuilt = store
+            .and_then(|store| Self::read_spilled(disk, store))
+            .unwrap_or_default();
+        Cow::Owned(rebuilt)
+    }
+
+    /// Decode a spilled column's blob back into an owned, fully resident
+    /// [`SubfieldColumn`] (`disk: None`) — the inverse of [`Self::spill`].
+    /// Returns `None` on any I/O or decode failure (truncated file,
+    /// corrupt length…), letting the caller fall back to an empty column
+    /// rather than panicking.
+    fn read_spilled(
+        disk: SubfieldColumnDisk,
+        store: &subfield_segment::SubfieldSegment,
+    ) -> Option<SubfieldColumn> {
+        let offsets_len = u32::try_from((u64::from(disk.dict_len) + 1).saturating_mul(4)).ok()?;
+        let offsets_bytes = store.read(disk.dict_offsets_base, offsets_len)?;
+        let dict_bytes = store.read(disk.dict_bytes_base, disk.dict_bytes_len)?;
+        let codes_bytes = store.read(disk.codes_base, disk.codes_len.saturating_mul(4))?;
+
+        let mut offsets = Vec::with_capacity(disk.dict_len as usize + 1);
+        for chunk in offsets_bytes.chunks_exact(4) {
+            offsets.push(u32::from_le_bytes(chunk.try_into().ok()?));
+        }
+        let mut dict = Vec::with_capacity(disk.dict_len as usize);
+        for window in offsets.windows(2) {
+            let (start, end) = (window[0] as usize, window[1] as usize);
+            let slice = dict_bytes.get(start..end)?;
+            dict.push(String::from_utf8(slice.to_vec()).ok()?.into_boxed_str());
+        }
+        let mut codes = Vec::with_capacity(disk.codes_len as usize);
+        for chunk in codes_bytes.chunks_exact(4) {
+            codes.push(u32::from_le_bytes(chunk.try_into().ok()?));
+        }
+        Some(SubfieldColumn {
+            dict,
+            codes,
+            intern_index: HashMap::new(),
+            disk: None,
+        })
     }
 
     /// Lot C Phase 1 lever 2 memory accounting: approximate heap bytes
@@ -483,6 +936,11 @@ impl SubfieldColumn {
     /// `intern_index`: duplicate `Box<str>` keys over the same distinct
     /// values as `dict`, plus a conservative per-entry hash-table
     /// overhead — bounded by `dict.len()`, negligible next to `codes`.
+    ///
+    /// Plan segments S5c: `dict`/`codes`/`intern_index` are all empty once
+    /// [`Self::spill`] succeeded, so this naturally reads ~0 for a spilled
+    /// column (just the tiny [`SubfieldColumnDisk`] descriptor, added
+    /// explicitly below for an exact count) — no separate branch needed.
     pub fn memory_bytes(&self) -> u64 {
         let box_str_header = std::mem::size_of::<Box<str>>() as u64;
         let dict_bytes: u64 = self
@@ -500,7 +958,12 @@ impl SubfieldColumn {
             .keys()
             .map(|value| intern_entry_overhead + value.len() as u64)
             .sum();
-        dict_bytes + codes_bytes + intern_bytes
+        let disk_descriptor_bytes = if self.disk.is_some() {
+            std::mem::size_of::<SubfieldColumnDisk>() as u64
+        } else {
+            0
+        };
+        dict_bytes + codes_bytes + intern_bytes + disk_descriptor_bytes
     }
 }
 
@@ -845,8 +1308,13 @@ impl DocumentIndex {
     /// check and the `_refresh` path can share it without duplicating the
     /// no-clone builder move.
     fn materialize_active_segment_terms(&mut self) {
+        // Plan segments S5c: resolved once, unconditionally — `terms`'s
+        // disk mode and `subfield_values`' disk-back share the SAME
+        // process flag (`SURCH_POSTINGS_DISK`, no new knob), so both
+        // producers of a sealed segment must agree on it regardless of
+        // which `if` branch below actually rebuilds `terms`.
+        let disk_enabled = self.resolved_postings_disk_enabled();
         if self.terms_dirty {
-            let disk_enabled = self.resolved_postings_disk_enabled();
             let builder = std::mem::replace(&mut self.postings_builder, PostingsBuilder::new());
             let new_terms = builder.build_with_disk_flag(disk_enabled);
             self.segment_mut().terms = new_terms;
@@ -855,9 +1323,7 @@ impl DocumentIndex {
         } else {
             self.postings_builder = PostingsBuilder::new();
         }
-        for column in self.segment_mut().subfield_values.values_mut() {
-            column.finalize();
-        }
+        self.segment_mut().seal_subfield_columns(disk_enabled);
     }
 
     /// Plan segments S2: if the active segment actually holds at least
@@ -1004,14 +1470,22 @@ impl DocumentIndex {
         let live_docs = merge_live_docs(run, merged_doc_base);
         let merged_segment_count = run.len();
 
-        let merged = Segment {
+        let mut merged = Segment {
             terms,
             field_stats,
             subfield_values,
             live_docs,
             doc_base: merged_doc_base,
             doc_count: merged_doc_count,
+            subfield_segment: None,
         };
+        // Plan segments S5c: the merged columns `merge_subfield_values`
+        // just built are fully resident (a fresh union/remap) regardless
+        // of whether the SOURCE segments were spilled — re-spill them into
+        // the merged segment's OWN file, same producer as the ordinary
+        // seal path (`Segment::seal_subfield_columns`), so a merged
+        // segment's memory footprint matches a freshly-sealed one.
+        merged.seal_subfield_columns(disk_enabled);
         self.segments
             .splice(start..end, std::iter::once(Arc::new(merged)));
 
@@ -1348,6 +1822,11 @@ impl DocumentIndex {
             segment.terms = TermDictionary::default();
             segment.field_stats.clear();
             segment.subfield_values.clear();
+            // Plan segments S5c: every column was just cleared, so any
+            // spilled file this segment held is now dead weight — drop it
+            // (removes the tempfile via `Drop`) rather than leaking it
+            // until the segment itself is replaced.
+            segment.subfield_segment = None;
             segment.doc_base = 0;
             segment.doc_count = 0;
         } else {
@@ -1722,6 +2201,23 @@ impl DocumentIndex {
             .sum()
     }
 
+    /// Plan segments S5c: raw disk-footprint of the sub-field spill
+    /// segments (`surch_index_disk_subfield_values_bytes`), summed over
+    /// every sealed segment — mirrors [`Self::postings_segment_bytes`]'s
+    /// pairing with `subfield_values_bytes`: deliberately NOT part of
+    /// [`crate::memory::MemoryUsage`] (these are bytes ON DISK/page-cache,
+    /// the RAM the same values used to occupy is exactly what
+    /// `subfield_values_bytes` stops counting once spilled — summing both
+    /// would double-count nothing, but they measure different axes: RAM
+    /// vs disk footprint).
+    pub fn subfield_segment_bytes(&self) -> u64 {
+        self.segments
+            .iter()
+            .filter_map(|s| s.subfield_segment.as_ref())
+            .map(|store| store.bytes_written())
+            .sum()
+    }
+
     /// #17c memory accounting: taille on-heap du `PostingsBuilder` retenu.
     /// Lot 1.5 garde le builder live entre rebuilds incrémentaux, donc
     /// pour 1.36 M docs ça peut peser GROS et n'était pas compté ailleurs.
@@ -1865,7 +2361,7 @@ impl DocumentIndex {
 
     /// A10 (Phase 4): stored projected value for `(field_path, doc_id)`.
     ///
-    /// Returns `Some(&str)` when `field_path` is a declared multi-field
+    /// Returns `Some(value)` when `field_path` is a declared multi-field
     /// sub-field (`parent.sub`) that was fanned out at write time for this
     /// doc, with the sub-field's analyzer/normalizer already applied. The
     /// query side uses this for `sort`/`agg`/`composite` on `.raw`/`.norm`
@@ -1877,11 +2373,23 @@ impl DocumentIndex {
     /// resolves the owning segment via `partition_point` over `doc_base`
     /// (segments are always kept in ascending `doc_base` order) before
     /// indexing locally. With exactly one segment `doc_base` is always
-    /// `0`, so the fast path below is the exact pre-S2 global lookup,
-    /// unchanged.
-    pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<&str> {
+    /// `0`, so the fast path below is the exact pre-S2 global lookup.
+    ///
+    /// Plan segments S5c: this is NOT a hot production path (grep-audited:
+    /// only this crate's own tests call it; the real sort/agg reader is
+    /// [`Self::subfield_projection`]), so it is allowed to pay a
+    /// materialize-then-copy cost on a spilled column — hence `Option<String>`
+    /// rather than the previous zero-copy `Option<&str>` (a borrow into a
+    /// column that may now be a locally-rebuilt temporary cannot outlive
+    /// this call).
+    pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<String> {
         if self.segments.len() == 1 {
-            return self.segment().subfield_values.get(field_path)?.get(doc_id);
+            let segment = self.segment();
+            let column = segment.subfield_values.get(field_path)?;
+            return column
+                .materialized(segment.subfield_segment.as_deref())
+                .get(doc_id)
+                .map(str::to_string);
         }
         let idx = self.segments.partition_point(|s| s.doc_base <= doc_id);
         if idx == 0 {
@@ -1889,7 +2397,11 @@ impl DocumentIndex {
         }
         let segment = &self.segments[idx - 1];
         let local = doc_id - segment.doc_base;
-        segment.subfield_values.get(field_path)?.get(local)
+        let column = segment.subfield_values.get(field_path)?;
+        column
+            .materialized(segment.subfield_segment.as_deref())
+            .get(local)
+            .map(str::to_string)
     }
 
     /// A10 (Phase 4): whether `field_path` carries write-time fanned-out
@@ -1928,6 +2440,39 @@ impl DocumentIndex {
             .iter()
             .map(|s| (s.doc_base, &s.subfield_values))
             .collect()
+    }
+
+    /// Plan segments S5c (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §S5c): GLOBAL `(doc_id, value)` pairs for `field_path` across every
+    /// sealed segment that declares it, transparently materializing any
+    /// disk-spilled [`SubfieldColumn`] (one bulk `pread` per source
+    /// segment via [`SubfieldColumn::materialized`], never one per doc —
+    /// matches the full-column-scan access pattern the design doc's §S5c
+    /// study found for `AppState::subfield_projection`'s sort/agg reader,
+    /// the sole production caller of this method). Returns `None` iff no
+    /// segment ever declared the path (mirrors [`Self::has_subfield_values`]).
+    ///
+    /// Replaces the historical pattern of the caller walking
+    /// [`Self::subfield_values_maps`] and calling `SubfieldColumn::iter()`
+    /// itself: that pattern cannot survive a spilled column (it has no way
+    /// to hand the owning segment's `subfield_segment` file handle back to
+    /// `iter()`), so the whole "resolve segment, materialize, offset
+    /// `doc_base`" plumbing now lives here, next to the segment/disk
+    /// internals it depends on.
+    pub fn subfield_projection(&self, field_path: &str) -> Option<BTreeMap<u32, String>> {
+        let mut found = false;
+        let mut projection = BTreeMap::new();
+        for segment in &self.segments {
+            let Some(column) = segment.subfield_values.get(field_path) else {
+                continue;
+            };
+            found = true;
+            let materialized = column.materialized(segment.subfield_segment.as_deref());
+            for (local_doc_id, value) in materialized.iter() {
+                projection.insert(segment.doc_base + local_doc_id, value.to_owned());
+            }
+        }
+        found.then_some(projection)
     }
 }
 
@@ -2012,9 +2557,19 @@ fn merge_field_stats(run: &[Arc<Segment>]) -> BTreeMap<String, FieldLengthStats>
 /// shared by several source segments' dictionaries collapses to ONE code
 /// in the merged column instead of concatenating raw code integers (which
 /// would be wrong the moment two source segments assigned the same code
-/// to two DIFFERENT values). `finalize()` at the end matches every other
-/// sealed segment's contract (`intern_index` empty — write-only, and a
-/// merged segment is sealed, never written to again).
+/// to two DIFFERENT values). The caller ([`DocumentIndex::merge_segments_run`])
+/// finalizes (and, best-effort, re-spills) every returned column via
+/// [`Segment::seal_subfield_columns`] — matches every other sealed
+/// segment's contract (`intern_index` empty — write-only, and a merged
+/// segment is sealed, never written to again).
+///
+/// Plan segments S5c: a SOURCE segment's own column may already be
+/// disk-spilled (`SURCH_POSTINGS_DISK` was on for the whole process
+/// lifetime the run's segments were sealed under, see the
+/// `debug_assert!` in `merge_segments_run`) — [`SubfieldColumn::materialized`]
+/// is called ONCE PER SOURCE SEGMENT PER PATH here (a bulk `pread`, not
+/// one per doc) before the per-doc loop below reads it, so this never
+/// pays one `pread` per value even when merging already-spilled sources.
 fn merge_subfield_values(run: &[Arc<Segment>]) -> BTreeMap<String, SubfieldColumn> {
     let mut paths: BTreeSet<&str> = BTreeSet::new();
     for segment in run {
@@ -2027,15 +2582,15 @@ fn merge_subfield_values(run: &[Arc<Segment>]) -> BTreeMap<String, SubfieldColum
         let mut run_offset: u32 = 0;
         for segment in run {
             if let Some(source) = segment.subfield_values.get(path) {
+                let materialized = source.materialized(segment.subfield_segment.as_deref());
                 for local in 0..segment.doc_count {
-                    if let Some(value) = source.get(local) {
+                    if let Some(value) = materialized.get(local) {
                         column.set(run_offset + local, value.to_string());
                     }
                 }
             }
             run_offset += segment.doc_count;
         }
-        column.finalize();
         merged.insert(path.to_string(), column);
     }
     merged
@@ -2385,7 +2940,10 @@ mod tests {
 
         assert!(index.has_subfield_values("NOM.raw"));
         // Whole value, lowercased + asciifolded, single keyword token.
-        assert_eq!(index.subfield_value("NOM.raw", 1), Some("etienne dupre"));
+        assert_eq!(
+            index.subfield_value("NOM.raw", 1).as_deref(),
+            Some("etienne dupre")
+        );
         // The parent field is untouched: no stored projection on "NOM".
         assert!(!index.has_subfield_values("NOM"));
         assert!(index.subfield_value("NOM", 1).is_none());
@@ -2523,7 +3081,10 @@ mod tests {
             .add_document_with_mapping(1, [("NOM", "Dupré Martin")], &mapping)
             .expect("doc 1");
 
-        assert_eq!(index.subfield_value("NOM.exact", 1), Some("Dupré Martin"));
+        assert_eq!(
+            index.subfield_value("NOM.exact", 1).as_deref(),
+            Some("Dupré Martin")
+        );
     }
 
     #[test]
@@ -2714,10 +3275,19 @@ mod tests {
 
         // Sub-field columns are LOCAL per segment; the public API takes a
         // GLOBAL doc_id and must route it through the right segment.
-        assert_eq!(index.subfield_value("NOM.raw", 0), Some("dupont martin"));
-        assert_eq!(index.subfield_value("NOM.raw", 1), Some("dupre"));
-        assert_eq!(index.subfield_value("NOM.raw", 2), Some("bernard"));
-        assert_eq!(index.subfield_value("NOM.raw", 3), Some("petit durand"));
+        assert_eq!(
+            index.subfield_value("NOM.raw", 0).as_deref(),
+            Some("dupont martin")
+        );
+        assert_eq!(index.subfield_value("NOM.raw", 1).as_deref(), Some("dupre"));
+        assert_eq!(
+            index.subfield_value("NOM.raw", 2).as_deref(),
+            Some("bernard")
+        );
+        assert_eq!(
+            index.subfield_value("NOM.raw", 3).as_deref(),
+            Some("petit durand")
+        );
         assert_eq!(
             index.subfield_value("NOM.raw", 4),
             None,
@@ -2814,8 +3384,11 @@ mod tests {
         assert_eq!(index.segment_count(), 3, "empty delta seals nothing");
 
         assert_eq!(index.doc_ids(), vec![0, 1]);
-        assert_eq!(index.subfield_value("NOM.raw", 0), Some("dupont"));
-        assert_eq!(index.subfield_value("NOM.raw", 1), Some("dupre"));
+        assert_eq!(
+            index.subfield_value("NOM.raw", 0).as_deref(),
+            Some("dupont")
+        );
+        assert_eq!(index.subfield_value("NOM.raw", 1).as_deref(), Some("dupre"));
     }
 
     #[test]
@@ -2852,8 +3425,11 @@ mod tests {
         assert_eq!(index.segments[0].doc_base, 0);
         assert!(!index.postings_disk_backed());
         assert_eq!(index.doc_ids(), vec![0, 1]);
-        assert_eq!(index.subfield_value("NOM.raw", 0), Some("dupont"));
-        assert_eq!(index.subfield_value("NOM.raw", 1), Some("dupre"));
+        assert_eq!(
+            index.subfield_value("NOM.raw", 0).as_deref(),
+            Some("dupont")
+        );
+        assert_eq!(index.subfield_value("NOM.raw", 1).as_deref(), Some("dupre"));
     }
 
     // ---------------------------------------------------------------------
@@ -3073,5 +3649,131 @@ mod tests {
                 "NOM.raw diverged RAM vs disk for doc {doc_id}"
             );
         }
+        // Plan segments S5c: same corpus, now via the FULL-COLUMN-SCAN
+        // accessor `AppState::subfield_projection` actually uses — must
+        // agree exactly with the per-doc accessor above.
+        assert_eq!(
+            ram.subfield_projection("NOM.raw"),
+            disk.subfield_projection("NOM.raw"),
+            "subfield_projection diverged RAM vs disk merged reads"
+        );
+        // White-box: prove this test actually exercised the spilled merge
+        // path (`merge_subfield_values` reading from an ALREADY-spilled
+        // source, since `build_merge_test_index(_, _, true)` spills at
+        // EVERY per-chunk seal before any cascade even runs), not a
+        // silent resident fallback — and that the merged segment itself
+        // was re-spilled by `Segment::seal_subfield_columns`.
+        assert!(
+            disk.subfield_segment_bytes() > 0,
+            "merged disk-enabled index must have spilled subfield bytes on disk"
+        );
+        assert_eq!(
+            ram.subfield_segment_bytes(),
+            0,
+            "RAM-mode index must never create a subfield segment file"
+        );
+        for segment in &disk.segments[..disk.segments.len() - 1] {
+            if let Some(column) = segment.subfield_values.get("NOM.raw") {
+                assert!(
+                    column.disk.is_some(),
+                    "every sealed segment's NOM.raw column must be spilled under disk_enabled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subfield_spill_is_transparent_across_a_plain_seal() {
+        // Plan segments S5c: NOT a merge scenario — exercises the ordinary
+        // seal path (`materialize_terms_and_finalize_postings` →
+        // `Segment::seal_subfield_columns`) directly on a mono-segment
+        // index, forcing exactly one real `_refresh` so the column is
+        // genuinely spilled (not merely finalized). Compares against a RAM
+        // oracle built from the SAME corpus with the flag off.
+        let mapping = nom_multi_field_mapping();
+        const DOC_COUNT: u32 = 30;
+
+        let build = |disk_enabled: bool| -> DocumentIndex {
+            let mut index = DocumentIndex::new();
+            // Pinned deterministic regardless of ambient env (same
+            // rationale as every other override in this module): forcing
+            // "no budget" keeps this a single-segment test, isolating the
+            // ordinary seal path from S3's merge path (covered separately
+            // by `merge_ram_and_disk_modes_produce_identical_reads`).
+            index.set_flush_budget_bytes_override(None);
+            index.set_postings_disk_enabled(disk_enabled);
+            for doc_id in 0..DOC_COUNT {
+                index
+                    .add_documents_with_mapping_deferred(
+                        [(doc_id, [("NOM", format!("Nom Numero {doc_id}"))])],
+                        &mapping,
+                    )
+                    .unwrap_or_else(|err| panic!("doc {doc_id}: {err:?}"));
+            }
+            index.materialize_terms_and_finalize_postings();
+            index
+        };
+
+        let ram = build(false);
+        let disk = build(true);
+        assert_eq!(ram.segment_count(), 1, "sanity: mono-segment RAM oracle");
+        assert_eq!(disk.segment_count(), 1, "sanity: mono-segment disk index");
+
+        // White-box: the disk-enabled index actually spilled — proves the
+        // parity checks below exercise the pread path, not a silent
+        // resident fallback.
+        let disk_segment = &disk.segments[0];
+        assert!(
+            disk_segment.subfield_segment.is_some(),
+            "disk-enabled seal must create a shared subfield segment file"
+        );
+        let disk_column = disk_segment
+            .subfield_values
+            .get("NOM.raw")
+            .expect("NOM.raw column present");
+        assert!(disk_column.disk.is_some(), "column must be spilled");
+        assert!(
+            disk_column.dict.is_empty() && disk_column.codes.is_empty(),
+            "resident dict/codes must be emptied once spilled"
+        );
+        let ram_segment = &ram.segments[0];
+        assert!(ram_segment.subfield_segment.is_none());
+        let ram_column = ram_segment
+            .subfield_values
+            .get("NOM.raw")
+            .expect("NOM.raw column present (ram)");
+        assert!(ram_column.disk.is_none());
+
+        // Parity: single-doc accessor.
+        for doc_id in 0..DOC_COUNT {
+            assert_eq!(
+                ram.subfield_value("NOM.raw", doc_id),
+                disk.subfield_value("NOM.raw", doc_id),
+                "NOM.raw diverged for doc {doc_id}"
+            );
+        }
+        // Parity: the full-column-scan accessor sort/agg actually uses.
+        assert_eq!(
+            ram.subfield_projection("NOM.raw"),
+            disk.subfield_projection("NOM.raw"),
+            "subfield_projection diverged flag on vs off"
+        );
+        assert!(
+            ram.subfield_projection("NOM.raw")
+                .is_some_and(|projection| projection.len() as u32 == DOC_COUNT),
+            "sanity: every doc has a NOM.raw value in this fixture"
+        );
+
+        // Gauge: resident bytes collapse, disk footprint appears — the
+        // `~0 (ou la moitié spillée)` gate from the design doc.
+        assert!(
+            disk_column.memory_bytes() < ram_column.memory_bytes(),
+            "spilled column ({} bytes) must be smaller than the resident \
+             one ({} bytes)",
+            disk_column.memory_bytes(),
+            ram_column.memory_bytes()
+        );
+        assert!(disk.subfield_segment_bytes() > 0);
+        assert_eq!(ram.subfield_segment_bytes(), 0);
     }
 }

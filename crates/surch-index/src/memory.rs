@@ -379,6 +379,71 @@ mod tests {
     }
 
     #[test]
+    fn subfield_values_bytes_collapses_when_disk_backed() {
+        // Plan segments S5c (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+        // §S5c): same fixture as the RAM test above, but with the
+        // disk-back flag pinned ON and a real seal (`_refresh`) so
+        // `Segment::seal_subfield_columns` actually spills the column.
+        // `subfield_values_bytes` must read well below the resident
+        // baseline afterwards (just the tiny `SubfieldColumnDisk`
+        // descriptor), while `DocumentIndex::subfield_segment_bytes`
+        // (the disk-footprint gauge, deliberately outside `MemoryUsage`)
+        // becomes positive — proof the bytes moved off-heap rather than
+        // vanished.
+        let mut subfields = std::collections::BTreeMap::new();
+        subfields.insert(
+            "raw".to_owned(),
+            FieldMapping::new(FieldType::Keyword, None)
+                .with_normalizer(Some(crate::mapping::AnalyzerName::Norm)),
+        );
+        let nom = FieldMapping::new(FieldType::Text, None).with_subfields(subfields);
+        let mut mapping = IndexMapping::new();
+        mapping.set_field_mapping("NOM", nom);
+
+        let build = |disk_enabled: bool| -> DocumentIndex {
+            let mut index = DocumentIndex::new();
+            index.set_flush_budget_bytes_override(None);
+            index.set_postings_disk_enabled(disk_enabled);
+            for doc_id in 0..50u32 {
+                index
+                    .add_documents_with_mapping_deferred(
+                        [(doc_id, [("NOM", format!("Nom Numero {doc_id}"))])],
+                        &mapping,
+                    )
+                    .unwrap_or_else(|err| panic!("doc {doc_id}: {err:?}"));
+            }
+            index.materialize_terms_and_finalize_postings();
+            index
+        };
+
+        let resident = build(false);
+        let spilled = build(true);
+
+        let resident_usage = document_index_memory_usage(&resident);
+        let spilled_usage = document_index_memory_usage(&spilled);
+        assert!(
+            resident_usage.subfield_values_bytes > 0,
+            "{resident_usage:?}"
+        );
+        assert!(
+            spilled_usage.subfield_values_bytes < resident_usage.subfield_values_bytes,
+            "spilled subfield_values_bytes ({}) should collapse well below \
+             the resident baseline ({})",
+            spilled_usage.subfield_values_bytes,
+            resident_usage.subfield_values_bytes
+        );
+        assert!(
+            spilled.subfield_segment_bytes() > 0,
+            "the disk-footprint gauge must reflect the bytes that moved off-heap"
+        );
+        assert_eq!(
+            resident.subfield_segment_bytes(),
+            0,
+            "flag off must never create a subfield segment file"
+        );
+    }
+
+    #[test]
     fn stored_fields_bytes_grows_with_payload_size() {
         let short = serde_json::json!({ "name": "a" });
         let long = serde_json::json!({ "name": "a much longer payload than the previous one" });
