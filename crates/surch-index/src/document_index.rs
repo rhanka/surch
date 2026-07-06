@@ -1666,11 +1666,14 @@ impl DocumentIndex {
     }
 
     /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
-    /// §"Dimensionnement S5"): per-term CSR/directory metadata bytes
-    /// (`offsets`, `block_offsets`, `segment_descriptors`, `block_directory`,
-    /// `block_dir_offsets`) that no other gauge counted before this — see
+    /// §"Dimensionnement S5"): RESIDENT per-term CSR/directory metadata
+    /// bytes (`offsets`, `block_offsets`, `segment_descriptors`,
+    /// `block_directory`, `block_dir_offsets`) that no other gauge counted
+    /// before this — see
     /// [`crate::postings::TermDictionary::postings_directory_bytes`] for
-    /// the full rationale. Summed over every sealed segment.
+    /// the full rationale (S5b spills all five under
+    /// `SURCH_POSTINGS_DISK`, so this reads ~0 with the flag on). Summed
+    /// over every sealed segment.
     pub fn postings_directory_bytes(&self) -> u64 {
         self.segments
             .iter()

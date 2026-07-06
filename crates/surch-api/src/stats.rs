@@ -349,11 +349,15 @@ fn set_gauges(
         .set(usage.subfield_values_bytes as f64);
     // #17c walker complet : live_docs BTreeSet<u32>.
     metrics::gauge!("surch_index_live_docs_bytes", &label).set(usage.live_docs_bytes as f64);
-    // Plan segments S5 : per-term CSR/directory metadata (offsets,
-    // block_offsets, segment_descriptors, block_directory,
+    // Plan segments S5 : per-term CSR/directory metadata RÉSIDENTE
+    // (offsets, block_offsets, segment_descriptors, block_directory,
     // block_dir_offsets) — le poste identifié comme le plus fort candidat
     // pour le gap ~295 MiB non gaugé mesuré à 1,36 M (cf. design doc §S5).
     // Scale avec le nombre de termes DISTINCTS, pas le nombre de docs.
+    // S5b : les 5 tableaux sont spillés dans le segment pread sous
+    // SURCH_POSTINGS_DISK (table TermEntry unifiée 28 o/terme) — cette
+    // gauge doit lire ~0 flag on ; les octets déplacés apparaissent dans
+    // surch_index_disk_postings_bytes (footprint disque, page cache).
     metrics::gauge!("surch_index_postings_directory_bytes", &label)
         .set(usage.postings_directory_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);
