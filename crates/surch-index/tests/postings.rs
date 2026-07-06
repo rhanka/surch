@@ -783,7 +783,7 @@ fn term_dictionary_fst_terms_returns_lex_sorted() {
 /// `OnceLock` cannot flip mid-process) and asserts every term's
 /// `decode_from_segment` result stays bit-identical between the resident
 /// array (flag off, UNCHANGED default) and the new disk-backed directory
-/// + one extra `pread` (flag on). The companion white-box test
+/// plus one extra `pread` (flag on). The companion white-box test
 /// `segment_descriptors_move_off_heap_when_disk_flag_is_on` (in
 /// `crates/surch-index/src/postings.rs`'s own `#[cfg(test)]` module, which
 /// has access to the private `FieldPostings` fields) covers the actual
