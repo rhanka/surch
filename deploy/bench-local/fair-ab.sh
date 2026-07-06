@@ -263,8 +263,8 @@ run_engine(){
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
 }
 
-run_engine es
-run_engine surch
+ENGINES="${ENGINES:-es surch}"   # ex: ENGINES=surch pour rejouer un seul moteur
+for _e in $ENGINES; do run_engine "$_e"; done
 
 log "=== SCORECARD ($MEM_LIMIT, $NDOCS docs, cpuset $CPUSET) ==="
 for e in es surch; do cat "$OUT_DIR/$e.json" 2>/dev/null; echo; done
