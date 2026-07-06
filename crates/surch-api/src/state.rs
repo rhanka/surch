@@ -2743,6 +2743,24 @@ impl AppState {
         }
     }
 
+    /// Plan segments S3b (design doc §S3b, "cap de taille de tier") test/ops
+    /// hook: pin `index`'s tiered-merge doc-count cap independently of the
+    /// process-wide `SURCH_MERGE_MAX_DOCS` env var (same
+    /// `OnceLock`-cannot-flip-mid-run rationale as
+    /// [`Self::set_flush_budget_bytes_override`]). `Some(docs)` forces that
+    /// exact cap (used by parity tests to force real, smaller-than-corpus
+    /// merged segments deterministically); `None` forces "no cap"
+    /// regardless of the env var. No-op if `index` does not exist.
+    pub fn set_merge_max_docs_override(&self, index: &str, max_docs: Option<u64>) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if let Some(data) = store.indices.get_mut(index) {
+            data.index.set_merge_max_docs_override(max_docs);
+        }
+    }
+
     /// C1 fix (design doc §C1) test/ops hook: pin `index`'s id-maps
     /// densify-by-budget threshold independently of the process-wide
     /// `SURCH_DENSIFY_BUDGET_DOCS` env var (same
