@@ -135,6 +135,14 @@ S3b copie verbatim (merge quasi-I/O-bound) et/ou plafonner la taille de segment 
 **Verdict full corpus à ce jour : plancher surch 8g (RSS steady 3,10 GiB) vs ES ≤4g (RSS 3,24) —
 écart ≤2× ; à 8g surch bat ES sur RAM steady, latence (2,5-3,5×) et débit (parité, merges inclus).**
 
+## 🏆🏆🏆 S3b MERGÉ + 28M@4g PASS (sha b795b10) — PARITÉ DE PLANCHER ATTEINTE, SURCH BAT ES AU FULL
+Oracle 0 div (cap exercé). **28,9M @4g (= LE plancher d'ES) : count COMPLET, RSS 3,01 GiB (< ES 3,24),
+21,8k doc/s (0,89× ES — merges inclus), latence 0,35/0,55/0,86 vs ES 0,90/1,33/2,93 (2,5-3,4×).**
+Réglage : budget flush 256M + densify 1M + fanin 8 + **cap tier 7M** (S3b : cap + spill incrémental
+subfields au merge). Le pari du design (« un moteur qui EXISTE à 28M sous budget ES, latence < ES ») est
+ATTEINT ET DÉPASSÉ : plancher ÉGAL à ES, RAM légèrement meilleure, latence 2,5-3,4×, débit 0,89×.
+Restent : disque 1,5× (write-amp — S3b-verbatim/compression), S4 NRT, C3 prefix, artillery borné.
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
