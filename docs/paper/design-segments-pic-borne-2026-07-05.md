@@ -35,12 +35,51 @@
   bool/full) = l'arbitrage RAM/latence.
 - Tout derrière **flag `SURCH_SEGMENTS`** (off = moteur mono-segment actuel bit-identique).
 
-## ⚖️ Divergence à arbitrer (Fable 5, au reset quota)
-**doc_ids : LOCAUX per-segment + doc_base (Opus) vs GLOBAUX (Codex, défaut).** L'argument Opus est
-ancré : `doc_len_dense`/`SubfieldColumn.codes` sont dimensionnés au max doc_id global
-(document_index.rs:250,455) → avec des IDs globaux, un segment tardif allouerait des colonnes de 28M
-entrées (maladie B aggravée) ; locaux = colonnes de seg_size + meilleure compression FoR (deltas petits).
-Coût : remap au merge + table de routage `doc_base[]`. Position par défaut en attendant Fable : **locaux**.
+## ⚖️ ARBITRAGE FABLE 5 (rendu 2026-07-06) — doc_ids GLOBAUX STABLES, jamais renumérotés au merge
+Fable tranche CONTRE la renumérotation Lucene-style : (1) les id_maps sont GLOBALES (FST uid→doc_id
+immuable, state.rs:497) → renuméroter un tier de 300k déclencherait une reconstruction 28M (O(corpus)
+par merge) ; (2) l'invariant « doc_id jamais réutilisé » est porteur de correction
+(`deleted_since_dense`) ; (3) garder les ids rend le merge **quasi I/O-bound** : segments ADJACENTS
+(runs consécutifs de doc_base, style LogMergePolicy) → concat déjà triée → **copie VERBATIM des blobs
+FoR avec fixup du seul premier varint**, roaring=union, re-encode seulement les termes à tombstone ;
+(4) coût des trous marginal (~R×70 B/slot ; INSEE append-only R≈0) ; (5) id_maps/source_store : zéro
+changement. Stats du merge recalculées depuis les postings (JAMAIS depuis doc_len SmallFloat quantisé
+→ dérive avg_doc_len → mort de l'oracle). Renumérotation reléguée à une « compaction d'époque »
+explicite et rare (aussi la soupape de l'espace u32 — cf. C7). Les colonnes per-segment restent
+indexées par `doc_id − doc_base` (compatible : plages contiguës).
+
+## 🔴 Challenges Fable (C1-C7) — intégrés au plan
+- **C1 — `densify()` est O(corpus) à CHAQUE refresh** (state.rs:1164, FST 28M + CSR + documents[]
+  reconstruits, pic transitoire ~1-1,5 GiB) : le gate S4 « NRT ≥ ES » est intenable sans **densify par
+  budget d'overlay** ; la vraie solution (id_maps per-segment paginées) est du travail S5 → S5 AVANT S4.
+- **C2 — le vrai tueur NRT est `terms_finalized`** (state.rs:1034-1042) : le prochain append après
+  refresh fait un rebuild COMPLET qui **reset le multi-segment en mono-segment**. S4 = SUPPRIMER ce
+  flag au profit du seal S2 (un delete de code, pas une construction).
+- **C3 — `prefix_postings` hors Segment = pic NON borné** (BTreeMap global, document_index.rs:153).
+  **CONFIRMÉ actif dans nos benchs** : le mapping deces a `index_prefixes` sur DATE_NAISSANCE/DATE_DECES.
+  Fix : router les préfixes comme champ synthétique `champ._index_prefix` dans le PostingsBuilder normal
+  (budget/flush/merge gratuits). À faire avant S6.
+- **C4 — concurrence merge** : S3 = merge SYNCHRONE inline (simple, gateable) ; background + carry-over
+  deletes + generation-stamp seulement en S4 (quand les tombstones existent).
+- **C5 — gate oracle post-CRUD à redéfinir** : df/doc_count incluent les tombstones jusqu'au merge (comme
+  Lucene) pendant qu'ES merge à son rythme → divergence légitime. Gate CRUD = parité après force-merge
+  des DEUX côtés (ou parité d'ensembles + tolérance score).
+- **C6 — nos doc/s n'incluent AUCUN coût de merge** (ceux d'ES si) : fair-ab doit mesurer le wall-clock
+  jusqu'à QUIESCENCE des merges + le PIC disque (2× le tier avant suppression des inputs).
+- **C7 — contrat update change en S4** : update = tombstone + NOUVEL id (jamais-réutilisé) → à ~25k
+  updates/s soutenu, u32 épuisé en ~2 jours → la compaction d'époque n'est pas cosmétique.
+
+## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
+- **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
+  budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
+- **S3.5 (nouveau, ~1h)** : smoke 28M@16g dès S3 — mesure la courbe resident réelle vs l'extrapolation
+  ~10-11 GiB (maladie B) et dimensionne S5. Ne pas attendre S6 pour toucher 28M.
+- **S5 avant S4** : le disk-back des métadonnées est le lift existentiel (« un moteur qui existe à
+  28M ») ; le corpus INSEE append-only n'a besoin ni de NRT ni de tombstones pour le gate survie 28M@4g ;
+  un gate NRT fait avant S5 serait invalidé par S5.
+- **S4 absorbe** : suppression `terms_finalized` (C2), tombstones + update=nouvel-id (C7), densify
+  budgeté (C1), merge background + carry-over (C4), gate oracle CRUD redéfini (C5).
+- **Transverse avant S6** : C3 (prefix synthétique) + C6 (fair-ab quiescence + pic disque).
 
 ## Plan d'exécution (chaque étape commit-able, gatée `deploy/bench-local/fair-ab.sh`)
 | # | Périmètre | Risque | Gate | Réversibilité |
