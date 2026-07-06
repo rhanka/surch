@@ -5,7 +5,7 @@ use std::{
 };
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
-use fst::{Map, MapBuilder};
+use fst::{Map, MapBuilder, Streamer};
 use rayon::prelude::*;
 use serde_json::Value;
 use surch_index::{
@@ -431,6 +431,78 @@ fn parse_source_blob(blob: &SourceBlob, store: &SourceStore) -> Value {
     }
 }
 
+/// C1 fix (design doc `docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §C1): merge-joins `old` (an already-built `fst::Map`, sorted by
+/// construction) with `new_entries` (sorted ascending by uid bytes by the
+/// caller) into ONE fresh FST, without re-collecting or re-inserting any
+/// key `old` already carries. Used by
+/// [`InMemoryIndex::densify_append_only`] so a budget-triggered
+/// incremental densify does not have to re-materialize every HISTORICAL
+/// uid on every call (which [`InMemoryIndex::densify_full`]'s
+/// from-scratch rebuild does — an `Arc::from(uid)` heap allocation PER
+/// already-densified doc, PER call, and the cost this incremental path
+/// exists to avoid).
+///
+/// The two key sets are DISJOINT by construction, which is what makes a
+/// plain merge-join (as opposed to `fst::map::OpBuilder::union`, built
+/// for possibly-overlapping sources) correct here:
+/// `upsert_document_deferred` only mints a fresh `doc_id` — and therefore
+/// only ever adds an uid to `new_entries` — when `resolve_uid` found
+/// NOTHING live for that uid. The one case where the SAME uid text could
+/// legitimately reappear (delete-then-reinsert) always tombstones the old
+/// `doc_id` into `deleted_since_dense` first (see
+/// `delete_document_deferred`), which is exactly the condition
+/// [`InMemoryIndex::densify`]'s interference check routes to
+/// `densify_full` instead — so by the time this function runs, `old`
+/// cannot contain any uid also present in `new_entries`.
+///
+/// `fst::MapBuilder::memory()` is used here (not the streaming-to-file
+/// trick applied to `merge_term_dictionaries` in `surch-index`): the
+/// id-maps FST covers far fewer distinct bytes than a multi-field term
+/// dictionary — one key per doc, heavily prefix-shared on the INSEE
+/// corpus's sequential-looking uids (tens of MiB at 28,9M, see the design
+/// doc's §C1 diagnostic table) — and this can run far more often (once
+/// per budget tranche) than the rare large tiered merge. A future pass
+/// can stream this one too if a concrete corpus proves the memory
+/// transient matters.
+fn merge_forward_fst(
+    old: Option<Map<Vec<u8>>>,
+    new_entries: &[(Arc<str>, u32)],
+) -> Option<Map<Vec<u8>>> {
+    if new_entries.is_empty() {
+        // Nothing new to fold in — whatever `old` already is (`Some` or
+        // `None`) is still the correct answer, no rebuild needed.
+        return old;
+    }
+    let mut builder = MapBuilder::memory();
+    let mut next_new = 0usize;
+    if let Some(old_map) = &old {
+        let mut stream = old_map.stream();
+        while let Some((key, value)) = stream.next() {
+            while next_new < new_entries.len() && new_entries[next_new].0.as_bytes() < key {
+                let (uid, doc_id) = &new_entries[next_new];
+                builder.insert(uid.as_bytes(), u64::from(*doc_id)).expect(
+                    "new_entries sorted ascending and disjoint from `old` — \
+                         this key sorts strictly before the old FST's next key",
+                );
+                next_new += 1;
+            }
+            builder
+                .insert(key, value)
+                .expect("fst::Map::stream re-emits its own keys in strictly ascending order");
+        }
+    }
+    for (uid, doc_id) in &new_entries[next_new..] {
+        builder
+            .insert(uid.as_bytes(), u64::from(*doc_id))
+            .expect("new_entries sorted ascending by the caller, disjoint from `old`");
+    }
+    let bytes = builder
+        .into_inner()
+        .expect("fst::MapBuilder memory writer never fails I/O");
+    Some(Map::new(bytes).expect("fst::Map from valid MapBuilder bytes"))
+}
+
 use surch_search::scoring::{bm25_score, Bm25Config};
 
 use crate::scroll::ScrollTable;
@@ -478,12 +550,12 @@ struct MemoryStore {
 ///   octets sont encodes dans le graphe FST partage-prefixe (meme
 ///   crate/pattern que `TermDictionary`, cf. `surch-index::postings`).
 /// - `reverse_uids` / `reverse_offsets` : `doc_id -> uid` empaquetes en
-///   UN buffer `Box<[u8]>` + une table d'offsets CSR (`len = doc_count +
-///   1`), indexee directement par `doc_id`. Un "trou" (doc_id supprime
-///   avant ce densify) est encode par `offsets[i] == offsets[i+1]` (span
-///   vide) — sans collision possible avec un UID legitime car
-///   `document_handler` rejette tout id vide en amont
-///   (`document.rs::document_handler`: "document id must not be empty").
+///   UN buffer + une table d'offsets CSR (`len = doc_count + 1`), indexee
+///   directement par `doc_id`. Un "trou" (doc_id supprime avant ce
+///   densify) est encode par `offsets[i] == offsets[i+1]` (span vide) —
+///   sans collision possible avec un UID legitime car `document_handler`
+///   rejette tout id vide en amont (`document.rs::document_handler`:
+///   "document id must not be empty").
 /// - `documents` : `_source` (`SourceBlob`) indexe par `doc_id`, `Option`
 ///   pour distinguer un trou (`None`) d'un blob present.
 ///
@@ -493,12 +565,34 @@ struct MemoryStore {
 /// [`InMemoryIndex::upsert_document_deferred`]) : un trou reste un trou a
 /// vie, il n'est jamais "re-rempli" en place, seulement omis du PROCHAIN
 /// snapshot dense.
+///
+/// C1 fix (revue independante, design doc §C1) : `reverse_uids`/
+/// `reverse_offsets`/`documents` etaient des `Box<[T]>` exact-fit (zero
+/// slack, optimal en steady-state) — mais `Box<[T]>::into_vec()` PUIS
+/// `Vec::into_boxed_slice()` (le cycle que `InMemoryIndex::densify_full`/
+/// `densify_append_only` faisait a CHAQUE appel) shrink-to-fit
+/// SYSTEMATIQUEMENT la capacite a la longueur exacte a la fin de chaque
+/// appel, ce qui annule tout le benefice de la croissance amortie d'un
+/// `Vec` : la tranche SUIVANTE re-declenche une reallocation+copie de la
+/// TOTALITE du buffer courant (pas seulement la tranche neuve), rendant
+/// `densify_append_only` cumulativement O(N²/tranche) au lieu de O(N)
+/// amorti — feedback direct de la revue Opus sur ce fix (voir le doc
+/// design §C1 fix). `Vec<T>` (sans `into_boxed_slice()` final) laisse la
+/// capacite geometrique-croissante de `Vec` survivre d'un appel au
+/// suivant : la MAJORITE des tranches n'ont alors PLUS besoin de
+/// reallouer du tout (la capacite residuelle suffit), au prix d'un peu de
+/// slack resident en steady-state (borne, pas illimite) — echange
+/// clairement favorable pour borner le PIC transitoire, l'objectif de ce
+/// fix. Les accesseurs `uid`/`blob`/`doc_count` ci-dessous sont
+/// INCHANGES : `Vec<T>` deref vers `&[T]`, `.len()`/`.get()`/l'indexation
+/// se comportent identiquement (bornes sur la longueur LOGIQUE, jamais la
+/// capacite).
 #[derive(Debug, Default)]
 struct DenseIdMaps {
     forward: Option<Map<Vec<u8>>>,
-    reverse_uids: Box<[u8]>,
-    reverse_offsets: Box<[u32]>,
-    documents: Box<[Option<SourceBlob>]>,
+    reverse_uids: Vec<u8>,
+    reverse_offsets: Vec<u32>,
+    documents: Vec<Option<SourceBlob>>,
 }
 
 impl DenseIdMaps {
@@ -604,6 +698,73 @@ struct InMemoryIndex {
     /// `rebuild_index()` to preserve the previously-indexed
     /// postings. The flag is reset by any rebuild or append.
     terms_finalized: bool,
+    /// C1 fix (design doc `docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §C1) test/ops hook: per-index override of
+    /// [`Self::maybe_densify_by_budget`]'s budget, independently of the
+    /// process-wide `SURCH_DENSIFY_BUDGET_DOCS` env var — same
+    /// `OnceLock`-cannot-flip-mid-run rationale as `DocumentIndex`'s
+    /// `FlushBudgetOverride`/`MergeFaninOverride` (`surch_index::document_index`).
+    densify_budget_override: DensifyBudgetOverride,
+}
+
+/// See `InMemoryIndex`'s `densify_budget_override` field. `UseEnv` (the
+/// `Default`) reads [`densify_budget_docs`] (the process-wide
+/// `SURCH_DENSIFY_BUDGET_DOCS` `OnceLock`) — production default.
+/// `Forced(_)` is set via [`AppState::set_densify_budget_docs_override`]
+/// so a test can pin an exact budget (or force "no budget") on ONE index
+/// instance, independently of the env var and of any other test in the
+/// same process.
+#[derive(Debug, Clone, Copy, Default)]
+enum DensifyBudgetOverride {
+    #[default]
+    UseEnv,
+    Forced(Option<u64>),
+}
+
+/// C1 fix: env-configured doc-count threshold for
+/// [`InMemoryIndex::maybe_densify_by_budget`], read ONCE per process
+/// (mirrors `surch_index::document_index::flush_budget_bytes`'s
+/// established `OnceLock` pattern). `None` when unset, empty, `"0"`, or
+/// unparseable — the reversibility flag: with no budget configured, the
+/// id-maps overlay (`forward_dirty`/`reverse_dirty`/`documents_dirty`/
+/// `deleted_since_dense`) is only ever drained by an explicit `_refresh`
+/// (`InMemoryIndex::densify`, called from `finalize_terms_for_refresh`),
+/// exactly like before this feature existed — this flag ONLY controls
+/// whether `_bulk` chunk boundaries ALSO proactively trigger a densify
+/// mid-bulk.
+///
+/// Precision (independent review, design doc §C1 fix): this flag does
+/// NOT gate which internal algorithm `InMemoryIndex::densify` picks —
+/// that dispatch (`densify_append_only` vs `densify_full`) is decided
+/// SOLELY by interference detection, in every call, flag or no flag. So
+/// even with this env var unset, a SECOND (and later) explicit `_refresh`
+/// on an append-only sequence already takes the incremental path, not
+/// just the historical from-scratch one — proven output-equivalent (not
+/// literally the same code path) to what ran before this fix. What THIS
+/// flag changes is purely the CADENCE: whether densify also runs
+/// mid-bulk, before an explicit `_refresh` ever happens.
+///
+/// When set, every `_bulk` chunk boundary
+/// (`InMemoryIndex::append_to_index`) ALSO checks the overlay's size and
+/// drains it early via the incremental append-only fast path
+/// (`InMemoryIndex::densify_append_only`) once it crosses the budget —
+/// bounding the OVERLAY's peak to O(budget) instead of O(corpus). This is
+/// what the design doc's §C1 diagnostic identified as the DOMINANT
+/// transient of the 28,9M refresh OOM: with a single final `_refresh`
+/// (the fair-ab bench's default), the overlay held the WHOLE corpus
+/// (measured ~5+ GiB at 28,9M with the codebase's own
+/// `index_state_memory_bytes` accounting formula), dwarfing the
+/// old+new-`DenseIdMaps` double-detention (~2,4 GiB re-measured by
+/// independent review, see `InMemoryIndex::densify`'s doc comment)
+/// `densify_full` alone pays.
+fn densify_budget_docs() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("SURCH_DENSIFY_BUDGET_DOCS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&docs| docs > 0)
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1087,6 +1248,57 @@ impl InMemoryIndex {
         // `rebuild_index()`, which must always reproduce a mono-segment
         // index (see `DocumentIndex::clear`'s doc).
         self.index.maybe_flush_by_budget();
+        // C1 fix: same chunk-boundary hook, for the id-maps overlay this
+        // time — see `maybe_densify_by_budget`'s doc comment. No-op when
+        // `SURCH_DENSIFY_BUDGET_DOCS` is unset, and (like the postings
+        // budget above) deliberately not called from `rebuild_index()`.
+        self.maybe_densify_by_budget();
+    }
+
+    /// C1 fix (design doc §C1): resolve this index's densify budget,
+    /// honoring the `densify_budget_override` field when forced (test/ops
+    /// hook, see [`AppState::set_densify_budget_docs_override`]) or
+    /// falling back to the process-wide [`densify_budget_docs`] env var.
+    fn resolved_densify_budget_docs(&self) -> Option<u64> {
+        match self.densify_budget_override {
+            DensifyBudgetOverride::UseEnv => densify_budget_docs(),
+            DensifyBudgetOverride::Forced(budget) => budget,
+        }
+    }
+
+    /// C1 fix: if the id-maps overlay (everything inserted since the
+    /// last [`Self::densify`]) has grown past the configured budget,
+    /// drain it NOW via the incremental append-only fast path instead of
+    /// waiting for the next explicit `_refresh`. Call this ONCE PER BULK
+    /// CHUNK (mirrors `DocumentIndex::maybe_flush_by_budget`'s own
+    /// contract) — never from `rebuild_index()`'s replay path.
+    ///
+    /// `next_doc_id - dense.doc_count()` is used as the overlay-size
+    /// proxy rather than re-deriving the byte estimate
+    /// `AppState::index_state_memory_bytes` computes: for the append-only
+    /// hot path this function targets, every doc_id in that range holds
+    /// exactly one `forward_dirty`/`reverse_dirty`/`documents_dirty`
+    /// entry, so a doc-count budget is a simple, cheap, and accurate
+    /// enough trigger. At ~140-150 bytes/doc across the three overlays, a
+    /// budget of a few hundred thousand to ~1-2M docs keeps the OVERLAY
+    /// itself in the tens to low hundreds of MiB — nowhere near the ~5+
+    /// GiB measured for the whole 28,9M corpus with no periodic trigger
+    /// at all (the design doc's §C1 diagnostic, the DOMINANT transient).
+    /// The dense buffers `densify_append_only` extends can still spike
+    /// higher on the rare tranche that crosses one of `Vec`'s own growth
+    /// thresholds (an amortized, not per-tranche, cost — see that
+    /// method's doc comment) — smaller and far less frequent than the
+    /// overlay problem this budget exists to bound, but not literally
+    /// zero.
+    fn maybe_densify_by_budget(&mut self) {
+        let Some(budget) = self.resolved_densify_budget_docs() else {
+            return;
+        };
+        let overlay_docs = u64::from(self.next_doc_id - self.dense.doc_count());
+        if overlay_docs < budget {
+            return;
+        }
+        self.densify();
     }
 
     /// Track A `wp-a-perf-followups.md` Lot 1.5: free the in-memory
@@ -1140,27 +1352,55 @@ impl InMemoryIndex {
     /// Lot C `C2` : fusionne les 4 overlays mutables
     /// (`forward_dirty`/`reverse_dirty`/`documents_dirty`/
     /// `deleted_since_dense`) dans un `DenseIdMaps` frais, puis vide les
-    /// overlays. Appelee par [`Self::finalize_terms_for_refresh`] — le
-    /// "builder" des id maps est ces 4 champs, exactement comme
-    /// `postings_builder` est le builder du dictionnaire de termes ;
-    /// cette methode est leur `materialize_terms_and_finalize_postings`.
+    /// overlays. Appelee par [`Self::finalize_terms_for_refresh`] (le
+    /// `_refresh` explicite) ET, si `SURCH_DENSIFY_BUDGET_DOCS` est
+    /// configure, par [`Self::maybe_densify_by_budget`] (mi-bulk, par
+    /// tranche) — le "builder" des id maps est ces 4 champs, exactement
+    /// comme `postings_builder` est le builder du dictionnaire de termes.
     ///
-    /// O(doc courant vivant + trous) : meme ordre de grandeur que le
-    /// rescan complet deja paye par `rebuild_index()` sur un delete/update
-    /// et que la reconstruction FST des postings a chaque refresh — pas
-    /// un cout nouveau de nature, juste un cout supplementaire du meme
-    /// ordre.
+    /// C1 fix (design doc `docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §C1) : diagnostic chiffre — dans le flux bench "gros bulk puis UN
+    /// SEUL `_refresh` final" (le cas 28,9M@8g mesure), cette fonction ne
+    /// tournait qu'UNE fois, avec un overlay ayant accumule TOUT le
+    /// corpus (aucun autre point ne draine `forward_dirty`/
+    /// `reverse_dirty`/`documents_dirty` avant un `_refresh` explicite).
+    /// A 28,9M docs, la formule deja utilisee par
+    /// `AppState::index_state_memory_bytes` (`HASH_ENTRY_OVERHEAD` = 48
+    /// o + en-tete `Arc` 16 o + octets uid ~7,6 o/doc pour
+    /// `forward_dirty` ; 48+4 o pour `reverse_dirty` ; 48+4+
+    /// `size_of::<Option<SourceBlob>>()`~24 o pour `documents_dirty`)
+    /// chiffre l'overlay a lui seul a **~5,4 GiB** (1,93 `forward_dirty`
+    /// plus 1,40 `reverse_dirty` plus 2,05 `documents_dirty`), CONTRE
+    /// (revue independante, cf. design doc §C1 fix) **~2,4 GiB** pour le
+    /// pic reel de `densify_full` (le doublement ancien+nouveau `dense` —
+    /// quasi vide au tout premier refresh — PLUS le scratch `live_uids`
+    /// ~700 Mo PLUS ~28,9M reallocations `Arc::from(uid)` neuves ~680 Mo
+    /// PLUS le nouveau `documents` ~700 Mo ; la premiere estimation de ce
+    /// commentaire, ~1-1,3 GiB, ne comptait que le doublement de `dense`
+    /// seul et etait optimiste). **L'overlay domine toujours** (~2x, pas
+    /// ~4x comme initialement estime) : c'est lui qui transforme un
+    /// refresh en pic O(corpus) au lieu de O(tranche), pas la
+    /// double-detention seule — mais l'un ET l'autre restent bornes par
+    /// ce fix.
     ///
-    /// Cout transitoire assume : le nouveau snapshot est construit
-    /// PENDANT que l'ancien `self.dense` reste alloue (il est lu tout du
-    /// long), donc le pic memoire pendant `densify()` est
-    /// `ancien dense + nouveau dense` — un doublement transitoire, borne
-    /// et libere des la sortie de cette methode (`self.dense = ...`
-    /// droppe l'ancien). Le remplacement en place façon "Phase 0a" (sans
-    /// double-detention) demanderait un merge incremental plus complexe ;
-    /// laisse en amelioration future si ce pic s'avere genant en
-    /// pratique (id maps est un poste petit relativement a
-    /// `stored_fields`/`postings`).
+    /// Fix retenu : densifier PAR TRANCHES plutot qu'une seule fois —
+    /// [`Self::maybe_densify_by_budget`] declenche cette methode des que
+    /// l'overlay depasse un budget de doc-count configurable. Le chemin
+    /// rapide [`Self::densify_append_only`] ne retraite QUE la tranche
+    /// neuve (append aux buffers `reverse_uids`/`reverse_offsets`/
+    /// `documents`, fusion streaming du FST via [`merge_forward_fst`]) —
+    /// cout AMORTI O(tranche) sur l'ensemble du bulk (voir son commentaire
+    /// pour la nuance : une reallocation `Vec` occasionnelle, rare, coute
+    /// encore O(taille courante), mais PAS a chaque tranche comme un
+    /// rescan complet le ferait — un rescan complet a chaque tranche
+    /// re-allouerait un `Arc<str>` par UID DEJA densifie a CHAQUE appel,
+    /// un cout cumulatif O(N²/tranche) inacceptable, c'est pour ca que ce
+    /// chemin existe). Valide uniquement quand rien dans l'overlay ne
+    /// touche un `doc_id` DEJA densifie (voir le detecteur d'interference
+    /// ci-dessous). Sinon (update/delete contre un vieux doc — plus rare,
+    /// plus petit en pratique), on retombe sur [`Self::densify_full`],
+    /// l'algorithme EXISTANT (from-scratch, correct et inchange pour ce
+    /// cas).
     fn densify(&mut self) {
         if self.forward_dirty.is_empty()
             && self.deleted_since_dense.is_empty()
@@ -1171,6 +1411,75 @@ impl InMemoryIndex {
             // deja a jour, evite un rescan O(doc_count) inutile.
             return;
         }
+
+        let old_boundary = self.dense.doc_count();
+        // Interference = un update OU un delete touchant un doc_id DEJA
+        // densifie (`doc_id < old_boundary`). `deleted_since_dense` ne
+        // contient JAMAIS que de tels doc_id par construction
+        // (`delete_document_deferred` n'y insere que si `doc_id <
+        // self.dense.doc_count()` — un doc frais jamais densifie n'a pas
+        // besoin de tombstone), donc le verifier vide suffit sans avoir
+        // a comparer chaque entree a `old_boundary`. `documents_dirty`,
+        // en revanche, recoit AUSSI les updates de docs frais (pas
+        // encore densifies) — d'ou le scan explicite par seuil.
+        let has_old_interference = !self.deleted_since_dense.is_empty()
+            || self
+                .documents_dirty
+                .keys()
+                .any(|&doc_id| doc_id < old_boundary);
+
+        if has_old_interference {
+            self.densify_full();
+        } else {
+            self.densify_append_only(old_boundary);
+        }
+    }
+
+    /// Chemin complet (from-scratch) — l'algorithme `densify` historique,
+    /// utilise en fallback quand [`Self::densify`] detecte une interference
+    /// avec un doc_id deja densifie (un update ou un delete contre un vieux
+    /// doc_id).
+    ///
+    /// Precision (revue independante) : CE fallback n'est PAS conditionne
+    /// par `SURCH_DENSIFY_BUDGET_DOCS` — le dispatch rapide/complet dans
+    /// [`Self::densify`] ne regarde QUE l'interference, jamais le flag ;
+    /// celui-ci ne controle QUE la CADENCE de declenchement mi-bulk
+    /// (`Self::maybe_densify_by_budget`). Consequence assumee : meme flag
+    /// absent, un `_refresh` explicite APRES un `_refresh` precedent sans
+    /// interference entre les deux (insertions pures) emprunte deja
+    /// [`Self::densify_append_only`], pas ce chemin complet — ce n'est PAS
+    /// une regression de comportement OBSERVABLE (sortie prouvee
+    /// equivalente, voir le commentaire de `densify_append_only`), mais ce
+    /// n'est pas non plus "l'ancien chemin de code au mot pres" ; seul le
+    /// TOUT PREMIER appel jamais interference-libre partage exactement le
+    /// meme calcul que l'ancien `densify()` faisait a chaque fois.
+    ///
+    /// O(doc courant vivant + trous) : meme ordre de grandeur que le
+    /// rescan complet deja paye par `rebuild_index()` sur un delete/update
+    /// et que la reconstruction FST des postings a chaque refresh — pas
+    /// un cout nouveau de nature, juste un cout supplementaire du meme
+    /// ordre.
+    ///
+    /// Cout transitoire assume : le nouveau snapshot est construit
+    /// PENDANT que l'ancien `self.dense.reverse_uids`/`reverse_offsets`/
+    /// `documents` restent alloues (ils sont lus tout du long — `.blob`/
+    /// `.uid` ci-dessous), donc le pic memoire pendant cette methode est
+    /// `ancien dense + nouveau dense` pour CES TROIS buffers — un
+    /// doublement transitoire, borne et libere des la sortie de cette
+    /// methode (`self.dense = ...` droppe l'ancien).
+    ///
+    /// C1 fix : `self.dense.forward` (le FST), lui, n'est JAMAIS lu par
+    /// la boucle ci-dessous (`dense.blob`/`dense.uid` ne touchent que
+    /// `documents`/`reverse_uids`/`reverse_offsets` — `forward` ne sert
+    /// qu'a `resolve_uid`, hors de cette methode) : on peut donc le
+    /// liberer des MAINTENANT plutot qu'a l'affectation finale, sans
+    /// attendre. Sans risque pour un lecteur concurrent : le
+    /// verrou d'ecriture pris par `AppState::refresh_index` (ou
+    /// `maybe_densify_by_budget`, appele sous le meme verrou que
+    /// `append_to_index`) couvre TOUTE la duree de cet appel — aucune
+    /// recherche ne peut observer `forward` absent entre-temps.
+    fn densify_full(&mut self) {
+        self.dense.forward = None;
 
         let doc_count = self.next_doc_id;
         // `live_uids[i]` correspond a `documents[i]` par construction (la
@@ -1214,7 +1523,7 @@ impl InMemoryIndex {
         debug_assert_eq!(
             documents.len(),
             doc_count as usize,
-            "densify must produce exactly one documents slot per doc_id in 0..next_doc_id"
+            "densify_full must produce exactly one documents slot per doc_id in 0..next_doc_id"
         );
 
         // Reverse (doc_id -> uid), empaquete, positionnel par
@@ -1266,9 +1575,9 @@ impl InMemoryIndex {
 
         self.dense = DenseIdMaps {
             forward,
-            reverse_uids: reverse_uids.into_boxed_slice(),
-            reverse_offsets: reverse_offsets.into_boxed_slice(),
-            documents: documents.into_boxed_slice(),
+            reverse_uids,
+            reverse_offsets,
+            documents,
         };
         self.forward_dirty.clear();
         self.forward_dirty.shrink_to_fit();
@@ -1278,6 +1587,105 @@ impl InMemoryIndex {
         self.documents_dirty.shrink_to_fit();
         self.deleted_since_dense.clear();
         self.deleted_since_dense.shrink_to_fit();
+    }
+
+    /// C1 fix: chemin rapide de [`Self::densify`], valide UNIQUEMENT
+    /// quand rien dans l'overlay ne touche un `doc_id` deja densifie
+    /// (`old_boundary == self.dense.doc_count()`, garanti par l'appelant
+    /// — voir son detecteur d'interference). C'est le cas courant d'un
+    /// bulk append-only (le corpus INSEE deces du gate 28,9M : aucun
+    /// update/delete).
+    ///
+    /// `reverse_uids`/`reverse_offsets`/`documents` sont ETENDUS via
+    /// `Vec::reserve`/`push` (voir `DenseIdMaps`'s doc comment : ces
+    /// champs sont des `Vec<T>`, PAS des `Box<[T]>`, precisement pour que
+    /// la capacite geometrique accumulee survive d'un appel au suivant —
+    /// sans ca, `.reserve()` re-copierait la TOTALITE du buffer courant a
+    /// CHAQUE tranche, un piege repere en revue independante). Cout
+    /// AMORTI sur l'ensemble du bulk : O(N) total (comme n'importe quel
+    /// `Vec` qui grossit par `push`), la plupart des tranches ne
+    /// reallouant PAS du tout (capacite deja suffisante) ; seules les
+    /// tranches qui franchissent un palier de croissance de `Vec`
+    /// (rare, ~O(log N) fois sur tout le bulk) paient une copie de la
+    /// taille courante — un pic ponctuel, PAS le pic systematique a
+    /// CHAQUE tranche que `densify_full` paierait s'il etait appele en
+    /// boucle (cout cumulatif O(N²/tranche) inacceptable, un
+    /// `Arc::from(uid)` neuf par uid DEJA densifie a chaque appel).
+    /// `forward` est reconstruit via [`merge_forward_fst`], une fusion
+    /// streaming (merge-join) de l'ANCIEN FST avec la tranche neuve
+    /// triee, O(ancien FST + tranche) — voir le commentaire de cette
+    /// fonction pour l'argument de disjonction des cles.
+    fn densify_append_only(&mut self, old_boundary: u32) {
+        let new_upper = self.next_doc_id;
+        let tranche_len = (new_upper - old_boundary) as usize;
+
+        // C1 fix (revue independante) : `mem::take` recupere directement le
+        // `Vec<T>` du champ (plus de `Box<[T]>`/`.into_vec()`/
+        // `.into_boxed_slice()` intermediaires) — la capacite geometrique
+        // eventuellement deja presente sur ces buffers SURVIT d'un appel
+        // au suivant, ce qui est le point : sans ca, `.reserve()`
+        // ci-dessous re-declencherait une reallocation+copie de la
+        // TOTALITE du buffer courant a CHAQUE tranche (voir le
+        // commentaire de `DenseIdMaps`).
+        let mut documents = std::mem::take(&mut self.dense.documents);
+        documents.reserve(tranche_len);
+
+        let mut reverse_uids = std::mem::take(&mut self.dense.reverse_uids);
+        let mut reverse_offsets = std::mem::take(&mut self.dense.reverse_offsets);
+        if reverse_offsets.is_empty() {
+            // Bootstrap: le tout premier densify (dense encore `Default`)
+            // n'a pas encore le `0` sentinelle de tete — tout appel
+            // suivant en herite via l'append ci-dessous.
+            reverse_offsets.push(0);
+        }
+        reverse_offsets.reserve(tranche_len);
+
+        let mut new_entries: Vec<(Arc<str>, u32)> = Vec::with_capacity(tranche_len);
+        for doc_id in old_boundary..new_upper {
+            documents.push(self.documents_dirty.get(&doc_id).cloned());
+            if let Some(uid) = self.reverse_dirty.get(&doc_id) {
+                reverse_uids.extend_from_slice(uid.as_bytes());
+                new_entries.push((Arc::clone(uid), doc_id));
+            }
+            // Un doc_id sans entree `reverse_dirty` a ete cree PUIS
+            // supprime DANS cette meme fenetre (jamais entre dans
+            // `dense`, donc jamais besoin de tombstone) — span vide,
+            // meme convention de trou que `densify_full`.
+            reverse_offsets.push(reverse_uids.len() as u32);
+        }
+        debug_assert_eq!(documents.len(), new_upper as usize);
+        debug_assert_eq!(reverse_offsets.len(), new_upper as usize + 1);
+
+        // `merge_forward_fst` fait un merge-join : `new_entries` doit
+        // etre trie par octets d'uid (l'ordre d'insertion ci-dessus est
+        // par doc_id croissant, pas par uid) — meme tri que
+        // `densify_full`.
+        new_entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        debug_assert!(
+            new_entries
+                .windows(2)
+                .all(|pair| pair[0].0.as_bytes() < pair[1].0.as_bytes()),
+            "two live doc_ids resolved to the same uid within one tranche — forward resolution invariant violated"
+        );
+
+        let forward = merge_forward_fst(self.dense.forward.take(), &new_entries);
+
+        self.dense = DenseIdMaps {
+            forward,
+            reverse_uids,
+            reverse_offsets,
+            documents,
+        };
+        self.forward_dirty.clear();
+        self.forward_dirty.shrink_to_fit();
+        self.reverse_dirty.clear();
+        self.reverse_dirty.shrink_to_fit();
+        self.documents_dirty.clear();
+        self.documents_dirty.shrink_to_fit();
+        debug_assert!(
+            self.deleted_since_dense.is_empty(),
+            "densify_append_only must only run when the caller's interference check found no old tombstone"
+        );
     }
 
     /// Convertit en bloc tous les `SourceBlob::OnDisk` vivants en
@@ -2332,6 +2740,26 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         if let Some(data) = store.indices.get_mut(index) {
             data.index.set_merge_fanin_override(fanin);
+        }
+    }
+
+    /// C1 fix (design doc §C1) test/ops hook: pin `index`'s id-maps
+    /// densify-by-budget threshold independently of the process-wide
+    /// `SURCH_DENSIFY_BUDGET_DOCS` env var (same
+    /// `OnceLock`-cannot-flip-mid-run rationale as
+    /// [`Self::set_flush_budget_bytes_override`]). `Some(docs)` forces
+    /// that exact doc-count budget (used by parity tests to force the
+    /// incremental fast path deterministically, in-process, across
+    /// several `_bulk` chunks); `None` forces "no budget" (overlay only
+    /// drained at an explicit `_refresh`, today's behaviour) regardless
+    /// of the env var. No-op if `index` does not exist.
+    pub fn set_densify_budget_docs_override(&self, index: &str, budget: Option<u64>) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if let Some(data) = store.indices.get_mut(index) {
+            data.densify_budget_override = DensifyBudgetOverride::Forced(budget);
         }
     }
 
@@ -4119,14 +4547,23 @@ impl AppState {
     /// [`index_memory_usage`]. Returns `(documents_overhead, id_maps)`.
     ///
     /// Lot C `C2` : les 3 anciennes `BTreeMap` ont disparu. `documents_overhead`
-    /// couvre maintenant `dense.documents: Box<[Option<SourceBlob>]>` (un
-    /// slot par `doc_id`, ZERO overhead par-entree au-dela du slot
-    /// lui-meme — plus de nœud `BTreeMap`, plus de cle `Arc<str>`
-    /// dupliquee) plus l'overlay `documents_dirty: HashMap<u32,
-    /// SourceBlob>` (borne par la taille d'un batch bulk, pas par le
-    /// corpus). `id_maps` couvre le snapshot dense (`reverse_uids` +
-    /// `reverse_offsets` empaquetes, `forward` FST) plus les 3 overlays
-    /// UID (`forward_dirty`/`reverse_dirty`/`deleted_since_dense`).
+    /// couvre maintenant `dense.documents` (un slot par `doc_id`, ZERO
+    /// overhead par-entree au-dela du slot lui-meme — plus de nœud
+    /// `BTreeMap`, plus de cle `Arc<str>` dupliquee) plus l'overlay
+    /// `documents_dirty: HashMap<u32, SourceBlob>` (borne par la taille
+    /// d'un batch bulk, pas par le corpus — sauf si
+    /// `SURCH_DENSIFY_BUDGET_DOCS` est absent ET qu'aucun `_refresh`
+    /// n'est jamais appele, voir le design doc §C1). `id_maps` couvre le
+    /// snapshot dense (`reverse_uids` + `reverse_offsets` empaquetes,
+    /// `forward` FST) plus les 3 overlays UID
+    /// (`forward_dirty`/`reverse_dirty`/`deleted_since_dense`).
+    ///
+    /// C1 fix : `dense.documents`/`.reverse_uids`/`.reverse_offsets` sont
+    /// des `Vec<T>` (pas des `Box<[T]>`) depuis ce fix — voir
+    /// `DenseIdMaps`'s doc comment — donc `.capacity()` (pas `.len()`)
+    /// est la mesure honnete de leur empreinte RAM reelle : un `Vec`
+    /// etendu par tranches (`InMemoryIndex::densify_append_only`) peut
+    /// porter du slack de croissance non utilise entre deux appels.
     ///
     /// Le FST `forward` et le buffer `reverse_uids` ENCODENT chacun les
     /// octets UTF-8 des UID separement (pas de partage entre les deux
@@ -4160,14 +4597,19 @@ impl AppState {
         let source_blob_slot = std::mem::size_of::<Option<SourceBlob>>() as u64;
         let u32_size = std::mem::size_of::<u32>() as u64;
 
+        // `.capacity()`, not `.len()`: these three buffers are `Vec<T>`
+        // (C1 fix) and can carry unused growth slack between two
+        // `densify_append_only` tranches — see `DenseIdMaps`'s doc
+        // comment. `.capacity()` is the honest resident-bytes measure.
         let dense_documents_bytes =
-            (data.dense.documents.len() as u64).saturating_mul(source_blob_slot);
+            (data.dense.documents.capacity() as u64).saturating_mul(source_blob_slot);
         let dirty_documents_bytes = (data.documents_dirty.len() as u64)
             .saturating_mul(HASH_ENTRY_OVERHEAD + u32_size + source_blob_slot);
         let documents_overhead = dense_documents_bytes.saturating_add(dirty_documents_bytes);
 
-        let dense_reverse_bytes = (data.dense.reverse_uids.len() as u64)
-            .saturating_add((data.dense.reverse_offsets.len() as u64).saturating_mul(u32_size));
+        let dense_reverse_bytes = (data.dense.reverse_uids.capacity() as u64).saturating_add(
+            (data.dense.reverse_offsets.capacity() as u64).saturating_mul(u32_size),
+        );
         let dense_forward_bytes = data
             .dense
             .forward

@@ -1116,6 +1116,129 @@ fn build_block_metas_from_freqs(freqs: &[u32]) -> Vec<BlockMeta> {
         .collect()
 }
 
+/// Unique tempfile path for [`MergeFstBuilder::new`], mirroring
+/// `postings_segment::next_temp_path`'s pid+seq+nanos scheme (kept
+/// independent: that helper is private to the `postings_segment` module,
+/// and this one needs plain sequential `std::fs::File` I/O, not the
+/// `FileExt` positional read/write `postings_segment` uses — no
+/// `#[cfg(unix)]` split needed here).
+fn merge_fst_temp_path() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("surch-fst-merge-{pid}-{seq}-{nanos}.dat"))
+}
+
+/// Best-effort tempfile open for [`MergeFstBuilder::new`] — `None` on any
+/// I/O failure (unwritable `TMPDIR`, `ENOSPC`, ...), in which case the
+/// caller falls back to `MapBuilder::memory()` (same contract as
+/// [`postings_segment::PostingsSegment::try_new`]).
+fn create_merge_fst_tempfile() -> Option<(std::fs::File, std::path::PathBuf)> {
+    let path = merge_fst_temp_path();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .ok()?;
+    Some((file, path))
+}
+
+/// Plan segments — Q6 (design doc `docs/paper/design-segments-pic-borne-2026-07-05.md`,
+/// challenge C1 diagnostic): backing store for
+/// [`FieldMergeAccumulator`]'s `fst::MapBuilder`. A large tiered merge
+/// (the design's "paliers ×10, fan-in ~4-10") can touch a term dictionary
+/// of 10-15M distinct terms (edge_ngram/prefix fields inflate `T` well
+/// past the doc count) — `MapBuilder::memory()`'s `Vec<u8>` sink then
+/// holds the WHOLE compressed FST resident WHILE it grows (geometric
+/// reallocation spikes toward ~2x the final size at the worst moment),
+/// hundreds of MiB transient on top of everything else already live
+/// during a merge. `Streamed` writes incrementally to a tempfile through
+/// a bounded `BufWriter` (tens of KiB resident regardless of key count)
+/// and the final bytes are read back ONCE, sized exactly (`fs::read`, no
+/// growth doubling) — peak drops from ~2x-final-FST-size to ~1x. Falls
+/// back to `Memory` when the tempfile cannot even be opened — same
+/// best-effort contract as [`postings_segment::PostingsSegment::try_new`]
+/// elsewhere in this module: never let an optimization crash indexation.
+///
+/// Ordinary per-segment seals (`PostingsBuilder::build_with_disk_flag`)
+/// deliberately keep `MapBuilder::memory()` unchanged: a single
+/// budget-bounded segment's own FST is already small (the design doc:
+/// "les FST de seal de petits segments peuvent rester memory()") — only
+/// the MERGE path, which can span a whole large tier, gets the streaming
+/// treatment.
+///
+/// Known residual risk (flagged by independent review, design doc §C1
+/// fix): the best-effort contract above only covers the tempfile OPEN.
+/// Once opened, a LATE write/flush/read-back failure (`ENOSPC`/`EIO` on
+/// `TMPDIR` mid-merge) still propagates as a panic via the caller's
+/// `.expect()` (`FieldMergeAccumulator::push_term`/`finish`) — a
+/// narrower failure mode than `MapBuilder::memory()` ever had (an
+/// in-memory `Vec<u8>` write essentially cannot fail short of the
+/// process already being OOM), so this is NOT a strict risk regression
+/// in the impossible-in-practice sense, but it IS a new, real, rare
+/// panic surface (a full disk under a big merge) this pass accepts
+/// rather than solves: recovering would need buffering enough state to
+/// replay the merge in memory, which re-introduces the very transient
+/// this fix exists to avoid. Left as a documented follow-up.
+enum MergeFstBuilder {
+    Streamed {
+        builder: MapBuilder<std::io::BufWriter<std::fs::File>>,
+        path: std::path::PathBuf,
+    },
+    Memory(MapBuilder<Vec<u8>>),
+}
+
+impl MergeFstBuilder {
+    fn new() -> Self {
+        if let Some((file, path)) = create_merge_fst_tempfile() {
+            if let Ok(builder) = MapBuilder::new(std::io::BufWriter::new(file)) {
+                return MergeFstBuilder::Streamed { builder, path };
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        MergeFstBuilder::Memory(MapBuilder::memory())
+    }
+
+    fn insert(&mut self, key: &[u8], value: u64) -> fst::Result<()> {
+        match self {
+            MergeFstBuilder::Streamed { builder, .. } => builder.insert(key, value),
+            MergeFstBuilder::Memory(builder) => builder.insert(key, value),
+        }
+    }
+
+    /// Finishes the FST and returns its encoded bytes, ready for
+    /// `fst::Map::new`. `MapBuilder::into_inner` already flushes the
+    /// underlying writer (see the `fst` crate's own doc comment on that
+    /// method), so the streamed tempfile is fully written by the time we
+    /// read it back with a single `fs::read` — then removed, the same
+    /// tempfile-cleanup contract every other disk-backed segment in this
+    /// crate follows.
+    fn finish(self) -> Vec<u8> {
+        match self {
+            MergeFstBuilder::Streamed { builder, path } => {
+                let bytes = builder
+                    .into_inner()
+                    .ok()
+                    .and_then(|_flushed_writer| std::fs::read(&path).ok())
+                    .expect(
+                        "streamed fst tempfile should flush and be readable right after writing it",
+                    );
+                let _ = std::fs::remove_file(&path);
+                bytes
+            }
+            MergeFstBuilder::Memory(builder) => builder
+                .into_inner()
+                .expect("fst::MapBuilder memory writer never fails I/O"),
+        }
+    }
+}
+
 /// S3 merge tiered inline: per-field accumulator for
 /// [`merge_term_dictionaries`], bundling the same channels
 /// [`PostingsBuilder::build_with_disk_flag`]'s per-field loop accumulates
@@ -1126,7 +1249,7 @@ fn build_block_metas_from_freqs(freqs: &[u32]) -> Vec<BlockMeta> {
 /// comment).
 struct FieldMergeAccumulator {
     disk_enabled: bool,
-    builder: MapBuilder<Vec<u8>>,
+    builder: MergeFstBuilder,
     doc_ids_flat: Vec<u32>,
     freqs_flat: Vec<u32>,
     block_metas_flat: Vec<BlockMeta>,
@@ -1153,7 +1276,7 @@ impl FieldMergeAccumulator {
         let block_offsets = if disk_enabled { Vec::new() } else { vec![0] };
         Self {
             disk_enabled,
-            builder: MapBuilder::memory(),
+            builder: MergeFstBuilder::new(),
             doc_ids_flat: Vec::new(),
             freqs_flat: Vec::new(),
             block_metas_flat: Vec::new(),
@@ -1209,9 +1332,12 @@ impl FieldMergeAccumulator {
         );
         let term_idx = self.next_term_idx;
         self.next_term_idx += 1;
-        self.builder
-            .insert(term, u64::from(term_idx))
-            .expect("fst union stream yields strictly increasing keys");
+        self.builder.insert(term, u64::from(term_idx)).expect(
+            "fst union stream must yield strictly increasing keys (a failure here is a \
+             logic bug) OR, in MergeFstBuilder::Streamed mode, the tempfile write just \
+             failed (ENOSPC/EIO on TMPDIR) — a narrower, accepted best-effort risk this \
+             pass does not recover from gracefully, see MergeFstBuilder's doc comment",
+        );
 
         if self.disk_enabled {
             if doc_ids.len() > TERM_ROARING_THRESHOLD {
@@ -1318,10 +1444,7 @@ impl FieldMergeAccumulator {
             );
         }
 
-        let bytes = self
-            .builder
-            .into_inner()
-            .expect("fst::MapBuilder memory writer never fails I/O");
+        let bytes = self.builder.finish();
         let fst = Map::new(bytes).expect("fst::Map from valid MapBuilder bytes");
         // Plan segments S5b: same best-effort disk-back as
         // `PostingsBuilder::build_with_disk_flag` — see
@@ -2987,6 +3110,86 @@ mod tests {
             .disk_cursor("body", "wide")
             .expect("wide disk cursor (flag on)");
         assert_eq!(cursor.doc_freq(), BLOCK_SIZE * 3 + 17);
+    }
+
+    /// C1 fix (design doc `docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §C1, Q6): `merge_term_dictionaries`'s FST builder now streams to a
+    /// tempfile (`MergeFstBuilder::Streamed`) instead of growing an
+    /// in-memory `Vec<u8>` — this must not change the merged
+    /// dictionary's CONTENT at all. Exercises enough distinct terms
+    /// (1,501 : 1 shared across every source plus 500 unique per
+    /// segment, over 3 segments) to be a meaningful stand-in for a "big
+    /// tier" merge, checks every term's postings survive byte-for-byte,
+    /// AND that the FST is COMPLETE (no truncation from the tempfile
+    /// round trip) — in BOTH RAM and disk-backed mode.
+    #[test]
+    fn merge_streams_fst_without_altering_merged_term_dictionary_contents() {
+        const TERMS_PER_SEGMENT: u32 = 500;
+        const SEGMENTS: u32 = 3;
+
+        fn build_segment(segment_idx: u32, disk_enabled: bool) -> TermDictionary {
+            let mut builder = PostingsBuilder::new();
+            let doc_base = segment_idx * TERMS_PER_SEGMENT;
+            for i in 0..TERMS_PER_SEGMENT {
+                let doc_id = doc_base + i;
+                // A term shared by EVERY segment (exercises the FST
+                // union's multi-source branch) plus a segment-unique
+                // term (exercises the "only this source has it" branch).
+                builder
+                    .add("body", "shared", doc_id, vec![0])
+                    .expect("shared term");
+                builder
+                    .add("body", format!("seg{segment_idx}-term{i}"), doc_id, vec![0])
+                    .expect("segment-unique term");
+            }
+            builder.build_with_disk_flag(disk_enabled)
+        }
+
+        for disk_enabled in [false, true] {
+            let segments: Vec<TermDictionary> = (0..SEGMENTS)
+                .map(|s| build_segment(s, disk_enabled))
+                .collect();
+            let refs: Vec<&TermDictionary> = segments.iter().collect();
+            let merged = merge_term_dictionaries(&refs, disk_enabled);
+
+            // Every segment-unique term resolves to EXACTLY its own
+            // doc_id — proves the merge-joined FST correctly threads
+            // each source's own term index back to the right postings.
+            for segment_idx in 0..SEGMENTS {
+                let doc_base = segment_idx * TERMS_PER_SEGMENT;
+                for i in 0..TERMS_PER_SEGMENT {
+                    let doc_id = doc_base + i;
+                    let term = format!("seg{segment_idx}-term{i}");
+                    let (ids, _freqs) = merged
+                        .decode_from_segment("body", &term)
+                        .unwrap_or_else(|| panic!("term {term} must survive the merge"));
+                    assert_eq!(ids, vec![doc_id], "term {term} doc_id mismatch after merge");
+                }
+            }
+            // The shared term must carry every doc_id across all 3
+            // segments, ascending, un-renumbered (Fable's arbitrage:
+            // adjacent runs concatenate verbatim, never re-sorted).
+            let (shared_ids, shared_freqs) = merged
+                .decode_from_segment("body", "shared")
+                .expect("shared term must survive the merge");
+            let expected_shared: Vec<u32> = (0..SEGMENTS * TERMS_PER_SEGMENT).collect();
+            assert_eq!(
+                shared_ids, expected_shared,
+                "shared term must carry every doc_id across all 3 segments, in \
+                 order (disk_enabled={disk_enabled})"
+            );
+            assert_eq!(shared_freqs.len(), expected_shared.len());
+
+            // Term-count sanity: 1 shared + `TERMS_PER_SEGMENT` unique
+            // per segment — proves the streamed FST is COMPLETE, not
+            // silently truncated by the tempfile round trip.
+            let all_terms: Vec<String> = merged.terms("body").collect();
+            assert_eq!(
+                all_terms.len(),
+                1 + (SEGMENTS * TERMS_PER_SEGMENT) as usize,
+                "merged FST term count diverged from the expected union (disk_enabled={disk_enabled})"
+            );
+        }
     }
 
     /// Plan segments S5b: [`encode_term_entry`]/[`decode_term_entry`]
