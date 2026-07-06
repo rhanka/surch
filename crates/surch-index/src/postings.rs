@@ -932,11 +932,16 @@ impl PostingsBuilder {
 /// fails (`ENOSPC`, …) — matching every other best-effort segment-write
 /// failure mode in this file: correctness never depends on this
 /// succeeding, only the RAM saving does.
+/// Resident per-term `(offset, len)` descriptor table (empty when spilled).
+type DescriptorTable = Box<[(u64, u32)]>;
+/// `(offset, len)` of the spilled descriptor table inside the segment file.
+type DescriptorDirectory = Option<(u64, u32)>;
+
 fn persist_or_keep_descriptors(
     descriptors: Vec<(u64, u32)>,
     disk_enabled: bool,
     postings_segment: &mut Option<PostingsSegment>,
-) -> (Box<[(u64, u32)]>, Option<(u64, u32)>) {
+) -> (DescriptorTable, DescriptorDirectory) {
     if !disk_enabled || descriptors.is_empty() {
         return (descriptors.into_boxed_slice(), None);
     }
