@@ -101,6 +101,14 @@ overlays, frag) — LE plus gros poste, ×21 ≈ ~6 GiB à 28M. Ordre S5 : (a) g
 (b) disk-back par taille : le non-gaugé dominant + subfields + directory/CSR + FST (mmap/pread per-segment).
 Roaring reste résident (hot path). Cible : plancher 28M ≤4g (= ES).
 
+## ✅ S5a MERGÉ + MESURÉ (sha af65940) — gap identifié et 1re tranche livrée
+Gap ~295 MiB = les **5 tableaux par-terme** (T≈10-15M termes distincts, edge_ngram/prefixes du mapping).
+Disk-back de `segment_descriptors` : **allocated 555 → 447 MiB (−108)**, resident 675 → 567. Nouvelle
+gauge `postings_directory_bytes` = **148 MiB** restants (offsets/block_offsets/block_directory/
+block_dir_offsets). Comptabilité ≥90% : 148 dir + 80 subfields + 57 postings + 49 fst + 31 docs_ovh +
+20 id_maps + 13 roaring + 9 stats = 407/447. **Projection S5b+c** (disk-back directory 148 + subfields 80
++ fst 49) : allocated ~170 MiB à 1,36M → **~3,6 GiB à 28M → plancher ≤4g = parité plancher ES au full**.
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
