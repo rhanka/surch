@@ -109,6 +109,12 @@ block_dir_offsets). Comptabilité ≥90% : 148 dir + 80 subfields + 57 postings 
 20 id_maps + 13 roaring + 9 stats = 407/447. **Projection S5b+c** (disk-back directory 148 + subfields 80
 + fst 49) : allocated ~170 MiB à 1,36M → **~3,6 GiB à 28M → plancher ≤4g = parité plancher ES au full**.
 
+## ✅ S5b MERGÉ + GATES PASS (sha d259d40) — table TermEntry unifiée
+Oracle 0 divergence (merges actifs). fair-ab 1,36M @1536m : **RSS 618 → 363,6 MiB (−254)**, 26,1k doc/s
+(↑), latence 0,32/0,57/0,90 (p95 ≤ budget 0,6). Disque 744→978 MiB (tables spillées, attendu).
+À 1,36M mémoire constante 1536m : **RSS surch 0,27× ES.** Prochain : plancher 28M re-mesuré (@8g), puis
+S5c subfields (80 MiB) + S5d fst (49).
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
