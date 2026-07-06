@@ -618,23 +618,36 @@ pub struct StoredDocument {
     pub source: Arc<Value>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Plan segments S2 (`docs/paper/design-segments-pic-borne-2026-07-05.md`):
+/// the dense `doc_len` byte slice(s) backing [`FieldScoringStats::doc_len`].
+/// `doc_id`s are GLOBAL but each sealed segment's own `doc_len_dense` is
+/// indexed LOCALLY (`doc_id - doc_base`, see `surch_index`'s `Segment`
+/// design note), so resolving a global `doc_id` needs to know which
+/// segment it falls into. `Single` is the fast path used whenever there is
+/// exactly one segment (forever true while `SURCH_FLUSH_BUDGET_BYTES` is
+/// unset — the S1 reversibility flag): it borrows the SAME slice
+/// `doc_len_dense` used to be, with NO extra allocation and NO
+/// `partition_point` — bit-identical to before this enum existed.
+/// `Segments` is the genuine multi-segment case (`Vec` allocated once per
+/// query per field, bounded by segment count).
+#[derive(Clone, Debug, PartialEq)]
+enum DocLenDense<'a> {
+    None,
+    Single(&'a [u8]),
+    /// `(doc_base, doc_len_dense)` pairs, ascending by `doc_base`.
+    Segments(Vec<(u32, &'a [u8])>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FieldScoringStats<'a> {
     pub doc_count: u64,
     pub avg_doc_len: f64,
     pub norms_enabled: bool,
-    /// Dense per-`doc_id` **Lucene `SmallFloat`-quantized** length (`0` =
-    /// absent), borrowed ZERO-COPY from the index's
-    /// `FieldLengthStats::doc_len_dense`. Each byte must be decoded via
-    /// [`surch_index::decode_doc_len_byte`] (or [`Self::doc_len`]) before
-    /// being fed to BM25 — the encoding is the same one Lucene's
-    /// `BM25Similarity` uses, so the reconstructed value is the value the
-    /// scorer must consume (see `docs/paper/ndcg-trec-covid-rootcause-22.md`).
-    ///
-    /// Empty slice when `norms_enabled` is false. The switch from
-    /// `Vec<u64>` to `Vec<u8>` also drops `field_stats_bytes` ~8× on the
-    /// 1.36 M docs × ~6 indexed fields corpus (~65 MiB freed).
-    pub doc_len_dense: &'a [u8],
+    /// See [`DocLenDense`]. Not `pub`: `Self::doc_len` is the only
+    /// sanctioned way to read a doc's length (mirrors the pre-S2 API,
+    /// which never exposed `doc_len_dense` for direct indexing either —
+    /// grep-audited, every consumer already went through `.doc_len()`).
+    doc_len_dense: DocLenDense<'a>,
     /// Precomputed smallest reconstructed `doc_len` (`0` = none),
     /// threaded from the index's incrementally-maintained
     /// `FieldLengthStats::min_doc_len` so the WAND upper bound no
@@ -644,12 +657,36 @@ pub struct FieldScoringStats<'a> {
 }
 
 impl<'a> FieldScoringStats<'a> {
+    /// Lucene-quantized `doc_len` for the GLOBAL `doc_id`, or `None` when
+    /// no length was recorded. Each byte is decoded via
+    /// [`surch_index::decode_doc_len_byte`] — the encoding is the same one
+    /// Lucene's `BM25Similarity` uses, so the reconstructed value is the
+    /// value the scorer must consume (see
+    /// `docs/paper/ndcg-trec-covid-rootcause-22.md`).
     pub fn doc_len(&self, doc_id: u32) -> Option<u64> {
-        self.doc_len_dense
-            .get(doc_id as usize)
-            .copied()
-            .filter(|&byte| byte > 0)
-            .map(surch_index::decode_doc_len_byte)
+        match &self.doc_len_dense {
+            DocLenDense::None => None,
+            DocLenDense::Single(dense) => dense
+                .get(doc_id as usize)
+                .copied()
+                .filter(|&byte| byte > 0)
+                .map(surch_index::decode_doc_len_byte),
+            DocLenDense::Segments(segments) => {
+                // `partition_point` over ascending `doc_base`: the owning
+                // segment is the last one whose `doc_base <= doc_id`.
+                let idx = segments.partition_point(|&(base, _)| base <= doc_id);
+                if idx == 0 {
+                    return None;
+                }
+                let (base, dense) = segments[idx - 1];
+                let local = doc_id - base;
+                dense
+                    .get(local as usize)
+                    .copied()
+                    .filter(|&byte| byte > 0)
+                    .map(surch_index::decode_doc_len_byte)
+            }
+        }
     }
 
     pub fn min_doc_len(&self) -> Option<u64> {
@@ -1042,6 +1079,14 @@ impl InMemoryIndex {
         let _ = self
             .index
             .add_documents_with_mapping_deferred(documents, &self.mapping);
+        // Plan segments S2: check the flush-by-budget threshold ONCE per
+        // bulk chunk — this function IS the chunk boundary (one call per
+        // `_bulk` POST / `apply_document_writes` batch of fresh inserts).
+        // No-op when `SURCH_FLUSH_BUDGET_BYTES` is unset (the S1
+        // reversibility flag). Deliberately NOT called from
+        // `rebuild_index()`, which must always reproduce a mono-segment
+        // index (see `DocumentIndex::clear`'s doc).
+        self.index.maybe_flush_by_budget();
     }
 
     /// Track A `wp-a-perf-followups.md` Lot 1.5: free the in-memory
@@ -1488,14 +1533,15 @@ impl InMemoryIndex {
     }
 
     fn field_scoring_stats(&self, field: &str) -> Option<FieldScoringStats<'_>> {
-        // Plan segments S1 (docs/paper/design-segments-pic-borne-2026-07-05.md):
+        // Plan segments S1/S2 (docs/paper/design-segments-pic-borne-2026-07-05.md):
         // BM25 `doc_count`/`avg_doc_len`/`min_doc_len` are the GLOBAL
         // aggregate across every sealed segment (Σ doc_count, Σ
         // total_terms / Σ doc_count) — non-negotiable for oracle parity
-        // once `segments.len() > 1` (S2+). With exactly one segment (S1)
-        // this reduces to the same single division
-        // `FieldLengthStats::avg_doc_len()` performed directly, so the
-        // value is bit-for-bit identical to the pre-segment code path.
+        // once `segments.len() > 1`. With exactly one segment (S1, the
+        // default while `SURCH_FLUSH_BUDGET_BYTES` is unset) this reduces
+        // to the same single division `FieldLengthStats::avg_doc_len()`
+        // performed directly, so the value is bit-for-bit identical to
+        // the pre-segment code path.
         let aggregated = self.index.field_stats_aggregated(field)?;
         let norms_enabled = self.mapping.norms_enabled(field);
         let avg_doc_len = if norms_enabled {
@@ -1503,22 +1549,29 @@ impl InMemoryIndex {
         } else {
             1.0
         };
-        // Borrow the dense per-doc slice zero-copy — no per-query
-        // allocation, O(1) cache-friendly doc_id indexing in the hot
-        // loop. `field_stats` is the (S1: single, so always the right
-        // one) segment's own `FieldLengthStats`; routing a `doc_id` to
-        // ITS segment for this borrow is an S2 concern (local doc_ids +
-        // doc_base), out of scope while `segments.len()` is asserted to
-        // be 1. Bytes are Lucene `SmallFloat`-quantized lengths;
-        // reconstruction is folded into `FieldScoringStats::doc_len` and
-        // the hot-path call sites (search.rs / state.rs `bm25_field_score`).
-        let doc_len_dense: &[u8] = if norms_enabled {
-            self.index
-                .field_stats(field)
-                .map(|stats| stats.doc_len_dense())
-                .unwrap_or(&[])
+        // Plan segments S2: `doc_len` needs to resolve a GLOBAL doc_id to
+        // the right segment's LOCALLY-indexed dense byte slice (see
+        // `DocLenDense`'s doc). Fast path: with exactly one segment
+        // (`segment_count() == 1`, forever true while budget flush is
+        // unset), borrow the SAME zero-copy slice as before this
+        // refactor — no allocation, bit-identical to S1. Only the
+        // genuinely multi-segment case pays a small per-query `Vec`
+        // allocation (bounded by segment count).
+        let doc_len_dense = if !norms_enabled {
+            DocLenDense::None
+        } else if self.index.segment_count() == 1 {
+            match self.index.field_stats(field) {
+                Some(stats) => DocLenDense::Single(stats.doc_len_dense()),
+                None => DocLenDense::None,
+            }
         } else {
-            &[]
+            DocLenDense::Segments(
+                self.index
+                    .field_stats_segments(field)
+                    .into_iter()
+                    .map(|(base, stats)| (base, stats.doc_len_dense()))
+                    .collect(),
+            )
         };
 
         let min_doc_len = if norms_enabled {
@@ -1841,6 +1894,17 @@ impl InMemoryIndex {
     /// matching the RAM path's `_ => return Vec::new()` for an unknown
     /// term.
     fn conjunction_hits_disk(index: &DocumentIndex, terms: &[(String, String)]) -> Vec<u32> {
+        // Plan segments S2: `DiskPostingsCursor` is a single-segment,
+        // block-addressed streaming cursor — merging N of them into one
+        // monotonic cursor would need a genuine multi-cursor merge
+        // (deferred; correctness over that optimisation for now, same
+        // trade-off the design's S2 read-path note sanctions elsewhere).
+        // Route the genuinely multi-segment case through the "decode
+        // owned, correct-first" fallback instead — see
+        // `Self::conjunction_hits_merged`.
+        if index.segment_count() > 1 {
+            return Self::conjunction_hits_merged(index, terms);
+        }
         let mut cursors: Vec<DiskPostingsCursor<'_>> = Vec::with_capacity(terms.len());
         for (field, term) in terms {
             match index.disk_cursor(field, term) {
@@ -1874,6 +1938,35 @@ impl InMemoryIndex {
             out.push(target);
         }
         out
+    }
+
+    /// Plan segments S2: genuinely multi-segment counterpart of
+    /// [`Self::conjunction_hits_disk`] (which delegates here when
+    /// `index.segment_count() > 1`, regardless of whether any individual
+    /// segment is itself disk-backed — see
+    /// `DocumentIndex::postings_disk_backed`'s doc). Decodes each
+    /// required term ONCE via [`DocumentIndex::decode_from_segment`]
+    /// (already merges across every sealed segment), then a plain
+    /// `BTreeSet` intersection — correctness-first, matching
+    /// [`Self::materialised_conjunction`]'s fallback shape rather than
+    /// the roaring/skip-list optimisations (out of scope until segment
+    /// merging, S3, bounds the segment count again).
+    fn conjunction_hits_merged(index: &DocumentIndex, terms: &[(String, String)]) -> Vec<u32> {
+        let mut acc: Option<BTreeSet<u32>> = None;
+        for (field, term) in terms {
+            let current: BTreeSet<u32> = match index.decode_from_segment(field, term) {
+                Some((doc_ids, _freqs)) => doc_ids.into_iter().collect(),
+                None => return Vec::new(),
+            };
+            acc = Some(match acc {
+                None => current,
+                Some(prev) => prev.intersection(&current).copied().collect(),
+            });
+            if acc.as_ref().is_some_and(BTreeSet::is_empty) {
+                return Vec::new();
+            }
+        }
+        acc.unwrap_or_default().into_iter().collect()
     }
 
     /// Exact `BTreeSet` intersection of the lists' doc-ids (ascending). Fallback
@@ -2207,6 +2300,24 @@ impl AppState {
         }
     }
 
+    /// Plan segments S2 test/ops hook: pin `index`'s flush-by-budget
+    /// threshold independently of the process-wide `SURCH_FLUSH_BUDGET_BYTES`
+    /// env var (same `OnceLock`-cannot-flip-mid-run rationale as
+    /// [`Self::set_postings_disk_enabled`]). `Some(bytes)` forces that
+    /// exact budget (used by parity tests to force real multi-segment
+    /// indexing deterministically in-process); `None` forces "no budget"
+    /// (mono-segment) regardless of the env var. No-op if `index` does
+    /// not exist.
+    pub fn set_flush_budget_bytes_override(&self, index: &str, budget: Option<u64>) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if let Some(data) = store.indices.get_mut(index) {
+            data.index.set_flush_budget_bytes_override(budget);
+        }
+    }
+
     pub fn put_index_template(
         &self,
         name: &str,
@@ -2315,6 +2426,23 @@ impl AppState {
             .indices
             .get(index)
             .map_or(0, |data| data.index.terms_build_count())
+    }
+
+    /// Plan segments S2: number of sealed/active segments currently held
+    /// by the named index (`1` for an unknown index or one that has
+    /// never been written, matching a fresh mono-segment
+    /// `DocumentIndex`). Used by the flush-by-budget parity test to
+    /// assert a forced tiny budget actually produced real multi-segment
+    /// indexing, and available as a diagnostic hook more generally.
+    pub fn index_segment_count(&self, index: &str) -> usize {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map_or(1, |data| data.index.segment_count())
     }
 
     /// Track A `wp-a-perf-followups.md` Lot 1.6: lazily rebuild the
@@ -2714,20 +2842,33 @@ impl AppState {
             .read()
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
-        let column = data.index.subfield_values_map().get(field_path)?;
-        // Lot C Phase 1 lever 2: `column.iter()` yields owned `doc_id: u32`
-        // (dense-array index) + borrowed `&str` (dict-interned, zero-copy)
-        // instead of the previous `BTreeMap<u32, String>::iter()` pairs of
-        // borrowed `&u32`/`&String` — same ascending-doc_id, absent-omitted
-        // contract, so the resulting projection is unchanged.
-        let projection = column
-            .iter()
-            .filter_map(|(doc_id, value)| {
-                data.uid_for_doc_id(doc_id)
-                    .map(|public_id| (public_id.to_string(), value.to_owned()))
-            })
-            .collect();
-        Some(projection)
+        // Plan segments S2: `subfield_values_maps()` walks every sealed
+        // segment; `SubfieldColumn::iter()` yields `doc_id`s LOCAL to
+        // their owning segment (see `surch_index::Segment`'s doc), so
+        // each is translated back to a GLOBAL id (`local + doc_base`)
+        // before `uid_for_doc_id` — which only ever resolves globals —
+        // is called. With one segment `doc_base == 0`, so this is
+        // bit-identical to the pre-S2 single-map walk.
+        let mut found = false;
+        let mut projection = BTreeMap::new();
+        for (doc_base, map) in data.index.subfield_values_maps() {
+            let Some(column) = map.get(field_path) else {
+                continue;
+            };
+            found = true;
+            // Lot C Phase 1 lever 2: `column.iter()` yields owned `doc_id: u32`
+            // (dense-array index) + borrowed `&str` (dict-interned, zero-copy)
+            // instead of the previous `BTreeMap<u32, String>::iter()` pairs of
+            // borrowed `&u32`/`&String` — same ascending-doc_id, absent-omitted
+            // contract, so the resulting projection is unchanged.
+            for (local_doc_id, value) in column.iter() {
+                let doc_id = doc_base + local_doc_id;
+                if let Some(public_id) = data.uid_for_doc_id(doc_id) {
+                    projection.insert(public_id.to_string(), value.to_owned());
+                }
+            }
+        }
+        found.then_some(projection)
     }
 
     pub fn index_metadata(&self, index: &str) -> Option<IndexMetadata> {
@@ -3397,6 +3538,14 @@ impl AppState {
         data: &InMemoryIndex,
         clauses: &[(&str, &str)],
     ) -> Option<Vec<(f64, u32)>> {
+        // Plan segments S2: same rationale as
+        // `InMemoryIndex::conjunction_hits_disk` — `DiskPostingsCursor`
+        // streams ONE segment; a genuine multi-cursor merge across N
+        // segments is deferred, so route to the "decode owned,
+        // correct-first" fallback instead.
+        if data.index.segment_count() > 1 {
+            return Self::fused_conjunction_scores_merged(data, clauses);
+        }
         struct DiskTermCtx<'a> {
             field_stats: FieldScoringStats<'a>,
             doc_freq: u64,
@@ -3481,6 +3630,107 @@ impl AppState {
                     continue 'docs;
                 }
                 sum += term_contrib(&t.field_stats, t.doc_freq, doc_id, t.cursor.freq());
+            }
+            scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+        }
+        Some(scored)
+    }
+
+    /// Plan segments S2: genuinely multi-segment counterpart of
+    /// [`Self::fused_conjunction_scores_disk`] (which delegates here when
+    /// `segment_count() > 1`). Each clause's single token is decoded ONCE
+    /// via [`DocumentIndex::decode_from_segment`] (merges across every
+    /// sealed segment, ascending `doc_id`), then the rarest term drives a
+    /// `binary_search`-per-follower walk — correctness-first (no
+    /// galloping-cursor state to carry across segments), same BM25
+    /// `term_contrib` kernel as the RAM/disk paths so the score formula
+    /// stays bit-identical.
+    fn fused_conjunction_scores_merged(
+        data: &InMemoryIndex,
+        clauses: &[(&str, &str)],
+    ) -> Option<Vec<(f64, u32)>> {
+        struct MergedTermCtx<'a> {
+            field_stats: FieldScoringStats<'a>,
+            doc_freq: u64,
+            doc_ids: Vec<u32>,
+            freqs: Vec<u32>,
+        }
+        let mut terms: Vec<MergedTermCtx<'_>> = Vec::with_capacity(clauses.len());
+        for &(field, value) in clauses {
+            let recall = normalized_terms_for_field(value, field, &data.mapping);
+            if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
+                return None;
+            }
+            let token = recall.into_iter().next().expect("len checked == 1");
+            let Some((doc_ids, freqs)) = data.index.decode_from_segment(field, &token) else {
+                // A required term with no postings ⇒ the intersection is empty.
+                return Some(Vec::new());
+            };
+            if doc_ids.is_empty() {
+                return Some(Vec::new());
+            }
+            let field_stats = data.field_scoring_stats(field)?;
+            let doc_freq = doc_ids.len() as u64;
+            terms.push(MergedTermCtx {
+                field_stats,
+                doc_freq,
+                doc_ids,
+                freqs,
+            });
+        }
+
+        // Drive the rarest term; same ordering rationale as the RAM/disk
+        // paths.
+        terms.sort_by_key(|t| t.doc_ids.len());
+        let config = Bm25Config::default();
+
+        // Same `term_contrib` kernel as the RAM/disk paths.
+        let term_contrib =
+            |field_stats: &FieldScoringStats<'_>, doc_freq: u64, doc_id: u32, freq: u32| -> f64 {
+                if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
+                    return 0.0;
+                }
+                let doc_len = if field_stats.norms_enabled {
+                    match field_stats.doc_len(doc_id) {
+                        Some(len) => len,
+                        None => return 0.0,
+                    }
+                } else {
+                    1
+                };
+                match bm25_score(
+                    config,
+                    field_stats.doc_count,
+                    doc_freq,
+                    u64::from(freq),
+                    doc_len,
+                    field_stats.avg_doc_len,
+                ) {
+                    Ok(score) if score != 1.0 => score,
+                    _ => 0.0,
+                }
+            };
+
+        let mut scored: Vec<(f64, u32)> = Vec::new();
+        'docs: for (idx, &doc_id) in terms[0].doc_ids.iter().enumerate() {
+            let mut sum = term_contrib(
+                &terms[0].field_stats,
+                terms[0].doc_freq,
+                doc_id,
+                terms[0].freqs[idx],
+            );
+            for follower in &terms[1..] {
+                match follower.doc_ids.binary_search(&doc_id) {
+                    Ok(pos) => {
+                        sum += term_contrib(
+                            &follower.field_stats,
+                            follower.doc_freq,
+                            doc_id,
+                            follower.freqs[pos],
+                        );
+                    }
+                    Err(_) => continue 'docs,
+                }
             }
             scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
         }

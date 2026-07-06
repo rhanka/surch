@@ -231,10 +231,15 @@ fn prefix_postings_bytes(doc_index: &DocumentIndex) -> u64 {
 /// outer `field -> column` map plus the path-string overhead.
 fn subfield_values_bytes(doc_index: &DocumentIndex) -> u64 {
     let mut total: u64 = 0;
-    for (field, column) in doc_index.subfield_values_map().iter() {
-        total += field.len() as u64;
-        total += size_of::<String>() as u64;
-        total += column.memory_bytes();
+    // Plan segments S2: sum over EVERY sealed segment's own column map,
+    // not just one — `doc_base` is irrelevant to a byte count, so it is
+    // discarded here.
+    for (_doc_base, map) in doc_index.subfield_values_maps() {
+        for (field, column) in map.iter() {
+            total += field.len() as u64;
+            total += size_of::<String>() as u64;
+            total += column.memory_bytes();
+        }
     }
     total
 }
@@ -247,10 +252,14 @@ fn field_stats_bytes(doc_index: &DocumentIndex) -> u64 {
     // indexed fields workload.
     let entry_size = size_of::<u8>() as u64;
     let mut total: u64 = 0;
-    for (field, stats) in doc_index.field_stats_map().iter() {
-        total += field.len() as u64;
-        total += stats_header;
-        total += (stats.doc_len_dense().len() as u64).saturating_mul(entry_size);
+    // Plan segments S2: sum over EVERY sealed segment's own map, not just
+    // one.
+    for map in doc_index.field_stats_maps() {
+        for (field, stats) in map.iter() {
+            total += field.len() as u64;
+            total += stats_header;
+            total += (stats.doc_len_dense().len() as u64).saturating_mul(entry_size);
+        }
     }
     total
 }
