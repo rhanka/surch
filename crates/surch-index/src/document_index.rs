@@ -2786,9 +2786,7 @@ fn merge_subfield_values(
     let mut any_spilled = false;
     if let Some(store) = store.as_mut() {
         for column in merged.values_mut() {
-            if column.disk.is_some() {
-                any_spilled = true;
-            } else if !column.dict.is_empty() && column.spill(store) {
+            if column.disk.is_some() || (!column.dict.is_empty() && column.spill(store)) {
                 any_spilled = true;
             }
         }
