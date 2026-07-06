@@ -76,7 +76,12 @@ indexées par `doc_id − doc_base` (compatible : plages contiguës).
   plancher 3g) : count complet, **RSS 618 MiB**, 24 733 doc/s (≈ pré-S2), latence 0,36/0,50/0,78 ms
   (multi-segment ≈ mono). À mémoire constante 1536m : ES = 18 486 doc/s, RSS 1341 MiB, lat 1,64/2,92/3,46
   → **Surch y bat ES sur RAM (0,46×), débit (1,34×) et latence (~4-5×)**, disque 1,12× pire.
-- Le plancher surch à 1,36M passe de 3g à ≤1536m (nouveau plancher à mesurer : 1g ? 768m ?).
+- Le plancher surch à 1,36M passe de 3g à **]1g, 1536m]** (sweep : @1g OOM à ~910k docs, @768m à ~300k,
+  @512m à ~90k — docs-avant-mort ∝ cap). **= le plancher d'ES (1536m) : parité de survie à 1,36M.**
+- Lecture du sweep : le pic du BUILDER est borné (mission S2 accomplie), mais le **résident linéaire
+  par-corpus demeure** (~0,44 KB/doc : métadonnées des segments scellés — FST, directories, subfields,
+  doc_len — + id_maps globales) = la **maladie B**. Extrapolé 28M ≈ ~12,6 GiB resident → confirme S5
+  comme lift existentiel ; le smoke S3.5 (28M@16g) devrait passer SANS S5 (12,6 < 16g) — à mesurer.
 
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
