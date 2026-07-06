@@ -121,6 +121,12 @@ Oracle 0 div. fair-ab 1,36M @1536m : **RSS 363,6 → 187 MiB (−177)**, 27,1k d
 28M : bulk ENTIER passe @8g (28,9M indexés) mais **OOM au refresh final** = transient C1 (densify
 double-détention/overlay O(corpus) + FST du grand merge en RAM) → fix C1 en cours, PUIS re-test @8g/@4g.
 
+## 🏆🏆 C1 MERGÉ + GATE 28M@8g PASS (sha 23b28b6) — le transient est cassé
+Oracle 0 div (densify par tranches actif). **28,9M @8g : count COMPLET, RSS 3,10 GiB** (< ES@8g 6,54 et
+même < ES@4g 3,24 !), 23,2k doc/s, latence 0,37/0,55/0,73 ms. Le refresh final ne tue plus : densify
+append-only par tranches (SURCH_DENSIFY_BUDGET_DOCS) + FST de merge streaming. Test @4g (= plancher ES)
+en cours — s'il passe, parité de plancher au full corpus.
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
@@ -292,3 +298,126 @@ rendait le terme muet via `open_with_directory([])`). `doc_freq()` du cursor dev
   ~447−148 ≈ **~300 MiB** ; `disk_postings_bytes` +~150 MiB (payload + directory + TermEntry) ;
   latence p95 ≤ ~0,6 ms. Non exécuté localement (contrainte session : jamais cargo
   build/test/clippy) — `cargo fmt --check` propre ; CI + oracle-local + fair-ab à lancer.
+
+## 🔧 C1 fix — densify par tranches + FST merge streaming (diagnostic chiffré : l'overlay domine)
+
+**Contexte** : au 28M@8g (S5b actif), le bulk complet (28 917 511 docs, indexed=28917511) passe
+ENTIER puis OOM **pendant le refresh final**. Le challenge C1 (§ ci-dessus) soupçonnait deux
+transients : (A) la double-détention ancien+nouveau `DenseIdMaps` dans `densify()`, (B) le FST du
+grand merge construit en RAM (`MapBuilder::memory()`).
+
+**Diagnostic chiffré (étude du flux exact avant tout fix)** : dans le harnais bench
+(`deploy/bench-local/fair-ab.sh`), `_refresh` n'est appelé qu'**UNE SEULE FOIS**, après TOUT le
+bulk (`REFRESH_EACH=0` par défaut) — `densify()` n'était donc invoqué qu'une fois, avec un overlay
+(`forward_dirty`/`reverse_dirty`/`documents_dirty`) ayant accumulé la TOTALITÉ du corpus (aucun
+autre point de code ne les draine avant un `_refresh` explicite — vérifié par grep : ni
+`ensure_terms_ready`, ni `maybe_flush_by_budget`, ni `rebuild_index` ne touchent `densify`/`dense`).
+En réutilisant la formule déjà en place dans `AppState::index_state_memory_bytes`
+(`HASH_ENTRY_OVERHEAD=48`, en-tête `Arc`=16, `size_of::<Option<SourceBlob>>()`≈24) sur les 28,9M
+docs (`_id` = entier séquentiel, ~7,6 octets/uid en moyenne — corpus `fair-ab.sh` : `_id=NR`) :
+
+| Poste | Formule | 28,9M docs |
+|---|---|---|
+| `forward_dirty` | (48 + 16 + ~7,6 o uid) / doc | **~1,93 GiB** |
+| `reverse_dirty` | (48 + 4) / doc | **~1,40 GiB** |
+| `documents_dirty` | (48 + 4 + 24) / doc | **~2,05 GiB** |
+| **Overlay total** | | **~5,4 GiB** |
+| Pic reel de `densify_full` (hyp. A, re-mesuré en revue) | doublement dense (quasi vide au 1er refresh) + scratch `live_uids` ~700 Mo + ~28,9M `Arc::from(uid)` neufs ~680 Mo + nouveau `documents` ~700 Mo | **~2,4 GiB** |
+
+**L'overlay domine** (~2x le pic de `densify_full`, pas ~4x comme une première estimation
+optimiste le disait — voir « revue indépendante » ci-dessous) : dans le flux "gros bulk puis UN
+refresh", c'est LUI le vrai verrou du 28M@8g, mais la double-détention n'est pas négligeable non
+plus. Un simple `mem::take` de l'ancien `dense` seul n'aurait résolu qu'une fraction du pic total.
+
+**Fix retenu (les deux, le dominant en priorité)** :
+1. **Overlay par tranches** : `densify()` devient un dispatcher — chemin rapide
+   `densify_append_only` (append pur : `reverse_uids`/`reverse_offsets`/`documents` étendus, `forward`
+   FST reconstruit par **merge-join streaming** avec l'ancien FST via `merge_forward_fst`, les deux
+   jeux de clés étant disjoints par construction) déclenché mid-bulk par
+   `InMemoryIndex::maybe_densify_by_budget` (même point d'accroche que
+   `DocumentIndex::maybe_flush_by_budget`, dans `append_to_index`), gouverné par un nouveau flag
+   `SURCH_DENSIFY_BUDGET_DOCS` (doc-count, unset = plus JAMAIS de déclenchement mi-bulk — flag de
+   réversibilité, même idiome que `SURCH_FLUSH_BUDGET_BYTES`/`SURCH_MERGE_FANIN`). Un détecteur
+   d'interférence (update/delete contre un `doc_id` déjà densifié — `deleted_since_dense` non vide
+   ou `documents_dirty` avec un vieux `doc_id`) fait retomber sur l'algorithme complet historique
+   `densify_full` (inchangé, correct). Bonus gratuit : `densify_full` libère maintenant
+   `dense.forward` (jamais lu par sa boucle) AVANT de reconstruire.
+2. **FST du merge en streaming** (Q6) : `FieldMergeAccumulator` (dans `merge_term_dictionaries`)
+   bascule son `fst::MapBuilder` vers un tempfile (`MergeFstBuilder::Streamed`, `BufWriter<File>`)
+   au lieu de `MapBuilder::memory()` — pic de construction O(1 buffer) au lieu de O(FST final ×
+   ~2 pour le doublement de croissance du `Vec`), les octets relus en UNE fois (`fs::read`) puis le
+   tempfile supprimé. Fallback best-effort vers `MapBuilder::memory()` si le tempfile ne peut pas
+   être ouvert (même contrat que `PostingsSegment::try_new`). Les FST de SEAL (segments
+   individuels, `PostingsBuilder::build_with_disk_flag`) restent inchangés (`MapBuilder::memory()`)
+   — déjà petits car bornés par le budget de flush.
+3. **`DenseIdMaps` en `Vec<T>` (pas `Box<[T]>`)** (ajouté après la double revue, voir plus bas) :
+   condition nécessaire pour que le point 1 soit vraiment O(tranche) amorti et pas
+   O(N²/tranche) — voir « correction majeure » ci-dessous.
+
+**Fichiers** : `crates/surch-api/src/state.rs` (`densify`/`densify_full`/`densify_append_only`,
+`merge_forward_fst`, `maybe_densify_by_budget`, `DensifyBudgetOverride`, `densify_budget_docs`,
+`AppState::set_densify_budget_docs_override`, `DenseIdMaps` en `Vec<T>`), `crates/surch-index/src/postings.rs`
+(`MergeFstBuilder`, `FieldMergeAccumulator::builder`), `deploy/bench-local/fair-ab.sh` +
+`oracle-local.sh` (passthrough `SURCH_DENSIFY_BUDGET_DOCS`).
+
+**Tests** : `crates/surch-api/tests/densify_budget_parity.rs` — parité bit-identique budget vs
+refresh-only après bulk multi-chunks (`_search`/`_mget`/`_count`), et repli correct
+`densify_full` sur update+delete contre un doc déjà densifié par le chemin rapide ;
+`crates/surch-index/src/postings.rs::tests::merge_streams_fst_without_altering_merged_term_dictionary_contents`
+— merge de 3 segments (1 terme partagé + 500 termes propres chacun) RAM et disk, FST complet
+(comptage de termes) et postings byte-identiques.
+
+**Double revue indépendante avant de conclure** (règle du repo : tout point de design passe par
+consensus Codex + Opus AVANT de considérer un fix acquis) — deux agents ont relu le diff réel
+(pas seulement ce résumé) et posé les questions dures. Verdict des deux : **fonctionnellement
+correct** (l'argument de disjonction des clés du merge-join FST, vérifié pas à pas par les deux,
+tient robustement — un uid vivant ne peut jamais être à la fois dans l'ancien FST et dans la
+tranche neuve, car sa seule façon de redevenir "frais" passe par un tombstone qui route vers
+`densify_full`, lequel PURGE l'uid mort du FST avant qu'un `densify_append_only` ne puisse
+tourner à nouveau ; une violation ferait de toute façon paniquer `fst::MapBuilder::insert`, pas de
+corruption silencieuse) ; MAIS 3 points corrigés dans ce document et le code suite à la revue :
+
+- **Le pic de `densify_full` était sous-estimé** (~1-1,3 GiB annoncé initialement → **~2,4 GiB**
+  réel une fois comptés le scratch `live_uids`, les `Arc::from(uid)` neufs et le nouveau
+  `documents` — voir le tableau corrigé ci-dessus). L'overlay reste dominant mais ~2x, pas ~4x.
+- **CORRECTION MAJEURE (Opus) : `densify_append_only` n'était PAS O(tranche) tel qu'écrit
+  initialement.** `DenseIdMaps` stockait `reverse_uids`/`reverse_offsets`/`documents` en
+  `Box<[T]>` (exact-fit) ; le cycle `Box::into_vec()` → `push` → `Vec::into_boxed_slice()` que
+  `densify_append_only` faisait à CHAQUE appel **shrink-to-fit systématiquement à la fin**,
+  annulant toute capacité de croissance amortie — la tranche SUIVANTE re-déclenchait une
+  réallocation+copie de la TOTALITÉ du buffer courant, rendant le chemin rapide cumulativement
+  **O(N²/tranche)** en recopie mémoire (pas juste O(tranche) comme documenté). **Fix appliqué** :
+  `DenseIdMaps.reverse_uids`/`.reverse_offsets`/`.documents` sont maintenant des `Vec<T>` (pas des
+  `Box<[T]>`), et `densify_full`/`densify_append_only` ne font plus jamais
+  `.into_boxed_slice()`/`.into_vec()` sur ces champs — la capacité géométrique de `Vec` survit
+  d'un appel au suivant, donc la PLUPART des tranches ne réallouent PAS du tout (coût amorti
+  O(N) total, comme n'importe quel `Vec` qui grossit par `push`), au prix d'un peu de slack
+  résident en steady-state (borné, pas illimité). Les accesseurs `DenseIdMaps::uid`/`.blob`/
+  `.doc_count` sont inchangés (`Vec<T>` deref vers `&[T]`, mêmes bornes logiques). **Sans ce
+  correctif, le fix budget/tranches n'aurait PAS atteint son objectif** (le pic serait resté
+  O(corpus) à chaque déclenchement, juste avec une constante plus petite).
+- **Le flag `SURCH_DENSIFY_BUDGET_DOCS` ne contrôle PAS le choix d'algorithme** (Codex) : le
+  dispatch rapide/complet dans `densify()` ne regarde QUE l'interférence, jamais le flag — celui-ci
+  ne contrôle que la CADENCE de déclenchement mi-bulk. Conséquence assumée et documentée dans le
+  code : même flag absent, un `_refresh` explicite après un précédent sans interférence emprunte
+  déjà `densify_append_only` (sortie prouvée équivalente, pas littéralement "l'ancien chemin de
+  code"). Corrigé dans les commentaires (`densify`, `densify_budget_docs`).
+- **Risque résiduel documenté (Codex + Opus), non résolu dans cette passe** : `MergeFstBuilder`
+  best-effort ne couvre que l'OUVERTURE du tempfile — un échec tardif d'écriture/lecture
+  (`ENOSPC`/`EIO` sur `TMPDIR` en cours de merge) panique via `.expect()`, une surface de panic
+  RÉELLE (bien que rare) que `MapBuilder::memory()` n'avait jamais (une écriture `Vec<u8>` ne peut
+  échouer qu'à l'OOM). Un vrai repli gracieux mi-flux nécessiterait de bufferiser assez d'état pour
+  rejouer le merge en mémoire, ce qui réintroduirait le transient que ce fix vise à éviter — laissé
+  en suivi documenté (messages de panic clarifiés pour ne pas confondre avec un vrai bug logique).
+
+**Non exécuté localement** (contrainte session : jamais cargo build/test/clippy) — `cargo fmt
+--check` propre sur les 2 crates touchés et sur tout le workspace. Gates à lancer : CI ;
+oracle-local (0 divergence attendue, aucun changement de résultat observable) ; **28M@8g avec
+`SURCH_DENSIFY_BUDGET_DOCS` positionné (ex. 1000000) en plus de `SURCH_FLUSH_BUDGET_BYTES`/
+`SURCH_MERGE_FANIN`** — le gate cible (refresh final SANS OOM). Sans ce nouveau flag positionné,
+l'overlay n'est toujours drainé qu'au `_refresh` explicite (le bug initial) : le gate 28M@8g DOIT être
+relancé avec le flag actif pour valider le fix. **Mesurer le pic RÉEL sous le cap 8 GiB** (règle
+maison "mesurer sous limite", pas juste en extrapolant ce diagnostic) : le fix supprime le
+dominant ~5,4 GiB mais le pic résiduel (double-détention `densify_full` ~2,4 GiB, ou les
+réallocations `Vec` occasionnelles côté `densify_append_only`) reste non nul — la marge sous 8 GiB
+n'est pas garantie à l'avance, seulement plausible.
