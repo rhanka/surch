@@ -429,3 +429,114 @@ maison "mesurer sous limite", pas juste en extrapolant ce diagnostic) : le fix s
 dominant ~5,4 GiB mais le pic résiduel (double-détention `densify_full` ~2,4 GiB, ou les
 réallocations `Vec` occasionnelles côté `densify_append_only`) reste non nul — la marge sous 8 GiB
 n'est pas garantie à l'avance, seulement plausible.
+
+## 🔧 S3b — cap de taille de tier + spill incrémental des colonnes subfields (implémenté, session
+## en cours, PAS committé)
+
+**Contexte** : suite du plancher 28M (§ ci-dessus) — @4g OOM à 27,1M/28,9M (94%) avec budgets
+256M/1M, et un budget plus serré (128M/500k) est PIRE (mort à 19M) car plus de segments → plus de
+merges → le mur identifié est le **transient du merge des grands tiers**, pas le steady-state.
+
+**Constats (étude du code, avant fix)** : `DocumentIndex::merge_segments_run` (document_index.rs)
+appelle 4 fonctions dont le résident pendant la fenêtre du merge scale avec `Σ doc_count` du run —
+au DERNIER tier, ce `Σ` est ~tout le corpus par construction (la politique tiered ne plafonnait rien) :
+- `merge_term_dictionaries` : DÉJÀ streaming terme-par-terme (une passe FST k-way, un seul terme
+  décodé/ré-encodé à la fois) — mais `FieldMergeAccumulator::field_payload` (postings.rs) accumule
+  TOUT le payload FoR d'UN CHAMP avant un unique `append()` (le lot batché anti-C0 voulu), donc son
+  pic est O(Σ postings du champ le plus gros dans le run) — borné par le cap ci-dessous, pas éliminé
+  (pas de format "append par bloc" sans réintroduire le coût C0 d'un `pwrite` par terme).
+- `merge_field_stats` : concatène `doc_len_dense` (`Vec<u8>`, 1 o/doc/champ) — **AUCUN format disque
+  n'existe pour `FieldLengthStats`** (jamais disk-backé, ni en régime permanent ni pendant un merge) :
+  ce poste est structurellement résident que le merge existe ou non ; le merge double-tient
+  momentanément (sources encore vivantes + destination en construction) avant le `splice` qui libère
+  les sources — un doublement inévitable sans inventer un format S5-style pour `field_stats` (hors
+  scope de cette passe, jamais demandé ailleurs dans le plan S5).
+- `merge_subfield_values` (AVANT ce fix) : construisait la `SubfieldColumn` fusionnée ENTIÈRE
+  (dict+codes, O(Σ doc_count du run)) pour CHAQUE chemin sub-field, insérait TOUTES les colonnes
+  fusionnées dans la map AVANT de les spiller (un seul passage `Segment::seal_subfield_columns` à la
+  fin) — donc au dernier tier, pic = Σ_colonnes(28M docs × 4 o/code), ~900 Mo pour 8 colonnes deces
+  (edge_ngram/.raw/.norm). **Seul poste avec un format disque EXISTANT (S5c) qu'on peut streamer.**
+- `merge_live_docs` : négligeable (1 bit/doc, `LiveDocsBitset`).
+
+**Fix 1 — cap de taille de tier** (`SURCH_MERGE_MAX_DOCS`, défaut `0`/absent = illimité,
+réversibilité totale) : `DocumentIndex::find_eligible_merge_run` (document_index.rs:1538) porte
+maintenant une deuxième borne, en plus du ratio ×10 déjà en place — la boucle d'extension d'un run
+candidat s'arrête AUSSI dès que la somme cumulée dépasserait le cap (même `while`, un `break`
+supplémentaire ; suivi via `env::var` + `OnceLock`, `merge_max_docs()` document_index.rs:473,
+override per-index `set_merge_max_docs_override`/`resolved_merge_max_docs` document_index.rs:1424-1439,
+même idiome que `SURCH_MERGE_FANIN`/`FlushBudgetOverride`). Effet : le run le plus long éligible à un
+tier donné est maintenant `min(longueur bornée par le ratio, longueur bornée par le cap)` — le
+transient de `merge_segments_run` passe de `O(corpus)` à `O(cap)` au dernier tier, au prix de PLUS de
+segments finaux (ex. cap 8M sur 28,9M → ~4 gros segments plutôt qu'1 seul) — le read-path
+multi-segment le supporte déjà (S1/S3). Un segment qui atteint déjà le cap à lui seul n'est plus
+jamais réintégré dans un run (`sizes[start] > cap` fait déjà échouer le premier `candidate_sum`) —
+état terminal voulu, pas un bug.
+
+**Fix 2 — spill incrémental des colonnes subfields fusionnées** (`document_index.rs:2743` et
+suivantes, remplace l'ancien couple `merge_subfield_values` + `Segment::seal_subfield_columns` pour
+la partie subfields) : `merge_subfield_values` bascule vers un flux en 2 passes qui n'accumule
+JAMAIS la colonne fusionnée entière en RAM :
+1. **Passe dict** (`merge_subfield_column_streamed`, document_index.rs:2869) : pour chaque source
+   du run (dans l'ordre), lit SEULEMENT son dictionnaire propre via le nouvel accesseur
+   `SubfieldColumn::dict_only` (document_index.rs:963 — 2 `pread` groupés, offsets+bytes dict,
+   SANS lire les codes potentiellement énormes) et le ré-interne dans un accumulateur — donne une
+   table de remap `ancien_code -> code_fusionné` par source, bornée par LE VOCABULAIRE de cette
+   source (pas par son doc_count). Le dictionnaire fusionné (borné par le nombre de valeurs
+   DISTINCTES du run entier, jamais par Σ doc_count) est écrit UNE FOIS
+   (`write_subfield_dict_header`, document_index.rs:2946).
+2. **Passe codes** (même fonction) : pour chaque source (même ordre), lit SEULEMENT ses codes via le
+   nouvel accesseur `SubfieldColumn::codes_only` (document_index.rs:979 — 1 `pread`, le header dict
+   n'est jamais relu), les retraduit via la table de remap de cette source
+   (`translate_source_codes`, document_index.rs:2992 — positions hors bornes et sentinelle `ABSENT`
+   → `ABSENT`, jamais de panic) et les `append()` DIRECTEMENT dans le fichier du segment fusionné
+   (`append_codes_chunk`, document_index.rs:3019) — **UN append PAR SOURCE** (borné par le fan-in,
+   jamais par document — la leçon C0/commit `af94e52` reverté le même jour pour un `pwrite`/valeur).
+   `SubfieldSegment::append` étant un writer monotone, les chunks successifs atterrissent contigus
+   sans trou — le lecteur (`SubfieldColumn::read_spilled`) fait un seul `pread` groupé sur tout le
+   span et ne voit jamais la fragmentation d'écriture.
+- **Best-effort** : toute défaillance (source illisible, `append` en échec) fait retomber CE chemin
+  sur l'ancien corps résident (`merge_subfield_column_resident`, document_index.rs:2813, gardé tel
+  quel comme filet de secours), qui reçoit ensuite une dernière tentative de spill classique via le
+  MÊME fichier partagé (mirroir du comportement de `Segment::seal_subfield_columns`) — une colonne
+  qui échoue au streaming ne perd jamais de données, elle paie juste l'ancien coût `O(run docs)`.
+- Gain net attendu : plus de "toutes les colonnes résidentes en même temps avant le premier spill" —
+  une colonne réussie au streaming est DÉJÀ spillée (dict/codes vides) au moment où elle entre dans
+  la map fusionnée, donc N colonnes réussies coexistent quasi gratuitement (juste le petit descripteur
+  `SubfieldColumnDisk`, `O(1)` par colonne) au lieu de `O(Σ doc_count × colonnes)`.
+
+**Non fait dans cette passe (item 3 du brief, "copie verbatim FoR")** : le hook prévu
+(`FieldMergeAccumulator::encode_and_store`, postings.rs — déjà documenté comme LE point de
+remplacement pour un futur passage "verbatim + fixup du premier varint") n'a pas été touché. Analyse :
+`merge_term_dictionaries` est DÉJÀ streaming terme-par-terme (pas de re-matérialisation du corpus
+entier) — le gain d'une copie verbatim serait en CPU/temps de merge (éviter décode+ré-encode), pas en
+mémoire résidente (le poste déjà borné par terme, puis par le cap du fix 1 pour `field_payload`) : ce
+n'est donc pas sur le chemin critique du mur mémoire 28M@4g diagnostiqué. Laissé en l'état, hook
+inchangé, comme prévu par le brief ("sinon, dis-le et laisse le hook").
+
+**Tests ajoutés** (`crates/surch-index/src/document_index.rs::tests`) :
+- `merge_cap_bounds_run_doc_count_and_matches_unmerged_oracle` (document_index.rs:4058) : cap=5,
+  fanin=3, 60 docs — vérifie qu'AUCUN segment scellé ne dépasse le cap, que le cap force PLUS de
+  segments que la politique non plafonnée, ET que les résultats (doc_ids, live_doc_count,
+  field_stats agrégées, postings, valeurs sub-field) restent bit-identiques à l'oracle non fusionné
+  (fanin=0) — le cap ne change QUE la granularité de segmentation, jamais la correction.
+- `merge_subfield_streamed_matches_resident_merge` (document_index.rs:4213) : test boîte blanche —
+  construit un run de segments déjà spillés (`disk_enabled=true`, fanin=0 pour isoler les sources),
+  appelle directement `merge_subfield_column_streamed` ET `merge_subfield_column_resident` sur le
+  MÊME run/chemin, et vérifie que chaque doc résout la MÊME valeur via les deux chemins — la
+  vérification demandée "spill incrémental == spill classique".
+- `merge_ram_and_disk_modes_produce_identical_reads` (existant, document_index.rs:4135) continue de
+  passer par le nouveau chemin streamed pour `disk_enabled=true` (commentaire mis à jour).
+
+**Fichiers** : `crates/surch-index/src/document_index.rs` (`MergeMaxDocsOverride`/`merge_max_docs`/
+`set_merge_max_docs_override`/`resolved_merge_max_docs`, `find_eligible_merge_run` cap,
+`merge_subfield_values`/`merge_subfield_column_resident`/`merge_subfield_column_streamed`/
+`write_subfield_dict_header`/`translate_source_codes`/`append_codes_chunk`,
+`SubfieldColumn::dict_only`/`codes_only`/`read_spilled_dict`/`read_spilled_codes`),
+`deploy/bench-local/fair-ab.sh` + `oracle-local.sh` (passthrough `SURCH_MERGE_MAX_DOCS`).
+
+**Non exécuté localement** (contrainte session : jamais cargo build/test/clippy) — `cargo fmt --check`
+propre sur le fichier touché et sur tout le workspace (seul signal de validité syntaxique
+disponible sans compilateur ; auto-revue manuelle ligne à ligne des types/emprunts en complément).
+Gates à lancer : CI ; oracle-local (0 divergence attendue, budget minuscule + fanin 3 + cap petit
+pour exercer cascades ET cap) ; **28M@4g avec `SURCH_MERGE_MAX_DOCS` positionné (~7-8M, en plus des
+budgets/fanin déjà en place)** — le gate cible de cette passe.

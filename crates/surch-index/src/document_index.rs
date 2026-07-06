@@ -371,6 +371,11 @@ pub struct DocumentIndex {
     /// rationale/pattern as `flush_budget_override` — see
     /// [`MergeFaninOverride`].
     merge_fanin_override: MergeFaninOverride,
+    /// Plan segments S3b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §S3b, "cap de taille de tier"): per-index override for the
+    /// tiered-merge doc-count cap, same rationale/pattern as
+    /// `merge_fanin_override` — see [`MergeMaxDocsOverride`].
+    merge_max_docs_override: MergeMaxDocsOverride,
 }
 
 /// Plan segments S2: resolution mode for [`DocumentIndex::maybe_flush_by_budget`]
@@ -424,6 +429,57 @@ fn merge_fanin_bytes() -> usize {
     })
 }
 
+/// Plan segments S3b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §S3b, "cap de taille de tier"): resolution mode for
+/// [`DocumentIndex::find_eligible_merge_run`]'s doc-count cap. `UseEnv`
+/// (the `Default`) reads [`merge_max_docs`] (the process-wide
+/// `SURCH_MERGE_MAX_DOCS` `OnceLock`) — production default. `Forced(_)`
+/// is set via [`DocumentIndex::set_merge_max_docs_override`] so a test can
+/// pin an exact cap (or `None`, "no cap") on ONE index instance,
+/// independently of the env var and of any other test in the same
+/// process — same rationale as [`FlushBudgetOverride`]/[`MergeFaninOverride`].
+#[derive(Debug, Clone, Copy, Default)]
+enum MergeMaxDocsOverride {
+    #[default]
+    UseEnv,
+    Forced(Option<u64>),
+}
+
+/// Plan segments S3b: env-configured cap, in TOTAL DOCUMENTS, on a
+/// tiered-merge run's `Σ doc_count` — read ONCE per process (mirrors
+/// [`merge_fanin_bytes`]'s established `OnceLock` pattern). `None` when
+/// unset, empty, `"0"`, or unparseable — the reversibility flag: with no
+/// cap configured, [`DocumentIndex::find_eligible_merge_run`] never
+/// rejects a run on size, bit-identical to before this feature existed.
+///
+/// The measured 28M@4g wall (`docs/paper/design-segments-pic-borne-2026-07-05.md`,
+/// "PLANCHER 28M FINAL"): the transient `DocumentIndex::merge_segments_run`
+/// builds (merged term dictionary payload, per-field `doc_len_dense`
+/// concat, merged sub-field columns) before spilling scales with the
+/// MERGED run's `Σ doc_count` — at the corpus's LAST tier that is the
+/// whole corpus (~28M docs) by construction (the tiered policy keeps
+/// merging comparably-sized runs upward with no ceiling). `Some(cap)`
+/// makes [`DocumentIndex::find_eligible_merge_run`] refuse to extend a
+/// candidate run past `cap` total docs, bounding that transient to
+/// `O(cap)` instead of `O(corpus)` — at the cost of more, smaller final
+/// segments (the read path already fans out over `Vec<Arc<Segment>>`, see
+/// the design doc's "read-path multi-segment"). A segment that already
+/// reached (or exceeds) the cap on its own simply stops being eligible
+/// for any further run (`sizes[start] > cap` alone already fails the very
+/// first `candidate_sum` check), which is the intended terminal state —
+/// not a bug: a ~28M segment already discharged its whole transient once
+/// and should not be re-merged into something bigger under a cap that
+/// exists specifically to prevent that.
+fn merge_max_docs() -> Option<u64> {
+    static MAX_DOCS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MAX_DOCS.get_or_init(|| {
+        std::env::var("SURCH_MERGE_MAX_DOCS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&docs| docs > 0)
+    })
+}
+
 impl Default for DocumentIndex {
     fn default() -> Self {
         Self {
@@ -436,6 +492,7 @@ impl Default for DocumentIndex {
             next_doc_id_hint: 0,
             flush_budget_override: FlushBudgetOverride::UseEnv,
             merge_fanin_override: MergeFaninOverride::UseEnv,
+            merge_max_docs_override: MergeMaxDocsOverride::UseEnv,
         }
     }
 }
@@ -533,11 +590,18 @@ impl Segment {
     /// Plan segments S5c (`docs/paper/design-segments-pic-borne-2026-07-05.md`
     /// §S5c): finalize (clear write-time interning, matches every other
     /// sealed segment's contract) and, best-effort, disk-back every column
-    /// of `self.subfield_values` into ONE shared per-segment file. Shared
-    /// by the ordinary seal path
-    /// (`DocumentIndex::materialize_active_segment_terms`) and the S3
-    /// merge path (`DocumentIndex::merge_segments_run`) so the on-disk
-    /// layout has a single producer.
+    /// of `self.subfield_values` into ONE shared per-segment file.
+    ///
+    /// Plan segments S3b: the S3 merge path (`DocumentIndex::merge_segments_run`)
+    /// no longer calls this whole method — it streams each column's
+    /// merge+spill directly (`merge_subfield_values`/
+    /// `merge_subfield_column_streamed`) instead of building a
+    /// fully-resident merged column and spilling it here afterwards; only
+    /// the per-column `SubfieldColumn::spill` call this method also uses is
+    /// reused there, as a best-effort catch-up for any ONE path that failed
+    /// to stream (see `merge_subfield_values`'s doc comment). This method
+    /// itself is now solely the ordinary seal path's
+    /// (`DocumentIndex::materialize_active_segment_terms`) producer.
     ///
     /// Idempotent: calling this twice on an already-sealed segment is a
     /// strict no-op — every column's `intern_index` is already empty, and
@@ -891,19 +955,51 @@ impl SubfieldColumn {
         Cow::Owned(rebuilt)
     }
 
-    /// Decode a spilled column's blob back into an owned, fully resident
-    /// [`SubfieldColumn`] (`disk: None`) — the inverse of [`Self::spill`].
-    /// Returns `None` on any I/O or decode failure (truncated file,
-    /// corrupt length…), letting the caller fall back to an empty column
-    /// rather than panicking.
-    fn read_spilled(
+    /// Plan segments S3b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §S3b): the DICT-only half of [`Self::materialized`] — 2 grouped
+    /// `pread`s (offsets, dict bytes) when spilled, skipping the
+    /// potentially large codes region entirely — used by the S3b streamed
+    /// merge's dict pass (`merge_subfield_column_streamed`), which needs
+    /// every source's vocabulary but not yet its per-doc codes. A resident
+    /// column (never spilled) returns a cheap clone of `self.dict`
+    /// (already in RAM, no I/O). `None` on any I/O/decode failure — same
+    /// best-effort contract as `materialized`, but propagated as `None`
+    /// (rather than degrading to empty) so the streamed merge can fall
+    /// back to the fully-resident path for this one column instead of
+    /// silently losing values.
+    fn dict_only(
+        &self,
+        store: Option<&subfield_segment::SubfieldSegment>,
+    ) -> Option<Vec<Box<str>>> {
+        let Some(disk) = self.disk else {
+            return Some(self.dict.clone());
+        };
+        Self::read_spilled_dict(disk, store?)
+    }
+
+    /// Plan segments S3b: the CODES-only half of [`Self::materialized`] —
+    /// 1 `pread` when spilled, WITHOUT re-reading the dict header (already
+    /// consumed by [`Self::dict_only`] in the streamed merge's first pass)
+    /// — used by the streamed merge's codes pass. A resident column
+    /// returns a cheap clone of `self.codes`. `None` on any I/O/decode
+    /// failure (same rationale as `dict_only`).
+    fn codes_only(&self, store: Option<&subfield_segment::SubfieldSegment>) -> Option<Vec<u32>> {
+        let Some(disk) = self.disk else {
+            return Some(self.codes.clone());
+        };
+        Self::read_spilled_codes(disk, store?)
+    }
+
+    /// Decode a spilled column's DICT region only — factored out of
+    /// [`Self::read_spilled`] so [`Self::dict_only`] can skip the codes
+    /// `pread` entirely. Returns `None` on any I/O or decode failure.
+    fn read_spilled_dict(
         disk: SubfieldColumnDisk,
         store: &subfield_segment::SubfieldSegment,
-    ) -> Option<SubfieldColumn> {
+    ) -> Option<Vec<Box<str>>> {
         let offsets_len = u32::try_from((u64::from(disk.dict_len) + 1).saturating_mul(4)).ok()?;
         let offsets_bytes = store.read(disk.dict_offsets_base, offsets_len)?;
         let dict_bytes = store.read(disk.dict_bytes_base, disk.dict_bytes_len)?;
-        let codes_bytes = store.read(disk.codes_base, disk.codes_len.saturating_mul(4))?;
 
         let mut offsets = Vec::with_capacity(disk.dict_len as usize + 1);
         for chunk in offsets_bytes.chunks_exact(4) {
@@ -915,10 +1011,35 @@ impl SubfieldColumn {
             let slice = dict_bytes.get(start..end)?;
             dict.push(String::from_utf8(slice.to_vec()).ok()?.into_boxed_str());
         }
+        Some(dict)
+    }
+
+    /// Decode a spilled column's CODES region only — factored out of
+    /// [`Self::read_spilled`] so [`Self::codes_only`] can skip the dict
+    /// `pread`s entirely. Returns `None` on any I/O or decode failure.
+    fn read_spilled_codes(
+        disk: SubfieldColumnDisk,
+        store: &subfield_segment::SubfieldSegment,
+    ) -> Option<Vec<u32>> {
+        let codes_bytes = store.read(disk.codes_base, disk.codes_len.saturating_mul(4))?;
         let mut codes = Vec::with_capacity(disk.codes_len as usize);
         for chunk in codes_bytes.chunks_exact(4) {
             codes.push(u32::from_le_bytes(chunk.try_into().ok()?));
         }
+        Some(codes)
+    }
+
+    /// Decode a spilled column's blob back into an owned, fully resident
+    /// [`SubfieldColumn`] (`disk: None`) — the inverse of [`Self::spill`].
+    /// Returns `None` on any I/O or decode failure (truncated file,
+    /// corrupt length…), letting the caller fall back to an empty column
+    /// rather than panicking.
+    fn read_spilled(
+        disk: SubfieldColumnDisk,
+        store: &subfield_segment::SubfieldSegment,
+    ) -> Option<SubfieldColumn> {
+        let dict = Self::read_spilled_dict(disk, store)?;
+        let codes = Self::read_spilled_codes(disk, store)?;
         Some(SubfieldColumn {
             dict,
             codes,
@@ -1301,6 +1422,26 @@ impl DocumentIndex {
         }
     }
 
+    /// Plan segments S3b: per-index override for the tiered-merge doc-count
+    /// cap — see [`MergeMaxDocsOverride`]. MUST be called before any
+    /// document is indexed to take effect deterministically (mirrors
+    /// [`Self::set_flush_budget_bytes_override`]'s contract). `None` forces
+    /// "no cap" regardless of the env var; `Some(docs)` forces that exact
+    /// cap.
+    pub fn set_merge_max_docs_override(&mut self, max_docs: Option<u64>) {
+        self.merge_max_docs_override = MergeMaxDocsOverride::Forced(max_docs);
+    }
+
+    /// Plan segments S3b: the tiered-merge doc-count cap this index should
+    /// use right now — the per-index override if one was set, otherwise
+    /// the process-wide [`merge_max_docs`] env var.
+    fn resolved_merge_max_docs(&self) -> Option<u64> {
+        match self.merge_max_docs_override {
+            MergeMaxDocsOverride::UseEnv => merge_max_docs(),
+            MergeMaxDocsOverride::Forced(max_docs) => max_docs,
+        }
+    }
+
     /// Plan segments S2: materialize the active segment's pending
     /// `postings_builder`/sub-field-intern state IN PLACE — byte-for-byte
     /// the work [`Self::materialize_terms_and_finalize_postings`] always
@@ -1369,7 +1510,8 @@ impl DocumentIndex {
         if fanin < 2 {
             return;
         }
-        while let Some((start, end)) = self.find_eligible_merge_run(fanin) {
+        let max_docs = self.resolved_merge_max_docs();
+        while let Some((start, end)) = self.find_eligible_merge_run(fanin, max_docs) {
             self.merge_segments_run(start, end);
         }
     }
@@ -1386,7 +1528,25 @@ impl DocumentIndex {
     /// length) are broken leftmost. Returns `None` when no eligible run
     /// exists (including the trivial "fewer than `fanin` sealed segments
     /// at all" case).
-    fn find_eligible_merge_run(&self, fanin: usize) -> Option<(usize, usize)> {
+    ///
+    /// Plan segments S3b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §S3b, "cap de taille de tier"): `max_docs` (when `Some`, from
+    /// [`Self::resolved_merge_max_docs`]) ALSO bounds the running `Σ
+    /// doc_count` of a candidate run — extension stops the moment the NEXT
+    /// segment would push the run's total past the cap, exactly like the
+    /// existing size-ratio bound above (same `while` loop, one more early
+    /// `break`). This bounds [`Self::merge_segments_run`]'s transient (the
+    /// merged term dictionary/field-stats/sub-field columns it builds
+    /// before spilling) to `O(cap)` instead of `O(corpus)` at the
+    /// corpus's last tier — the measured 28M@4g wall (design doc,
+    /// "PLANCHER 28M FINAL"). `None` (the default, unset env) preserves
+    /// the pre-S3b behaviour exactly (no size ceiling, only the ratio
+    /// bound).
+    fn find_eligible_merge_run(
+        &self,
+        fanin: usize,
+        max_docs: Option<u64>,
+    ) -> Option<(usize, usize)> {
         /// Segments inside an eligible run must stay within this ratio of
         /// the run's smallest `doc_count` — the design doc's "~10×".
         const SIZE_RATIO: u64 = 10;
@@ -1405,14 +1565,22 @@ impl DocumentIndex {
             let mut end = start + 1;
             let mut run_min = sizes[start];
             let mut run_max = sizes[start];
+            let mut run_sum = sizes[start];
             while end < sizes.len() {
                 let candidate_min = run_min.min(sizes[end]);
                 let candidate_max = run_max.max(sizes[end]);
                 if candidate_max > candidate_min.saturating_mul(SIZE_RATIO) {
                     break;
                 }
+                let candidate_sum = run_sum.saturating_add(sizes[end]);
+                if let Some(cap) = max_docs {
+                    if candidate_sum > cap {
+                        break;
+                    }
+                }
                 run_min = candidate_min;
                 run_max = candidate_max;
+                run_sum = candidate_sum;
                 end += 1;
             }
             let len = end - start;
@@ -1466,26 +1634,27 @@ impl DocumentIndex {
         let term_dicts: Vec<&TermDictionary> = run.iter().map(|segment| &segment.terms).collect();
         let terms = merge_term_dictionaries(&term_dicts, disk_enabled);
         let field_stats = merge_field_stats(run);
-        let subfield_values = merge_subfield_values(run);
+        // Plan segments S3b (design doc §S3b, "spill incrémental des
+        // colonnes fusionnées pendant le merge"): unlike the S5c
+        // build-then-spill pattern this replaces, `merge_subfield_values`
+        // now streams each spilled path directly into the merged segment's
+        // OWN file source-by-source (never holding the whole run's merged
+        // `codes` resident) and hands back the resulting file directly —
+        // no separate `seal_subfield_columns` pass needed for the paths it
+        // successfully streamed.
+        let (subfield_values, subfield_segment) = merge_subfield_values(run, disk_enabled);
         let live_docs = merge_live_docs(run, merged_doc_base);
         let merged_segment_count = run.len();
 
-        let mut merged = Segment {
+        let merged = Segment {
             terms,
             field_stats,
             subfield_values,
             live_docs,
             doc_base: merged_doc_base,
             doc_count: merged_doc_count,
-            subfield_segment: None,
+            subfield_segment,
         };
-        // Plan segments S5c: the merged columns `merge_subfield_values`
-        // just built are fully resident (a fresh union/remap) regardless
-        // of whether the SOURCE segments were spilled — re-spill them into
-        // the merged segment's OWN file, same producer as the ordinary
-        // seal path (`Segment::seal_subfield_columns`), so a merged
-        // segment's memory footprint matches a freshly-sealed one.
-        merged.seal_subfield_columns(disk_enabled);
         self.segments
             .splice(start..end, std::iter::once(Arc::new(merged)));
 
@@ -2548,52 +2717,322 @@ fn merge_field_stats(run: &[Arc<Segment>]) -> BTreeMap<String, FieldLengthStats>
     merged
 }
 
-/// Plan segments S3: merge `run`'s per-path [`SubfieldColumn`]s into one
-/// map, indexed LOCALLY to the merged segment. For each qualified path
-/// present in at least one of `run`'s segments, every source segment's
-/// `doc_count` local doc_ids are re-set on a fresh column at the run's
-/// cumulative local offset — "union des dicts + remap des codes": `set()`
-/// re-interns each value into the NEW column's own `dict`, so a value
-/// shared by several source segments' dictionaries collapses to ONE code
-/// in the merged column instead of concatenating raw code integers (which
-/// would be wrong the moment two source segments assigned the same code
-/// to two DIFFERENT values). The caller ([`DocumentIndex::merge_segments_run`])
-/// finalizes (and, best-effort, re-spills) every returned column via
-/// [`Segment::seal_subfield_columns`] — matches every other sealed
-/// segment's contract (`intern_index` empty — write-only, and a merged
-/// segment is sealed, never written to again).
+/// Plan segments S3b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §S3b, "spill incrémental des colonnes fusionnées pendant le merge"):
+/// merge `run`'s per-path [`SubfieldColumn`]s into one map, indexed
+/// LOCALLY to the merged segment, and (best-effort, when `disk_enabled`)
+/// spill every path DIRECTLY into a fresh per-merge [`SubfieldSegment`]
+/// file — returned alongside the map for the caller
+/// ([`DocumentIndex::merge_segments_run`]) to stash on the merged
+/// `Segment` — instead of the pre-S3b two-step "build the whole merged
+/// column resident, THEN spill it" (S5c's `seal_subfield_columns`, called
+/// after this function used to return a fully resident map).
 ///
-/// Plan segments S5c: a SOURCE segment's own column may already be
-/// disk-spilled (`SURCH_POSTINGS_DISK` was on for the whole process
-/// lifetime the run's segments were sealed under, see the
-/// `debug_assert!` in `merge_segments_run`) — [`SubfieldColumn::materialized`]
-/// is called ONCE PER SOURCE SEGMENT PER PATH here (a bulk `pread`, not
-/// one per doc) before the per-doc loop below reads it, so this never
-/// pays one `pread` per value even when merging already-spilled sources.
-fn merge_subfield_values(run: &[Arc<Segment>]) -> BTreeMap<String, SubfieldColumn> {
+/// The pre-S3b resident build was the diagnosed transient at the corpus's
+/// LAST merge tier (design doc, "PLANCHER 28M FINAL"): a run's `Σ
+/// doc_count` codes, for EVERY path, held resident simultaneously (all
+/// paths are inserted into `merged` before any of them gets spilled) —
+/// ~28M × 4 B × (number of sub-field columns). S3b eliminates the "many
+/// full columns resident at once" half of that by streaming each path
+/// through [`merge_subfield_column_streamed`] (dict pass, then
+/// source-by-source codes pass, `append()`ed directly — never a resident
+/// `Σ doc_count`-sized `codes` array) — a successfully streamed column's
+/// resulting [`SubfieldColumn`] is already spilled (`dict`/`codes` empty)
+/// the moment it lands in `merged`. `disk_enabled == false` (or a failed
+/// [`SubfieldSegment::try_new`], or a per-PATH streaming failure — a
+/// source unreadable, an `append` I/O error) falls back to
+/// [`merge_subfield_column_resident`] (the historical resident
+/// union-dict/remap-codes body) for that one path, then gets one more
+/// best-effort [`SubfieldColumn::spill`] attempt via the SAME output file
+/// (mirrors [`Segment::seal_subfield_columns`]'s per-column loop) — so a
+/// rare failure degrades to "this one path pays the old O(run docs)
+/// transient", never to data loss or a panic.
+fn merge_subfield_values(
+    run: &[Arc<Segment>],
+    disk_enabled: bool,
+) -> (
+    BTreeMap<String, SubfieldColumn>,
+    Option<Arc<SubfieldSegment>>,
+) {
     let mut paths: BTreeSet<&str> = BTreeSet::new();
     for segment in run {
         paths.extend(segment.subfield_values.keys().map(String::as_str));
     }
 
+    let mut store = if disk_enabled {
+        SubfieldSegment::try_new()
+    } else {
+        None
+    };
+
     let mut merged = BTreeMap::new();
     for path in paths {
-        let mut column = SubfieldColumn::default();
-        let mut run_offset: u32 = 0;
-        for segment in run {
-            if let Some(source) = segment.subfield_values.get(path) {
-                let materialized = source.materialized(segment.subfield_segment.as_deref());
-                for local in 0..segment.doc_count {
-                    if let Some(value) = materialized.get(local) {
-                        column.set(run_offset + local, value.to_string());
-                    }
-                }
-            }
-            run_offset += segment.doc_count;
-        }
+        let streamed = store
+            .as_mut()
+            .and_then(|store| merge_subfield_column_streamed(run, path, store));
+        let mut column = match streamed {
+            Some(column) => column,
+            None => merge_subfield_column_resident(run, path),
+        };
+        column.finalize();
         merged.insert(path.to_string(), column);
     }
-    merged
+
+    // Best-effort catch-up: any path that fell back to the resident
+    // merge above (streaming failed, or was never attempted for that
+    // path) still gets ONE spill attempt via the SAME shared file — the
+    // exact per-column loop `Segment::seal_subfield_columns` runs for a
+    // freshly-sealed (non-merge) segment.
+    let mut any_spilled = false;
+    if let Some(store) = store.as_mut() {
+        for column in merged.values_mut() {
+            if column.disk.is_some() {
+                any_spilled = true;
+            } else if !column.dict.is_empty() && column.spill(store) {
+                any_spilled = true;
+            }
+        }
+    }
+
+    let subfield_segment = if any_spilled {
+        store.map(Arc::new)
+    } else {
+        None
+    };
+    (merged, subfield_segment)
+}
+
+/// Plan segments S3b: the historical (pre-S3b) resident merge body for
+/// ONE sub-field path — "union des dicts + remap des codes": `set()`
+/// re-interns each value into the NEW column's own `dict`, so a value
+/// shared by several source segments' dictionaries collapses to ONE code
+/// in the merged column instead of concatenating raw code integers (which
+/// would be wrong the moment two source segments assigned the same code
+/// to two DIFFERENT values). Kept as the fallback [`merge_subfield_values`]
+/// uses when the streamed path ([`merge_subfield_column_streamed`]) is
+/// unavailable (`disk_enabled == false`) or fails for this one path.
+///
+/// A SOURCE segment's own column may already be disk-spilled — `pread`s
+/// go through [`SubfieldColumn::materialized`], called ONCE PER SOURCE
+/// SEGMENT (a bulk read, not one per doc) before the per-doc loop below
+/// reads it, so this never pays one `pread` per value even when merging
+/// already-spilled sources.
+fn merge_subfield_column_resident(run: &[Arc<Segment>], path: &str) -> SubfieldColumn {
+    let mut column = SubfieldColumn::default();
+    let mut run_offset: u32 = 0;
+    for segment in run {
+        if let Some(source) = segment.subfield_values.get(path) {
+            let materialized = source.materialized(segment.subfield_segment.as_deref());
+            for local in 0..segment.doc_count {
+                if let Some(value) = materialized.get(local) {
+                    column.set(run_offset + local, value.to_string());
+                }
+            }
+        }
+        run_offset += segment.doc_count;
+    }
+    column
+}
+
+/// Plan segments S3b: best-effort STREAMED merge+spill of ONE sub-field
+/// `path`'s column across `run`, appending DIRECTLY into `store` — never
+/// materializes the merged column's `codes` (the run's `Σ doc_count`, the
+/// diagnosed transient) as one resident array.
+///
+/// Two passes, matching the on-disk layout's ordering constraint (the
+/// dict header must be fully known — and written — before the codes
+/// region that follows it):
+///
+/// 1. **Dict pass**: for each source (in run order), fetch just its OWN
+///    dict via [`SubfieldColumn::dict_only`] (2 grouped `pread`s when
+///    spilled — skips the, potentially large, codes region entirely) and
+///    re-intern every value into a fresh accumulator column, remembering
+///    the resulting `old_code -> merged_code` remap table (bounded by
+///    that ONE source's vocabulary, never by doc count). The merged dict
+///    (bounded by total DISTINCT values, not doc count — see
+///    [`SubfieldColumn`]'s struct doc) is then written ONCE via
+///    [`write_subfield_dict_header`].
+/// 2. **Codes pass**: for each source (in the SAME run order), fetch just
+///    its OWN codes via [`SubfieldColumn::codes_only`] (1 `pread` when
+///    spilled — the dict header is never re-read), translate them through
+///    that source's remap table, and [`append_codes_chunk`] the result
+///    DIRECTLY to `store` — ONE `append()` per SOURCE SEGMENT (bounded by
+///    the run's fan-in, never per document — the C0 lesson,
+///    `subfield_segment`'s module doc). `store.append` is a monotonic
+///    writer, so consecutive per-source chunks land contiguously with no
+///    gaps, exactly matching [`SubfieldColumn::spill`]'s single-blob
+///    `codes` region — the reader ([`SubfieldColumn::read_spilled`]) does
+///    one `pread` over the whole span and cannot tell it was written in
+///    several calls.
+///
+/// Returns `None` on ANY failure (a source's dict/codes unreadable, or an
+/// `append` I/O error) — [`merge_subfield_values`] then falls back to
+/// [`merge_subfield_column_resident`] for this path only. Bytes may
+/// already have been appended to `store` before a failure — wasted disk
+/// space, never referenced by any descriptor, same best-effort contract
+/// as `postings::persist_or_keep_term_directory`. Also returns `None`
+/// (not a failure) when the path has no values in `run` at all — matches
+/// [`SubfieldColumn::spill`]'s "nothing to gain" no-op guard.
+fn merge_subfield_column_streamed(
+    run: &[Arc<Segment>],
+    path: &str,
+    store: &mut subfield_segment::SubfieldSegment,
+) -> Option<SubfieldColumn> {
+    // Pass 1: union dict + per-source remap tables.
+    let mut dict_column = SubfieldColumn::default();
+    let mut remaps: Vec<Option<Vec<u32>>> = Vec::with_capacity(run.len());
+    for segment in run {
+        match segment.subfield_values.get(path) {
+            Some(source) => {
+                let dict = source.dict_only(segment.subfield_segment.as_deref())?;
+                let mut remap = Vec::with_capacity(dict.len());
+                for value in dict {
+                    remap.push(dict_column.intern(String::from(value)));
+                }
+                remaps.push(Some(remap));
+            }
+            None => remaps.push(None),
+        }
+    }
+    if dict_column.dict.is_empty() {
+        return None;
+    }
+    let dict_len = dict_column.dict.len() as u32;
+    let (dict_offsets_base, dict_bytes_base, dict_bytes_len) =
+        write_subfield_dict_header(&dict_column.dict, store)?;
+
+    // Pass 2: stream each source's own codes, remapped, appended directly.
+    let mut codes_base: Option<u64> = None;
+    let mut codes_len: u64 = 0;
+    for (segment, remap) in run.iter().zip(remaps.iter()) {
+        let translated = match remap {
+            Some(remap) => {
+                let source = segment
+                    .subfield_values
+                    .get(path)
+                    .expect("a remap was only built above when this source's path is present");
+                let source_codes = source.codes_only(segment.subfield_segment.as_deref())?;
+                translate_source_codes(&source_codes, segment.doc_count, remap)
+            }
+            None => vec![SubfieldColumn::ABSENT; segment.doc_count as usize],
+        };
+        let base = append_codes_chunk(&translated, store)?;
+        if codes_base.is_none() {
+            codes_base = Some(base);
+        }
+        codes_len += translated.len() as u64;
+    }
+    let codes_base =
+        codes_base.unwrap_or_else(|| dict_bytes_base.saturating_add(u64::from(dict_bytes_len)));
+    let codes_len = u32::try_from(codes_len).ok()?;
+
+    Some(SubfieldColumn {
+        dict: Vec::new(),
+        codes: Vec::new(),
+        intern_index: HashMap::new(),
+        disk: Some(SubfieldColumnDisk {
+            dict_offsets_base,
+            dict_len,
+            dict_bytes_base,
+            dict_bytes_len,
+            codes_base,
+            codes_len,
+        }),
+    })
+}
+
+/// Plan segments S3b: encode+append just the dict header (CSR offsets +
+/// UTF-8 bytes) portion of the S5c on-disk column layout — the STREAMED
+/// counterpart of [`SubfieldColumn::spill`]'s combined blob, letting the
+/// codes region ([`append_codes_chunk`]) follow afterwards, source by
+/// source, without ever holding the merged codes array in RAM. Returns
+/// `(dict_offsets_base, dict_bytes_base, dict_bytes_len)` — the
+/// [`SubfieldColumnDisk`] fields this call determines — or `None` on the
+/// same u32-overflow guard [`SubfieldColumn::spill`] uses, or an `append`
+/// I/O failure.
+fn write_subfield_dict_header(
+    dict: &[Box<str>],
+    store: &mut subfield_segment::SubfieldSegment,
+) -> Option<(u64, u64, u32)> {
+    let max_u32 = u32::MAX as usize;
+    let dict_total_bytes: usize = dict.iter().map(|value| value.len()).sum();
+    if dict_total_bytes > max_u32 || dict.len() >= max_u32 / 4 {
+        return None;
+    }
+    let mut dict_offsets: Vec<u32> = Vec::with_capacity(dict.len() + 1);
+    let mut dict_bytes: Vec<u8> = Vec::new();
+    let mut offset = 0u32;
+    dict_offsets.push(0);
+    for value in dict {
+        offset = offset.saturating_add(value.len() as u32);
+        dict_offsets.push(offset);
+        dict_bytes.extend_from_slice(value.as_bytes());
+    }
+    let mut blob = Vec::with_capacity(
+        dict_offsets
+            .len()
+            .saturating_mul(4)
+            .saturating_add(dict_bytes.len()),
+    );
+    for entry in &dict_offsets {
+        blob.extend_from_slice(&entry.to_le_bytes());
+    }
+    blob.extend_from_slice(&dict_bytes);
+    let base = store.append(&blob)?;
+    let dict_offsets_len = (dict_offsets.len() as u64).saturating_mul(4);
+    let dict_bytes_base = base.saturating_add(dict_offsets_len);
+    Some((base, dict_bytes_base, dict_bytes.len() as u32))
+}
+
+/// Plan segments S3b: translate ONE source segment's OWN `codes` (local to
+/// that source, length `<= segment.doc_count`, resize-on-write like every
+/// other dense per-doc column) through `remap` (`old_code -> merged_code`,
+/// built by [`merge_subfield_column_streamed`]'s dict pass), producing
+/// exactly `doc_count` entries — positions past `source_codes.len()`, and
+/// the [`SubfieldColumn::ABSENT`] sentinel itself, both translate to
+/// `ABSENT` (never looked up in `remap`), matching
+/// [`merge_subfield_column_resident`]'s "absent stays absent" semantics.
+/// An out-of-range code (would only happen if `remap` and `source_codes`
+/// disagree on the source's own dict size — never reachable given both
+/// are derived from the SAME source column) degrades to `ABSENT` rather
+/// than panicking.
+fn translate_source_codes(source_codes: &[u32], doc_count: u32, remap: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(doc_count as usize);
+    for local in 0..doc_count {
+        let code = source_codes
+            .get(local as usize)
+            .copied()
+            .unwrap_or(SubfieldColumn::ABSENT);
+        let translated = if code == SubfieldColumn::ABSENT {
+            SubfieldColumn::ABSENT
+        } else {
+            remap
+                .get(code as usize)
+                .copied()
+                .unwrap_or(SubfieldColumn::ABSENT)
+        };
+        out.push(translated);
+    }
+    out
+}
+
+/// Plan segments S3b: append one source's already-remapped `codes` chunk
+/// to `store` as ONE `append()` call (bounded by the run's fan-in — never
+/// per document, the C0 lesson) — the STREAMED counterpart of
+/// [`SubfieldColumn::spill`]'s codes region. Returns the byte offset the
+/// chunk starts at (the FIRST call's return value becomes the merged
+/// column's `codes_base`; later calls land contiguously right after,
+/// since `store.append` is a monotonic writer).
+fn append_codes_chunk(codes: &[u32], store: &mut subfield_segment::SubfieldSegment) -> Option<u64> {
+    let max_u32 = u32::MAX as usize;
+    if codes.len() > max_u32 / 4 {
+        return None;
+    }
+    let mut blob = Vec::with_capacity(codes.len() * 4);
+    for &code in codes {
+        blob.extend_from_slice(&code.to_le_bytes());
+    }
+    store.append(&blob)
 }
 
 /// Plan segments S3: merge `run`'s per-segment [`LiveDocsBitset`]s into
@@ -3450,11 +3889,26 @@ mod tests {
         fanin: usize,
         disk_enabled: bool,
     ) -> (DocumentIndex, IndexMapping) {
+        build_merge_test_index_with_cap(doc_count, fanin, disk_enabled, None)
+    }
+
+    /// Same corpus/knobs as [`build_merge_test_index`], plus an explicit
+    /// [`DocumentIndex::set_merge_max_docs_override`] — Plan segments S3b
+    /// (`docs/paper/design-segments-pic-borne-2026-07-05.md` §S3b, "cap de
+    /// taille de tier"). `max_docs: None` reproduces `build_merge_test_index`
+    /// exactly (the reversibility default).
+    fn build_merge_test_index_with_cap(
+        doc_count: u32,
+        fanin: usize,
+        disk_enabled: bool,
+        max_docs: Option<u64>,
+    ) -> (DocumentIndex, IndexMapping) {
         let mapping = nom_multi_field_mapping();
         let mut index = DocumentIndex::new();
         index.set_flush_budget_bytes_override(Some(1));
         index.set_merge_fanin_override(fanin);
         index.set_postings_disk_enabled(disk_enabled);
+        index.set_merge_max_docs_override(max_docs);
 
         const NAMES: [&str; 5] = [
             "Dupont Martin",
@@ -3608,6 +4062,83 @@ mod tests {
     }
 
     #[test]
+    fn merge_cap_bounds_run_doc_count_and_matches_unmerged_oracle() {
+        // Plan segments S3b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+        // §S3b, "cap de taille de tier"): a small `SURCH_MERGE_MAX_DOCS`
+        // cap must (a) still cascade merges up to the cap, (b) never let
+        // any sealed segment's `doc_count` exceed it, and (c) still
+        // produce results identical to the unmerged oracle — the cap only
+        // changes segmentation granularity, never correctness.
+        const DOC_COUNT: u32 = 60;
+        const FANIN: usize = 3;
+        const CAP: u64 = 5;
+        let (capped, _mapping) =
+            build_merge_test_index_with_cap(DOC_COUNT, FANIN, false, Some(CAP));
+        let (uncapped, _mapping) = build_merge_test_index(DOC_COUNT, FANIN, false);
+        let (oracle, _mapping) = build_merge_test_index(DOC_COUNT, 0, false);
+
+        let sealed_end = capped.segments.len() - 1;
+        assert!(
+            capped.segments[..sealed_end]
+                .iter()
+                .all(|segment| u64::from(segment.doc_count) <= CAP),
+            "every sealed segment must respect the {CAP}-doc cap, got sizes {:?}",
+            capped.segments[..sealed_end]
+                .iter()
+                .map(|s| s.doc_count)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            capped.segment_count() > uncapped.segment_count(),
+            "a small cap must force MORE (smaller) segments than the \
+             uncapped merge policy: capped={}, uncapped={}",
+            capped.segment_count(),
+            uncapped.segment_count()
+        );
+        assert!(
+            capped.segment_count() < oracle.segment_count(),
+            "the cap must still cascade merges below one segment per doc: \
+             capped={}, oracle={}",
+            capped.segment_count(),
+            oracle.segment_count()
+        );
+
+        // Parity vs the unmerged oracle: the cap must never lose or
+        // duplicate data, only change how many segments it lands in.
+        assert_eq!(capped.doc_ids(), oracle.doc_ids());
+        assert_eq!(capped.live_doc_count(), oracle.live_doc_count());
+        for field in ["NOM", "BODY"] {
+            assert_eq!(
+                capped.field_stats_aggregated(field),
+                oracle.field_stats_aggregated(field),
+                "field_stats_aggregated diverged for {field} under a cap"
+            );
+        }
+        for term in ["commun", "lorem"] {
+            let sorted_pairs = |index: &DocumentIndex| -> Vec<(u32, u32)> {
+                let (ids, freqs) = index
+                    .decode_from_segment("BODY", term)
+                    .unwrap_or_else(|| panic!("BODY={term} must be present"));
+                let mut pairs: Vec<(u32, u32)> = ids.into_iter().zip(freqs).collect();
+                pairs.sort_unstable();
+                pairs
+            };
+            assert_eq!(
+                sorted_pairs(&capped),
+                sorted_pairs(&oracle),
+                "BODY={term} postings diverged under a cap"
+            );
+        }
+        for doc_id in 0..DOC_COUNT {
+            assert_eq!(
+                capped.subfield_value("NOM.raw", doc_id),
+                oracle.subfield_value("NOM.raw", doc_id),
+                "NOM.raw diverged for doc {doc_id} under a cap"
+            );
+        }
+    }
+
+    #[test]
     fn merge_ram_and_disk_modes_produce_identical_reads() {
         // (d) the same merge policy driving a RAM-backed vs a disk-backed
         // `TermDictionary` per source segment must read back identically —
@@ -3662,7 +4193,10 @@ mod tests {
         // source, since `build_merge_test_index(_, _, true)` spills at
         // EVERY per-chunk seal before any cascade even runs), not a
         // silent resident fallback — and that the merged segment itself
-        // was re-spilled by `Segment::seal_subfield_columns`.
+        // was re-spilled, now via the S3b STREAMED path
+        // (`merge_subfield_column_streamed`, see
+        // `merge_subfield_streamed_matches_resident_merge` below for the
+        // dedicated streamed-vs-resident parity check).
         assert!(
             disk.subfield_segment_bytes() > 0,
             "merged disk-enabled index must have spilled subfield bytes on disk"
@@ -3679,6 +4213,60 @@ mod tests {
                     "every sealed segment's NOM.raw column must be spilled under disk_enabled"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn merge_subfield_streamed_matches_resident_merge() {
+        // Plan segments S3b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+        // §S3b): white-box parity between the new STREAMED merge+spill
+        // (`merge_subfield_column_streamed` — dict pass, then a
+        // per-SOURCE codes pass appended directly to a fresh file, NEVER
+        // holding the run's whole `Σ doc_count`-sized `codes` array
+        // resident) and the historical fully-resident merge
+        // (`merge_subfield_column_resident`, kept as the best-effort
+        // fallback) — both consuming the SAME already-spilled source
+        // segments, so this exercises `SubfieldColumn::dict_only`/
+        // `codes_only`'s `pread` paths, not their resident-clone
+        // shortcuts.
+        const DOC_COUNT: u32 = 11;
+        let (index, _mapping) = build_merge_test_index(DOC_COUNT, 0, true);
+        // fanin=0: never auto-merges, so every doc got its OWN sealed
+        // segment — `run` is exactly the sealed prefix (excludes the
+        // final, still-empty active segment).
+        let run: &[Arc<Segment>] = &index.segments[..index.segments.len() - 1];
+        assert!(run.len() >= 3, "sanity: need several sources to merge");
+        assert!(
+            run.iter().all(|segment| segment
+                .subfield_values
+                .get("NOM.raw")
+                .is_some_and(|column| column.disk.is_some())),
+            "every source's NOM.raw column must already be spilled for this test \
+             to actually exercise dict_only/codes_only's pread paths"
+        );
+
+        let mut store = SubfieldSegment::try_new().expect("tempfile for the merged column");
+        let streamed = merge_subfield_column_streamed(run, "NOM.raw", &mut store)
+            .expect("streaming must succeed under normal (non-failing) I/O");
+        assert!(
+            streamed.disk.is_some(),
+            "a successful streamed merge must produce an already-spilled column"
+        );
+        let resident = merge_subfield_column_resident(run, "NOM.raw");
+        assert!(
+            resident.disk.is_none(),
+            "the resident fallback must produce a RAM column (nothing to \
+             compare against otherwise)"
+        );
+
+        let merged_doc_count: u32 = run.iter().map(|segment| segment.doc_count).sum();
+        let streamed_materialized = streamed.materialized(Some(&store));
+        for doc_id in 0..merged_doc_count {
+            assert_eq!(
+                streamed_materialized.get(doc_id),
+                resident.get(doc_id),
+                "streamed vs resident merge diverged for local doc_id {doc_id}"
+            );
         }
     }
 
