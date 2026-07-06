@@ -773,25 +773,22 @@ fn term_dictionary_fst_terms_returns_lex_sorted() {
     assert!(missing.is_empty());
 }
 
-/// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
-/// §"Dimensionnement S5"): `segment_descriptors` was identified as the
-/// single largest previously-ungauged, per-term (`T`-scaled) RAM
-/// component — 16 B/term after Rust struct padding, invisible to every
-/// existing gauge. Read-parity gate for its disk-back: builds the SAME
+/// Plan segments S5a+S5b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §"Dimensionnement S5"): the five per-term (`T`-scaled) arrays
+/// (`segment_descriptors`, `offsets`, `block_offsets`, `block_directory`,
+/// `block_dir_offsets`) were identified as the largest previously-ungauged
+/// RAM component. Read-parity gate for their disk-back: builds the SAME
 /// postings twice (flag off, then flag on, via `build_with_disk_flag` —
 /// the per-call override, since the process-wide `SURCH_POSTINGS_DISK`
 /// `OnceLock` cannot flip mid-process) and asserts every term's
 /// `decode_from_segment` result stays bit-identical between the resident
-/// array (flag off, UNCHANGED default) and the new disk-backed directory
-/// plus one extra `pread` (flag on). The companion white-box test
-/// `segment_descriptors_move_off_heap_when_disk_flag_is_on` (in
-/// `crates/surch-index/src/postings.rs`'s own `#[cfg(test)]` module, which
-/// has access to the private `FieldPostings` fields) covers the actual
-/// RAM-shrink claim from the inside — the aggregate
-/// `postings_directory_bytes()` gauge also carries the PRE-EXISTING C1b
-/// `block_directory`/`block_dir_offsets` disk-mode cost, which is
-/// orthogonal to this change and can outweigh it for single-block terms,
-/// so comparing that gauge flag-off vs flag-on here would be misleading.
+/// arrays (flag off, UNCHANGED default) and the spilled unified per-term
+/// `TermEntry` table plus one extra `pread` (flag on). The companion
+/// white-box test `per_term_directory_moves_off_heap_when_disk_flag_is_on`
+/// (in `crates/surch-index/src/postings.rs`'s own `#[cfg(test)]` module,
+/// which has access to the private `FieldPostings` fields) covers the
+/// actual RAM-shrink claim from the inside, including the
+/// `postings_directory_bytes() == 0` gauge assertion.
 #[test]
 fn postings_disk_backed_descriptors_match_resident_descriptors() {
     // 200 DISTINCT terms per field (T = 200) so the per-term CSR/directory
@@ -849,4 +846,93 @@ fn postings_disk_backed_descriptors_match_resident_descriptors() {
             "decode_from_segment diverged for title/{alt}"
         );
     }
+}
+
+/// Plan segments S5b: the disk cursor opened from a SPILLED per-term
+/// directory (flag on — `TermEntry` table + packed block-directory
+/// region, both `pread` from the shared segment) must reproduce the RAM
+/// leapfrog (flag off — the unchanged resident engine) bit-for-bit,
+/// including the matched `freq` and the O(1) `doc_freq`. Mirrors
+/// `disk_cursor_matches_ram_leapfrog` above (which exercises the
+/// flag-off `open()` recompute path) with the flag-ON grouped-pread fast
+/// path — together they cover both sides of the S5b cursor plumbing.
+#[test]
+fn disk_cursor_with_spilled_directory_matches_ram_leapfrog() {
+    fn populate(builder: &mut PostingsBuilder) {
+        let total: u32 = (BLOCK_SIZE * 3 + 17) as u32;
+        for i in 0..total {
+            // Same irregular-gap shape as `disk_cursor_matches_ram_leapfrog`.
+            let doc_id = i * 7 + i % 5;
+            let freq_len = (i % 5) + 1;
+            let positions: Vec<u32> = (0..freq_len).collect();
+            builder
+                .add("body", "t", doc_id, positions)
+                .expect("add posting");
+        }
+        // A second, mono-block term so the spilled table carries more
+        // than one entry and the per-term addressing (idx * 28) is
+        // genuinely exercised.
+        builder.add("body", "aa", 3, vec![0]).expect("aa posting");
+    }
+    let total = BLOCK_SIZE * 3 + 17;
+    let doc_ids: Vec<u32> = (0..total as u32).map(|i| i * 7 + i % 5).collect();
+
+    let mut builder_off = PostingsBuilder::new();
+    populate(&mut builder_off);
+    let dict_off = builder_off.build_with_disk_flag(false);
+
+    let mut builder_on = PostingsBuilder::new();
+    populate(&mut builder_on);
+    let dict_on = builder_on.build_with_disk_flag(true);
+
+    let list = dict_off
+        .postings_with_block_metas("body", "t")
+        .expect("RAM postings list (flag off)");
+    let mut ram_iter = list
+        .skip_iter()
+        .expect("block skip list builds")
+        .expect("non-empty postings");
+    let mut disk_cursor = dict_on
+        .disk_cursor("body", "t")
+        .expect("flag-on disk cursor over the spilled directory");
+    assert_eq!(
+        disk_cursor.doc_freq(),
+        total,
+        "doc_freq must come from the spilled TermEntry's postings_count"
+    );
+
+    let mut targets: Vec<u32> = Vec::new();
+    for &doc_id in &doc_ids {
+        targets.push(doc_id.saturating_sub(1));
+        targets.push(doc_id);
+        targets.push(doc_id + 1);
+    }
+    targets.push(doc_ids.last().unwrap() + 1000);
+    targets.sort_unstable();
+
+    for &target in &targets {
+        let ram_doc_id = ram_iter.advance_to(target);
+        let disk_doc_id = disk_cursor.advance_to(target);
+        assert_eq!(
+            disk_doc_id, ram_doc_id,
+            "advance_to({target}) diverged between the spilled-directory cursor and the RAM leapfrog"
+        );
+        if ram_doc_id.is_some() {
+            let ram_freq = list.freqs()[ram_iter.position() - 1];
+            assert_eq!(
+                disk_cursor.freq(),
+                ram_freq,
+                "freq diverged at doc_id {ram_doc_id:?} for target {target}"
+            );
+        }
+    }
+
+    // The mono-block term resolves through the same spilled table.
+    let mut aa_cursor = dict_on
+        .disk_cursor("body", "aa")
+        .expect("mono-block term cursor (flag on)");
+    assert_eq!(aa_cursor.doc_freq(), 1);
+    assert_eq!(aa_cursor.advance_to(0), Some(3));
+    assert_eq!(aa_cursor.freq(), 1);
+    assert_eq!(aa_cursor.advance_to(4), None);
 }

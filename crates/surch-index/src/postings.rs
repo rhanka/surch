@@ -571,14 +571,26 @@ impl PostingsBuilder {
             let mut block_metas_flat: Vec<BlockMeta> =
                 Vec::with_capacity(if disk_enabled { 0 } else { total_blocks });
             let mut offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
-            let mut block_offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
+            // Plan segments S5b: `block_offsets` is DEAD in disk mode — its
+            // only readers (`lookup_block_metas`/`lookup_with_block_metas`)
+            // index `block_metas_flat`, which stays empty under
+            // `disk_enabled`, and every `surch-api` call site branches on
+            // `postings_disk_backed()` before reaching them. It is not
+            // built at all in disk mode (neither resident nor spilled) —
+            // the disk read path's block addressing lives in the
+            // block-directory channel below instead. `disk_enabled ==
+            // false` keeps the exact historical shape (`T + 1` entries).
+            let mut block_offsets: Vec<u32> =
+                Vec::with_capacity(if disk_enabled { 0 } else { term_count + 1 });
             // Sparse side table: only terms with df > TERM_ROARING_THRESHOLD
             // get an entry, so there is no useful exact size to precompute;
             // `shrink_to_fit()` right before insertion below removes the
             // geometric-growth slack instead.
             let mut roaring: Vec<(u32, RoaringDocSet)> = Vec::new();
             offsets.push(0);
-            block_offsets.push(0);
+            if !disk_enabled {
+                block_offsets.push(0);
+            }
 
             // Lot C `C1a-batché`: per-term `(offset, len)` descriptor into
             // the shared `postings_segment`, index-aligned with `offsets`
@@ -634,17 +646,14 @@ impl PostingsBuilder {
                     // directory built below are the sole source of truth for
                     // this term's postings, RAM is freed. Mirrors the
                     // flag-off branch's CSR bookkeeping (`offsets`,
-                    // `block_offsets`, `roaring`, `segment_descriptors`)
-                    // exactly, just sourced differently.
+                    // `roaring`, `segment_descriptors`) exactly, just
+                    // sourced differently — `block_offsets` is deliberately
+                    // NOT maintained here (dead in disk mode, see its init
+                    // above; plan segments S5b).
                     let term_doc_ids: Vec<u32> =
                         term_postings.iter().map(|posting| posting.doc_id).collect();
                     let term_freqs: Vec<u32> =
                         term_postings.iter().map(|posting| posting.freq).collect();
-
-                    block_offsets.push(
-                        block_offsets.last().copied().unwrap_or(0)
-                            + term_postings.len().div_ceil(BLOCK_SIZE) as u32,
-                    );
 
                     if term_postings.len() > TERM_ROARING_THRESHOLD {
                         roaring.push((idx as u32, RoaringDocSet::from_sorted(&term_doc_ids)));
@@ -877,12 +886,20 @@ impl PostingsBuilder {
                 .into_inner()
                 .expect("fst::MapBuilder memory writer never fails I/O");
             let fst = Map::new(bytes).expect("fst::Map from valid MapBuilder bytes");
-            // Plan segments S5: best-effort disk-back of this field's
-            // descriptors — see `persist_or_keep_descriptors`'s doc
-            // comment. No-op (returns the resident slice unchanged,
-            // `directory: None`) when `disk_enabled` is `false`.
-            let (segment_descriptors, segment_descriptors_directory) = persist_or_keep_descriptors(
-                segment_descriptors,
+            // Plan segments S5b: best-effort disk-back of this field's
+            // WHOLE per-term directory (descriptors + CSR offsets + block
+            // directory) — see `persist_or_keep_term_directory`'s doc
+            // comment. No-op (returns every channel resident unchanged,
+            // `term_entries_directory: None`) when `disk_enabled` is
+            // `false`.
+            let tables = persist_or_keep_term_directory(
+                TermDirectoryChannels {
+                    segment_descriptors,
+                    offsets,
+                    block_offsets,
+                    block_directory: block_directory_flat,
+                    block_dir_offsets,
+                },
                 disk_enabled,
                 &mut postings_segment,
             );
@@ -893,13 +910,13 @@ impl PostingsBuilder {
                     doc_ids_flat: doc_ids_flat.into_boxed_slice(),
                     freqs_flat: freqs_flat.into_boxed_slice(),
                     block_metas_flat: block_metas_flat.into_boxed_slice(),
-                    offsets: offsets.into_boxed_slice(),
-                    block_offsets: block_offsets.into_boxed_slice(),
+                    offsets: tables.offsets,
+                    block_offsets: tables.block_offsets,
                     roaring,
-                    segment_descriptors,
-                    segment_descriptors_directory,
-                    block_directory: block_directory_flat.into_boxed_slice(),
-                    block_dir_offsets: block_dir_offsets.into_boxed_slice(),
+                    segment_descriptors: tables.segment_descriptors,
+                    term_entries_directory: tables.term_entries_directory,
+                    block_directory: tables.block_directory,
+                    block_dir_offsets: tables.block_dir_offsets,
                 },
             );
         }
@@ -913,60 +930,173 @@ impl PostingsBuilder {
     }
 }
 
-/// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
-/// §"Dimensionnement S5"): best-effort disk-back of a field's (already
-/// rebased) `segment_descriptors` — shared by both producers
-/// ([`PostingsBuilder::build_with_disk_flag`] and
-/// [`FieldMergeAccumulator::finish`]) so the on-disk layout stays a
-/// single source of truth. When `disk_enabled` and `descriptors` is
-/// non-empty, packs every descriptor into
-/// [`DESCRIPTOR_ENCODED_LEN`]-byte records ([`encode_descriptor`]) and
-/// appends them to `postings_segment` in ONE extra `append()` call (same
-/// per-field batching contract as the field's own FoR payload) — this is
-/// what lets [`FieldPostings::segment_descriptors`] drop to `Box::default()`
-/// (zero heap) instead of staying resident at 16 B/term.
-///
-/// Falls back to keeping `descriptors` fully resident (returning
-/// `directory: None`) whenever the disk flag is off (unchanged default),
-/// the field carries no descriptors at all, or the `append()` itself
-/// fails (`ENOSPC`, …) — matching every other best-effort segment-write
-/// failure mode in this file: correctness never depends on this
-/// succeeding, only the RAM saving does.
-/// Resident per-term `(offset, len)` descriptor table (empty when spilled).
-type DescriptorTable = Box<[(u64, u32)]>;
-/// `(offset, len)` of the spilled descriptor table inside the segment file.
-type DescriptorDirectory = Option<(u64, u32)>;
+/// Plan segments S5b: per-field, per-term metadata channels a build
+/// (`PostingsBuilder::build_with_disk_flag`) or a merge
+/// (`FieldMergeAccumulator::finish`) accumulated, handed to
+/// [`persist_or_keep_term_directory`] once the field's per-term loop is
+/// done and every descriptor has been rebased to segment-absolute
+/// offsets. One struct rather than five parameters: the spill decision
+/// is all-or-nothing across the channels (a half-spilled field would
+/// leave readers guessing which side is authoritative), and clippy's
+/// `too_many_arguments` agrees.
+struct TermDirectoryChannels {
+    /// Per-term `(offset, len)` into the shared segment — `T` entries.
+    segment_descriptors: Vec<(u64, u32)>,
+    /// CSR postings offsets — `T + 1` entries (both modes).
+    offsets: Vec<u32>,
+    /// CSR block-meta offsets — `T + 1` entries in RAM mode, EMPTY in
+    /// disk mode (dead there, never built — plan segments S5b).
+    block_offsets: Vec<u32>,
+    /// Every term's [`BlockDirEntry`] run concatenated (disk mode only).
+    block_directory: Vec<BlockDirEntry>,
+    /// CSR offsets into `block_directory` — `T + 1` entries in disk
+    /// mode, empty in RAM mode.
+    block_dir_offsets: Vec<u32>,
+}
 
-fn persist_or_keep_descriptors(
-    descriptors: Vec<(u64, u32)>,
+/// What [`persist_or_keep_term_directory`] resolved
+/// [`TermDirectoryChannels`] into: either every channel boxed resident
+/// (`term_entries_directory: None` — the flag-off default and every
+/// best-effort fallback) or every channel EMPTY with
+/// `term_entries_directory: Some((base, term_count))` pointing at the
+/// spilled [`TermEntry`] table inside the shared segment.
+struct TermDirectoryTables {
+    segment_descriptors: Box<[(u64, u32)]>,
+    offsets: Box<[u32]>,
+    block_offsets: Box<[u32]>,
+    block_directory: Box<[BlockDirEntry]>,
+    block_dir_offsets: Box<[u32]>,
+    term_entries_directory: Option<(u64, u32)>,
+}
+
+impl TermDirectoryChannels {
+    /// Keep every channel resident (boxed as-is, no spill) — the
+    /// flag-off default and the target of every best-effort fallback in
+    /// [`persist_or_keep_term_directory`].
+    fn into_resident(self) -> TermDirectoryTables {
+        TermDirectoryTables {
+            segment_descriptors: self.segment_descriptors.into_boxed_slice(),
+            offsets: self.offsets.into_boxed_slice(),
+            block_offsets: self.block_offsets.into_boxed_slice(),
+            block_directory: self.block_directory.into_boxed_slice(),
+            block_dir_offsets: self.block_dir_offsets.into_boxed_slice(),
+            term_entries_directory: None,
+        }
+    }
+}
+
+/// Plan segments S5b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+/// §"Dimensionnement S5", après le S5a `segment_descriptors`): best-effort
+/// disk-back of a field's WHOLE per-term directory — the four remaining
+/// `T`-scaled resident arrays (`offsets`, `block_directory`,
+/// `block_dir_offsets`, plus the S5a `segment_descriptors`) collapse into
+/// ONE fixed-size [`TermEntry`] record per term (28 bytes, see
+/// [`encode_term_entry`]) written to the shared `postings_segment` in TWO
+/// extra `append()` calls per field (the packed block-directory region,
+/// then the `TermEntry` table — same per-field batching contract as the
+/// field's own FoR payload, never one write per term). Shared by both
+/// producers ([`PostingsBuilder::build_with_disk_flag`] and
+/// [`FieldMergeAccumulator::finish`]) so the on-disk layout stays a
+/// single source of truth.
+///
+/// The unified record (rather than one spilled table per array) keeps
+/// the query-time cost at ONE `pread` per resolved term for ALL the
+/// scalar metadata (postings offset/len/df + block-dir locator), plus
+/// one more `pread` for the term's whole block-directory run when a
+/// cursor is opened ([`FieldPostings::block_directory_entries`] — read
+/// in one grouped shot, never one `pread` per block).
+///
+/// Falls back to keeping every channel fully resident (returning
+/// [`TermDirectoryChannels::into_resident`]) whenever the disk flag is
+/// off (unchanged default), the field carries no terms, the channel
+/// shapes are inconsistent, the segment is absent, or either metadata
+/// `append()` fails (`ENOSPC`, …). On a metadata append failure the
+/// segment itself is deliberately kept ALIVE — unlike a FoR-payload
+/// append failure (which disables it): under `disk_enabled` the flat RAM
+/// channels are empty, so the already-written payload bytes are the ONLY
+/// readable copy of the postings, and the resident tables this fallback
+/// preserves still address them correctly. Nulling the segment here
+/// would silently empty every query on the segment — the exact opposite
+/// of "best-effort".
+fn persist_or_keep_term_directory(
+    channels: TermDirectoryChannels,
     disk_enabled: bool,
     postings_segment: &mut Option<PostingsSegment>,
-) -> (DescriptorTable, DescriptorDirectory) {
-    if !disk_enabled || descriptors.is_empty() {
-        return (descriptors.into_boxed_slice(), None);
+) -> TermDirectoryTables {
+    if !disk_enabled || channels.segment_descriptors.is_empty() {
+        return channels.into_resident();
     }
-    let term_count = descriptors.len() as u32;
-    let mut encoded = Vec::with_capacity(descriptors.len() * DESCRIPTOR_ENCODED_LEN as usize);
-    for &(offset, len) in &descriptors {
-        encoded.extend_from_slice(&encode_descriptor(offset, len));
+    let term_count = channels.segment_descriptors.len();
+    // Producer invariant (both producers push exactly one entry per term
+    // into each CSR channel in disk mode) — checked loudly in debug
+    // builds, with a graceful resident fallback (never a panic) in
+    // release if a future refactor ever breaks it.
+    debug_assert_eq!(
+        channels.offsets.len(),
+        term_count + 1,
+        "offsets CSR shape diverged from the descriptor count"
+    );
+    debug_assert_eq!(
+        channels.block_dir_offsets.len(),
+        term_count + 1,
+        "block_dir_offsets CSR shape diverged from the descriptor count"
+    );
+    if channels.offsets.len() != term_count + 1
+        || channels.block_dir_offsets.len() != term_count + 1
+    {
+        return channels.into_resident();
     }
     let Some(segment) = postings_segment.as_mut() else {
-        return (descriptors.into_boxed_slice(), None);
+        return channels.into_resident();
     };
-    match segment.append(&encoded) {
-        Some(dir_base) => (
-            Vec::<(u64, u32)>::new().into_boxed_slice(),
-            Some((dir_base, term_count)),
-        ),
-        None => {
-            // The batched `append()` failed (e.g. `ENOSPC`): mirror the
-            // existing per-field FoR-payload failure handling and
-            // disable the segment for the rest of the build rather than
-            // risk a half-written directory some OTHER field's
-            // descriptors might still reference.
-            *postings_segment = None;
-            (descriptors.into_boxed_slice(), None)
-        }
+
+    // (1) The field's whole block directory, packed at
+    // BLOCK_DIR_ENTRY_ENCODED_LEN (10 B, no Rust padding) per entry —
+    // ONE append for the field.
+    let mut encoded_directory = Vec::with_capacity(
+        channels
+            .block_directory
+            .len()
+            .saturating_mul(BLOCK_DIR_ENTRY_ENCODED_LEN as usize),
+    );
+    for entry in &channels.block_directory {
+        encoded_directory.extend_from_slice(&encode_block_dir_entry(entry));
+    }
+    let Some(block_dir_base) = segment.append(&encoded_directory) else {
+        return channels.into_resident();
+    };
+
+    // (2) The per-term TermEntry table, TERM_ENTRY_ENCODED_LEN (28 B)
+    // per term — ONE append for the field. Built only now that
+    // `block_dir_base` is known, so every record carries a FINAL
+    // segment-absolute block-dir offset (never a to-be-rebased one).
+    let mut encoded_entries =
+        Vec::with_capacity(term_count.saturating_mul(TERM_ENTRY_ENCODED_LEN as usize));
+    for idx in 0..term_count {
+        let (postings_offset, postings_len) = channels.segment_descriptors[idx];
+        let postings_count = channels.offsets[idx + 1].saturating_sub(channels.offsets[idx]);
+        let dir_start = channels.block_dir_offsets[idx];
+        let dir_end = channels.block_dir_offsets[idx + 1];
+        let entry = TermEntry {
+            postings_offset,
+            postings_len,
+            postings_count,
+            block_dir_offset: block_dir_base + u64::from(dir_start) * BLOCK_DIR_ENTRY_ENCODED_LEN,
+            block_dir_count: dir_end.saturating_sub(dir_start),
+        };
+        encoded_entries.extend_from_slice(&encode_term_entry(&entry));
+    }
+    let Some(entries_base) = segment.append(&encoded_entries) else {
+        return channels.into_resident();
+    };
+
+    TermDirectoryTables {
+        segment_descriptors: Box::default(),
+        offsets: Box::default(),
+        block_offsets: Box::default(),
+        block_directory: Box::default(),
+        block_dir_offsets: Box::default(),
+        term_entries_directory: Some((entries_base, term_count as u32)),
     }
 }
 
@@ -1017,6 +1147,10 @@ impl FieldMergeAccumulator {
         if disk_enabled {
             block_dir_offsets.push(0);
         }
+        // Plan segments S5b: `block_offsets` is dead in disk mode (same
+        // rationale as `PostingsBuilder::build_with_disk_flag`'s init) —
+        // only the RAM merge maintains it.
+        let block_offsets = if disk_enabled { Vec::new() } else { vec![0] };
         Self {
             disk_enabled,
             builder: MapBuilder::memory(),
@@ -1024,7 +1158,7 @@ impl FieldMergeAccumulator {
             freqs_flat: Vec::new(),
             block_metas_flat: Vec::new(),
             offsets: vec![0],
-            block_offsets: vec![0],
+            block_offsets,
             roaring: Vec::new(),
             segment_descriptors: Vec::new(),
             field_payload: Vec::new(),
@@ -1080,10 +1214,6 @@ impl FieldMergeAccumulator {
             .expect("fst union stream yields strictly increasing keys");
 
         if self.disk_enabled {
-            self.block_offsets.push(
-                self.block_offsets.last().copied().unwrap_or(0)
-                    + doc_ids.len().div_ceil(BLOCK_SIZE) as u32,
-            );
             if doc_ids.len() > TERM_ROARING_THRESHOLD {
                 self.roaring
                     .push((term_idx, RoaringDocSet::from_sorted(doc_ids)));
@@ -1193,11 +1323,17 @@ impl FieldMergeAccumulator {
             .into_inner()
             .expect("fst::MapBuilder memory writer never fails I/O");
         let fst = Map::new(bytes).expect("fst::Map from valid MapBuilder bytes");
-        // Plan segments S5: same best-effort disk-back as
+        // Plan segments S5b: same best-effort disk-back as
         // `PostingsBuilder::build_with_disk_flag` — see
-        // `persist_or_keep_descriptors`'s doc comment.
-        let (segment_descriptors, segment_descriptors_directory) = persist_or_keep_descriptors(
-            self.segment_descriptors,
+        // `persist_or_keep_term_directory`'s doc comment.
+        let tables = persist_or_keep_term_directory(
+            TermDirectoryChannels {
+                segment_descriptors: self.segment_descriptors,
+                offsets: self.offsets,
+                block_offsets: self.block_offsets,
+                block_directory: self.block_directory_flat,
+                block_dir_offsets: self.block_dir_offsets,
+            },
             self.disk_enabled,
             postings_segment,
         );
@@ -1207,13 +1343,13 @@ impl FieldMergeAccumulator {
                 doc_ids_flat: self.doc_ids_flat.into_boxed_slice(),
                 freqs_flat: self.freqs_flat.into_boxed_slice(),
                 block_metas_flat: self.block_metas_flat.into_boxed_slice(),
-                offsets: self.offsets.into_boxed_slice(),
-                block_offsets: self.block_offsets.into_boxed_slice(),
+                offsets: tables.offsets,
+                block_offsets: tables.block_offsets,
                 roaring: self.roaring,
-                segment_descriptors,
-                segment_descriptors_directory,
-                block_directory: self.block_directory_flat.into_boxed_slice(),
-                block_dir_offsets: self.block_dir_offsets.into_boxed_slice(),
+                segment_descriptors: tables.segment_descriptors,
+                term_entries_directory: tables.term_entries_directory,
+                block_directory: tables.block_directory,
+                block_dir_offsets: tables.block_dir_offsets,
             },
             self.postings_skipped_terms,
         )
@@ -1245,16 +1381,17 @@ impl FieldMergeAccumulator {
 /// `PostingsBuilder::build`'s `BTreeMap` does for a fresh build. For every
 /// resulting term, the union's `IndexedValue`s hand back each
 /// participating source's own FST output (the term idx) directly, so the
-/// per-source postings are resolved through the CSR `offsets` table with
-/// NO second FST lookup: a RAM-backed source is read from its resident
+/// per-source postings are resolved with NO second FST lookup: a
+/// RAM-backed source is read from its resident CSR `offsets` +
 /// `doc_ids_flat`/`freqs_flat` slices, a disk-backed one through its
-/// `segment_descriptors` entry (one `pread` + [`decode_postings_blocked`]
-/// — the same bytes [`TermDictionary::decode_from_segment`] would read,
-/// minus that method's redundant FST resolution). A disk source term
-/// carrying the sentinel `(0, 0)` descriptor (no disk coverage — an I/O
-/// failure at ITS build; those postings are then already unreadable by
-/// every production query on that segment) contributes nothing, matching
-/// `decode_from_segment`'s best-effort contract.
+/// [`FieldPostings::term_entry`] record (resident-or-pread — plan
+/// segments S5b — then one `pread` + [`decode_postings_blocked`] for the
+/// payload, the same bytes [`TermDictionary::decode_from_segment`] would
+/// read, minus that method's redundant FST resolution). A disk source
+/// term carrying the sentinel `postings_len == 0` (no disk coverage — an
+/// I/O failure at ITS build; those postings are then already unreadable
+/// by every production query on that segment) contributes nothing,
+/// matching `decode_from_segment`'s best-effort contract.
 ///
 /// `disk_enabled` selects the MERGED dictionary's own RAM/disk layout. The
 /// caller passes `DocumentIndex`'s resolved postings-disk flag, which
@@ -1309,28 +1446,36 @@ pub(crate) fn merge_term_dictionaries(
                     continue;
                 };
                 let term_idx = indexed.value as usize;
-                let start = fp.offsets[term_idx] as usize;
-                let end = fp.offsets[term_idx + 1] as usize;
                 if source.disk_backed() {
+                    // Plan segments S5b: a disk-backed source's CSR
+                    // `offsets` may be EMPTY (spilled into its TermEntry
+                    // table), so everything — descriptor AND df — comes
+                    // from the unified accessor, resident-or-pread. The
+                    // resident indexing below is RAM-branch-only.
                     let segment = source.postings_segment.as_deref();
-                    let Some((offset, len)) = fp.descriptor_at(term_idx, segment) else {
+                    let Some(entry) = fp.term_entry(term_idx, segment) else {
                         continue;
                     };
-                    if len == 0 {
+                    if entry.postings_len == 0 {
                         continue;
                     }
                     let Some(segment) = segment else {
                         continue;
                     };
-                    let Some(bytes) = segment.read(offset, len) else {
+                    let Some(bytes) = segment.read(entry.postings_offset, entry.postings_len)
+                    else {
                         continue;
                     };
-                    let Ok((ids, freqs)) = decode_postings_blocked(&bytes, end - start) else {
+                    let Ok((ids, freqs)) =
+                        decode_postings_blocked(&bytes, entry.postings_count as usize)
+                    else {
                         continue;
                     };
                     merged_doc_ids.extend(ids);
                     merged_freqs.extend(freqs);
                 } else {
+                    let start = fp.offsets[term_idx] as usize;
+                    let end = fp.offsets[term_idx + 1] as usize;
                     merged_doc_ids.extend_from_slice(&fp.doc_ids_flat[start..end]);
                     merged_freqs.extend_from_slice(&fp.freqs_flat[start..end]);
                 }
@@ -1469,9 +1614,21 @@ pub struct FieldPostings {
     /// `PostingsBuilder::build()` carries a `debug_assert` that the
     /// cumulative count fits, with a comment on switching to `u64` if a
     /// future corpus needs more than ~4.29 B total postings in one field.
+    ///
+    /// Plan segments S5b: `Box::default()` (empty) when
+    /// [`Self::term_entries_directory`] is `Some(_)` — each term's `df`
+    /// then comes from its spilled [`TermEntry::postings_count`] instead
+    /// of an `offsets[i+1] - offsets[i]` difference.
     offsets: Box<[u32]>,
     /// CSR offsets into `block_metas_flat`, length `T + 1`, same shape as
     /// `offsets` but for the (coarser) block-meta channel.
+    ///
+    /// Plan segments S5b: RAM mode only — DEAD in disk mode (its only
+    /// readers, [`Self::lookup_block_metas`] /
+    /// [`Self::lookup_with_block_metas`], index `block_metas_flat`, which
+    /// is empty under the disk flag, and every `surch-api` call site
+    /// branches on `postings_disk_backed()` first), so disk-mode builds
+    /// leave it empty from the start, neither resident nor spilled.
     block_offsets: Box<[u32]>,
     /// SPARSE side table: only terms whose `df > TERM_ROARING_THRESHOLD`
     /// get an entry — `(term_idx, bitmap)`, sorted ascending by `term_idx`
@@ -1497,73 +1654,166 @@ pub struct FieldPostings {
     /// Rust struct padding — a field with high term cardinality, e.g. an
     /// `edge_ngram`/`autocomplete` analyzer or `index_prefixes`, can push
     /// `T` into the millions even on a modest doc count). `Box::default()`
-    /// (empty) when [`Self::segment_descriptors_directory`] is `Some(_)` —
+    /// (empty) when [`Self::term_entries_directory`] is `Some(_)` —
     /// see that field's doc comment for the disk-backed replacement.
     segment_descriptors: Box<[(u64, u32)]>,
-    /// Plan segments S5: when `Some((dir_base, term_count))`, the array
-    /// above is EMPTY and every term's descriptor instead lives in the
-    /// SHARED `postings_segment` file as a packed 12-byte record
-    /// (`u64` offset + `u32` len, both little-endian — see
-    /// [`encode_descriptor`]/[`decode_descriptor`]) at byte
-    /// `dir_base + term_idx * DESCRIPTOR_ENCODED_LEN`, written ONCE by
-    /// [`PostingsBuilder::build_with_disk_flag`] / [`FieldMergeAccumulator::finish`]
-    /// right after the field's own FoR payload (same per-field batching
-    /// contract, one extra `append()`). Resolved by [`FieldPostings::descriptor_at`]
-    /// with one extra `pread` instead of an O(1) RAM index — the S5
-    /// trade-off already accepted for the FoR payload itself (C1b).
+    /// Plan segments S5b (extends the S5a descriptor spill): when
+    /// `Some((entries_base, term_count))`, EVERY `T`-scaled resident
+    /// array of this struct (`segment_descriptors`, `offsets`,
+    /// `block_offsets`, `block_directory`, `block_dir_offsets`) is EMPTY
+    /// and each term's whole per-term metadata instead lives in the
+    /// SHARED `postings_segment` file as ONE packed 28-byte [`TermEntry`]
+    /// record (see [`encode_term_entry`]) at byte `entries_base +
+    /// term_idx * TERM_ENTRY_ENCODED_LEN`, written ONCE by
+    /// [`persist_or_keep_term_directory`] right after the field's own FoR
+    /// payload and its packed block-directory region (same per-field
+    /// batching contract, two extra `append()`s). Resolved by
+    /// [`FieldPostings::term_entry`] with one `pread` for ALL the scalar
+    /// per-term metadata (postings offset/len/df + block-dir locator) —
+    /// the S5 trade-off already accepted for the FoR payload itself
+    /// (C1b) — and the term's block-directory run is then fetched in one
+    /// MORE grouped `pread` by [`FieldPostings::block_directory_entries`]
+    /// when a cursor opens (never one `pread` per block).
     /// `None` when the postings-disk flag (`SURCH_POSTINGS_DISK`) was off
     /// at build time (the unchanged, 100 %-resident default) or when
     /// persisting the directory failed (best-effort: falls back to the
-    /// resident `segment_descriptors` above, same philosophy as every
-    /// other segment-write failure in this file).
-    segment_descriptors_directory: Option<(u64, u32)>,
+    /// resident arrays above, same philosophy as every other
+    /// segment-write failure in this file).
+    term_entries_directory: Option<(u64, u32)>,
     /// Lot C `C1b` sous-pas 2: per-block directory (`max_doc_id` per FoR
     /// block, [`BlockDirEntry`]), persisted ONCE at
     /// [`PostingsBuilder::build_with_disk_flag`] time — CSR-indexed by
     /// [`Self::block_dir_offsets`], concatenated across every term in FST
-    /// idx order (same shape as `block_metas_flat`/`block_offsets`).
-    /// Built ONLY when the disk flag is on for this build; `Box::default()`
-    /// (empty, zero heap) otherwise, so the RAM-only engine pays nothing
-    /// for it. Lets [`TermDictionary::disk_cursor`] open a block-addressed
-    /// cursor in O(term's block count) — a directory LOOKUP — instead of
-    /// `pread`-ing and decoding the term's WHOLE payload just to compute
-    /// the directory (sous-pas 1's ad hoc fallback, still used when this
-    /// is empty — e.g. a `TermDictionary` built with the flag off).
+    /// idx order. Built ONLY when the disk flag is on for this build;
+    /// `Box::default()` (empty, zero heap) otherwise, so the RAM-only
+    /// engine pays nothing for it. Lets [`TermDictionary::disk_cursor`]
+    /// open a block-addressed cursor in O(term's block count) — a
+    /// directory LOOKUP — instead of `pread`-ing and decoding the term's
+    /// WHOLE payload just to compute the directory (sous-pas 1's ad hoc
+    /// fallback, still used when no directory is available for a term).
+    ///
+    /// Plan segments S5b: `Box::default()` (empty) when
+    /// [`Self::term_entries_directory`] is `Some(_)` — the entries then
+    /// live in the shared segment as packed 10-byte records
+    /// ([`encode_block_dir_entry`]), addressed per term by
+    /// [`TermEntry::block_dir_offset`]/[`TermEntry::block_dir_count`] and
+    /// fetched in ONE grouped `pread` per cursor open
+    /// ([`Self::block_directory_entries`]).
     block_directory: Box<[BlockDirEntry]>,
     /// CSR offsets into `block_directory`, length `T + 1` when the disk
     /// flag was on for this build, empty (`Box::default()`) otherwise —
-    /// same shape/contract as `offsets`/`block_offsets`.
+    /// same shape/contract as `offsets`/`block_offsets`. Plan segments
+    /// S5b: also empty once spilled (see
+    /// [`Self::term_entries_directory`]).
     block_dir_offsets: Box<[u32]>,
 }
 
-/// Plan segments S5: on-disk encoded length of one
-/// [`FieldPostings::segment_descriptors_directory`] entry — 8 bytes for
-/// the `u64` offset plus 4 for the `u32` len, packed with NO padding (the
-/// in-RAM tuple `(u64, u32)` pads to 16 bytes on `size_of`-driven gauges;
-/// the on-disk format is deliberately the tight 12 bytes since it is only
-/// ever read back through [`decode_descriptor`], never transmuted).
-const DESCRIPTOR_ENCODED_LEN: u64 = 12;
+/// Plan segments S5b: one term's COMPLETE per-term metadata, unified
+/// across what used to be four separate resident arrays (S5a's
+/// `segment_descriptors` + the CSR `offsets` df + the
+/// `block_dir_offsets`-CSR-indexed `block_directory` locator). ONE
+/// fixed-size record per term so the disk-backed read path resolves
+/// everything scalar about a term in ONE `pread`
+/// ([`FieldPostings::term_entry`]).
+///
+/// Sentinel contract (mirrors the historical `(0, 0)` descriptor):
+/// `postings_len == 0` means NO disk coverage for the term (its FoR
+/// encode failed at build time, or the payload append failed) — readers
+/// must not interpret any other field then. `postings_offset == 0` with
+/// `postings_len > 0` is a perfectly valid record (the first term of the
+/// first field written to the segment). `block_dir_count == 0` with
+/// `postings_len > 0` means the payload is readable but carries no
+/// persisted block directory (its `block_directory()` computation failed
+/// at build time) — [`TermDictionary::disk_cursor`] then falls back to
+/// [`DiskPostingsCursor::open`]'s recompute instead of treating the term
+/// as empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TermEntry {
+    /// Segment-absolute byte offset of the term's FoR payload.
+    postings_offset: u64,
+    /// Byte length of the term's FoR payload (`0` = sentinel, see above).
+    postings_len: u32,
+    /// The term's `df` (posting count) — what `offsets[i+1] - offsets[i]`
+    /// used to provide.
+    postings_count: u32,
+    /// Where the term's [`BlockDirEntry`] run starts. Directory spilled
+    /// ([`FieldPostings::term_entries_directory`] `Some`): segment-absolute
+    /// byte offset of the packed 10-byte records. Resident fallback:
+    /// START INDEX into the resident `block_directory` array (an entry
+    /// count, not bytes) — [`FieldPostings::block_directory_entries`] is
+    /// the single reader and branches accordingly.
+    block_dir_offset: u64,
+    /// Number of [`BlockDirEntry`] records in the term's run (`0` = no
+    /// persisted directory, cursor recomputes — see the sentinel
+    /// contract above).
+    block_dir_count: u32,
+}
 
-/// Plan segments S5: pack one `(offset, len)` descriptor into the tight
-/// 12-byte on-disk format (`DESCRIPTOR_ENCODED_LEN`), little-endian.
-fn encode_descriptor(offset: u64, len: u32) -> [u8; DESCRIPTOR_ENCODED_LEN as usize] {
-    let mut buf = [0u8; DESCRIPTOR_ENCODED_LEN as usize];
-    buf[0..8].copy_from_slice(&offset.to_le_bytes());
-    buf[8..12].copy_from_slice(&len.to_le_bytes());
+/// Plan segments S5b: on-disk encoded length of one [`TermEntry`] — 28
+/// bytes packed with NO padding (`u64 + u32 + u32 + u64 + u32`), only
+/// ever read back through [`decode_term_entry`], never transmuted.
+const TERM_ENTRY_ENCODED_LEN: u64 = 28;
+
+/// Plan segments S5b: pack one [`TermEntry`] into the tight 28-byte
+/// on-disk format ([`TERM_ENTRY_ENCODED_LEN`]), little-endian.
+fn encode_term_entry(entry: &TermEntry) -> [u8; TERM_ENTRY_ENCODED_LEN as usize] {
+    let mut buf = [0u8; TERM_ENTRY_ENCODED_LEN as usize];
+    buf[0..8].copy_from_slice(&entry.postings_offset.to_le_bytes());
+    buf[8..12].copy_from_slice(&entry.postings_len.to_le_bytes());
+    buf[12..16].copy_from_slice(&entry.postings_count.to_le_bytes());
+    buf[16..24].copy_from_slice(&entry.block_dir_offset.to_le_bytes());
+    buf[24..28].copy_from_slice(&entry.block_dir_count.to_le_bytes());
     buf
 }
 
-/// Plan segments S5: inverse of [`encode_descriptor`]. Returns `None` if
-/// `bytes` is shorter than [`DESCRIPTOR_ENCODED_LEN`] (a truncated
+/// Plan segments S5b: inverse of [`encode_term_entry`]. Returns `None`
+/// if `bytes` is shorter than [`TERM_ENTRY_ENCODED_LEN`] (a truncated
 /// `pread`, treated the same as every other best-effort I/O failure in
 /// this file: the caller sees "no disk coverage" for that term).
-fn decode_descriptor(bytes: &[u8]) -> Option<(u64, u32)> {
-    let offset_bytes: [u8; 8] = bytes.get(0..8)?.try_into().ok()?;
-    let len_bytes: [u8; 4] = bytes.get(8..12)?.try_into().ok()?;
-    Some((
-        u64::from_le_bytes(offset_bytes),
-        u32::from_le_bytes(len_bytes),
-    ))
+fn decode_term_entry(bytes: &[u8]) -> Option<TermEntry> {
+    Some(TermEntry {
+        postings_offset: u64::from_le_bytes(bytes.get(0..8)?.try_into().ok()?),
+        postings_len: u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?),
+        postings_count: u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?),
+        block_dir_offset: u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?),
+        block_dir_count: u32::from_le_bytes(bytes.get(24..28)?.try_into().ok()?),
+    })
+}
+
+/// Plan segments S5b: on-disk encoded length of one [`BlockDirEntry`] —
+/// 10 bytes packed with NO padding (`u32 + u16 + u32`; the in-RAM struct
+/// pads to 12 on `size_of`-driven gauges).
+const BLOCK_DIR_ENTRY_ENCODED_LEN: u64 = 10;
+
+/// Plan segments S5b: pack one [`BlockDirEntry`] into the tight 10-byte
+/// on-disk format ([`BLOCK_DIR_ENTRY_ENCODED_LEN`]), little-endian.
+fn encode_block_dir_entry(entry: &BlockDirEntry) -> [u8; BLOCK_DIR_ENTRY_ENCODED_LEN as usize] {
+    let mut buf = [0u8; BLOCK_DIR_ENTRY_ENCODED_LEN as usize];
+    buf[0..4].copy_from_slice(&entry.byte_offset_in_term_payload.to_le_bytes());
+    buf[4..6].copy_from_slice(&entry.count.to_le_bytes());
+    buf[6..10].copy_from_slice(&entry.max_doc_id.to_le_bytes());
+    buf
+}
+
+/// Plan segments S5b: decode a term's whole [`BlockDirEntry`] run back
+/// from `count` packed 10-byte records ([`encode_block_dir_entry`]).
+/// Returns `None` on a truncated buffer — the caller
+/// ([`FieldPostings::block_directory_entries`]) then reports no
+/// directory and [`TermDictionary::disk_cursor`] falls back to the
+/// recompute path, matching every other best-effort I/O failure here.
+fn decode_block_dir_entries(bytes: &[u8], count: usize) -> Option<Vec<BlockDirEntry>> {
+    let mut entries = Vec::with_capacity(count);
+    for idx in 0..count {
+        let base = idx.checked_mul(BLOCK_DIR_ENTRY_ENCODED_LEN as usize)?;
+        entries.push(BlockDirEntry {
+            byte_offset_in_term_payload: u32::from_le_bytes(
+                bytes.get(base..base + 4)?.try_into().ok()?,
+            ),
+            count: u16::from_le_bytes(bytes.get(base + 4..base + 6)?.try_into().ok()?),
+            max_doc_id: u32::from_le_bytes(bytes.get(base + 6..base + 10)?.try_into().ok()?),
+        });
+    }
+    Some(entries)
 }
 
 impl FieldPostings {
@@ -1588,54 +1838,105 @@ impl FieldPostings {
     /// Lot C `C1a-batché` SHADOW: this term's `(offset, len)` descriptor
     /// into the shared segment, plus its posting count (`df`, needed by
     /// [`decode_postings_blocked`] to know where the last block ends).
-    /// `segment` is only consulted when [`Self::segment_descriptors_directory`]
-    /// is `Some(_)` (plan segments S5, disk-backed descriptors) — pass
-    /// `None` when no segment is available, which then makes this method
-    /// return `None` for such a term, matching every other best-effort
-    /// I/O failure in this file.
+    /// `segment` is only consulted when [`Self::term_entries_directory`]
+    /// is `Some(_)` (plan segments S5b, spilled per-term directory) —
+    /// pass `None` when no segment is available, which then makes this
+    /// method return `None` for such a term, matching every other
+    /// best-effort I/O failure in this file.
     fn segment_slice(
         &self,
         term: &str,
         segment: Option<&PostingsSegment>,
     ) -> Option<((u64, u32), usize)> {
-        let (idx, start, end) = self.term_range(term)?;
-        let descriptor = self.descriptor_at(idx, segment)?;
-        Some((descriptor, end - start))
+        let idx = self.fst.get(term.as_bytes())? as usize;
+        let entry = self.term_entry(idx, segment)?;
+        Some((
+            (entry.postings_offset, entry.postings_len),
+            entry.postings_count as usize,
+        ))
     }
 
-    /// Plan segments S5: resolve term idx `idx`'s `(offset, len)`
-    /// descriptor, either from the resident [`Self::segment_descriptors`]
-    /// slice (postings-disk flag was off at build time, or persisting the
-    /// directory failed — see that field's doc comment) or via one extra
-    /// `pread` into the shared `postings_segment` directory
-    /// ([`Self::segment_descriptors_directory`], flag on). Shared by
-    /// [`Self::segment_slice`] and [`merge_term_dictionaries`] (which
-    /// needs a SOURCE dictionary's own descriptor while merging, not just
-    /// the merged dictionary's).
-    fn descriptor_at(&self, idx: usize, segment: Option<&PostingsSegment>) -> Option<(u64, u32)> {
-        match self.segment_descriptors_directory {
-            Some((dir_base, term_count)) => {
-                if idx as u32 >= term_count {
+    /// Plan segments S5b: resolve term idx `idx`'s whole [`TermEntry`],
+    /// either assembled from the resident arrays (postings-disk flag was
+    /// off at build time, or persisting the directory failed — see
+    /// [`Self::term_entries_directory`]'s doc comment) or via ONE `pread`
+    /// into the spilled per-term table (flag on). The single accessor
+    /// every consumer goes through: [`Self::segment_slice`] (thus
+    /// [`TermDictionary::decode_from_segment`]),
+    /// [`TermDictionary::disk_cursor`], and [`merge_term_dictionaries`]
+    /// (which needs a SOURCE dictionary's own metadata while merging, not
+    /// just the merged dictionary's).
+    fn term_entry(&self, idx: usize, segment: Option<&PostingsSegment>) -> Option<TermEntry> {
+        match self.term_entries_directory {
+            Some((entries_base, term_count)) => {
+                if idx as u64 >= u64::from(term_count) {
                     return None;
                 }
-                let byte_offset = dir_base + (idx as u64) * DESCRIPTOR_ENCODED_LEN;
-                let bytes = segment?.read(byte_offset, DESCRIPTOR_ENCODED_LEN as u32)?;
-                decode_descriptor(&bytes)
+                let byte_offset = entries_base + (idx as u64) * TERM_ENTRY_ENCODED_LEN;
+                let bytes = segment?.read(byte_offset, TERM_ENTRY_ENCODED_LEN as u32)?;
+                decode_term_entry(&bytes)
             }
-            None => self.segment_descriptors.get(idx).copied(),
+            None => {
+                let &(postings_offset, postings_len) = self.segment_descriptors.get(idx)?;
+                let start = *self.offsets.get(idx)? as usize;
+                let end = *self.offsets.get(idx + 1)? as usize;
+                // Resident block-dir CSR: empty when the flag was off at
+                // build time (RAM mode never builds a directory) — the
+                // entry then reports `block_dir_count == 0`, which
+                // downstream means "no persisted directory, recompute".
+                let (block_dir_offset, block_dir_count) = match (
+                    self.block_dir_offsets.get(idx),
+                    self.block_dir_offsets.get(idx + 1),
+                ) {
+                    (Some(&dir_start), Some(&dir_end)) => {
+                        (u64::from(dir_start), dir_end.saturating_sub(dir_start))
+                    }
+                    _ => (0, 0),
+                };
+                Some(TermEntry {
+                    postings_offset,
+                    postings_len,
+                    postings_count: end.saturating_sub(start) as u32,
+                    block_dir_offset,
+                    block_dir_count,
+                })
+            }
         }
     }
 
-    /// Lot C `C1b` sous-pas 2: this term's persisted per-block directory
-    /// slice, if one was built (disk flag was on at build time). `None`
-    /// when `block_dir_offsets` is empty (flag was off) — the CSR lookup
-    /// then naturally misses regardless of `idx`, so [`TermDictionary::disk_cursor`]
-    /// falls back to sous-pas 1's ad hoc directory computation.
-    fn persisted_block_directory(&self, term: &str) -> Option<&[BlockDirEntry]> {
-        let idx = self.fst.get(term.as_bytes())? as usize;
-        let start = *self.block_dir_offsets.get(idx)? as usize;
-        let end = *self.block_dir_offsets.get(idx + 1)? as usize;
-        self.block_directory.get(start..end)
+    /// Plan segments S5b: fetch `entry`'s whole persisted per-block
+    /// directory run in ONE grouped read — a slice copy of the resident
+    /// [`Self::block_directory`] (spill fell back or never happened), or
+    /// a single `pread` of `block_dir_count` packed 10-byte records
+    /// (spilled — never one `pread` per block). Returns `None` when the
+    /// term carries no persisted directory (`block_dir_count == 0`,
+    /// including every RAM-mode build) or on any I/O/decode failure —
+    /// [`TermDictionary::disk_cursor`] then falls back to
+    /// [`DiskPostingsCursor::open`]'s payload-recompute path.
+    fn block_directory_entries(
+        &self,
+        entry: TermEntry,
+        segment: Option<&PostingsSegment>,
+    ) -> Option<Vec<BlockDirEntry>> {
+        if entry.block_dir_count == 0 {
+            return None;
+        }
+        match self.term_entries_directory {
+            Some(_) => {
+                let byte_len = entry
+                    .block_dir_count
+                    .checked_mul(BLOCK_DIR_ENTRY_ENCODED_LEN as u32)?;
+                let bytes = segment?.read(entry.block_dir_offset, byte_len)?;
+                decode_block_dir_entries(&bytes, entry.block_dir_count as usize)
+            }
+            None => {
+                let start = usize::try_from(entry.block_dir_offset).ok()?;
+                let end = start.checked_add(entry.block_dir_count as usize)?;
+                self.block_directory
+                    .get(start..end)
+                    .map(<[BlockDirEntry]>::to_vec)
+            }
+        }
     }
 
     fn lookup_block_metas(&self, term: &str) -> Option<&[BlockMeta]> {
@@ -1885,38 +2186,51 @@ impl TermDictionary {
     /// (`crates/surch-index/tests/postings.rs`) still drives it directly
     /// too.
     ///
-    /// Fast path (sous-pas 2): when `(field, term)` has a PERSISTED
-    /// per-block directory ([`FieldPostings::persisted_block_directory`]
-    /// — built at [`PostingsBuilder::build_with_disk_flag`] time when the
-    /// disk flag was on), the cursor opens from it directly
+    /// Fast path (sous-pas 2, re-plumbed by plan segments S5b): when
+    /// `(field, term)` has a PERSISTED per-block directory, the term's
+    /// [`TermEntry`] is resolved first
+    /// ([`FieldPostings::term_entry`] — resident, or ONE `pread`) and the
+    /// directory run is fetched in ONE grouped read
+    /// ([`FieldPostings::block_directory_entries`] — a resident slice
+    /// copy, or one `pread` of the whole run; never one `pread` per
+    /// block), then the cursor opens from it directly
     /// ([`DiskPostingsCursor::open_with_directory`]) — no `pread` of the
     /// term's payload just to compute the directory. Falls back to
-    /// sous-pas 1's ad hoc [`DiskPostingsCursor::open`] (one whole-payload
-    /// `pread` + directory recompute) when no persisted directory exists
-    /// — e.g. a `TermDictionary` built with the flag off, exactly
-    /// reproducing this method's pre-sous-pas-2 behaviour.
+    /// sous-pas 1's ad hoc [`DiskPostingsCursor::open`] (one
+    /// whole-payload `pread` + directory recompute) when no persisted
+    /// directory exists — e.g. a `TermDictionary` built with the flag
+    /// off, or a term whose directory computation failed at build time
+    /// (`block_dir_count == 0` with a readable payload — see
+    /// [`TermEntry`]'s sentinel contract; such a term is NOT empty).
     ///
     /// Returns `None` for the same reasons [`Self::decode_from_segment`]
-    /// does: unknown field/term, the sentinel `(0, 0)` descriptor (no
+    /// does: unknown field/term, the sentinel `postings_len == 0` (no
     /// disk coverage), an absent segment, or a directory-computation
     /// failure inside [`DiskPostingsCursor::open`].
     pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
         let field_postings = self.fields.get(field)?;
         let segment = self.postings_segment.as_deref();
-        let ((offset, len), count) = field_postings.segment_slice(term, segment)?;
-        if len == 0 {
+        let idx = field_postings.fst.get(term.as_bytes())? as usize;
+        let entry = field_postings.term_entry(idx, segment)?;
+        if entry.postings_len == 0 {
             return None;
         }
         let segment = segment?;
-        if let Some(directory) = field_postings.persisted_block_directory(term) {
+        if let Some(directory) = field_postings.block_directory_entries(entry, Some(segment)) {
             return Some(DiskPostingsCursor::open_with_directory(
                 segment,
-                offset,
-                len,
-                directory.to_vec(),
+                entry.postings_offset,
+                entry.postings_len,
+                directory,
+                entry.postings_count as usize,
             ));
         }
-        DiskPostingsCursor::open(segment, offset, len, count)
+        DiskPostingsCursor::open(
+            segment,
+            entry.postings_offset,
+            entry.postings_len,
+            entry.postings_count as usize,
+        )
     }
 
     /// Lot C `C1a-batché` gauge: total bytes physically written to the
@@ -1998,11 +2312,16 @@ impl TermDictionary {
     /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
     /// §"Dimensionnement S5"): total bytes held by the per-term CSR/directory
     /// metadata NO OTHER gauge counted before this — `offsets`,
-    /// `block_offsets`, `segment_descriptors` (when resident — see
-    /// [`FieldPostings::segment_descriptors_directory`]'s doc comment: the
-    /// S5 disk-back drops this component to ~0 once `SURCH_POSTINGS_DISK`
-    /// is on), `block_directory`, and `block_dir_offsets`. Summed over
-    /// every field.
+    /// `block_offsets`, `segment_descriptors`, `block_directory`, and
+    /// `block_dir_offsets`, RESIDENT bytes only. Summed over every field.
+    /// Plan segments S5b spills ALL five arrays into the shared segment
+    /// once `SURCH_POSTINGS_DISK` is on (see
+    /// [`FieldPostings::term_entries_directory`]'s doc comment), so this
+    /// gauge reads ~0 under the flag — it keeps measuring what actually
+    /// sits on the heap (including any best-effort resident fallback),
+    /// while the spilled bytes show up in
+    /// [`Self::postings_segment_bytes`] (disk footprint, page-cache
+    /// backed) instead.
     ///
     /// Scales with the DISTINCT TERM COUNT (`T`), not the doc count — an
     /// `edge_ngram`/`autocomplete` analyzer or an `index_prefixes` field
@@ -2399,6 +2718,12 @@ pub struct DiskPostingsCursor<'seg> {
     local_pos: usize,
     /// `freq` of the doc_id most recently returned by [`Self::advance_to`].
     last_freq: u32,
+    /// Plan segments S5b: the term's `df`, carried by the caller (the
+    /// [`TermEntry::postings_count`] the cursor was opened from) so
+    /// [`Self::doc_freq`] is O(1) instead of an O(blocks) directory sum —
+    /// `fused_conjunction_scores_disk` (surch-api) reads it per term per
+    /// query BEFORE any `advance_to`, for idf and driver ordering.
+    total_count: usize,
 }
 
 impl<'seg> DiskPostingsCursor<'seg> {
@@ -2442,23 +2767,28 @@ impl<'seg> DiskPostingsCursor<'seg> {
             loaded: None,
             local_pos: 0,
             last_freq: 0,
+            total_count,
         })
     }
 
     /// Lot C `C1b` sous-pas 2: build a cursor from an ALREADY-COMPUTED
-    /// directory (`FieldPostings::block_directory`, persisted at
-    /// [`PostingsBuilder::build_with_disk_flag`] time) instead of
-    /// `pread`-ing the whole term payload to compute it fresh — the
-    /// production fast path [`TermDictionary::disk_cursor`] takes when a
-    /// persisted directory is available. Infallible: the directory was
-    /// already validated once, at build time (the per-term
-    /// `debug_assert!` round trip in `PostingsBuilder::build_with_disk_flag`'s
-    /// disk-mode branch).
+    /// directory (the term's persisted [`BlockDirEntry`] run, resident or
+    /// `pread` in one grouped shot — see
+    /// [`FieldPostings::block_directory_entries`], plan segments S5b)
+    /// instead of `pread`-ing the whole term payload to compute it fresh
+    /// — the production fast path [`TermDictionary::disk_cursor`] takes
+    /// when a persisted directory is available. `total_count` is the
+    /// term's `df` ([`TermEntry::postings_count`]) — carried so
+    /// [`Self::doc_freq`] is O(1). Infallible: the directory was already
+    /// validated once, at build time (the per-term `debug_assert!` round
+    /// trip in `PostingsBuilder::build_with_disk_flag`'s disk-mode
+    /// branch).
     pub(crate) fn open_with_directory(
         segment: &'seg PostingsSegment,
         term_base_offset: u64,
         term_payload_len: u32,
         directory: Vec<BlockDirEntry>,
+        total_count: usize,
     ) -> Self {
         Self {
             segment,
@@ -2469,6 +2799,7 @@ impl<'seg> DiskPostingsCursor<'seg> {
             loaded: None,
             local_pos: 0,
             last_freq: 0,
+            total_count,
         }
     }
 
@@ -2546,17 +2877,17 @@ impl<'seg> DiskPostingsCursor<'seg> {
     }
 
     /// Lot C `C1b` sous-pas 2: total posting count (`df`) for this term,
-    /// summed from the directory's per-block `count`s — O(blocks), not
-    /// O(postings), and available without advancing the cursor at all.
-    /// Used by the disk-mode conjunction/scoring read path
-    /// (`surch-api::state`) to pick the rarest driver term and to
-    /// compute `idf`, mirroring what `PostingsList::doc_freq_from_block_metas`
-    /// gives the RAM path.
+    /// available without advancing the cursor at all. Used by the
+    /// disk-mode conjunction/scoring read path (`surch-api::state`) to
+    /// pick the rarest driver term and to compute `idf`, mirroring what
+    /// `PostingsList::doc_freq_from_block_metas` gives the RAM path.
+    /// Plan segments S5b: O(1) — reads the count both constructors carry
+    /// ([`TermEntry::postings_count`], or [`Self::open`]'s `total_count`
+    /// argument) instead of summing the directory's per-block `count`s
+    /// (whose sum it equals by construction: both derive from the same
+    /// build-time postings).
     pub fn doc_freq(&self) -> usize {
-        self.directory
-            .iter()
-            .map(|entry| entry.count as usize)
-            .sum()
+        self.total_count
     }
 }
 
@@ -2564,81 +2895,181 @@ impl<'seg> DiskPostingsCursor<'seg> {
 mod tests {
     use super::*;
 
-    /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// Plan segments S5b (`docs/paper/design-segments-pic-borne-2026-07-05.md`
     /// §"Dimensionnement S5"): white-box counterpart to
-    /// `crates/surch-index/tests/postings.rs`'s
-    /// `postings_disk_backed_descriptors_match_resident_descriptors` — that
-    /// integration test can only observe PUBLIC behaviour (read parity);
-    /// this one has access to the private `FieldPostings` fields and
-    /// directly asserts the RAM-shrink claim the S5 disk-back is FOR:
-    /// `segment_descriptors` drops to empty (`Box::default()`, zero heap)
-    /// and `segment_descriptors_directory` becomes `Some(_)` once the
-    /// postings-disk flag is on, for a field that carries terms. Flag off
-    /// stays BYTE-IDENTICAL to the pre-S5 shape: `segment_descriptors.len()
-    /// == the field's term count` and `segment_descriptors_directory ==
-    /// None`.
-    ///
-    /// Deliberately does NOT compare the aggregate
-    /// [`TermDictionary::postings_directory_bytes`] gauge between flag off
-    /// and flag on here: that comparison also mixes in the PRE-EXISTING
-    /// (C1b sous-pas 2) `block_directory`/`block_dir_offsets` disk-mode
-    /// cost, which for single-block terms (as below) exactly offsets the
-    /// 16 B/term this change saves — see that method's doc comment. The
-    /// claim this test makes instead, `segment_descriptors` itself goes to
-    /// zero, is the one this change actually delivers.
+    /// `crates/surch-index/tests/postings.rs`'s read-parity tests — those
+    /// can only observe PUBLIC behaviour; this one has access to the
+    /// private `FieldPostings` fields and directly asserts the RAM-shrink
+    /// claim the S5 disk-back is FOR: ALL FIVE per-term arrays
+    /// (`segment_descriptors`, `offsets`, `block_offsets`,
+    /// `block_directory`, `block_dir_offsets`) drop to empty
+    /// (`Box::default()`, zero heap — the `postings_directory_bytes`
+    /// gauge reads exactly 0) and `term_entries_directory` becomes
+    /// `Some(_)` once the postings-disk flag is on, for a field that
+    /// carries terms, INCLUDING a multi-block one (so the spilled block
+    /// directory is non-trivial). Flag off stays BYTE-IDENTICAL to the
+    /// historical shape: `T`-sized descriptors, `T + 1` CSR tables,
+    /// `term_entries_directory == None`.
     #[test]
-    fn segment_descriptors_move_off_heap_when_disk_flag_is_on() {
-        let mut builder_off = PostingsBuilder::new();
-        let mut builder_on = PostingsBuilder::new();
-        for i in 0..50u32 {
-            builder_off
-                .add("body", format!("term{i}"), i, vec![0])
-                .expect("add (flag off)");
-            builder_on
-                .add("body", format!("term{i}"), i, vec![0])
-                .expect("add (flag on)");
+    fn per_term_directory_moves_off_heap_when_disk_flag_is_on() {
+        fn populate(builder: &mut PostingsBuilder) {
+            for i in 0..50u32 {
+                builder
+                    .add("body", format!("term{i}"), i, vec![0])
+                    .expect("distinct term");
+            }
+            // One multi-block term (3 full blocks + a partial one) so the
+            // block-directory channel genuinely carries several entries
+            // per its term.
+            for doc_id in 0..(BLOCK_SIZE as u32 * 3 + 17) {
+                builder
+                    .add("body", "wide", doc_id, vec![0])
+                    .expect("wide posting");
+            }
         }
+        const TERM_COUNT: usize = 51;
 
+        let mut builder_off = PostingsBuilder::new();
+        populate(&mut builder_off);
         let dict_off = builder_off.build_with_disk_flag(false);
         let field_off = dict_off.fields.get("body").expect("body field (flag off)");
         assert_eq!(
             field_off.segment_descriptors.len(),
-            50,
+            TERM_COUNT,
             "flag off must keep every term's descriptor resident (unchanged default)"
         );
+        assert_eq!(field_off.offsets.len(), TERM_COUNT + 1);
+        assert_eq!(field_off.block_offsets.len(), TERM_COUNT + 1);
         assert!(
-            field_off.segment_descriptors_directory.is_none(),
-            "flag off must never persist a directory"
+            field_off.block_directory.is_empty() && field_off.block_dir_offsets.is_empty(),
+            "flag off never builds a persisted block directory (pre-existing C1b contract)"
         );
+        assert!(
+            field_off.term_entries_directory.is_none(),
+            "flag off must never spill a per-term directory"
+        );
+        assert!(dict_off.postings_directory_bytes() > 0);
 
+        let mut builder_on = PostingsBuilder::new();
+        populate(&mut builder_on);
         let dict_on = builder_on.build_with_disk_flag(true);
         let field_on = dict_on.fields.get("body").expect("body field (flag on)");
         assert!(
-            field_on.segment_descriptors.is_empty(),
-            "flag on should shed the resident segment_descriptors entirely"
+            field_on.segment_descriptors.is_empty()
+                && field_on.offsets.is_empty()
+                && field_on.block_offsets.is_empty()
+                && field_on.block_directory.is_empty()
+                && field_on.block_dir_offsets.is_empty(),
+            "flag on should shed every resident per-term array entirely"
         );
         assert!(
-            field_on.segment_descriptors_directory.is_some(),
-            "flag on should persist a directory instead"
+            field_on.term_entries_directory.is_some(),
+            "flag on should spill the unified per-term table instead"
+        );
+        assert_eq!(
+            dict_on.postings_directory_bytes(),
+            0,
+            "the resident-directory gauge must read exactly 0 once spilled"
+        );
+
+        // Read parity on the spilled side, through the unified accessor:
+        // same postings for a mono-block and the multi-block term.
+        for term in ["term7", "wide"] {
+            assert_eq!(
+                dict_on.decode_from_segment("body", term),
+                dict_off.decode_from_segment("body", term),
+                "decode_from_segment diverged for {term}"
+            );
+        }
+        // The cursor opens from the SPILLED directory (one grouped pread)
+        // and reports the O(1) doc_freq carried by the TermEntry.
+        let cursor = dict_on
+            .disk_cursor("body", "wide")
+            .expect("wide disk cursor (flag on)");
+        assert_eq!(cursor.doc_freq(), BLOCK_SIZE * 3 + 17);
+    }
+
+    /// Plan segments S5b: [`encode_term_entry`]/[`decode_term_entry`]
+    /// round-trip, including the boundary values a real segment can
+    /// produce (offset `0`, a large `u64` offset past 4 GiB,
+    /// `postings_len == 0` — the sentinel "no disk coverage" record —
+    /// and `block_dir_count == 0` — the "recompute the directory"
+    /// marker).
+    #[test]
+    fn term_entry_encoding_round_trips() {
+        let entries = [
+            TermEntry {
+                postings_offset: 0,
+                postings_len: 0,
+                postings_count: 0,
+                block_dir_offset: 0,
+                block_dir_count: 0,
+            },
+            TermEntry {
+                postings_offset: 12,
+                postings_len: 512,
+                postings_count: 129,
+                block_dir_offset: 4096,
+                block_dir_count: 2,
+            },
+            TermEntry {
+                postings_offset: u32::MAX as u64 + 1,
+                postings_len: u32::MAX,
+                postings_count: u32::MAX,
+                block_dir_offset: u64::MAX,
+                block_dir_count: u32::MAX,
+            },
+        ];
+        for entry in entries {
+            let encoded = encode_term_entry(&entry);
+            assert_eq!(encoded.len(), TERM_ENTRY_ENCODED_LEN as usize);
+            let decoded = decode_term_entry(&encoded).expect("full-length buffer decodes");
+            assert_eq!(decoded, entry);
+        }
+        assert_eq!(
+            decode_term_entry(&[0u8; 12]),
+            None,
+            "truncated buffer must not decode"
         );
     }
 
-    /// Plan segments S5: [`encode_descriptor`]/[`decode_descriptor`]
-    /// round-trip, including the boundary values a real segment can
-    /// produce (offset `0`, a large `u64` offset past 4 GiB, and `len ==
-    /// 0` — the sentinel "no disk coverage" descriptor).
+    /// Plan segments S5b: [`encode_block_dir_entry`]/
+    /// [`decode_block_dir_entries`] round-trip over a multi-entry run
+    /// (the grouped per-term pread shape), plus the truncated-buffer
+    /// guard.
     #[test]
-    fn descriptor_encoding_round_trips() {
-        for &(offset, len) in &[(0u64, 0u32), (12, 512), (u32::MAX as u64 + 1, u32::MAX)] {
-            let encoded = encode_descriptor(offset, len);
-            assert_eq!(encoded.len(), DESCRIPTOR_ENCODED_LEN as usize);
-            let decoded = decode_descriptor(&encoded).expect("full-length buffer decodes");
-            assert_eq!(decoded, (offset, len));
+    fn block_dir_entry_encoding_round_trips() {
+        let run = vec![
+            BlockDirEntry {
+                byte_offset_in_term_payload: 0,
+                count: 128,
+                max_doc_id: 1_000,
+            },
+            BlockDirEntry {
+                byte_offset_in_term_payload: 300,
+                count: 128,
+                max_doc_id: 250_000,
+            },
+            BlockDirEntry {
+                byte_offset_in_term_payload: 641,
+                count: 17,
+                max_doc_id: u32::MAX,
+            },
+        ];
+        let mut bytes = Vec::new();
+        for entry in &run {
+            bytes.extend_from_slice(&encode_block_dir_entry(entry));
         }
         assert_eq!(
-            decode_descriptor(&[0u8; 4]),
+            bytes.len(),
+            run.len() * BLOCK_DIR_ENTRY_ENCODED_LEN as usize
+        );
+        let decoded = decode_block_dir_entries(&bytes, run.len()).expect("full run decodes");
+        assert_eq!(decoded, run);
+        assert_eq!(
+            decode_block_dir_entries(&bytes[..bytes.len() - 1], run.len()),
             None,
-            "truncated buffer must not decode"
+            "truncated run must not decode"
         );
     }
 }

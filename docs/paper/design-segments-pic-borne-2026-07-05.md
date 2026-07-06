@@ -223,3 +223,60 @@ consommateur `merge_term_dictionaries` (lecture d'un descripteur SOURCE pendant 
   --check` passe propre sur tout le workspace après l'implémentation (seul signal de validité
   syntaxique disponible sans compilateur) ; validation réelle (gauge coverage ≥90%, oracle 0
   divergence, plancher 28M) à faire via `ci-k8s`/bench-local au prochain passage.
+
+## 🔧 S5b — spill des 4 tableaux par-terme restants (TABLE UNIFIÉE, fusion avec S5a)
+Consensus **Codex GPT-5.5 @ xhigh + Opus 4.8 @ max** (2026-07-06, convergence forte, 0 divergence
+de fond) sur le design, puis implémentation. Cible : la gauge `postings_directory_bytes` (148 MiB
+résidents à 1,36M = `offsets` + `block_offsets` + `block_directory` + `block_dir_offsets`, ×21 ≈
+3,1 GiB à 28M).
+
+**Constats d'étude (grep exhaustif des consommateurs)** :
+- `offsets` (CSR T+1) : en mode disque sa seule valeur utile est `df = offsets[i+1]−offsets[i]`
+  (passé à `decode_postings_blocked`/`DiskPostingsCursor` par `segment_slice`/`disk_cursor`/
+  `merge_term_dictionaries`) — les flats qu'il indexe sont vides.
+- `block_offsets` (CSR T+1) : **MORT en mode disque** — ses seuls lecteurs
+  (`lookup_block_metas`/`lookup_with_block_metas`) indexent `block_metas_flat` (vide flag on) et
+  tous les call sites surch-api branchent sur `postings_disk_backed()` avant. Décision : plus
+  jamais construit en mode disque (ni résident ni spillé).
+- `block_directory`/`block_dir_offsets` : hot path réel = `disk_cursor()`, appelé UNE fois par
+  terme résolu par les SEULES conjonctions mono-segment (`conjunction_hits_disk`,
+  `fused_conjunction_scores_disk`). Le `match` mono-token passe par `decode_from_segment`
+  (aucune lecture de directory) ; le multi-segment par `conjunction_hits_merged` (idem).
+
+**Design retenu (fusion S5a+S5b)** : le spill S5a (12 o/terme) est REMPLACÉ par UNE table
+unifiée `TermEntry` **28 o/terme packés LE** (`postings_offset u64`, `postings_len u32`,
+`postings_count u32` = df, `block_dir_offset u64`, `block_dir_count u32`), écrite en DEUX
+`append()` par champ (région block-directory packée 10 o/entrée, puis table TermEntry) après le
+payload FoR — jamais un pwrite par terme. Accesseur unique `FieldPostings::term_entry(idx,
+segment)` résident-ou-pread consommé par `segment_slice`/`disk_cursor`/`merge` ; le directory
+d'un terme est lu par le cursor en UN SEUL pread groupé (`block_directory_entries`,
+`block_dir_count`×10 o), jamais un pread par bloc. Sentinelles : `postings_len == 0` = pas de
+couverture (offset 0 reste légitime) ; `block_dir_count == 0` avec `len > 0` = directory absent
+→ fallback `open()` recompute — **corrige au passage un bug latent S5a/C1b** (directory vide
+rendait le terme muet via `open_with_directory([])`). `doc_freq()` du cursor devient O(1)
+(porte `postings_count`).
+- **Coût pread par terme résolu** (page-cache chaud) : match mono-token = 1 TermEntry + 1
+  payload (inchangé vs S5a : 1 descriptor + 1 payload) ; conjonction mono-segment = 1 TermEntry
+  + 1 directory groupé + ~1/bloc touché (**+1 pread/terme vs S5a**, le prix incompressible de
+  sortir le directory du résident) — ≤5 termes/requête ≈ +5 preads chauds, budget latence tenu
+  d'après les deux panels (gate fair-ab p95 ≤ ~0,6 ms à vérifier).
+- **Durcissement best-effort (fix Opus)** : sur échec d'append des MÉTADONNÉES, le segment
+  reste VIVANT et les 5 tableaux restent résidents (S5a nullait `postings_segment` → en mode
+  disque toutes les lectures seraient devenues silencieusement vides, les flats RAM étant déjà
+  vides). Seul l'échec d'append du PAYLOAD FoR désactive le segment (comportement historique).
+- **Écarté après consensus** : cache LRU RAM du directory (réintroduirait du résident à borner,
+  le page cache EST le cache) ; inline du 1er BlockDirEntry dans TermEntry (complexité non
+  prouvée, gate p95 d'abord) ; renumérotation des tables séparées S5a/S5b (2-3 preads/terme).
+- Fichiers : `crates/surch-index/src/postings.rs` (struct `TermEntry`,
+  `persist_or_keep_term_directory` + `TermDirectoryChannels`/`TermDirectoryTables`,
+  `term_entry`/`block_directory_entries`, encodeurs 28 o/10 o, cursor `total_count`),
+  `memory.rs`/`document_index.rs`/`stats.rs` (docs gauge : ~0 attendu flag on). Tests : parité
+  cursor spillé vs leapfrog RAM (`disk_cursor_with_spilled_directory_matches_ram_leapfrog`),
+  white-box « les 5 tableaux vides + gauge == 0 flag on »
+  (`per_term_directory_moves_off_heap_when_disk_flag_is_on`), round-trips encodeurs ; le merge
+  spillé est couvert par `merge_ram_and_disk_modes_produce_identical_reads` (document_index) et
+  la parité end-to-end par `postings_disk_parity.rs` (surch-api, 300 docs = terme 3 blocs).
+- **Attendu au prochain bench 1,36M flag on** : `postings_directory_bytes` ~0 ; allocated
+  ~447−148 ≈ **~300 MiB** ; `disk_postings_bytes` +~150 MiB (payload + directory + TermEntry) ;
+  latence p95 ≤ ~0,6 ms. Non exécuté localement (contrainte session : jamais cargo
+  build/test/clippy) — `cargo fmt --check` propre ; CI + oracle-local + fair-ab à lancer.
