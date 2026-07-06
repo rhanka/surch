@@ -22,6 +22,7 @@ docker run -d --name ol-surch --network "$NET" --memory=512m --memory-swap=512m 
   -e SURCH_HOST=0.0.0.0 -e SURCH_PORT=7700 -e RUST_LOG=warn \
   ${SURCH_FLUSH_BUDGET_BYTES:+-e SURCH_FLUSH_BUDGET_BYTES="$SURCH_FLUSH_BUDGET_BYTES"} \
   ${SURCH_MERGE_FANIN:+-e SURCH_MERGE_FANIN="$SURCH_MERGE_FANIN"} \
+  ${SURCH_DENSIFY_BUDGET_DOCS:+-e SURCH_DENSIFY_BUDGET_DOCS="$SURCH_DENSIFY_BUDGET_DOCS"} \
   "ghcr.io/rhanka/surch:sha-${SURCH_SHA}" >/dev/null
 docker run -d --name ol-es --network "$NET" --memory=2048m --memory-swap=2048m \
   -e discovery.type=single-node -e xpack.security.enabled=false \
