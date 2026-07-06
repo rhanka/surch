@@ -16,3 +16,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 fst = { workspace = true }
 rayon = { workspace = true }
+tracing = { workspace = true }

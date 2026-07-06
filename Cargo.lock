@@ -3249,6 +3249,7 @@ dependencies = [
  "surch-store",
  "surch-types",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

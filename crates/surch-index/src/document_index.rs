@@ -13,8 +13,8 @@ use thiserror::Error;
 
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
-    postings_disk_enabled, BlockMeta, DiskPostingsCursor, PostingsBuilder, PostingsEnum,
-    PostingsError, PostingsList, TermDictionary, TermsEnum,
+    merge_term_dictionaries, postings_disk_enabled, BlockMeta, DiskPostingsCursor, PostingsBuilder,
+    PostingsEnum, PostingsError, PostingsList, TermDictionary, TermsEnum,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
@@ -197,6 +197,10 @@ pub struct DocumentIndex {
     /// single test binary cannot flip an `OnceLock`-cached env read
     /// mid-run). See [`FlushBudgetOverride`].
     flush_budget_override: FlushBudgetOverride,
+    /// Plan segments S3: per-index override for the merge fan-in, same
+    /// rationale/pattern as `flush_budget_override` — see
+    /// [`MergeFaninOverride`].
+    merge_fanin_override: MergeFaninOverride,
 }
 
 /// Plan segments S2: resolution mode for [`DocumentIndex::maybe_flush_by_budget`]
@@ -214,6 +218,42 @@ enum FlushBudgetOverride {
     Forced(Option<u64>),
 }
 
+/// Plan segments S3 (`docs/paper/design-segments-pic-borne-2026-07-05.md`,
+/// merge tiered inline): resolution mode for
+/// [`DocumentIndex::maybe_merge_after_seal`]. `UseEnv` (the `Default`)
+/// reads [`merge_fanin_bytes`] (the process-wide `SURCH_MERGE_FANIN`
+/// `OnceLock`) — production default. `Forced(_)` is set via
+/// [`DocumentIndex::set_merge_fanin_override`] so a test can pin an exact
+/// fan-in (or `0`, the merge-disabled reversibility flag) on ONE index
+/// instance, independently of the env var and of any other test in the
+/// same process — same rationale as [`FlushBudgetOverride`].
+#[derive(Debug, Clone, Copy, Default)]
+enum MergeFaninOverride {
+    #[default]
+    UseEnv,
+    Forced(usize),
+}
+
+/// Plan segments S3: env-configured tiered-merge fan-in threshold, read
+/// ONCE per process (mirrors [`flush_budget_bytes`]'s established
+/// `OnceLock` pattern). Defaults to `8` when unset or unparseable — a
+/// LogMergePolicy-style fan-in that keeps a 28M-doc corpus at a budget of
+/// a few hundred MiB from accumulating 100+ segments (the design doc's
+/// "sans merge, le fan-out FST × S tue la latence"). `0` disables merging
+/// entirely — the S3 reversibility flag: [`DocumentIndex::maybe_merge_after_seal`]
+/// is then always a no-op and `segments` only ever grows, bit-identical to
+/// S2 without this feature. A `1` is treated the same as `0` (a "run" of
+/// one segment is not a merge).
+fn merge_fanin_bytes() -> usize {
+    static FANIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *FANIN.get_or_init(|| {
+        std::env::var("SURCH_MERGE_FANIN")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+    })
+}
+
 impl Default for DocumentIndex {
     fn default() -> Self {
         Self {
@@ -225,6 +265,7 @@ impl Default for DocumentIndex {
             postings_disk_enabled_override: None,
             next_doc_id_hint: 0,
             flush_budget_override: FlushBudgetOverride::UseEnv,
+            merge_fanin_override: MergeFaninOverride::UseEnv,
         }
     }
 }
@@ -777,6 +818,26 @@ impl DocumentIndex {
         }
     }
 
+    /// Plan segments S3: per-index override for the tiered-merge fan-in —
+    /// see [`MergeFaninOverride`]. MUST be called before any document is
+    /// indexed to take effect deterministically (mirrors
+    /// [`Self::set_flush_budget_bytes_override`]'s contract). `0` forces
+    /// "merge disabled" regardless of the env var; any other value forces
+    /// that exact fan-in.
+    pub fn set_merge_fanin_override(&mut self, fanin: usize) {
+        self.merge_fanin_override = MergeFaninOverride::Forced(fanin);
+    }
+
+    /// Plan segments S3: the tiered-merge fan-in this index should use
+    /// right now — the per-index override if one was set, otherwise the
+    /// process-wide [`merge_fanin_bytes`] env var.
+    fn resolved_merge_fanin(&self) -> usize {
+        match self.merge_fanin_override {
+            MergeFaninOverride::UseEnv => merge_fanin_bytes(),
+            MergeFaninOverride::Forced(fanin) => fanin,
+        }
+    }
+
     /// Plan segments S2: materialize the active segment's pending
     /// `postings_builder`/sub-field-intern state IN PLACE — byte-for-byte
     /// the work [`Self::materialize_terms_and_finalize_postings`] always
@@ -820,12 +881,158 @@ impl DocumentIndex {
         }));
     }
 
+    /// Plan segments S3 (`docs/paper/design-segments-pic-borne-2026-07-05.md`,
+    /// "merge tiered inline sur runs adjacents"): after a seal has just
+    /// appended a fresh sealed segment (`start_new_active_segment_if_nonempty`),
+    /// repeatedly find and merge the longest eligible run of ADJACENT,
+    /// comparably-sized SEALED segments — never the currently-active
+    /// (last, still-being-written) one — until none remains. Merges can
+    /// cascade: a freshly-merged segment becomes a candidate for the next
+    /// tier up on a LATER call (each call only merges runs that exist
+    /// RIGHT NOW; a merge changes segment sizes, so the search restarts
+    /// from scratch after every merge inside the `while` loop below).
+    ///
+    /// No-op — and therefore free, a single `OnceLock`/override read plus
+    /// an O(sealed segments) scan that finds nothing — when the resolved
+    /// fan-in is `< 2` (`SURCH_MERGE_FANIN=0`, the S3 reversibility flag,
+    /// or a forced `1`, which is not a merge). With budget flush unset
+    /// (S1/S2 reversibility) `segments.len()` never exceeds 1, so there is
+    /// never more than zero sealed segments to consider either way.
+    fn maybe_merge_after_seal(&mut self) {
+        let fanin = self.resolved_merge_fanin();
+        if fanin < 2 {
+            return;
+        }
+        while let Some((start, end)) = self.find_eligible_merge_run(fanin) {
+            self.merge_segments_run(start, end);
+        }
+    }
+
+    /// Plan segments S3: the longest run of ADJACENT, comparably-sized
+    /// SEALED segments (`self.segments[..len-1]` — the last entry is
+    /// always the currently-active, not-yet-sealed segment, see
+    /// [`Self::active_segment`]) whose length is `>= fanin`, as a
+    /// half-open `[start, end)` index range. "Comparably-sized" (the
+    /// design doc's LogMergePolicy-style policy): every segment's
+    /// `doc_count` inside the run stays within ~10x of the run's smallest
+    /// — tracked incrementally as a running `(min, max)` over `doc_count`
+    /// while extending a candidate run rightward. Ties (same longest
+    /// length) are broken leftmost. Returns `None` when no eligible run
+    /// exists (including the trivial "fewer than `fanin` sealed segments
+    /// at all" case).
+    fn find_eligible_merge_run(&self, fanin: usize) -> Option<(usize, usize)> {
+        /// Segments inside an eligible run must stay within this ratio of
+        /// the run's smallest `doc_count` — the design doc's "~10×".
+        const SIZE_RATIO: u64 = 10;
+
+        let sealed_end = self.segments.len().saturating_sub(1);
+        if sealed_end < fanin {
+            return None;
+        }
+        let sizes: Vec<u64> = self.segments[..sealed_end]
+            .iter()
+            .map(|s| u64::from(s.doc_count))
+            .collect();
+
+        let mut best: Option<(usize, usize)> = None;
+        for start in 0..sizes.len() {
+            let mut end = start + 1;
+            let mut run_min = sizes[start];
+            let mut run_max = sizes[start];
+            while end < sizes.len() {
+                let candidate_min = run_min.min(sizes[end]);
+                let candidate_max = run_max.max(sizes[end]);
+                if candidate_max > candidate_min.saturating_mul(SIZE_RATIO) {
+                    break;
+                }
+                run_min = candidate_min;
+                run_max = candidate_max;
+                end += 1;
+            }
+            let len = end - start;
+            if len >= fanin {
+                let is_longer = match best {
+                    None => true,
+                    Some((best_start, best_end)) => len > best_end - best_start,
+                };
+                if is_longer {
+                    best = Some((start, end));
+                }
+            }
+        }
+        best
+    }
+
+    /// Plan segments S3: merge sealed segments `self.segments[start..end]`
+    /// (an ADJACENT run — `start`/`end` are always produced by
+    /// [`Self::find_eligible_merge_run`], never called with an arbitrary
+    /// range) into ONE new sealed segment, replacing them in place.
+    ///
+    /// Doc_ids stay GLOBAL and are never renumbered (Fable's arbitrage):
+    /// the merged segment's `doc_base` is the run's first segment's own
+    /// `doc_base`, and `doc_count` is the Σ of the run's — the run is
+    /// contiguous by construction (segments are only ever pushed with
+    /// `doc_base == previous doc_base + previous doc_count`, see
+    /// [`Self::start_new_active_segment_if_nonempty`]), so this covers
+    /// exactly the same global doc_id range as the run did, with no gaps.
+    ///
+    /// `terms` streams through [`crate::postings::merge_term_dictionaries`]
+    /// (bounded memory: one merged term's postings at a time). The eager
+    /// per-doc columns (`field_stats`, `subfield_values`, `live_docs`) are
+    /// concatenated with a per-segment LOCAL offset equal to that
+    /// segment's `doc_base` minus the merged segment's own `doc_base` —
+    /// exactly "ancien local + offset du segment dans le run", since the
+    /// run's contiguity makes that offset equal to the cumulative
+    /// `doc_count` of the run's earlier segments.
+    fn merge_segments_run(&mut self, start: usize, end: usize) {
+        let merge_started_at = std::time::Instant::now();
+        let run = &self.segments[start..end];
+        let merged_doc_base = run[0].doc_base;
+        let merged_doc_count: u32 = run.iter().map(|segment| segment.doc_count).sum();
+
+        let disk_enabled = self.resolved_postings_disk_enabled();
+        debug_assert!(
+            run.iter()
+                .all(|segment| segment.terms.disk_backed() == disk_enabled),
+            "every segment of a DocumentIndex shares the same postings-disk mode \
+             for its whole process lifetime (see `postings_disk_enabled`'s doc comment)"
+        );
+        let term_dicts: Vec<&TermDictionary> = run.iter().map(|segment| &segment.terms).collect();
+        let terms = merge_term_dictionaries(&term_dicts, disk_enabled);
+        let field_stats = merge_field_stats(run);
+        let subfield_values = merge_subfield_values(run);
+        let live_docs = merge_live_docs(run, merged_doc_base);
+        let merged_segment_count = run.len();
+
+        let merged = Segment {
+            terms,
+            field_stats,
+            subfield_values,
+            live_docs,
+            doc_base: merged_doc_base,
+            doc_count: merged_doc_count,
+        };
+        self.segments
+            .splice(start..end, std::iter::once(Arc::new(merged)));
+
+        tracing_log_segment_merge(
+            merged_segment_count,
+            merged_doc_count,
+            merge_started_at.elapsed(),
+        );
+    }
+
     /// Plan segments S2: if `postings_builder.memory_bytes()` has reached
     /// the configured flush budget, seal the active segment (materialize
     /// its terms, finalize sub-field interning) and start a fresh active
     /// one — turning what used to be a single ever-growing builder into
     /// real, appended, immutable segments. This is what bounds the
     /// indexation memory pic (the design's diagnostic "maladie A").
+    ///
+    /// Plan segments S3: also runs the tiered-merge policy right after the
+    /// seal ([`Self::maybe_merge_after_seal`]) — a no-op when
+    /// `SURCH_MERGE_FANIN=0`/forced off, so this stays the exact S2
+    /// behaviour when merging is disabled.
     ///
     /// Call this ONCE PER BULK CHUNK, after merging the chunk's documents
     /// (`surch-api::InMemoryIndex::append_to_index`) — NEVER from the
@@ -842,6 +1049,7 @@ impl DocumentIndex {
         }
         self.materialize_active_segment_terms();
         self.start_new_active_segment_if_nonempty();
+        self.maybe_merge_after_seal();
     }
 
     pub fn add_document<I, K, V>(&mut self, doc_id: u32, fields: I) -> Result<()>
@@ -1097,10 +1305,16 @@ impl DocumentIndex {
     /// plus par refresh". Budget non configuré (flag de réversibilité
     /// S1) : ce scellement reste EXACTEMENT l'ancien comportement,
     /// remplace `segments[0]` en place, pour toujours mono-segment.
+    ///
+    /// Plan segments S3 : lance ENSUITE la politique de merge tiered
+    /// ([`Self::maybe_merge_after_seal`]) — no-op quand
+    /// `SURCH_MERGE_FANIN=0`/forcé off, donc ce chemin reste EXACTEMENT le
+    /// comportement S2 quand le merge est désactivé.
     pub fn materialize_terms_and_finalize_postings(&mut self) {
         self.materialize_active_segment_terms();
         if self.resolved_flush_budget_bytes().is_some() {
             self.start_new_active_segment_if_nonempty();
+            self.maybe_merge_after_seal();
         }
     }
 
@@ -1701,6 +1915,153 @@ impl DocumentIndex {
     }
 }
 
+/// Plan segments S3: merge `run`'s per-field [`FieldLengthStats`] into one
+/// map, indexed LOCALLY to the merged segment (the run-relative offset —
+/// each source segment's own `doc_count` bytes, in run order, see
+/// [`merge_live_docs`] for the same offset applied to `live_docs`). For
+/// each field present in at least one of `run`'s
+/// segments, `doc_count`/`total_terms` are summed directly from each
+/// source's own EXACT (non-quantized) fields — never re-derived from
+/// `doc_len_dense` (the design doc's explicit warning: that channel is
+/// Lucene-`SmallFloat`-quantized, re-deriving `total_terms` from it would
+/// drift `avg_doc_len` and break oracle parity) — exactly the same Σ
+/// [`DocumentIndex::field_stats_aggregated`] already performs across
+/// segments for BM25 stats today. `doc_len_dense` itself is a genuine
+/// per-doc concat: each source segment's own dense byte slice, padded
+/// with the `0` ("absent") sentinel up to that segment's `doc_count` when
+/// short (a field can stop being written before every doc in the source
+/// segment, or be entirely absent from a source), so segment `i`'s bytes
+/// always land at the SAME local offset the run's doc_id offset uses for
+/// `live_docs`/`subfield_values` below.
+fn merge_field_stats(run: &[Arc<Segment>]) -> BTreeMap<String, FieldLengthStats> {
+    let mut field_names: BTreeSet<&str> = BTreeSet::new();
+    for segment in run {
+        field_names.extend(segment.field_stats.keys().map(String::as_str));
+    }
+
+    let mut merged = BTreeMap::new();
+    for field in field_names {
+        let mut doc_len_dense: Vec<u8> = Vec::new();
+        let mut doc_count = 0u64;
+        let mut total_terms = 0u64;
+        let mut min_doc_len = 0u64;
+        for segment in run {
+            let segment_len = segment.doc_count as usize;
+            match segment.field_stats.get(field) {
+                Some(stats) => {
+                    doc_count += stats.doc_count;
+                    total_terms += stats.total_terms;
+                    if let Some(segment_min) = stats.min_doc_len() {
+                        min_doc_len = if min_doc_len == 0 {
+                            segment_min
+                        } else {
+                            min_doc_len.min(segment_min)
+                        };
+                    }
+                    let bytes = stats.doc_len_dense();
+                    debug_assert!(
+                        bytes.len() <= segment_len,
+                        "a sealed segment's doc_len_dense never exceeds its doc_count \
+                         (resize-on-write is bounded by the local ids merge_analyzed wrote)"
+                    );
+                    doc_len_dense.extend_from_slice(bytes);
+                    if bytes.len() < segment_len {
+                        doc_len_dense.resize(doc_len_dense.len() + (segment_len - bytes.len()), 0);
+                    }
+                }
+                None => {
+                    doc_len_dense.resize(doc_len_dense.len() + segment_len, 0);
+                }
+            }
+        }
+        merged.insert(
+            field.to_string(),
+            FieldLengthStats {
+                doc_count,
+                total_terms,
+                doc_len_dense,
+                min_doc_len,
+            },
+        );
+    }
+    merged
+}
+
+/// Plan segments S3: merge `run`'s per-path [`SubfieldColumn`]s into one
+/// map, indexed LOCALLY to the merged segment. For each qualified path
+/// present in at least one of `run`'s segments, every source segment's
+/// `doc_count` local doc_ids are re-set on a fresh column at the run's
+/// cumulative local offset — "union des dicts + remap des codes": `set()`
+/// re-interns each value into the NEW column's own `dict`, so a value
+/// shared by several source segments' dictionaries collapses to ONE code
+/// in the merged column instead of concatenating raw code integers (which
+/// would be wrong the moment two source segments assigned the same code
+/// to two DIFFERENT values). `finalize()` at the end matches every other
+/// sealed segment's contract (`intern_index` empty — write-only, and a
+/// merged segment is sealed, never written to again).
+fn merge_subfield_values(run: &[Arc<Segment>]) -> BTreeMap<String, SubfieldColumn> {
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for segment in run {
+        paths.extend(segment.subfield_values.keys().map(String::as_str));
+    }
+
+    let mut merged = BTreeMap::new();
+    for path in paths {
+        let mut column = SubfieldColumn::default();
+        let mut run_offset: u32 = 0;
+        for segment in run {
+            if let Some(source) = segment.subfield_values.get(path) {
+                for local in 0..segment.doc_count {
+                    if let Some(value) = source.get(local) {
+                        column.set(run_offset + local, value.to_string());
+                    }
+                }
+            }
+            run_offset += segment.doc_count;
+        }
+        column.finalize();
+        merged.insert(path.to_string(), column);
+    }
+    merged
+}
+
+/// Plan segments S3: merge `run`'s per-segment [`LiveDocsBitset`]s into
+/// one, remapping each segment's LOCAL doc_ids to the merged segment's own
+/// local indexing — `segment.doc_base - merged_doc_base` is that
+/// segment's cumulative offset inside the run (the run is contiguous by
+/// construction, see [`DocumentIndex::merge_segments_run`]'s doc comment).
+/// S3 carries no tombstones yet, so this is a pure concatenation: no
+/// doc_id is ever dropped or deduplicated (a run's segments cover
+/// disjoint doc_id ranges by construction).
+fn merge_live_docs(run: &[Arc<Segment>], merged_doc_base: u32) -> LiveDocsBitset {
+    let mut merged = LiveDocsBitset::default();
+    for segment in run {
+        let offset = segment.doc_base - merged_doc_base;
+        for local in segment.live_docs.iter() {
+            merged.insert(local + offset);
+        }
+    }
+    merged
+}
+
+/// Plan segments S3 observability: emit one `tracing::debug!` per
+/// completed segment merge (run size, resulting doc_count, wall-clock
+/// duration) — the design doc's "log debug par merge". Kept as its own
+/// tiny function (rather than an inline `tracing::debug!` call at the
+/// single call site) so the event's shape is documented once.
+fn tracing_log_segment_merge(
+    merged_segment_count: usize,
+    merged_doc_count: u32,
+    elapsed: std::time::Duration,
+) {
+    tracing::debug!(
+        merged_segment_count,
+        merged_doc_count,
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        "surch_index: segment merge completed"
+    );
+}
+
 /// A10 (Phase 4): the analyzed term carrying the lowest position increment,
 /// i.e. the first token of the analyzed stream. For a keyword/normalizer
 /// sub-field this is the whole normalized value (single token); for a text
@@ -2262,6 +2623,10 @@ mod tests {
         let mut index = DocumentIndex::new();
         index.set_flush_budget_bytes_override(Some(1));
         index.set_postings_disk_enabled(false);
+        // Plan segments S3: merge pinned OFF so the exact 3-segment layout
+        // asserted below stays deterministic under any ambient
+        // `SURCH_MERGE_FANIN` (same rationale as the two pins above).
+        index.set_merge_fanin_override(0);
 
         index
             .add_documents_with_mapping_deferred(
@@ -2405,6 +2770,9 @@ mod tests {
         let mut index = DocumentIndex::new();
         index.set_flush_budget_bytes_override(Some(u64::MAX));
         index.set_postings_disk_enabled(false);
+        // Plan segments S3: merge pinned OFF — the exact segment counts
+        // asserted below must not depend on the ambient `SURCH_MERGE_FANIN`.
+        index.set_merge_fanin_override(0);
 
         index
             .add_documents_with_mapping_deferred([(0, [("NOM", "Dupont")])], &mapping)
@@ -2470,5 +2838,224 @@ mod tests {
         assert_eq!(index.doc_ids(), vec![0, 1]);
         assert_eq!(index.subfield_value("NOM.raw", 0), Some("dupont"));
         assert_eq!(index.subfield_value("NOM.raw", 1), Some("dupre"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Plan segments S3: tiered merge (`docs/paper/design-segments-pic-borne-2026-07-05.md`)
+    // ---------------------------------------------------------------------
+
+    /// Deterministic `doc_count`-doc corpus (5 cycling `NOM` values, a
+    /// shared `BODY` term so at least one term spans every segment), one
+    /// doc PER CHUNK with a forced tiny budget so every chunk seals its
+    /// own segment (mirrors `surch-api`'s "call `maybe_flush_by_budget`
+    /// once per bulk chunk" contract), then a final `_refresh`-style seal.
+    /// `fanin`/`disk_enabled` are forced explicitly — never read from the
+    /// process env — so the test is deterministic regardless of
+    /// `SURCH_MERGE_FANIN`/`SURCH_POSTINGS_DISK` in the ambient test
+    /// process (same rationale as every other override in this module).
+    fn build_merge_test_index(
+        doc_count: u32,
+        fanin: usize,
+        disk_enabled: bool,
+    ) -> (DocumentIndex, IndexMapping) {
+        let mapping = nom_multi_field_mapping();
+        let mut index = DocumentIndex::new();
+        index.set_flush_budget_bytes_override(Some(1));
+        index.set_merge_fanin_override(fanin);
+        index.set_postings_disk_enabled(disk_enabled);
+
+        const NAMES: [&str; 5] = [
+            "Dupont Martin",
+            "Dupré",
+            "Bernard",
+            "Petit Durand",
+            "Lefèvre Noir",
+        ];
+        for doc_id in 0..doc_count {
+            let name = NAMES[doc_id as usize % NAMES.len()];
+            index
+                .add_documents_with_mapping_deferred(
+                    [(doc_id, [("NOM", name), ("BODY", "commun lorem")])],
+                    &mapping,
+                )
+                .unwrap_or_else(|err| panic!("doc {doc_id} should index: {err:?}"));
+            index.maybe_flush_by_budget();
+        }
+        index.materialize_terms_and_finalize_postings();
+        (index, mapping)
+    }
+
+    #[test]
+    fn merge_fanin_zero_never_merges() {
+        // S3 reversibility flag: `SURCH_MERGE_FANIN=0` (forced here via the
+        // per-index override) must reproduce EXACTLY the S2 layout — one
+        // sealed segment per doc (budget=1 flushes every chunk) plus the
+        // fresh active one, unaffected by the merge feature existing at all.
+        const DOC_COUNT: u32 = 10;
+        let (index, _mapping) = build_merge_test_index(DOC_COUNT, 0, false);
+        assert_eq!(
+            index.segment_count(),
+            DOC_COUNT as usize + 1,
+            "fanin=0 must never merge"
+        );
+    }
+
+    #[test]
+    fn merge_cascades_and_matches_unmerged_oracle() {
+        const DOC_COUNT: u32 = 40;
+        // `merged`: fan-in 3 forces real, cascading merges. `oracle`: the
+        // SAME corpus with merging disabled (fanin=0) — a known-correct
+        // multi-segment layout (proven by the S2 tests above) used as the
+        // ground truth every read below must agree with bit-for-bit.
+        let (merged, _mapping) = build_merge_test_index(DOC_COUNT, 3, false);
+        let (oracle, _mapping) = build_merge_test_index(DOC_COUNT, 0, false);
+
+        assert_eq!(
+            oracle.segment_count(),
+            DOC_COUNT as usize + 1,
+            "sanity: the un-merged oracle must have one segment per doc"
+        );
+        assert!(
+            merged.segment_count() < oracle.segment_count(),
+            "merge (fanin=3) must produce fewer segments than the unmerged \
+             oracle: merged={}, oracle={}",
+            merged.segment_count(),
+            oracle.segment_count()
+        );
+        assert!(
+            merged.segment_count() <= 15,
+            "merge should have cascaded well below one segment per doc \
+             (LogMergePolicy-style tiering), got {} segments for {DOC_COUNT} docs",
+            merged.segment_count()
+        );
+
+        // Global doc-id / live-doc reads agree exactly.
+        assert_eq!(merged.doc_ids(), oracle.doc_ids());
+        assert_eq!(merged.live_doc_count(), oracle.live_doc_count());
+
+        // (b) BM25 stats aggregated per field agree exactly — doc_count,
+        // total_terms, min_doc_len (avg_doc_len is derived from the first
+        // two, see `AggregatedFieldStats::avg_doc_len`), summed during the
+        // merge's field_stats concat, never re-derived from the quantized
+        // `doc_len_dense` byte.
+        for field in ["NOM", "BODY"] {
+            assert_eq!(
+                merged.field_stats_aggregated(field),
+                oracle.field_stats_aggregated(field),
+                "field_stats_aggregated diverged for {field}"
+            );
+        }
+
+        // Per-term postings (doc_freq + doc_ids + freqs) agree exactly —
+        // the proxy for "search results identical" at this crate's level
+        // (BM25 scoring itself lives in `surch-api`; see
+        // `segment_merge_parity.rs` for the end-to-end `_search` gate).
+        for term in ["commun", "lorem"] {
+            let sorted_pairs = |index: &DocumentIndex| -> Vec<(u32, u32)> {
+                let (ids, freqs) = index
+                    .decode_from_segment("BODY", term)
+                    .unwrap_or_else(|| panic!("BODY={term} must be present"));
+                let mut pairs: Vec<(u32, u32)> = ids.into_iter().zip(freqs).collect();
+                pairs.sort_unstable();
+                pairs
+            };
+            assert_eq!(
+                sorted_pairs(&merged),
+                sorted_pairs(&oracle),
+                "BODY={term} postings diverged between merged and oracle"
+            );
+        }
+        for name in [
+            "dupont martin",
+            "dupre",
+            "bernard",
+            "petit durand",
+            "lefevre noir",
+        ] {
+            assert_eq!(
+                merged.decode_from_segment("NOM.raw", name),
+                oracle.decode_from_segment("NOM.raw", name),
+                "NOM.raw={name} postings diverged between merged and oracle"
+            );
+        }
+
+        // (e) sub-field values (dict remap) and doc_len (dense concat with
+        // local-offset remap) agree for EVERY doc — proof the merge's
+        // per-segment offset arithmetic survived cascading merges.
+        // `resolve_doc_len` reproduces `surch-api`'s multi-segment
+        // resolution (last segment whose `doc_base <= doc_id`, then LOCAL
+        // indexing) — a local index past a segment's own range reads the
+        // dense slice out of bounds and yields `None`, never a wrong byte.
+        let resolve_doc_len = |index: &DocumentIndex, field: &str, doc_id: u32| -> Option<u64> {
+            index
+                .field_stats_segments(field)
+                .into_iter()
+                .rev()
+                .find(|(doc_base, _)| *doc_base <= doc_id)
+                .and_then(|(doc_base, stats)| stats.doc_len(doc_id - doc_base))
+        };
+        for doc_id in 0..DOC_COUNT {
+            assert_eq!(
+                merged.subfield_value("NOM.raw", doc_id),
+                oracle.subfield_value("NOM.raw", doc_id),
+                "NOM.raw diverged for doc {doc_id}"
+            );
+            for field in ["NOM", "BODY"] {
+                assert_eq!(
+                    resolve_doc_len(&merged, field, doc_id),
+                    resolve_doc_len(&oracle, field, doc_id),
+                    "doc_len diverged for doc {doc_id} field {field}"
+                );
+                assert!(
+                    resolve_doc_len(&merged, field, doc_id).is_some(),
+                    "every doc has a recorded {field} length in this corpus \
+                     (guards against a trivially-equal None == None pass)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_ram_and_disk_modes_produce_identical_reads() {
+        // (d) the same merge policy driving a RAM-backed vs a disk-backed
+        // `TermDictionary` per source segment must read back identically —
+        // `merge_term_dictionaries` branches per SOURCE (`disk_backed()`),
+        // not on a single global assumption.
+        const DOC_COUNT: u32 = 24;
+        let (ram, _mapping) = build_merge_test_index(DOC_COUNT, 3, false);
+        let (disk, _mapping) = build_merge_test_index(DOC_COUNT, 3, true);
+
+        assert!(ram.segment_count() > 1, "sanity: merge must have run");
+        assert_eq!(ram.doc_ids(), disk.doc_ids());
+        assert_eq!(ram.live_doc_count(), disk.live_doc_count());
+        for field in ["NOM", "BODY"] {
+            assert_eq!(
+                ram.field_stats_aggregated(field),
+                disk.field_stats_aggregated(field),
+                "field_stats_aggregated diverged RAM vs disk for {field}"
+            );
+        }
+        for term in ["commun", "lorem"] {
+            let sorted_pairs = |index: &DocumentIndex| -> Vec<(u32, u32)> {
+                let (ids, freqs) = index
+                    .decode_from_segment("BODY", term)
+                    .unwrap_or_else(|| panic!("BODY={term} must be present"));
+                let mut pairs: Vec<(u32, u32)> = ids.into_iter().zip(freqs).collect();
+                pairs.sort_unstable();
+                pairs
+            };
+            assert_eq!(
+                sorted_pairs(&ram),
+                sorted_pairs(&disk),
+                "BODY={term} postings diverged RAM vs disk merged reads"
+            );
+        }
+        for doc_id in 0..DOC_COUNT {
+            assert_eq!(
+                ram.subfield_value("NOM.raw", doc_id),
+                disk.subfield_value("NOM.raw", doc_id),
+                "NOM.raw diverged RAM vs disk for doc {doc_id}"
+            );
+        }
     }
 }

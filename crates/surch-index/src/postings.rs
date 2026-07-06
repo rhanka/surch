@@ -903,6 +903,375 @@ impl PostingsBuilder {
     }
 }
 
+/// S3 (`docs/paper/design-segments-pic-borne-2026-07-05.md`, "merge tiered
+/// STREAMING"): same per-block `max_term_freq` computation as
+/// [`build_block_metas`], sourced from an already-merged `freqs` slice
+/// (the segment merge concatenates `doc_ids`/`freqs` directly — it never
+/// reconstructs a `Vec<Posting>`) instead of a `&[Posting]`. Byte-identical
+/// output to `build_block_metas` for the same postings: both chunk by
+/// [`BLOCK_SIZE`] and take the max `freq` per chunk.
+fn build_block_metas_from_freqs(freqs: &[u32]) -> Vec<BlockMeta> {
+    freqs
+        .chunks(BLOCK_SIZE)
+        .map(|chunk| BlockMeta {
+            max_term_freq: chunk.iter().copied().max().unwrap_or(0),
+        })
+        .collect()
+}
+
+/// S3 merge tiered inline: per-field accumulator for
+/// [`merge_term_dictionaries`], bundling the same channels
+/// [`PostingsBuilder::build_with_disk_flag`]'s per-field loop accumulates
+/// (FST builder, CSR offsets, the sparse roaring side table, the disk
+/// segment payload, the persisted block directory) behind one struct —
+/// avoids a `too_many_arguments` free function, and is the single place a
+/// future S3b fast path would change (see [`Self::push_term`]'s doc
+/// comment).
+struct FieldMergeAccumulator {
+    disk_enabled: bool,
+    builder: MapBuilder<Vec<u8>>,
+    doc_ids_flat: Vec<u32>,
+    freqs_flat: Vec<u32>,
+    block_metas_flat: Vec<BlockMeta>,
+    offsets: Vec<u32>,
+    block_offsets: Vec<u32>,
+    roaring: Vec<(u32, RoaringDocSet)>,
+    segment_descriptors: Vec<(u64, u32)>,
+    field_payload: Vec<u8>,
+    block_directory_flat: Vec<BlockDirEntry>,
+    block_dir_offsets: Vec<u32>,
+    postings_skipped_terms: u64,
+    next_term_idx: u32,
+}
+
+impl FieldMergeAccumulator {
+    fn new(disk_enabled: bool) -> Self {
+        let mut block_dir_offsets = Vec::new();
+        if disk_enabled {
+            block_dir_offsets.push(0);
+        }
+        Self {
+            disk_enabled,
+            builder: MapBuilder::memory(),
+            doc_ids_flat: Vec::new(),
+            freqs_flat: Vec::new(),
+            block_metas_flat: Vec::new(),
+            offsets: vec![0],
+            block_offsets: vec![0],
+            roaring: Vec::new(),
+            segment_descriptors: Vec::new(),
+            field_payload: Vec::new(),
+            block_directory_flat: Vec::new(),
+            block_dir_offsets,
+            postings_skipped_terms: 0,
+            next_term_idx: 0,
+        }
+    }
+
+    /// Streaming per-term merge step. `term` must be strictly greater
+    /// (lexicographically) than every previously pushed term — guaranteed
+    /// by [`merge_term_dictionaries`]'s `fst::map::OpBuilder::union`
+    /// stream, which already walks every source field's FST in sorted
+    /// lock-step. `doc_ids`/`freqs` are this term's postings, already
+    /// concatenated across the merge run's segments in ascending
+    /// `doc_base` order by the caller.
+    ///
+    /// Fable's arbitrage (design doc, doc_ids GLOBAUX STABLES) keeps
+    /// doc_ids global and never renumbers them, and a run is only ever
+    /// ADJACENT sealed segments, so the concatenation the caller built is
+    /// already strictly ascending with NO overlap: unlike
+    /// `PostingsBuilder::build`'s `dedup_merge_postings` (which exists for
+    /// a same-DOCUMENT multi-valued field, a write-time concern), there is
+    /// no run of equal doc_ids to merge here — only a debug-only sanity
+    /// check that the invariant actually holds.
+    ///
+    /// v1 (this commit) is decode+concat+re-encode: the caller already
+    /// materialized `doc_ids`/`freqs` by reading back each source
+    /// segment's postings (a RAM slice, or one `pread`+decode when that
+    /// source is disk-backed) and concatenating them; this method
+    /// re-encodes them exactly like a fresh build. The planned S3b fast
+    /// path (design doc: "copie verbatim des blobs FoR avec fixup du seul
+    /// premier varint") only needs to replace the body of
+    /// [`Self::encode_and_store`] below with a byte-copy of each source's
+    /// already-FoR-encoded block payload (re-based varint-delta on the
+    /// very first doc_id of the run only) instead of calling
+    /// `encode_postings_blocked` on decoded `u32`s — every other channel
+    /// here (FST insert, CSR offsets, roaring, directory) is already
+    /// agnostic to how the payload bytes were produced, so this is the
+    /// ONLY hook that path needs to change.
+    fn push_term(&mut self, term: &[u8], doc_ids: &[u32], freqs: &[u32]) {
+        debug_assert_eq!(doc_ids.len(), freqs.len());
+        debug_assert!(
+            doc_ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "merged term postings must be strictly ascending doc_id — adjacent \
+             sealed segments must never overlap (S3 carries no tombstones yet)"
+        );
+        let term_idx = self.next_term_idx;
+        self.next_term_idx += 1;
+        self.builder
+            .insert(term, u64::from(term_idx))
+            .expect("fst union stream yields strictly increasing keys");
+
+        if self.disk_enabled {
+            self.block_offsets.push(
+                self.block_offsets.last().copied().unwrap_or(0)
+                    + doc_ids.len().div_ceil(BLOCK_SIZE) as u32,
+            );
+            if doc_ids.len() > TERM_ROARING_THRESHOLD {
+                self.roaring
+                    .push((term_idx, RoaringDocSet::from_sorted(doc_ids)));
+            }
+            self.offsets
+                .push(self.offsets.last().copied().unwrap_or(0) + doc_ids.len() as u32);
+            self.encode_and_store(doc_ids, freqs);
+            self.block_dir_offsets
+                .push(self.block_directory_flat.len() as u32);
+        } else {
+            self.block_metas_flat
+                .extend(build_block_metas_from_freqs(freqs));
+            self.block_offsets.push(self.block_metas_flat.len() as u32);
+            let doc_ids_start = self.doc_ids_flat.len();
+            self.doc_ids_flat.extend_from_slice(doc_ids);
+            if doc_ids.len() > TERM_ROARING_THRESHOLD {
+                self.roaring.push((
+                    term_idx,
+                    RoaringDocSet::from_sorted(&self.doc_ids_flat[doc_ids_start..]),
+                ));
+            }
+            self.freqs_flat.extend_from_slice(freqs);
+            self.offsets.push(self.freqs_flat.len() as u32);
+            self.encode_and_store(doc_ids, freqs);
+        }
+    }
+
+    /// FoR-encode `(doc_ids, freqs)` and accumulate into `field_payload`,
+    /// mirroring [`PostingsBuilder::build_with_disk_flag`]'s per-term
+    /// encode step (persisted block directory only when `disk_enabled`,
+    /// same sentinel-on-failure contract).
+    fn encode_and_store(&mut self, doc_ids: &[u32], freqs: &[u32]) {
+        match encode_postings_blocked(doc_ids, freqs) {
+            Ok(block_payload) => {
+                let payload_offset = self.field_payload.len() as u64;
+                if self.disk_enabled {
+                    if let Ok(directory) = block_directory(&block_payload, doc_ids.len()) {
+                        self.block_directory_flat.extend(directory);
+                    }
+                }
+                self.field_payload.extend_from_slice(&block_payload);
+                self.segment_descriptors
+                    .push((payload_offset, block_payload.len() as u32));
+            }
+            Err(_) => {
+                self.segment_descriptors.push((0, 0));
+                self.postings_skipped_terms += 1;
+            }
+        }
+    }
+
+    /// Finish this field: flush `field_payload` into the SHARED
+    /// `postings_segment` with ONE `append()` call (same per-field
+    /// batching contract as [`PostingsBuilder::build_with_disk_flag`]),
+    /// rebase `segment_descriptors`, and assemble the final
+    /// [`FieldPostings`]. Returns the skipped-terms count for the caller
+    /// to fold into [`TermDictionary::postings_skipped_terms`].
+    fn finish(mut self, postings_segment: &mut Option<PostingsSegment>) -> (FieldPostings, u64) {
+        self.roaring.shrink_to_fit();
+        let field_base_offset = if self.field_payload.is_empty() {
+            None
+        } else if let Some(segment) = postings_segment.as_mut() {
+            let appended = segment.append(&self.field_payload);
+            if appended.is_none() {
+                *postings_segment = None;
+            }
+            appended
+        } else {
+            None
+        };
+        match field_base_offset {
+            Some(base) => {
+                for descriptor in &mut self.segment_descriptors {
+                    if descriptor.1 != 0 {
+                        descriptor.0 += base;
+                    }
+                }
+            }
+            None => {
+                self.segment_descriptors.fill((0, 0));
+            }
+        }
+
+        // SHADOW validation, same contract (and same free-in-release
+        // `debug_assert!`) as `PostingsBuilder::build_with_disk_flag`'s
+        // post-loop round trip: re-`pread` every merged term's
+        // just-flushed bytes from the actual segment file and compare
+        // against the RAM channels. RAM mode only — under `disk_enabled`
+        // the flat channels are intentionally empty (the per-term encode
+        // was instead sanity-checked by `push_term`'s strict-ascending
+        // `debug_assert!` on the exact slices that were encoded).
+        if !self.disk_enabled {
+            debug_assert!(
+                validate_field_segment_round_trip(
+                    postings_segment.as_ref(),
+                    &self.segment_descriptors,
+                    &self.offsets,
+                    &self.doc_ids_flat,
+                    &self.freqs_flat,
+                ),
+                "merged postings segment blocked round-trip mismatch"
+            );
+        }
+
+        let bytes = self
+            .builder
+            .into_inner()
+            .expect("fst::MapBuilder memory writer never fails I/O");
+        let fst = Map::new(bytes).expect("fst::Map from valid MapBuilder bytes");
+        (
+            FieldPostings {
+                fst,
+                doc_ids_flat: self.doc_ids_flat.into_boxed_slice(),
+                freqs_flat: self.freqs_flat.into_boxed_slice(),
+                block_metas_flat: self.block_metas_flat.into_boxed_slice(),
+                offsets: self.offsets.into_boxed_slice(),
+                block_offsets: self.block_offsets.into_boxed_slice(),
+                roaring: self.roaring,
+                segment_descriptors: self.segment_descriptors.into_boxed_slice(),
+                block_directory: self.block_directory_flat.into_boxed_slice(),
+                block_dir_offsets: self.block_dir_offsets.into_boxed_slice(),
+            },
+            self.postings_skipped_terms,
+        )
+    }
+}
+
+/// S3 (`docs/paper/design-segments-pic-borne-2026-07-05.md`, ordre amendé
+/// "S3: merge tiered inline sur runs adjacents"): merge a run of ADJACENT
+/// sealed segments' [`TermDictionary`]s into ONE, streaming per term — the
+/// merge never materializes a whole segment's postings in RAM at once,
+/// only one term's merged postings at a time (v1 scope: "simple et correct
+/// d'abord" — see [`FieldMergeAccumulator::push_term`]'s doc comment for
+/// the planned S3b verbatim fast path).
+///
+/// `sources` MUST be the run's `TermDictionary`s in ascending `doc_base`
+/// order — the only caller, `document_index::DocumentIndex`'s merge
+/// policy, only ever builds runs of CONSECUTIVE `segments` entries, which
+/// are always kept in ascending `doc_base` order by construction (segments
+/// are only ever pushed, never reordered). Fable's arbitrage keeps
+/// doc_ids global and never renumbers them, so a term's per-source
+/// postings, concatenated in `sources` order, are already one strictly
+/// ascending list — no re-sort, no dedup needed (S3 carries no tombstones
+/// yet, see the design doc's §C5).
+///
+/// For each field present in at least one source, a k-way `fst::Map`
+/// union (`fst::map::OpBuilder`, one stream per participating source)
+/// walks every source's FST in sorted lock-step — this is what gives the
+/// merged term order for free, with no separate sort pass, exactly like
+/// `PostingsBuilder::build`'s `BTreeMap` does for a fresh build. For every
+/// resulting term, the union's `IndexedValue`s hand back each
+/// participating source's own FST output (the term idx) directly, so the
+/// per-source postings are resolved through the CSR `offsets` table with
+/// NO second FST lookup: a RAM-backed source is read from its resident
+/// `doc_ids_flat`/`freqs_flat` slices, a disk-backed one through its
+/// `segment_descriptors` entry (one `pread` + [`decode_postings_blocked`]
+/// — the same bytes [`TermDictionary::decode_from_segment`] would read,
+/// minus that method's redundant FST resolution). A disk source term
+/// carrying the sentinel `(0, 0)` descriptor (no disk coverage — an I/O
+/// failure at ITS build; those postings are then already unreadable by
+/// every production query on that segment) contributes nothing, matching
+/// `decode_from_segment`'s best-effort contract.
+///
+/// `disk_enabled` selects the MERGED dictionary's own RAM/disk layout. The
+/// caller passes `DocumentIndex`'s resolved postings-disk flag, which
+/// (being fixed for the process's/index's whole lifetime — see
+/// [`postings_disk_enabled`]'s doc comment) necessarily already agrees
+/// with every source's own `disk_backed()`.
+pub(crate) fn merge_term_dictionaries(
+    sources: &[&TermDictionary],
+    disk_enabled: bool,
+) -> TermDictionary {
+    let mut field_names: BTreeSet<&str> = BTreeSet::new();
+    for source in sources {
+        field_names.extend(source.fields.keys().map(String::as_str));
+    }
+
+    let mut postings_segment = PostingsSegment::try_new();
+    let mut postings_skipped_terms: u64 = 0;
+    let mut fields: BTreeMap<String, FieldPostings> = BTreeMap::new();
+
+    for field in field_names {
+        let participants: Vec<(&TermDictionary, &FieldPostings)> = sources
+            .iter()
+            .copied()
+            .filter_map(|source| source.fields.get(field).map(|fp| (source, fp)))
+            .collect();
+        if participants.is_empty() {
+            continue;
+        }
+
+        let mut op = participants[0].1.fst.op();
+        for (_, fp) in &participants[1..] {
+            op = op.add(&fp.fst);
+        }
+        let mut union_stream = op.union();
+
+        let mut acc = FieldMergeAccumulator::new(disk_enabled);
+        let mut merged_doc_ids: Vec<u32> = Vec::new();
+        let mut merged_freqs: Vec<u32> = Vec::new();
+        while let Some((term_bytes, indexed_values)) = union_stream.next() {
+            merged_doc_ids.clear();
+            merged_freqs.clear();
+            // Concatenate in ascending `doc_base` order == `participants`
+            // order (== `sources` order): each participant's `IndexedValue`
+            // is matched back by its stream index (a linear `find` over
+            // <= fan-in entries) rather than trusting any internal
+            // ordering of `indexed_values` itself.
+            for (participant_idx, (source, fp)) in participants.iter().enumerate() {
+                let Some(indexed) = indexed_values
+                    .iter()
+                    .find(|indexed| indexed.index == participant_idx)
+                else {
+                    continue;
+                };
+                let term_idx = indexed.value as usize;
+                let start = fp.offsets[term_idx] as usize;
+                let end = fp.offsets[term_idx + 1] as usize;
+                if source.disk_backed() {
+                    let (offset, len) = fp.segment_descriptors[term_idx];
+                    if len == 0 {
+                        continue;
+                    }
+                    let Some(segment) = source.postings_segment.as_deref() else {
+                        continue;
+                    };
+                    let Some(bytes) = segment.read(offset, len) else {
+                        continue;
+                    };
+                    let Ok((ids, freqs)) = decode_postings_blocked(&bytes, end - start) else {
+                        continue;
+                    };
+                    merged_doc_ids.extend(ids);
+                    merged_freqs.extend(freqs);
+                } else {
+                    merged_doc_ids.extend_from_slice(&fp.doc_ids_flat[start..end]);
+                    merged_freqs.extend_from_slice(&fp.freqs_flat[start..end]);
+                }
+            }
+            acc.push_term(term_bytes, &merged_doc_ids, &merged_freqs);
+        }
+
+        let (field_postings, skipped) = acc.finish(&mut postings_segment);
+        postings_skipped_terms += skipped;
+        fields.insert(field.to_string(), field_postings);
+    }
+
+    TermDictionary {
+        fields,
+        postings_segment: postings_segment.map(Arc::new),
+        postings_skipped_terms,
+        disk_enabled,
+    }
+}
+
 /// SHADOW validation (Lot C `C1a-batché`, only ever called from inside a
 /// `debug_assert!` in [`PostingsBuilder::build`]): re-`pread`s every
 /// term's just-flushed bytes from `segment` and decodes them via

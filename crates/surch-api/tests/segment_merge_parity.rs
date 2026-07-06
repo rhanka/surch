@@ -1,23 +1,18 @@
-//! Plan segments S2 gate
-//! (`docs/paper/design-segments-pic-borne-2026-07-05.md`): flush-by-budget
-//! must produce REAL multi-segment indexing (`DocumentIndex::segments.len()`
-//! exceeding 1) while staying BIT-IDENTICAL — same doc-id sets, same BM25 scores,
-//! same ranking order — to the mono-segment engine (`SURCH_FLUSH_BUDGET_BYTES`
-//! unset, the S1 reversibility flag).
+//! Plan segments S3 gate (`docs/paper/design-segments-pic-borne-2026-07-05.md`,
+//! "merge tiered inline sur runs adjacents"): the tiered merge must produce
+//! REAL, CASCADING segment reduction (far fewer sealed segments than the
+//! un-merged multi-segment engine) while staying BIT-IDENTICAL — same
+//! doc-id sets, same BM25 scores, same ranking order — to both the
+//! mono-segment engine (`SURCH_FLUSH_BUDGET_BYTES` unset) and the
+//! un-merged multi-segment engine (`SURCH_MERGE_FANIN=0`, forced via the
+//! per-index override).
 //!
-//! Testability note (mirrors `tests/postings_disk_parity.rs`): the budget is
-//! normally a process-wide `OnceLock`-cached env var, which cannot flip
-//! mid-process. This test never touches the env var; it uses
-//! [`AppState::set_flush_budget_bytes_override`], a per-index override that
-//! bypasses the `OnceLock` entirely, to build one index with a forced tiny
-//! budget (real multi-segment) and a second, independent index with the
-//! override forced to `None` (mono-segment), in the SAME process, and
-//! compares their `_search` responses.
-//!
-//! The corpus is deliberately sent as SEVERAL `_bulk` chunks (not one): the
-//! budget check runs once per chunk
-//! (`InMemoryIndex::append_to_index` -> `DocumentIndex::maybe_flush_by_budget`),
-//! so a single giant chunk would only ever seal at most one segment boundary.
+//! Mirrors `segment_flush_budget_parity.rs`'s corpus/harness shape, adding
+//! the merge-fan-in dimension: three engines are built from the SAME
+//! corpus — mono (no budget), multi un-merged (budget forced, fanin
+//! forced to `0`), multi merged (budget forced, fanin forced to a small
+//! value so a corpus of this size actually cascades) — and every
+//! `_search` response is compared pairwise.
 
 use axum::{
     body::{to_bytes, Body},
@@ -35,12 +30,13 @@ async fn response_json(response: axum::response::Response<Body>) -> Value {
 }
 
 /// Deterministic corpus, split into `CHUNKS` separate `_bulk` NDJSON
-/// payloads of `PER_CHUNK` docs each — so the budget check fires once per
-/// chunk, not once for the whole corpus. 3 `title` groups (`widget` spans
-/// most docs, multi-FoR-block; `gadget` a minority), 2 `category` groups, a
-/// `body` term (`common`) shared by EVERY doc.
-const CHUNKS: usize = 12;
-const PER_CHUNK: usize = 25;
+/// payloads of `PER_CHUNK` docs each — the budget check fires once per
+/// chunk, not once for the whole corpus (same rationale as
+/// `segment_flush_budget_parity.rs`). Sized larger than the S2 gate
+/// (more chunks) so a small merge fan-in has enough sealed segments to
+/// actually cascade through more than one tier.
+const CHUNKS: usize = 24;
+const PER_CHUNK: usize = 10;
 
 fn corpus_chunks() -> Vec<String> {
     let mut chunks = Vec::with_capacity(CHUNKS);
@@ -70,20 +66,19 @@ fn corpus_chunks() -> Vec<String> {
 }
 
 /// Build a fresh `AppState`-backed router, pin `index`'s flush-by-budget
-/// override BEFORE any document lands (mirrors
-/// `postings_disk_parity.rs::build_index`'s ordering rationale — the
-/// override must be set before the first `PostingsBuilder`-consuming call),
+/// and merge-fan-in overrides BEFORE any document lands (mirrors
+/// `segment_flush_budget_parity.rs::build_index`'s ordering rationale),
 /// then POST the corpus as `CHUNKS` separate `_bulk` requests and refresh
 /// once at the end.
-async fn build_index(index: &str, forced_budget_bytes: Option<u64>) -> (axum::Router, AppState) {
+async fn build_index(
+    index: &str,
+    forced_budget_bytes: Option<u64>,
+    forced_merge_fanin: usize,
+) -> (axum::Router, AppState) {
     let app_state = AppState::default();
     app_state.create_index(index, None, serde_json::json!({}), Default::default());
     app_state.set_flush_budget_bytes_override(index, forced_budget_bytes);
-    // Plan segments S3: merge pinned OFF — this test is the S2 gate (raw
-    // un-merged multi-segment vs mono parity) and must stay deterministic
-    // under any ambient `SURCH_MERGE_FANIN`; the merge-enabled counterpart
-    // lives in `segment_merge_parity.rs`.
-    app_state.set_merge_fanin_override(index, 0);
+    app_state.set_merge_fanin_override(index, forced_merge_fanin);
 
     let router = app_router_with_state(AppRouterState {
         app: app_state.clone(),
@@ -107,14 +102,11 @@ async fn build_index(index: &str, forced_budget_bytes: Option<u64>) -> (axum::Ro
         let bulk_body = response_json(bulk_response).await;
         assert_eq!(
             bulk_body["errors"], false,
-            "bulk indexing must succeed (forced_budget_bytes={forced_budget_bytes:?}): {bulk_body:?}"
+            "bulk indexing must succeed (forced_budget_bytes={forced_budget_bytes:?}, \
+             forced_merge_fanin={forced_merge_fanin}): {bulk_body:?}"
         );
     }
 
-    // Explicit `_refresh` so the same production `_bulk` (x N) -> `_refresh`
-    // -> `_search` sequence real usage follows is exercised here too — and,
-    // per the design, `_refresh` ALSO seals the active segment as one more
-    // boundary when a budget is configured.
     let refresh_response = router
         .clone()
         .oneshot(
@@ -153,8 +145,8 @@ async fn search(router: &axum::Router, index: &str, query_body: &str) -> Value {
 }
 
 /// `(id, score)` pairs in response order — order matters, not just set
-/// membership, since a scoring divergence between the mono- and
-/// multi-segment paths could also reorder ties.
+/// membership, since a scoring divergence between engines could also
+/// reorder ties.
 fn extract_ordered_hits(body: &Value) -> Vec<(String, f64)> {
     body["hits"]["hits"]
         .as_array()
@@ -169,27 +161,42 @@ fn extract_ordered_hits(body: &Value) -> Vec<(String, f64)> {
 }
 
 #[tokio::test]
-async fn budget_flush_forces_multi_segment_and_matches_mono_segment_bit_identical() {
-    let index = "seg-flush-parity-idx";
+async fn tiered_merge_cascades_and_matches_mono_and_unmerged_bit_identical() {
+    let index = "seg-merge-parity-idx";
 
-    // `Some(1)`: any non-empty `PostingsBuilder` (>= 1 byte) crosses the
-    // budget, so every one of the `CHUNKS` `_bulk` POSTs seals its own
-    // segment — the strongest possible exercise of real multi-segment
-    // indexing. `None`: forces "no budget" regardless of the process env,
-    // reproducing the S1 mono-segment engine exactly.
-    let (router_multi, app_state_multi) = build_index(index, Some(1)).await;
-    let (router_mono, app_state_mono) = build_index(index, None).await;
+    // `Some(1)`: any non-empty `PostingsBuilder` crosses the budget, so
+    // every one of the `CHUNKS` `_bulk` POSTs seals its own segment —
+    // `router_unmerged` (fanin=0) is the S2-shaped ground truth (real
+    // multi-segment, but merge never runs); `router_merged` (fanin=3)
+    // must cascade that down to far fewer segments. `router_mono`
+    // (`None` budget) reproduces the S1 mono-segment engine.
+    let (router_mono, app_state_mono) = build_index(index, None, 0).await;
+    let (router_unmerged, app_state_unmerged) = build_index(index, Some(1), 0).await;
+    let (router_merged, app_state_merged) = build_index(index, Some(1), 3).await;
 
     assert_eq!(
         app_state_mono.index_segment_count(index),
         1,
         "budget-unset (forced None) index must stay mono-segment — the S1 invariant"
     );
+    assert_eq!(
+        app_state_unmerged.index_segment_count(index),
+        CHUNKS + 1,
+        "fanin=0 (S3 reversibility flag) must reproduce the exact S2 layout: \
+         one sealed segment per chunk plus the fresh active one"
+    );
     assert!(
-        app_state_multi.index_segment_count(index) > 1,
-        "a budget of 1 byte across {CHUNKS} separate `_bulk` chunks must have sealed \
-         more than one segment (got {})",
-        app_state_multi.index_segment_count(index)
+        app_state_merged.index_segment_count(index) < app_state_unmerged.index_segment_count(index),
+        "fanin=3 must cascade to fewer segments than the unmerged engine: \
+         merged={}, unmerged={}",
+        app_state_merged.index_segment_count(index),
+        app_state_unmerged.index_segment_count(index)
+    );
+    assert!(
+        app_state_merged.index_segment_count(index) <= CHUNKS / 2,
+        "merge should have cascaded well below one segment per chunk, got {} \
+         sealed+active segments for {CHUNKS} chunks",
+        app_state_merged.index_segment_count(index)
     );
 
     let total = CHUNKS * PER_CHUNK;
@@ -226,26 +233,36 @@ async fn budget_flush_forces_multi_segment_and_matches_mono_segment_bit_identica
 
     for &(label, query_body) in queries {
         let body_mono = search(&router_mono, index, query_body).await;
-        let body_multi = search(&router_multi, index, query_body).await;
+        let body_unmerged = search(&router_unmerged, index, query_body).await;
+        let body_merged = search(&router_merged, index, query_body).await;
 
         assert_eq!(
-            body_mono["hits"]["total"]["value"], body_multi["hits"]["total"]["value"],
-            "[{label}] total hits diverged between mono- and multi-segment for {query_body}"
+            body_mono["hits"]["total"]["value"], body_unmerged["hits"]["total"]["value"],
+            "[{label}] total hits diverged mono vs unmerged for {query_body}"
+        );
+        assert_eq!(
+            body_mono["hits"]["total"]["value"], body_merged["hits"]["total"]["value"],
+            "[{label}] total hits diverged mono vs merged for {query_body}"
         );
 
         let hits_mono = extract_ordered_hits(&body_mono);
-        let hits_multi = extract_ordered_hits(&body_multi);
+        let hits_unmerged = extract_ordered_hits(&body_unmerged);
+        let hits_merged = extract_ordered_hits(&body_merged);
         assert_eq!(
-            hits_mono, hits_multi,
-            "[{label}] (id, score) hits diverged between mono- and multi-segment for {query_body}"
+            hits_mono, hits_unmerged,
+            "[{label}] (id, score) hits diverged mono vs unmerged for {query_body}"
+        );
+        assert_eq!(
+            hits_mono, hits_merged,
+            "[{label}] (id, score) hits diverged mono vs merged for {query_body}"
         );
     }
 
     // `match_all` at `size` >= corpus recovers every doc: an independent
-    // sanity check that BOTH engines actually indexed the full corpus (not
-    // just agreeing on an accidentally-truncated candidate set).
+    // sanity check that all three engines actually indexed the full corpus
+    // (not just agreeing on an accidentally-truncated candidate set).
     let body_all = search(
-        &router_mono,
+        &router_merged,
         index,
         r#"{"query":{"match_all":{}},"size":10000}"#,
     )

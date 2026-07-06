@@ -2318,6 +2318,23 @@ impl AppState {
         }
     }
 
+    /// Plan segments S3 test/ops hook: pin `index`'s tiered-merge fan-in
+    /// independently of the process-wide `SURCH_MERGE_FANIN` env var (same
+    /// `OnceLock`-cannot-flip-mid-run rationale as
+    /// [`Self::set_flush_budget_bytes_override`]). `0` forces "merge
+    /// disabled" (used by parity tests to prove the un-merged multi-segment
+    /// engine is unaffected by this feature); any other value forces that
+    /// exact fan-in. No-op if `index` does not exist.
+    pub fn set_merge_fanin_override(&self, index: &str, fanin: usize) {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if let Some(data) = store.indices.get_mut(index) {
+            data.index.set_merge_fanin_override(fanin);
+        }
+    }
+
     pub fn put_index_template(
         &self,
         name: &str,
