@@ -125,6 +125,7 @@ run_engine(){
       -v "$VOL:/tmp" \
       -e SURCH_PORT=9200 -e SURCH_ELASTIC_PRODUCT_COMPAT=1 \
       -e SURCH_POSTINGS_DISK="$POSTINGS_DISK" \
+      ${SURCH_FLUSH_BUDGET_BYTES:+-e SURCH_FLUSH_BUDGET_BYTES="$SURCH_FLUSH_BUDGET_BYTES"} \
       "$SURCH_IMAGE" >/dev/null 2>&1
   fi
 

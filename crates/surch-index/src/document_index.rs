@@ -113,26 +113,29 @@ impl LiveDocsBitset {
 
 #[derive(Debug, Clone)]
 pub struct DocumentIndex {
-    /// Sealed, per-generation index state — see [`Segment`] for what it
-    /// bundles and why.
+    /// Sealed-or-active, per-generation index state — see [`Segment`] for
+    /// what it bundles and why.
     ///
-    /// Plan segments **S1** (`docs/paper/design-segments-pic-borne-2026-07-05.md`):
-    /// `DocumentIndex` always holds `Vec<Arc<Segment>>` of length
-    /// EXACTLY 1 for now — this is the pure structural refactor step,
-    /// bit-identical to the pre-segment layout by construction (a single
-    /// segment IS the whole index, so every aggregate below is a `Σ`
-    /// over one term). S2 introduces budget-triggered flush, at which
-    /// point `segments.len()` can exceed 1.
+    /// Plan segments (`docs/paper/design-segments-pic-borne-2026-07-05.md`):
+    /// **S1** kept `Vec<Arc<Segment>>` at length EXACTLY 1 (the pure
+    /// structural refactor step, bit-identical to the pre-segment
+    /// layout). **S2** (budget-triggered flush, [`Self::maybe_flush_by_budget`],
+    /// and `_refresh`, [`Self::materialize_terms_and_finalize_postings`])
+    /// can genuinely append more — `segments.len()` stays `1` forever
+    /// only while `SURCH_FLUSH_BUDGET_BYTES` is unset (the S1
+    /// reversibility flag).
     ///
-    /// Every write (`merge_analyzed`) mutates `segments[0]` in place via
-    /// `Arc::make_mut` (never clones in S1: nothing else ever holds a
-    /// second strong reference to a segment), so this costs nothing
-    /// extra over the previous direct-field layout. Every read goes
-    /// through [`Self::segment`] (single-segment passthrough — the right
-    /// shape for data that can only be merged with real cross-segment
-    /// logic, e.g. postings enumeration, deferred to S2) or, where the
-    /// aggregation is meaningful today (BM25 doc_count/avg_doc_len, byte
-    /// accounting, `live_doc_count`), a real `Σ` over `segments.iter()`.
+    /// Every eager write (`merge_analyzed`) mutates the ACTIVE segment
+    /// (`segments.last()`) in place via `Arc::make_mut` (never clones:
+    /// nothing else ever holds a second strong reference to a live
+    /// segment), so this costs nothing extra over a direct-field layout.
+    /// Every read goes through [`Self::segment`] (`segments[0]`
+    /// passthrough — valid only when the caller has established
+    /// `segment_count() == 1`, see that method's doc) or, where the
+    /// aggregation is meaningful for every segment count (BM25
+    /// doc_count/avg_doc_len, byte accounting, `live_doc_count`,
+    /// `postings_disk_backed`/`decode_from_segment`'s owned merge), a
+    /// real `Σ`/merge over `segments.iter()`.
     segments: Vec<Arc<Segment>>,
     postings_builder: PostingsBuilder,
     /// A6 phase 2: per-field write-time prefix expansion. Populated only for
@@ -177,6 +180,38 @@ pub struct DocumentIndex {
     /// [`Self::resolved_postings_disk_enabled`] at every
     /// `PostingsBuilder::build_with_disk_flag` call site.
     postings_disk_enabled_override: Option<bool>,
+    /// Plan segments S2: one past the highest GLOBAL doc_id ever merged
+    /// into the currently-active segment (i.e. the doc_id the NEXT write
+    /// will use, assuming the caller's monotonic-non-reused contract —
+    /// see `surch-api::InMemoryIndex::next_doc_id`). Updated at the end
+    /// of every [`Self::merge_analyzed`] call. Used to (a) know the
+    /// active segment's `doc_base` to hand to a freshly-pushed successor
+    /// at seal time, and (b) detect whether the active segment is empty
+    /// (`next_doc_id_hint == active.doc_base`) so sealing it twice in a
+    /// row (e.g. two `_refresh` calls with no write in between) does not
+    /// push a useless empty segment. Reset to `0` by [`Self::clear`].
+    next_doc_id_hint: u32,
+    /// Plan segments S2: per-index override for the flush-by-budget
+    /// threshold, bypassing the process-wide `SURCH_FLUSH_BUDGET_BYTES`
+    /// env var — same rationale as `postings_disk_enabled_override` (a
+    /// single test binary cannot flip an `OnceLock`-cached env read
+    /// mid-run). See [`FlushBudgetOverride`].
+    flush_budget_override: FlushBudgetOverride,
+}
+
+/// Plan segments S2: resolution mode for [`DocumentIndex::maybe_flush_by_budget`]
+/// and the `_refresh`-time seal. `UseEnv` (the `Default`) reads
+/// [`flush_budget_bytes`] (the process-wide `SURCH_FLUSH_BUDGET_BYTES`
+/// `OnceLock`) — production default. `Forced(_)` is set via
+/// [`DocumentIndex::set_flush_budget_bytes_override`] so a test can pin an
+/// exact budget (or force "no budget") on ONE index instance,
+/// independently of the env var and of any other test in the same
+/// process.
+#[derive(Debug, Clone, Copy, Default)]
+enum FlushBudgetOverride {
+    #[default]
+    UseEnv,
+    Forced(Option<u64>),
 }
 
 impl Default for DocumentIndex {
@@ -188,8 +223,27 @@ impl Default for DocumentIndex {
             terms_dirty: false,
             terms_build_count: Arc::new(AtomicU64::new(0)),
             postings_disk_enabled_override: None,
+            next_doc_id_hint: 0,
+            flush_budget_override: FlushBudgetOverride::UseEnv,
         }
     }
+}
+
+/// Plan segments S2: env-configured flush-by-budget threshold in bytes,
+/// read ONCE per process (mirrors [`crate::postings::postings_disk_enabled`]'s
+/// established `OnceLock` pattern). `None` when unset, empty, `"0"`, or
+/// unparseable — the S1 reversibility flag: with no budget configured,
+/// [`DocumentIndex::maybe_flush_by_budget`] is always a no-op and
+/// `_refresh` never seals a new segment either, so `DocumentIndex` stays
+/// forever mono-segment, bit-identical to before this feature existed.
+fn flush_budget_bytes() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("SURCH_FLUSH_BUDGET_BYTES")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&bytes| bytes > 0)
+    })
 }
 
 /// Plan segments **S1** (`docs/paper/design-segments-pic-borne-2026-07-05.md`):
@@ -202,30 +256,57 @@ impl Default for DocumentIndex {
 /// S1 scope: `DocumentIndex` always holds `Vec<Arc<Segment>>` of length
 /// EXACTLY 1 — the pure structural refactor step, bit-identical to the
 /// pre-segment layout by construction (a single segment IS the whole
-/// index). S2 introduces budget-triggered flush, at which point
-/// `segments.len()` can exceed 1 and this type becomes genuinely
-/// immutable-and-shared across a background merge (doc_ids
-/// local-per-segment + `doc_base`, per the design's divergence note).
-/// `prefix_postings` is deliberately NOT part of this bundle for S1 (see
-/// `DocumentIndex::prefix_postings`'s field doc).
+/// index).
+///
+/// Plan segments **S2**: budget-triggered flush (env
+/// `SURCH_FLUSH_BUDGET_BYTES`, see [`flush_budget_bytes`]) and `_refresh`
+/// can now seal the currently-active segment and APPEND a fresh one, so
+/// `segments.len()` can genuinely exceed 1. Segments are always kept in
+/// ascending [`Segment::doc_base`] order (only ever pushed, never
+/// reordered), and each one covers a CONTIGUOUS range of GLOBAL doc_ids
+/// `[doc_base, doc_base + doc_count)`. Per the design's divergence note
+/// (resolved for S2): **postings keep GLOBAL doc_ids** in their FoR lists
+/// (no remap needed — a segment's own postings only ever reference
+/// doc_ids inside its own range, which is already true by construction),
+/// while the EAGER per-doc columns (`field_stats.doc_len_dense`,
+/// `subfield_values`' `SubfieldColumn.codes`, `live_docs`) are indexed
+/// LOCALLY (`doc_id - doc_base`) so a late segment's dense arrays stay
+/// sized to ITS OWN doc count instead of the whole corpus (the "maladie
+/// B" this avoids — see the design doc's diagnostic).
 #[derive(Debug, Default, Clone)]
 struct Segment {
     /// Term dictionary: FST + postings (RAM or disk-backed), sealed by
     /// the last `materialize_terms` / `materialize_terms_and_finalize_postings`.
+    /// Postings inside store GLOBAL doc_ids (see the struct doc above).
     terms: TermDictionary,
-    /// Per-field BM25 length stats. Unlike `terms`, updated eagerly by
-    /// every `merge_analyzed` call (never deferred behind `terms_dirty`)
-    /// — moving it into `Segment` does not change when it becomes
-    /// visible to readers, only where it physically lives.
+    /// Per-field BM25 length stats, indexed LOCALLY (`doc_id - doc_base`
+    /// — see the struct doc). Unlike `terms`, updated eagerly by every
+    /// `merge_analyzed` call (never deferred behind `terms_dirty`) —
+    /// moving it into `Segment` does not change when it becomes visible
+    /// to readers, only where it physically lives.
     field_stats: BTreeMap<String, FieldLengthStats>,
-    /// A10 (Phase 4) write-time sub-field projections (see
-    /// [`SubfieldColumn`]'s doc comment for the full per-doc contract) —
-    /// unchanged behaviour, only relocated from `DocumentIndex`.
+    /// A10 (Phase 4) write-time sub-field projections, indexed LOCALLY
+    /// (see [`SubfieldColumn`]'s doc comment for the full per-doc
+    /// contract, and the struct doc above for the local-indexing
+    /// rationale) — unchanged behaviour otherwise, only relocated from
+    /// `DocumentIndex`.
     subfield_values: BTreeMap<String, SubfieldColumn>,
-    /// Live document ids in this generation (presence bitset) — see
-    /// [`LiveDocsBitset`]'s doc comment for the encoding. Updated eagerly
-    /// by `merge_analyzed`, same as `field_stats`.
+    /// Live document ids in this generation (presence bitset), indexed
+    /// LOCALLY — see [`LiveDocsBitset`]'s doc comment for the encoding.
+    /// Updated eagerly by `merge_analyzed`, same as `field_stats`.
     live_docs: LiveDocsBitset,
+    /// Plan segments S2: the smallest GLOBAL doc_id this segment covers.
+    /// Fixed once, at the moment the segment is created (either the
+    /// first-ever segment, always `0`, or a freshly-pushed segment after
+    /// a budget flush / `_refresh` seal, set to `DocumentIndex`'s
+    /// `next_doc_id_hint` at that instant) — never mutated afterwards.
+    /// Every eager column above is indexed by `global_doc_id - doc_base`.
+    doc_base: u32,
+    /// Plan segments S2: number of doc_ids this SEALED segment covers
+    /// (`next_doc_id_hint - doc_base` at the moment it was sealed).
+    /// Meaningless (`0`) for the currently-active (not yet sealed)
+    /// segment — nothing reads it until sealing sets it.
+    doc_count: u32,
 }
 
 /// Lot C Phase 1 lever 2: dense, dict-interned column backing
@@ -340,6 +421,14 @@ impl SubfieldColumn {
     /// `intern_index` here never causes a `dict` value to be re-interned
     /// with a duplicate code across write batches — it only frees memory
     /// slightly earlier than that guaranteed next `clear()` would anyway.
+    ///
+    /// Plan segments S2: also called when a budget flush seals the active
+    /// segment (`DocumentIndex::maybe_flush_by_budget`). Safe for the
+    /// same write-only reason, with an even simpler successor guarantee:
+    /// the very next `set()` after a flush targets the FRESH active
+    /// segment's own brand-new column (`entry(path).or_default()` on an
+    /// empty map), never this sealed one — a sealed segment's columns are
+    /// immutable for the rest of their life.
     fn finalize(&mut self) {
         self.intern_index = HashMap::new();
     }
@@ -620,34 +709,139 @@ impl DocumentIndex {
         Self::default()
     }
 
-    /// Plan segments S1: read-only handle on the (single, for now)
-    /// sealed segment. Every borrowing read method below goes through
-    /// this instead of touching `self.segments[0]` inline, so the S1
-    /// invariant is asserted in exactly one place.
+    /// Plan segments S2: read-only handle on `segments[0]`. Valid ONLY
+    /// when the caller has already established `segments.len() == 1`
+    /// (e.g. via [`Self::segment_count`] or the multi-segment-aware
+    /// [`Self::postings_disk_backed`] returning `false`) — every method
+    /// below that still routes through this accessor (`terms`,
+    /// `postings`, `block_metas`, `postings_with_block_metas`,
+    /// `disk_cursor`, `field_stats`) is ITSELF only ever called from such
+    /// a single-segment-gated call site (see the design's S2 read-path
+    /// note), so `segments[0]` and "the only segment" coincide there.
+    /// With budget flush unset (the S1 reversibility flag) that is
+    /// unconditionally true forever — bit-identical to S1.
     fn segment(&self) -> &Segment {
-        debug_assert_eq!(
-            self.segments.len(),
-            1,
-            "S1 invariant: DocumentIndex must always hold exactly one segment \
-             (multi-segment fan-out lands in S2)"
-        );
         &self.segments[0]
     }
 
-    /// Plan segments S1: mutable handle on the (single, for now) active
-    /// segment, used by every write path. `Arc::make_mut` is used purely
-    /// as the ownership container here — in S1 nothing ever clones
-    /// `segments[0]`'s `Arc` out to a second owner, so `strong_count` is
-    /// always 1 and this never actually clones the `Segment` (no new
-    /// allocation over the pre-segment direct-field layout).
+    /// Plan segments S2: mutable handle on the CURRENTLY ACTIVE segment
+    /// — the one eager writes (`merge_analyzed`) and the next
+    /// `materialize_terms*` target — which is always `segments.last()`.
+    /// `Arc::make_mut` is used purely as the ownership container here —
+    /// nothing ever clones a live segment's `Arc` out to a second owner,
+    /// so `strong_count` is always 1 and this never actually clones the
+    /// `Segment` (no new allocation over the pre-segment direct-field
+    /// layout). With budget flush unset there is only ever one segment,
+    /// so this is exactly the S1 `segments[0]` target — bit-identical.
     fn segment_mut(&mut self) -> &mut Segment {
-        debug_assert_eq!(
-            self.segments.len(),
-            1,
-            "S1 invariant: DocumentIndex must always hold exactly one segment \
-             (multi-segment fan-out lands in S2)"
-        );
-        Arc::make_mut(&mut self.segments[0])
+        Arc::make_mut(
+            self.segments
+                .last_mut()
+                .expect("DocumentIndex always holds at least one segment"),
+        )
+    }
+
+    /// Plan segments S2: number of sealed/active segments currently held.
+    /// `1` forever when `SURCH_FLUSH_BUDGET_BYTES` is unset (or forced
+    /// off via [`Self::set_flush_budget_bytes_override`]) — the S1
+    /// reversibility flag.
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Plan segments S2: read-only handle on the currently active
+    /// (last) segment — the immutable counterpart of [`Self::segment_mut`].
+    fn active_segment(&self) -> &Segment {
+        self.segments
+            .last()
+            .expect("DocumentIndex always holds at least one segment")
+    }
+
+    /// Plan segments S2: per-index override for the flush-by-budget
+    /// threshold — see [`FlushBudgetOverride`]. MUST be called before any
+    /// document is indexed to take effect deterministically (mirrors
+    /// [`Self::set_postings_disk_enabled`]'s contract). `None` forces "no
+    /// budget" (mono-segment) regardless of the env var; `Some(bytes)`
+    /// forces that exact budget.
+    pub fn set_flush_budget_bytes_override(&mut self, budget: Option<u64>) {
+        self.flush_budget_override = FlushBudgetOverride::Forced(budget);
+    }
+
+    /// Plan segments S2: the flush-by-budget threshold this index should
+    /// use right now — the per-index override if one was set, otherwise
+    /// the process-wide [`flush_budget_bytes`] env var.
+    fn resolved_flush_budget_bytes(&self) -> Option<u64> {
+        match self.flush_budget_override {
+            FlushBudgetOverride::UseEnv => flush_budget_bytes(),
+            FlushBudgetOverride::Forced(budget) => budget,
+        }
+    }
+
+    /// Plan segments S2: materialize the active segment's pending
+    /// `postings_builder`/sub-field-intern state IN PLACE — byte-for-byte
+    /// the work [`Self::materialize_terms_and_finalize_postings`] always
+    /// did before this refactor, just factored out so both the budget
+    /// check and the `_refresh` path can share it without duplicating the
+    /// no-clone builder move.
+    fn materialize_active_segment_terms(&mut self) {
+        if self.terms_dirty {
+            let disk_enabled = self.resolved_postings_disk_enabled();
+            let builder = std::mem::replace(&mut self.postings_builder, PostingsBuilder::new());
+            let new_terms = builder.build_with_disk_flag(disk_enabled);
+            self.segment_mut().terms = new_terms;
+            self.terms_dirty = false;
+            self.terms_build_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.postings_builder = PostingsBuilder::new();
+        }
+        for column in self.segment_mut().subfield_values.values_mut() {
+            column.finalize();
+        }
+    }
+
+    /// Plan segments S2: if the active segment actually holds at least
+    /// one document (`next_doc_id_hint > active.doc_base` — a freshly
+    /// sealed-and-replaced segment starts empty, so re-sealing it again
+    /// with nothing written in between would be a wasted no-op entry),
+    /// stamp its final `doc_count` and APPEND a fresh, empty `Segment` to
+    /// `self.segments`, which becomes the new active one. Must be called
+    /// AFTER [`Self::materialize_active_segment_terms`] so the
+    /// about-to-be-former-active segment's `terms`/`subfield_values` are
+    /// already sealed.
+    fn start_new_active_segment_if_nonempty(&mut self) {
+        let active_doc_base = self.active_segment().doc_base;
+        if self.next_doc_id_hint <= active_doc_base {
+            return;
+        }
+        self.segment_mut().doc_count = self.next_doc_id_hint - active_doc_base;
+        self.segments.push(Arc::new(Segment {
+            doc_base: self.next_doc_id_hint,
+            ..Segment::default()
+        }));
+    }
+
+    /// Plan segments S2: if `postings_builder.memory_bytes()` has reached
+    /// the configured flush budget, seal the active segment (materialize
+    /// its terms, finalize sub-field interning) and start a fresh active
+    /// one — turning what used to be a single ever-growing builder into
+    /// real, appended, immutable segments. This is what bounds the
+    /// indexation memory pic (the design's diagnostic "maladie A").
+    ///
+    /// Call this ONCE PER BULK CHUNK, after merging the chunk's documents
+    /// (`surch-api::InMemoryIndex::append_to_index`) — NEVER from the
+    /// `rebuild_index()` replay path, which must always reproduce a
+    /// mono-segment index (tombstone reclamation lands in S4). No-op
+    /// (and therefore free — a single `OnceLock` read) when
+    /// `SURCH_FLUSH_BUDGET_BYTES` is unset/0, the S1 reversibility flag.
+    pub fn maybe_flush_by_budget(&mut self) {
+        let Some(budget) = self.resolved_flush_budget_bytes() else {
+            return;
+        };
+        if self.postings_builder.memory_bytes() < budget {
+            return;
+        }
+        self.materialize_active_segment_terms();
+        self.start_new_active_segment_if_nonempty();
     }
 
     pub fn add_document<I, K, V>(&mut self, doc_id: u32, fields: I) -> Result<()>
@@ -729,10 +923,29 @@ impl DocumentIndex {
         V: Into<String>,
     {
         let mut seen = BTreeSet::new();
+        // Plan segments S2: a genuinely NEW doc_id can only ever land in
+        // the ACTIVE segment's own range — doc_ids are monotonic and
+        // never reused (guaranteed by the caller, see
+        // `surch-api::InMemoryIndex::next_doc_id`), so a doc_id BELOW the
+        // active segment's `doc_base` necessarily re-uses an id an
+        // already-sealed segment's range consumed: rejected as a
+        // duplicate (keeps `merge_analyzed`'s `doc_id >= doc_base`
+        // invariant a true invariant instead of a reachable panic).
+        // Within the active range, the check is the same live-docs probe
+        // as S1, just translated to the segment's LOCAL indexing — with
+        // one segment `doc_base == 0`, so local == global, bit-identical.
+        let active = self.active_segment();
+        let active_doc_base = active.doc_base;
         let documents = documents
             .into_iter()
             .map(|(doc_id, fields)| {
-                if self.segment().live_docs.contains(doc_id) || !seen.insert(doc_id) {
+                let is_duplicate = match doc_id.checked_sub(active_doc_base) {
+                    // Below the active segment's range: an id a sealed
+                    // segment already consumed (never reused upstream).
+                    None => true,
+                    Some(local) => active.live_docs.contains(local),
+                };
+                if is_duplicate || !seen.insert(doc_id) {
                     return Err(DocumentIndexError::DuplicateDocId { doc_id });
                 }
 
@@ -871,30 +1084,31 @@ impl DocumentIndex {
     ///
     /// À n'utiliser QUE là où le builder n'est plus nécessaire ensuite (le
     /// cycle de refresh) — sur le chemin search, utiliser `materialize_terms()`.
+    ///
+    /// Plan segments S2 : ce scellement matérialise TOUJOURS les postings
+    /// de l'actif en place (Lot C `C2` : meme mouvement pour le builder
+    /// d'interning des sub-fields — voir `SubfieldColumn::finalize` pour
+    /// la preuve qu'il est sans danger de le vider ici, write-only,
+    /// toujours repeuple depuis zero par le prochain write via
+    /// `clear()`). Si le budget de flush est CONFIGURE
+    /// (`SURCH_FLUSH_BUDGET_BYTES`), `_refresh` referme EN PLUS la
+    /// génération courante comme un segment scellé de plus (même
+    /// mécanique que [`Self::maybe_flush_by_budget`]) — "un segment de
+    /// plus par refresh". Budget non configuré (flag de réversibilité
+    /// S1) : ce scellement reste EXACTEMENT l'ancien comportement,
+    /// remplace `segments[0]` en place, pour toujours mono-segment.
     pub fn materialize_terms_and_finalize_postings(&mut self) {
-        if self.terms_dirty {
-            let disk_enabled = self.resolved_postings_disk_enabled();
-            let builder = std::mem::replace(&mut self.postings_builder, PostingsBuilder::new());
-            let new_terms = builder.build_with_disk_flag(disk_enabled);
-            self.segment_mut().terms = new_terms;
-            self.terms_dirty = false;
-            self.terms_build_count.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.postings_builder = PostingsBuilder::new();
-        }
-        // Lot C `C2` : meme mouvement pour le builder d'interning des
-        // sub-fields — voir `SubfieldColumn::finalize` pour la preuve
-        // qu'il est sans danger de le vider ici (write-only, toujours
-        // repeuple depuis zero par le prochain write via `clear()`).
-        //
-        // Plan segments S1 : ce scellement produit LE segment unique
-        // (`segments[0]`, remplace son `terms` en place via
-        // `Arc::make_mut` — voir `Self::segment_mut`).
-        for column in self.segment_mut().subfield_values.values_mut() {
-            column.finalize();
+        self.materialize_active_segment_terms();
+        if self.resolved_flush_budget_bytes().is_some() {
+            self.start_new_active_segment_if_nonempty();
         }
     }
 
+    /// Plan segments S2: `rebuild_index()` (update/delete/`set_mapping`
+    /// on the `surch-api` side) always calls this FIRST, then repopulates
+    /// from every currently-live doc — it must always reproduce a
+    /// mono-segment index (tombstone-aware merge lands in S4), regardless
+    /// of how many segments a prior budget flush / `_refresh` had sealed.
     pub fn clear(&mut self) {
         self.postings_builder = PostingsBuilder::new();
         self.prefix_postings.clear();
@@ -904,23 +1118,48 @@ impl DocumentIndex {
         // Keep the per-index counter (an `Arc<AtomicU64>`) untouched
         // so cumulative diagnostics across rebuilds remain coherent.
         self.terms_dirty = false;
-        // Plan segments S1: reset the single sealed segment's contents
-        // in place (through `Arc::make_mut`, same no-clone guarantee as
-        // every other write path) rather than replacing `segments[0]`
-        // wholesale, so `live_docs`' bitmap keeps its allocated capacity
-        // across a `rebuild_index()` cycle exactly like before this
-        // refactor (`LiveDocsBitset::clear()` does not deallocate).
-        let segment = self.segment_mut();
-        segment.live_docs.clear();
-        segment.terms = TermDictionary::default();
-        segment.field_stats.clear();
-        segment.subfield_values.clear();
+        self.next_doc_id_hint = 0;
+        if self.segments.len() == 1 {
+            // S1 fast path (also the ONLY path when budget flush is
+            // unset): reset the single sealed segment's contents in
+            // place (through `Arc::make_mut`, same no-clone guarantee as
+            // every other write path) rather than replacing `segments[0]`
+            // wholesale, so `live_docs`' bitmap keeps its allocated
+            // capacity across a `rebuild_index()` cycle exactly like
+            // before this refactor (`LiveDocsBitset::clear()` does not
+            // deallocate). `doc_base` is reset to `0` — bit-identical to
+            // S1, where it is implicitly always `0`.
+            let segment = self.segment_mut();
+            segment.live_docs.clear();
+            segment.terms = TermDictionary::default();
+            segment.field_stats.clear();
+            segment.subfield_values.clear();
+            segment.doc_base = 0;
+            segment.doc_count = 0;
+        } else {
+            // S2: coming back from a genuinely multi-segment state (a
+            // budget flush had fired before this rebuild). Collapse to a
+            // single fresh segment — `rebuild_index()` always reproduces
+            // a mono-segment index. Loses the `live_docs` capacity-reuse
+            // micro-optimisation above, which only matters on the
+            // already-rare update/delete/set_mapping path, not the bulk
+            // hot path this feature targets.
+            self.segments = vec![Arc::new(Segment::default())];
+        }
     }
 
+    /// Plan segments S2: GLOBAL live doc_ids across every sealed segment.
+    /// `live_docs` is indexed LOCALLY per segment (see [`Segment`]'s doc),
+    /// so each segment's local ids are offset back by its own `doc_base`
+    /// before being collected — a no-op offset (`+ 0`) when there is only
+    /// one segment, i.e. bit-identical to S1.
     pub fn doc_ids(&self) -> Vec<u32> {
         self.segments
             .iter()
-            .flat_map(|segment| segment.live_docs.iter())
+            .flat_map(|segment| {
+                let doc_base = segment.doc_base;
+                segment.live_docs.iter().map(move |local| local + doc_base)
+            })
             .collect()
     }
 
@@ -933,25 +1172,31 @@ impl DocumentIndex {
         None
     }
 
-    /// Plan segments S1: single-segment passthrough. Enumerating terms
-    /// across N real segments needs a genuine k-way-merged `TermsEnum`
-    /// (streaming FST merge, S3) — out of scope while `segments.len()`
-    /// is asserted to be 1, so this borrows straight from the one
-    /// sealed segment, exactly as it did before `Segment` existed.
+    /// Single-segment passthrough (`segments[0]`). Enumerating terms
+    /// across N real segments would need a genuine k-way-merged
+    /// `TermsEnum` (streaming FST merge, S3's tiered-merge territory) —
+    /// out of scope here: this method is only ever used by this crate's
+    /// own single-segment tests/admin tooling (grep-audited), never by
+    /// any `surch-api` read path, so it is left untouched.
     pub fn terms(&self, field: &str) -> TermsEnum {
         self.segment().terms.terms(field)
     }
 
-    /// Plan segments S1: single-segment passthrough — see [`Self::terms`]'s
-    /// doc for why a real cross-segment merge is deferred to S2+.
+    /// Single-segment passthrough (`segments[0]`). Plan segments S2: every
+    /// `surch-api::state` call site is gated behind
+    /// [`Self::postings_disk_backed`] returning `false`, which (per that
+    /// method's doc) is only possible when `segment_count() == 1` — so
+    /// this is never reached in a genuinely multi-segment index; left
+    /// unchanged (no extra allocation on the RAM hot path).
     pub fn postings(&self, field: &str, term: &str) -> Option<PostingsEnum<'_>> {
         self.segment().terms.postings(field, term)
     }
 
     /// Returns the pre-computed per-block stats for `(field, term)`,
     /// aligned with [`postings`] chunks of 128 entries. See
-    /// [`crate::postings::BlockMeta`] for the schema. Plan segments S1:
-    /// single-segment passthrough, see [`Self::terms`]'s doc.
+    /// [`crate::postings::BlockMeta`] for the schema. Single-segment
+    /// passthrough, see [`Self::postings`]'s doc for why this is safe
+    /// unchanged under S2.
     pub fn block_metas(&self, field: &str, term: &str) -> Option<&[BlockMeta]> {
         self.segment().terms.block_metas(field, term)
     }
@@ -959,8 +1204,10 @@ impl DocumentIndex {
     /// Runtime view that ties a term's postings to its FoR-aligned block
     /// metadata in a single lookup. The search scoring path prefers this
     /// over separate [`postings`]/[`block_metas`] calls so it can borrow
-    /// both zero-copy from the live term dictionary. Plan segments S1:
-    /// single-segment passthrough, see [`Self::terms`]'s doc.
+    /// both zero-copy from the live term dictionary. Single-segment
+    /// passthrough, see [`Self::postings`]'s doc for why this is safe
+    /// unchanged under S2 (every call site is gated behind
+    /// `!postings_disk_backed()`, itself gated on `segment_count() == 1`).
     pub fn postings_with_block_metas(&self, field: &str, term: &str) -> Option<PostingsList<'_>> {
         self.segment().terms.postings_with_block_metas(field, term)
     }
@@ -972,19 +1219,36 @@ impl DocumentIndex {
     /// on this — not on the process-wide
     /// [`crate::postings::postings_disk_enabled`] flag — so a query
     /// always agrees with what the dictionary it is about to read
-    /// actually contains. Plan segments S1: single-segment passthrough
-    /// (every segment shares the same disk/RAM layout decision until S2
-    /// makes per-segment flush possible).
+    /// actually contains.
+    ///
+    /// Plan segments S2: `true` whenever there is more than one segment,
+    /// REGARDLESS of any individual segment's own RAM/disk layout — this
+    /// is the single switch every `surch-api::state` call site already
+    /// branches on to pick its "owned, correct-first" fallback
+    /// ([`Self::decode_from_segment`]/`disk_cursor`-based) over the
+    /// zero-copy RAM path, so reusing it also routes multi-segment
+    /// queries through that same owned/merged fallback with ZERO changes
+    /// to those call sites — see the design's S2 read-path note. With
+    /// exactly one segment (the S1 case, forever true while
+    /// `SURCH_FLUSH_BUDGET_BYTES` is unset) this reduces to that
+    /// segment's own flag, bit-identical to before this refactor.
     pub fn postings_disk_backed(&self) -> bool {
-        self.segment().terms.disk_backed()
+        self.segments.len() > 1 || self.segment().terms.disk_backed()
     }
 
     /// Lot C `C1b` sous-pas 2: block-addressed disk cursor over
     /// `(field, term)`'s postings — the production read path for the
     /// conjunction/leapfrog functions in `surch-api::state` when
     /// [`Self::postings_disk_backed`] is `true`. See
-    /// [`crate::postings::TermDictionary::disk_cursor`]. Plan segments
-    /// S1: single-segment passthrough, see [`Self::terms`]'s doc.
+    /// [`crate::postings::TermDictionary::disk_cursor`].
+    ///
+    /// Plan segments S2: `segments[0]` passthrough, still valid — a
+    /// `DiskPostingsCursor` streams ONE segment, and both call sites
+    /// (`conjunction_hits_disk`, `fused_conjunction_scores_disk` in
+    /// `surch-api::state`) explicitly route the `segment_count() > 1`
+    /// case to their `*_merged` counterparts BEFORE ever building a
+    /// cursor, so this is only reached when `segments[0]` is the only
+    /// segment.
     pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
         self.segment().terms.disk_cursor(field, term)
     }
@@ -996,9 +1260,44 @@ impl DocumentIndex {
     /// collect into an owned structure (`match_hits_internal`,
     /// `conjunction_of_matches`) when [`Self::postings_disk_backed`] is
     /// `true`. See [`crate::postings::TermDictionary::decode_from_segment`].
-    /// Plan segments S1: single-segment passthrough, see [`Self::terms`]'s doc.
+    ///
+    /// Plan segments S2: with exactly one segment this is the unchanged
+    /// S1 passthrough (no extra allocation, pure disk read — the C1b
+    /// contract). With more than one, this MERGES every segment's own
+    /// postings (concatenated in ascending `doc_base` order — each
+    /// segment's postings only ever cover its own contiguous doc_id
+    /// range, so the concatenation is already globally doc_id-ascending,
+    /// no re-sort needed). Per segment the source is picked by ITS OWN
+    /// layout: a RAM-backed segment is read from its resident
+    /// `doc_ids_flat`/`freqs_flat` channels (authoritative — cannot have
+    /// lost coverage), a disk-backed one from its persisted segment via
+    /// `TermDictionary::decode_from_segment`. Deliberately NOT the
+    /// SHADOW disk copy for a RAM segment: shadow writes are best-effort
+    /// (an I/O failure leaves sentinel `(0, 0)` descriptors without ever
+    /// being a correctness problem for the RAM engine), so relying on
+    /// them here could silently drop a term's postings. Returns `None`
+    /// only when NO segment has any postings for `(field, term)`.
     pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
-        self.segment().terms.decode_from_segment(field, term)
+        if self.segments.len() == 1 {
+            return self.segment().terms.decode_from_segment(field, term);
+        }
+        let mut doc_ids = Vec::new();
+        let mut freqs = Vec::new();
+        let mut any = false;
+        for segment in &self.segments {
+            if segment.terms.disk_backed() {
+                if let Some((ids, fr)) = segment.terms.decode_from_segment(field, term) {
+                    any = true;
+                    doc_ids.extend(ids);
+                    freqs.extend(fr);
+                }
+            } else if let Some(list) = segment.terms.postings_with_block_metas(field, term) {
+                any = true;
+                doc_ids.extend_from_slice(list.doc_ids());
+                freqs.extend_from_slice(list.freqs());
+            }
+        }
+        any.then_some((doc_ids, freqs))
     }
 
     /// Lot C `C1b` sous-pas 2: per-index override for the disk-backed
@@ -1023,11 +1322,14 @@ impl DocumentIndex {
             .unwrap_or_else(postings_disk_enabled)
     }
 
-    /// Plan segments S1: single-segment passthrough — see [`Self::terms`]'s
-    /// doc. The BM25-facing aggregate (`Σ doc_count` /
-    /// `Σ total_terms / Σ doc_count`) lives on [`Self::field_stats_aggregated`];
-    /// this accessor stays for the zero-copy `doc_len_dense` borrow that
-    /// only makes sense scoped to one segment (S1: the only one).
+    /// `segments[0]`'s own stats. The BM25-facing aggregate (`Σ
+    /// doc_count` / `Σ total_terms / Σ doc_count`) lives on
+    /// [`Self::field_stats_aggregated`]; this accessor stays for the
+    /// zero-copy `doc_len_dense` borrow, valid when the caller has
+    /// established `segment_count() == 1` (see
+    /// `surch-api::AppState::field_scoring_stats`'s fast path) —
+    /// [`Self::field_stats_segments`] is the genuine multi-segment
+    /// counterpart.
     pub fn field_stats(&self, field: &str) -> Option<&FieldLengthStats> {
         self.segment().field_stats.get(field)
     }
@@ -1070,14 +1372,45 @@ impl DocumentIndex {
         })
     }
 
-    /// Returns the in-memory `field -> FieldLengthStats` map. Used by the
-    /// memory accounting helper (`crate::memory`) to size the BM25 norms
-    /// payload without exposing the underlying `BTreeMap` everywhere.
-    /// Plan segments S1: single-segment passthrough, see [`Self::terms`]'s
-    /// doc — a genuine per-field merge across segments would need an
-    /// owned map, out of scope for a `&BTreeMap` accessor.
+    /// Plan segments S2: `(doc_base, FieldLengthStats)` pairs for `field`,
+    /// one per sealed segment that recorded any stats for it, in
+    /// ascending `doc_base` order. Used by
+    /// `surch-api::AppState::field_scoring_stats` to resolve
+    /// `doc_len(global_doc_id)` through the right segment
+    /// (`partition_point` over `doc_base`) once `segment_count() > 1` —
+    /// the `segment_count() == 1` fast path there uses
+    /// [`Self::field_stats`] directly instead (zero-copy, no `Vec`
+    /// allocation), so this is only ever called in the genuinely
+    /// multi-segment case.
+    pub fn field_stats_segments(&self, field: &str) -> Vec<(u32, &FieldLengthStats)> {
+        self.segments
+            .iter()
+            .filter_map(|segment| {
+                segment
+                    .field_stats
+                    .get(field)
+                    .map(|stats| (segment.doc_base, stats))
+            })
+            .collect()
+    }
+
+    /// Returns the in-memory `field -> FieldLengthStats` map for
+    /// `segments[0]`. Plan segments S2: kept for the existing
+    /// single-segment callers/tests; [`Self::field_stats_maps`] is the
+    /// genuine multi-segment counterpart (used by the memory accounting
+    /// walker in `crate::memory`, which must reach every segment's own
+    /// map, not just one).
     pub fn field_stats_map(&self) -> &BTreeMap<String, FieldLengthStats> {
         &self.segment().field_stats
+    }
+
+    /// Plan segments S2: the `field -> FieldLengthStats` map of EVERY
+    /// sealed segment, for `crate::memory`'s byte-accounting walker to
+    /// sum over the whole index instead of just `segments[0]`. With
+    /// exactly one segment this yields the same single map
+    /// [`Self::field_stats_map`] does, wrapped in a one-element `Vec`.
+    pub fn field_stats_maps(&self) -> Vec<&BTreeMap<String, FieldLengthStats>> {
+        self.segments.iter().map(|s| &s.field_stats).collect()
     }
 
     /// Returns the names of every field that currently has indexed
@@ -1249,8 +1582,21 @@ impl DocumentIndex {
     /// ends before the next `self.prefix_postings`/`self.postings_builder`
     /// statement — same field-mutation order as before this refactor, so
     /// the merged state is identical.
+    ///
+    /// Plan segments S2: `postings_builder`/`prefix_postings` keep the
+    /// GLOBAL `doc_id` unchanged (postings never need a remap — see the
+    /// design note on [`Segment`]). The active segment's own eager
+    /// columns (`subfield_values`, `field_stats`, `live_docs`) are
+    /// indexed by the LOCAL id (`doc_id - active.doc_base`) instead —
+    /// with budget flush unset the active segment's `doc_base` is always
+    /// `0`, so `local_doc_id == doc_id` and every write below is
+    /// byte-for-byte the S1 behaviour.
     fn merge_analyzed(&mut self, document: AnalyzedDocument) -> Result<()> {
         let doc_id = document.doc_id;
+        let local_doc_id = doc_id.checked_sub(self.active_segment().doc_base).expect(
+            "doc_id must be >= the active segment's doc_base (monotonic, \
+                 non-reused doc_id invariant)",
+        );
         {
             let segment = self.segment_mut();
             for (path, stored) in document.subfield_values {
@@ -1258,7 +1604,7 @@ impl DocumentIndex {
                     .subfield_values
                     .entry(path)
                     .or_default()
-                    .set(doc_id, stored);
+                    .set(local_doc_id, stored);
             }
         }
         for (field, prefix) in document.prefixes {
@@ -1279,10 +1625,11 @@ impl DocumentIndex {
                     .field_stats
                     .entry(field)
                     .or_default()
-                    .record_doc_len(doc_id, doc_len, norms_enabled);
+                    .record_doc_len(local_doc_id, doc_len, norms_enabled);
             }
-            segment.live_docs.insert(doc_id);
+            segment.live_docs.insert(local_doc_id);
         }
+        self.next_doc_id_hint = self.next_doc_id_hint.max(doc_id.saturating_add(1));
         Ok(())
     }
 
@@ -1293,12 +1640,26 @@ impl DocumentIndex {
     /// doc, with the sub-field's analyzer/normalizer already applied. The
     /// query side uses this for `sort`/`agg`/`composite` on `.raw`/`.norm`
     /// without re-normalizing the parent's `_source` on read. Returns `None`
-    /// for top-level fields and for docs missing the sub-field value. Plan
-    /// segments S1: single-segment passthrough — `doc_id` stays a global
-    /// id resolved directly in the one sealed segment (S1 does not touch
-    /// doc_id semantics at all, see the design's S1 scope).
+    /// for top-level fields and for docs missing the sub-field value.
+    ///
+    /// Plan segments S2: `doc_id` is a GLOBAL id; `SubfieldColumn` is
+    /// indexed LOCALLY per segment (see [`Segment`]'s doc), so this
+    /// resolves the owning segment via `partition_point` over `doc_base`
+    /// (segments are always kept in ascending `doc_base` order) before
+    /// indexing locally. With exactly one segment `doc_base` is always
+    /// `0`, so the fast path below is the exact pre-S2 global lookup,
+    /// unchanged.
     pub fn subfield_value(&self, field_path: &str, doc_id: u32) -> Option<&str> {
-        self.segment().subfield_values.get(field_path)?.get(doc_id)
+        if self.segments.len() == 1 {
+            return self.segment().subfield_values.get(field_path)?.get(doc_id);
+        }
+        let idx = self.segments.partition_point(|s| s.doc_base <= doc_id);
+        if idx == 0 {
+            return None;
+        }
+        let segment = &self.segments[idx - 1];
+        let local = doc_id - segment.doc_base;
+        segment.subfield_values.get(field_path)?.get(local)
     }
 
     /// A10 (Phase 4): whether `field_path` carries write-time fanned-out
@@ -1312,14 +1673,31 @@ impl DocumentIndex {
             .any(|segment| segment.subfield_values.contains_key(field_path))
     }
 
-    /// A10 (Phase 4): the full per-doc stored sub-field projection map.
-    /// Empty when no field in the mapping declared sub-fields. Exposed for
-    /// memory accounting and for the query side to enumerate projections.
-    /// Plan segments S1: single-segment passthrough, see [`Self::terms`]'s
-    /// doc — a genuine per-path merge across segments would need an owned
-    /// map, out of scope for a `&BTreeMap` accessor.
+    /// A10 (Phase 4): the per-doc stored sub-field projection map of
+    /// `segments[0]`. Plan segments S2: kept for the existing
+    /// single-segment callers/tests; [`Self::subfield_values_maps`] is the
+    /// genuine multi-segment counterpart.
     pub fn subfield_values_map(&self) -> &BTreeMap<String, SubfieldColumn> {
         &self.segment().subfield_values
+    }
+
+    /// Plan segments S2: `(doc_base, subfield_values)` pairs across every
+    /// sealed segment, in ascending `doc_base` order. Used by the memory
+    /// accounting walker (`crate::memory::subfield_values_bytes`, which
+    /// only needs the byte totals, `doc_base` unused there) and by
+    /// `surch-api::AppState::subfield_projection` (sort/agg on a
+    /// `.raw`/`.norm` sub-field), which DOES need `doc_base`:
+    /// `SubfieldColumn::iter()`'s yielded `doc_id`s are LOCAL to their
+    /// owning segment (see [`Segment`]'s doc), so a caller resolving a
+    /// GLOBAL doc_id (e.g. `uid_for_doc_id`) must add the segment's own
+    /// `doc_base` back. With exactly one segment this yields the same
+    /// single map [`Self::subfield_values_map`] does (with `doc_base ==
+    /// 0`), wrapped in a one-element `Vec`.
+    pub fn subfield_values_maps(&self) -> Vec<(u32, &BTreeMap<String, SubfieldColumn>)> {
+        self.segments
+            .iter()
+            .map(|s| (s.doc_base, &s.subfield_values))
+            .collect()
     }
 }
 
@@ -1861,5 +2239,236 @@ mod tests {
         assert_eq!(index.live_doc_count(), 0);
         assert!(index.field_stats("name").is_none());
         assert!(index.field_stats_aggregated("name").is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Plan segments S2: budget-triggered flush → real multi-segment.
+    // ---------------------------------------------------------------------
+
+    /// Multi-segment fixture: NOM multi-field mapping (so sub-field
+    /// columns cross a segment boundary too), a per-doc unique NOM value
+    /// and a BODY token (`commun`) shared by every doc (so one posting
+    /// list genuinely spans segments). Budget forced to 1 byte (any
+    /// non-empty builder crosses it) and the disk-postings override
+    /// pinned OFF, so the test is deterministic regardless of the
+    /// process's `SURCH_FLUSH_BUDGET_BYTES` / `SURCH_POSTINGS_DISK` env.
+    ///
+    /// Layout produced: docs 0-1 sealed by an explicit
+    /// `maybe_flush_by_budget` (the per-chunk call site), docs 2-3 sealed
+    /// by `materialize_terms_and_finalize_postings` (the `_refresh` call
+    /// site), plus the fresh empty active segment = 3 segments.
+    fn multi_segment_index() -> (DocumentIndex, IndexMapping) {
+        let mapping = nom_multi_field_mapping();
+        let mut index = DocumentIndex::new();
+        index.set_flush_budget_bytes_override(Some(1));
+        index.set_postings_disk_enabled(false);
+
+        index
+            .add_documents_with_mapping_deferred(
+                [
+                    (0, [("NOM", "Dupont Martin"), ("BODY", "commun")]),
+                    (1, [("NOM", "Dupré"), ("BODY", "commun")]),
+                ],
+                &mapping,
+            )
+            .expect("docs 0-1");
+        index.maybe_flush_by_budget();
+        index
+            .add_documents_with_mapping_deferred(
+                [
+                    (2, [("NOM", "Bernard"), ("BODY", "commun")]),
+                    (3, [("NOM", "Petit Durand"), ("BODY", "commun")]),
+                ],
+                &mapping,
+            )
+            .expect("docs 2-3");
+        index.materialize_terms_and_finalize_postings();
+        (index, mapping)
+    }
+
+    #[test]
+    fn budget_flush_seals_real_segments_with_global_reads_intact() {
+        let (index, _mapping) = multi_segment_index();
+
+        assert_eq!(
+            index.segment_count(),
+            3,
+            "expected two sealed segments (budget flush + refresh) plus the fresh active one"
+        );
+        assert_eq!(index.segments[0].doc_base, 0);
+        assert_eq!(index.segments[0].doc_count, 2);
+        assert_eq!(index.segments[1].doc_base, 2);
+        assert_eq!(index.segments[1].doc_count, 2);
+        assert_eq!(index.segments[2].doc_base, 4, "fresh active segment");
+
+        // Global doc_id reads across segments: live docs, counts, BM25 Σ.
+        assert_eq!(index.doc_ids(), vec![0, 1, 2, 3]);
+        assert_eq!(index.live_doc_count(), 4);
+        let aggregated = index
+            .field_stats_aggregated("NOM")
+            .expect("aggregated stats for NOM across segments");
+        assert_eq!(aggregated.doc_count, 4);
+        // "Dupont Martin"(2) + "Dupré"(1) + "Bernard"(1) + "Petit Durand"(2)
+        assert_eq!(aggregated.total_terms, 6);
+        assert_eq!(aggregated.avg_doc_len(), Some(1.5));
+
+        // Multi-segment forces the owned/merged read path.
+        assert!(index.postings_disk_backed());
+        let (doc_ids, freqs) = index
+            .decode_from_segment("BODY", "commun")
+            .expect("BODY=commun spans every segment");
+        assert_eq!(doc_ids, vec![0, 1, 2, 3]);
+        assert_eq!(freqs, vec![1, 1, 1, 1]);
+        // A term entirely inside the SECOND segment resolves too (its
+        // postings keep GLOBAL doc_ids — no remap).
+        let (doc_ids, _freqs) = index
+            .decode_from_segment("NOM", "bernard")
+            .expect("NOM=bernard lives in the second sealed segment");
+        assert_eq!(doc_ids, vec![2]);
+    }
+
+    #[test]
+    fn subfields_and_doc_len_resolve_across_segment_boundaries() {
+        let (index, _mapping) = multi_segment_index();
+
+        // Sub-field columns are LOCAL per segment; the public API takes a
+        // GLOBAL doc_id and must route it through the right segment.
+        assert_eq!(index.subfield_value("NOM.raw", 0), Some("dupont martin"));
+        assert_eq!(index.subfield_value("NOM.raw", 1), Some("dupre"));
+        assert_eq!(index.subfield_value("NOM.raw", 2), Some("bernard"));
+        assert_eq!(index.subfield_value("NOM.raw", 3), Some("petit durand"));
+        assert_eq!(
+            index.subfield_value("NOM.raw", 4),
+            None,
+            "doc_id 4 was never written (empty active segment)"
+        );
+
+        // doc_len is exposed per segment with its doc_base, LOCAL indexing.
+        let per_segment = index.field_stats_segments("NOM");
+        assert_eq!(per_segment.len(), 2, "two sealed segments recorded NOM");
+        let (base0, stats0) = per_segment[0];
+        let (base1, stats1) = per_segment[1];
+        assert_eq!(base0, 0);
+        assert_eq!(base1, 2);
+        assert_eq!(stats0.doc_len(0), Some(2), "doc 0: 'Dupont Martin'");
+        assert_eq!(stats0.doc_len(1), Some(1), "doc 1: 'Dupré'");
+        assert_eq!(stats1.doc_len(0), Some(1), "doc 2 locally 0: 'Bernard'");
+        assert_eq!(
+            stats1.doc_len(1),
+            Some(2),
+            "doc 3 locally 1: 'Petit Durand'"
+        );
+        // The dense arrays are sized to their OWN segment, not the corpus
+        // (the design's "maladie B" guard).
+        assert!(stats1.doc_len_dense().len() <= 2);
+    }
+
+    #[test]
+    fn stale_doc_id_below_active_doc_base_is_rejected_as_duplicate() {
+        let (mut index, mapping) = multi_segment_index();
+        // doc_id 1 belongs to the FIRST sealed segment's range — re-adding
+        // it must be the same `DuplicateDocId` error S1 raised, never a
+        // panic in `merge_analyzed`'s local-id translation.
+        let err = index
+            .add_documents_with_mapping_deferred([(1, [("NOM", "Rejoue")])], &mapping)
+            .expect_err("re-using a sealed segment's doc_id must fail");
+        assert_eq!(err, DocumentIndexError::DuplicateDocId { doc_id: 1 });
+    }
+
+    #[test]
+    fn clear_collapses_multi_segment_back_to_one() {
+        let (mut index, mapping) = multi_segment_index();
+        assert!(index.segment_count() > 1);
+
+        index.clear();
+
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "rebuild_index()'s clear() must always reproduce a mono-segment index"
+        );
+        assert_eq!(index.live_doc_count(), 0);
+        assert_eq!(index.doc_ids(), Vec::<u32>::new());
+        // The rebuild replay starts over from doc_id 0 — accepted again.
+        index
+            .add_documents_with_mapping_deferred([(0, [("NOM", "Neuf")])], &mapping)
+            .expect("doc_id 0 must be insertable again after clear()");
+        assert_eq!(index.doc_ids(), vec![0]);
+    }
+
+    #[test]
+    fn refresh_seals_the_delta_as_one_more_segment() {
+        // Budget too high for any per-chunk flush: only the `_refresh`
+        // sealing (`materialize_terms_and_finalize_postings` with a budget
+        // CONFIGURED) creates segments.
+        let mapping = nom_multi_field_mapping();
+        let mut index = DocumentIndex::new();
+        index.set_flush_budget_bytes_override(Some(u64::MAX));
+        index.set_postings_disk_enabled(false);
+
+        index
+            .add_documents_with_mapping_deferred([(0, [("NOM", "Dupont")])], &mapping)
+            .expect("doc 0");
+        index.maybe_flush_by_budget();
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "a huge budget must not flush mid-ingestion"
+        );
+        index.materialize_terms_and_finalize_postings();
+        assert_eq!(index.segment_count(), 2, "refresh sealed generation 1");
+
+        index
+            .add_documents_with_mapping_deferred([(1, [("NOM", "Dupré")])], &mapping)
+            .expect("doc 1");
+        index.materialize_terms_and_finalize_postings();
+        assert_eq!(index.segment_count(), 3, "refresh sealed generation 2");
+
+        // A refresh with NOTHING written in between must not push a
+        // useless empty segment.
+        index.materialize_terms_and_finalize_postings();
+        assert_eq!(index.segment_count(), 3, "empty delta seals nothing");
+
+        assert_eq!(index.doc_ids(), vec![0, 1]);
+        assert_eq!(index.subfield_value("NOM.raw", 0), Some("dupont"));
+        assert_eq!(index.subfield_value("NOM.raw", 1), Some("dupre"));
+    }
+
+    #[test]
+    fn budget_forced_off_stays_mono_segment_regardless_of_env() {
+        let mapping = nom_multi_field_mapping();
+        let mut index = DocumentIndex::new();
+        // `Forced(None)`: the S1 reversibility contract, pinned so this
+        // test stays green even under `SURCH_FLUSH_BUDGET_BYTES=... cargo test`.
+        index.set_flush_budget_bytes_override(None);
+        // Pinned OFF for the same determinism reason (`SURCH_POSTINGS_DISK`),
+        // so the `postings_disk_backed()` assertion below is unambiguous.
+        index.set_postings_disk_enabled(false);
+
+        index
+            .add_documents_with_mapping_deferred(
+                [(0, [("NOM", "Dupont")]), (1, [("NOM", "Dupré")])],
+                &mapping,
+            )
+            .expect("docs 0-1");
+        index.maybe_flush_by_budget();
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "budget off: maybe_flush_by_budget must be a strict no-op"
+        );
+        index.materialize_terms_and_finalize_postings();
+
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "budget off must keep the historical mono-segment layout forever \
+             (refresh replaces segments[0] in place, never appends)"
+        );
+        assert_eq!(index.segments[0].doc_base, 0);
+        assert!(!index.postings_disk_backed());
+        assert_eq!(index.doc_ids(), vec![0, 1]);
+        assert_eq!(index.subfield_value("NOM.raw", 0), Some("dupont"));
+        assert_eq!(index.subfield_value("NOM.raw", 1), Some("dupre"));
     }
 }
