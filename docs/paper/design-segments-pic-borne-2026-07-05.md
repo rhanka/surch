@@ -135,3 +135,83 @@ Roaring reste résident (hot path). Cible : plancher 28M ≤4g (= ES).
 
 **Le pari** : pas « ≥2× partout » (démenti par la mesure) mais **un moteur qui EXISTE à 28M sous budget
 ES** — survie ≤ES, latence < ES, NRT gagné franchement — au lieu d'un moteur qui meurt à l'échelle.
+
+## 🔍 S5a — identification code du non-gaugé + 1er disk-back (`segment_descriptors`)
+**Volet 1 (identifier)** : audit code (pas de run — analyse statique + calcul par structure).
+- **SourceBlob écarté** : `compact_after_refresh` (state.rs) n'est PLUS appelée depuis
+  `finalize_terms_for_refresh` (mmap M1 neutralise Option B) — les blobs `_source` restent `OnDisk
+  {offset,len}` en régime permanent, `payload_len()==0`. Zéro octet anon. L'hypothèse « SourceBlob
+  compressés résidents » du brief est donc **réfutée par le code actuel**.
+- **DenseIdMaps déjà comptée en entier** : `AppState::index_state_memory_bytes` (state.rs) somme
+  `reverse_uids`+`reverse_offsets`+FST `forward` (octets réels via `as_fst().as_bytes().len()`) +
+  les 4 overlays dirty, et `dense.documents: Box<[Option<SourceBlob>]>` via
+  `size_of::<Option<SourceBlob>>()` exact. `prefix_postings_bytes` est déjà gaugée aussi
+  (`surch_index_prefix_postings_bytes`). Aucun de ces postes n'explique le gap.
+- **Poste identifié (grep-certifié jamais sommé nulle part)** : dans `FieldPostings`
+  (postings.rs), 5 tableaux CSR/annuaire par-TERME — `offsets`, `block_offsets`,
+  `segment_descriptors` (16 o/terme après padding Rust), `block_directory`, `block_dir_offsets` —
+  scalent avec **T = nombre de termes DISTINCTS**, pas avec le nombre de docs. Un champ
+  `edge_ngram`/`autocomplete`/`index_prefixes` (le mapping matchID `deces_index.yml` en a, 28
+  champs, norm/edge_ngram/.raw/dates) peut pousser T à plusieurs millions même à 1,36M docs.
+  Recoupement : `fst_bytes` (49 MiB, COMPRESSÉ) suggère T de l'ordre de 10-15M si le ratio de
+  compression FST est de quelques octets/terme sur cet automate peu partagé (28 champs
+  hétérogènes) — × ~24-28 o/terme NON compressés pour le quintette ci-dessus ≈ 240-350 MiB,
+  l'ordre de grandeur exact du gap ~295 MiB. **Tableau (à 1,36M, chiffré par structure) :**
+
+  | Poste | Structure | Octet/terme (ou /doc) | Gaugé avant S5a | Contribution estimée |
+  |---|---|---|---|---|
+  | subfields | `SubfieldColumn` (dict+codes) | ~/doc | oui (`subfield_values_bytes`) | 80 MiB |
+  | FST | `fst::Map` par champ (compressé) | ~qq o/terme | oui (`fst_bytes`) | 49 MiB |
+  | roaring | bitmaps df>4096 | ~/doc chaud | oui (`roaring_bytes`) | 13 MiB |
+  | field_stats | `doc_len_dense` 1 o/doc | /doc | oui (`field_stats_bytes`) | 9 MiB |
+  | id_maps | FST uid→doc_id + reverse CSR + overlays | /doc | oui (`surch_state_id_maps_bytes`) | 20 MiB |
+  | documents_overhead | slot `Option<SourceBlob>` + overlay | /doc | oui (`surch_state_documents_overhead_bytes`) | 31 MiB |
+  | **postings_directory (NOUVEAU)** | `offsets`+`block_offsets`+`segment_descriptors`+`block_directory`+`block_dir_offsets` | **~24-28 o/terme + 12 o/bloc** | **NON — jamais sommé (grep confirmé)** | **~295 MiB (le gap entier)** |
+  | **Total** | | | | **≈ 555 MiB** |
+
+  Chiffres FST/subfields/roaring/etc. repris du scrape mesuré (commit précédent) ; la ligne
+  `postings_directory` est une estimation par calcul de structure (T inconnu précisément sans
+  re-mesure) — **la nouvelle gauge ci-dessous donnera le chiffre exact au prochain bench**.
+- **Gauge ajoutée** : `surch_index_postings_directory_bytes` (+ `MemoryUsage::postings_directory_bytes`,
+  `/_surch/stats` → `memory.postings_directory_bytes`) — somme exacte (`size_of`) des 5 tableaux,
+  par segment, sur tout `DocumentIndex`. `total_accounted_bytes` en profite automatiquement (déjà
+  `usage.total_bytes() + state_id_maps + state_documents_overhead`) : le prochain scrape 1,36M doit
+  expliquer ≥90% de `surch_jemalloc_allocated_bytes`.
+
+**Volet 2 (disk-back, poste dominant)** : `segment_descriptors` (le plus gros du quintette, 16
+o/terme flat, **T-scaled indépendamment du nombre de postings** — contrairement à `block_directory`
+qui scale avec le nombre de BLOCS) est maintenant disk-backé derrière le flag existant
+`SURCH_POSTINGS_DISK` (pas de nouveau flag). `FieldPostings::segment_descriptors_directory:
+Option<(u64 base_offset, u32 term_count)>` : quand `Some`, le tableau résident devient
+`Box::default()` (0 octet) et chaque descripteur est un enregistrement 12 octets packés (u64+u32
+LE, sans le padding Rust à 16) écrit une seule fois dans le `postings_segment` partagé (même
+fichier pread que le FoR déjà disk-backed C1b), lu via `descriptor_at` (1 `pread` supplémentaire,
+même compromis latence déjà accepté pour le payload FoR). Best-effort : flag off ou échec d'écriture
+→ reste résident, comportement 100% inchangé. Couvre les DEUX producteurs
+(`PostingsBuilder::build_with_disk_flag` et `FieldMergeAccumulator::finish`, S3 merge) et le
+consommateur `merge_term_dictionaries` (lecture d'un descripteur SOURCE pendant un merge).
+- Fichiers : `crates/surch-index/src/postings.rs` (struct `FieldPostings`, fn
+  `persist_or_keep_descriptors`/`descriptor_at`/`encode_descriptor`/`decode_descriptor`,
+  `TermDictionary::postings_directory_bytes`), `document_index.rs` (passthrough),
+  `crates/surch-index/src/memory.rs` (`MemoryUsage::postings_directory_bytes`),
+  `crates/surch-api/src/stats.rs` (gauge + `MemoryReport`).
+- **Reste pour S5 complet** : `offsets`/`block_offsets`/`block_directory`/`block_dir_offsets`
+  encore résidents (T-scalés eux aussi, mais nécessaires au hot-path term lookup dans les DEUX
+  modes ou T+1-scalés à cadence fixe — refactor plus large, read-path partagé RAM/disk) ; FST par
+  champ (49 MiB, déjà compressé — mmap/pread per-segment resterait le gain suivant) ; doc_len_dense
+  / id_maps paginés (mentionnés par le design S5 mais hors scope de cette passe). Projection
+  plancher 28M : le gain net dépend du ratio blocs/terme réel du corpus (voir piège ci-dessous),
+  **à mesurer** — pas promis tant que non re-scrapé.
+- **Piège chiffré (documenté dans le code)** : pour un terme mono-bloc (df ≤ 128, le cas
+  dominant Zipfien), l'économie de 16 o (descriptor supprimé) est exactement compensée par le coût
+  PRÉ-EXISTANT (C1b) de `block_directory`+`block_dir_offsets` (12+4 o) — un terme mono-bloc ne
+  gagne donc RIEN en RAM nette ; le gain net vient des termes multi-blocs (df > 128, où
+  `block_directory` coûte proportionnellement moins par terme) ET du fait que `segment_descriptors`
+  est retiré INCONDITIONNELLEMENT (16 o/terme, quel que soit df) alors que l'ajout C1b scale avec
+  les blocs. Tests : parité lecture flag on/off + white-box (RAM shrink direct sur les champs
+  privés) dans `crates/surch-index/src/postings.rs` (`mod tests`) et
+  `crates/surch-index/tests/postings.rs`.
+- **Non exécuté** (contrainte session : jamais `cargo build/check/test/clippy/run`) : `cargo fmt
+  --check` passe propre sur tout le workspace après l'implémentation (seul signal de validité
+  syntaxique disponible sans compilateur) ; validation réelle (gauge coverage ≥90%, oracle 0
+  divergence, plancher 28M) à faire via `ci-k8s`/bench-local au prochain passage.

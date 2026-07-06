@@ -1665,6 +1665,19 @@ impl DocumentIndex {
             .sum()
     }
 
+    /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
+    /// §"Dimensionnement S5"): per-term CSR/directory metadata bytes
+    /// (`offsets`, `block_offsets`, `segment_descriptors`, `block_directory`,
+    /// `block_dir_offsets`) that no other gauge counted before this — see
+    /// [`crate::postings::TermDictionary::postings_directory_bytes`] for
+    /// the full rationale. Summed over every sealed segment.
+    pub fn postings_directory_bytes(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.terms.postings_directory_bytes())
+            .sum()
+    }
+
     /// #17c memory accounting: Vec capacity slack across every term's
     /// `Vec<Posting>` and `Vec<u32>` channels. Surfaces the bytes
     /// allocated-but-unused after the FST build — typically up to ~50 %
