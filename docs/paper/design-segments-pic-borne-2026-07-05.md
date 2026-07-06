@@ -92,6 +92,15 @@ indexées par `doc_id − doc_base` (compatible : plages contiguës).
   doc_base + FoR page-cache évictable font mieux que prévu. Sweep plancher 28M (8g/4g) pour le verdict
   mémoire-constante complet ; S5 reste pertinent pour viser ≤4g (plancher ES).
 
+## 📐 Dimensionnement S5 (ventilation mesurée 1,36M segments+merge @1536m, /_prometheus_metrics)
+Plancher 28M mesuré : **@8g OOM à 21,9M docs (75%), @4g à 8,7M (30%)** → plancher Surch 28M = ]8g,16g]
+vs ES ≤4g. Résiduel anon ~0,4 KB/doc. Ventilation à 1,36M : jemalloc allocated **555 MiB** = subfields 80
++ postings résiduel (directory/CSR/descriptors) 57 + FST 49 + roaring 13 + field_stats 9 + gauges état
+(id_maps 20 + documents_overhead 31) + **~295 MiB NON GAUGÉS** (DenseIdMaps réelles, SourceBlob handles,
+overlays, frag) — LE plus gros poste, ×21 ≈ ~6 GiB à 28M. Ordre S5 : (a) gauger/identifier le non-compté,
+(b) disk-back par taille : le non-gaugé dominant + subfields + directory/CSR + FST (mmap/pread per-segment).
+Roaring reste résident (hot path). Cible : plancher 28M ≤4g (= ES).
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
