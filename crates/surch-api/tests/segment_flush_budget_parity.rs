@@ -79,6 +79,11 @@ async fn build_index(index: &str, forced_budget_bytes: Option<u64>) -> (axum::Ro
     let app_state = AppState::default();
     app_state.create_index(index, None, serde_json::json!({}), Default::default());
     app_state.set_flush_budget_bytes_override(index, forced_budget_bytes);
+    // Plan segments S3: merge pinned OFF — this test is the S2 gate (raw
+    // un-merged multi-segment vs mono parity) and must stay deterministic
+    // under any ambient `SURCH_MERGE_FANIN`; the merge-enabled counterpart
+    // lives in `segment_merge_parity.rs`.
+    app_state.set_merge_fanin_override(index, 0);
 
     let router = app_router_with_state(AppRouterState {
         app: app_state.clone(),
