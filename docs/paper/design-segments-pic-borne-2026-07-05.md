@@ -69,6 +69,15 @@ indexées par `doc_id − doc_base` (compatible : plages contiguës).
 - **C7 — contrat update change en S4** : update = tombstone + NOUVEL id (jamais-réutilisé) → à ~25k
   updates/s soutenu, u32 épuisé en ~2 jours → la compaction d'époque n'est pas cosmétique.
 
+## ✅ S2 MERGÉ + GATE DÉCISIF PASS (2026-07-06, sha 76674ed) — LA MALADIE A EST CASSÉE
+- CI verte (dont test intégration parité multi==mono, scores BM25 identiques sur 7 requêtes).
+- Oracle-local **0 divergence en multi-segment forcé** (budget 4 MiB / 10k docs).
+- **Gate décisif : 1,36M docs riches @1536m avec budget 256M — SURVIT** (pré-S2 : OOM à 1536m ET 2g,
+  plancher 3g) : count complet, **RSS 618 MiB**, 24 733 doc/s (≈ pré-S2), latence 0,36/0,50/0,78 ms
+  (multi-segment ≈ mono). À mémoire constante 1536m : ES = 18 486 doc/s, RSS 1341 MiB, lat 1,64/2,92/3,46
+  → **Surch y bat ES sur RAM (0,46×), débit (1,34×) et latence (~4-5×)**, disque 1,12× pire.
+- Le plancher surch à 1,36M passe de 3g à ≤1536m (nouveau plancher à mesurer : 1g ? 768m ?).
+
 ## 📋 ORDRE AMENDÉ (Fable) : S3 → S3.5 → S5 → S4 → S6
 - **S3** : merge tiered inline sur runs adjacents (copie verbatim + fixup varint). Sans merge, 28M à
   budget 256 MiB = 100+ segments → fan-out FST × S tue la latence.
