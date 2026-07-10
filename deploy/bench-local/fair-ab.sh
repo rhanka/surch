@@ -29,7 +29,10 @@ MEM_LIMIT="${MEM_LIMIT:-2g}"           # cap cgroup identique aux deux
 CORPUS_LINES="${CORPUS_LINES:-100000}" # nb de docs indexés (head du fichier INSEE)
 DATA_FILE="${DATA_FILE:-$HOME/Téléchargements/deces-2025.txt}"
 ES_IMAGE="${ES_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:8.6.1}"
-SURCH_IMAGE="${SURCH_IMAGE:-ghcr.io/rhanka/surch:sha-69668db407fe49631b44e6f2e5ea0afafd968caa}"
+# Défaut = image du run "28M@4g PASS" (commit ea86930, doc-only ; code = b795b10) : la précédente
+# (sha-69668db4..., commit [ci-k8s] antérieur à [segments S3] ac3f12a) est stale et n'expose PAS
+# encore la gauge surch_index_segment_count -> segment_count/2a resterait toujours null avec elle.
+SURCH_IMAGE="${SURCH_IMAGE:-ghcr.io/rhanka/surch:sha-b795b100682afcfa65ab7db14f36d543cf039b38}"
 POSTINGS_DISK="${POSTINGS_DISK:-1}"    # Surch : 1 = read-path disque (C1b)
 OUT_DIR="${OUT_DIR:-/tmp/fair-ab-$(printf '%s' "$MEM_LIMIT")}"
 PROBE_REQUESTS="${PROBE_REQUESTS:-1000}"
