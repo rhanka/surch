@@ -34,6 +34,21 @@ POSTINGS_DISK="${POSTINGS_DISK:-1}"    # Surch : 1 = read-path disque (C1b)
 OUT_DIR="${OUT_DIR:-/tmp/fair-ab-$(printf '%s' "$MEM_LIMIT")}"
 PROBE_REQUESTS="${PROBE_REQUESTS:-1000}"
 REFRESH_EACH="${REFRESH_EACH:-0}"   # 1 = refresh après chaque chunk (counts corrects ; Surch perd sinon ~1 chunk sous bulk rapide)
+# ---- sonde random / cold (front #1 "latence honnête", brainstorm-4-fronts-2026-07-09.md b1) ----
+PROBE_NAMES_N="${PROBE_NAMES_N:-10000}"          # 1a : taille de l'échantillon probe_names.tsv
+# PROBE_FIELD_NOM/PROBE_FIELD_PRENOMS : clés JSON à extraire des docs $BULK pour peupler la
+# sonde random ET pour construire ses requêtes (mêmes clés = c'est le champ ES réellement mappé).
+# Défaut = schéma du builder awk interne ("nom"/"prenoms"). Pour un BULK_FILE au schéma matchID
+# réel (ex. deces-1.36M.ndjson / deces-28M.ndjson, mapping deces-mapping.json), passer
+# PROBE_FIELD_NOM=NOM PROBE_FIELD_PRENOMS=PRENOMS — SINON la sonde random requêterait un champ
+# absent de la mapping (0 hit garanti), exactement le défaut dont souffre déjà silencieusement la
+# sonde FIXE historique ci-dessous sur ce type de corpus (elle reste "nom" à l'identique, par
+# continuité historique — seule la sonde random doit être correcte pour être honnête).
+PROBE_FIELD_NOM="${PROBE_FIELD_NOM:-nom}"
+PROBE_FIELD_PRENOMS="${PROBE_FIELD_PRENOMS:-prenoms}"
+COLD_PROBE="${COLD_PROBE:-1}"       # 1c : 1 = tenter la sonde cold (memory.reclaim cgroup v2), 0 = off
+HOLD_SECONDS="${HOLD_SECONDS:-0}"   # après mesures, tient le conteneur N s avant teardown (permet
+                                     # à artillery-replay.sh de se brancher sur le réseau fair-ab, 1d)
 # BULK_FILE   : NDJSON pré-construit (lignes alternées action/doc) indexé TEL QUEL (bypass builder awk interne).
 # MAPPING_FILE: JSON de mapping ES appliqué à la création de l'index deces_bench (au lieu du mapping minimal en dur).
 # Non fournis => comportement inchangé (builder awk + mapping minimal).
@@ -94,6 +109,78 @@ else
 fi
 NDOCS=$(( $(wc -l < "$BULK") / 2 ))
 log "corpus prêt : $NDOCS docs ($(du -h "$BULK" | cut -f1))"
+
+# ---- 1a. probe_names.tsv : échantillon déterministe tiré du corpus $BULK ----
+# JAMAIS shuf sans graine, JAMAIS $RANDOM : échantillonnage À PAS FIXE (1 doc toutes les
+# NDOCS/PROBE_NAMES_N lignes-doc). Comme on échantillonne le corpus BRUT (pas une liste de noms
+# uniques), c'est un tirage PONDÉRÉ PAR LA FRÉQUENCE -> distribution Zipf naturelle (MARTIN sort
+# proportionnellement à sa fréquence dans le corpus) : exactement le trafic matchID réel, sans
+# inventer de distribution. Généré UNE FOIS avant la boucle ENGINES -> fichier partagé, identique
+# pour ES et surch.
+PROBE_NAMES="$OUT_DIR/probe_names.tsv"
+want_probe_n=$NDOCS; [ "$want_probe_n" -gt "$PROBE_NAMES_N" ] && want_probe_n=$PROBE_NAMES_N
+if [ ! -s "$PROBE_NAMES" ] || [ "$(wc -l < "$PROBE_NAMES")" -ne "$want_probe_n" ]; then
+  log "génération probe_names.tsv ($want_probe_n paires, pas fixe depuis \$BULK, champs $PROBE_FIELD_NOM/$PROBE_FIELD_PRENOMS)"
+  awk -v ndocs="$NDOCS" -v n="$PROBE_NAMES_N" -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" '
+    function esc(x){ gsub(/[[:cntrl:]\\"]/,"",x); return x }
+    function extract(line, key,    pat, val) {
+      pat = "\"" key "\":\"[^\"]*\""
+      if (match(line, pat)) {
+        val = substr(line, RSTART, RLENGTH)
+        sub(/^"[^"]*":"/, "", val)
+        sub(/"$/, "", val)
+        return esc(val)
+      }
+      return ""
+    }
+    BEGIN { stride = ndocs / n; if (stride < 1) stride = 1; nextd = 1; d = 0; got = 0 }
+    NR % 2 == 0 {
+      d++
+      if (got < n && d >= nextd) {
+        print extract($0, fnom) "\t" extract($0, fpre)
+        got++
+        nextd += stride
+      }
+    }
+  ' "$BULK" > "$PROBE_NAMES"
+fi
+PROBE_NAMES_COUNT=$(wc -l < "$PROBE_NAMES" 2>/dev/null); PROBE_NAMES_COUNT=${PROBE_NAMES_COUNT:-0}
+log "probe_names.tsv prêt : $PROBE_NAMES_COUNT paires nom/prenoms"
+
+# ---- 1b (préparation) : requêtes random pré-générées, IDENTIQUES pour les 2 moteurs ----
+# Séquence d'indices déterministe dans probe_names.tsv (LCG à graine fixe -> reproductible,
+# jamais $RANDOM/shuf) ; mix 50/50 match/bool décidé par la parité de l'index (même convention
+# que scripts/bench/artillery-replay.sh). size:10 OBLIGATOIRE (force le fetch _source, le poste
+# page-cache le plus gros — cf brainstorm-4-fronts-2026-07-09.md P2). Un seul fichier de bodies
+# généré ICI (pas par moteur) -> même fichier monté dans les 2 conteneurs = mêmes requêtes, même
+# ordre, par construction (pas seulement "en principe").
+PROBE_IDX="$OUT_DIR/probe_idx.txt"
+PROBE_BODIES="$OUT_DIR/probe_rand_bodies.ndjson"
+if [ "$PROBE_NAMES_COUNT" -gt 0 ] && { [ ! -s "$PROBE_BODIES" ] || [ "$(wc -l < "$PROBE_BODIES")" -ne "$PROBE_REQUESTS" ]; }; then
+  log "génération séquence random ($PROBE_REQUESTS requêtes, LCG graine fixe, fichier partagé ES/surch)"
+  awk -v n="$PROBE_REQUESTS" -v maxidx="$PROBE_NAMES_COUNT" -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" \
+      -v idxout="$PROBE_IDX" -v namesfile="$PROBE_NAMES" '
+    BEGIN {
+      while ((getline line < namesfile) > 0) { cnt++; names[cnt] = line }
+      close(namesfile)
+      seed = 42
+      for (i = 1; i <= n; i++) {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        idx = (seed % maxidx) + 1
+        print idx > idxout
+        split(names[idx], f, "\t")
+        if (idx % 2 == 0) {
+          printf "{\"query\":{\"match\":{\"%s\":\"%s\"}},\"size\":10}\n", fnom, f[1]
+        } else {
+          printf "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"%s\":\"%s\"}},{\"match\":{\"%s\":\"%s\"}}]}},\"size\":10}\n", fnom, f[1], fpre, f[2]
+        }
+      }
+      close(idxout)
+      exit
+    }
+  ' > "$PROBE_BODIES"
+fi
+log "sonde random prête : $(wc -l < "$PROBE_BODIES" 2>/dev/null || echo 0) requêtes pré-générées"
 
 docker network create "$NET" >/dev/null 2>&1 || true
 
@@ -250,8 +337,43 @@ run_engine(){
   disk=$(docker run --rm -v "fairab-vol-$ENGINE:/d" alpine:3 du -sm /d 2>/dev/null | awk '{print $1}')
   disk=${disk:-?}
 
-  # sonde latence : PROBE_REQUESTS requêtes match dans UN SEUL conteneur curl
-  # (éviter de mesurer le démarrage conteneur au lieu de la requête)
+  # ---- 2a. ventilation disque (surch uniquement) + vérif réclamation post-merge ----
+  # Familles de fichiers connues (cf crates/surch-index/postings.rs, document_index.rs,
+  # surch-api/state.rs::source_store) + comparaison au nb de segments VIVANTS déclaré par la
+  # gauge surch_index_segment_count (/_prometheus_metrics) : si files_postings_count >
+  # segment_count, un Arc<Segment> est retenu par un registre après merge/Drop -> fichier(s)
+  # orphelin(s) invisibles à un simple comptage de segments logiques. null côté ES (pas de
+  # gauge segment_count ; le disque agrégé est déjà couvert par disk_mib ci-dessus).
+  local disk_bytes_postings="null" disk_bytes_subfields="null" disk_bytes_source="null" \
+        disk_bytes_fst_merge="null" disk_bytes_other="null" files_postings_count="null" segment_count="null"
+  if [ "$ENGINE" = "surch" ]; then
+    local bp=0 bsub=0 bsrc=0 bfst=0 both=0 fpc=0 vent_listing
+    vent_listing=$(docker run --rm -v "fairab-vol-$ENGINE:/d" alpine:3 sh -c '
+      cd /d 2>/dev/null || exit 0
+      for f in *; do
+        [ -f "$f" ] || continue
+        sz=$(stat -c "%s" "$f" 2>/dev/null); sz=${sz:-0}
+        echo "$f $sz"
+      done' 2>/dev/null)
+    while IFS=' ' read -r fname fsize; do
+      [ -z "$fname" ] && continue
+      case "$fname" in
+        surch-postings-*) bp=$((bp+fsize)); fpc=$((fpc+1)) ;;
+        surch-subfields-*) bsub=$((bsub+fsize)) ;;
+        surch-source-*) bsrc=$((bsrc+fsize)) ;;
+        surch-fst-merge-*) bfst=$((bfst+fsize)) ;;
+        *) both=$((both+fsize)) ;;
+      esac
+    done <<< "$vent_listing"
+    disk_bytes_postings=$bp; disk_bytes_subfields=$bsub; disk_bytes_source=$bsrc
+    disk_bytes_fst_merge=$bfst; disk_bytes_other=$both; files_postings_count=$fpc
+    segment_count=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s "$BASE/_prometheus_metrics" 2>/dev/null | awk '/^surch_index_segment_count\{/{print $NF; exit}')
+    [ -z "$segment_count" ] && segment_count="null"
+  fi
+
+  # sonde latence FIXE (continuité historique — CONSERVÉE À L'IDENTIQUE, cf brainstorm
+  # b1/P2) : PROBE_REQUESTS requêtes match dans UN SEUL conteneur curl (éviter de mesurer le
+  # démarrage conteneur au lieu de la requête).
   local lat50 lat95 lat99
   read -r lat50 lat95 lat99 < <(docker run --rm --network "$NET" curlimages/curl:8.10.1 sh -c "
     for i in \$(seq 1 $PROBE_REQUESTS); do
@@ -261,8 +383,74 @@ run_engine(){
     done" 2>/dev/null | sort -n | awk -v n="$PROBE_REQUESTS" '{a[NR]=$1} END{printf "%.2f %.2f %.2f", a[int(n*0.5)]*1000, a[int(n*0.95)]*1000, a[int(n*0.99)]*1000}')
   lat50=${lat50:-0}; lat95=${lat95:-0}; lat99=${lat99:-0}
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99}" > "$OUT_DIR/$ENGINE.json"
-  log "$ENGINE OK : ${dps} doc/s | RSS $rss | disk ${disk}MiB | p50/95/99 ${lat50}/${lat95}/${lat99} ms"
+  # ---- 1b. sonde RANDOM warm : PROBE_BODIES pré-généré, IDENTIQUE pour les 2 moteurs ----
+  # Mix 50/50 match/bool, size:10 (fetch _source). Même mécanique que la sonde fixe (un seul
+  # conteneur curl, boucle, time_total -> seul le démarrage du CONTENEUR docker est hors mesure,
+  # comme pour la sonde fixe ; curl lui-même mesure sa propre requête via -w, pas le shell).
+  local latr50=0 latr95=0 latr99=0
+  if [ -s "$PROBE_BODIES" ]; then
+    read -r latr50 latr95 latr99 < <(docker run --rm --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
+      while IFS= read -r body; do
+        curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
+          -H 'Content-Type: application/json' -d \"\$body\"
+      done < /bodies.ndjson" 2>/dev/null | sort -n | awk -v n="$PROBE_REQUESTS" '{a[NR]=$1} END{printf "%.2f %.2f %.2f", a[int(n*0.5)]*1000, a[int(n*0.95)]*1000, a[int(n*0.99)]*1000}')
+    latr50=${latr50:-0}; latr95=${latr95:-0}; latr99=${latr99:-0}
+  fi
+
+  # ---- 1c. sonde COLD : éviction du page cache DU CONTENEUR SEUL (cgroup v2 memory.reclaim), ----
+  # puis re-sonde random IDENTIQUE. Best-effort : sudo -n d'abord (écriture root requise),
+  # sinon écriture directe (perms locales), sinon SKIP PROPRE documenté — ne casse jamais le run.
+  # memory.stat (anon vs file) est world-readable (pas besoin de root) et capturé dans tous les
+  # cas, avant et après la tentative, pour distinguer résident applicatif et cache (b1/P3).
+  local latc50=0 latc95=0 latc99=0 cold_attempted=false cold_ok=false cold_skip_reason=""
+  local mem_anon_warm="null" mem_file_warm="null" mem_anon_cold="null" mem_file_cold="null"
+  local full_id cg_scope reclaim_path stat_path
+  full_id=$(docker inspect -f '{{.Id}}' "$CID" 2>/dev/null)
+  cg_scope="/sys/fs/cgroup/system.slice/docker-${full_id}.scope"
+  reclaim_path="$cg_scope/memory.reclaim"
+  stat_path="$cg_scope/memory.stat"
+  if [ -r "$stat_path" ]; then
+    local v
+    v=$(awk '/^anon /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v" ] && mem_anon_warm="$v"
+    v=$(awk '/^file /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v" ] && mem_file_warm="$v"
+  fi
+  if [ "$COLD_PROBE" != "1" ]; then
+    cold_skip_reason="cold_probe_disabled"
+  elif [ ! -s "$PROBE_BODIES" ]; then
+    cold_skip_reason="probe_bodies_missing"
+  elif [ ! -e "$reclaim_path" ]; then
+    cold_skip_reason="cgroup_memory_reclaim_absent"
+  else
+    local mb bytes
+    mb=$(mem_to_mib "$MEM_LIMIT"); bytes=$(( mb * 1024 * 1024 * 2 ))   # agressif : 2x le cap
+    cold_attempted=true
+    if sudo -n sh -c "echo $bytes > '$reclaim_path'" >/dev/null 2>&1; then
+      cold_ok=true
+    elif echo "$bytes" > "$reclaim_path" 2>/dev/null; then
+      cold_ok=true
+    else
+      cold_skip_reason="no_write_perm_memory_reclaim"
+    fi
+  fi
+  if [ "$cold_ok" = true ]; then
+    sleep 1   # laisser le noyau appliquer le reclaim avant re-sonde
+    read -r latc50 latc95 latc99 < <(docker run --rm --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
+      while IFS= read -r body; do
+        curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
+          -H 'Content-Type: application/json' -d \"\$body\"
+      done < /bodies.ndjson" 2>/dev/null | sort -n | awk -v n="$PROBE_REQUESTS" '{a[NR]=$1} END{printf "%.2f %.2f %.2f", a[int(n*0.5)]*1000, a[int(n*0.95)]*1000, a[int(n*0.99)]*1000}')
+    latc50=${latc50:-0}; latc95=${latc95:-0}; latc99=${latc99:-0}
+  fi
+  if [ -r "$stat_path" ]; then
+    local v2
+    v2=$(awk '/^anon /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v2" ] && mem_anon_cold="$v2"
+    v2=$(awk '/^file /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v2" ] && mem_file_cold="$v2"
+  fi
+  local cold_skip_json="null"; [ -n "$cold_skip_reason" ] && cold_skip_json="\"$cold_skip_reason\""
+
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_skip_reason\":$cold_skip_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count}" > "$OUT_DIR/$ENGINE.json"
+  log "$ENGINE OK : ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe ${lat50}/${lat95}/${lat99} | rand ${latr50}/${latr95}/${latr99} | cold ${latc50}/${latc95}/${latc99} (attempted=$cold_attempted ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
+  [ "$HOLD_SECONDS" -gt 0 ] 2>/dev/null && { log "$ENGINE : HOLD_SECONDS=$HOLD_SECONDS avant teardown (brancher artillery-replay.sh sur $NET / $CID)"; sleep "$HOLD_SECONDS"; }
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
 }
 
