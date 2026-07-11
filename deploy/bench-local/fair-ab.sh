@@ -21,7 +21,9 @@ set -uo pipefail
 export LC_ALL=C   # décimales en point, pas virgule (parsing latence/heap)
 
 # MEM_LIMIT (ex 4g, 1536m) -> Mio entiers
-mem_to_mib(){ echo "$1" | awk 'BEGIN{IGNORECASE=1}{v=$0; if(v ~ /g/){sub(/[gG].*/,"",v); print int(v*1024)} else {sub(/[mM].*/,"",v); print int(v)}}'; }
+# NB : classes [gG] explicites — IGNORECASE est un gawk-isme ignoré par mawk (défaut Ubuntu),
+# "3G" y était lu comme 3 Mio.
+mem_to_mib(){ echo "$1" | awk '{v=$0; if(v ~ /[gG]/){sub(/[gG].*/,"",v); print int(v*1024)} else {sub(/[mM].*/,"",v); print int(v)}}'; }
 
 # ---- paramètres (env) ----
 CPUSET="${CPUSET:-0-7,16-23}"          # 8 cœurs physiques (threads N & N+16), 8 restants pour l'hôte
@@ -34,7 +36,7 @@ ES_IMAGE="${ES_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:8.6.1}"
 # encore la gauge surch_index_segment_count -> segment_count/2a resterait toujours null avec elle.
 SURCH_IMAGE="${SURCH_IMAGE:-ghcr.io/rhanka/surch:sha-b795b100682afcfa65ab7db14f36d543cf039b38}"
 POSTINGS_DISK="${POSTINGS_DISK:-1}"    # Surch : 1 = read-path disque (C1b)
-OUT_DIR="${OUT_DIR:-/tmp/fair-ab-$(printf '%s' "$MEM_LIMIT")}"
+OUT_DIR="${OUT_DIR:-$HOME/.cache/fair-ab/$(printf '%s' "$MEM_LIMIT")}"   # HORS /tmp : tmpfs = RAM hôte
 PROBE_REQUESTS="${PROBE_REQUESTS:-1000}"
 REFRESH_EACH="${REFRESH_EACH:-0}"   # 1 = refresh après chaque chunk (counts corrects ; Surch perd sinon ~1 chunk sous bulk rapide)
 # ---- sonde random / cold (front #1 "latence honnête", brainstorm-4-fronts-2026-07-09.md b1) ----
@@ -63,11 +65,57 @@ NET="fair-ab-net"
 mkdir -p "$OUT_DIR"
 log(){ printf '\033[1;36m[fair-ab]\033[0m %s\n' "$*"; }
 err(){ printf '\033[1;31m[fair-ab]\033[0m %s\n' "$*" >&2; }
+case "$(stat -fc %T "$OUT_DIR" 2>/dev/null)" in tmpfs)
+  err "AVERTISSEMENT OUT_DIR=$OUT_DIR est sur tmpfs (=RAM hôte) — les gros artefacts (bulk.ndjson) pèseront sur la mémoire";;
+esac
 
 # ---- garde-fous ----
 [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] || { err "cgroup v2 requis"; exit 1; }
 gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
 [ "$gov" = "performance" ] || err "AVERTISSEMENT gouverneur=$gov (biais fréquence ; 'sudo cpupower frequency-set -g performance' pour un run rigoureux)"
+
+# ---- plafonnement ressources hôte (post-mortem 2026-07-11 : OOM global machine) ----
+# La nuit du 10-11/07 un run 28M a contribué à un OOM GLOBAL de l'hôte (le noyau a tué des
+# processus tiers). Failles côté harnais : conteneurs auxiliaires (feeder split/curl, sondes)
+# SANS cap mémoire -> la page cache du split 14,7 Go n'était pas bornée ; partie hôte
+# (awk corpus/sondes) non bornée ; OUT_DIR par défaut sur /tmp (tmpfs = RAM). Garde-fous,
+# AVANT tout travail — un emballement doit tuer le RUN, jamais la machine :
+#  (0) re-exec dans un scope systemd user plafonné (MemoryMax) : borne les process hôte du
+#      harnais Y COMPRIS leur page cache de lecture corpus (comptée au scope en cgroup v2)
+#  (1) verrou flock : un seul fair-ab à la fois
+#  (2) préflight : refus de démarrer si MemAvailable < cap conteneur + cap scope + marge
+#  (3) trap : teardown conteneurs/volumes/réseau même sur interruption (INT/TERM)
+# Les conteneurs moteurs étaient déjà cappés (--memory) ; les auxiliaires le sont via $AUXCAP.
+HARNESS_MEM_MAX="${HARNESS_MEM_MAX:-3G}"              # cap du scope hôte du harnais (suffixe MAJUSCULE : systemd)
+PREFLIGHT_MARGIN_MIB="${PREFLIGHT_MARGIN_MIB:-2048}"  # marge exigée au-delà des deux caps
+PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"               # 1 = passer outre le préflight (déconseillé)
+AUX_MEM="${AUX_MEM:-512m}"                            # cap des conteneurs auxiliaires
+AUXCAP="--memory=$AUX_MEM --memory-swap=$AUX_MEM"
+if [ "${FAIRAB_SCOPED:-0}" != "1" ] && command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user --scope -q -p MemoryMax=64M -- true >/dev/null 2>&1; then
+  log "re-exec dans un scope systemd plafonné (MemoryMax=$HARNESS_MEM_MAX, swap scope 256M)"
+  FAIRAB_SCOPED=1 exec systemd-run --user --scope -q \
+    -p MemoryMax="$HARNESS_MEM_MAX" -p MemorySwapMax=256M -- "$0" "$@"
+fi
+[ "${FAIRAB_SCOPED:-0}" = "1" ] || err "AVERTISSEMENT scope systemd indisponible -> partie hôte du harnais NON plafonnée"
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/fair-ab.lock"
+flock -n 9 || { err "un autre fair-ab tourne déjà (verrou fair-ab.lock) — runs concurrents refusés"; exit 1; }
+mem_avail_mib=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
+need_mib=$(( $(mem_to_mib "$MEM_LIMIT") + $(mem_to_mib "$HARNESS_MEM_MAX") + PREFLIGHT_MARGIN_MIB ))
+if [ "${mem_avail_mib:-0}" -lt "$need_mib" ]; then
+  if [ "$PREFLIGHT_FORCE" = "1" ]; then
+    err "AVERTISSEMENT préflight bypassé (PREFLIGHT_FORCE=1) : ${mem_avail_mib}MiB dispo < ${need_mib}MiB requis"
+  else
+    err "préflight mémoire : ${mem_avail_mib}MiB disponibles < ${need_mib}MiB requis (cap conteneur $(mem_to_mib "$MEM_LIMIT")MiB + scope harnais $(mem_to_mib "$HARNESS_MEM_MAX")MiB + marge ${PREFLIGHT_MARGIN_MIB}MiB) — libérer de la RAM ou PREFLIGHT_FORCE=1"
+    exit 1
+  fi
+fi
+swap_total_kib=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo); swap_free_kib=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+[ "${swap_total_kib:-0}" -gt 0 ] && [ "${swap_free_kib:-0}" -lt $(( swap_total_kib / 10 )) ] \
+  && err "AVERTISSEMENT swap hôte quasi plein ($(( (swap_total_kib - swap_free_kib) / 1024 ))/$(( swap_total_kib / 1024 ))MiB) : machine déjà sous pression mémoire"
+trap 'docker rm -f fairab-es fairab-surch >/dev/null 2>&1; docker volume rm fairab-vol-es fairab-vol-surch >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # BULK_FILE fourni => on n'a plus besoin du corpus brut INSEE ; sinon il est requis
 if [ -n "$BULK_FILE" ]; then
   [ -s "$BULK_FILE" ] || { err "BULK_FILE introuvable/vide : $BULK_FILE"; exit 1; }
@@ -226,7 +274,7 @@ run_engine(){
   # attendre healthy (ou détecter OOM précoce)
   local up=0 i
   for i in $(seq 1 60); do
-    if docker run --rm --network "$NET" curlimages/curl:8.10.1 -s "$BASE/" >/dev/null 2>&1; then up=1; break; fi
+    if docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s "$BASE/" >/dev/null 2>&1; then up=1; break; fi
     [ "$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null)" = "true" ] && break
     sleep 2
   done
@@ -238,10 +286,10 @@ run_engine(){
 
   # créer l'index : mapping fourni (MAPPING_FILE) ou mapping minimal texte français en dur
   if [ -n "$MAPPING_FILE" ]; then
-    docker run --rm --network "$NET" -v "$MAPPING_FILE:/mapping.json:ro" curlimages/curl:8.10.1 \
+    docker run --rm $AUXCAP --network "$NET" -v "$MAPPING_FILE:/mapping.json:ro" curlimages/curl:8.10.1 \
       -s -XPUT "$BASE/deces_bench" -H 'Content-Type: application/json' --data-binary @/mapping.json >/dev/null 2>&1
   else
-    docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -XPUT "$BASE/deces_bench" \
+    docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s -XPUT "$BASE/deces_bench" \
       -H 'Content-Type: application/json' -d '{"mappings":{"properties":{"nom":{"type":"text"},"prenoms":{"type":"text"},"lieu_naissance":{"type":"text"},"sexe":{"type":"keyword"},"date_naissance":{"type":"keyword"},"date_deces":{"type":"keyword"}}}}' >/dev/null 2>&1
   fi
 
@@ -253,7 +301,7 @@ run_engine(){
   local t0 t1 oom bulk_rc
   local BOUT="$OUT_DIR/$ENGINE.bulklog"
   t0=$(date +%s.%N)
-  docker run --rm --network "$NET" -v "$BULK:/bulk.ndjson:ro" curlimages/curl:8.10.1 sh -c "
+  docker run --rm $AUXCAP --network "$NET" -v "$BULK:/bulk.ndjson:ro" curlimages/curl:8.10.1 sh -c "
     BASE='$BASE'; REFRESH_EACH='$REFRESH_EACH'; MAXTRY='$BULK_RETRIES'
     split -l 20000 -a 4 /bulk.ndjson /tmp/chunk_   # -a 4 : >676 chunks au 28M (57,8M lignes = 2892 chunks)
     indexed=0; item_err=0; hard=0; failed=''; n=0; dead=0
@@ -296,14 +344,14 @@ run_engine(){
     [ \$hard -eq 0 ]
   " > "$BOUT" 2>&1
   bulk_rc=$?
-  docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1
+  docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1
   t1=$(date +%s.%N)   # throughput = jusqu'au 1er refresh (loyal, hors matérialisation tardive)
   # 2e refresh + attente : surch ne matérialise pas le dernier lot sur un seul refresh final ;
   # ES insensible. Hors timing pour ne léser personne.
-  sleep 2; docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1; sleep 1
+  sleep 2; docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1; sleep 1
   oom=$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null)
   local running; running=$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)
-  local cnt; cnt=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s "$BASE/deces_bench/_count" 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+  local cnt; cnt=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s "$BASE/deces_bench/_count" 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
   cnt=${cnt:-0}
   # résumé machine du bulk (indexé / erreurs item / échec dur / chunks KO)
   local summary indexed item_err hard_fail failed_chunks expected_indexed
@@ -338,7 +386,7 @@ run_engine(){
   dps=$(awk -v c="$NDOCS" -v a="$t0" -v b="$t1" 'BEGIN{printf "%.0f", c/(b-a)}')
   rss=$(sample_rss "$CID")
   # disque : du du volume de données côté hôte (via alpine, l'image moteur n'a pas de shell)
-  disk=$(docker run --rm -v "fairab-vol-$ENGINE:/d" alpine:3 du -sm /d 2>/dev/null | awk '{print $1}')
+  disk=$(docker run --rm $AUXCAP -v "fairab-vol-$ENGINE:/d" alpine:3 du -sm /d 2>/dev/null | awk '{print $1}')
   disk=${disk:-?}
 
   # ---- 2a. ventilation disque (surch uniquement) + vérif réclamation post-merge ----
@@ -352,7 +400,7 @@ run_engine(){
         disk_bytes_fst_merge="null" disk_bytes_other="null" files_postings_count="null" segment_count="null"
   if [ "$ENGINE" = "surch" ]; then
     local bp=0 bsub=0 bsrc=0 bfst=0 both=0 fpc=0 vent_listing
-    vent_listing=$(docker run --rm -v "fairab-vol-$ENGINE:/d" alpine:3 sh -c '
+    vent_listing=$(docker run --rm $AUXCAP -v "fairab-vol-$ENGINE:/d" alpine:3 sh -c '
       cd /d 2>/dev/null || exit 0
       for f in *; do
         [ -f "$f" ] || continue
@@ -373,7 +421,7 @@ run_engine(){
     done <<< "$vent_listing"
     disk_bytes_postings=$bp; disk_bytes_subfields=$bsub; disk_bytes_source=$bsrc
     disk_bytes_fst_merge=$bfst; disk_bytes_other=$both; files_postings_count=$fpc
-    segment_count=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s "$BASE/_prometheus_metrics" 2>/dev/null | awk '/^surch_index_segment_count\{/{print $NF; exit}')
+    segment_count=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s "$BASE/_prometheus_metrics" 2>/dev/null | awk '/^surch_index_segment_count\{/{print $NF; exit}')
     [ -z "$segment_count" ] && segment_count="null"
   fi
 
@@ -381,7 +429,7 @@ run_engine(){
   # b1/P2) : PROBE_REQUESTS requêtes match dans UN SEUL conteneur curl (éviter de mesurer le
   # démarrage conteneur au lieu de la requête).
   local lat50 lat95 lat99
-  read -r lat50 lat95 lat99 < <(docker run --rm --network "$NET" curlimages/curl:8.10.1 sh -c "
+  read -r lat50 lat95 lat99 < <(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 sh -c "
     for i in \$(seq 1 $PROBE_REQUESTS); do
       curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
         -H 'Content-Type: application/json' \
@@ -395,7 +443,7 @@ run_engine(){
   # comme pour la sonde fixe ; curl lui-même mesure sa propre requête via -w, pas le shell).
   local latr50=0 latr95=0 latr99=0
   if [ -s "$PROBE_BODIES" ]; then
-    read -r latr50 latr95 latr99 < <(docker run --rm --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
+    read -r latr50 latr95 latr99 < <(docker run --rm $AUXCAP --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
       while IFS= read -r body; do
         curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
           -H 'Content-Type: application/json' -d \"\$body\"
@@ -460,7 +508,7 @@ run_engine(){
   fi
   if [ "$cold_ok" = true ]; then
     sleep 1   # laisser le noyau appliquer le reclaim avant re-sonde
-    read -r latc50 latc95 latc99 < <(docker run --rm --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
+    read -r latc50 latc95 latc99 < <(docker run --rm $AUXCAP --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
       while IFS= read -r body; do
         curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
           -H 'Content-Type: application/json' -d \"\$body\"
