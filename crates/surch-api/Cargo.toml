@@ -85,6 +85,14 @@ chrono = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 aws-credential-types = { workspace = true }
+# [source 2b] compression zstd PAR-DOC du `_source` (cf.
+# docs/paper/contre-expertise-2b-source-2026-07-10.md, section D) : le
+# socle deflate/flate2 existant (`SourceBlob::Compressed`,
+# `compact_after_refresh`) est dead-code depuis `mmap M1` ; zstd est une
+# dependance neuve, utilisee UNIQUEMENT dans le hot path
+# `upsert_document_deferred`/`parse_source_blob` de `state.rs`, pas
+# workspace-pinnee car aucun autre crate n'en a besoin.
+zstd = "0.13"
 
 [dev-dependencies]
 opensearch-oracle = { path = "../opensearch-oracle" }

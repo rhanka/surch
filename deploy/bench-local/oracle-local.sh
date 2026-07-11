@@ -24,6 +24,7 @@ docker run -d --name ol-surch --network "$NET" --memory=512m --memory-swap=512m 
   ${SURCH_MERGE_FANIN:+-e SURCH_MERGE_FANIN="$SURCH_MERGE_FANIN"} \
   ${SURCH_MERGE_MAX_DOCS:+-e SURCH_MERGE_MAX_DOCS="$SURCH_MERGE_MAX_DOCS"} \
   ${SURCH_DENSIFY_BUDGET_DOCS:+-e SURCH_DENSIFY_BUDGET_DOCS="$SURCH_DENSIFY_BUDGET_DOCS"} \
+  ${SURCH_SOURCE_COMPRESS:+-e SURCH_SOURCE_COMPRESS="$SURCH_SOURCE_COMPRESS"} \
   "ghcr.io/rhanka/surch:sha-${SURCH_SHA}" >/dev/null
 docker run -d --name ol-es --network "$NET" --memory=2048m --memory-swap=2048m \
   -e discovery.type=single-node -e xpack.security.enabled=false \
