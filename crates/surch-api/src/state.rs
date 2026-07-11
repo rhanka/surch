@@ -15,6 +15,7 @@ use surch_index::{
     postings::{BlockMeta, DiskPostingsCursor, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
 };
+use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor};
 
 /// `mmap M1` (P1 du plan persistance segments + manifest, cf.
 /// `docs/paper/persistence-iceberg-architecture.md` §10) — cherry-pick
@@ -256,7 +257,8 @@ use source_store::SourceStore;
 /// **composee avec `mmap M1` (P1 persistance)**.
 ///
 /// Apres `mmap M1`, la variante "fresh source" du bulk path n'est plus
-/// `Raw(Arc<str>)` en RAM : c'est `OnDisk { offset, length }`, un
+/// `Raw(Arc<str>)` en RAM : c'est `OnDisk { offset, length, codec }`
+/// (`codec` ajoute par la tranche 2b, cf. plus bas), un
 /// pointeur dans le segment `source.dat` file-backed (cf. module
 /// `source_store`). Les bytes vivent dans le page-cache OS, pas dans le
 /// heap du process. Apres `_refresh`, `compact_after_refresh` lit chaque
@@ -282,11 +284,52 @@ enum SourceBlob {
     /// Pointeur dans le segment `source.dat` file-backed. Etat
     /// transitoire entre l'INSERT bulk et le premier `_refresh`. Le
     /// `length` `u32` borne un doc a 4 GiB — largement au-dela des
-    /// `_source` matchID / BEIR observes (< 1 MiB).
-    OnDisk { offset: u64, length: u32 },
+    /// `_source` matchID / BEIR observes (< 1 MiB) ; depuis tranche 2b
+    /// (`docs/paper/contre-expertise-2b-source-2026-07-10.md` §D), c'est
+    /// la longueur des bytes ECRITS sur `source.dat`, compresses ou non
+    /// selon `codec`.
+    ///
+    /// `codec` est le tag auto-descriptif de l'amendement 3 : chaque blob
+    /// se relit correctement quel que soit son codec, y compris dans un
+    /// store a codec MIXTE (flip de `SURCH_SOURCE_COMPRESS` en cours de
+    /// vie du process). Tient dans le padding existant de la variante
+    /// (`offset: u64` + `length: u32` occupe deja 16 o alignes, `codec: u8`
+    /// n'agrandit pas `size_of::<SourceBlob>()`).
+    OnDisk { offset: u64, length: u32, codec: u8 },
     /// Bytes deflate-bruts produits par `compact_after_refresh()`.
     /// Decode via [`SourceBlob::decode_compressed`] (Decompress thread-local).
     Compressed(Arc<[u8]>),
+}
+
+/// Tag codec `u8` de [`SourceBlob::OnDisk`] — amendement 3 du contrat 2b.
+/// `0` = bytes JSON bruts (comportement historique, bit-identique).
+const SOURCE_CODEC_RAW: u8 = 0;
+/// `1` = bytes zstd (niveau [`ZSTD_SOURCE_LEVEL`]), produits quand
+/// `SURCH_SOURCE_COMPRESS=1` (cf. [`source_compress_enabled`]).
+const SOURCE_CODEC_ZSTD: u8 = 1;
+
+/// Niveau zstd par defaut pour la compression PAR-DOC du `_source`
+/// (contrat 2b, amendement 2 : par-doc d'abord, pas de dictionnaire).
+/// Niveau 3 = defaut zstd standard, compromis ratio/vitesse valide par la
+/// contre-expertise (~2-3 µs/doc sur ~500 o, <5 % d'un coeur a 21,8k doc/s).
+const ZSTD_SOURCE_LEVEL: i32 = 3;
+
+/// Flag `SURCH_SOURCE_COMPRESS` (contrat 2b, gate Q5) : lu UNE FOIS par
+/// process (mirroir du pattern `OnceLock` etabli par [`densify_budget_docs`]
+/// — un flip mid-run n'est pas supporte, coherent avec tous les autres
+/// `SURCH_*` du process). `0`/absent/invalide = OFF (comportement actuel
+/// bit-identique, tag [`SOURCE_CODEC_RAW`]) ; `1` = ON (tag
+/// [`SOURCE_CODEC_ZSTD`]). La lecture (`parse_source_blob`) gere les DEUX
+/// tags dans tous les cas, flag ou pas — un store a codec mixte pendant un
+/// flip de flag reste valide.
+fn source_compress_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SURCH_SOURCE_COMPRESS")
+            .ok()
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+    })
 }
 
 impl SourceBlob {
@@ -409,18 +452,93 @@ impl SourceBlob {
             })
         })
     }
+
+    /// Compresse `raw` en zstd niveau [`ZSTD_SOURCE_LEVEL`] — tranche 2b,
+    /// actif quand [`source_compress_enabled`] retourne `true`. Reutilise
+    /// un `zstd::bulk::Compressor` thread-local (meme rationale que
+    /// `encode_for_compact` : amortir l'init du contexte `CCtx` sur le hot
+    /// path bulk, cf. `docs/paper/contre-expertise-2b-source-2026-07-10.md`
+    /// §C Q2). `compress` dimensionne lui-meme le buffer de sortie
+    /// (`ZSTD_compressBound`), pas de boucle de croissance necessaire ici
+    /// (contrairement au deflate `compress_vec` bas niveau).
+    fn encode_zstd(raw: &[u8]) -> Vec<u8> {
+        thread_local! {
+            static COMPRESSOR: RefCell<ZstdCompressor<'static>> = RefCell::new(
+                ZstdCompressor::new(ZSTD_SOURCE_LEVEL)
+                    .expect("zstd compressor context initialises at a valid level"),
+            );
+        }
+        COMPRESSOR.with(|cell| {
+            cell.borrow_mut()
+                .compress(raw)
+                .expect("zstd compress of a validated _source blob does not fail")
+        })
+    }
+
+    /// Decompresse un blob zstd ecrit par [`SourceBlob::encode_zstd`].
+    /// Reutilise un `zstd::bulk::Decompressor` thread-local (meme
+    /// rationale que `decode_compressed`). `Decompressor::decompress` exige
+    /// une capacite de sortie explicite (zstd bulk n'auto-agrandit pas) ;
+    /// on part d'une heuristique (×4 la taille compressee, plancher 4 KiB —
+    /// meme heuristique que le chemin deflate) et on double jusqu'a ce que
+    /// ca tienne, borne a 20 tentatives pour eviter une boucle infinie sur
+    /// un store corrompu (le round-trip est garanti lossless par
+    /// construction — cf. contrat 2b §A6 — donc ce plafond ne devrait
+    /// jamais etre atteint en usage normal).
+    fn decode_zstd(bytes: &[u8]) -> Vec<u8> {
+        thread_local! {
+            static DECOMPRESSOR: RefCell<ZstdDecompressor<'static>> = RefCell::new(
+                ZstdDecompressor::new().expect("zstd decompressor context initialises"),
+            );
+        }
+        DECOMPRESSOR.with(|cell| {
+            let mut decompressor = cell.borrow_mut();
+            let mut capacity = bytes.len().saturating_mul(4).max(4096);
+            for _ in 0..20 {
+                match decompressor.decompress(bytes, capacity) {
+                    Ok(out) => return out,
+                    Err(_) => capacity = capacity.saturating_mul(2),
+                }
+            }
+            panic!(
+                "stored zstd _source blob did not decode within the capacity growth bound \
+                 (store contract violation — round-trip is lossless by construction, cf. \
+                 contre-expertise-2b-source-2026-07-10.md §A6)"
+            );
+        })
+    }
+}
+
+/// Lit et decode les bytes bruts (JSON) d'un blob [`SourceBlob::OnDisk`],
+/// quel que soit son `codec` — amendement 3 du contrat 2b : un store a
+/// codec MIXTE (flip de `SURCH_SOURCE_COMPRESS` en cours de vie du
+/// process) reste toujours relisible, blob par blob.
+fn read_on_disk_bytes(store: &SourceStore, offset: u64, length: u32, codec: u8) -> Vec<u8> {
+    let bytes = store.read(offset, length);
+    match codec {
+        SOURCE_CODEC_RAW => bytes,
+        SOURCE_CODEC_ZSTD => SourceBlob::decode_zstd(&bytes),
+        other => panic!(
+            "unknown _source codec tag {other} on OnDisk blob (contrat 2b : raw={SOURCE_CODEC_RAW}, zstd={SOURCE_CODEC_ZSTD})"
+        ),
+    }
 }
 
 /// Helper pour parser un [`SourceBlob`] en `Value`. Reutilise par
 /// `parsed_source`, `rebuild_index` et `documents_paginated`.
 ///
 /// `mmap M1` : le `store` est lu pour les blobs `OnDisk` (pread sur le
-/// segment file-backed) ; les `Compressed` decodent via le `Decompress`
-/// thread-local (inchange option B).
+/// segment file-backed, decode selon `codec` via [`read_on_disk_bytes`]) ;
+/// les `Compressed` decodent via le `Decompress` thread-local (inchange
+/// option B).
 fn parse_source_blob(blob: &SourceBlob, store: &SourceStore) -> Value {
     match blob {
-        SourceBlob::OnDisk { offset, length } => {
-            let bytes = store.read(*offset, *length);
+        SourceBlob::OnDisk {
+            offset,
+            length,
+            codec,
+        } => {
+            let bytes = read_on_disk_bytes(store, *offset, *length, *codec);
             serde_json::from_slice(&bytes).expect("stored OnDisk _source is valid JSON")
         }
         SourceBlob::Compressed(bytes) => {
@@ -1053,12 +1171,21 @@ impl InMemoryIndex {
     fn upsert_document_deferred(&mut self, id: &str, source: Value) {
         // `mmap M1` + option B : on serialise puis on append au segment
         // `source.dat` file-backed (cf. module `source_store`). Le slot
-        // stocke `OnDisk { offset, length }` — 12 octets en RAM au lieu
-        // des bytes JSON eux-memes.
+        // stocke `OnDisk { offset, length, codec }` — 12 octets utiles
+        // (+ le tag `codec`) en RAM au lieu des bytes JSON eux-memes.
         //
         // Coût bulk : 1× pwrite (~5 µs amorti grace au
         // `posix_fallocate` qui evite l'extension ext4 par bloc 4 KiB).
         // Gate indexation >= 14 000 docs/s preserve.
+        //
+        // Tranche 2b (`docs/paper/contre-expertise-2b-source-2026-07-10.md`
+        // §D) : compression zstd PAR-DOC inline, juste avant l'append,
+        // gatee par `SURCH_SOURCE_COMPRESS` (cf. [`source_compress_enabled`]).
+        // OFF (defaut) = bytes bruts ecrits tels quels, tag
+        // [`SOURCE_CODEC_RAW`] — comportement bit-identique a avant 2b. ON
+        // = bytes zstd niveau [`ZSTD_SOURCE_LEVEL`], tag
+        // [`SOURCE_CODEC_ZSTD`]. Zero buffering supplementaire : toujours
+        // 1 seul `pwrite`/doc, juste plus petit quand compresse.
         //
         // `ensure_fields` a besoin du `Value` parse, donc analyse AVANT
         // serialisation. Updates (meme `id`) ecrasent le slot dirty — les
@@ -1069,8 +1196,17 @@ impl InMemoryIndex {
         self.mapping.ensure_fields(&source);
         let serialized =
             serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
-        let (offset, length) = self.source_store.append(&serialized);
-        let blob = SourceBlob::OnDisk { offset, length };
+        let (stored_bytes, codec) = if source_compress_enabled() {
+            (SourceBlob::encode_zstd(&serialized), SOURCE_CODEC_ZSTD)
+        } else {
+            (serialized, SOURCE_CODEC_RAW)
+        };
+        let (offset, length) = self.source_store.append(&stored_bytes);
+        let blob = SourceBlob::OnDisk {
+            offset,
+            length,
+            codec,
+        };
 
         if let Some(doc_id) = self.resolve_uid(id) {
             // Update : le `doc_id` ne change JAMAIS, seul le blob
@@ -1714,20 +1850,35 @@ impl InMemoryIndex {
     #[allow(dead_code)]
     fn compact_after_refresh(&mut self) {
         for slot in self.dense.documents.iter_mut() {
-            let Some(SourceBlob::OnDisk { offset, length }) = *slot else {
+            let Some(SourceBlob::OnDisk {
+                offset,
+                length,
+                codec,
+            }) = *slot
+            else {
                 continue;
             };
-            let raw_bytes = self.source_store.read(offset, length);
+            // `read_on_disk_bytes` decode selon `codec` (raw ou zstd,
+            // tranche 2b) : les bytes obtenus ici sont TOUJOURS le JSON
+            // brut, quel que soit le codec du blob source — condition
+            // necessaire pour que `encode_for_compact` (deflate) reçoive
+            // du JSON et non un flux zstd deja compresse.
+            let raw_bytes = read_on_disk_bytes(&self.source_store, offset, length, codec);
             let compressed = SourceBlob::encode_for_compact(&raw_bytes);
             *slot = Some(SourceBlob::Compressed(Arc::from(
                 compressed.into_boxed_slice(),
             )));
         }
         for blob in self.documents_dirty.values_mut() {
-            let SourceBlob::OnDisk { offset, length } = *blob else {
+            let SourceBlob::OnDisk {
+                offset,
+                length,
+                codec,
+            } = *blob
+            else {
                 continue;
             };
-            let raw_bytes = self.source_store.read(offset, length);
+            let raw_bytes = read_on_disk_bytes(&self.source_store, offset, length, codec);
             let compressed = SourceBlob::encode_for_compact(&raw_bytes);
             *blob = SourceBlob::Compressed(Arc::from(compressed.into_boxed_slice()));
         }
