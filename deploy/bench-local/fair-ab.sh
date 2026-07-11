@@ -355,8 +355,10 @@ run_engine(){
       cd /d 2>/dev/null || exit 0
       for f in *; do
         [ -f "$f" ] || continue
-        sz=$(stat -c "%s" "$f" 2>/dev/null); sz=${sz:-0}
-        echo "$f $sz"
+        # %b*512 = octets réellement OCCUPÉS (pas la taille apparente : les stores sont
+        # préalloués/creux -> stat %s surestime, cf gate 1,36M : 1375 MiB apparents vs 1040 du)
+        blk=$(stat -c "%b" "$f" 2>/dev/null); blk=${blk:-0}
+        echo "$f $(( blk * 512 ))"
       done' 2>/dev/null)
     while IFS=' ' read -r fname fsize; do
       [ -z "$fname" ] && continue
@@ -405,7 +407,7 @@ run_engine(){
   # sinon écriture directe (perms locales), sinon SKIP PROPRE documenté — ne casse jamais le run.
   # memory.stat (anon vs file) est world-readable (pas besoin de root) et capturé dans tous les
   # cas, avant et après la tentative, pour distinguer résident applicatif et cache (b1/P3).
-  local latc50=0 latc95=0 latc99=0 cold_attempted=false cold_ok=false cold_skip_reason=""
+  local latc50=0 latc95=0 latc99=0 cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
   local mem_anon_warm="null" mem_file_warm="null" mem_anon_cold="null" mem_file_cold="null"
   local full_id cg_scope reclaim_path stat_path
   full_id=$(docker inspect -f '{{.Id}}' "$CID" 2>/dev/null)
@@ -428,11 +430,31 @@ run_engine(){
     mb=$(mem_to_mib "$MEM_LIMIT"); bytes=$(( mb * 1024 * 1024 * 2 ))   # agressif : 2x le cap
     cold_attempted=true
     if sudo -n sh -c "echo $bytes > '$reclaim_path'" >/dev/null 2>&1; then
-      cold_ok=true
+      cold_ok=true; cold_method="memory_reclaim"
     elif echo "$bytes" > "$reclaim_path" 2>/dev/null; then
-      cold_ok=true
+      cold_ok=true; cold_method="memory_reclaim"
     else
-      cold_skip_reason="no_write_perm_memory_reclaim"
+      # FALLBACK sans root (gate 1,36M : memory.reclaim = Permission denied sans sudo) :
+      # abaisser temporairement le cap à anon+128 MiB via docker update force le noyau à
+      # évincer le page cache du conteneur (l'anon, non-évictable, tient dans la marge ;
+      # le moteur est au repos pendant la fenêtre). Même mécanisme pour les 2 moteurs.
+      # Impossible si anon+128 >= cap (ex. ES @1536m, heap ~= cap) -> skip documenté.
+      local anon_now squeeze_mib cap_mib
+      anon_now=$(awk '/^anon /{print $2}' "$stat_path" 2>/dev/null); anon_now=${anon_now:-0}
+      cap_mib=$(mem_to_mib "$MEM_LIMIT")
+      squeeze_mib=$(( anon_now / 1048576 + 128 ))
+      if [ "$squeeze_mib" -lt "$cap_mib" ] && \
+         docker update --memory="${squeeze_mib}m" --memory-swap="${squeeze_mib}m" "$CID" >/dev/null 2>&1; then
+        sleep 3
+        docker update --memory="$MEM_LIMIT" --memory-swap="$MEM_LIMIT" "$CID" >/dev/null 2>&1
+        if [ "$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null)" = "true" ]; then
+          cold_skip_reason="oom_during_squeeze"
+        else
+          cold_ok=true; cold_method="docker_update_squeeze"
+        fi
+      else
+        cold_skip_reason="no_write_perm_and_squeeze_impossible_anon${squeeze_mib}m_cap${cap_mib}m"
+      fi
     fi
   fi
   if [ "$cold_ok" = true ]; then
@@ -450,8 +472,9 @@ run_engine(){
     v2=$(awk '/^file /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v2" ] && mem_file_cold="$v2"
   fi
   local cold_skip_json="null"; [ -n "$cold_skip_reason" ] && cold_skip_json="\"$cold_skip_reason\""
+  local cold_method_json="null"; [ -n "$cold_method" ] && cold_method_json="\"$cold_method\""
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_skip_reason\":$cold_skip_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count}" > "$OUT_DIR/$ENGINE.json"
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count}" > "$OUT_DIR/$ENGINE.json"
   log "$ENGINE OK : ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe ${lat50}/${lat95}/${lat99} | rand ${latr50}/${latr95}/${latr99} | cold ${latc50}/${latc95}/${latc99} (attempted=$cold_attempted ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
   [ "$HOLD_SECONDS" -gt 0 ] 2>/dev/null && { log "$ENGINE : HOLD_SECONDS=$HOLD_SECONDS avant teardown (brancher artillery-replay.sh sur $NET / $CID)"; sleep "$HOLD_SECONDS"; }
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
