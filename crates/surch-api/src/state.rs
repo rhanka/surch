@@ -658,6 +658,97 @@ struct MemoryStore {
 // `next_offset` et les `OnDisk { offset, length }`). Le derive Clone
 // originel n'etait pas utilise (verification par grep) — on le retire
 // pour eviter un piege future.
+/// Largeur en bits de chaque champ du `u64` packe de
+/// [`DenseIdMaps::documents`] (plan 2c,
+/// `docs/paper/plan-packing-sidetable-2026-07-12.md`) : `[codec:1]
+/// [length:23][offset:40]`, MSB -> LSB.
+/// - `offset` (40 bits) = 1 Tio adressables dans `source.dat` — a 28,9M
+///   docs on mesure ~15 Go orphelins compris, marge 64×.
+/// - `length` (23 bits) = 8 Mio/doc max — les `_source` observes
+///   (matchID/BEIR) font < 1 Mio ; l'ancien contrat `u32` (4 Gio) etait
+///   deja theorique.
+/// - `codec` (1 bit) = les 2 valeurs actuelles ([`SOURCE_CODEC_RAW`] /
+///   [`SOURCE_CODEC_ZSTD`]). Un 3e codec grignotera un bit de `length`
+///   ou d'`offset` — a trancher au moment du dictionnaire zstd, pas
+///   avant (cf. le plan).
+const PACKED_OFFSET_BITS: u32 = 40;
+const PACKED_LENGTH_BITS: u32 = 23;
+const PACKED_CODEC_BITS: u32 = 1;
+const _: () = assert!(PACKED_OFFSET_BITS + PACKED_LENGTH_BITS + PACKED_CODEC_BITS == 64);
+
+const PACKED_OFFSET_SHIFT: u32 = 0;
+const PACKED_LENGTH_SHIFT: u32 = PACKED_OFFSET_BITS;
+const PACKED_CODEC_SHIFT: u32 = PACKED_OFFSET_BITS + PACKED_LENGTH_BITS;
+
+/// Offset maximal representable (2^40 − 1, soit 1 Tio − 1 o).
+const PACKED_OFFSET_MAX: u64 = (1u64 << PACKED_OFFSET_BITS) - 1;
+/// Length maximale representable (2^23 − 1, soit 8 Mio − 1 o).
+const PACKED_LENGTH_MAX: u32 = (1u32 << PACKED_LENGTH_BITS) - 1;
+
+/// Empaquete un pointeur `OnDisk { offset, length, codec }` en un `u64`
+/// pour un slot de [`DenseIdMaps::documents`] (plan 2c). `length == 0`
+/// est reserve au trou ([`unpack_document_slot`]) — jamais atteint pour
+/// un `_source` reel (meme `{}` serialise deja sur 2 octets).
+///
+/// Panique plutot que de tronquer silencieusement : un doc dont le
+/// `_source` (compresse ou non) depasse 8 Mio, ou un `source.dat` qui
+/// depasse 1 Tio, sortent du contrat de cette side-table packee. Le plan
+/// prevoit une `HashMap<u32, SourceBlob>` d'exceptions comme escape-hatch
+/// si ce cas se presente un jour — non implementee ici, pas encore
+/// necessaire (aucun `_source` deces/matchID/BEIR n'approche 8 Mio).
+fn pack_document_slot(offset: u64, length: u32, codec: u8) -> u64 {
+    assert!(
+        length <= PACKED_LENGTH_MAX,
+        "doc _source > 8 MiB non supporté par la side-table packée"
+    );
+    assert!(
+        offset <= PACKED_OFFSET_MAX,
+        "offset _source > 1 TiB non supporté par la side-table packée"
+    );
+    debug_assert!(
+        codec <= 1,
+        "codec _source doit tenir sur 1 bit (0=raw, 1=zstd) — voir \
+         SOURCE_CODEC_RAW/SOURCE_CODEC_ZSTD"
+    );
+    ((u64::from(codec) & 0x1) << PACKED_CODEC_SHIFT)
+        | (u64::from(length) << PACKED_LENGTH_SHIFT)
+        | (offset << PACKED_OFFSET_SHIFT)
+}
+
+/// Deballe un slot packe en `(offset, length, codec)`, ou `None` si c'est
+/// un trou (`length == 0` — doc supprime avant ce densify, cf. le champ
+/// `documents` de [`DenseIdMaps`]).
+fn unpack_document_slot(packed: u64) -> Option<(u64, u32, u8)> {
+    let length = ((packed >> PACKED_LENGTH_SHIFT) & u64::from(PACKED_LENGTH_MAX)) as u32;
+    if length == 0 {
+        return None;
+    }
+    let offset = (packed >> PACKED_OFFSET_SHIFT) & PACKED_OFFSET_MAX;
+    let codec = (packed >> PACKED_CODEC_SHIFT) as u8;
+    Some((offset, length, codec))
+}
+
+/// Empaquete un [`SourceBlob`] vivant du chemin dense en `u64` (plan 2c).
+/// Seul `OnDisk` peut apparaitre ici : depuis `mmap M1`, aucun chemin de
+/// densify ne peut produire de `Compressed` — `compact_after_refresh`,
+/// seul producteur de `Compressed`, n'est plus appele nulle part (voir le
+/// "Constat structurel" #1 du plan). `unreachable!` documente ce contrat
+/// plutot que de tronquer silencieusement un cas cense impossible.
+fn pack_source_blob(blob: &SourceBlob) -> u64 {
+    match blob {
+        SourceBlob::OnDisk {
+            offset,
+            length,
+            codec,
+        } => pack_document_slot(*offset, *length, *codec),
+        SourceBlob::Compressed(_) => unreachable!(
+            "densify ne doit jamais voir de SourceBlob::Compressed sur le chemin dense \
+             (mmap M1 : compact_after_refresh n'est plus appele — plan 2c, \
+             docs/paper/plan-packing-sidetable-2026-07-12.md, Constat structurel #1)"
+        ),
+    }
+}
+
 /// Lot C `C2` : snapshot immuable et dense des 3 anciennes `BTreeMap`
 /// (`documents`, `document_ids`, `reverse_document_ids`), materialise a
 /// chaque `_refresh` par [`InMemoryIndex::densify`]. Remplace jusqu'a
@@ -674,8 +765,12 @@ struct MemoryStore {
 ///   sans collision possible avec un UID legitime car `document_handler`
 ///   rejette tout id vide en amont (`document.rs::document_handler`:
 ///   "document id must not be empty").
-/// - `documents` : `_source` (`SourceBlob`) indexe par `doc_id`, `Option`
-///   pour distinguer un trou (`None`) d'un blob present.
+/// - `documents` : `_source` indexe par `doc_id`, empaquete en `u64` (plan
+///   2c, `docs/paper/plan-packing-sidetable-2026-07-12.md` — remplace
+///   l'ancien `Vec<Option<SourceBlob>>` ~24 o/slot par 8 o/slot, −433 Mio
+///   anon a 28,9M docs). Encodage `[codec:1][length:23][offset:40]`
+///   (MSB -> LSB), trou = `length == 0` : voir [`pack_document_slot`] /
+///   [`unpack_document_slot`] ci-dessus.
 ///
 /// `doc_id` n'est **jamais reutilise** (`InMemoryIndex::next_doc_id` ne
 /// fait qu'incrementer ; un uid absent — y compris un uid precedemment
@@ -710,7 +805,7 @@ struct DenseIdMaps {
     forward: Option<Map<Vec<u8>>>,
     reverse_uids: Vec<u8>,
     reverse_offsets: Vec<u32>,
-    documents: Vec<Option<SourceBlob>>,
+    documents: Vec<u64>,
 }
 
 impl DenseIdMaps {
@@ -732,8 +827,17 @@ impl DenseIdMaps {
     }
 
     /// `_source` stocke pour `doc_id` ; `None` si hors bornes ou trou.
-    fn blob(&self, doc_id: u32) -> Option<&SourceBlob> {
-        self.documents.get(doc_id as usize)?.as_ref()
+    /// Retourne PAR VALEUR depuis le plan 2c : `OnDisk` est reconstruit a
+    /// partir du slot packe ([`unpack_document_slot`]), copie triviale de
+    /// scalaires, aucun cout au-dela du deballage lui-meme.
+    fn blob(&self, doc_id: u32) -> Option<SourceBlob> {
+        let packed = *self.documents.get(doc_id as usize)?;
+        let (offset, length, codec) = unpack_document_slot(packed)?;
+        Some(SourceBlob::OnDisk {
+            offset,
+            length,
+            codec,
+        })
     }
 
     /// `doc_id` pour `uid` dans CE snapshot, sans tenir compte des
@@ -744,6 +848,71 @@ impl DenseIdMaps {
             .as_ref()?
             .get(uid.as_bytes())
             .map(|value| value as u32)
+    }
+}
+
+#[cfg(test)]
+mod packed_document_slot_tests {
+    use super::{
+        pack_document_slot, unpack_document_slot, PACKED_LENGTH_MAX, PACKED_OFFSET_MAX,
+        SOURCE_CODEC_RAW, SOURCE_CODEC_ZSTD,
+    };
+
+    /// Round-trip : ce que `pack` encode, `unpack` le retrouve a
+    /// l'identique, pour les deux codecs.
+    #[test]
+    fn round_trip_raw_and_zstd() {
+        for (offset, length, codec) in [
+            (0u64, 2u32, SOURCE_CODEC_RAW),
+            (1_234_567u64, 512u32, SOURCE_CODEC_ZSTD),
+            (PACKED_OFFSET_MAX, PACKED_LENGTH_MAX, SOURCE_CODEC_ZSTD),
+        ] {
+            let packed = pack_document_slot(offset, length, codec);
+            assert_eq!(
+                unpack_document_slot(packed),
+                Some((offset, length, codec)),
+                "round-trip failed for offset={offset} length={length} codec={codec}"
+            );
+        }
+    }
+
+    /// Un trou (`length == 0`, quel que soit `offset`) deballe en `None` —
+    /// c'est la convention qui remplace l'ancien `Option::None` du
+    /// `Vec<Option<SourceBlob>>`.
+    #[test]
+    fn hole_is_length_zero() {
+        assert_eq!(unpack_document_slot(0), None);
+        // `offset` non nul mais `length == 0` reste un trou — seul
+        // `length` porte la semantique de trou, l'`offset` est ignore.
+        let packed = pack_document_slot(999, 0, SOURCE_CODEC_RAW);
+        assert_eq!(unpack_document_slot(packed), None);
+    }
+
+    /// Bornes maximales : `offset`/`length` a leur plafond exact
+    /// (2^40 − 1 / 2^23 − 1) round-trippent sans troncature ni panic.
+    #[test]
+    fn max_bounds_round_trip() {
+        let packed = pack_document_slot(PACKED_OFFSET_MAX, PACKED_LENGTH_MAX, SOURCE_CODEC_ZSTD);
+        assert_eq!(
+            unpack_document_slot(packed),
+            Some((PACKED_OFFSET_MAX, PACKED_LENGTH_MAX, SOURCE_CODEC_ZSTD))
+        );
+    }
+
+    /// `length` au-dela de 2^23 − 1 (8 Mio) doit paniquer explicitement
+    /// plutot que tronquer silencieusement — le garde-fou du plan 2c.
+    #[test]
+    #[should_panic(expected = "doc _source > 8 MiB non supporté par la side-table packée")]
+    fn length_overflow_panics_with_explicit_message() {
+        pack_document_slot(0, PACKED_LENGTH_MAX + 1, SOURCE_CODEC_RAW);
+    }
+
+    /// `offset` au-dela de 2^40 − 1 (1 Tio) doit paniquer explicitement
+    /// plutot que tronquer silencieusement (meme garde-fou, second champ).
+    #[test]
+    #[should_panic(expected = "offset _source > 1 TiB non supporté par la side-table packée")]
+    fn offset_overflow_panics_with_explicit_message() {
+        pack_document_slot(PACKED_OFFSET_MAX + 1, 2, SOURCE_CODEC_RAW);
     }
 }
 
@@ -1147,13 +1316,17 @@ impl InMemoryIndex {
     }
 
     /// Lot C `C2` : `_source` stocke pour `doc_id`, fusionnant les deux
-    /// couches (meme ordre de priorite que `uid_for_doc_id`).
-    fn blob_for_doc_id(&self, doc_id: u32) -> Option<&SourceBlob> {
+    /// couches (meme ordre de priorite que `uid_for_doc_id`). Retourne
+    /// PAR VALEUR depuis le plan 2c (`DenseIdMaps::blob` deballe le cote
+    /// dense ; le cote dirty clone un `SourceBlob` existant — `OnDisk`
+    /// copie des scalaires, `Compressed` bump un `Arc` refcount, les deux
+    /// pas chers).
+    fn blob_for_doc_id(&self, doc_id: u32) -> Option<SourceBlob> {
         if self.deleted_since_dense.contains(&doc_id) {
             return None;
         }
         if let Some(blob) = self.documents_dirty.get(&doc_id) {
-            return Some(blob);
+            return Some(blob.clone());
         }
         self.dense.blob(doc_id)
     }
@@ -1288,7 +1461,7 @@ impl InMemoryIndex {
             // pread sur le segment file-backed, Compressed -> decode
             // thread-local). Seul chemin d'INDEXATION qui touche le
             // decode/pread ; pas le hot path bulk steady-state.
-            let parsed = parse_source_blob(blob, &self.source_store);
+            let parsed = parse_source_blob(&blob, &self.source_store);
             documents.push((doc_id, indexed_fields_for_document(&parsed, &self.mapping)));
         }
         // Lot 1.6: defer the FST rebuild. The bulk path then chains
@@ -1363,7 +1536,7 @@ impl InMemoryIndex {
             .par_iter()
             .filter_map(|&doc_id| {
                 let blob = self_ref.blob_for_doc_id(doc_id)?;
-                let source = parse_source_blob(blob, &self_ref.source_store);
+                let source = parse_source_blob(&blob, &self_ref.source_store);
                 Some((
                     doc_id,
                     indexed_fields_for_document(&source, &self_ref.mapping),
@@ -1622,17 +1795,21 @@ impl InMemoryIndex {
         // meme condition `Some(blob) && Some(uid)` remplit les deux au
         // meme rang) — voir le `debug_assert!` plus bas.
         let mut live_uids: Vec<(u32, Arc<str>)> = Vec::new();
-        let mut documents: Vec<Option<SourceBlob>> = Vec::with_capacity(doc_count as usize);
+        // Plan 2c : `documents` est desormais un `Vec<u64>` packe — un
+        // slot vaut `0` (trou, `length == 0`) ou le pack de l'`OnDisk`
+        // vivant ([`pack_source_blob`], jamais de `Compressed` sur ce
+        // chemin, voir son doc comment).
+        let mut documents: Vec<u64> = Vec::with_capacity(doc_count as usize);
         for doc_id in 0..doc_count {
             if self.deleted_since_dense.contains(&doc_id) {
-                documents.push(None);
+                documents.push(0);
                 continue;
             }
             let blob = self
                 .documents_dirty
                 .get(&doc_id)
                 .cloned()
-                .or_else(|| self.dense.blob(doc_id).cloned());
+                .or_else(|| self.dense.blob(doc_id));
             let uid: Option<Arc<str>> = match self.reverse_dirty.get(&doc_id) {
                 Some(uid) => Some(Arc::clone(uid)),
                 None => match self.dense.uid(doc_id) {
@@ -1646,14 +1823,14 @@ impl InMemoryIndex {
             match (blob, uid) {
                 (Some(blob), Some(uid)) => {
                     live_uids.push((doc_id, uid));
-                    documents.push(Some(blob));
+                    documents.push(pack_source_blob(&blob));
                 }
                 // Defensif : un `doc_id < doc_count` non tombstonne doit
                 // toujours avoir un blob ET un uid (invariant maintenu
                 // par `upsert_document_deferred`/`delete_document_deferred`).
-                // Ne devrait jamais arriver ; on reste sur `None` plutot
+                // Ne devrait jamais arriver ; on reste sur le trou plutot
                 // que de paniquer sur un etat interne incoherent.
-                _ => documents.push(None),
+                _ => documents.push(0),
             }
         }
         debug_assert_eq!(
@@ -1763,6 +1940,10 @@ impl InMemoryIndex {
         // ci-dessous re-declencherait une reallocation+copie de la
         // TOTALITE du buffer courant a CHAQUE tranche (voir le
         // commentaire de `DenseIdMaps`).
+        //
+        // Plan 2c : `documents` est un `Vec<u64>` packe — cette copie de
+        // prefixe est desormais un simple memcpy de `u64` (8 o/slot),
+        // plus rapide que l'ancien `Vec<Option<SourceBlob>>` (24 o/slot).
         let mut documents = std::mem::take(&mut self.dense.documents);
         documents.reserve(tranche_len);
 
@@ -1778,7 +1959,16 @@ impl InMemoryIndex {
 
         let mut new_entries: Vec<(Arc<str>, u32)> = Vec::with_capacity(tranche_len);
         for doc_id in old_boundary..new_upper {
-            documents.push(self.documents_dirty.get(&doc_id).cloned());
+            // Plan 2c : pack direct depuis `documents_dirty` — `0` (trou)
+            // quand ce doc_id a ete cree PUIS supprime dans cette meme
+            // fenetre (voir le commentaire sur `reverse_offsets` juste en
+            // dessous, meme cas).
+            let packed = self
+                .documents_dirty
+                .get(&doc_id)
+                .map(pack_source_blob)
+                .unwrap_or(0);
+            documents.push(packed);
             if let Some(uid) = self.reverse_dirty.get(&doc_id) {
                 reverse_uids.extend_from_slice(uid.as_bytes());
                 new_entries.push((Arc::clone(uid), doc_id));
@@ -1847,14 +2037,24 @@ impl InMemoryIndex {
     /// Lot C `C2` : adaptee aux structures dense/dirty — parcourt les
     /// deux (le dense snapshot ET l'overlay dirty), en ignorant les trous
     /// (`None`).
+    ///
+    /// Plan 2c (`docs/paper/plan-packing-sidetable-2026-07-12.md`) :
+    /// `dense.documents` est desormais un `Vec<u64>` packe qui ne peut
+    /// encoder QUE des pointeurs `OnDisk { offset, length, codec }` —
+    /// aucune representation possible pour des bytes `Compressed` tenus
+    /// en RAM (voir [`pack_document_slot`]). Le cote dense de cette
+    /// fonction est donc structurellement irrealisable depuis ce packing
+    /// (deja fonctionnellement mort depuis `mmap M1`, cf. la note
+    /// ci-dessus) : on ne compacte plus QUE `documents_dirty`, seul cote
+    /// qui peut encore porter un `Compressed`.
     #[allow(dead_code)]
     fn compact_after_refresh(&mut self) {
-        for slot in self.dense.documents.iter_mut() {
-            let Some(SourceBlob::OnDisk {
+        for blob in self.documents_dirty.values_mut() {
+            let SourceBlob::OnDisk {
                 offset,
                 length,
                 codec,
-            }) = *slot
+            } = *blob
             else {
                 continue;
             };
@@ -1865,34 +2065,20 @@ impl InMemoryIndex {
             // du JSON et non un flux zstd deja compresse.
             let raw_bytes = read_on_disk_bytes(&self.source_store, offset, length, codec);
             let compressed = SourceBlob::encode_for_compact(&raw_bytes);
-            *slot = Some(SourceBlob::Compressed(Arc::from(
-                compressed.into_boxed_slice(),
-            )));
-        }
-        for blob in self.documents_dirty.values_mut() {
-            let SourceBlob::OnDisk {
-                offset,
-                length,
-                codec,
-            } = *blob
-            else {
-                continue;
-            };
-            let raw_bytes = read_on_disk_bytes(&self.source_store, offset, length, codec);
-            let compressed = SourceBlob::encode_for_compact(&raw_bytes);
             *blob = SourceBlob::Compressed(Arc::from(compressed.into_boxed_slice()));
         }
-        // Tous les `OnDisk` sont desormais migres ; les bytes du
-        // segment `source.dat` n'ont plus de reference. On tronque a 0 +
-        // re-fallocate le chunk initial pour la prochaine vague bulk.
-        let still_on_disk = self
-            .dense
-            .documents
-            .iter()
-            .flatten()
-            .chain(self.documents_dirty.values())
+        // Un `source.dat` ne peut etre tronque en securite que si AUCUN
+        // pointeur `OnDisk` n'y fait plus reference. Cote dense, un slot
+        // packe vivant EST TOUJOURS un `OnDisk` par construction (jamais
+        // de `Compressed` possible depuis ce packing) — toute entree
+        // dense vivante interdit donc le reset tant qu'elle existe.
+        let dense_still_on_disk =
+            (0..self.dense.doc_count()).any(|doc_id| self.dense.blob(doc_id).is_some());
+        let dirty_still_on_disk = self
+            .documents_dirty
+            .values()
             .any(|blob| matches!(blob, SourceBlob::OnDisk { .. }));
-        if !still_on_disk {
+        if !dense_still_on_disk && !dirty_still_on_disk {
             self.source_store.reset();
         }
     }
@@ -2554,7 +2740,7 @@ impl InMemoryIndex {
     fn parsed_source(&self, id: &str) -> Option<Arc<Value>> {
         let doc_id = self.resolve_uid(id)?;
         let blob = self.blob_for_doc_id(doc_id)?;
-        Some(Arc::new(parse_source_blob(blob, &self.source_store)))
+        Some(Arc::new(parse_source_blob(&blob, &self.source_store)))
     }
 
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
@@ -2566,7 +2752,7 @@ impl InMemoryIndex {
                 // was already known.
                 let id = self.uid_for_doc_id(doc_id)?;
                 let blob = self.blob_for_doc_id(doc_id)?;
-                let source = Arc::new(parse_source_blob(blob, &self.source_store));
+                let source = Arc::new(parse_source_blob(&blob, &self.source_store));
                 Some(StoredDocument {
                     index: index.to_owned(),
                     id: id.to_string(),
@@ -2593,7 +2779,7 @@ impl InMemoryIndex {
             .filter_map(|&doc_id| {
                 let id = self.uid_for_doc_id(doc_id)?;
                 let blob = self.blob_for_doc_id(doc_id)?;
-                let source = Arc::new(parse_source_blob(blob, &self.source_store));
+                let source = Arc::new(parse_source_blob(&blob, &self.source_store));
                 Some((
                     doc_id,
                     StoredDocument {
@@ -3710,7 +3896,7 @@ impl AppState {
                     Some(StoredDocument {
                         index: index.to_owned(),
                         id: id.to_string(),
-                        source: Arc::new(parse_source_blob(blob, &data.source_store)),
+                        source: Arc::new(parse_source_blob(&blob, &data.source_store)),
                     })
                 })
             })
@@ -3769,7 +3955,7 @@ impl AppState {
                     // stocke (OnDisk -> pread, Compressed -> decode
                     // thread-local) en `Value` ; cette voie ne traite que
                     // la fenetre `[from..from+size)`.
-                    source: Arc::new(parse_source_blob(blob, &data.source_store)),
+                    source: Arc::new(parse_source_blob(&blob, &data.source_store)),
                 })
             })
             .collect()
@@ -4763,7 +4949,14 @@ impl AppState {
         // les UID encore dans un overlay dirty (pas densifies) en paient
         // le cout ici.
         const ARC_HEADER: u64 = 16;
+        // `documents_dirty: HashMap<u32, SourceBlob>` reste tel quel (pas
+        // touche par le plan 2c) — `source_blob_slot` continue de mesurer
+        // SON cout par entree.
         let source_blob_slot = std::mem::size_of::<Option<SourceBlob>>() as u64;
+        // Plan 2c : `dense.documents` est un `Vec<u64>` packe, 8 o/slot
+        // (contre `source_blob_slot` ~24 o avant ce plan) — c'est le gain
+        // −433 Mio anon a 28,9M docs que le plan vise.
+        let packed_document_slot = std::mem::size_of::<u64>() as u64;
         let u32_size = std::mem::size_of::<u32>() as u64;
 
         // `.capacity()`, not `.len()`: these three buffers are `Vec<T>`
@@ -4771,7 +4964,7 @@ impl AppState {
         // `densify_append_only` tranches — see `DenseIdMaps`'s doc
         // comment. `.capacity()` is the honest resident-bytes measure.
         let dense_documents_bytes =
-            (data.dense.documents.capacity() as u64).saturating_mul(source_blob_slot);
+            (data.dense.documents.capacity() as u64).saturating_mul(packed_document_slot);
         let dirty_documents_bytes = (data.documents_dirty.len() as u64)
             .saturating_mul(HASH_ENTRY_OVERHEAD + u32_size + source_blob_slot);
         let documents_overhead = dense_documents_bytes.saturating_add(dirty_documents_bytes);
