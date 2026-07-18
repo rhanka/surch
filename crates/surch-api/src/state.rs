@@ -332,6 +332,22 @@ fn source_compress_enabled() -> bool {
     })
 }
 
+/// Flag `SURCH_SOURCE_FETCH_PARALLEL` : lu UNE FOIS par process, comme
+/// [`source_compress_enabled`]. `0`/absent/invalide conserve exactement la
+/// boucle sequentielle historique ; `1` hydrate en parallele les seuls
+/// gagnants top-K. Le `collect` Rayon preserve l'ordre des `internal_ids`,
+/// donc l'ordre de sortie reste independant de l'ordre d'achevement des
+/// `pread`.
+fn source_fetch_parallel_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SURCH_SOURCE_FETCH_PARALLEL")
+            .ok()
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
 impl SourceBlob {
     /// Taille en **RAM** des bytes utiles (sans le header Arc), pour la
     /// gauge `surch_index_stored_fields_bytes`. Les blobs `OnDisk`
@@ -2744,22 +2760,45 @@ impl InMemoryIndex {
     }
 
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
-        internal_ids
-            .iter()
-            .filter_map(|&doc_id| {
-                // Lot C `C2`: doc_id-keyed lookups on both sides — no more
-                // detour through the public uid to re-derive a doc_id that
-                // was already known.
-                let id = self.uid_for_doc_id(doc_id)?;
-                let blob = self.blob_for_doc_id(doc_id)?;
-                let source = Arc::new(parse_source_blob(&blob, &self.source_store));
-                Some(StoredDocument {
-                    index: index.to_owned(),
-                    id: id.to_string(),
-                    source,
+        if source_fetch_parallel_enabled() {
+            // Les `winner_ids` restent ordonnes par score avant cette etape.
+            // Le premier `collect` garde un slot par id ; le filtrage reste
+            // sequentiel apres lui, donc les pread disperses ne peuvent pas
+            // changer l'ordre de sortie.
+            internal_ids
+                .par_iter()
+                .map(|&doc_id| {
+                    let id = self.uid_for_doc_id(doc_id)?;
+                    let blob = self.blob_for_doc_id(doc_id)?;
+                    let source = Arc::new(parse_source_blob(&blob, &self.source_store));
+                    Some(StoredDocument {
+                        index: index.to_owned(),
+                        id: id.to_string(),
+                        source,
+                    })
                 })
-            })
-            .collect()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flatten()
+                .collect()
+        } else {
+            internal_ids
+                .iter()
+                .filter_map(|&doc_id| {
+                    // Lot C `C2`: doc_id-keyed lookups on both sides — no more
+                    // detour through the public uid to re-derive a doc_id that
+                    // was already known.
+                    let id = self.uid_for_doc_id(doc_id)?;
+                    let blob = self.blob_for_doc_id(doc_id)?;
+                    let source = Arc::new(parse_source_blob(&blob, &self.source_store));
+                    Some(StoredDocument {
+                        index: index.to_owned(),
+                        id: id.to_string(),
+                        source,
+                    })
+                })
+                .collect()
+        }
     }
 
     /// Hydrate documents while CARRYING each one's internal `doc_id`. The
