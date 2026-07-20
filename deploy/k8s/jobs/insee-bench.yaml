@@ -45,13 +45,6 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: surch
-      nodeSelector:
-        k8s.scaleway.com/pool-name: burst-rwx
-      tolerations:
-        - key: pool
-          operator: Equal
-          value: burst
-          effect: NoSchedule
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

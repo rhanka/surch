@@ -42,13 +42,6 @@ spec:
       securityContext:
         fsGroup: 1000
         fsGroupChangePolicy: OnRootMismatch
-      tolerations:
-        - key: pool
-          operator: Equal
-          value: burst
-          effect: NoSchedule
-      nodeSelector:
-        k8s.scaleway.com/pool-name: burst-rwx
       volumes:
         - name: scratch
           persistentVolumeClaim:

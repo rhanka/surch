@@ -12,18 +12,12 @@
 # the 171 k corpus finished; run 26300123587 under Surch=4Gi peaked at
 # 3961 MiB and OOM'd at chunk 19 of ~21. Going to Surch=7Gi gives
 # ~3 GiB headroom above the observed peak for run-to-run variance.
-# Requires the poc-k8s burst pool node + tenant ResourceQuota
-# `limits.memory>=10Gi`:
+# Requires a tenant ResourceQuota `limits.memory>=10Gi`:
 #   surch       cpu  150m req / 2000m lim ; mem 256Mi req / 7168Mi lim
 #   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 2048Mi lim  (JVM Xmx=1g)
 #   driver      cpu  100m req /  500m lim ; mem 128Mi req / 1024Mi lim
 #   ---------------------------------------------------------------
 #   total       cpu  500m req / 3700m lim ; mem 640Mi req / 10240Mi lim
-# BURST NODE (2026-05): migrated DEV1-XL (4 vCPU / 12 GiB) -> POP2-4C-16G
-# (4 vCPU / 16 GiB). CPU is UNCHANGED (4 vCPU) so cross-run timing/latency
-# numbers stay comparable across the migration; RAM rose 12->16 GiB, giving
-# the surch=7Gi limit more headroom (no behavioural change to bulk/search).
-# Same-run head-to-head (Surch vs OpenSearch, same pod) is node-independent.
 #
 # `${SURCH_SHA}` is substituted by the GHA workflow via envsubst and
 # rendered into the docker-build.yml tag format: `sha-<full commit SHA>`.
@@ -49,13 +43,6 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: surch
-      nodeSelector:
-        k8s.scaleway.com/pool-name: burst-rwx
-      tolerations:
-        - key: pool
-          operator: Equal
-          value: burst
-          effect: NoSchedule
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
