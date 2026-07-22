@@ -27,17 +27,13 @@
 # the ci-k8s workflow reconstruct them after the driver terminates.
 #
 # Resource envelope mirrors ndcg-gate (the 171 k corpus needs Surch=7Gi;
-# the 2026-05-22 chain OOM'd 4Gi at chunk 19). Requires the poc-k8s burst
-# node + tenant ResourceQuota limits.memory>=10Gi:
+# the 2026-05-22 chain OOM'd 4Gi at chunk 19). Requires a tenant
+# ResourceQuota limits.memory>=10Gi:
 #   surch       cpu  150m req / 2000m lim ; mem 256Mi req / 7168Mi lim
 #   opensearch  cpu  250m req / 1200m lim ; mem 256Mi req / 2048Mi lim  (JVM Xmx=1g)
 #   driver      cpu  100m req /  500m lim ; mem 128Mi req / 1024Mi lim
 #   ---------------------------------------------------------------
 #   total       cpu  500m req / 3700m lim ; mem 640Mi req / 10240Mi lim
-# BURST NODE (2026-05): DEV1-XL (4 vCPU / 12 GiB) -> POP2-4C-16G (4 vCPU /
-# 16 GiB). 4 vCPU unchanged -> latency numbers comparable across migration;
-# +4 GiB headroom. CPU lim sum 3700m fits the 4-core node. Same-run
-# Surch-vs-OpenSearch comparison is node-independent.
 #
 # `${SURCH_SHA}` is substituted by the GHA workflow via envsubst.
 apiVersion: batch/v1
@@ -62,13 +58,6 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: surch
-      nodeSelector:
-        k8s.scaleway.com/pool-name: burst-rwx
-      tolerations:
-        - key: pool
-          operator: Equal
-          value: burst
-          effect: NoSchedule
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
