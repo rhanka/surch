@@ -3184,7 +3184,7 @@ async fn search_router_a9_size_zero_keeps_total_without_returning_hits() {
         ),
         (
             "bool fused",
-            r#"{"query":{"bool":{"must":[{"match":{"name":"desk"}]}},"size":0}"#,
+            r#"{"query":{"bool":{"must":[{"match":{"name":"desk"}}]}},"size":0}"#,
         ),
     ] {
         let body = search_with_body(&router, request).await;

@@ -1132,7 +1132,11 @@ fn search_response_cache_eligible(
 /// résultats. Le garde est placé avant tout TopN afin que `from>0,size:0`
 /// ne transforme pas le décalage en hydratation inutile.
 fn requested_hit_window_limit(from: usize, size: usize) -> usize {
-    (size != 0).then(|| from.saturating_add(size)).unwrap_or(0)
+    if size != 0 {
+        from.saturating_add(size)
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -2026,9 +2030,11 @@ fn run_topk_exact_bool(
             .take(size)
             .collect();
         let winner_ids: Vec<u32> = window.iter().map(|(_, id)| *id).collect();
-        let hydrated = (!winner_ids.is_empty())
-            .then(|| reader.documents_by_internal_ids(&winner_ids))
-            .unwrap_or_default();
+        let hydrated = if winner_ids.is_empty() {
+            Vec::new()
+        } else {
+            reader.documents_by_internal_ids(&winner_ids)
+        };
         let hits: Vec<_> = window
             .iter()
             .zip(hydrated)
@@ -2165,9 +2171,11 @@ fn finalize_fused_topk(
     // ne doit pas seulement donner une liste vide : il ne doit jamais appeler
     // `documents_by_internal_ids`, donc aucune lecture/decode de `_source`.
     let t_hydrate = std::time::Instant::now();
-    let hydrated = (!winner_ids.is_empty())
-        .then(|| state.documents_by_internal_ids(index, &winner_ids))
-        .unwrap_or_default();
+    let hydrated = if winner_ids.is_empty() {
+        Vec::new()
+    } else {
+        state.documents_by_internal_ids(index, &winner_ids)
+    };
     let hits: Vec<_> = window
         .iter()
         .zip(hydrated)
