@@ -41,17 +41,24 @@ PROBE_REQUESTS="${PROBE_REQUESTS:-1000}"
 REFRESH_EACH="${REFRESH_EACH:-0}"   # 1 = refresh après chaque chunk (counts corrects ; Surch perd sinon ~1 chunk sous bulk rapide)
 # ---- sonde random / cold (front #1 "latence honnête", brainstorm-4-fronts-2026-07-09.md b1) ----
 PROBE_NAMES_N="${PROBE_NAMES_N:-10000}"          # 1a : taille de l'échantillon probe_names.tsv
-# PROBE_FIELD_NOM/PROBE_FIELD_PRENOMS : clés JSON à extraire des docs $BULK pour peupler la
-# sonde random ET pour construire ses requêtes (mêmes clés = c'est le champ ES réellement mappé).
+# PROBE_FIELD_NOM/PROBE_FIELD_PRENOMS : clés JSON à extraire des docs $BULK pour peupler les
+# sondes fixe/random ET construire leurs requêtes (mêmes clés = c'est le champ ES réellement mappé).
 # Défaut = schéma du builder awk interne ("nom"/"prenoms"). Pour un BULK_FILE au schéma matchID
 # réel (ex. deces-1.36M.ndjson / deces-28M.ndjson, mapping deces-mapping.json), passer
-# PROBE_FIELD_NOM=NOM PROBE_FIELD_PRENOMS=PRENOMS — SINON la sonde random requêterait un champ
-# absent de la mapping (0 hit garanti), exactement le défaut dont souffre déjà silencieusement la
-# sonde FIXE historique ci-dessous sur ce type de corpus (elle reste "nom" à l'identique, par
-# continuité historique — seule la sonde random doit être correcte pour être honnête).
+# PROBE_FIELD_NOM=NOM PROBE_FIELD_PRENOMS=PRENOMS — sans cela les sondes requêteraient un champ
+# absent de la mapping et retourneraient zéro hit. La sonde fixe doit elle aussi suivre ce réglage.
 PROBE_FIELD_NOM="${PROBE_FIELD_NOM:-nom}"
 PROBE_FIELD_PRENOMS="${PROBE_FIELD_PRENOMS:-prenoms}"
+PROBE_FIXED_TERM="${PROBE_FIXED_TERM:-MARTIN}"
 COLD_PROBE="${COLD_PROBE:-1}"       # 1c : 1 = tenter la sonde cold (memory.reclaim cgroup v2), 0 = off
+COLD_PROBE_REQUESTS="${COLD_PROBE_REQUESTS:-50}" # protocole L2 : reclaim avant chacune des 50 requêtes
+# Seuil fixe du protocole L2 : le cache file résiduel doit être <= 4 MiB ou
+# <= 20 % de la valeur avant reclaim, selon la borne la moins stricte.
+COLD_FILE_CACHE_FLOOR_BYTES=4194304
+# Profil L2 benchmark-only : OFF par défaut. A 1, le runner passe un chemin
+# explicite dans le volume Surch pour un JSONL borné, exporté par phase.
+SURCH_SOURCE_FETCH_PROFILE="${SURCH_SOURCE_FETCH_PROFILE:-0}"
+SURCH_SOURCE_FETCH_PROFILE_FILE="${SURCH_SOURCE_FETCH_PROFILE_FILE:-/tmp/surch-source-fetch-profile.jsonl}"
 HOLD_SECONDS="${HOLD_SECONDS:-0}"   # après mesures, tient le conteneur N s avant teardown (permet
                                      # à artillery-replay.sh de se brancher sur le réseau fair-ab, 1d)
 # BULK_FILE   : NDJSON pré-construit (lignes alternées action/doc) indexé TEL QUEL (bypass builder awk interne).
@@ -65,6 +72,17 @@ NET="fair-ab-net"
 mkdir -p "$OUT_DIR"
 log(){ printf '\033[1;36m[fair-ab]\033[0m %s\n' "$*"; }
 err(){ printf '\033[1;31m[fair-ab]\033[0m %s\n' "$*" >&2; }
+case "$PROBE_REQUESTS" in ''|*[!0-9]*) err "PROBE_REQUESTS doit être un entier positif"; exit 1;; esac
+[ "$PROBE_REQUESTS" -gt 0 ] || { err "PROBE_REQUESTS doit être > 0"; exit 1; }
+if [ "$SURCH_SOURCE_FETCH_PROFILE" = "1" ] && [ "$PROBE_REQUESTS" -ne 1000 ]; then
+  err "protocole L2 profilé invalide : PROBE_REQUESTS doit rester 1000 (reçu $PROBE_REQUESTS)"
+  exit 1
+fi
+case "$COLD_PROBE_REQUESTS" in ''|*[!0-9]*) err "COLD_PROBE_REQUESTS doit être un entier"; exit 1;; esac
+if [ "$COLD_PROBE_REQUESTS" -ne 50 ]; then
+  err "protocole L2 cold invalide : COLD_PROBE_REQUESTS doit rester 50 (reçu $COLD_PROBE_REQUESTS)"
+  exit 1
+fi
 case "$(stat -fc %T "$OUT_DIR" 2>/dev/null)" in tmpfs)
   err "AVERTISSEMENT OUT_DIR=$OUT_DIR est sur tmpfs (=RAM hôte) — les gros artefacts (bulk.ndjson) pèseront sur la mémoire";;
 esac
@@ -161,6 +179,50 @@ fi
 NDOCS=$(( $(wc -l < "$BULK") / 2 ))
 log "corpus prêt : $NDOCS docs ($(du -h "$BULK" | cut -f1))"
 
+# ---- manifeste L2 : invalider les sondes si corpus ou contrat changent ----
+# Le nombre de lignes seul ne prouve pas que les bodies correspondent encore
+# au mapping courant. Le manifeste capture l'identité stat du corpus (sans le
+# relire intégralement), le mapping et tous les paramètres qui influencent les
+# requêtes; les quatre fichiers dérivés sont régénérés ensemble si nécessaire.
+PROBE_PROTOCOL_VERSION="l2-source-fetch-v3"
+PROBE_NAMES="$OUT_DIR/probe_names.tsv"
+PROBE_IDX="$OUT_DIR/probe_idx.txt"
+PROBE_BODIES="$OUT_DIR/probe_rand_bodies.ndjson"
+PROBE_FIXED_BODIES="$OUT_DIR/probe_fixed_bodies.ndjson"
+PROBE_CONTROL_BODIES="$OUT_DIR/probe_no_source_bodies.ndjson"
+PROBE_MANIFEST="$OUT_DIR/probe_manifest.txt"
+want_probe_n=$NDOCS; [ "$want_probe_n" -gt "$PROBE_NAMES_N" ] && want_probe_n=$PROBE_NAMES_N
+probe_corpus_identity=$(stat -Lc '%d:%i:%s:%Y' "$BULK" 2>/dev/null) || {
+  err "fingerprint corpus impossible : $BULK"; exit 1;
+}
+if [ -n "$MAPPING_FILE" ]; then
+  probe_mapping_identity=$(stat -Lc '%d:%i:%s:%Y' "$MAPPING_FILE" 2>/dev/null) || {
+    err "fingerprint mapping impossible : $MAPPING_FILE"; exit 1;
+  }
+else
+  probe_mapping_identity="mapping-minimal-interne"
+fi
+PROBE_MANIFEST_PAYLOAD=$(printf '%s\n' \
+  "protocol=$PROBE_PROTOCOL_VERSION" \
+  "corpus_path=$BULK" \
+  "corpus_identity=$probe_corpus_identity" \
+  "corpus_docs=$NDOCS" \
+  "mapping_identity=$probe_mapping_identity" \
+  "probe_field_nom=$PROBE_FIELD_NOM" \
+  "probe_field_prenoms=$PROBE_FIELD_PRENOMS" \
+  "probe_fixed_term=$PROBE_FIXED_TERM" \
+  "probe_requests=$PROBE_REQUESTS" \
+  "probe_names_n=$PROBE_NAMES_N" \
+  "probe_names_wanted=$want_probe_n" \
+  "request_cache=false")
+PROBE_FINGERPRINT=$(printf '%s\n' "$PROBE_MANIFEST_PAYLOAD" | cksum | awk '{print $1 ":" $2}')
+PROBE_CACHE_STALE=0
+if [ ! -s "$PROBE_MANIFEST" ] \
+   || [ "$(sed -n 's/^fingerprint=//p' "$PROBE_MANIFEST" 2>/dev/null | tail -1)" != "$PROBE_FINGERPRINT" ]; then
+  PROBE_CACHE_STALE=1
+  log "manifeste de sondes stale/absent : régénération complète (fingerprint=$PROBE_FINGERPRINT)"
+fi
+
 # ---- 1a. probe_names.tsv : échantillon déterministe tiré du corpus $BULK ----
 # JAMAIS shuf sans graine, JAMAIS $RANDOM : échantillonnage À PAS FIXE (1 doc toutes les
 # NDOCS/PROBE_NAMES_N lignes-doc). Comme on échantillonne le corpus BRUT (pas une liste de noms
@@ -168,9 +230,7 @@ log "corpus prêt : $NDOCS docs ($(du -h "$BULK" | cut -f1))"
 # proportionnellement à sa fréquence dans le corpus) : exactement le trafic matchID réel, sans
 # inventer de distribution. Généré UNE FOIS avant la boucle ENGINES -> fichier partagé, identique
 # pour ES et surch.
-PROBE_NAMES="$OUT_DIR/probe_names.tsv"
-want_probe_n=$NDOCS; [ "$want_probe_n" -gt "$PROBE_NAMES_N" ] && want_probe_n=$PROBE_NAMES_N
-if [ ! -s "$PROBE_NAMES" ] || [ "$(wc -l < "$PROBE_NAMES")" -ne "$want_probe_n" ]; then
+if [ "$PROBE_CACHE_STALE" = "1" ] || [ ! -s "$PROBE_NAMES" ] || [ "$(wc -l < "$PROBE_NAMES")" -ne "$want_probe_n" ]; then
   log "génération probe_names.tsv ($want_probe_n paires, pas fixe depuis \$BULK, champs $PROBE_FIELD_NOM/$PROBE_FIELD_PRENOMS)"
   awk -v ndocs="$NDOCS" -v n="$PROBE_NAMES_N" -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" '
     function esc(x){ gsub(/[[:cntrl:]\\"]/,"",x); return x }
@@ -193,21 +253,23 @@ if [ ! -s "$PROBE_NAMES" ] || [ "$(wc -l < "$PROBE_NAMES")" -ne "$want_probe_n" 
         nextd += stride
       }
     }
-  ' "$BULK" > "$PROBE_NAMES"
+  ' "$BULK" > "$PROBE_NAMES" || { err "échec génération probe_names.tsv"; exit 1; }
 fi
 PROBE_NAMES_COUNT=$(wc -l < "$PROBE_NAMES" 2>/dev/null); PROBE_NAMES_COUNT=${PROBE_NAMES_COUNT:-0}
+[ "$PROBE_NAMES_COUNT" -eq "$want_probe_n" ] || {
+  err "probe_names.tsv invalide : $PROBE_NAMES_COUNT/$want_probe_n lignes"; exit 1;
+}
 log "probe_names.tsv prêt : $PROBE_NAMES_COUNT paires nom/prenoms"
 
 # ---- 1b (préparation) : requêtes random pré-générées, IDENTIQUES pour les 2 moteurs ----
 # Séquence d'indices déterministe dans probe_names.tsv (LCG à graine fixe -> reproductible,
-# jamais $RANDOM/shuf) ; mix 50/50 match/bool décidé par la parité de l'index (même convention
-# que scripts/bench/artillery-replay.sh). size:10 OBLIGATOIRE (force le fetch _source, le poste
+# jamais $RANDOM/shuf) ; mix 50/50 match/bool décidé par la parité de l'itération. Le LCG ne
+# choisit que le nom : sa précision flottante awk ne peut donc plus biaiser le mix. size:10
+# OBLIGATOIRE (force le fetch _source, le poste
 # page-cache le plus gros — cf brainstorm-4-fronts-2026-07-09.md P2). Un seul fichier de bodies
 # généré ICI (pas par moteur) -> même fichier monté dans les 2 conteneurs = mêmes requêtes, même
 # ordre, par construction (pas seulement "en principe").
-PROBE_IDX="$OUT_DIR/probe_idx.txt"
-PROBE_BODIES="$OUT_DIR/probe_rand_bodies.ndjson"
-if [ "$PROBE_NAMES_COUNT" -gt 0 ] && { [ ! -s "$PROBE_BODIES" ] || [ "$(wc -l < "$PROBE_BODIES")" -ne "$PROBE_REQUESTS" ]; }; then
+if [ "$PROBE_CACHE_STALE" = "1" ] || [ ! -s "$PROBE_BODIES" ] || [ "$(wc -l < "$PROBE_BODIES")" -ne "$PROBE_REQUESTS" ]; then
   log "génération séquence random ($PROBE_REQUESTS requêtes, LCG graine fixe, fichier partagé ES/surch)"
   awk -v n="$PROBE_REQUESTS" -v maxidx="$PROBE_NAMES_COUNT" -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" \
       -v idxout="$PROBE_IDX" -v namesfile="$PROBE_NAMES" '
@@ -220,7 +282,7 @@ if [ "$PROBE_NAMES_COUNT" -gt 0 ] && { [ ! -s "$PROBE_BODIES" ] || [ "$(wc -l < 
         idx = (seed % maxidx) + 1
         print idx > idxout
         split(names[idx], f, "\t")
-        if (idx % 2 == 0) {
+        if (i % 2 == 0) {
           printf "{\"query\":{\"match\":{\"%s\":\"%s\"}},\"size\":10}\n", fnom, f[1]
         } else {
           printf "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"%s\":\"%s\"}},{\"match\":{\"%s\":\"%s\"}}]}},\"size\":10}\n", fnom, f[1], fpre, f[2]
@@ -229,14 +291,340 @@ if [ "$PROBE_NAMES_COUNT" -gt 0 ] && { [ ! -s "$PROBE_BODIES" ] || [ "$(wc -l < 
       close(idxout)
       exit
     }
-  ' > "$PROBE_BODIES"
+  ' > "$PROBE_BODIES" || { err "échec génération probe_rand_bodies.ndjson"; exit 1; }
 fi
-log "sonde random prête : $(wc -l < "$PROBE_BODIES" 2>/dev/null || echo 0) requêtes pré-générées"
+[ "$(wc -l < "$PROBE_IDX" 2>/dev/null || echo 0)" -eq "$PROBE_REQUESTS" ] || {
+  err "probe_idx.txt invalide : nombre de lignes différent de $PROBE_REQUESTS"; exit 1;
+}
+[ "$(wc -l < "$PROBE_BODIES" 2>/dev/null || echo 0)" -eq "$PROBE_REQUESTS" ] || {
+  err "probe_rand_bodies.ndjson invalide : nombre de lignes différent de $PROBE_REQUESTS"; exit 1;
+}
+if [ "$SURCH_SOURCE_FETCH_PROFILE" = "1" ]; then
+  probe_match_count=$(grep -c '"query":{"match"' "$PROBE_BODIES" 2>/dev/null || true)
+  probe_bool_count=$(grep -c '"query":{"bool"' "$PROBE_BODIES" 2>/dev/null || true)
+  cold_match_count=$(head -n 50 "$PROBE_BODIES" | grep -c '"query":{"match"' || true)
+  cold_bool_count=$(head -n 50 "$PROBE_BODIES" | grep -c '"query":{"bool"' || true)
+  [ "$probe_match_count" -eq 500 ] && [ "$probe_bool_count" -eq 500 ] \
+    && [ "$cold_match_count" -eq 25 ] && [ "$cold_bool_count" -eq 25 ] || {
+      err "mix L2 invalide : warm match/bool=$probe_match_count/$probe_bool_count, cold=$cold_match_count/$cold_bool_count"; exit 1;
+    }
+fi
+log "sonde random prête : $PROBE_REQUESTS requêtes pré-générées"
+
+# L2 : toutes les sondes partent de corps pré-générés et les temps bruts sont
+# conservés. Le témoin est volontairement la même séquence random, mais
+# `size:0` : le code search court-circuite alors documents_by_internal_ids.
+if [ "$PROBE_CACHE_STALE" = "1" ] || [ ! -s "$PROBE_FIXED_BODIES" ] || [ "$(wc -l < "$PROBE_FIXED_BODIES")" -ne "$PROBE_REQUESTS" ]; then
+  awk -v n="$PROBE_REQUESTS" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" \
+    'BEGIN { for (i = 1; i <= n; i++) printf "{\"query\":{\"match\":{\"%s\":\"%s\"}},\"size\":10}\n", fnom, term }' \
+    > "$PROBE_FIXED_BODIES" || { err "échec génération probe_fixed_bodies.ndjson"; exit 1; }
+fi
+if [ "$PROBE_CACHE_STALE" = "1" ] || [ ! -s "$PROBE_CONTROL_BODIES" ] || [ "$(wc -l < "$PROBE_CONTROL_BODIES")" -ne "$PROBE_REQUESTS" ]; then
+  sed 's/"size":10}/"size":0}/' "$PROBE_BODIES" > "$PROBE_CONTROL_BODIES" \
+    || { err "échec génération probe_no_source_bodies.ndjson"; exit 1; }
+fi
+[ "$(wc -l < "$PROBE_FIXED_BODIES" 2>/dev/null || echo 0)" -eq "$PROBE_REQUESTS" ] || {
+  err "probe_fixed_bodies.ndjson invalide : nombre de lignes différent de $PROBE_REQUESTS"; exit 1;
+}
+[ "$(wc -l < "$PROBE_CONTROL_BODIES" 2>/dev/null || echo 0)" -eq "$PROBE_REQUESTS" ] || {
+  err "probe_no_source_bodies.ndjson invalide : nombre de lignes différent de $PROBE_REQUESTS"; exit 1;
+}
+[ "$(grep -c '"size":0}' "$PROBE_CONTROL_BODIES" 2>/dev/null || echo 0)" -eq "$PROBE_REQUESTS" ] || {
+  err "probe_no_source_bodies.ndjson ne contient pas exactement $PROBE_REQUESTS témoins size:0"; exit 1;
+}
+printf '%s\nfingerprint=%s\n' "$PROBE_MANIFEST_PAYLOAD" "$PROBE_FINGERPRINT" > "$PROBE_MANIFEST" \
+  || { err "écriture manifeste de sondes impossible"; exit 1; }
 
 docker network create "$NET" >/dev/null 2>&1 || true
 
 # ---- helper : mesure RSS conteneur (memory.current, page-cache inclus) ----
 sample_rss(){ docker stats --no-stream --format '{{.MemUsage}}' "$1" 2>/dev/null | awk '{print $1}'; }
+
+# Les fichiers de séries restent possédés par le runner. Le conteneur curl ne
+# reçoit qu'un mount lecture seule des corps et écrit ses `time_total` sur sa
+# sortie standard : aucun UID de curlimages/curl ne peut alors rendre un bind
+# mount hôte vide ou partiellement écrit.
+probe_series_file_is_valid(){
+  local raw="$1" wanted="$2" phase="$3" got
+  got=$(wc -l < "$raw" 2>/dev/null); got=${got:-0}
+  if [ "$got" -ne "$wanted" ]; then
+    PROBE_CAPTURE_REASON="${phase}_line_count_${got}_of_${wanted}"
+    return 1
+  fi
+  if ! awk 'NF != 1 || $1 !~ /^[0-9]+([.][0-9]+)?$/ || ($1 + 0) < 0 { exit 1 }' "$raw"; then
+    PROBE_CAPTURE_REASON="${phase}_non_numeric_latency_sample"
+    return 1
+  fi
+}
+
+# Écrit exactement une latence curl par ligne (secondes) dans $3. Le démarrage
+# du conteneur est hors `time_total`, comme dans le protocole historique, mais
+# tout HTTP 4xx/5xx et tout nombre de lignes inattendu invalident la série.
+capture_probe_samples(){
+  local base="$1" bodies="$2" raw="$3" wanted="$4" phase="$5"
+  PROBE_CAPTURE_REASON=""
+  : > "$raw"
+  if ! docker run --rm $AUXCAP --network "$NET" \
+    -v "$bodies:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -eu -c '
+      base=$1
+      while IFS= read -r body; do
+        curl --fail-with-body --silent --show-error --output /dev/null \
+          --write-out "%{time_total}\\n" \
+          "$base/deces_bench/_search?request_cache=false" \
+          -H "Content-Type: application/json" -d "$body"
+      done < /bodies.ndjson
+    ' sh "$base" > "$raw"; then
+    PROBE_CAPTURE_REASON="${phase}_curl_exit_nonzero"
+    return 1
+  fi
+  probe_series_file_is_valid "$raw" "$wanted" "$phase"
+}
+
+probe_quantiles(){
+  sort -n "$1" | awk '
+    function nearest_rank(n, q, raw, rank) {
+      raw = n * q
+      rank = int(raw)
+      if (rank < raw) rank++
+      return (rank < 1) ? 1 : rank
+    }
+    { a[NR] = $1 }
+    END {
+      if (NR == 0) exit 1
+      p50 = nearest_rank(NR, 0.50)
+      p95 = nearest_rank(NR, 0.95)
+      p99 = nearest_rank(NR, 0.99)
+      printf "%.2f %.2f %.2f", a[p50] * 1000, a[p95] * 1000, a[p99] * 1000
+    }'
+}
+
+# Snapshot Prometheus brut par phase. Les compteurs restent bornés côté
+# serveur; les distributions exactes sont dans le JSONL, jamais dans des
+# summaries Prometheus.
+snapshot_source_fetch_metrics(){
+  local base="$1" out="$2" phase="$3" require_metrics="$4"
+  SOURCE_FETCH_SCRAPE_REASON=""
+  : > "$out"
+  if ! docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
+    --fail-with-body --silent --show-error "$base/_prometheus_metrics" \
+    | awk '/^# (HELP|TYPE) surch_source_fetch_|^surch_source_fetch_/' > "$out"; then
+    SOURCE_FETCH_SCRAPE_REASON="${phase}_prometheus_curl_exit_nonzero"
+    return 1
+  fi
+  if [ "$require_metrics" = "1" ] \
+     && { [ ! -s "$out" ] \
+       || ! grep -q '^surch_source_fetch_requests_total' "$out" \
+       || ! grep -q '^surch_source_fetch_requested_ids_total' "$out" \
+       || ! grep -q '^surch_source_fetch_workers_total' "$out" \
+       || ! grep -q '^surch_source_fetch_profile_records_total' "$out"; }; then
+    SOURCE_FETCH_SCRAPE_REASON="${phase}_prometheus_expected_metrics_missing"
+    return 1
+  fi
+}
+
+# Soustrait seulement les compteurs monotones. Les summaries et les gauges ne
+# passent jamais cette barrière : aucun quantile Prometheus n'est donc delta.
+source_fetch_phase_delta(){
+  local before="$1" after="$2" out="$3"
+  awk '
+    function key(line, value_start, result) {
+      result = line
+      sub(/[[:space:]][^[:space:]]+$/, "", result)
+      return result
+    }
+    NR == FNR {
+      if ($0 ~ /^surch_source_fetch_.*_total(\{|[[:space:]])/) previous[key($0)] = $NF + 0
+      next
+    }
+    $0 ~ /^surch_source_fetch_.*_total(\{|[[:space:]])/ {
+      sample = key($0)
+      printf "%s %.17g\n", sample, (($NF + 0) - ((sample in previous) ? previous[sample] : 0))
+    }
+  ' "$before" "$after" > "$out"
+}
+
+# Somme un compteur dans un delta Prometheus. Les familles sont connues et
+# sans labels libres; un nom absent vaut zero pour rendre les gates explicites.
+source_fetch_counter_total(){
+  local delta="$1" metric="$2"
+  awk -v metric="$metric" '
+    substr($1, 1, length(metric)) == metric && (substr($1, length(metric) + 1, 1) == "" || substr($1, length(metric) + 1, 1) == "{") {
+      total += $NF
+    }
+    END { printf "%.0f", total + 0 }
+  ' "$delta"
+}
+
+# Exporte le prefixe nouveau d'un JSONL append-only apres une phase stable.
+# Le runner ne lit le fichier qu'apres le retour de tous les curls : il n'y a
+# donc pas de lecture concurrente d'une ligne en cours d'ecriture. Le JSONL
+# annote la phase ici, sous controle du harnais, pour les filtres/bootstrap.
+source_fetch_export_phase(){
+  local cid="$1" container_file="$2" snapshot="$3" out="$4" phase="$5" previous="$6"
+  SOURCE_FETCH_ARTIFACT_REASON=""
+  if ! docker cp "$cid:$container_file" "$snapshot" >/dev/null 2>&1; then
+    SOURCE_FETCH_ARTIFACT_REASON="${phase}_profile_jsonl_copy_failed"
+    return 1
+  fi
+  local total start
+  total=$(wc -l < "$snapshot" 2>/dev/null); total=${total:-0}
+  case "$total:$previous" in *[!0-9:]* )
+    SOURCE_FETCH_ARTIFACT_REASON="${phase}_profile_jsonl_count_invalid"; return 1;;
+  esac
+  if [ "$total" -lt "$previous" ]; then
+    SOURCE_FETCH_ARTIFACT_REASON="${phase}_profile_jsonl_non_monotonic"; return 1
+  fi
+  start=$((previous + 1))
+  if ! tail -n +"$start" "$snapshot" | awk -v phase="$phase" '
+    function has_number(name) {
+      return match($0, "\\\"" name "\\\":[0-9]+")
+    }
+    {
+      if ($0 !~ /^\{"mode":"(parallel|sequential)",/)
+        invalid = 1
+      split("requested_ids hydrated_hits bytes fetch_wall_us pread_sum_us pread_max_us decode_sum_us decode_max_us json_sum_us json_max_us workers_effectifs", names, " ")
+      for (i in names) if (!has_number(names[i])) invalid = 1
+      if (invalid) exit 1
+      sub(/}$/, ",\"phase\":\"" phase "\"}")
+      print
+    }
+  ' > "$out"; then
+    SOURCE_FETCH_ARTIFACT_REASON="${phase}_profile_jsonl_invalid"
+    return 1
+  fi
+  SOURCE_FETCH_ARTIFACT_RECORDS=$((total - previous))
+}
+
+# Le nombre de lignes exportees doit être celui que le compteur monotone dit
+# avoir ecrit. Toute erreur d'I/O ou troncature de la borne 4096 invalide L2.
+source_fetch_artifact_matches_delta(){
+  local delta="$1" artifact="$2"
+  local expected actual dropped failures
+  expected=$(source_fetch_counter_total "$delta" surch_source_fetch_profile_records_total)
+  dropped=$(source_fetch_counter_total "$delta" surch_source_fetch_profile_dropped_total)
+  failures=$(source_fetch_counter_total "$delta" surch_source_fetch_profile_write_failures_total)
+  actual=$(wc -l < "$artifact" 2>/dev/null); actual=${actual:-0}
+  [ "$expected" -eq "$actual" ] && [ "$dropped" -eq 0 ] && [ "$failures" -eq 0 ]
+}
+
+source_fetch_random_hydrated_eight_plus(){
+  awk '
+    /"phase":"random"/ {
+      value = $0
+      sub(/^.*"hydrated_hits":/, "", value)
+      sub(/,.*/, "", value)
+      if (value ~ /^[0-9]+$/ && value + 0 >= 8) count++
+    }
+    END { printf "%.0f", count + 0 }
+  ' "$1"
+}
+
+source_fetch_no_source_delta_is_zero(){
+  awk '
+    /^surch_source_fetch_(requests|hits|bytes|decoded_bytes)_total(\{|[[:space:]])/ {
+      seen = 1
+      if (($NF + 0) != 0) invalid = 1
+    }
+    END { exit !(seen && !invalid) }
+  ' "$1"
+}
+
+# Sonde froide L2 : chaque requête est précédée d'un reclaim cgroup v2. La
+# quantité demandée vise le cache `file` réellement observé. Chaque couple
+# before/after est conservé : aucune éviction partielle ambigüe n'est admise.
+capture_cold_samples(){
+  local base="$1" bodies="$2" raw="$3" audit="$4" reclaim_path="$5" stat_path="$6" current_path="$7" writer="$8" wanted="$9"
+  local body file_before file_after file_after_max memory_current reclaim_target
+  local sample completed=0 request_no
+  COLD_CAPTURE_REASON=""
+  COLD_CAPTURE_COMPLETED=0
+  : > "$raw"
+  : > "$audit"
+
+  while IFS= read -r body; do
+    [ "$completed" -ge "$wanted" ] && break
+    request_no=$((completed + 1))
+    file_before=$(awk '/^file /{print $2; exit}' "$stat_path" 2>/dev/null)
+    memory_current=$(cat "$current_path" 2>/dev/null)
+    case "$file_before" in ''|*[!0-9]*)
+      COLD_CAPTURE_REASON="memory_stat_or_current_invalid_before_request_$request_no"
+      COLD_CAPTURE_COMPLETED="$completed"
+      return 1;;
+    esac
+    case "$memory_current" in ''|*[!0-9]*)
+      COLD_CAPTURE_REASON="memory_stat_or_current_invalid_before_request_$request_no"
+      COLD_CAPTURE_COMPLETED="$completed"
+      return 1;;
+    esac
+    file_after_max=$(( file_before / 5 ))
+    if [ "$file_after_max" -lt "$COLD_FILE_CACHE_FLOOR_BYTES" ]; then
+      file_after_max="$COLD_FILE_CACHE_FLOOR_BYTES"
+    fi
+    reclaim_target="$file_before"
+    if [ "$reclaim_target" -gt "$memory_current" ]; then
+      reclaim_target="$memory_current"
+    fi
+
+    if [ "$writer" = "sudo" ]; then
+      if ! sudo -n sh -c 'printf "%s\\n" "$1" > "$2"' sh "$reclaim_target" "$reclaim_path" >/dev/null 2>&1; then
+        COLD_CAPTURE_REASON="memory_reclaim_write_failed_before_request_$request_no"
+        COLD_CAPTURE_COMPLETED="$completed"
+        return 1
+      fi
+    elif ! printf '%s\n' "$reclaim_target" > "$reclaim_path"; then
+      COLD_CAPTURE_REASON="memory_reclaim_write_failed_before_request_$request_no"
+      COLD_CAPTURE_COMPLETED="$completed"
+      return 1
+    fi
+    file_after=$(awk '/^file /{print $2; exit}' "$stat_path" 2>/dev/null)
+    case "$file_after" in ''|*[!0-9]*)
+      COLD_CAPTURE_REASON="memory_stat_file_absent_after_request_$request_no"
+      COLD_CAPTURE_COMPLETED="$completed"
+      return 1;;
+    esac
+    if [ "$file_after" -gt "$file_after_max" ]; then
+      COLD_CAPTURE_REASON="memory_reclaim_target_missed_before_request_${request_no}_after_${file_after}_max_${file_after_max}"
+      COLD_CAPTURE_COMPLETED="$completed"
+      return 1
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$request_no" "$file_before" "$file_after" "$file_after_max" >> "$audit"
+
+    if ! sample=$(printf '%s\n' "$body" | docker run -i --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
+      sh -eu -c 'IFS= read -r body; curl --fail-with-body --silent --show-error --output /dev/null --write-out "%{time_total}\\n" "$1/deces_bench/_search?request_cache=false" -H "Content-Type: application/json" -d "$body"' \
+      sh "$base"); then
+      COLD_CAPTURE_REASON="cold_curl_exit_nonzero_after_reclaim_$request_no"
+      COLD_CAPTURE_COMPLETED="$completed"
+      return 1
+    fi
+    if ! printf '%s\n' "$sample" | awk 'NF == 1 && $1 ~ /^[0-9]+([.][0-9]+)?$/ && ($1 + 0) >= 0 { ok = 1 } END { exit !ok }'; then
+      COLD_CAPTURE_REASON="cold_non_numeric_latency_sample_after_reclaim_$request_no"
+      COLD_CAPTURE_COMPLETED="$completed"
+      return 1
+    fi
+    printf '%s\n' "$sample" >> "$raw"
+    completed=$((completed + 1))
+  done < "$bodies"
+
+  COLD_CAPTURE_COMPLETED="$completed"
+  if [ "$completed" -ne "$wanted" ]; then
+    COLD_CAPTURE_REASON="probe_bodies_short_${completed}_of_${wanted}"
+    return 1
+  fi
+  [ "$(wc -l < "$audit" 2>/dev/null || echo 0)" -eq "$wanted" ] || {
+    COLD_CAPTURE_REASON="cold_reclaim_audit_count_invalid"
+    return 1
+  }
+  probe_series_file_is_valid "$raw" "$wanted" cold
+}
+
+# Un échec de sonde reste visible dans la scorecard sans inventer des
+# quantiles à zéro. Le code appelant reçoit aussi un statut non nul pour
+# arrêter le run avec un échec fermé après avoir conservé ce diagnostic.
+record_invalid_measurement(){
+  local engine="$1" count="$2" indexed="$3" item_errors="$4" reason="$5"
+  printf '{"engine":"%s","mem_limit":"%s","cpuset":"%s","survived_boot":true,"survived_index":true,"count":%s,"expected":%s,"indexed":%s,"item_errors":%s,"measurement_valid":false,"measurement_invalid_reason":"%s","lat_p50_ms":null,"lat_p95_ms":null,"lat_p99_ms":null,"lat_rand_p50_ms":null,"lat_rand_p95_ms":null,"lat_rand_p99_ms":null,"lat_no_source_p50_ms":null,"lat_no_source_p95_ms":null,"lat_no_source_p99_ms":null,"lat_cold_p50_ms":null,"lat_cold_p95_ms":null,"lat_cold_p99_ms":null}\n' \
+    "$engine" "$MEM_LIMIT" "$CPUSET" "$count" "$NDOCS" "$indexed" "$item_errors" "$reason" > "$OUT_DIR/$engine.json"
+}
 
 run_engine(){
   local ENGINE="$1" CID PORT HEAP HALF
@@ -269,29 +657,38 @@ run_engine(){
       ${SURCH_DENSIFY_BUDGET_DOCS:+-e SURCH_DENSIFY_BUDGET_DOCS="$SURCH_DENSIFY_BUDGET_DOCS"} \
       ${SURCH_SOURCE_COMPRESS:+-e SURCH_SOURCE_COMPRESS="$SURCH_SOURCE_COMPRESS"} \
       ${SURCH_SOURCE_FETCH_PARALLEL:+-e SURCH_SOURCE_FETCH_PARALLEL="$SURCH_SOURCE_FETCH_PARALLEL"} \
+      -e SURCH_SOURCE_FETCH_PROFILE="$SURCH_SOURCE_FETCH_PROFILE" \
+      -e SURCH_SOURCE_FETCH_PROFILE_FILE="$SURCH_SOURCE_FETCH_PROFILE_FILE" \
       "$SURCH_IMAGE" >/dev/null 2>&1
   fi
 
   # attendre healthy (ou détecter OOM précoce)
   local up=0 i
   for i in $(seq 1 60); do
-    if docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s "$BASE/" >/dev/null 2>&1; then up=1; break; fi
+    if docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
+      --fail-with-body --silent --show-error "$BASE/" >/dev/null 2>&1; then up=1; break; fi
     [ "$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null)" = "true" ] && break
     sleep 2
   done
   if [ "$up" != 1 ]; then
     err "$ENGINE : pas UP (OOMKilled=$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null))"
     echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"survived_boot\":false}" > "$OUT_DIR/$ENGINE.json"
-    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
 
   # créer l'index : mapping fourni (MAPPING_FILE) ou mapping minimal texte français en dur
   if [ -n "$MAPPING_FILE" ]; then
-    docker run --rm $AUXCAP --network "$NET" -v "$MAPPING_FILE:/mapping.json:ro" curlimages/curl:8.10.1 \
-      -s -XPUT "$BASE/deces_bench" -H 'Content-Type: application/json' --data-binary @/mapping.json >/dev/null 2>&1
+    if ! docker run --rm $AUXCAP --network "$NET" -v "$MAPPING_FILE:/mapping.json:ro" curlimages/curl:8.10.1 \
+      --fail-with-body --silent --show-error -XPUT "$BASE/deces_bench" -H 'Content-Type: application/json' --data-binary @/mapping.json >/dev/null; then
+      err "$ENGINE : création index avec mapping impossible"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
   else
-    docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s -XPUT "$BASE/deces_bench" \
-      -H 'Content-Type: application/json' -d '{"mappings":{"properties":{"nom":{"type":"text"},"prenoms":{"type":"text"},"lieu_naissance":{"type":"text"},"sexe":{"type":"keyword"},"date_naissance":{"type":"keyword"},"date_deces":{"type":"keyword"}}}}' >/dev/null 2>&1
+    if ! docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 --fail-with-body --silent --show-error -XPUT "$BASE/deces_bench" \
+      -H 'Content-Type: application/json' -d '{"mappings":{"properties":{"nom":{"type":"text"},"prenoms":{"type":"text"},"lieu_naissance":{"type":"text"},"sexe":{"type":"keyword"},"date_naissance":{"type":"keyword"},"date_deces":{"type":"keyword"}}}}' >/dev/null; then
+      err "$ENGINE : création index avec mapping minimal impossible"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
   fi
 
   # indexation chronométrée : bulk SÉRIE chunké (10k docs/req = 20k lignes NDJSON)
@@ -368,7 +765,7 @@ run_engine(){
   if [ "$oom" = "true" ] || [ "$running" != "true" ]; then
     err "$ENGINE : OOM/mort sous $MEM_LIMIT (count=$cnt/$NDOCS OOM=$oom running=$running)"
     echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"survived_boot\":true,\"survived_index\":false,\"oom\":\"$oom\",\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err}" > "$OUT_DIR/$ENGINE.json"
-    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
   # (2) échec bulk : chunk KO après retries (hard_fail), OU count < ce qu'on a réellement indexé
   #     (perte silencieuse). On ÉCHOUE BRUYAMMENT avec le détail — jamais un faux succès.
@@ -377,7 +774,7 @@ run_engine(){
     err "  chunks KO=$failed_chunks — extrait bulklog :"
     grep -E '^\[chunk|ECHEC|resp head|BULKRESULT' "$BOUT" 2>/dev/null | tail -12 | while IFS= read -r l; do err "    $l"; done
     echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"survived_boot\":true,\"survived_index\":false,\"bulk_failed\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"failed_chunks\":\"$failed_chunks\"}" > "$OUT_DIR/$ENGINE.json"
-    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
   # succès : count >= attendu_indexé. Si des docs source ont été rejetés (item_err>0), c'est LÉGITIME
   # (JSON source invalide, perdu aussi par ES) et explicitement signalé — pas un count silencieusement court.
@@ -422,48 +819,137 @@ run_engine(){
     done <<< "$vent_listing"
     disk_bytes_postings=$bp; disk_bytes_subfields=$bsub; disk_bytes_source=$bsrc
     disk_bytes_fst_merge=$bfst; disk_bytes_other=$both; files_postings_count=$fpc
-    segment_count=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s "$BASE/_prometheus_metrics" 2>/dev/null | awk '/^surch_index_segment_count\{/{print $NF; exit}')
+    segment_count=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 --fail-with-body --silent --show-error "$BASE/_prometheus_metrics" 2>/dev/null | awk '/^surch_index_segment_count\{/{print $NF; exit}')
     [ -z "$segment_count" ] && segment_count="null"
   fi
 
-  # sonde latence FIXE (continuité historique — CONSERVÉE À L'IDENTIQUE, cf brainstorm
-  # b1/P2) : PROBE_REQUESTS requêtes match dans UN SEUL conteneur curl (éviter de mesurer le
-  # démarrage conteneur au lieu de la requête).
+  # Sondes L2 : les séries brutes (une ligne `time_total` par requête) sont
+  # conservées pour bootstrap/IC95. La sonde fixe utilise le champ configuré,
+  # donc `NOM` sur le mapping 28M et non l'ancien `nom` zéro-hit.
+  local fixed_raw="$OUT_DIR/$ENGINE.lat_fixed_s"
+  local random_raw="$OUT_DIR/$ENGINE.lat_random_s"
+  local no_source_raw="$OUT_DIR/$ENGINE.lat_no_source_s"
+  local source_fetch_profile_enabled=false source_fetch_profile_valid=true source_fetch_profile_reason=""
+  local source_fetch_before_fixed="null" source_fetch_after_fixed="null" source_fetch_after_random="null"
+  local source_fetch_after_no_source="null" source_fetch_after_cold="null"
+  local source_fetch_fixed_delta="null" source_fetch_random_delta="null" source_fetch_no_source_delta="null"
+  local source_fetch_cold_delta="null" source_fetch_random_hydrated_8plus_requests="null"
+  local source_fetch_random_hydrated_8plus_gate="null" source_fetch_random_worker_participations="null"
+  local source_fetch_profile_snapshot="null" source_fetch_fixed_jsonl="null" source_fetch_random_jsonl="null"
+  local source_fetch_no_source_jsonl="null" source_fetch_cold_jsonl="null" source_fetch_profile_previous=0
+  if [ "$ENGINE" = "surch" ] && [ "$SURCH_SOURCE_FETCH_PROFILE" = "1" ]; then
+    source_fetch_profile_enabled=true
+    source_fetch_before_fixed="$OUT_DIR/$ENGINE.source_fetch.before_fixed.prom"
+    source_fetch_after_fixed="$OUT_DIR/$ENGINE.source_fetch.after_fixed.prom"
+    source_fetch_after_random="$OUT_DIR/$ENGINE.source_fetch.after_random.prom"
+    source_fetch_after_no_source="$OUT_DIR/$ENGINE.source_fetch.after_no_source.prom"
+    source_fetch_after_cold="$OUT_DIR/$ENGINE.source_fetch.after_cold.prom"
+    source_fetch_fixed_delta="$OUT_DIR/$ENGINE.source_fetch.fixed.delta.prom"
+    source_fetch_random_delta="$OUT_DIR/$ENGINE.source_fetch.random.delta.prom"
+    source_fetch_no_source_delta="$OUT_DIR/$ENGINE.source_fetch.no_source.delta.prom"
+    source_fetch_cold_delta="$OUT_DIR/$ENGINE.source_fetch.cold.delta.prom"
+    source_fetch_profile_snapshot="$OUT_DIR/$ENGINE.source_fetch.profile.snapshot.jsonl"
+    source_fetch_fixed_jsonl="$OUT_DIR/$ENGINE.source_fetch.fixed.jsonl"
+    source_fetch_random_jsonl="$OUT_DIR/$ENGINE.source_fetch.random.jsonl"
+    source_fetch_no_source_jsonl="$OUT_DIR/$ENGINE.source_fetch.no_source.jsonl"
+    source_fetch_cold_jsonl="$OUT_DIR/$ENGINE.source_fetch.cold.jsonl"
+    if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_before_fixed" before_fixed 0; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="$SOURCE_FETCH_SCRAPE_REASON"
+    fi
+  fi
+  if ! capture_probe_samples "$BASE" "$PROBE_FIXED_BODIES" "$fixed_raw" "$PROBE_REQUESTS" fixed; then
+    err "$ENGINE : série fixe invalide : $PROBE_CAPTURE_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  fi
   local lat50 lat95 lat99
-  read -r lat50 lat95 lat99 < <(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 sh -c "
-    for i in \$(seq 1 $PROBE_REQUESTS); do
-      curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
-        -H 'Content-Type: application/json' \
-        -d '{\"query\":{\"match\":{\"nom\":\"MARTIN\"}},\"size\":10}'
-    done" 2>/dev/null | sort -n | awk -v n="$PROBE_REQUESTS" '{a[NR]=$1} END{printf "%.2f %.2f %.2f", a[int(n*0.5)]*1000, a[int(n*0.95)]*1000, a[int(n*0.99)]*1000}')
-  lat50=${lat50:-0}; lat95=${lat95:-0}; lat99=${lat99:-0}
-
-  # ---- 1b. sonde RANDOM warm : PROBE_BODIES pré-généré, IDENTIQUE pour les 2 moteurs ----
-  # Mix 50/50 match/bool, size:10 (fetch _source). Même mécanique que la sonde fixe (un seul
-  # conteneur curl, boucle, time_total -> seul le démarrage du CONTENEUR docker est hors mesure,
-  # comme pour la sonde fixe ; curl lui-même mesure sa propre requête via -w, pas le shell).
-  local latr50=0 latr95=0 latr99=0
-  if [ -s "$PROBE_BODIES" ]; then
-    read -r latr50 latr95 latr99 < <(docker run --rm $AUXCAP --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
-      while IFS= read -r body; do
-        curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
-          -H 'Content-Type: application/json' -d \"\$body\"
-      done < /bodies.ndjson" 2>/dev/null | sort -n | awk -v n="$PROBE_REQUESTS" '{a[NR]=$1} END{printf "%.2f %.2f %.2f", a[int(n*0.5)]*1000, a[int(n*0.95)]*1000, a[int(n*0.99)]*1000}')
-    latr50=${latr50:-0}; latr95=${latr95:-0}; latr99=${latr99:-0}
+  read -r lat50 lat95 lat99 < <(probe_quantiles "$fixed_raw")
+  if [ "$source_fetch_profile_enabled" = true ]; then
+    if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_fixed" after_fixed 1; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${source_fetch_profile_reason:-$SOURCE_FETCH_SCRAPE_REASON}"
+    fi
+    source_fetch_phase_delta "$source_fetch_before_fixed" "$source_fetch_after_fixed" "$source_fetch_fixed_delta"
+    if ! source_fetch_export_phase "$CID" "$SURCH_SOURCE_FETCH_PROFILE_FILE" "$source_fetch_profile_snapshot" "$source_fetch_fixed_jsonl" fixed "$source_fetch_profile_previous" \
+       || ! source_fetch_artifact_matches_delta "$source_fetch_fixed_delta" "$source_fetch_fixed_jsonl"; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${SOURCE_FETCH_ARTIFACT_REASON:-fixed_profile_jsonl_counter_mismatch}"
+    else
+      source_fetch_profile_previous=$((source_fetch_profile_previous + SOURCE_FETCH_ARTIFACT_RECORDS))
+    fi
+  fi
+  if ! capture_probe_samples "$BASE" "$PROBE_BODIES" "$random_raw" "$PROBE_REQUESTS" random; then
+    err "$ENGINE : série random invalide : $PROBE_CAPTURE_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  fi
+  local latr50 latr95 latr99
+  read -r latr50 latr95 latr99 < <(probe_quantiles "$random_raw")
+  if [ "$source_fetch_profile_enabled" = true ]; then
+    if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_random" after_random 1; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${source_fetch_profile_reason:-$SOURCE_FETCH_SCRAPE_REASON}"
+    fi
+    source_fetch_phase_delta "$source_fetch_after_fixed" "$source_fetch_after_random" "$source_fetch_random_delta"
+    if ! source_fetch_export_phase "$CID" "$SURCH_SOURCE_FETCH_PROFILE_FILE" "$source_fetch_profile_snapshot" "$source_fetch_random_jsonl" random "$source_fetch_profile_previous" \
+       || ! source_fetch_artifact_matches_delta "$source_fetch_random_delta" "$source_fetch_random_jsonl"; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${SOURCE_FETCH_ARTIFACT_REASON:-random_profile_jsonl_counter_mismatch}"
+    else
+      source_fetch_profile_previous=$((source_fetch_profile_previous + SOURCE_FETCH_ARTIFACT_RECORDS))
+    fi
+    source_fetch_random_hydrated_8plus_requests=$(source_fetch_random_hydrated_eight_plus "$source_fetch_random_jsonl")
+    source_fetch_random_worker_participations=$(source_fetch_counter_total "$source_fetch_random_delta" surch_source_fetch_workers_total)
+    if [ "$source_fetch_random_hydrated_8plus_requests" -gt 0 ]; then
+      source_fetch_random_hydrated_8plus_gate="pass"
+    else
+      source_fetch_random_hydrated_8plus_gate="fail"
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${source_fetch_profile_reason:-random_hydrated_8plus_absent}"
+    fi
+  fi
+  if ! capture_probe_samples "$BASE" "$PROBE_CONTROL_BODIES" "$no_source_raw" "$PROBE_REQUESTS" no_source; then
+    err "$ENGINE : série témoin size:0 invalide : $PROBE_CAPTURE_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  fi
+  local latn50 latn95 latn99
+  read -r latn50 latn95 latn99 < <(probe_quantiles "$no_source_raw")
+  if [ "$source_fetch_profile_enabled" = true ]; then
+    if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_no_source" after_no_source 1; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${source_fetch_profile_reason:-$SOURCE_FETCH_SCRAPE_REASON}"
+    fi
+    source_fetch_phase_delta "$source_fetch_after_random" "$source_fetch_after_no_source" "$source_fetch_no_source_delta"
+    if ! source_fetch_export_phase "$CID" "$SURCH_SOURCE_FETCH_PROFILE_FILE" "$source_fetch_profile_snapshot" "$source_fetch_no_source_jsonl" no_source "$source_fetch_profile_previous" \
+       || ! source_fetch_artifact_matches_delta "$source_fetch_no_source_delta" "$source_fetch_no_source_jsonl"; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${SOURCE_FETCH_ARTIFACT_REASON:-no_source_profile_jsonl_counter_mismatch}"
+    else
+      source_fetch_profile_previous=$((source_fetch_profile_previous + SOURCE_FETCH_ARTIFACT_RECORDS))
+    fi
+    if ! source_fetch_no_source_delta_is_zero "$source_fetch_no_source_delta"; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${source_fetch_profile_reason:-size_zero_hydration_delta_nonzero}"
+    fi
   fi
 
-  # ---- 1c. sonde COLD : éviction du page cache DU CONTENEUR SEUL (cgroup v2 memory.reclaim), ----
-  # puis re-sonde random IDENTIQUE. Best-effort : sudo -n d'abord (écriture root requise),
-  # sinon écriture directe (perms locales), sinon SKIP PROPRE documenté — ne casse jamais le run.
-  # memory.stat (anon vs file) est world-readable (pas besoin de root) et capturé dans tous les
-  # cas, avant et après la tentative, pour distinguer résident applicatif et cache (b1/P3).
-  local latc50=0 latc95=0 latc99=0 cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
+  # ---- 1c. sonde COLD : 50 requêtes, reclaim vérifié AVANT chacune ----
+  # Une unique éviction avant 1 000 requêtes se réchauffait et ne mesurait pas
+  # un accès froid. Le protocole L2 garde au plus COLD_PROBE_REQUESTS corps
+  # random, et invalide toute série où un reclaim n'est pas vérifié.
+  local latc50="null" latc95="null" latc99="null" cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
+  local cold_raw="$OUT_DIR/$ENGINE.lat_cold_s" cold_reclaimed_requests=0
+  local cold_reclaim_audit="$OUT_DIR/$ENGINE.cold_reclaim.tsv" cold_reclaim_audit_records=0
+  : > "$cold_reclaim_audit"
   local mem_anon_warm="null" mem_file_warm="null" mem_anon_cold="null" mem_file_cold="null"
-  local full_id cg_scope reclaim_path stat_path
+  local full_id cg_scope reclaim_path stat_path current_path reclaim_writer=""
   full_id=$(docker inspect -f '{{.Id}}' "$CID" 2>/dev/null)
   cg_scope="/sys/fs/cgroup/system.slice/docker-${full_id}.scope"
   reclaim_path="$cg_scope/memory.reclaim"
   stat_path="$cg_scope/memory.stat"
+  current_path="$cg_scope/memory.current"
   if [ -r "$stat_path" ]; then
     local v
     v=$(awk '/^anon /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v" ] && mem_anon_warm="$v"
@@ -471,50 +957,39 @@ run_engine(){
   fi
   if [ "$COLD_PROBE" != "1" ]; then
     cold_skip_reason="cold_probe_disabled"
-  elif [ ! -s "$PROBE_BODIES" ]; then
-    cold_skip_reason="probe_bodies_missing"
-  elif [ ! -e "$reclaim_path" ]; then
-    cold_skip_reason="cgroup_memory_reclaim_absent"
+  elif [ ! -r "$stat_path" ] || [ ! -r "$current_path" ]; then
+    cold_skip_reason="cgroup_memory_stat_unreadable"
+  elif [ -w "$reclaim_path" ]; then
+    reclaim_writer="direct"
+  elif sudo -n test -w "$reclaim_path" >/dev/null 2>&1; then
+    reclaim_writer="sudo"
   else
-    local mb bytes
-    mb=$(mem_to_mib "$MEM_LIMIT"); bytes=$(( mb * 1024 * 1024 * 2 ))   # agressif : 2x le cap
+    cold_skip_reason="cgroup_memory_reclaim_unwritable"
+  fi
+  if [ -n "$reclaim_writer" ]; then
     cold_attempted=true
-    if sudo -n sh -c "echo $bytes > '$reclaim_path'" >/dev/null 2>&1; then
-      cold_ok=true; cold_method="memory_reclaim"
-    elif echo "$bytes" > "$reclaim_path" 2>/dev/null; then
-      cold_ok=true; cold_method="memory_reclaim"
+    if capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS"; then
+      cold_ok=true
+      cold_method="memory_reclaim_file_target_verified_each_request"
+      cold_reclaimed_requests="$COLD_CAPTURE_COMPLETED"
+      read -r latc50 latc95 latc99 < <(probe_quantiles "$cold_raw")
     else
-      # FALLBACK sans root (gate 1,36M : memory.reclaim = Permission denied sans sudo) :
-      # abaisser temporairement le cap à anon+128 MiB via docker update force le noyau à
-      # évincer le page cache du conteneur (l'anon, non-évictable, tient dans la marge ;
-      # le moteur est au repos pendant la fenêtre). Même mécanisme pour les 2 moteurs.
-      # Impossible si anon+128 >= cap (ex. ES @1536m, heap ~= cap) -> skip documenté.
-      local anon_now squeeze_mib cap_mib
-      anon_now=$(awk '/^anon /{print $2}' "$stat_path" 2>/dev/null); anon_now=${anon_now:-0}
-      cap_mib=$(mem_to_mib "$MEM_LIMIT")
-      squeeze_mib=$(( anon_now / 1048576 + 128 ))
-      if [ "$squeeze_mib" -lt "$cap_mib" ] && \
-         docker update --memory="${squeeze_mib}m" --memory-swap="${squeeze_mib}m" "$CID" >/dev/null 2>&1; then
-        sleep 3
-        docker update --memory="$MEM_LIMIT" --memory-swap="$MEM_LIMIT" "$CID" >/dev/null 2>&1
-        if [ "$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null)" = "true" ]; then
-          cold_skip_reason="oom_during_squeeze"
-        else
-          cold_ok=true; cold_method="docker_update_squeeze"
-        fi
-      else
-        cold_skip_reason="no_write_perm_and_squeeze_impossible_anon${squeeze_mib}m_cap${cap_mib}m"
-      fi
+      cold_skip_reason="${COLD_CAPTURE_REASON:-cold_capture_failed}"
+      cold_reclaimed_requests="$COLD_CAPTURE_COMPLETED"
     fi
   fi
+  [ -f "$cold_raw" ] || : > "$cold_raw"
+  cold_reclaim_audit_records=$(wc -l < "$cold_reclaim_audit" 2>/dev/null); cold_reclaim_audit_records=${cold_reclaim_audit_records:-0}
   if [ "$cold_ok" = true ]; then
-    sleep 1   # laisser le noyau appliquer le reclaim avant re-sonde
-    read -r latc50 latc95 latc99 < <(docker run --rm $AUXCAP --network "$NET" -v "$PROBE_BODIES:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -c "
-      while IFS= read -r body; do
-        curl -s -w '%{time_total}\n' -o /dev/null '$BASE/deces_bench/_search' \
-          -H 'Content-Type: application/json' -d \"\$body\"
-      done < /bodies.ndjson" 2>/dev/null | sort -n | awk -v n="$PROBE_REQUESTS" '{a[NR]=$1} END{printf "%.2f %.2f %.2f", a[int(n*0.5)]*1000, a[int(n*0.95)]*1000, a[int(n*0.99)]*1000}')
-    latc50=${latc50:-0}; latc95=${latc95:-0}; latc99=${latc99:-0}
+    # Une série n'est cold que si ses N reclamations ont toutes été vérifiées.
+    if [ "$cold_reclaimed_requests" -ne "$COLD_PROBE_REQUESTS" ]; then
+      cold_ok=false
+      cold_skip_reason="reclaim_count_${cold_reclaimed_requests}_of_${COLD_PROBE_REQUESTS}"
+    fi
+    if [ "$cold_reclaim_audit_records" -ne 50 ]; then
+      cold_ok=false
+      cold_skip_reason="reclaim_audit_count_${cold_reclaim_audit_records}_of_50"
+    fi
   fi
   if [ -r "$stat_path" ]; then
     local v2
@@ -524,15 +999,68 @@ run_engine(){
   local cold_skip_json="null"; [ -n "$cold_skip_reason" ] && cold_skip_json="\"$cold_skip_reason\""
   local cold_method_json="null"; [ -n "$cold_method" ] && cold_method_json="\"$cold_method\""
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count}" > "$OUT_DIR/$ENGINE.json"
-  log "$ENGINE OK : ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe ${lat50}/${lat95}/${lat99} | rand ${latr50}/${latr95}/${latr99} | cold ${latc50}/${latc95}/${latc99} (attempted=$cold_attempted ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
+  if [ "$source_fetch_profile_enabled" = true ] && [ "$cold_ok" = true ]; then
+    if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_cold" after_cold 1; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${source_fetch_profile_reason:-$SOURCE_FETCH_SCRAPE_REASON}"
+    fi
+    source_fetch_phase_delta "$source_fetch_after_no_source" "$source_fetch_after_cold" "$source_fetch_cold_delta"
+    if ! source_fetch_export_phase "$CID" "$SURCH_SOURCE_FETCH_PROFILE_FILE" "$source_fetch_profile_snapshot" "$source_fetch_cold_jsonl" cold "$source_fetch_profile_previous" \
+       || ! source_fetch_artifact_matches_delta "$source_fetch_cold_delta" "$source_fetch_cold_jsonl"; then
+      source_fetch_profile_valid=false
+      source_fetch_profile_reason="${SOURCE_FETCH_ARTIFACT_REASON:-cold_profile_jsonl_counter_mismatch}"
+    else
+      source_fetch_profile_previous=$((source_fetch_profile_previous + SOURCE_FETCH_ARTIFACT_RECORDS))
+    fi
+  fi
+
+  local measurement_valid=true measurement_invalid_reason="null"
+  if [ "$cold_reclaimed_requests" -ne 50 ] || [ "$cold_reclaim_audit_records" -ne 50 ] || [ "$cold_ok" != true ]; then
+    measurement_valid=false
+    measurement_invalid_reason="\"${cold_skip_reason:-cold_capture_failed}\""
+  fi
+  if [ "$source_fetch_profile_enabled" = true ] && [ "$source_fetch_profile_valid" != true ]; then
+    measurement_valid=false
+    measurement_invalid_reason="\"${source_fetch_profile_reason:-source_fetch_profile_invalid}\""
+  fi
+  local source_fetch_profile_reason_json="null" source_fetch_random_gate_json="null"
+  [ -n "$source_fetch_profile_reason" ] && source_fetch_profile_reason_json="\"$source_fetch_profile_reason\""
+  [ "$source_fetch_random_hydrated_8plus_gate" != "null" ] && source_fetch_random_gate_json="\"$source_fetch_random_hydrated_8plus_gate\""
+  local source_fetch_before_json="null" source_fetch_fixed_json="null" source_fetch_random_json="null"
+  local source_fetch_no_source_json="null" source_fetch_cold_json="null"
+  local source_fetch_fixed_delta_json="null" source_fetch_random_delta_json="null"
+  local source_fetch_no_source_delta_json="null" source_fetch_cold_delta_json="null"
+  local source_fetch_fixed_jsonl_json="null" source_fetch_random_jsonl_json="null"
+  local source_fetch_no_source_jsonl_json="null" source_fetch_cold_jsonl_json="null"
+  [ "$source_fetch_before_fixed" = "null" ] || source_fetch_before_json="\"$source_fetch_before_fixed\""
+  [ "$source_fetch_after_fixed" = "null" ] || source_fetch_fixed_json="\"$source_fetch_after_fixed\""
+  [ "$source_fetch_after_random" = "null" ] || source_fetch_random_json="\"$source_fetch_after_random\""
+  [ "$source_fetch_after_no_source" = "null" ] || source_fetch_no_source_json="\"$source_fetch_after_no_source\""
+  [ "$source_fetch_after_cold" = "null" ] || source_fetch_cold_json="\"$source_fetch_after_cold\""
+  [ "$source_fetch_fixed_delta" = "null" ] || source_fetch_fixed_delta_json="\"$source_fetch_fixed_delta\""
+  [ "$source_fetch_random_delta" = "null" ] || source_fetch_random_delta_json="\"$source_fetch_random_delta\""
+  [ "$source_fetch_no_source_delta" = "null" ] || source_fetch_no_source_delta_json="\"$source_fetch_no_source_delta\""
+  [ "$source_fetch_cold_delta" = "null" ] || source_fetch_cold_delta_json="\"$source_fetch_cold_delta\""
+  [ "$source_fetch_fixed_jsonl" = "null" ] || source_fetch_fixed_jsonl_json="\"$source_fetch_fixed_jsonl\""
+  [ "$source_fetch_random_jsonl" = "null" ] || source_fetch_random_jsonl_json="\"$source_fetch_random_jsonl\""
+  [ "$source_fetch_no_source_jsonl" = "null" ] || source_fetch_no_source_jsonl_json="\"$source_fetch_no_source_jsonl\""
+  [ "$source_fetch_cold_jsonl" = "null" ] || source_fetch_cold_jsonl_json="\"$source_fetch_cold_jsonl\""
+  local source_fetch_prometheus_json="$source_fetch_no_source_json"
+  [ "$cold_ok" = true ] && source_fetch_prometheus_json="$source_fetch_cold_json"
+  local source_fetch_metrics_json="$source_fetch_prometheus_json,\"measurement_valid\":$measurement_valid,\"measurement_invalid_reason\":$measurement_invalid_reason,\"source_fetch_profile_valid\":$source_fetch_profile_valid,\"source_fetch_profile_invalid_reason\":$source_fetch_profile_reason_json,\"source_fetch_random_worker_participations\":$source_fetch_random_worker_participations,\"source_fetch_random_hydrated_8plus_requests\":$source_fetch_random_hydrated_8plus_requests,\"source_fetch_random_hydrated_8plus_gate\":$source_fetch_random_gate_json,\"source_fetch_jsonl\":{\"fixed\":$source_fetch_fixed_jsonl_json,\"random\":$source_fetch_random_jsonl_json,\"no_source\":$source_fetch_no_source_jsonl_json,\"cold\":$source_fetch_cold_jsonl_json},\"source_fetch_snapshots\":{\"before_fixed\":$source_fetch_before_json,\"after_fixed\":$source_fetch_fixed_json,\"after_random\":$source_fetch_random_json,\"after_no_source\":$source_fetch_no_source_json,\"after_cold\":$source_fetch_cold_json},\"source_fetch_deltas\":{\"fixed\":$source_fetch_fixed_delta_json,\"random\":$source_fetch_random_delta_json,\"no_source\":$source_fetch_no_source_delta_json,\"cold\":$source_fetch_cold_delta_json}"
+
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json}" > "$OUT_DIR/$ENGINE.json"
+  log "$ENGINE : mesure valide=$measurement_valid | ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe ${lat50}/${lat95}/${lat99} | rand ${latr50}/${latr95}/${latr99} | témoin ${latn50}/${latn95}/${latn99} | cold ${latc50}/${latc95}/${latc99} (reclaims=$cold_reclaimed_requests/50 audit=$cold_reclaim_audit_records/50 ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
   [ "$HOLD_SECONDS" -gt 0 ] 2>/dev/null && { log "$ENGINE : HOLD_SECONDS=$HOLD_SECONDS avant teardown (brancher artillery-replay.sh sur $NET / $CID)"; sleep "$HOLD_SECONDS"; }
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
+  [ "$measurement_valid" = true ]
 }
 
 ENGINES="${ENGINES:-es surch}"   # ex: ENGINES=surch pour rejouer un seul moteur
-for _e in $ENGINES; do run_engine "$_e"; done
+run_failed=0
+for _e in $ENGINES; do run_engine "$_e" || run_failed=1; done
 
 log "=== SCORECARD ($MEM_LIMIT, $NDOCS docs, cpuset $CPUSET) ==="
 for e in es surch; do cat "$OUT_DIR/$e.json" 2>/dev/null; echo; done
 docker network rm "$NET" >/dev/null 2>&1 || true
+exit "$run_failed"

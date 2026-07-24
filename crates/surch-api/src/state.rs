@@ -1,7 +1,10 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    sync::{Arc, RwLock},
+    fs::OpenOptions,
+    io::Write,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
@@ -348,6 +351,271 @@ fn source_fetch_parallel_enabled() -> bool {
     })
 }
 
+/// Drapeau benchmark-only `SURCH_SOURCE_FETCH_PROFILE`. Absent, `0` ou une
+/// valeur invalide = OFF : le chemin historique ne construit alors aucune
+/// structure de profil ni n'emet de metrique. `1` active les compteurs et,
+/// si `SURCH_SOURCE_FETCH_PROFILE_FILE` est explicite, l'artefact JSONL borne
+/// de [`InMemoryIndex::documents_by_internal_ids`].
+fn source_fetch_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("SURCH_SOURCE_FETCH_PROFILE").ok();
+        source_fetch_profile_enabled_from(value.as_deref())
+    })
+}
+
+fn source_fetch_profile_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+/// Agregat local a UNE hydratation top-K. Il n'est jamais partage entre les
+/// workers Rayon : chaque worker produit son propre echantillon, fusionne
+/// sequentiellement apres le `collect` indexe. Ainsi, les compteurs restent
+/// exacts sans mutex dans le hot path parallele.
+#[derive(Default)]
+struct SourceFetchProfile {
+    requested_ids: u64,
+    hits: u64,
+    source_bytes: u64,
+    decoded_bytes: u64,
+    pread_sum: Duration,
+    pread_max: Duration,
+    decode_zstd_sum: Duration,
+    decode_zstd_max: Duration,
+    json_parse_sum: Duration,
+    json_parse_max: Duration,
+    worker_indices: BTreeSet<usize>,
+}
+
+impl SourceFetchProfile {
+    fn merge(&mut self, other: Self) {
+        self.requested_ids += other.requested_ids;
+        self.hits += other.hits;
+        self.source_bytes += other.source_bytes;
+        self.decoded_bytes += other.decoded_bytes;
+        self.pread_sum += other.pread_sum;
+        self.pread_max = self.pread_max.max(other.pread_max);
+        self.decode_zstd_sum += other.decode_zstd_sum;
+        self.decode_zstd_max = self.decode_zstd_max.max(other.decode_zstd_max);
+        self.json_parse_sum += other.json_parse_sum;
+        self.json_parse_max = self.json_parse_max.max(other.json_parse_max);
+        self.worker_indices.extend(other.worker_indices);
+    }
+
+    fn record_pread(&mut self, elapsed: Duration) {
+        self.pread_sum += elapsed;
+        self.pread_max = self.pread_max.max(elapsed);
+    }
+
+    fn record_zstd_decode(&mut self, elapsed: Duration) {
+        self.decode_zstd_sum += elapsed;
+        self.decode_zstd_max = self.decode_zstd_max.max(elapsed);
+    }
+
+    fn record_json_parse(&mut self, elapsed: Duration) {
+        self.json_parse_sum += elapsed;
+        self.json_parse_max = self.json_parse_max.max(elapsed);
+    }
+
+    fn record_worker(&mut self, worker_index: usize) {
+        self.worker_indices.insert(worker_index);
+    }
+
+    fn workers_effectifs(&self) -> u64 {
+        self.worker_indices.len() as u64
+    }
+}
+
+const SOURCE_FETCH_PROFILE_MAX_RECORDS: usize = 4096;
+
+/// Ecriture benchmark-only, bornee et serialisee de l'artefact brut L2.
+///
+/// Le profil est opt-in et le chemin de sortie doit etre explicite : sans ce
+/// chemin, aucune ligne n'est ecrite. Le mutex ne couvre qu'une ligne par
+/// requete, apres le `collect` Rayon; les workers ne touchent donc jamais le
+/// fichier. La borne protege un serveur mal configure d'un fichier sans fin.
+struct SourceFetchProfileSink {
+    file: std::fs::File,
+    records: usize,
+}
+
+fn source_fetch_profile_sink() -> Result<&'static Mutex<SourceFetchProfileSink>, ()> {
+    static SINK: std::sync::OnceLock<Result<Mutex<SourceFetchProfileSink>, ()>> =
+        std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        let path = std::env::var("SURCH_SOURCE_FETCH_PROFILE_FILE")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .ok_or(())?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| ())?;
+        Ok(Mutex::new(SourceFetchProfileSink { file, records: 0 }))
+    })
+    .as_ref()
+    .map_err(|_| ())
+}
+
+/// Emet les compteurs bornes qui servent aux gates et une ligne JSONL par
+/// hydratation. Les distributions viennent exclusivement du JSONL exact : les
+/// summaries Prometheus ne sont ni utilisees ni soustraites entre phases.
+fn record_source_fetch_profile(
+    mode: &'static str,
+    fetch_wall: Duration,
+    profile: SourceFetchProfile,
+) {
+    // Les labels sont bornes : les phases restent dans les fichiers JSONL
+    // exportes par le harnais, jamais dans une serie Prometheus par requete.
+    let hits_bucket = source_fetch_hits_bucket(profile.hits);
+    metrics::counter!(
+        "surch_source_fetch_requests_total",
+        "mode" => mode,
+        "hits_bucket" => hits_bucket,
+    )
+    .increment(1);
+    metrics::counter!(
+        "surch_source_fetch_hits_total",
+        "mode" => mode,
+        "hits_bucket" => hits_bucket,
+    )
+    .increment(profile.hits);
+    metrics::counter!(
+        "surch_source_fetch_bytes_total",
+        "mode" => mode,
+        "hits_bucket" => hits_bucket,
+    )
+    .increment(profile.source_bytes);
+    metrics::counter!(
+        "surch_source_fetch_decoded_bytes_total",
+        "mode" => mode,
+        "hits_bucket" => hits_bucket,
+    )
+    .increment(profile.decoded_bytes);
+    metrics::counter!(
+        "surch_source_fetch_requested_ids_total",
+        "mode" => mode,
+        "hits_bucket" => hits_bucket,
+    )
+    .increment(profile.requested_ids);
+    metrics::counter!(
+        "surch_source_fetch_workers_total",
+        "mode" => mode,
+        "hits_bucket" => hits_bucket,
+    )
+    .increment(profile.workers_effectifs());
+
+    let Ok(sink) = source_fetch_profile_sink() else {
+        metrics::counter!("surch_source_fetch_profile_write_failures_total").increment(1);
+        return;
+    };
+    let mut sink = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if sink.records >= SOURCE_FETCH_PROFILE_MAX_RECORDS {
+        metrics::counter!("surch_source_fetch_profile_dropped_total").increment(1);
+        return;
+    }
+    if writeln!(
+        sink.file,
+        "{{\"mode\":\"{mode}\",\"requested_ids\":{},\"hydrated_hits\":{},\"bytes\":{},\"fetch_wall_us\":{},\"pread_sum_us\":{},\"pread_max_us\":{},\"decode_sum_us\":{},\"decode_max_us\":{},\"json_sum_us\":{},\"json_max_us\":{},\"workers_effectifs\":{}}}",
+        profile.requested_ids,
+        profile.hits,
+        profile.source_bytes,
+        fetch_wall.as_micros(),
+        profile.pread_sum.as_micros(),
+        profile.pread_max.as_micros(),
+        profile.decode_zstd_sum.as_micros(),
+        profile.decode_zstd_max.as_micros(),
+        profile.json_parse_sum.as_micros(),
+        profile.json_parse_max.as_micros(),
+        profile.workers_effectifs(),
+    )
+    .is_err()
+    {
+        metrics::counter!("surch_source_fetch_profile_write_failures_total").increment(1);
+        return;
+    }
+    sink.records += 1;
+    metrics::counter!("surch_source_fetch_profile_records_total").increment(1);
+}
+
+/// Trois valeurs constantes bornent la cardinalité Prometheus et suffisent
+/// aux gates L2 : absence de fetch, petit fetch, ou fenêtre hydratée >= 8.
+fn source_fetch_hits_bucket(hits: u64) -> &'static str {
+    match hits {
+        0 => "zero",
+        1..=7 => "one_to_seven",
+        _ => "eight_plus",
+    }
+}
+
+#[cfg(test)]
+mod source_fetch_profile_tests {
+    use std::time::Duration;
+
+    use super::{source_fetch_profile_enabled_from, SourceFetchProfile};
+
+    #[test]
+    fn source_fetch_profile_flag_is_strictly_off_unless_set_to_one() {
+        for value in [None, Some(""), Some("0"), Some("true"), Some(" 2 ")] {
+            assert!(
+                !source_fetch_profile_enabled_from(value),
+                "{value:?} must leave the benchmark profile off"
+            );
+        }
+        assert!(source_fetch_profile_enabled_from(Some(" 1 ")));
+    }
+
+    #[test]
+    fn source_fetch_profile_merges_worker_samples_without_losing_maxima() {
+        let mut sequential = SourceFetchProfile {
+            requested_ids: 2,
+            hits: 1,
+            source_bytes: 12,
+            decoded_bytes: 20,
+            ..SourceFetchProfile::default()
+        };
+        sequential.record_worker(0);
+        sequential.record_pread(Duration::from_micros(7));
+        sequential.record_zstd_decode(Duration::from_micros(3));
+        sequential.record_json_parse(Duration::from_micros(5));
+
+        let mut worker = SourceFetchProfile {
+            hits: 1,
+            source_bytes: 8,
+            decoded_bytes: 13,
+            ..SourceFetchProfile::default()
+        };
+        worker.record_worker(3);
+        worker.record_pread(Duration::from_micros(11));
+        worker.record_zstd_decode(Duration::from_micros(2));
+        worker.record_json_parse(Duration::from_micros(9));
+
+        sequential.merge(worker);
+
+        assert_eq!(sequential.requested_ids, 2);
+        assert_eq!(sequential.hits, 2);
+        assert_eq!(sequential.source_bytes, 20);
+        assert_eq!(sequential.decoded_bytes, 33);
+        assert_eq!(sequential.pread_sum, Duration::from_micros(18));
+        assert_eq!(sequential.pread_max, Duration::from_micros(11));
+        assert_eq!(sequential.decode_zstd_sum, Duration::from_micros(5));
+        assert_eq!(sequential.decode_zstd_max, Duration::from_micros(3));
+        assert_eq!(sequential.json_parse_sum, Duration::from_micros(14));
+        assert_eq!(sequential.json_parse_max, Duration::from_micros(9));
+        assert_eq!(sequential.workers_effectifs(), 2);
+    }
+
+    #[test]
+    fn source_fetch_profile_bounds_hit_labels_for_l2_gates() {
+        assert_eq!(super::source_fetch_hits_bucket(0), "zero");
+        assert_eq!(super::source_fetch_hits_bucket(7), "one_to_seven");
+        assert_eq!(super::source_fetch_hits_bucket(8), "eight_plus");
+        assert_eq!(super::source_fetch_hits_bucket(u64::MAX), "eight_plus");
+    }
+}
+
 impl SourceBlob {
     /// Taille en **RAM** des bytes utiles (sans le header Arc), pour la
     /// gauge `surch_index_stored_fields_bytes`. Les blobs `OnDisk`
@@ -540,6 +808,35 @@ fn read_on_disk_bytes(store: &SourceStore, offset: u64, length: u32, codec: u8) 
     }
 }
 
+/// Variante benchmark-only de [`read_on_disk_bytes`]. Le chronometre encadre
+/// exactement [`SourceStore::read`], donc `pread_sum` ne comprend ni decode ni
+/// JSON. Elle n'est jamais atteinte quand `SURCH_SOURCE_FETCH_PROFILE` est OFF.
+fn read_on_disk_bytes_profiled(
+    store: &SourceStore,
+    offset: u64,
+    length: u32,
+    codec: u8,
+    profile: &mut SourceFetchProfile,
+) -> Vec<u8> {
+    let pread_started = Instant::now();
+    let bytes = store.read(offset, length);
+    profile.record_pread(pread_started.elapsed());
+    profile.source_bytes += u64::from(length);
+
+    match codec {
+        SOURCE_CODEC_RAW => bytes,
+        SOURCE_CODEC_ZSTD => {
+            let decode_started = Instant::now();
+            let decoded = SourceBlob::decode_zstd(&bytes);
+            profile.record_zstd_decode(decode_started.elapsed());
+            decoded
+        }
+        other => panic!(
+            "unknown _source codec tag {other} on OnDisk blob (contrat 2b : raw={SOURCE_CODEC_RAW}, zstd={SOURCE_CODEC_ZSTD})"
+        ),
+    }
+}
+
 /// Helper pour parser un [`SourceBlob`] en `Value`. Reutilise par
 /// `parsed_source`, `rebuild_index` et `documents_paginated`.
 ///
@@ -563,6 +860,37 @@ fn parse_source_blob(blob: &SourceBlob, store: &SourceStore) -> Value {
                 .expect("stored Compressed _source decodes to valid JSON")
         }
     }
+}
+
+/// Variante benchmark-only de [`parse_source_blob`]. Elle garde les mesures
+/// dans une valeur locale retournable par un worker Rayon; aucune metrique ni
+/// synchronisation n'est executee par hit.
+fn parse_source_blob_profiled(
+    blob: &SourceBlob,
+    store: &SourceStore,
+) -> (Value, SourceFetchProfile) {
+    let mut profile = SourceFetchProfile::default();
+    let bytes = match blob {
+        SourceBlob::OnDisk {
+            offset,
+            length,
+            codec,
+        } => read_on_disk_bytes_profiled(store, *offset, *length, *codec, &mut profile),
+        SourceBlob::Compressed(bytes) => {
+            profile.source_bytes += bytes.len() as u64;
+            let decode_started = Instant::now();
+            let decoded = SourceBlob::decode_compressed(bytes.as_ref());
+            profile.record_zstd_decode(decode_started.elapsed());
+            decoded
+        }
+    };
+    profile.decoded_bytes += bytes.len() as u64;
+
+    let json_started = Instant::now();
+    let source = serde_json::from_slice(&bytes).expect("stored _source is valid JSON");
+    profile.record_json_parse(json_started.elapsed());
+    profile.hits = 1;
+    (source, profile)
 }
 
 /// C1 fix (design doc `docs/paper/design-segments-pic-borne-2026-07-05.md`
@@ -2760,7 +3088,59 @@ impl InMemoryIndex {
     }
 
     fn documents_by_internal_ids(&self, index: &str, internal_ids: &[u32]) -> Vec<StoredDocument> {
-        if source_fetch_parallel_enabled() {
+        let parallel = source_fetch_parallel_enabled();
+        if !source_fetch_profile_enabled() {
+            return if parallel {
+                // Les `winner_ids` restent ordonnes par score avant cette etape.
+                // Le premier `collect` garde un slot par id ; le filtrage reste
+                // sequentiel apres lui, donc les pread disperses ne peuvent pas
+                // changer l'ordre de sortie.
+                internal_ids
+                    .par_iter()
+                    .map(|&doc_id| {
+                        let id = self.uid_for_doc_id(doc_id)?;
+                        let blob = self.blob_for_doc_id(doc_id)?;
+                        let source = Arc::new(parse_source_blob(&blob, &self.source_store));
+                        Some(StoredDocument {
+                            index: index.to_owned(),
+                            id: id.to_string(),
+                            source,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            } else {
+                internal_ids
+                    .iter()
+                    .filter_map(|&doc_id| {
+                        // Lot C `C2`: doc_id-keyed lookups on both sides — no more
+                        // detour through the public uid to re-derive a doc_id that
+                        // was already known.
+                        let id = self.uid_for_doc_id(doc_id)?;
+                        let blob = self.blob_for_doc_id(doc_id)?;
+                        let source = Arc::new(parse_source_blob(&blob, &self.source_store));
+                        Some(StoredDocument {
+                            index: index.to_owned(),
+                            id: id.to_string(),
+                            source,
+                        })
+                    })
+                    .collect()
+            };
+        }
+
+        // Profil L2 : une seule emission Prometheus par hydratation top-K,
+        // sans log par requete. Chaque worker retourne son agregat local;
+        // la fusion reste sequentielle et preserve l'ordre des gagnants.
+        let mode = if parallel { "parallel" } else { "sequential" };
+        let fetch_started = Instant::now();
+        let mut profile = SourceFetchProfile {
+            requested_ids: internal_ids.len() as u64,
+            ..SourceFetchProfile::default()
+        };
+        let documents = if parallel {
             // Les `winner_ids` restent ordonnes par score avant cette etape.
             // Le premier `collect` garde un slot par id ; le filtrage reste
             // sequentiel apres lui, donc les pread disperses ne peuvent pas
@@ -2768,20 +3148,35 @@ impl InMemoryIndex {
             internal_ids
                 .par_iter()
                 .map(|&doc_id| {
-                    let id = self.uid_for_doc_id(doc_id)?;
-                    let blob = self.blob_for_doc_id(doc_id)?;
-                    let source = Arc::new(parse_source_blob(&blob, &self.source_store));
-                    Some(StoredDocument {
-                        index: index.to_owned(),
-                        id: id.to_string(),
-                        source,
-                    })
+                    let mut task_profile = SourceFetchProfile::default();
+                    if let Some(worker_index) = rayon::current_thread_index() {
+                        task_profile.record_worker(worker_index);
+                    }
+                    let document = (|| {
+                        let id = self.uid_for_doc_id(doc_id)?;
+                        let blob = self.blob_for_doc_id(doc_id)?;
+                        let (source, hit_profile) =
+                            parse_source_blob_profiled(&blob, &self.source_store);
+                        task_profile.merge(hit_profile);
+                        Some(StoredDocument {
+                            index: index.to_owned(),
+                            id: id.to_string(),
+                            source: Arc::new(source),
+                        })
+                    })();
+                    (document, task_profile)
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
-                .flatten()
+                .filter_map(|(document, task_profile)| {
+                    profile.merge(task_profile);
+                    document
+                })
                 .collect()
         } else {
+            if !internal_ids.is_empty() {
+                profile.record_worker(0);
+            }
             internal_ids
                 .iter()
                 .filter_map(|&doc_id| {
@@ -2790,15 +3185,19 @@ impl InMemoryIndex {
                     // was already known.
                     let id = self.uid_for_doc_id(doc_id)?;
                     let blob = self.blob_for_doc_id(doc_id)?;
-                    let source = Arc::new(parse_source_blob(&blob, &self.source_store));
+                    let (source, hit_profile) =
+                        parse_source_blob_profiled(&blob, &self.source_store);
+                    profile.merge(hit_profile);
                     Some(StoredDocument {
                         index: index.to_owned(),
                         id: id.to_string(),
-                        source,
+                        source: Arc::new(source),
                     })
                 })
                 .collect()
-        }
+        };
+        record_source_fetch_profile(mode, fetch_started.elapsed(), profile);
+        documents
     }
 
     /// Hydrate documents while CARRYING each one's internal `doc_id`. The
