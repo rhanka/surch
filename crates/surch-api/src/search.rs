@@ -863,8 +863,13 @@ pub async fn search_handler(
     // `?scroll=1m` triggers the stateful scan path: skip the search
     // cache (each scroll session is logically unique), install a
     // ScrollContext, and decorate the response with `_scroll_id`.
+    // Le harnais L2 emploie aussi `request_cache=false` : ce paramètre
+    // OpenSearch conserve la sémantique de recherche, mais interdit qu'une
+    // réponse mémorisée masque l'hydratation `_source` mesurée.
     let scroll_keepalive = params.get("scroll").map(String::as_str);
-    let cache_eligible = indices.len() == 1 && scroll_keepalive.is_none();
+    let request_cache = params.get("request_cache").map(String::as_str);
+    let cache_eligible =
+        search_response_cache_eligible(indices.len(), scroll_keepalive, request_cache);
     let cache_key = if cache_eligible {
         Some(hash_search_body(&body))
     } else {
@@ -1110,6 +1115,43 @@ fn hash_search_body(body: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     body.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Le cache de réponses Surch est indexé sur le corps seul. Une variation de
+/// query string ne pourrait donc pas forcer un miss; `request_cache=false`
+/// doit désactiver explicitement ce cache, comme pour les sondes L2.
+fn search_response_cache_eligible(
+    indices_len: usize,
+    scroll_keepalive: Option<&str>,
+    request_cache: Option<&str>,
+) -> bool {
+    indices_len == 1 && scroll_keepalive.is_none() && request_cache != Some("false")
+}
+
+/// `size:0` calcule toujours le total, mais ne demande aucune fenêtre de
+/// résultats. Le garde est placé avant tout TopN afin que `from>0,size:0`
+/// ne transforme pas le décalage en hydratation inutile.
+fn requested_hit_window_limit(from: usize, size: usize) -> usize {
+    (size != 0).then(|| from.saturating_add(size)).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod l2_search_guards_tests {
+    use super::{requested_hit_window_limit, search_response_cache_eligible};
+
+    #[test]
+    fn request_cache_false_bypasses_the_response_cache_without_a_body_nonce() {
+        assert!(!search_response_cache_eligible(1, None, Some("false")));
+        assert!(search_response_cache_eligible(1, None, None));
+        assert!(!search_response_cache_eligible(1, Some("1m"), None));
+    }
+
+    #[test]
+    fn size_zero_never_builds_a_topk_window_even_with_a_from_offset() {
+        assert_eq!(requested_hit_window_limit(0, 0), 0);
+        assert_eq!(requested_hit_window_limit(37, 0), 0);
+        assert_eq!(requested_hit_window_limit(37, 10), 47);
+    }
 }
 
 /// A matched document paired with its `_score`.
@@ -1812,7 +1854,7 @@ fn run_topk_search(
 
     let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
     let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
-    let limit = from.saturating_add(size);
+    let limit = requested_hit_window_limit(from, size);
 
     let (scored, total) = topk_scored_documents(state, &indices[0], query, limit)?;
 
@@ -1908,7 +1950,7 @@ fn run_topk_exact_bool(
 
     let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
     let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
-    let limit = from.saturating_add(size);
+    let limit = requested_hit_window_limit(from, size);
 
     // Fused fast path (campaign #18): the deces `bool`/`full` shape reduces to a
     // single-token conjunction scored by a plain BM25 sum. Score it in ONE
@@ -1984,7 +2026,9 @@ fn run_topk_exact_bool(
             .take(size)
             .collect();
         let winner_ids: Vec<u32> = window.iter().map(|(_, id)| *id).collect();
-        let hydrated = reader.documents_by_internal_ids(&winner_ids);
+        let hydrated = (!winner_ids.is_empty())
+            .then(|| reader.documents_by_internal_ids(&winner_ids))
+            .unwrap_or_default();
         let hits: Vec<_> = window
             .iter()
             .zip(hydrated)
@@ -2088,7 +2132,7 @@ fn finalize_fused_topk(
     size: usize,
     started_at: Instant,
 ) -> Option<SearchResponse> {
-    let limit = from.saturating_add(size);
+    let limit = requested_hit_window_limit(from, size);
     let cmp = |a: &(f64, u32), b: &(f64, u32)| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -2117,9 +2161,13 @@ fn finalize_fused_topk(
     // Instrumentation (#20): isolate hydration + hit-building (the top-K
     // _source fetch / source-filter / serialise) from the top-K collection
     // loop above, to see whether the bool/full tail is the per-candidate
-    // scoring or the per-query response build.
+    // scoring or the per-query response build. Le temoin benchmark `size:0`
+    // ne doit pas seulement donner une liste vide : il ne doit jamais appeler
+    // `documents_by_internal_ids`, donc aucune lecture/decode de `_source`.
     let t_hydrate = std::time::Instant::now();
-    let hydrated = state.documents_by_internal_ids(index, &winner_ids);
+    let hydrated = (!winner_ids.is_empty())
+        .then(|| state.documents_by_internal_ids(index, &winner_ids))
+        .unwrap_or_default();
     let hits: Vec<_> = window
         .iter()
         .zip(hydrated)
@@ -2324,6 +2372,11 @@ fn finalize_topk(
     let scored = topn.into_sorted_vec();
 
     let winner_ids: Vec<u32> = scored.iter().map(|(_, id)| *id).collect();
+    // Le temoin `size:0` du protocole L2 garde le calcul du total, mais
+    // court-circuite reellement l'hydratation `_source`.
+    if winner_ids.is_empty() {
+        return Some((Vec::new(), total));
+    }
     // Hydrate through the same scoped guard — no extra lock acquisition.
     let hydrated = reader.documents_by_internal_ids(&winner_ids);
 

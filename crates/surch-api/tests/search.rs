@@ -3162,6 +3162,43 @@ async fn search_router_a9_from_size_returns_requested_slice() {
     assert_eq!(body["hits"]["hits"].as_array().unwrap().len(), 2);
 }
 
+/// Le temoin L2 envoie les memes formes que les sondes hydratees, mais avec
+/// `size:0`. Le total reste calculé tandis que le chemin top-K court-circuite
+/// `documents_by_internal_ids`, donc aucun `_source` n'est materialise, même
+/// avec `from>0`, bool générique ou bool fused.
+#[tokio::test]
+async fn search_router_a9_size_zero_keeps_total_without_returning_hits() {
+    let router = app_router();
+    for i in 0..3 {
+        index_product(&router, &format!("sku-{i}"), r#"{"name":"desk"}"#).await;
+    }
+
+    for (shape, request) in [
+        (
+            "match from>0",
+            r#"{"query":{"match":{"name":"desk"}},"from":1,"size":0}"#,
+        ),
+        (
+            "bool générique",
+            r#"{"query":{"bool":{"must":[{"match":{"name":"desk"}},{"match_all":{}}]}},"size":0}"#,
+        ),
+        (
+            "bool fused",
+            r#"{"query":{"bool":{"must":[{"match":{"name":"desk"}]}},"size":0}"#,
+        ),
+    ] {
+        let body = search_with_body(&router, request).await;
+        assert_eq!(body["hits"]["total"]["value"], 3, "{shape}");
+        assert!(
+            body["hits"]["hits"]
+                .as_array()
+                .expect("hits should be an array")
+                .is_empty(),
+            "{shape}: size:0 doit rester le temoin benchmark non hydrate"
+        );
+    }
+}
+
 #[tokio::test]
 async fn search_router_a9_from_size_paginates_to_next_page() {
     let router = app_router();
