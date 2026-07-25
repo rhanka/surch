@@ -109,6 +109,40 @@ PREFLIGHT_MARGIN_MIB="${PREFLIGHT_MARGIN_MIB:-2048}"  # marge exigée au-delà d
 PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"               # 1 = passer outre le préflight (déconseillé)
 AUX_MEM="${AUX_MEM:-512m}"                            # cap des conteneurs auxiliaires
 AUXCAP="--memory=$AUX_MEM --memory-swap=$AUX_MEM"
+# La sonde ne partage aucun cœur avec le moteur : son coût CPU reste ainsi
+# mesurable séparément. On ne suppose pas une topologie SMT particulière ;
+# l'ensemble complémentaire de CPUSET, borné par nproc, est la seule source.
+HOST_CPU_COUNT=$(nproc)
+case "$HOST_CPU_COUNT" in ''|*[!0-9]*|0) err "nproc invalide : $HOST_CPU_COUNT"; exit 1;; esac
+PROBE_CPUSET=$(awk -v n="$HOST_CPU_COUNT" -v selected="$CPUSET" '
+  BEGIN {
+    if (n < 2) exit 1
+    count = split(selected, ranges, ",")
+    for (i = 1; i <= count; i++) {
+      if (ranges[i] ~ /^[0-9]+$/) {
+        first = ranges[i]; last = ranges[i]
+      } else if (ranges[i] ~ /^[0-9]+-[0-9]+$/) {
+        split(ranges[i], bounds, "-"); first = bounds[1]; last = bounds[2]
+      } else {
+        exit 1
+      }
+      if (first < 0 || last < first || last >= n) exit 1
+      for (cpu = first; cpu <= last; cpu++) used[cpu] = 1
+    }
+    for (cpu = 0; cpu < n; cpu++) {
+      if (!(cpu in used)) out = out == "" ? cpu : out "," cpu
+    }
+    if (out == "") exit 1
+    print out
+  }
+')
+probe_cpuset_rc=$?
+if [ "$probe_cpuset_rc" -ne 0 ] || [ -z "$PROBE_CPUSET" ]; then
+  err "CPUSET invalide ou aucun cœur restant pour la sonde : CPUSET=$CPUSET, nproc=$HOST_CPU_COUNT"
+  exit 1
+fi
+PROBE_AUXCAP="$AUXCAP --cpuset-cpus=$PROBE_CPUSET"
+log "sonde CPUSET=$PROBE_CPUSET (moteur=$CPUSET, nproc=$HOST_CPU_COUNT)"
 if [ "${FAIRAB_SCOPED:-0}" != "1" ] && command -v systemd-run >/dev/null 2>&1 \
    && systemd-run --user --scope -q -p MemoryMax=64M -- true >/dev/null 2>&1; then
   log "re-exec dans un scope systemd plafonné (MemoryMax=$HARNESS_MEM_MAX, swap scope 256M)"
@@ -341,47 +375,123 @@ docker network create "$NET" >/dev/null 2>&1 || true
 sample_rss(){ docker stats --no-stream --format '{{.MemUsage}}' "$1" 2>/dev/null | awk '{print $1}'; }
 
 # Les fichiers de séries restent possédés par le runner. Le conteneur curl ne
-# reçoit qu'un mount lecture seule des corps et écrit ses `time_total` sur sa
-# sortie standard : aucun UID de curlimages/curl ne peut alors rendre un bind
-# mount hôte vide ou partiellement écrit.
+# reçoit qu'un mount lecture seule des corps et écrit le couple client/réponse
+# sur sa sortie standard : aucun UID de curlimages/curl ne peut alors rendre
+# un bind mount hôte vide ou partiellement écrit.
 probe_series_file_is_valid(){
-  local raw="$1" wanted="$2" phase="$3" got
+  local raw="$1" wanted="$2" phase="$3" series="$4" got
   got=$(wc -l < "$raw" 2>/dev/null); got=${got:-0}
   if [ "$got" -ne "$wanted" ]; then
-    PROBE_CAPTURE_REASON="${phase}_line_count_${got}_of_${wanted}"
+    PROBE_CAPTURE_REASON="${phase}_${series}_line_count_${got}_of_${wanted}"
     return 1
   fi
   if ! awk 'NF != 1 || $1 !~ /^[0-9]+([.][0-9]+)?$/ || ($1 + 0) < 0 { exit 1 }' "$raw"; then
-    PROBE_CAPTURE_REASON="${phase}_non_numeric_latency_sample"
+    PROBE_CAPTURE_REASON="${phase}_${series}_non_numeric_sample"
     return 1
   fi
 }
 
-# Écrit exactement une latence curl par ligne (secondes) dans $3. Le démarrage
-# du conteneur est hors `time_total`, comme dans le protocole historique, mais
-# tout HTTP 4xx/5xx et tout nombre de lignes inattendu invalident la série.
+# Le coût de sonde peut être légèrement négatif à l'unité près : `took` est
+# arrondi par le moteur, alors que le temps client est une durée continue.
+probe_overhead_file_is_valid(){
+  local raw="$1" wanted="$2" phase="$3" got
+  got=$(wc -l < "$raw" 2>/dev/null); got=${got:-0}
+  if [ "$got" -ne "$wanted" ]; then
+    PROBE_CAPTURE_REASON="${phase}_probe_overhead_line_count_${got}_of_${wanted}"
+    return 1
+  fi
+  if ! awk 'NF != 1 || $1 !~ /^-?[0-9]+([.][0-9]+)?$/ { exit 1 }' "$raw"; then
+    PROBE_CAPTURE_REASON="${phase}_probe_overhead_non_numeric_sample"
+    return 1
+  fi
+}
+
+# Décode les réponses après une invocation curl. `took` et hits.total.value
+# font partie du contrat Elasticsearch compatible ; une réponse sans l'un des
+# deux, ou une requête qui ne matche rien, invalide la phase entière.
+decode_probe_capture(){
+  local capture="$1" client_raw="$2" took_raw="$3" overhead_raw="$4" wanted="$5" phase="$6"
+  if ! awk -F '\t' '
+    NF != 2 || $1 !~ /^[0-9]+([.][0-9]+)?$/ || $2 !~ /^\{/ { exit 1 }
+    { print $1 }
+  ' "$capture" > "$client_raw"; then
+    PROBE_CAPTURE_REASON="${phase}_client_or_response_malformed"
+    return 1
+  fi
+  if ! awk -F '\t' '{ sub(/^[^\t]*\t/, ""); print }' "$capture" \
+    | jq -er 'if (.took | type) == "number" and .took >= 0 then .took else error("took absent ou invalide") end' \
+      > "$took_raw"; then
+    PROBE_CAPTURE_REASON="${phase}_took_missing_or_invalid"
+    return 1
+  fi
+  if ! awk -F '\t' '{ sub(/^[^\t]*\t/, ""); print }' "$capture" \
+    | jq -er 'if (.hits.total.value | type) == "number" and .hits.total.value > 0 then .hits.total.value else error("zero hit ou hits.total.value invalide") end' \
+      >/dev/null; then
+    PROBE_CAPTURE_REASON="${phase}_zero_hits_or_hits_total_invalid"
+    return 1
+  fi
+  if ! probe_series_file_is_valid "$client_raw" "$wanted" "$phase" client_s \
+     || ! probe_series_file_is_valid "$took_raw" "$wanted" "$phase" took_ms; then
+    return 1
+  fi
+  if ! awk 'NR == FNR { client[NR] = $1; next } { printf "%.6f\n", client[FNR] * 1000 - $1 }' \
+    "$client_raw" "$took_raw" > "$overhead_raw"; then
+    PROBE_CAPTURE_REASON="${phase}_probe_overhead_compute_failed"
+    return 1
+  fi
+  probe_overhead_file_is_valid "$overhead_raw" "$wanted" "$phase"
+}
+
+# Écrit les séries client (s), moteur `took` (ms) et leur écart (ms). Une
+# seule invocation curl porte toutes les requêtes de la phase : `--next`
+# sépare les corps, tout en laissant libcurl réemployer ses connexions entre
+# transferts. Chaque URL conserve `request_cache=false` : ES désactive ainsi
+# son shard request cache, y compris pour le témoin `size:0`. Le démarrage du
+# conteneur reste hors `time_total`.
 capture_probe_samples(){
-  local base="$1" bodies="$2" raw="$3" wanted="$4" phase="$5"
+  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" wanted="$6" phase="$7"
+  local capture="$client_raw.capture"
   PROBE_CAPTURE_REASON=""
-  : > "$raw"
-  if ! docker run --rm $AUXCAP --network "$NET" \
+  : > "$client_raw"; : > "$took_raw"; : > "$overhead_raw"; : > "$capture"
+  if ! docker run --rm $PROBE_AUXCAP --network "$NET" \
     -v "$bodies:/bodies.ndjson:ro" curlimages/curl:8.10.1 sh -eu -c '
       base=$1
+      mkdir -p /tmp/request /tmp/response
+      i=0
+      set --
       while IFS= read -r body; do
-        curl --fail-with-body --silent --show-error --output /dev/null \
-          --write-out "%{time_total}\\n" \
+        i=$((i + 1))
+        name=$(printf "%06d" "$i")
+        printf "%s\\n" "$body" > "/tmp/request/$name.json"
+        [ "$i" -le 1 ] || set -- "$@" --next
+        set -- "$@" --fail-with-body --silent --show-error \
+          --output "/tmp/response/$name.json" --write-out "%{time_total}\\n" \
           "$base/deces_bench/_search?request_cache=false" \
-          -H "Content-Type: application/json" -d "$body"
+          -H "Content-Type: application/json" --data-binary "@/tmp/request/$name.json"
       done < /bodies.ndjson
-    ' sh "$base" > "$raw"; then
+      [ "$i" -gt 0 ]
+      curl --disable "$@" > /tmp/client_s
+      [ "$(wc -l < /tmp/client_s)" -eq "$i" ]
+      i=0
+      for response in /tmp/response/*.json; do
+        [ -s "$response" ]
+        i=$((i + 1))
+        client=$(sed -n "${i}p" /tmp/client_s)
+        printf "%s\\t" "$client"
+        tr -d "\\r\\n" < "$response"
+        printf "\\n"
+      done
+      [ "$i" -eq "$(wc -l < /tmp/client_s)" ]
+    ' sh "$base" > "$capture"; then
     PROBE_CAPTURE_REASON="${phase}_curl_exit_nonzero"
     return 1
   fi
-  probe_series_file_is_valid "$raw" "$wanted" "$phase"
+  decode_probe_capture "$capture" "$client_raw" "$took_raw" "$overhead_raw" "$wanted" "$phase"
 }
 
 probe_quantiles(){
-  sort -n "$1" | awk '
+  local raw="$1" scale="$2"
+  sort -n "$raw" | awk -v scale="$scale" '
     function nearest_rank(n, q, raw, rank) {
       raw = n * q
       rank = int(raw)
@@ -394,7 +504,7 @@ probe_quantiles(){
       p50 = nearest_rank(NR, 0.50)
       p95 = nearest_rank(NR, 0.95)
       p99 = nearest_rank(NR, 0.99)
-      printf "%.2f %.2f %.2f", a[p50] * 1000, a[p95] * 1000, a[p99] * 1000
+      printf "%.2f %.2f %.2f", a[p50] * scale, a[p95] * scale, a[p99] * scale
     }'
 }
 
@@ -533,13 +643,17 @@ source_fetch_no_source_delta_is_zero(){
 # quantité demandée vise le cache `file` réellement observé. Chaque couple
 # before/after est conservé : aucune éviction partielle ambigüe n'est admise.
 capture_cold_samples(){
-  local base="$1" bodies="$2" raw="$3" audit="$4" reclaim_path="$5" stat_path="$6" current_path="$7" writer="$8" wanted="$9"
+  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" audit="$6" reclaim_path="$7" stat_path="$8" current_path="$9" writer="${10}" wanted="${11}"
   local body file_before file_after file_after_max memory_current reclaim_target
-  local sample completed=0 request_no
+  local completed=0 request_no one_body one_client one_took one_overhead
   COLD_CAPTURE_REASON=""
   COLD_CAPTURE_COMPLETED=0
-  : > "$raw"
+  : > "$client_raw"; : > "$took_raw"; : > "$overhead_raw"
   : > "$audit"
+  one_body="$client_raw.one_body.ndjson"
+  one_client="$client_raw.one_client_s"
+  one_took="$client_raw.one_took_ms"
+  one_overhead="$client_raw.one_probe_overhead_ms"
 
   while IFS= read -r body; do
     [ "$completed" -ge "$wanted" ] && break
@@ -589,19 +703,19 @@ capture_cold_samples(){
     fi
     printf '%s\t%s\t%s\t%s\n' "$request_no" "$file_before" "$file_after" "$file_after_max" >> "$audit"
 
-    if ! sample=$(printf '%s\n' "$body" | docker run -i --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
-      sh -eu -c 'IFS= read -r body; curl --fail-with-body --silent --show-error --output /dev/null --write-out "%{time_total}\\n" "$1/deces_bench/_search?request_cache=false" -H "Content-Type: application/json" -d "$body"' \
-      sh "$base"); then
-      COLD_CAPTURE_REASON="cold_curl_exit_nonzero_after_reclaim_$request_no"
+    printf '%s\n' "$body" > "$one_body"
+    # Le reclaim doit précéder chaque transfert cold : cette phase garde donc
+    # une invocation curl isolée par requête, explicitement déclarée dans la
+    # scorecard, plutôt que de simuler une réutilisation incompatible avec le
+    # protocole d'éviction vérifié.
+    if ! capture_probe_samples "$base" "$one_body" "$one_client" "$one_took" "$one_overhead" 1 cold; then
+      COLD_CAPTURE_REASON="${PROBE_CAPTURE_REASON}_after_reclaim_$request_no"
       COLD_CAPTURE_COMPLETED="$completed"
       return 1
     fi
-    if ! printf '%s\n' "$sample" | awk 'NF == 1 && $1 ~ /^[0-9]+([.][0-9]+)?$/ && ($1 + 0) >= 0 { ok = 1 } END { exit !ok }'; then
-      COLD_CAPTURE_REASON="cold_non_numeric_latency_sample_after_reclaim_$request_no"
-      COLD_CAPTURE_COMPLETED="$completed"
-      return 1
-    fi
-    printf '%s\n' "$sample" >> "$raw"
+    cat "$one_client" >> "$client_raw"
+    cat "$one_took" >> "$took_raw"
+    cat "$one_overhead" >> "$overhead_raw"
     completed=$((completed + 1))
   done < "$bodies"
 
@@ -614,7 +728,15 @@ capture_cold_samples(){
     COLD_CAPTURE_REASON="cold_reclaim_audit_count_invalid"
     return 1
   }
-  probe_series_file_is_valid "$raw" "$wanted" cold
+  if ! probe_series_file_is_valid "$client_raw" "$wanted" cold client_s \
+     || ! probe_series_file_is_valid "$took_raw" "$wanted" cold took_ms; then
+    COLD_CAPTURE_REASON="$PROBE_CAPTURE_REASON"
+    return 1
+  fi
+  if ! probe_overhead_file_is_valid "$overhead_raw" "$wanted" cold; then
+    COLD_CAPTURE_REASON="$PROBE_CAPTURE_REASON"
+    return 1
+  fi
 }
 
 # Un échec de sonde reste visible dans la scorecard sans inventer des
@@ -622,8 +744,8 @@ capture_cold_samples(){
 # arrêter le run avec un échec fermé après avoir conservé ce diagnostic.
 record_invalid_measurement(){
   local engine="$1" count="$2" indexed="$3" item_errors="$4" reason="$5"
-  printf '{"engine":"%s","mem_limit":"%s","cpuset":"%s","survived_boot":true,"survived_index":true,"count":%s,"expected":%s,"indexed":%s,"item_errors":%s,"measurement_valid":false,"measurement_invalid_reason":"%s","lat_p50_ms":null,"lat_p95_ms":null,"lat_p99_ms":null,"lat_rand_p50_ms":null,"lat_rand_p95_ms":null,"lat_rand_p99_ms":null,"lat_no_source_p50_ms":null,"lat_no_source_p95_ms":null,"lat_no_source_p99_ms":null,"lat_cold_p50_ms":null,"lat_cold_p95_ms":null,"lat_cold_p99_ms":null}\n' \
-    "$engine" "$MEM_LIMIT" "$CPUSET" "$count" "$NDOCS" "$indexed" "$item_errors" "$reason" > "$OUT_DIR/$engine.json"
+  printf '{"engine":"%s","mem_limit":"%s","cpuset":"%s","probe_cpuset":"%s","survived_boot":true,"survived_index":true,"count":%s,"expected":%s,"indexed":%s,"item_errors":%s,"measurement_valid":false,"measurement_invalid_reason":"%s","lat_p50_ms":null,"lat_p95_ms":null,"lat_p99_ms":null,"lat_rand_p50_ms":null,"lat_rand_p95_ms":null,"lat_rand_p99_ms":null,"lat_no_source_p50_ms":null,"lat_no_source_p95_ms":null,"lat_no_source_p99_ms":null,"lat_cold_p50_ms":null,"lat_cold_p95_ms":null,"lat_cold_p99_ms":null,"lat_fixed_client_s_file":null,"lat_fixed_took_ms_file":null,"lat_fixed_probe_overhead_ms_file":null,"lat_fixed_client_p50_ms":null,"lat_fixed_client_p95_ms":null,"lat_fixed_client_p99_ms":null,"lat_fixed_took_p50_ms":null,"lat_fixed_took_p95_ms":null,"lat_fixed_took_p99_ms":null,"lat_fixed_probe_overhead_p50_ms":null,"lat_fixed_probe_overhead_p95_ms":null,"lat_fixed_probe_overhead_p99_ms":null,"lat_rand_client_s_file":null,"lat_rand_took_ms_file":null,"lat_rand_probe_overhead_ms_file":null,"lat_rand_client_p50_ms":null,"lat_rand_client_p95_ms":null,"lat_rand_client_p99_ms":null,"lat_rand_took_p50_ms":null,"lat_rand_took_p95_ms":null,"lat_rand_took_p99_ms":null,"lat_rand_probe_overhead_p50_ms":null,"lat_rand_probe_overhead_p95_ms":null,"lat_rand_probe_overhead_p99_ms":null,"lat_no_source_client_s_file":null,"lat_no_source_took_ms_file":null,"lat_no_source_probe_overhead_ms_file":null,"lat_no_source_client_p50_ms":null,"lat_no_source_client_p95_ms":null,"lat_no_source_client_p99_ms":null,"lat_no_source_took_p50_ms":null,"lat_no_source_took_p95_ms":null,"lat_no_source_took_p99_ms":null,"lat_no_source_probe_overhead_p50_ms":null,"lat_no_source_probe_overhead_p95_ms":null,"lat_no_source_probe_overhead_p99_ms":null,"lat_cold_client_s_file":null,"lat_cold_took_ms_file":null,"lat_cold_probe_overhead_ms_file":null,"lat_cold_client_p50_ms":null,"lat_cold_client_p95_ms":null,"lat_cold_client_p99_ms":null,"lat_cold_took_p50_ms":null,"lat_cold_took_p95_ms":null,"lat_cold_took_p99_ms":null,"lat_cold_probe_overhead_p50_ms":null,"lat_cold_probe_overhead_p95_ms":null,"lat_cold_probe_overhead_p99_ms":null}\n' \
+    "$engine" "$MEM_LIMIT" "$CPUSET" "$PROBE_CPUSET" "$count" "$NDOCS" "$indexed" "$item_errors" "$reason" > "$OUT_DIR/$engine.json"
 }
 
 run_engine(){
@@ -823,12 +945,18 @@ run_engine(){
     [ -z "$segment_count" ] && segment_count="null"
   fi
 
-  # Sondes L2 : les séries brutes (une ligne `time_total` par requête) sont
-  # conservées pour bootstrap/IC95. La sonde fixe utilise le champ configuré,
-  # donc `NOM` sur le mapping 28M et non l'ancien `nom` zéro-hit.
-  local fixed_raw="$OUT_DIR/$ENGINE.lat_fixed_s"
-  local random_raw="$OUT_DIR/$ENGINE.lat_random_s"
-  local no_source_raw="$OUT_DIR/$ENGINE.lat_no_source_s"
+  # Sondes L2 : les séries client et moteur restent séparées pour bootstrap/
+  # IC95. La sonde fixe utilise le champ configuré, donc `NOM` sur le mapping
+  # 28M et non l'ancien `nom` zéro-hit.
+  local fixed_raw="$OUT_DIR/$ENGINE.lat_fixed_client_s"
+  local fixed_took_raw="$OUT_DIR/$ENGINE.lat_fixed_took_ms"
+  local fixed_overhead_raw="$OUT_DIR/$ENGINE.lat_fixed_probe_overhead_ms"
+  local random_raw="$OUT_DIR/$ENGINE.lat_rand_client_s"
+  local random_took_raw="$OUT_DIR/$ENGINE.lat_rand_took_ms"
+  local random_overhead_raw="$OUT_DIR/$ENGINE.lat_rand_probe_overhead_ms"
+  local no_source_raw="$OUT_DIR/$ENGINE.lat_no_source_client_s"
+  local no_source_took_raw="$OUT_DIR/$ENGINE.lat_no_source_took_ms"
+  local no_source_overhead_raw="$OUT_DIR/$ENGINE.lat_no_source_probe_overhead_ms"
   local source_fetch_profile_enabled=false source_fetch_profile_valid=true source_fetch_profile_reason=""
   local source_fetch_before_fixed="null" source_fetch_after_fixed="null" source_fetch_after_random="null"
   local source_fetch_after_no_source="null" source_fetch_after_cold="null"
@@ -858,13 +986,15 @@ run_engine(){
       source_fetch_profile_reason="$SOURCE_FETCH_SCRAPE_REASON"
     fi
   fi
-  if ! capture_probe_samples "$BASE" "$PROBE_FIXED_BODIES" "$fixed_raw" "$PROBE_REQUESTS" fixed; then
+  if ! capture_probe_samples "$BASE" "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS" fixed; then
     err "$ENGINE : série fixe invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
-  local lat50 lat95 lat99
-  read -r lat50 lat95 lat99 < <(probe_quantiles "$fixed_raw")
+  local lat50 lat95 lat99 lat_fixed_took50 lat_fixed_took95 lat_fixed_took99 lat_fixed_probe50 lat_fixed_probe95 lat_fixed_probe99
+  read -r lat50 lat95 lat99 < <(probe_quantiles "$fixed_raw" 1000)
+  read -r lat_fixed_took50 lat_fixed_took95 lat_fixed_took99 < <(probe_quantiles "$fixed_took_raw" 1)
+  read -r lat_fixed_probe50 lat_fixed_probe95 lat_fixed_probe99 < <(probe_quantiles "$fixed_overhead_raw" 1)
   if [ "$source_fetch_profile_enabled" = true ]; then
     if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_fixed" after_fixed 1; then
       source_fetch_profile_valid=false
@@ -879,13 +1009,15 @@ run_engine(){
       source_fetch_profile_previous=$((source_fetch_profile_previous + SOURCE_FETCH_ARTIFACT_RECORDS))
     fi
   fi
-  if ! capture_probe_samples "$BASE" "$PROBE_BODIES" "$random_raw" "$PROBE_REQUESTS" random; then
+  if ! capture_probe_samples "$BASE" "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS" random; then
     err "$ENGINE : série random invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
-  local latr50 latr95 latr99
-  read -r latr50 latr95 latr99 < <(probe_quantiles "$random_raw")
+  local latr50 latr95 latr99 lat_rand_took50 lat_rand_took95 lat_rand_took99 lat_rand_probe50 lat_rand_probe95 lat_rand_probe99
+  read -r latr50 latr95 latr99 < <(probe_quantiles "$random_raw" 1000)
+  read -r lat_rand_took50 lat_rand_took95 lat_rand_took99 < <(probe_quantiles "$random_took_raw" 1)
+  read -r lat_rand_probe50 lat_rand_probe95 lat_rand_probe99 < <(probe_quantiles "$random_overhead_raw" 1)
   if [ "$source_fetch_profile_enabled" = true ]; then
     if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_random" after_random 1; then
       source_fetch_profile_valid=false
@@ -909,13 +1041,15 @@ run_engine(){
       source_fetch_profile_reason="${source_fetch_profile_reason:-random_hydrated_8plus_absent}"
     fi
   fi
-  if ! capture_probe_samples "$BASE" "$PROBE_CONTROL_BODIES" "$no_source_raw" "$PROBE_REQUESTS" no_source; then
+  if ! capture_probe_samples "$BASE" "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS" no_source; then
     err "$ENGINE : série témoin size:0 invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
-  local latn50 latn95 latn99
-  read -r latn50 latn95 latn99 < <(probe_quantiles "$no_source_raw")
+  local latn50 latn95 latn99 lat_no_source_took50 lat_no_source_took95 lat_no_source_took99 lat_no_source_probe50 lat_no_source_probe95 lat_no_source_probe99
+  read -r latn50 latn95 latn99 < <(probe_quantiles "$no_source_raw" 1000)
+  read -r lat_no_source_took50 lat_no_source_took95 lat_no_source_took99 < <(probe_quantiles "$no_source_took_raw" 1)
+  read -r lat_no_source_probe50 lat_no_source_probe95 lat_no_source_probe99 < <(probe_quantiles "$no_source_overhead_raw" 1)
   if [ "$source_fetch_profile_enabled" = true ]; then
     if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_no_source" after_no_source 1; then
       source_fetch_profile_valid=false
@@ -939,8 +1073,8 @@ run_engine(){
   # Une unique éviction avant 1 000 requêtes se réchauffait et ne mesurait pas
   # un accès froid. Le protocole L2 garde au plus COLD_PROBE_REQUESTS corps
   # random, et invalide toute série où un reclaim n'est pas vérifié.
-  local latc50="null" latc95="null" latc99="null" cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
-  local cold_raw="$OUT_DIR/$ENGINE.lat_cold_s" cold_reclaimed_requests=0
+  local latc50="null" latc95="null" latc99="null" lat_cold_took50="null" lat_cold_took95="null" lat_cold_took99="null" lat_cold_probe50="null" lat_cold_probe95="null" lat_cold_probe99="null" cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
+  local cold_raw="$OUT_DIR/$ENGINE.lat_cold_client_s" cold_took_raw="$OUT_DIR/$ENGINE.lat_cold_took_ms" cold_overhead_raw="$OUT_DIR/$ENGINE.lat_cold_probe_overhead_ms" cold_reclaimed_requests=0
   local cold_reclaim_audit="$OUT_DIR/$ENGINE.cold_reclaim.tsv" cold_reclaim_audit_records=0
   : > "$cold_reclaim_audit"
   local mem_anon_warm="null" mem_file_warm="null" mem_anon_cold="null" mem_file_cold="null"
@@ -968,17 +1102,21 @@ run_engine(){
   fi
   if [ -n "$reclaim_writer" ]; then
     cold_attempted=true
-    if capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS"; then
+    if capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS"; then
       cold_ok=true
       cold_method="memory_reclaim_file_target_verified_each_request"
       cold_reclaimed_requests="$COLD_CAPTURE_COMPLETED"
-      read -r latc50 latc95 latc99 < <(probe_quantiles "$cold_raw")
+      read -r latc50 latc95 latc99 < <(probe_quantiles "$cold_raw" 1000)
+      read -r lat_cold_took50 lat_cold_took95 lat_cold_took99 < <(probe_quantiles "$cold_took_raw" 1)
+      read -r lat_cold_probe50 lat_cold_probe95 lat_cold_probe99 < <(probe_quantiles "$cold_overhead_raw" 1)
     else
       cold_skip_reason="${COLD_CAPTURE_REASON:-cold_capture_failed}"
       cold_reclaimed_requests="$COLD_CAPTURE_COMPLETED"
     fi
   fi
   [ -f "$cold_raw" ] || : > "$cold_raw"
+  [ -f "$cold_took_raw" ] || : > "$cold_took_raw"
+  [ -f "$cold_overhead_raw" ] || : > "$cold_overhead_raw"
   cold_reclaim_audit_records=$(wc -l < "$cold_reclaim_audit" 2>/dev/null); cold_reclaim_audit_records=${cold_reclaim_audit_records:-0}
   if [ "$cold_ok" = true ]; then
     # Une série n'est cold que si ses N reclamations ont toutes été vérifiées.
@@ -1049,8 +1187,8 @@ run_engine(){
   [ "$cold_ok" = true ] && source_fetch_prometheus_json="$source_fetch_cold_json"
   local source_fetch_metrics_json="$source_fetch_prometheus_json,\"measurement_valid\":$measurement_valid,\"measurement_invalid_reason\":$measurement_invalid_reason,\"source_fetch_profile_valid\":$source_fetch_profile_valid,\"source_fetch_profile_invalid_reason\":$source_fetch_profile_reason_json,\"source_fetch_random_worker_participations\":$source_fetch_random_worker_participations,\"source_fetch_random_hydrated_8plus_requests\":$source_fetch_random_hydrated_8plus_requests,\"source_fetch_random_hydrated_8plus_gate\":$source_fetch_random_gate_json,\"source_fetch_jsonl\":{\"fixed\":$source_fetch_fixed_jsonl_json,\"random\":$source_fetch_random_jsonl_json,\"no_source\":$source_fetch_no_source_jsonl_json,\"cold\":$source_fetch_cold_jsonl_json},\"source_fetch_snapshots\":{\"before_fixed\":$source_fetch_before_json,\"after_fixed\":$source_fetch_fixed_json,\"after_random\":$source_fetch_random_json,\"after_no_source\":$source_fetch_no_source_json,\"after_cold\":$source_fetch_cold_json},\"source_fetch_deltas\":{\"fixed\":$source_fetch_fixed_delta_json,\"random\":$source_fetch_random_delta_json,\"no_source\":$source_fetch_no_source_delta_json,\"cold\":$source_fetch_cold_delta_json}"
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json}" > "$OUT_DIR/$ENGINE.json"
-  log "$ENGINE : mesure valide=$measurement_valid | ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe ${lat50}/${lat95}/${lat99} | rand ${latr50}/${latr95}/${latr99} | témoin ${latn50}/${latn95}/${latn99} | cold ${latc50}/${latc95}/${latc99} (reclaims=$cold_reclaimed_requests/50 audit=$cold_reclaim_audit_records/50 ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\",\"probe_cpu_count\":$HOST_CPU_COUNT,\"probe_connection_reuse\":{\"fixed\":\"single_curl_next\",\"random\":\"single_curl_next\",\"no_source\":\"single_curl_next\",\"cold\":\"one_curl_per_reclaim\"},\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_fixed_client_s_file\":\"$fixed_raw\",\"lat_fixed_took_ms_file\":\"$fixed_took_raw\",\"lat_fixed_probe_overhead_ms_file\":\"$fixed_overhead_raw\",\"lat_fixed_client_p50_ms\":$lat50,\"lat_fixed_client_p95_ms\":$lat95,\"lat_fixed_client_p99_ms\":$lat99,\"lat_fixed_took_p50_ms\":$lat_fixed_took50,\"lat_fixed_took_p95_ms\":$lat_fixed_took95,\"lat_fixed_took_p99_ms\":$lat_fixed_took99,\"lat_fixed_probe_overhead_p50_ms\":$lat_fixed_probe50,\"lat_fixed_probe_overhead_p95_ms\":$lat_fixed_probe95,\"lat_fixed_probe_overhead_p99_ms\":$lat_fixed_probe99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_rand_client_s_file\":\"$random_raw\",\"lat_rand_took_ms_file\":\"$random_took_raw\",\"lat_rand_probe_overhead_ms_file\":\"$random_overhead_raw\",\"lat_rand_client_p50_ms\":$latr50,\"lat_rand_client_p95_ms\":$latr95,\"lat_rand_client_p99_ms\":$latr99,\"lat_rand_took_p50_ms\":$lat_rand_took50,\"lat_rand_took_p95_ms\":$lat_rand_took95,\"lat_rand_took_p99_ms\":$lat_rand_took99,\"lat_rand_probe_overhead_p50_ms\":$lat_rand_probe50,\"lat_rand_probe_overhead_p95_ms\":$lat_rand_probe95,\"lat_rand_probe_overhead_p99_ms\":$lat_rand_probe99,\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"lat_no_source_client_s_file\":\"$no_source_raw\",\"lat_no_source_took_ms_file\":\"$no_source_took_raw\",\"lat_no_source_probe_overhead_ms_file\":\"$no_source_overhead_raw\",\"lat_no_source_client_p50_ms\":$latn50,\"lat_no_source_client_p95_ms\":$latn95,\"lat_no_source_client_p99_ms\":$latn99,\"lat_no_source_took_p50_ms\":$lat_no_source_took50,\"lat_no_source_took_p95_ms\":$lat_no_source_took95,\"lat_no_source_took_p99_ms\":$lat_no_source_took99,\"lat_no_source_probe_overhead_p50_ms\":$lat_no_source_probe50,\"lat_no_source_probe_overhead_p95_ms\":$lat_no_source_probe95,\"lat_no_source_probe_overhead_p99_ms\":$lat_no_source_probe99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"lat_cold_client_s_file\":\"$cold_raw\",\"lat_cold_took_ms_file\":\"$cold_took_raw\",\"lat_cold_probe_overhead_ms_file\":\"$cold_overhead_raw\",\"lat_cold_client_p50_ms\":$latc50,\"lat_cold_client_p95_ms\":$latc95,\"lat_cold_client_p99_ms\":$latc99,\"lat_cold_took_p50_ms\":$lat_cold_took50,\"lat_cold_took_p95_ms\":$lat_cold_took95,\"lat_cold_took_p99_ms\":$lat_cold_took99,\"lat_cold_probe_overhead_p50_ms\":$lat_cold_probe50,\"lat_cold_probe_overhead_p95_ms\":$lat_cold_probe95,\"lat_cold_probe_overhead_p99_ms\":$lat_cold_probe99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json}" > "$OUT_DIR/$ENGINE.json"
+  log "$ENGINE : mesure valide=$measurement_valid | ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe client ${lat50}/${lat95}/${lat99}, moteur ${lat_fixed_took50}/${lat_fixed_took95}/${lat_fixed_took99}, sonde ${lat_fixed_probe50}/${lat_fixed_probe95}/${lat_fixed_probe99} | rand client ${latr50}/${latr95}/${latr99}, moteur ${lat_rand_took50}/${lat_rand_took95}/${lat_rand_took99}, sonde ${lat_rand_probe50}/${lat_rand_probe95}/${lat_rand_probe99} | témoin client ${latn50}/${latn95}/${latn99}, moteur ${lat_no_source_took50}/${lat_no_source_took95}/${lat_no_source_took99}, sonde ${lat_no_source_probe50}/${lat_no_source_probe95}/${lat_no_source_probe99} | cold client ${latc50}/${latc95}/${latc99}, moteur ${lat_cold_took50}/${lat_cold_took95}/${lat_cold_took99}, sonde ${lat_cold_probe50}/${lat_cold_probe95}/${lat_cold_probe99} (reclaims=$cold_reclaimed_requests/50 audit=$cold_reclaim_audit_records/50 ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
   [ "$HOLD_SECONDS" -gt 0 ] 2>/dev/null && { log "$ENGINE : HOLD_SECONDS=$HOLD_SECONDS avant teardown (brancher artillery-replay.sh sur $NET / $CID)"; sleep "$HOLD_SECONDS"; }
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
   [ "$measurement_valid" = true ]
