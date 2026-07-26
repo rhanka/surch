@@ -2849,6 +2849,16 @@ pub struct DiskPostingsCursor<'seg> {
     total_count: usize,
 }
 
+/// Résultat explicite d'une avance disque : la fin normale des postings et
+/// une erreur de lecture ou de décodage ne sont pas interchangeables pour un
+/// appelant qui doit pouvoir décliner vers son chemin de référence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskPostingsAdvance {
+    Found(u32),
+    Exhausted,
+    Error,
+}
+
 impl<'seg> DiskPostingsCursor<'seg> {
     /// Build a cursor over one term's payload inside `segment`. Computes
     /// the block directory (sous-pas 1: ad hoc, NOT persisted — see
@@ -2929,11 +2939,26 @@ impl<'seg> DiskPostingsCursor<'seg> {
     /// Advance to the first `doc_id >= target`, `pread`+decoding at most
     /// one NEW block to get there. `target` must be non-decreasing across
     /// calls — same contract, same return-and-consume semantics, as
-    /// [`PostingsBlockSkipIter::advance_to`]. Returns `None` once the
-    /// term's postings are exhausted.
+    /// [`PostingsBlockSkipIter::advance_to`]. `None` conserve le contrat
+    /// historique pour les appelants qui ne distinguent pas encore la fin
+    /// normale d'une erreur disque ; le chemin P1a utilise
+    /// [`Self::advance_to_with_status`] pour cette distinction.
     pub fn advance_to(&mut self, target: u32) -> Option<u32> {
+        match self.advance_to_with_status(target) {
+            DiskPostingsAdvance::Found(doc_id) => Some(doc_id),
+            DiskPostingsAdvance::Exhausted | DiskPostingsAdvance::Error => None,
+        }
+    }
+
+    /// Variante explicite de [`Self::advance_to`]. La fin des postings reste
+    /// `Exhausted`, tandis qu'un `pread`, une longueur de bloc invalide ou un
+    /// décodage invalide renvoie `Error` afin que le scorer fusionné puisse
+    /// décliner sans publier un préfixe partiel.
+    pub fn advance_to_with_status(&mut self, target: u32) -> DiskPostingsAdvance {
         loop {
-            let entry = *self.directory.get(self.block_cursor)?;
+            let Some(entry) = self.directory.get(self.block_cursor).copied() else {
+                return DiskPostingsAdvance::Exhausted;
+            };
             if entry.max_doc_id < target {
                 // Skip this whole block: directory-only, no pread, no
                 // decode.
@@ -2947,12 +2972,19 @@ impl<'seg> DiskPostingsCursor<'seg> {
                     .get(self.block_cursor + 1)
                     .map(|next| next.byte_offset_in_term_payload)
                     .unwrap_or(self.term_payload_len);
-                let block_len = block_end.checked_sub(entry.byte_offset_in_term_payload)?;
-                let block_bytes = self.segment.read(
+                let Some(block_len) = block_end.checked_sub(entry.byte_offset_in_term_payload)
+                else {
+                    return DiskPostingsAdvance::Error;
+                };
+                let Some(block_bytes) = self.segment.read(
                     self.term_base_offset + u64::from(entry.byte_offset_in_term_payload),
                     block_len,
-                )?;
-                let (doc_ids, freqs) = decode_block(&block_bytes, entry.count as usize).ok()?;
+                ) else {
+                    return DiskPostingsAdvance::Error;
+                };
+                let Ok((doc_ids, freqs)) = decode_block(&block_bytes, entry.count as usize) else {
+                    return DiskPostingsAdvance::Error;
+                };
                 self.loaded = Some((self.block_cursor, doc_ids, freqs));
                 self.local_pos = 0;
             }
@@ -2987,7 +3019,7 @@ impl<'seg> DiskPostingsCursor<'seg> {
             let found_index = self.local_pos + offset;
             self.local_pos = found_index + 1;
             self.last_freq = freqs[found_index];
-            return Some(doc_ids[found_index]);
+            return DiskPostingsAdvance::Found(doc_ids[found_index]);
         }
     }
 
@@ -3273,6 +3305,53 @@ mod tests {
             decode_block_dir_entries(&bytes[..bytes.len() - 1], run.len()),
             None,
             "truncated run must not decode"
+        );
+    }
+
+    #[test]
+    fn disk_cursor_status_separates_exhaustion_from_io_and_decode_errors() {
+        let empty_segment = PostingsSegment::try_new().expect("temporary segment must open");
+        let mut exhausted =
+            DiskPostingsCursor::open_with_directory(&empty_segment, 0, 0, Vec::new(), 0);
+        assert_eq!(
+            exhausted.advance_to_with_status(0),
+            DiskPostingsAdvance::Exhausted
+        );
+
+        let mut malformed_segment =
+            PostingsSegment::try_new().expect("temporary segment must open");
+        malformed_segment
+            .append(&[0])
+            .expect("malformed payload byte must be written");
+        let mut unreadable = DiskPostingsCursor::open_with_directory(
+            &malformed_segment,
+            u64::MAX - 1,
+            1,
+            vec![BlockDirEntry {
+                byte_offset_in_term_payload: 0,
+                count: 1,
+                max_doc_id: 0,
+            }],
+            1,
+        );
+        assert_eq!(
+            unreadable.advance_to_with_status(0),
+            DiskPostingsAdvance::Error
+        );
+        let mut malformed = DiskPostingsCursor::open_with_directory(
+            &malformed_segment,
+            0,
+            1,
+            vec![BlockDirEntry {
+                byte_offset_in_term_payload: 0,
+                count: 1,
+                max_doc_id: 0,
+            }],
+            1,
+        );
+        assert_eq!(
+            malformed.advance_to_with_status(0),
+            DiskPostingsAdvance::Error
         );
     }
 }
