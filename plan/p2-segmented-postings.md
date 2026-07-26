@@ -74,6 +74,11 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     tests P2 et des modules `#[cfg(test)]` ne relève aucune autre ambiguïté
     numérique, méthode standard incompatible, import inutile ou symbole non
     résolu.
+- [x] Lot 6 — harnais de mesure P2 local : corps `bool.must` mono-token
+  attestés, empreintes SHA-256 gelées, snapshots Prometheus avant/après,
+  réponses canoniques A/B, séries bool/match et bootstrap apparié. Le pilote
+  `deploy/bench-local/p2-campaign.sh` impose le smoke puis les trois paires
+  contrebalancées, sans lancer la campagne depuis le dépôt.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs

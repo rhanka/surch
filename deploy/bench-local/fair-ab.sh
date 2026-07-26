@@ -67,6 +67,22 @@ HOLD_SECONDS="${HOLD_SECONDS:-0}"   # après mesures, tient le conteneur N s ava
 BULK_FILE="${BULK_FILE:-}"
 MAPPING_FILE="${MAPPING_FILE:-}"
 BULK_RETRIES="${BULK_RETRIES:-3}"   # nb de tentatives par chunk avant échec dur
+# P2 est un protocole fermé, volontairement opt-in : les usages historiques
+# (L1/L2 et comparaison ES) gardent donc exactement leur comportement par
+# défaut. Le pilote p2-campaign.sh active cette voie pour les six mesures.
+P2_MEASURE="${P2_MEASURE:-0}"
+P2_VARIANT="${P2_VARIANT:-}"          # A = avant, B = parcours P2
+P2_INPUT_DIR="${P2_INPUT_DIR:-$OUT_DIR/p2-inputs}"
+P2_PAIR_COUNT="${P2_PAIR_COUNT:-1000}" # 1000 full ; 100 seulement pour le smoke
+P2_WARM_PAIR_COUNT="${P2_WARM_PAIR_COUNT:-100}"
+P2_EXPECTED_DOCS="${P2_EXPECTED_DOCS:-28917511}"
+P2_REQUIRED_SEGMENTS="${P2_REQUIRED_SEGMENTS:-12}"
+P2_SEGMENT_GATE="${P2_SEGMENT_GATE:-exact}" # exact (full) ou minimum (smoke)
+P2_CPU_STEAL_MAX_PERCENT="${P2_CPU_STEAL_MAX_PERCENT:-1}"
+P2_PROTOCOL_VERSION="p2-segmented-postings-v1"
+# Déclaré ici aussi parce que P2 refuse explicitement un bypass avant le
+# bloc historique de préflight qui consomme cette variable.
+PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"
 NET="fair-ab-net"
 
 mkdir -p "$OUT_DIR"
@@ -74,6 +90,34 @@ log(){ printf '\033[1;36m[fair-ab]\033[0m %s\n' "$*"; }
 err(){ printf '\033[1;31m[fair-ab]\033[0m %s\n' "$*" >&2; }
 case "$PROBE_REQUESTS" in ''|*[!0-9]*) err "PROBE_REQUESTS doit être un entier positif"; exit 1;; esac
 [ "$PROBE_REQUESTS" -gt 0 ] || { err "PROBE_REQUESTS doit être > 0"; exit 1; }
+case "$P2_MEASURE" in 0|1) ;; *) err "P2_MEASURE doit valoir 0 ou 1"; exit 1;; esac
+if [ "$P2_MEASURE" = "1" ]; then
+  [ "$P2_VARIANT" = "A" ] || [ "$P2_VARIANT" = "B" ] || {
+    err "P2_VARIANT doit valoir A ou B quand P2_MEASURE=1"; exit 1;
+  }
+  case "$P2_PAIR_COUNT:$P2_WARM_PAIR_COUNT" in *[!0-9:]*|:*|*::*) err "P2_PAIR_COUNT/P2_WARM_PAIR_COUNT invalides"; exit 1;; esac
+  [ "$P2_WARM_PAIR_COUNT" -eq 100 ] || {
+    err "protocole P2 invalide : P2_WARM_PAIR_COUNT doit rester 100"; exit 1;
+  }
+  [ "$PROBE_REQUESTS" -eq $(( 2 * P2_PAIR_COUNT )) ] || {
+    err "protocole P2 invalide : PROBE_REQUESTS doit valoir 2 × P2_PAIR_COUNT (reçu $PROBE_REQUESTS pour $P2_PAIR_COUNT paires)"; exit 1;
+  }
+  [ "$COLD_PROBE_REQUESTS" = "50" ] || {
+    err "protocole P2 invalide : COLD_PROBE_REQUESTS doit rester 50 (reçu $COLD_PROBE_REQUESTS)"; exit 1;
+  }
+  [ "$COLD_PROBE" = "1" ] || {
+    err "protocole P2 invalide : COLD_PROBE doit rester actif"; exit 1;
+  }
+  [ "$PREFLIGHT_FORCE" = "0" ] || {
+    err "protocole P2 invalide : PREFLIGHT_FORCE=1 contourne le garde-fou mémoire"; exit 1;
+  }
+  [ "$SURCH_SOURCE_FETCH_PROFILE" = "0" ] || {
+    err "protocole P2 invalide : SURCH_SOURCE_FETCH_PROFILE doit rester à 0"; exit 1;
+  }
+  [ -n "$BULK_FILE" ] && [ -n "$MAPPING_FILE" ] || {
+    err "protocole P2 : BULK_FILE et MAPPING_FILE explicites sont obligatoires"; exit 1;
+  }
+fi
 if [ "$SURCH_SOURCE_FETCH_PROFILE" = "1" ] && [ "$PROBE_REQUESTS" -ne 1000 ]; then
   err "protocole L2 profilé invalide : PROBE_REQUESTS doit rester 1000 (reçu $PROBE_REQUESTS)"
   exit 1
@@ -90,7 +134,13 @@ esac
 # ---- garde-fous ----
 [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] || { err "cgroup v2 requis"; exit 1; }
 gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
-[ "$gov" = "performance" ] || err "AVERTISSEMENT gouverneur=$gov (biais fréquence ; 'sudo cpupower frequency-set -g performance' pour un run rigoureux)"
+if [ "$gov" != "performance" ]; then
+  if [ "$P2_MEASURE" = "1" ]; then
+    err "protocole P2 invalide : gouverneur=$gov, performance obligatoire"
+    exit 1
+  fi
+  err "AVERTISSEMENT gouverneur=$gov (biais fréquence ; 'sudo cpupower frequency-set -g performance' pour un run rigoureux)"
+fi
 
 # ---- plafonnement ressources hôte (post-mortem 2026-07-11 : OOM global machine) ----
 # La nuit du 10-11/07 un run 28M a contribué à un OOM GLOBAL de l'hôte (le noyau a tué des
@@ -106,7 +156,8 @@ gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || 
 # Les conteneurs moteurs étaient déjà cappés (--memory) ; les auxiliaires le sont via $AUXCAP.
 HARNESS_MEM_MAX="${HARNESS_MEM_MAX:-3G}"              # cap du scope hôte du harnais (suffixe MAJUSCULE : systemd)
 PREFLIGHT_MARGIN_MIB="${PREFLIGHT_MARGIN_MIB:-2048}"  # marge exigée au-delà des deux caps
-PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"               # 1 = passer outre le préflight (déconseillé)
+# 1 = passer outre le préflight (déconseillé) ; P2 le refuse plus haut.
+PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"
 AUX_MEM="${AUX_MEM:-512m}"                            # cap des conteneurs auxiliaires
 AUXCAP="--memory=$AUX_MEM --memory-swap=$AUX_MEM"
 # La sonde ne partage aucun cœur avec le moteur : son coût CPU reste ainsi
@@ -141,6 +192,58 @@ if [ "$probe_cpuset_rc" -ne 0 ] || [ -z "$PROBE_CPUSET" ]; then
   err "CPUSET invalide ou aucun cœur restant pour la sonde : CPUSET=$CPUSET, nproc=$HOST_CPU_COUNT"
   exit 1
 fi
+if [ "$P2_MEASURE" = "1" ]; then
+  # La campagne décisive est attachée à la b3-16 : trois vCPU moteur et le
+  # quatrième exclusivement pour la sonde. Toute autre topologie est un autre
+  # protocole, pas une approximation silencieuse de P2.
+  [ "$HOST_CPU_COUNT" -eq 4 ] && [ "$CPUSET" = "0-2" ] && [ "$PROBE_CPUSET" = "3" ] || {
+    err "protocole P2 invalide : b3-16 attendue (nproc=4, CPUSET=0-2, sonde=3 ; reçu nproc=$HOST_CPU_COUNT, CPUSET=$CPUSET, sonde=$PROBE_CPUSET)"
+    exit 1
+  }
+  for p2_cpu in 0 1 2 3; do
+    p2_cpu_gov=$(cat "/sys/devices/system/cpu/cpu${p2_cpu}/cpufreq/scaling_governor" 2>/dev/null || true)
+    [ "$p2_cpu_gov" = "performance" ] || {
+      err "protocole P2 invalide : gouverneur cpu$p2_cpu=${p2_cpu_gov:-absent}, performance obligatoire"
+      exit 1
+    }
+  done
+  [ "$(mem_to_mib "$MEM_LIMIT")" -eq 6144 ] \
+    && [ "$(mem_to_mib "$HARNESS_MEM_MAX")" -eq 3072 ] \
+    && [ "$PREFLIGHT_MARGIN_MIB" -eq 2048 ] \
+    && [ "$(mem_to_mib "$AUX_MEM")" -eq 512 ] || {
+      err "protocole P2 invalide : caps attendus MEM_LIMIT=6g HARNESS_MEM_MAX=3G PREFLIGHT_MARGIN_MIB=2048 AUX_MEM=512m"
+      exit 1
+    }
+  [ "$POSTINGS_DISK" = "1" ] \
+    && [ "${SURCH_SOURCE_COMPRESS:-}" = "1" ] \
+    && [ -z "${SURCH_SOURCE_FETCH_PARALLEL:-}" ] \
+    && [ "$PROBE_FIELD_NOM" = "NOM" ] \
+    && [ "$PROBE_FIELD_PRENOMS" = "PRENOMS" ] || {
+      err "protocole P2 invalide : configuration postings/source différente du cahier des charges"
+      exit 1
+    }
+  case "$P2_EXPECTED_DOCS:$P2_REQUIRED_SEGMENTS" in
+    *[!0-9:]*|:*|*::*) err "paramètres P2 documents/segments invalides"; exit 1;;
+  esac
+  if [ "$P2_SEGMENT_GATE" = "exact" ]; then
+    [ "$P2_PAIR_COUNT" -eq 1000 ] \
+      && [ "${SURCH_FLUSH_BUDGET_BYTES:-}" = "268435456" ] \
+      && [ "${SURCH_MERGE_FANIN:-}" = "8" ] \
+      && [ "${SURCH_DENSIFY_BUDGET_DOCS:-}" = "1000000" ] \
+      && [ "${SURCH_MERGE_MAX_DOCS:-}" = "7000000" ] || {
+        err "P2 full invalide : budgets de segments différents du protocole"; exit 1;
+      }
+  elif [ "$P2_SEGMENT_GATE" = "minimum" ]; then
+    [ "$P2_PAIR_COUNT" -eq 100 ] \
+      && [ "${SURCH_FLUSH_BUDGET_BYTES:-}" = "33554432" ] \
+      && [ "${SURCH_MERGE_FANIN:-}" = "64" ] || {
+        err "P2 smoke invalide : budgets de segments différents du protocole"; exit 1;
+      }
+  else
+    err "P2_SEGMENT_GATE doit valoir exact ou minimum"; exit 1
+  fi
+  case "$P2_CPU_STEAL_MAX_PERCENT" in ''|*[!0-9.]*|*.*.*) err "P2_CPU_STEAL_MAX_PERCENT invalide"; exit 1;; esac
+fi
 PROBE_AUXCAP="$AUXCAP --cpuset-cpus=$PROBE_CPUSET"
 log "sonde CPUSET=$PROBE_CPUSET (moteur=$CPUSET, nproc=$HOST_CPU_COUNT)"
 if [ "${FAIRAB_SCOPED:-0}" != "1" ] && command -v systemd-run >/dev/null 2>&1 \
@@ -150,6 +253,10 @@ if [ "${FAIRAB_SCOPED:-0}" != "1" ] && command -v systemd-run >/dev/null 2>&1 \
     -p MemoryMax="$HARNESS_MEM_MAX" -p MemorySwapMax=256M -- "$0" "$@"
 fi
 [ "${FAIRAB_SCOPED:-0}" = "1" ] || err "AVERTISSEMENT scope systemd indisponible -> partie hôte du harnais NON plafonnée"
+if [ "$P2_MEASURE" = "1" ] && [ "${FAIRAB_SCOPED:-0}" != "1" ]; then
+  err "protocole P2 invalide : scope systemd MemoryMax indisponible"
+  exit 1
+fi
 exec 9>"${XDG_RUNTIME_DIR:-/tmp}/fair-ab.lock"
 flock -n 9 || { err "un autre fair-ab tourne déjà (verrou fair-ab.lock) — runs concurrents refusés"; exit 1; }
 mem_avail_mib=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
@@ -213,11 +320,224 @@ fi
 NDOCS=$(( $(wc -l < "$BULK") / 2 ))
 log "corpus prêt : $NDOCS docs ($(du -h "$BULK" | cut -f1))"
 
+# ---- P2 : entrées gelées, strictement éligibles au chemin bool.must disque ----
+# Les analyseurs découpent les blancs, apostrophes et ponctuation. La sélection
+# est volontairement plus stricte : ASCII alphanumérique seulement. Rejeter un
+# terme potentiellement multi-token vaut mieux que mesurer le repli générique.
+p2_sha256(){ sha256sum "$1" | awk '{print $1}'; }
+
+p2_validate_pairs(){
+  local pairs="$1" wanted="$P2_PAIR_COUNT"
+  awk -F '\t' -v wanted="$wanted" '
+    NF != 3 || $1 != NR || $2 !~ /^[[:alnum:]]+$/ || $3 !~ /^[[:alnum:]]+$/ { invalid = 1; exit }
+    END { exit (invalid || NR != wanted) }
+  ' "$pairs"
+}
+
+p2_validate_body_files(){
+  local pairs="$1" random="$2" no_source="$3" warm="$4" fixed="$5"
+  local expected_random=$(( 2 * P2_PAIR_COUNT )) expected_warm=$(( 2 * P2_WARM_PAIR_COUNT ))
+  [ "$(wc -l < "$random" 2>/dev/null || echo 0)" -eq "$expected_random" ] \
+    && [ "$(wc -l < "$no_source" 2>/dev/null || echo 0)" -eq "$expected_random" ] \
+    && [ "$(wc -l < "$warm" 2>/dev/null || echo 0)" -eq "$expected_warm" ] \
+    && [ "$(wc -l < "$fixed" 2>/dev/null || echo 0)" -eq "$expected_random" ] || return 1
+  awk -F '\t' -v bodies="$random" -v control="$no_source" -v warm="$warm" \
+      -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" \
+      -v wanted="$P2_PAIR_COUNT" -v warm_pairs="$P2_WARM_PAIR_COUNT" '
+    function bool_body(nom, pre, size) {
+      return "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"" fnom "\":\"" nom "\"}},{\"match\":{\"" fpre "\":\"" pre "\"}}]}},\"size\":" size "}"
+    }
+    function match_body(nom, size) {
+      return "{\"query\":{\"match\":{\"" fnom "\":\"" nom "\"}},\"size\":" size "}"
+    }
+    {
+      if ((getline b1 < bodies) <= 0 || (getline b2 < bodies) <= 0) { invalid = 1; exit }
+      if ((getline c1 < control) <= 0 || (getline c2 < control) <= 0) { invalid = 1; exit }
+      if (b1 != bool_body($2, $3, 10) || b2 != match_body($2, 10)) { invalid = 1; exit }
+      if (c1 != bool_body($2, $3, 0) || c2 != match_body($2, 0)) { invalid = 1; exit }
+      if (NR <= warm_pairs) {
+        if ((getline w1 < warm) <= 0 || (getline w2 < warm) <= 0) { invalid = 1; exit }
+        if (w1 != bool_body($2, $3, 10) || w2 != match_body($2, 10)) { invalid = 1; exit }
+      }
+    }
+    END {
+      close(bodies); close(control); close(warm)
+      exit (invalid || NR != wanted)
+    }
+  ' "$pairs" || return 1
+  awk -v n="$expected_random" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" '
+    { expected = "{\"query\":{\"match\":{\"" fnom "\":\"" term "\"}},\"size\":10}"; if ($0 != expected) { invalid = 1; exit } }
+    END { exit (invalid || NR != n) }
+  ' "$fixed"
+}
+
+p2_manifest_value(){
+  local key="$1" file="$2"
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+p2_validate_frozen_inputs(){
+  local manifest="$1" expected actual key file
+  [ "$(p2_manifest_value protocol "$manifest")" = "$P2_PROTOCOL_VERSION" ] || return 1
+  for key_file in \
+    "bulk_sha256:$BULK" \
+    "mapping_sha256:$MAPPING_FILE" \
+    "pairs_sha256:$P2_PAIRS" \
+    "warm_bodies_sha256:$P2_WARM_BODIES" \
+    "fixed_bodies_sha256:$PROBE_FIXED_BODIES" \
+    "random_bodies_sha256:$PROBE_BODIES" \
+    "no_source_bodies_sha256:$PROBE_CONTROL_BODIES" \
+    "random_kinds_sha256:$P2_RANDOM_KINDS"; do
+    key=${key_file%%:*}; file=${key_file#*:}
+    expected=$(p2_manifest_value "$key" "$manifest")
+    actual=$(p2_sha256 "$file" 2>/dev/null) || return 1
+    [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
+  done
+  expected=$(cat "$manifest.sha256" 2>/dev/null | awk '{print $1}')
+  actual=$(p2_sha256 "$manifest" 2>/dev/null) || return 1
+  [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
+  p2_validate_pairs "$P2_PAIRS" && p2_validate_body_files "$P2_PAIRS" "$PROBE_BODIES" "$PROBE_CONTROL_BODIES" "$P2_WARM_BODIES" "$PROBE_FIXED_BODIES"
+}
+
+p2_prepare_inputs(){
+  local manifest tmp pairs_tmp fixed_term_ok expected_random=$(( 2 * P2_PAIR_COUNT ))
+  P2_PAIRS="$P2_INPUT_DIR/probe_p2_pairs.tsv"
+  P2_WARM_BODIES="$P2_INPUT_DIR/probe_p2_warm_bodies.ndjson"
+  PROBE_FIXED_BODIES="$P2_INPUT_DIR/probe_p2_fixed_bodies.ndjson"
+  PROBE_BODIES="$P2_INPUT_DIR/probe_p2_random_bodies.ndjson"
+  PROBE_CONTROL_BODIES="$P2_INPUT_DIR/probe_p2_no_source_bodies.ndjson"
+  P2_RANDOM_KINDS="$P2_INPUT_DIR/probe_p2_random_kinds.tsv"
+  PROBE_MANIFEST="$P2_INPUT_DIR/probe_p2_inputs.manifest"
+  manifest="$PROBE_MANIFEST"
+  P2_INPUT_MANIFEST_SHA_FILE="$manifest.sha256"
+  mkdir -p "$P2_INPUT_DIR" || return 1
+
+  if [ -s "$manifest" ]; then
+    if ! p2_validate_frozen_inputs "$manifest"; then
+      err "P2 : entrées gelées invalides ou différentes dans $P2_INPUT_DIR (régénération interdite)"
+      return 1
+    fi
+    P2_INPUT_MANIFEST_SHA256=$(awk '{print $1}' "$P2_INPUT_MANIFEST_SHA_FILE")
+    log "P2 : entrées gelées vérifiées (manifeste SHA-256=$P2_INPUT_MANIFEST_SHA256)"
+    return 0
+  fi
+  if [ -n "$(find "$P2_INPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    err "P2 : $P2_INPUT_DIR contient déjà des fichiers sans manifeste, écrasement refusé"
+    return 1
+  fi
+  printf '%s' "$PROBE_FIXED_TERM" | awk '/^[[:alnum:]]+$/ { ok = 1 } END { exit !ok }' || {
+    err "P2 : PROBE_FIXED_TERM doit être mono-token ASCII"; return 1;
+  }
+
+  log "P2 : sélection déterministe de $P2_PAIR_COUNT documents NOM/PRENOMS mono-token"
+  pairs_tmp="$P2_PAIRS.tmp"
+  if ! awk -v ndocs="$NDOCS" -v wanted="$P2_PAIR_COUNT" -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" '
+    function extract(line, key,    pat, val) {
+      pat = "\"" key "\":\"[^\"]*\""
+      if (!match(line, pat)) return ""
+      val = substr(line, RSTART, RLENGTH)
+      sub(/^"[^"]*":"/, "", val); sub(/"$/, "", val)
+      return val
+    }
+    function mono(value) { return value ~ /^[[:alnum:]]+$/ }
+    NR % 2 == 0 {
+      doc++
+      nom = extract($0, fnom); pre = extract($0, fpre)
+      if (!mono(nom) || !mono(pre)) next
+      bucket = int((doc - 1) * wanted / ndocs) + 1
+      if (!(bucket in bucket_value)) {
+        bucket_value[bucket] = nom "\t" pre; bucket_doc[bucket] = doc
+      }
+      if (fallback_count < wanted * 2) {
+        fallback_count++; fallback_value[fallback_count] = nom "\t" pre; fallback_doc[fallback_count] = doc
+      }
+    }
+    END {
+      for (bucket = 1; bucket <= wanted; bucket++) {
+        if (bucket in bucket_value) {
+          selected_doc[bucket_doc[bucket]] = 1
+          selected[++selected_count] = bucket_value[bucket]
+        }
+      }
+      for (i = 1; i <= fallback_count && selected_count < wanted; i++) {
+        if (!(fallback_doc[i] in selected_doc)) {
+          selected_doc[fallback_doc[i]] = 1
+          selected[++selected_count] = fallback_value[i]
+        }
+      }
+      if (selected_count != wanted) exit 1
+      for (i = 1; i <= wanted; i++) print i "\t" selected[i]
+    }
+  ' "$BULK" > "$pairs_tmp"; then
+    rm -f "$pairs_tmp"
+    err "P2 : moins de $P2_PAIR_COUNT documents éligibles NOM/PRENOMS mono-token"
+    return 1
+  fi
+  if ! p2_validate_pairs "$pairs_tmp"; then
+    rm -f "$pairs_tmp"
+    err "P2 : sélection contient un terme multi-token ou est incomplète"
+    return 1
+  fi
+  mv "$pairs_tmp" "$P2_PAIRS" || return 1
+
+  if ! awk -F '\t' -v random="$PROBE_BODIES" -v control="$PROBE_CONTROL_BODIES" \
+      -v warm="$P2_WARM_BODIES" -v kinds="$P2_RANDOM_KINDS" \
+      -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" \
+      -v warm_pairs="$P2_WARM_PAIR_COUNT" '
+    function bool_body(nom, pre, size) {
+      return "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"" fnom "\":\"" nom "\"}},{\"match\":{\"" fpre "\":\"" pre "\"}}]}},\"size\":" size "}"
+    }
+    function match_body(nom, size) {
+      return "{\"query\":{\"match\":{\"" fnom "\":\"" nom "\"}},\"size\":" size "}"
+    }
+    {
+      bool10 = bool_body($2, $3, 10); match10 = match_body($2, 10)
+      print bool10 >> random; print match10 >> random
+      print bool_body($2, $3, 0) >> control; print match_body($2, 0) >> control
+      print (2 * NR - 1) "\tbool" >> kinds; print (2 * NR) "\tmatch" >> kinds
+      if (NR <= warm_pairs) { print bool10 >> warm; print match10 >> warm }
+    }
+  ' "$P2_PAIRS"; then
+    err "P2 : génération des corps random/warm impossible"
+    return 1
+  fi
+  if ! awk -v n="$expected_random" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" '
+    BEGIN { for (i = 1; i <= n; i++) print "{\"query\":{\"match\":{\"" fnom "\":\"" term "\"}},\"size\":10}" }
+  ' > "$PROBE_FIXED_BODIES"; then
+    err "P2 : génération des $expected_random témoins fixed impossible"
+    return 1
+  fi
+  if ! p2_validate_body_files "$P2_PAIRS" "$PROBE_BODIES" "$PROBE_CONTROL_BODIES" "$P2_WARM_BODIES" "$PROBE_FIXED_BODIES"; then
+    err "P2 : corps générés invalides"
+    return 1
+  fi
+  {
+    printf 'protocol=%s\n' "$P2_PROTOCOL_VERSION"
+    printf 'bulk_sha256=%s\n' "$(p2_sha256 "$BULK")"
+    printf 'mapping_sha256=%s\n' "$(p2_sha256 "$MAPPING_FILE")"
+    printf 'pairs_sha256=%s\n' "$(p2_sha256 "$P2_PAIRS")"
+    printf 'warm_bodies_sha256=%s\n' "$(p2_sha256 "$P2_WARM_BODIES")"
+    printf 'fixed_bodies_sha256=%s\n' "$(p2_sha256 "$PROBE_FIXED_BODIES")"
+    printf 'random_bodies_sha256=%s\n' "$(p2_sha256 "$PROBE_BODIES")"
+    printf 'no_source_bodies_sha256=%s\n' "$(p2_sha256 "$PROBE_CONTROL_BODIES")"
+    printf 'random_kinds_sha256=%s\n' "$(p2_sha256 "$P2_RANDOM_KINDS")"
+  } > "$manifest" || return 1
+  p2_sha256 "$manifest" > "$P2_INPUT_MANIFEST_SHA_FILE" || return 1
+  P2_INPUT_MANIFEST_SHA256=$(cat "$P2_INPUT_MANIFEST_SHA_FILE")
+  log "P2 : entrées créées puis gelées (manifeste SHA-256=$P2_INPUT_MANIFEST_SHA256)"
+}
+
 # ---- manifeste L2 : invalider les sondes si corpus ou contrat changent ----
 # Le nombre de lignes seul ne prouve pas que les bodies correspondent encore
 # au mapping courant. Le manifeste capture l'identité stat du corpus (sans le
 # relire intégralement), le mapping et tous les paramètres qui influencent les
 # requêtes; les quatre fichiers dérivés sont régénérés ensemble si nécessaire.
+if [ "$P2_MEASURE" = "1" ]; then
+  [ "$NDOCS" -eq "$P2_EXPECTED_DOCS" ] || {
+    err "P2 : count corpus $NDOCS différent du count attendu $P2_EXPECTED_DOCS"; exit 1;
+  }
+  p2_prepare_inputs || { err "P2 : préparation des entrées échouée"; exit 1; }
+else
 PROBE_PROTOCOL_VERSION="l2-source-fetch-v3"
 PROBE_NAMES="$OUT_DIR/probe_names.tsv"
 PROBE_IDX="$OUT_DIR/probe_idx.txt"
@@ -368,6 +688,7 @@ fi
 }
 printf '%s\nfingerprint=%s\n' "$PROBE_MANIFEST_PAYLOAD" "$PROBE_FINGERPRINT" > "$PROBE_MANIFEST" \
   || { err "écriture manifeste de sondes impossible"; exit 1; }
+fi
 
 docker network create "$NET" >/dev/null 2>&1 || true
 
@@ -449,7 +770,7 @@ decode_probe_capture(){
 # son shard request cache, y compris pour le témoin `size:0`. Le démarrage du
 # conteneur reste hors `time_total`.
 capture_probe_samples(){
-  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" wanted="$6" phase="$7"
+  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" wanted="$6" phase="$7" responses_raw="${8:-}"
   local capture="$client_raw.capture"
   PROBE_CAPTURE_REASON=""
   : > "$client_raw"; : > "$took_raw"; : > "$overhead_raw"; : > "$capture"
@@ -486,7 +807,19 @@ capture_probe_samples(){
     PROBE_CAPTURE_REASON="${phase}_curl_exit_nonzero"
     return 1
   fi
-  decode_probe_capture "$capture" "$client_raw" "$took_raw" "$overhead_raw" "$wanted" "$phase"
+  if ! decode_probe_capture "$capture" "$client_raw" "$took_raw" "$overhead_raw" "$wanted" "$phase"; then
+    return 1
+  fi
+  # P2 conserve la réponse brute séparément du temps client. Cette dérivation
+  # ne change pas les séries historiques et permet une parité A/B qui ignore
+  # uniquement `took`, jamais les hits, scores, ordre ou _source.
+  if [ -n "$responses_raw" ]; then
+    if ! awk -F '\t' '{ sub(/^[^\t]*\t/, ""); print }' "$capture" > "$responses_raw" \
+       || [ "$(wc -l < "$responses_raw" 2>/dev/null || echo 0)" -ne "$wanted" ]; then
+      PROBE_CAPTURE_REASON="${phase}_responses_raw_capture_invalid"
+      return 1
+    fi
+  fi
 }
 
 probe_quantiles(){
@@ -506,6 +839,235 @@ probe_quantiles(){
       p99 = nearest_rank(NR, 0.99)
       printf "%.2f %.2f %.2f", a[p50] * scale, a[p95] * scale, a[p99] * scale
     }'
+}
+
+# ---- P2 : preuve du routage et statistiques par corps ----
+p2_metric_names=(
+  surch_bool_direct_must_fused_total
+  surch_dbg_generic_total
+  surch_postings_disk_blocks_read_total
+  surch_postings_disk_blocks_total
+  surch_index_segment_count
+)
+
+p2_cpu_stat(){
+  awk '/^cpu / { total = 0; for (i = 2; i <= NF; i++) total += $i; print total, $9; exit }' /proc/stat
+}
+
+p2_cpu_steal_percent(){
+  local before="$1" after="$2"
+  awk -v before="$before" -v after="$after" '
+    BEGIN {
+      split(before, b, " "); split(after, a, " ")
+      total = a[1] - b[1]; steal = a[2] - b[2]
+      if (total <= 0 || steal < 0) exit 1
+      printf "%.6f", 100 * steal / total
+    }
+  '
+}
+
+p2_snapshot_metrics(){
+  local base="$1" out="$2" phase="$3" metric
+  P2_METRICS_REASON=""
+  if ! docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
+    --fail-with-body --silent --show-error "$base/_prometheus_metrics" > "$out"; then
+    P2_METRICS_REASON="${phase}_prometheus_curl_failed"
+    return 1
+  fi
+  for metric in "${p2_metric_names[@]}"; do
+    if ! grep -Eq "^${metric}(\\{|[[:space:]])" "$out"; then
+      # Les compteurs de blocs sont précisément l'instrumentation ajoutée par
+      # P2 : l'image A (961ade1) ne les publie pas. On conserve donc son scrape
+      # brut sans les inventer et les décode comme zéro dans le statut A ; B,
+      # lui, doit impérativement les exposer pour être recevable.
+      if [ "$P2_VARIANT" = "A" ] \
+        && { [ "$metric" = "surch_postings_disk_blocks_read_total" ] || [ "$metric" = "surch_postings_disk_blocks_total" ]; }; then
+        continue
+      fi
+      P2_METRICS_REASON="${phase}_prometheus_metric_missing_${metric}"
+      return 1
+    fi
+  done
+}
+
+p2_metric_value(){
+  local metric="$1" snapshot="$2"
+  if ! grep -Eq "^${metric}(\\{|[[:space:]])" "$snapshot"; then
+    if [ "$P2_VARIANT" = "A" ] \
+      && { [ "$metric" = "surch_postings_disk_blocks_read_total" ] || [ "$metric" = "surch_postings_disk_blocks_total" ]; }; then
+      printf '0'
+      return 0
+    fi
+    return 1
+  fi
+  awk -v metric="$metric" '
+    $0 ~ "^" metric "(\\{|[[:space:]])" { sum += $NF; found = 1 }
+    END { if (!found) exit 1; printf "%.17g", sum }
+  ' "$snapshot"
+}
+
+p2_number_equal(){ awk -v left="$1" -v right="$2" 'BEGIN { exit !((left + 0) == (right + 0)) }'; }
+p2_number_le(){ awk -v left="$1" -v right="$2" 'BEGIN { exit !((left + 0) <= (right + 0)) }'; }
+
+p2_segment_value_valid(){
+  local value="$1"
+  case "$P2_SEGMENT_GATE" in
+    exact) p2_number_equal "$value" "$P2_REQUIRED_SEGMENTS" ;;
+    minimum) p2_number_le "$P2_REQUIRED_SEGMENTS" "$value" ;;
+    *) return 1 ;;
+  esac
+}
+
+p2_write_phase_status(){
+  local phase="$1" bool_requests="$2" match_requests="$3" before="$4" after="$5"
+  local direct_before generic_before read_before total_before segments_before
+  local direct_after generic_after read_after total_after segments_after
+  local direct_delta generic_delta read_delta total_delta segment_delta ratio="null" blocks_metrics_emitted=true
+  local valid=true reason=""
+  direct_before=$(p2_metric_value surch_bool_direct_must_fused_total "$before") || valid=false
+  generic_before=$(p2_metric_value surch_dbg_generic_total "$before") || valid=false
+  read_before=$(p2_metric_value surch_postings_disk_blocks_read_total "$before") || valid=false
+  total_before=$(p2_metric_value surch_postings_disk_blocks_total "$before") || valid=false
+  segments_before=$(p2_metric_value surch_index_segment_count "$before") || valid=false
+  direct_after=$(p2_metric_value surch_bool_direct_must_fused_total "$after") || valid=false
+  generic_after=$(p2_metric_value surch_dbg_generic_total "$after") || valid=false
+  read_after=$(p2_metric_value surch_postings_disk_blocks_read_total "$after") || valid=false
+  total_after=$(p2_metric_value surch_postings_disk_blocks_total "$after") || valid=false
+  segments_after=$(p2_metric_value surch_index_segment_count "$after") || valid=false
+  if [ "$valid" != true ]; then
+    reason="metric_value_unreadable"
+  else
+    if ! grep -Eq '^surch_postings_disk_blocks_read_total(\{|[[:space:]])' "$before"; then
+      blocks_metrics_emitted=false
+    fi
+    direct_delta=$(awk -v a="$direct_after" -v b="$direct_before" 'BEGIN { printf "%.17g", a - b }')
+    generic_delta=$(awk -v a="$generic_after" -v b="$generic_before" 'BEGIN { printf "%.17g", a - b }')
+    read_delta=$(awk -v a="$read_after" -v b="$read_before" 'BEGIN { printf "%.17g", a - b }')
+    total_delta=$(awk -v a="$total_after" -v b="$total_before" 'BEGIN { printf "%.17g", a - b }')
+    segment_delta=$(awk -v a="$segments_after" -v b="$segments_before" 'BEGIN { printf "%.17g", a - b }')
+    if ! p2_segment_value_valid "$segments_before" || ! p2_segment_value_valid "$segments_after"; then
+      valid=false; reason="segment_count_${segments_before}_to_${segments_after}_invalid"
+    elif [ "$P2_VARIANT" = "A" ]; then
+      if ! p2_number_equal "$direct_delta" 0 || ! p2_number_equal "$generic_delta" "$bool_requests"; then
+        valid=false; reason="route_A_direct_${direct_delta}_generic_${generic_delta}_expected_0_${bool_requests}"
+      fi
+    elif ! p2_number_equal "$direct_delta" "$bool_requests" || ! p2_number_equal "$generic_delta" 0; then
+      valid=false; reason="route_B_direct_${direct_delta}_generic_${generic_delta}_expected_${bool_requests}_0"
+    fi
+    # Une phase sans bool (fixed match) doit être neutre pour chaque compteur
+    # P2. Dans les phases alternées, l'égalité au nombre de bool prouve que les
+    # 1000 (ou 25/100) match n'ont ajouté aucun passage direct/générique.
+    if [ "$valid" = true ] && [ "$bool_requests" -eq 0 ]; then
+      if ! p2_number_equal "$read_delta" 0 || ! p2_number_equal "$total_delta" 0; then
+        valid=false; reason="match_phase_p2_blocks_nonzero_read_${read_delta}_total_${total_delta}"
+      fi
+    fi
+    if [ "$valid" = true ] && [ "$P2_VARIANT" = "B" ] && [ "$bool_requests" -gt 0 ]; then
+      if ! p2_number_le 1 "$total_delta" || ! p2_number_le 0 "$read_delta"; then
+        valid=false; reason="blocks_B_non_positive_read_${read_delta}_total_${total_delta}"
+      else
+        ratio=$(awk -v read="$read_delta" -v total="$total_delta" 'BEGIN { printf "%.9f", read / total }')
+        if ! p2_number_le "$ratio" 0.25; then
+          valid=false; reason="blocks_ratio_${ratio}_above_0_25"
+        fi
+      fi
+    fi
+  fi
+  P2_PHASE_VALID="$valid"
+  P2_PHASE_REASON="$reason"
+  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"valid":%s,"reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}}}\n' \
+    "$phase" "$P2_VARIANT" "$bool_requests" "$match_requests" "$valid" \
+    "$( [ -n "$reason" ] && printf '\"%s\"' "$reason" || printf 'null' )" "$blocks_metrics_emitted" "$ratio" \
+    "${direct_before:-null}" "${direct_after:-null}" "${direct_delta:-null}" \
+    "${generic_before:-null}" "${generic_after:-null}" "${generic_delta:-null}" \
+    "${read_before:-null}" "${read_after:-null}" "${read_delta:-null}" \
+    "${total_before:-null}" "${total_after:-null}" "${total_delta:-null}" \
+    "${segments_before:-null}" "${segments_after:-null}" "${segment_delta:-null}" \
+    >> "$P2_PHASE_STATUS"
+  [ "$valid" = true ]
+}
+
+p2_capture_phase(){
+  local base="$1" phase="$2" bodies="$3" client_raw="$4" took_raw="$5" overhead_raw="$6" wanted="$7" bool_requests="$8" match_requests="$9"
+  local before="$OUT_DIR/$ENGINE.p2.prom.${phase}.before.prom"
+  local after="$OUT_DIR/$ENGINE.p2.prom.${phase}.after.prom"
+  local responses_raw="$OUT_DIR/$ENGINE.p2.responses.${phase}.raw.ndjson"
+  local responses_canonical="$OUT_DIR/$ENGINE.p2.responses.${phase}.canonical.ndjson"
+  if ! p2_snapshot_metrics "$base" "$before" "${phase}_before"; then
+    PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_prometheus_before_failed}"
+    return 1
+  fi
+  if ! capture_probe_samples "$base" "$bodies" "$client_raw" "$took_raw" "$overhead_raw" "$wanted" "$phase" "$responses_raw"; then
+    return 1
+  fi
+  if ! jq -cS '{hits_total: .hits.total, max_score: .hits.max_score, hits: [.hits.hits[] | {_id: ._id, _score: ._score, _source: ._source}]}' \
+      "$responses_raw" > "$responses_canonical" \
+     || [ "$(wc -l < "$responses_canonical" 2>/dev/null || echo 0)" -ne "$wanted" ]; then
+    PROBE_CAPTURE_REASON="${phase}_response_canonicalization_failed"
+    return 1
+  fi
+  if ! p2_snapshot_metrics "$base" "$after" "${phase}_after"; then
+    PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_prometheus_after_failed}"
+    return 1
+  fi
+  if ! p2_write_phase_status "$phase" "$bool_requests" "$match_requests" "$before" "$after"; then
+    PROBE_CAPTURE_REASON="${phase}_routing_invalid_${P2_PHASE_REASON:-unknown}"
+    return 1
+  fi
+}
+
+p2_quantiles_with_max(){
+  local raw="$1" scale="$2"
+  sort -n "$raw" | awk -v scale="$scale" '
+    function nearest_rank(n, q, raw, rank) {
+      raw = n * q; rank = int(raw); if (rank < raw) rank++
+      return (rank < 1) ? 1 : rank
+    }
+    { a[NR] = $1 }
+    END {
+      if (NR == 0) exit 1
+      printf "%.2f %.2f %.2f %.2f", a[nearest_rank(NR, 0.50)] * scale, a[nearest_rank(NR, 0.95)] * scale, a[nearest_rank(NR, 0.99)] * scale, a[NR] * scale
+    }
+  '
+}
+
+p2_write_stat(){
+  local phase="$1" kind="$2" metric="$3" raw="$4" scale="$5" wanted="$6"
+  local p50 p95 p99 max actual
+  actual=$(wc -l < "$raw" 2>/dev/null); actual=${actual:-0}
+  [ "$actual" -eq "$wanted" ] || return 1
+  if [ "$metric" = "probe" ]; then
+    probe_overhead_file_is_valid "$raw" "$wanted" "p2_${phase}_${kind}" || return 1
+  else
+    probe_series_file_is_valid "$raw" "$wanted" "p2_${phase}_${kind}" "$metric" || return 1
+  fi
+  read -r p50 p95 p99 max < <(p2_quantiles_with_max "$raw" "$scale") || return 1
+  printf '{"phase":"%s","kind":"%s","metric":"%s","raw_file":"%s","n":%s,"unit":"ms","p50":%s,"p95":%s,"p99":%s,"max":%s}\n' \
+    "$phase" "$kind" "$metric" "$raw" "$wanted" "$p50" "$p95" "$p99" "$max" >> "$P2_STATS_JSONL"
+}
+
+p2_split_and_stat_phase(){
+  local phase="$1" client="$2" took="$3" overhead="$4" bool_count="$5" match_count="$6"
+  local kind src out metric scale wanted
+  for kind in bool match; do
+    case "$kind" in
+      bool) wanted="$bool_count" ;;
+      match) wanted="$match_count" ;;
+    esac
+    [ "$wanted" -gt 0 ] || continue
+    for spec in "client:$client:1000" "took:$took:1" "probe:$overhead:1"; do
+      metric=${spec%%:*}; spec=${spec#*:}; src=${spec%:*}; scale=${spec##*:}
+      out="$OUT_DIR/$ENGINE.p2.${phase}.${kind}.${metric}$( [ "$metric" = client ] && printf '_s' || printf '_ms' )"
+      if [ "$bool_count" -eq 0 ] || [ "$match_count" -eq 0 ]; then
+        cp "$src" "$out"
+      elif [ "$kind" = "bool" ]; then
+        awk 'NR % 2 == 1 { print }' "$src" > "$out"
+      else
+        awk 'NR % 2 == 0 { print }' "$src" > "$out"
+      fi
+      p2_write_stat "$phase" "$kind" "$metric" "$out" "$scale" "$wanted" || return 1
+    done
+  done
 }
 
 # Snapshot Prometheus brut par phase. Les compteurs restent bornés côté
@@ -643,9 +1205,9 @@ source_fetch_no_source_delta_is_zero(){
 # quantité demandée vise le cache `file` réellement observé. Chaque couple
 # before/after est conservé : aucune éviction partielle ambigüe n'est admise.
 capture_cold_samples(){
-  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" audit="$6" reclaim_path="$7" stat_path="$8" current_path="$9" writer="${10}" wanted="${11}"
+  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" audit="$6" reclaim_path="$7" stat_path="$8" current_path="$9" writer="${10}" wanted="${11}" responses_raw="${12:-}"
   local body file_before file_after file_after_max memory_current reclaim_target
-  local completed=0 request_no one_body one_client one_took one_overhead
+  local completed=0 request_no one_body one_client one_took one_overhead one_responses
   COLD_CAPTURE_REASON=""
   COLD_CAPTURE_COMPLETED=0
   : > "$client_raw"; : > "$took_raw"; : > "$overhead_raw"
@@ -654,6 +1216,8 @@ capture_cold_samples(){
   one_client="$client_raw.one_client_s"
   one_took="$client_raw.one_took_ms"
   one_overhead="$client_raw.one_probe_overhead_ms"
+  one_responses="$client_raw.one_responses.ndjson"
+  [ -z "$responses_raw" ] || : > "$responses_raw"
 
   while IFS= read -r body; do
     [ "$completed" -ge "$wanted" ] && break
@@ -708,7 +1272,12 @@ capture_cold_samples(){
     # une invocation curl isolée par requête, explicitement déclarée dans la
     # scorecard, plutôt que de simuler une réutilisation incompatible avec le
     # protocole d'éviction vérifié.
-    if ! capture_probe_samples "$base" "$one_body" "$one_client" "$one_took" "$one_overhead" 1 cold; then
+    if [ -n "$responses_raw" ]; then
+      capture_probe_samples "$base" "$one_body" "$one_client" "$one_took" "$one_overhead" 1 cold "$one_responses"
+    else
+      capture_probe_samples "$base" "$one_body" "$one_client" "$one_took" "$one_overhead" 1 cold
+    fi
+    if [ "$?" -ne 0 ]; then
       COLD_CAPTURE_REASON="${PROBE_CAPTURE_REASON}_after_reclaim_$request_no"
       COLD_CAPTURE_COMPLETED="$completed"
       return 1
@@ -716,6 +1285,7 @@ capture_cold_samples(){
     cat "$one_client" >> "$client_raw"
     cat "$one_took" >> "$took_raw"
     cat "$one_overhead" >> "$overhead_raw"
+    [ -z "$responses_raw" ] || cat "$one_responses" >> "$responses_raw"
     completed=$((completed + 1))
   done < "$bodies"
 
@@ -737,6 +1307,10 @@ capture_cold_samples(){
     COLD_CAPTURE_REASON="$PROBE_CAPTURE_REASON"
     return 1
   fi
+  if [ -n "$responses_raw" ] && [ "$(wc -l < "$responses_raw" 2>/dev/null || echo 0)" -ne "$wanted" ]; then
+    COLD_CAPTURE_REASON="cold_responses_raw_line_count_invalid"
+    return 1
+  fi
 }
 
 # Un échec de sonde reste visible dans la scorecard sans inventer des
@@ -750,6 +1324,14 @@ record_invalid_measurement(){
 
 run_engine(){
   local ENGINE="$1" CID PORT HEAP HALF
+  local p2_cpu_before="" p2_cpu_after="" p2_cpu_steal_percent="null"
+  if [ "$P2_MEASURE" = "1" ]; then
+    [ "$ENGINE" = "surch" ] || { err "P2 ne mesure que Surch (ENGINE=$ENGINE refusé)"; return 1; }
+    p2_cpu_before=$(p2_cpu_stat) || { err "P2 : lecture CPU steal initiale impossible"; return 1; }
+    P2_PHASE_STATUS="$OUT_DIR/$ENGINE.p2.phase-status.jsonl"
+    P2_STATS_JSONL="$OUT_DIR/$ENGINE.p2.stats.jsonl"
+    : > "$P2_PHASE_STATUS"; : > "$P2_STATS_JSONL"
+  fi
   CID="fairab-$ENGINE"
   docker rm -f "$CID" >/dev/null 2>&1 || true
   # heap ES = M/2 (Lucene mmap = l'autre moitié = page-cache, analogue au disque Surch)
@@ -901,6 +1483,11 @@ run_engine(){
   # succès : count >= attendu_indexé. Si des docs source ont été rejetés (item_err>0), c'est LÉGITIME
   # (JSON source invalide, perdu aussi par ES) et explicitement signalé — pas un count silencieusement court.
   [ "$item_err" -gt 0 ] && log "$ENGINE : $item_err doc(s) source rejeté(s) (JSON invalide) — count $cnt = $NDOCS-$item_err attendu, OK"
+  if [ "$P2_MEASURE" = "1" ] && { [ "$cnt" -ne "$P2_EXPECTED_DOCS" ] || [ "$item_err" -ne 0 ] || [ "$indexed" -ne "$P2_EXPECTED_DOCS" ]; }; then
+    err "P2 : count exact requis ($P2_EXPECTED_DOCS) ; reçu count=$cnt indexed=$indexed item_errors=$item_err"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_exact_count_required"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  fi
 
   local dps rss disk
   dps=$(awk -v c="$NDOCS" -v a="$t0" -v b="$t1" 'BEGIN{printf "%.0f", c/(b-a)}')
@@ -944,6 +1531,22 @@ run_engine(){
     segment_count=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 --fail-with-body --silent --show-error "$BASE/_prometheus_metrics" 2>/dev/null | awk '/^surch_index_segment_count\{/{print $NF; exit}')
     [ -z "$segment_count" ] && segment_count="null"
   fi
+  if [ "$P2_MEASURE" = "1" ]; then
+    local p2_index_snapshot p2_index_segments
+    p2_index_snapshot="$OUT_DIR/$ENGINE.p2.prom.index_ready.prom"
+    if ! p2_snapshot_metrics "$BASE" "$p2_index_snapshot" index_ready; then
+      err "$ENGINE : P2 métriques initiales invalides : $P2_METRICS_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "${P2_METRICS_REASON:-p2_index_prometheus_invalid}"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
+    p2_index_segments=$(p2_metric_value surch_index_segment_count "$p2_index_snapshot") || p2_index_segments=""
+    if ! p2_segment_value_valid "${p2_index_segments:-invalid}"; then
+      err "$ENGINE : P2 segments invalides : $p2_index_segments (gate $P2_SEGMENT_GATE/$P2_REQUIRED_SEGMENTS)"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_segment_count_invalid_${p2_index_segments:-missing}"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
+    segment_count="$p2_index_segments"
+  fi
 
   # Sondes L2 : les séries client et moteur restent séparées pour bootstrap/
   # IC95. La sonde fixe utilise le champ configuré, donc `NOM` sur le mapping
@@ -986,7 +1589,20 @@ run_engine(){
       source_fetch_profile_reason="$SOURCE_FETCH_SCRAPE_REASON"
     fi
   fi
-  if ! capture_probe_samples "$BASE" "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS" fixed; then
+  if [ "$P2_MEASURE" = "1" ]; then
+    local warm_raw="$OUT_DIR/$ENGINE.p2.warm_client_s" warm_took_raw="$OUT_DIR/$ENGINE.p2.warm_took_ms" warm_overhead_raw="$OUT_DIR/$ENGINE.p2.warm_probe_overhead_ms"
+    if ! p2_capture_phase "$BASE" warm "$P2_WARM_BODIES" "$warm_raw" "$warm_took_raw" "$warm_overhead_raw" "$(( 2 * P2_WARM_PAIR_COUNT ))" "$P2_WARM_PAIR_COUNT" "$P2_WARM_PAIR_COUNT"; then
+      err "$ENGINE : chauffe P2 invalide : $PROBE_CAPTURE_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
+  fi
+  if [ "$P2_MEASURE" = "1" ]; then
+    p2_capture_phase "$BASE" fixed "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS" 0 "$PROBE_REQUESTS"
+  else
+    capture_probe_samples "$BASE" "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS" fixed
+  fi
+  if [ "$?" -ne 0 ]; then
     err "$ENGINE : série fixe invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
@@ -995,6 +1611,12 @@ run_engine(){
   read -r lat50 lat95 lat99 < <(probe_quantiles "$fixed_raw" 1000)
   read -r lat_fixed_took50 lat_fixed_took95 lat_fixed_took99 < <(probe_quantiles "$fixed_took_raw" 1)
   read -r lat_fixed_probe50 lat_fixed_probe95 lat_fixed_probe99 < <(probe_quantiles "$fixed_overhead_raw" 1)
+  if [ "$P2_MEASURE" = "1" ]; then
+    p2_split_and_stat_phase fixed "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" 0 "$PROBE_REQUESTS" || {
+      err "$ENGINE : statistiques P2 fixed invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_fixed_stats_invalid"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
+    }
+  fi
   if [ "$source_fetch_profile_enabled" = true ]; then
     if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_fixed" after_fixed 1; then
       source_fetch_profile_valid=false
@@ -1009,7 +1631,12 @@ run_engine(){
       source_fetch_profile_previous=$((source_fetch_profile_previous + SOURCE_FETCH_ARTIFACT_RECORDS))
     fi
   fi
-  if ! capture_probe_samples "$BASE" "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS" random; then
+  if [ "$P2_MEASURE" = "1" ]; then
+    p2_capture_phase "$BASE" random "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT"
+  else
+    capture_probe_samples "$BASE" "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS" random
+  fi
+  if [ "$?" -ne 0 ]; then
     err "$ENGINE : série random invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
@@ -1018,6 +1645,12 @@ run_engine(){
   read -r latr50 latr95 latr99 < <(probe_quantiles "$random_raw" 1000)
   read -r lat_rand_took50 lat_rand_took95 lat_rand_took99 < <(probe_quantiles "$random_took_raw" 1)
   read -r lat_rand_probe50 lat_rand_probe95 lat_rand_probe99 < <(probe_quantiles "$random_overhead_raw" 1)
+  if [ "$P2_MEASURE" = "1" ]; then
+    p2_split_and_stat_phase random "$random_raw" "$random_took_raw" "$random_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" || {
+      err "$ENGINE : statistiques P2 random invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_random_stats_invalid"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
+    }
+  fi
   if [ "$source_fetch_profile_enabled" = true ]; then
     if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_random" after_random 1; then
       source_fetch_profile_valid=false
@@ -1041,7 +1674,12 @@ run_engine(){
       source_fetch_profile_reason="${source_fetch_profile_reason:-random_hydrated_8plus_absent}"
     fi
   fi
-  if ! capture_probe_samples "$BASE" "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS" no_source; then
+  if [ "$P2_MEASURE" = "1" ]; then
+    p2_capture_phase "$BASE" no_source "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT"
+  else
+    capture_probe_samples "$BASE" "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS" no_source
+  fi
+  if [ "$?" -ne 0 ]; then
     err "$ENGINE : série témoin size:0 invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
@@ -1050,6 +1688,12 @@ run_engine(){
   read -r latn50 latn95 latn99 < <(probe_quantiles "$no_source_raw" 1000)
   read -r lat_no_source_took50 lat_no_source_took95 lat_no_source_took99 < <(probe_quantiles "$no_source_took_raw" 1)
   read -r lat_no_source_probe50 lat_no_source_probe95 lat_no_source_probe99 < <(probe_quantiles "$no_source_overhead_raw" 1)
+  if [ "$P2_MEASURE" = "1" ]; then
+    p2_split_and_stat_phase no_source "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" || {
+      err "$ENGINE : statistiques P2 size:0 invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_no_source_stats_invalid"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
+    }
+  fi
   if [ "$source_fetch_profile_enabled" = true ]; then
     if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_no_source" after_no_source 1; then
       source_fetch_profile_valid=false
@@ -1076,7 +1720,19 @@ run_engine(){
   local latc50="null" latc95="null" latc99="null" lat_cold_took50="null" lat_cold_took95="null" lat_cold_took99="null" lat_cold_probe50="null" lat_cold_probe95="null" lat_cold_probe99="null" cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
   local cold_raw="$OUT_DIR/$ENGINE.lat_cold_client_s" cold_took_raw="$OUT_DIR/$ENGINE.lat_cold_took_ms" cold_overhead_raw="$OUT_DIR/$ENGINE.lat_cold_probe_overhead_ms" cold_reclaimed_requests=0
   local cold_reclaim_audit="$OUT_DIR/$ENGINE.cold_reclaim.tsv" cold_reclaim_audit_records=0
+  local p2_cold_before="" p2_cold_after="" p2_cold_responses_raw="" p2_cold_responses_canonical="" p2_cold_phase_valid=true
   : > "$cold_reclaim_audit"
+  if [ "$P2_MEASURE" = "1" ]; then
+    p2_cold_before="$OUT_DIR/$ENGINE.p2.prom.cold.before.prom"
+    p2_cold_after="$OUT_DIR/$ENGINE.p2.prom.cold.after.prom"
+    p2_cold_responses_raw="$OUT_DIR/$ENGINE.p2.responses.cold.raw.ndjson"
+    p2_cold_responses_canonical="$OUT_DIR/$ENGINE.p2.responses.cold.canonical.ndjson"
+    if ! p2_snapshot_metrics "$BASE" "$p2_cold_before" cold_before; then
+      err "$ENGINE : métriques P2 cold avant invalides : $P2_METRICS_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "${P2_METRICS_REASON:-p2_cold_before_invalid}"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
+  fi
   local mem_anon_warm="null" mem_file_warm="null" mem_anon_cold="null" mem_file_cold="null"
   local full_id cg_scope reclaim_path stat_path current_path reclaim_writer=""
   full_id=$(docker inspect -f '{{.Id}}' "$CID" 2>/dev/null)
@@ -1102,7 +1758,12 @@ run_engine(){
   fi
   if [ -n "$reclaim_writer" ]; then
     cold_attempted=true
-    if capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS"; then
+    if [ "$P2_MEASURE" = "1" ]; then
+      capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS" "$p2_cold_responses_raw"
+    else
+      capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS"
+    fi
+    if [ "$?" -eq 0 ]; then
       cold_ok=true
       cold_method="memory_reclaim_file_target_verified_each_request"
       cold_reclaimed_requests="$COLD_CAPTURE_COMPLETED"
@@ -1134,6 +1795,24 @@ run_engine(){
     v2=$(awk '/^anon /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v2" ] && mem_anon_cold="$v2"
     v2=$(awk '/^file /{print $2}' "$stat_path" 2>/dev/null); [ -n "$v2" ] && mem_file_cold="$v2"
   fi
+  if [ "$P2_MEASURE" = "1" ]; then
+    if [ "$cold_ok" != true ]; then
+      p2_cold_phase_valid=false
+      cold_skip_reason="${cold_skip_reason:-p2_cold_capture_failed}"
+    elif ! jq -cS '{hits_total: .hits.total, max_score: .hits.max_score, hits: [.hits.hits[] | {_id: ._id, _score: ._score, _source: ._source}]}' \
+        "$p2_cold_responses_raw" > "$p2_cold_responses_canonical" \
+      || [ "$(wc -l < "$p2_cold_responses_canonical" 2>/dev/null || echo 0)" -ne 50 ]; then
+      p2_cold_phase_valid=false
+      cold_skip_reason="p2_cold_response_canonicalization_failed"
+    elif ! p2_snapshot_metrics "$BASE" "$p2_cold_after" cold_after \
+      || ! p2_write_phase_status cold 25 25 "$p2_cold_before" "$p2_cold_after"; then
+      p2_cold_phase_valid=false
+      cold_skip_reason="${P2_METRICS_REASON:-${P2_PHASE_REASON:-p2_cold_routing_invalid}}"
+    elif ! p2_split_and_stat_phase cold "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" 25 25; then
+      p2_cold_phase_valid=false
+      cold_skip_reason="p2_cold_stats_invalid"
+    fi
+  fi
   local cold_skip_json="null"; [ -n "$cold_skip_reason" ] && cold_skip_json="\"$cold_skip_reason\""
   local cold_method_json="null"; [ -n "$cold_method" ] && cold_method_json="\"$cold_method\""
 
@@ -1161,6 +1840,33 @@ run_engine(){
     measurement_valid=false
     measurement_invalid_reason="\"${source_fetch_profile_reason:-source_fetch_profile_invalid}\""
   fi
+  local p2_json=""
+  if [ "$P2_MEASURE" = "1" ]; then
+    local p2_phase_records p2_image_id p2_image_digest p2_bulk_sha256 p2_mapping_sha256
+    p2_cpu_after=$(p2_cpu_stat 2>/dev/null || true)
+    if [ -z "$p2_cpu_after" ] || ! p2_cpu_steal_percent "$p2_cpu_before" "$p2_cpu_after" >/dev/null; then
+      measurement_valid=false
+      measurement_invalid_reason="\"p2_cpu_steal_unreadable\""
+    else
+      p2_cpu_steal_percent=$(p2_cpu_steal_percent "$p2_cpu_before" "$p2_cpu_after")
+      if ! p2_number_le "$p2_cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT"; then
+        measurement_valid=false
+        measurement_invalid_reason="\"p2_cpu_steal_${p2_cpu_steal_percent}_above_${P2_CPU_STEAL_MAX_PERCENT}\""
+      fi
+    fi
+    p2_phase_records=$(wc -l < "$P2_PHASE_STATUS" 2>/dev/null); p2_phase_records=${p2_phase_records:-0}
+    if [ "$p2_phase_records" -ne 5 ] || [ "$p2_cold_phase_valid" != true ]; then
+      measurement_valid=false
+      measurement_invalid_reason="\"${cold_skip_reason:-p2_phase_status_incomplete_${p2_phase_records}_of_5}\""
+    fi
+    p2_image_id=$(docker image inspect -f '{{.Id}}' "$SURCH_IMAGE" 2>/dev/null || true)
+    p2_image_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$SURCH_IMAGE" 2>/dev/null || true)
+    [ -n "$p2_image_id" ] || p2_image_id="null"
+    [ -n "$p2_image_digest" ] || p2_image_digest="$p2_image_id"
+    p2_bulk_sha256=$(p2_manifest_value bulk_sha256 "$PROBE_MANIFEST")
+    p2_mapping_sha256=$(p2_manifest_value mapping_sha256 "$PROBE_MANIFEST")
+    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
+  fi
   local source_fetch_profile_reason_json="null" source_fetch_random_gate_json="null"
   [ -n "$source_fetch_profile_reason" ] && source_fetch_profile_reason_json="\"$source_fetch_profile_reason\""
   [ "$source_fetch_random_hydrated_8plus_gate" != "null" ] && source_fetch_random_gate_json="\"$source_fetch_random_hydrated_8plus_gate\""
@@ -1187,7 +1893,7 @@ run_engine(){
   [ "$cold_ok" = true ] && source_fetch_prometheus_json="$source_fetch_cold_json"
   local source_fetch_metrics_json="$source_fetch_prometheus_json,\"measurement_valid\":$measurement_valid,\"measurement_invalid_reason\":$measurement_invalid_reason,\"source_fetch_profile_valid\":$source_fetch_profile_valid,\"source_fetch_profile_invalid_reason\":$source_fetch_profile_reason_json,\"source_fetch_random_worker_participations\":$source_fetch_random_worker_participations,\"source_fetch_random_hydrated_8plus_requests\":$source_fetch_random_hydrated_8plus_requests,\"source_fetch_random_hydrated_8plus_gate\":$source_fetch_random_gate_json,\"source_fetch_jsonl\":{\"fixed\":$source_fetch_fixed_jsonl_json,\"random\":$source_fetch_random_jsonl_json,\"no_source\":$source_fetch_no_source_jsonl_json,\"cold\":$source_fetch_cold_jsonl_json},\"source_fetch_snapshots\":{\"before_fixed\":$source_fetch_before_json,\"after_fixed\":$source_fetch_fixed_json,\"after_random\":$source_fetch_random_json,\"after_no_source\":$source_fetch_no_source_json,\"after_cold\":$source_fetch_cold_json},\"source_fetch_deltas\":{\"fixed\":$source_fetch_fixed_delta_json,\"random\":$source_fetch_random_delta_json,\"no_source\":$source_fetch_no_source_delta_json,\"cold\":$source_fetch_cold_delta_json}"
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\",\"probe_cpu_count\":$HOST_CPU_COUNT,\"probe_connection_reuse\":{\"fixed\":\"single_curl_next\",\"random\":\"single_curl_next\",\"no_source\":\"single_curl_next\",\"cold\":\"one_curl_per_reclaim\"},\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_fixed_client_s_file\":\"$fixed_raw\",\"lat_fixed_took_ms_file\":\"$fixed_took_raw\",\"lat_fixed_probe_overhead_ms_file\":\"$fixed_overhead_raw\",\"lat_fixed_client_p50_ms\":$lat50,\"lat_fixed_client_p95_ms\":$lat95,\"lat_fixed_client_p99_ms\":$lat99,\"lat_fixed_took_p50_ms\":$lat_fixed_took50,\"lat_fixed_took_p95_ms\":$lat_fixed_took95,\"lat_fixed_took_p99_ms\":$lat_fixed_took99,\"lat_fixed_probe_overhead_p50_ms\":$lat_fixed_probe50,\"lat_fixed_probe_overhead_p95_ms\":$lat_fixed_probe95,\"lat_fixed_probe_overhead_p99_ms\":$lat_fixed_probe99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_rand_client_s_file\":\"$random_raw\",\"lat_rand_took_ms_file\":\"$random_took_raw\",\"lat_rand_probe_overhead_ms_file\":\"$random_overhead_raw\",\"lat_rand_client_p50_ms\":$latr50,\"lat_rand_client_p95_ms\":$latr95,\"lat_rand_client_p99_ms\":$latr99,\"lat_rand_took_p50_ms\":$lat_rand_took50,\"lat_rand_took_p95_ms\":$lat_rand_took95,\"lat_rand_took_p99_ms\":$lat_rand_took99,\"lat_rand_probe_overhead_p50_ms\":$lat_rand_probe50,\"lat_rand_probe_overhead_p95_ms\":$lat_rand_probe95,\"lat_rand_probe_overhead_p99_ms\":$lat_rand_probe99,\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"lat_no_source_client_s_file\":\"$no_source_raw\",\"lat_no_source_took_ms_file\":\"$no_source_took_raw\",\"lat_no_source_probe_overhead_ms_file\":\"$no_source_overhead_raw\",\"lat_no_source_client_p50_ms\":$latn50,\"lat_no_source_client_p95_ms\":$latn95,\"lat_no_source_client_p99_ms\":$latn99,\"lat_no_source_took_p50_ms\":$lat_no_source_took50,\"lat_no_source_took_p95_ms\":$lat_no_source_took95,\"lat_no_source_took_p99_ms\":$lat_no_source_took99,\"lat_no_source_probe_overhead_p50_ms\":$lat_no_source_probe50,\"lat_no_source_probe_overhead_p95_ms\":$lat_no_source_probe95,\"lat_no_source_probe_overhead_p99_ms\":$lat_no_source_probe99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"lat_cold_client_s_file\":\"$cold_raw\",\"lat_cold_took_ms_file\":\"$cold_took_raw\",\"lat_cold_probe_overhead_ms_file\":\"$cold_overhead_raw\",\"lat_cold_client_p50_ms\":$latc50,\"lat_cold_client_p95_ms\":$latc95,\"lat_cold_client_p99_ms\":$latc99,\"lat_cold_took_p50_ms\":$lat_cold_took50,\"lat_cold_took_p95_ms\":$lat_cold_took95,\"lat_cold_took_p99_ms\":$lat_cold_took99,\"lat_cold_probe_overhead_p50_ms\":$lat_cold_probe50,\"lat_cold_probe_overhead_p95_ms\":$lat_cold_probe95,\"lat_cold_probe_overhead_p99_ms\":$lat_cold_probe99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json}" > "$OUT_DIR/$ENGINE.json"
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\",\"probe_cpu_count\":$HOST_CPU_COUNT,\"probe_connection_reuse\":{\"fixed\":\"single_curl_next\",\"random\":\"single_curl_next\",\"no_source\":\"single_curl_next\",\"cold\":\"one_curl_per_reclaim\"},\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_fixed_client_s_file\":\"$fixed_raw\",\"lat_fixed_took_ms_file\":\"$fixed_took_raw\",\"lat_fixed_probe_overhead_ms_file\":\"$fixed_overhead_raw\",\"lat_fixed_client_p50_ms\":$lat50,\"lat_fixed_client_p95_ms\":$lat95,\"lat_fixed_client_p99_ms\":$lat99,\"lat_fixed_took_p50_ms\":$lat_fixed_took50,\"lat_fixed_took_p95_ms\":$lat_fixed_took95,\"lat_fixed_took_p99_ms\":$lat_fixed_took99,\"lat_fixed_probe_overhead_p50_ms\":$lat_fixed_probe50,\"lat_fixed_probe_overhead_p95_ms\":$lat_fixed_probe95,\"lat_fixed_probe_overhead_p99_ms\":$lat_fixed_probe99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_rand_client_s_file\":\"$random_raw\",\"lat_rand_took_ms_file\":\"$random_took_raw\",\"lat_rand_probe_overhead_ms_file\":\"$random_overhead_raw\",\"lat_rand_client_p50_ms\":$latr50,\"lat_rand_client_p95_ms\":$latr95,\"lat_rand_client_p99_ms\":$latr99,\"lat_rand_took_p50_ms\":$lat_rand_took50,\"lat_rand_took_p95_ms\":$lat_rand_took95,\"lat_rand_took_p99_ms\":$lat_rand_took99,\"lat_rand_probe_overhead_p50_ms\":$lat_rand_probe50,\"lat_rand_probe_overhead_p95_ms\":$lat_rand_probe95,\"lat_rand_probe_overhead_p99_ms\":$lat_rand_probe99,\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"lat_no_source_client_s_file\":\"$no_source_raw\",\"lat_no_source_took_ms_file\":\"$no_source_took_raw\",\"lat_no_source_probe_overhead_ms_file\":\"$no_source_overhead_raw\",\"lat_no_source_client_p50_ms\":$latn50,\"lat_no_source_client_p95_ms\":$latn95,\"lat_no_source_client_p99_ms\":$latn99,\"lat_no_source_took_p50_ms\":$lat_no_source_took50,\"lat_no_source_took_p95_ms\":$lat_no_source_took95,\"lat_no_source_took_p99_ms\":$lat_no_source_took99,\"lat_no_source_probe_overhead_p50_ms\":$lat_no_source_probe50,\"lat_no_source_probe_overhead_p95_ms\":$lat_no_source_probe95,\"lat_no_source_probe_overhead_p99_ms\":$lat_no_source_probe99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"lat_cold_client_s_file\":\"$cold_raw\",\"lat_cold_took_ms_file\":\"$cold_took_raw\",\"lat_cold_probe_overhead_ms_file\":\"$cold_overhead_raw\",\"lat_cold_client_p50_ms\":$latc50,\"lat_cold_client_p95_ms\":$latc95,\"lat_cold_client_p99_ms\":$latc99,\"lat_cold_took_p50_ms\":$lat_cold_took50,\"lat_cold_took_p95_ms\":$lat_cold_took95,\"lat_cold_took_p99_ms\":$lat_cold_took99,\"lat_cold_probe_overhead_p50_ms\":$lat_cold_probe50,\"lat_cold_probe_overhead_p95_ms\":$lat_cold_probe95,\"lat_cold_probe_overhead_p99_ms\":$lat_cold_probe99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json$p2_json}" > "$OUT_DIR/$ENGINE.json"
   log "$ENGINE : mesure valide=$measurement_valid | ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe client ${lat50}/${lat95}/${lat99}, moteur ${lat_fixed_took50}/${lat_fixed_took95}/${lat_fixed_took99}, sonde ${lat_fixed_probe50}/${lat_fixed_probe95}/${lat_fixed_probe99} | rand client ${latr50}/${latr95}/${latr99}, moteur ${lat_rand_took50}/${lat_rand_took95}/${lat_rand_took99}, sonde ${lat_rand_probe50}/${lat_rand_probe95}/${lat_rand_probe99} | témoin client ${latn50}/${latn95}/${latn99}, moteur ${lat_no_source_took50}/${lat_no_source_took95}/${lat_no_source_took99}, sonde ${lat_no_source_probe50}/${lat_no_source_probe95}/${lat_no_source_probe99} | cold client ${latc50}/${latc95}/${latc99}, moteur ${lat_cold_took50}/${lat_cold_took95}/${lat_cold_took99}, sonde ${lat_cold_probe50}/${lat_cold_probe95}/${lat_cold_probe99} (reclaims=$cold_reclaimed_requests/50 audit=$cold_reclaim_audit_records/50 ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
   [ "$HOLD_SECONDS" -gt 0 ] 2>/dev/null && { log "$ENGINE : HOLD_SECONDS=$HOLD_SECONDS avant teardown (brancher artillery-replay.sh sur $NET / $CID)"; sleep "$HOLD_SECONDS"; }
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
