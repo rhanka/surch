@@ -45,9 +45,14 @@ fn corpus_ndjson() -> String {
             _ => "gamma gadget",
         };
         let category = if i % 2 == 0 { "tools" } else { "toys" };
+        let body = if i.is_multiple_of(6) {
+            "common common lorem ipsum"
+        } else {
+            "common lorem ipsum"
+        };
         out.push_str(&format!(
             "{{\"index\":{{\"_id\":\"{i}\"}}}}\n\
-             {{\"title\":\"{title}\",\"category\":\"{category}\",\"body\":\"common lorem ipsum doc{i}\"}}\n"
+             {{\"title\":\"{title}\",\"category\":\"{category}\",\"body\":\"{body} doc{i}\"}}\n"
         ));
     }
     out
@@ -138,6 +143,12 @@ fn force_generic_bool_reference(body: &str) -> String {
     request_object.insert(
         "query".to_owned(),
         serde_json::json!({"function_score":{"query":query}}),
+    );
+    // Le surlignage force la référence à contourner tout scorer top-K direct
+    // sans modifier les ids ni les scores comparés par le fingerprint.
+    request_object.insert(
+        "highlight".to_owned(),
+        serde_json::json!({"fields":{"title":{}}}),
     );
     serde_json::to_string(&request).expect("reference request must serialize")
 }
@@ -300,4 +311,76 @@ async fn postings_disk_flag_on_matches_flag_off_bit_identical() {
             "[P2 {layout}] `from`/`size` doit conserver la fenêtre demandée"
         );
     }
+}
+
+#[tokio::test]
+async fn p2_trois_clauses_scorees_conservent_min_score_ordre_et_bits() {
+    let index = "p2-trois-clauses-scorees";
+    let router = build_index(index, true).await;
+    let base = r#"{"from":0,"size":300,"query":{"bool":{"should":[{"match":{"title":"widget"}},{"match":{"category":"tools"}},{"match":{"body":"common"}}],"minimum_should_match":3}}}"#;
+    let sans_filtre = search(&router, index, base).await;
+    let scores: Vec<f64> = sans_filtre["hits"]["hits"]
+        .as_array()
+        .expect("les hits non filtrés doivent être un tableau")
+        .iter()
+        .map(|hit| hit["_score"].as_f64().expect("hit scoré"))
+        .collect();
+    let score_min = scores
+        .iter()
+        .copied()
+        .reduce(f64::min)
+        .expect("au moins un hit scoré");
+    let score_max = scores
+        .iter()
+        .copied()
+        .reduce(f64::max)
+        .expect("au moins un hit scoré");
+    assert!(
+        score_min < score_max,
+        "la fixture doit placer des scores de part et d'autre du seuil"
+    );
+    let min_score = (score_min + score_max) / 2.0;
+    let request = serde_json::to_string(&json!({
+        "from": 0,
+        "size": 300,
+        "min_score": min_score,
+        "query": {
+            "bool": {
+                "should": [
+                    {"match": {"title": "widget"}},
+                    {"match": {"category": "tools"}},
+                    {"match": {"body": "common"}}
+                ],
+                "minimum_should_match": 3
+            }
+        }
+    }))
+    .expect("requête P2 sérialisable");
+
+    let direct = search(&router, index, &request).await;
+    let generic = search(&router, index, &force_generic_bool_reference(&request)).await;
+    assert_eq!(
+        p1a_scored_response_fingerprint(&direct),
+        p1a_scored_response_fingerprint(&generic),
+        "P2 doit conserver les ids, l'ordre, les bits, max_score et total"
+    );
+    assert!(
+        direct["hits"]["total"]["value"]
+            .as_u64()
+            .expect("total filtré")
+            < sans_filtre["hits"]["total"]["value"]
+                .as_u64()
+                .expect("total non filtré"),
+        "min_score doit éliminer au moins un hit P2"
+    );
+    assert!(
+        direct["hits"]["hits"]
+            .as_array()
+            .expect("hits filtrés")
+            .iter()
+            .all(|hit| hit["_score"]
+                .as_f64()
+                .is_some_and(|score| score >= min_score)),
+        "aucun hit P2 sous min_score ne doit survivre"
+    );
 }

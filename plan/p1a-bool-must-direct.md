@@ -67,7 +67,8 @@ Track A — perf / optimisation.
 - Preuves locales : diff relu, `cargo fmt`, `cargo fmt --check` et whitespace
   vérifiés. Le cache conserve désormais la provenance P1a : un cache hit
   incrémente `surch_bool_direct_must_fused_total` seulement si sa réponse a
-  été calculée par le chemin RAM mono-segment (commit local `[lecture S]`).
+  été calculée par le chemin direct checked, y compris RAM, disque et
+  multi-segments couverts par P2 (commit local `[lecture S]`).
   Les tests Rust,
   clippy et les gates externes restent volontairement non exécutés.
 - Preuves attendues : B1, CI et rapport de latence promu avec le compteur
