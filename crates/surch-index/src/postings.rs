@@ -979,6 +979,7 @@ impl PostingsBuilder {
                     block_dir_offsets: tables.block_dir_offsets,
                     p2_block_directory,
                     p2_block_dir_offsets,
+                    p2_term_payloads: tables.p2_term_payloads,
                 },
             );
         }
@@ -1029,13 +1030,17 @@ struct TermDirectoryTables {
     block_directory: Box<[BlockDirEntry]>,
     block_dir_offsets: Box<[u32]>,
     term_entries_directory: Option<(u64, u32)>,
+    p2_term_payloads: Box<[P2TermPayload]>,
 }
 
 impl TermDirectoryChannels {
     /// Keep every channel resident (boxed as-is, no spill) — the
     /// flag-off default and the target of every best-effort fallback in
     /// [`persist_or_keep_term_directory`].
-    fn into_resident(self) -> TermDirectoryTables {
+    fn into_resident(self, retain_p2_attestation: bool) -> TermDirectoryTables {
+        let p2_term_payloads = retain_p2_attestation
+            .then(|| build_p2_term_payloads(&self.segment_descriptors, &self.offsets))
+            .unwrap_or_default();
         TermDirectoryTables {
             segment_descriptors: self.segment_descriptors.into_boxed_slice(),
             offsets: self.offsets.into_boxed_slice(),
@@ -1043,6 +1048,7 @@ impl TermDirectoryChannels {
             block_directory: self.block_directory.into_boxed_slice(),
             block_dir_offsets: self.block_dir_offsets.into_boxed_slice(),
             term_entries_directory: None,
+            p2_term_payloads,
         }
     }
 }
@@ -1086,7 +1092,7 @@ fn persist_or_keep_term_directory(
     postings_segment: &mut Option<PostingsSegment>,
 ) -> TermDirectoryTables {
     if !disk_enabled || channels.segment_descriptors.is_empty() {
-        return channels.into_resident();
+        return channels.into_resident(disk_enabled);
     }
     let term_count = channels.segment_descriptors.len();
     // Producer invariant (both producers push exactly one entry per term
@@ -1106,10 +1112,10 @@ fn persist_or_keep_term_directory(
     if channels.offsets.len() != term_count + 1
         || channels.block_dir_offsets.len() != term_count + 1
     {
-        return channels.into_resident();
+        return channels.into_resident(true);
     }
     let Some(segment) = postings_segment.as_mut() else {
-        return channels.into_resident();
+        return channels.into_resident(true);
     };
 
     // (1) The field's whole block directory, packed at
@@ -1125,7 +1131,7 @@ fn persist_or_keep_term_directory(
         encoded_directory.extend_from_slice(&encode_block_dir_entry(entry));
     }
     let Some(block_dir_base) = segment.append(&encoded_directory) else {
-        return channels.into_resident();
+        return channels.into_resident(true);
     };
 
     // (2) The per-term TermEntry table, TERM_ENTRY_ENCODED_LEN (28 B)
@@ -1134,6 +1140,7 @@ fn persist_or_keep_term_directory(
     // segment-absolute block-dir offset (never a to-be-rebased one).
     let mut encoded_entries =
         Vec::with_capacity(term_count.saturating_mul(TERM_ENTRY_ENCODED_LEN as usize));
+    let mut p2_term_payloads = Vec::with_capacity(term_count);
     for idx in 0..term_count {
         let (postings_offset, postings_len) = channels.segment_descriptors[idx];
         let postings_count = channels.offsets[idx + 1].saturating_sub(channels.offsets[idx]);
@@ -1146,10 +1153,11 @@ fn persist_or_keep_term_directory(
             block_dir_offset: block_dir_base + u64::from(dir_start) * BLOCK_DIR_ENTRY_ENCODED_LEN,
             block_dir_count: dir_end.saturating_sub(dir_start),
         };
+        p2_term_payloads.push(P2TermPayload::from(entry));
         encoded_entries.extend_from_slice(&encode_term_entry(&entry));
     }
     let Some(entries_base) = segment.append(&encoded_entries) else {
-        return channels.into_resident();
+        return channels.into_resident(true);
     };
 
     TermDirectoryTables {
@@ -1159,6 +1167,7 @@ fn persist_or_keep_term_directory(
         block_directory: Box::default(),
         block_dir_offsets: Box::default(),
         term_entries_directory: Some((entries_base, term_count as u32)),
+        p2_term_payloads: p2_term_payloads.into_boxed_slice(),
     }
 }
 
@@ -1545,6 +1554,7 @@ impl FieldMergeAccumulator {
                 block_dir_offsets: tables.block_dir_offsets,
                 p2_block_directory,
                 p2_block_dir_offsets,
+                p2_term_payloads: tables.p2_term_payloads,
             },
             self.postings_skipped_terms,
         )
@@ -1918,6 +1928,9 @@ pub struct FieldPostings {
     p2_block_directory: Box<[BlockDirEntry]>,
     /// Offsets CSR de [`Self::p2_block_directory`], indexés comme le FST.
     p2_block_dir_offsets: Box<[u32]>,
+    /// Attestation compacte des scalaires de payload par terme. Elle garde
+    /// P2 borné sans réintroduire les canaux de service déversés.
+    p2_term_payloads: Box<[P2TermPayload]>,
 }
 
 /// Plan segments S5b: one term's COMPLETE per-term metadata, unified
@@ -1979,6 +1992,66 @@ impl TermEntry {
         }
         Ok(())
     }
+}
+
+/// Attestation résidente compacte des scalaires qui adressent le payload
+/// d'un terme. P2 la compare avant tout `pread` variable afin qu'une entrée
+/// déversée corrompue ne puisse ni changer la plage lue ni provoquer une
+/// allocation hostile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct P2TermPayload {
+    postings_offset: u64,
+    postings_len: u32,
+    postings_count: u32,
+}
+
+impl From<TermEntry> for P2TermPayload {
+    fn from(entry: TermEntry) -> Self {
+        Self {
+            postings_offset: entry.postings_offset,
+            postings_len: entry.postings_len,
+            postings_count: entry.postings_count,
+        }
+    }
+}
+
+impl P2TermPayload {
+    fn matches(self, entry: TermEntry) -> bool {
+        self.postings_offset == entry.postings_offset
+            && self.postings_len == entry.postings_len
+            && self.postings_count == entry.postings_count
+    }
+}
+
+/// Construit l'attestation avant que les canaux de répertoire soient
+/// éventuellement déversés. Une forme CSR invalide ne produit aucune
+/// attestation : le lecteur P2 déclinera alors explicitement.
+fn build_p2_term_payloads(
+    segment_descriptors: &[(u64, u32)],
+    offsets: &[u32],
+) -> Box<[P2TermPayload]> {
+    if offsets.len() != segment_descriptors.len().saturating_add(1) {
+        return Box::default();
+    }
+
+    let mut payloads = Vec::with_capacity(segment_descriptors.len());
+    for (idx, &(postings_offset, postings_len)) in segment_descriptors.iter().enumerate() {
+        let Some(&start) = offsets.get(idx) else {
+            return Box::default();
+        };
+        let Some(&end) = offsets.get(idx + 1) else {
+            return Box::default();
+        };
+        let Some(postings_count) = end.checked_sub(start) else {
+            return Box::default();
+        };
+        payloads.push(P2TermPayload {
+            postings_offset,
+            postings_len,
+            postings_count,
+        });
+    }
+    payloads.into_boxed_slice()
 }
 
 /// Plan segments S5b: on-disk encoded length of one [`TermEntry`] — 28
@@ -2301,6 +2374,19 @@ impl FieldPostings {
         .map_err(|_| PostingsReadError::Corrupt)?;
         self.p2_block_directory
             .get(start..end)
+            .ok_or(PostingsReadError::Corrupt)
+    }
+
+    /// Retourne les scalaires de payload attestés lors de l'indexation. Le
+    /// lecteur P2 ne lit aucune plage adressée par une entrée déversée avant
+    /// cette comparaison.
+    fn p2_term_payload_checked(
+        &self,
+        idx: usize,
+    ) -> core::result::Result<P2TermPayload, PostingsReadError> {
+        self.p2_term_payloads
+            .get(idx)
+            .copied()
             .ok_or(PostingsReadError::Corrupt)
     }
 
@@ -2751,10 +2837,22 @@ impl TermDictionary {
         };
         let segment = self.postings_segment.as_deref();
         let entry = field_postings.term_entry_checked(idx as usize, segment)?;
+        let expected_payload = field_postings.p2_term_payload_checked(idx as usize)?;
+        if !expected_payload.matches(entry) {
+            // Les scalaires relus adressent ensuite les `pread` et leurs
+            // allocations : une divergence doit donc décliner avant toute
+            // lecture de plage variable.
+            return Err(PostingsReadError::Corrupt);
+        }
         entry.validate()?;
         let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
 
         let expected_directory = field_postings.p2_block_directory_entries_checked(idx as usize)?;
+        let expected_directory_count =
+            u32::try_from(expected_directory.len()).map_err(|_| PostingsReadError::Corrupt)?;
+        if entry.block_dir_count != expected_directory_count {
+            return Err(PostingsReadError::Corrupt);
+        }
         match field_postings.block_directory_entries_checked(entry, Some(segment)) {
             Ok(Some(directory)) => {
                 let expected_count = usize::try_from(entry.postings_count)
@@ -2876,7 +2974,7 @@ impl TermDictionary {
     /// §"Dimensionnement S5"): total bytes held by the per-term CSR/directory
     /// metadata NO OTHER gauge counted before this — `offsets`,
     /// `block_offsets`, `segment_descriptors`, `block_directory`,
-    /// `block_dir_offsets` et l'attestation P2. Summed over every field.
+    /// `block_dir_offsets` et les attestations P2. Summed over every field.
     /// Plan segments S5b spills the five service arrays into the shared
     /// segment once `SURCH_POSTINGS_DISK` is on, mais P2 conserve son
     /// attestation exacte en mémoire pour refuser une directory corrompue
@@ -2900,6 +2998,7 @@ impl TermDictionary {
         let u32_size = std::mem::size_of::<u32>() as u64;
         let descriptor_size = std::mem::size_of::<(u64, u32)>() as u64;
         let block_dir_entry_size = std::mem::size_of::<BlockDirEntry>() as u64;
+        let p2_term_payload_size = std::mem::size_of::<P2TermPayload>() as u64;
         self.fields
             .values()
             .map(|fp| {
@@ -2910,6 +3009,7 @@ impl TermDictionary {
                     + (fp.block_dir_offsets.len() as u64).saturating_mul(u32_size)
                     + (fp.p2_block_directory.len() as u64).saturating_mul(block_dir_entry_size)
                     + (fp.p2_block_dir_offsets.len() as u64).saturating_mul(u32_size)
+                    + (fp.p2_term_payloads.len() as u64).saturating_mul(p2_term_payload_size)
             })
             .sum()
     }
@@ -3032,10 +3132,10 @@ fn p2_directory_has_expected_shape(
         || directory.len() != total_count.div_ceil(FOR_BLOCK_SIZE)
         || directory
             .first()
-            .map_or(true, |entry| entry.byte_offset_in_term_payload != 0)
-        || directory.last().map_or(true, |entry| {
-            entry.byte_offset_in_term_payload >= term_payload_len
-        })
+            .is_none_or(|entry| entry.byte_offset_in_term_payload != 0)
+        || directory
+            .last()
+            .is_none_or(|entry| entry.byte_offset_in_term_payload >= term_payload_len)
     {
         return false;
     }
@@ -3479,6 +3579,32 @@ impl<'seg> DiskPostingsCursor<'seg> {
         }
     }
 
+    /// Vérifie le bloc décodé avant de le publier au galope. Le maximum et le
+    /// count du répertoire ne suffisent pas : la borne inférieure est le
+    /// maximum du bloc précédent, et chaque identifiant doit croître
+    /// strictement dans le bloc courant.
+    fn decoded_block_matches_directory(
+        &self,
+        entry: BlockDirEntry,
+        doc_ids: &[u32],
+        freqs: &[u32],
+    ) -> bool {
+        let Some(first_doc_id) = doc_ids.first().copied() else {
+            return false;
+        };
+        let lower_bound_is_valid = self
+            .block_cursor
+            .checked_sub(1)
+            .and_then(|previous_idx| self.directory.get(previous_idx))
+            .is_none_or(|previous| first_doc_id > previous.max_doc_id);
+
+        doc_ids.len() == entry.count as usize
+            && freqs.len() == doc_ids.len()
+            && doc_ids.last().copied() == Some(entry.max_doc_id)
+            && lower_bound_is_valid
+            && doc_ids.windows(2).all(|pair| pair[0] < pair[1])
+    }
+
     /// Advance to the first `doc_id >= target`, `pread`+decoding at most
     /// one NEW block to get there. `target` must be non-decreasing across
     /// calls — same contract, same return-and-consume semantics, as
@@ -3520,24 +3646,23 @@ impl<'seg> DiskPostingsCursor<'seg> {
                     return DiskPostingsAdvance::Error;
                 };
                 self.blocks_read = self.blocks_read.saturating_add(1);
-                let Some(block_bytes) = self.segment.read(
-                    self.term_base_offset + u64::from(entry.byte_offset_in_term_payload),
-                    block_len,
-                ) else {
+                let Some(block_offset) = self
+                    .term_base_offset
+                    .checked_add(u64::from(entry.byte_offset_in_term_payload))
+                else {
+                    return DiskPostingsAdvance::Error;
+                };
+                let Ok(block_bytes) = self.segment.read_checked(block_offset, block_len) else {
                     return DiskPostingsAdvance::Error;
                 };
                 let Ok((doc_ids, freqs)) = decode_block(&block_bytes, entry.count as usize) else {
                     return DiskPostingsAdvance::Error;
                 };
-                if doc_ids.len() != entry.count as usize
-                    || freqs.len() != doc_ids.len()
-                    || doc_ids.last().copied() != Some(entry.max_doc_id)
-                {
-                    // Un bloc chargé doit confirmer le count et le maximum
-                    // annoncés par son répertoire. Sans cette preuve, un
-                    // maximum trop haut pourrait faire chercher hors bloc et
-                    // un maximum incohérent ne doit jamais être une fin
-                    // normale des postings.
+                if !self.decoded_block_matches_directory(entry, &doc_ids, &freqs) {
+                    // Un bloc chargé doit confirmer ses deux bornes, son
+                    // count et son ordre strict. Sans ces preuves, une
+                    // corruption ne doit jamais devenir une omission
+                    // silencieuse ni une fin normale des postings.
                     return DiskPostingsAdvance::Error;
                 }
                 self.loaded = Some((self.block_cursor, doc_ids, freqs));
@@ -4199,6 +4324,147 @@ mod tests {
             cursor.advance_to_with_status(BLOCK_SIZE as u32),
             DiskPostingsAdvance::Error,
             "un maximum trop haut doit devenir une erreur, jamais un panic"
+        );
+    }
+
+    #[test]
+    fn curseur_disque_refuse_la_borne_inferieure_corrompue_entre_blocs() {
+        let block_size = FOR_BLOCK_SIZE as u32;
+        let canonical_doc_ids: Vec<u32> = (0..block_size * 2).collect();
+        let canonical_freqs = vec![1; canonical_doc_ids.len()];
+        let canonical_payload = encode_postings_blocked(&canonical_doc_ids, &canonical_freqs)
+            .expect("le payload canonique doit s'encoder");
+        let directory = block_directory(&canonical_payload, canonical_doc_ids.len())
+            .expect("le répertoire canonique doit être construit");
+        assert_eq!(directory.len(), 2, "deux blocs canoniques attendus");
+
+        // Le second bloc conserve son count et son maximum, mais redémarre à
+        // 127 au lieu de 128. Chaque bloc reste localement décodable.
+        let first_doc_ids: Vec<u32> = (0..block_size).collect();
+        let mut second_doc_ids = Vec::with_capacity(FOR_BLOCK_SIZE);
+        second_doc_ids.push(block_size - 1);
+        second_doc_ids.extend((block_size + 1)..(block_size * 2));
+        let first_freqs = vec![1; first_doc_ids.len()];
+        let second_freqs = vec![1; second_doc_ids.len()];
+        let mut corrupted_payload = encode_postings_blocked(&first_doc_ids, &first_freqs)
+            .expect("le premier bloc doit s'encoder");
+        corrupted_payload.extend_from_slice(
+            &encode_postings_blocked(&second_doc_ids, &second_freqs)
+                .expect("le second bloc localement valide doit s'encoder"),
+        );
+        assert!(
+            corrupted_payload.len() <= canonical_payload.len(),
+            "la corruption doit rester dans la plage canonique lue"
+        );
+
+        let mut segment = PostingsSegment::try_new().expect("segment temporaire disponible");
+        let base = segment
+            .append(&corrupted_payload)
+            .expect("payload corrompu écrit pour la régression");
+        if corrupted_payload.len() < canonical_payload.len() {
+            let bourrage = vec![0; canonical_payload.len() - corrupted_payload.len()];
+            segment
+                .append(&bourrage)
+                .expect("bourrage trailing écrit pour la régression");
+        }
+        let mut cursor = DiskPostingsCursor::open_with_directory(
+            &segment,
+            base,
+            canonical_payload.len() as u32,
+            directory,
+            canonical_doc_ids.len(),
+        );
+
+        assert_eq!(
+            cursor.advance_to_with_status(block_size),
+            DiskPostingsAdvance::Error,
+            "la borne inférieure incohérente doit décliner, jamais omettre 128"
+        );
+    }
+
+    #[test]
+    fn validation_de_bloc_refuse_un_ordre_intra_bloc_non_strict() {
+        let dictionary = dictionnaire_p2_deux_blocs();
+        let segment = dictionary
+            .postings_segment
+            .as_deref()
+            .expect("le segment disque doit exister");
+        let field = dictionary.fields.get("body").expect("field present");
+        let idx = field.fst.get(b"large").expect("term present") as usize;
+        let entry = field
+            .term_entry(idx, Some(segment))
+            .expect("entry persisted present");
+        let directory = field.p2_block_directory.to_vec();
+        let cursor = DiskPostingsCursor::open_with_directory(
+            segment,
+            entry.postings_offset,
+            entry.postings_len,
+            directory.clone(),
+            entry.postings_count as usize,
+        );
+        let mut doc_ids: Vec<u32> = (FOR_BLOCK_SIZE as u32..FOR_BLOCK_SIZE as u32 * 2).collect();
+        doc_ids.swap(1, 2);
+        let freqs = vec![1; doc_ids.len()];
+
+        assert!(
+            !cursor.decoded_block_matches_directory(directory[1], &doc_ids, &freqs),
+            "un ordre intra-bloc non strict doit être rejeté avant publication"
+        );
+    }
+
+    #[test]
+    fn p2_rejette_les_scalaires_term_entry_non_attestes_avant_lecture() {
+        let mut offset_corrompu = dictionnaire_p2_deux_blocs();
+        rend_repertoire_p2_resident(&mut offset_corrompu);
+        offset_corrompu
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .segment_descriptors[0]
+            .0 = u64::MAX;
+        assert!(matches!(
+            offset_corrompu.disk_cursor_p2_checked("body", "large"),
+            Err(PostingsReadError::Corrupt)
+        ));
+
+        let mut longueur_corrompue = dictionnaire_p2_deux_blocs();
+        rend_repertoire_p2_resident(&mut longueur_corrompue);
+        longueur_corrompue
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .segment_descriptors[0]
+            .1 = u32::MAX;
+        assert!(matches!(
+            longueur_corrompue.disk_cursor_p2_checked("body", "large"),
+            Err(PostingsReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn curseur_disque_rejette_l_addition_d_offset_debordante() {
+        let dictionary = dictionnaire_p2_deux_blocs();
+        let segment = dictionary
+            .postings_segment
+            .as_deref()
+            .expect("le segment disque doit exister");
+        let field = dictionary.fields.get("body").expect("field present");
+        let idx = field.fst.get(b"large").expect("term present") as usize;
+        let entry = field
+            .term_entry(idx, Some(segment))
+            .expect("entry persisted present");
+        let mut cursor = DiskPostingsCursor::open_with_directory(
+            segment,
+            u64::MAX,
+            entry.postings_len,
+            field.p2_block_directory.to_vec(),
+            entry.postings_count as usize,
+        );
+
+        assert_eq!(
+            cursor.advance_to_with_status(FOR_BLOCK_SIZE as u32),
+            DiskPostingsAdvance::Error,
+            "l'addition de l'offset du second bloc doit rester checked"
         );
     }
 

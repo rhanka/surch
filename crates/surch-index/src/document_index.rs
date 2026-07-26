@@ -457,6 +457,53 @@ pub struct SegmentedPostings<'a> {
     global_df: u64,
 }
 
+/// Erreur de construction d'une vue P2. Elle conserve les compteurs des
+/// curseurs déjà ouverts : un repli ne doit pas faire disparaître le coût
+/// disque observé avant l'erreur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentedPostingsError {
+    reason: PostingsReadError,
+    blocks_read: u64,
+    blocks_total: u64,
+}
+
+impl SegmentedPostingsError {
+    fn from_partial(
+        reason: PostingsReadError,
+        per_segment: &[Option<SegmentPostingsCursor<'_>>],
+    ) -> Self {
+        let (blocks_read, blocks_total) = disk_block_counts(per_segment);
+        Self {
+            reason,
+            blocks_read,
+            blocks_total,
+        }
+    }
+
+    /// Cause checked qui interdit de publier une vue partielle.
+    pub fn reason(&self) -> PostingsReadError {
+        self.reason
+    }
+
+    /// Compteurs des curseurs ouverts avant l'échec de construction.
+    pub fn disk_block_counts(&self) -> (u64, u64) {
+        (self.blocks_read, self.blocks_total)
+    }
+}
+
+fn disk_block_counts(per_segment: &[Option<SegmentPostingsCursor<'_>>]) -> (u64, u64) {
+    per_segment
+        .iter()
+        .flatten()
+        .filter_map(SegmentPostingsCursor::disk_block_counts)
+        .fold((0, 0), |(read, total), (cursor_read, cursor_total)| {
+            (
+                read.saturating_add(cursor_read),
+                total.saturating_add(cursor_total),
+            )
+        })
+}
+
 impl<'a> SegmentedPostings<'a> {
     /// Somme des `df` locaux sur tous les segments qui portent ce terme.
     pub fn global_df(&self) -> u64 {
@@ -473,16 +520,7 @@ impl<'a> SegmentedPostings<'a> {
     /// fait après la tentative P2 afin d'inclure aussi les termes ouverts
     /// avant une erreur de construction ou un segment localement incomplet.
     pub fn disk_block_counts(&self) -> (u64, u64) {
-        self.per_segment
-            .iter()
-            .flatten()
-            .filter_map(SegmentPostingsCursor::disk_block_counts)
-            .fold((0, 0), |(read, total), (cursor_read, cursor_total)| {
-                (
-                    read.saturating_add(cursor_read),
-                    total.saturating_add(cursor_total),
-                )
-            })
+        disk_block_counts(&self.per_segment)
     }
 }
 
@@ -2238,44 +2276,55 @@ impl DocumentIndex {
         &self,
         field: &str,
         term: &str,
-    ) -> CheckedPostings<SegmentedPostings<'_>> {
+    ) -> core::result::Result<Option<SegmentedPostings<'_>>, SegmentedPostingsError> {
         let mut per_segment = Vec::with_capacity(self.segments.len());
         let mut global_df = 0u64;
         let mut any = false;
 
         for segment in &self.segments {
-            let cursor = if segment.terms.disk_backed() {
+            let cursor: CheckedPostings<SegmentPostingsCursor<'_>> = if segment.terms.disk_backed()
+            {
                 segment
                     .terms
-                    .disk_cursor_p2_checked(field, term)?
-                    .map(SegmentPostingsCursor::Disk)
+                    .disk_cursor_p2_checked(field, term)
+                    .map(|cursor| cursor.map(SegmentPostingsCursor::Disk))
             } else {
-                match segment
-                    .terms
-                    .postings_with_block_metas_checked(field, term)?
-                {
-                    Some(list) => {
+                match segment.terms.postings_with_block_metas_checked(field, term) {
+                    Ok(Some(list)) => {
                         let local_df = list.doc_freq_from_block_metas() as u64;
-                        let iter = list
-                            .skip_iter()
-                            .map_err(|_| PostingsReadError::Corrupt)?
-                            .ok_or(PostingsReadError::Corrupt)?;
-                        Some(SegmentPostingsCursor::Ram {
-                            iter,
-                            freqs: list.freqs(),
-                            local_df,
-                        })
+                        match list.skip_iter() {
+                            Ok(Some(iter)) => Ok(Some(SegmentPostingsCursor::Ram {
+                                iter,
+                                freqs: list.freqs(),
+                                local_df,
+                            })),
+                            _ => Err(PostingsReadError::Corrupt),
+                        }
                     }
-                    None => None,
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
                 }
             };
 
+            let cursor = match cursor {
+                Ok(cursor) => cursor,
+                Err(error) => {
+                    return Err(SegmentedPostingsError::from_partial(error, &per_segment))
+                }
+            };
             if let Some(cursor) = cursor {
-                global_df = global_df
-                    .checked_add(cursor.local_df())
-                    .ok_or(PostingsReadError::Corrupt)?;
-                any = true;
+                let local_df = cursor.local_df();
                 per_segment.push(Some(cursor));
+                global_df = match global_df.checked_add(local_df) {
+                    Some(global_df) => global_df,
+                    None => {
+                        return Err(SegmentedPostingsError::from_partial(
+                            PostingsReadError::Corrupt,
+                            &per_segment,
+                        ));
+                    }
+                };
+                any = true;
             } else {
                 per_segment.push(None);
             }
@@ -4031,10 +4080,18 @@ mod tests {
             .terms
             .test_remove_postings_segment();
 
-        assert!(matches!(
-            index.segmented_postings_checked("BODY", "commun"),
-            Err(crate::postings::PostingsReadError::MissingCoverage)
-        ));
+        let error = index
+            .segmented_postings_checked("BODY", "commun")
+            .expect_err("le second segment illisible doit interrompre la vue P2");
+        assert_eq!(
+            error.reason(),
+            crate::postings::PostingsReadError::MissingCoverage
+        );
+        assert_eq!(
+            error.disk_block_counts(),
+            (0, 1),
+            "le curseur du premier segment doit rester compté après l'échec tardif"
+        );
     }
 
     #[test]

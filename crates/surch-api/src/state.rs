@@ -14,6 +14,7 @@ use serde_json::Value;
 use surch_index::{
     document_index::{
         DocumentIndex, SegmentPostingsAdvance, SegmentPostingsCursor, SegmentedPostings,
+        SegmentedPostingsError,
     },
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
@@ -1018,6 +1019,12 @@ impl P2DiskBlockMetrics {
             self.blocks_read = self.blocks_read.saturating_add(read);
             self.blocks_total = self.blocks_total.saturating_add(total);
         }
+    }
+
+    fn observe_construction_error(&mut self, error: &SegmentedPostingsError) {
+        let (read, total) = error.disk_block_counts();
+        self.blocks_read = self.blocks_read.saturating_add(read);
+        self.blocks_total = self.blocks_total.saturating_add(total);
     }
 
     fn publish(&self) {
@@ -3070,8 +3077,9 @@ impl InMemoryIndex {
                     return Vec::new();
                 }
                 // Ne jamais publier le préfixe des segments déjà lus.
-                Err(_) => {
+                Err(error) => {
                     block_metrics.observe_segmented(&segmented_terms);
+                    block_metrics.observe_construction_error(&error);
                     block_metrics.publish();
                     return Self::conjunction_hits_merged(index, terms);
                 }
@@ -4928,8 +4936,9 @@ impl AppState {
                 // Une erreur checked doit décliner AVANT compteur et
                 // finalisation : le chemin générique reste seul autorisé à
                 // produire la réponse compatible.
-                Err(_) => {
+                Err(error) => {
                     block_metrics.observe_segmented(&segmented_terms);
+                    block_metrics.observe_construction_error(&error);
                     block_metrics.publish();
                     return None;
                 }

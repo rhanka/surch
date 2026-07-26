@@ -22,6 +22,12 @@ use serde_json::Value;
 use surch_api::{app_router_with_state, state::AppState, AppRouterState};
 use tower::ServiceExt;
 
+/// Le compteur Prometheus est partagé par tout ce binaire de tests. Les
+/// assertions par différence gardent donc cette serrure asynchrone durant
+/// toute la requête mesurée.
+static P1A_DIRECT_MUST_METRICS_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
 async fn response_json(response: axum::response::Response<Body>) -> Value {
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -228,6 +234,12 @@ fn force_generic_bool_reference(body: &str) -> String {
         "query".to_owned(),
         serde_json::json!({"function_score":{"query":query}}),
     );
+    // Le surlignage force la référence à contourner tout scorer top-K direct
+    // sans modifier les ids ni les scores comparés par le fingerprint.
+    request_object.insert(
+        "highlight".to_owned(),
+        serde_json::json!({"fields":{"title":{}}}),
+    );
     serde_json::to_string(&request).expect("reference request must serialize")
 }
 
@@ -282,6 +294,10 @@ fn p1a_scored_response_fingerprint(body: &Value) -> (Vec<(String, u64)>, Option<
 
 #[tokio::test]
 async fn p2_mixte_multisegment_conserve_parite_df_global_et_finalisation() {
+    let _metrics_guard = P1A_DIRECT_MUST_METRICS_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let index = "p2-mixte-parity-idx";
     let router = build_index_mixte_p2(index).await;
     let direct = r#"{"from":3,"size":5,"min_score":0.2,"query":{"bool":{"must":[{"match":{"title":"anchor"}},{"match":{"category":"shared"}}]}}}"#;
@@ -330,6 +346,10 @@ fn extract_ordered_hits(body: &Value) -> Vec<(String, f64)> {
 
 #[tokio::test]
 async fn tiered_merge_cascades_and_matches_mono_and_unmerged_bit_identical() {
+    let _metrics_guard = P1A_DIRECT_MUST_METRICS_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let index = "seg-merge-parity-idx";
 
     // `Some(1)`: any non-empty `PostingsBuilder` crosses the budget, so

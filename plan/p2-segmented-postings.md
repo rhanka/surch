@@ -57,6 +57,15 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
   - [x] Correction de revue locale — parité forcé-générique étendue aux
     termes distincts, `global_df` asymétrique, RAM/disque/mixte,
     `min_score` et `from`/`size`.
+  - [x] Correction 2 de revue locale — chaque bloc chargé atteste son count,
+    ses bornes supérieure et inférieure et son ordre strict ; une divergence
+    devient `DiskPostingsAdvance::Error` avant toute publication.
+  - [x] Correction 2 de revue locale — les scalaires de payload de
+    `TermEntry` sont attestés et les plages de lecture utilisent des additions
+    checked ; les compteurs conservent les curseurs ouverts lors d'un échec de
+    construction, et les tests de métriques sont sérialisés.
+  - [x] Correction 2 de revue locale — le golden P2 couvre `min_score`
+    effectivement filtrant et trois clauses scorées dans l'ordre demandé.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
