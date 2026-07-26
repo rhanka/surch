@@ -21,8 +21,9 @@ Track A — perf / optimisation.
 
 - [x] Router uniquement la racine `bool.must` exacte à deux `match`, sans
   `should`, `filter`, `must_not` ni boost.
-- [x] Réutiliser les chemins RAM, disque et multi-segment existants avec un
-  score `must` qui conserve chaque contribution BM25, y compris `1.0`.
+- [x] Exécuter P1a sur le chemin RAM mono-segment avec un score `must` qui
+  conserve chaque contribution BM25, y compris `1.0`; décliner vers le
+  générique sur disque ou multi-segment tant que leur lecture reste ambiguë.
 - [x] Distinguer la fin normale des postings d'une erreur `pread` ou de
   décodage dans le seul scorer `must`, qui décline alors vers le générique.
 - [x] Conserver `reduce_deces_conjunction_into`, le chemin `should`, la
