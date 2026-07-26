@@ -1016,8 +1016,17 @@ const SEARCH_CACHE_CAPACITY: usize = 256;
 
 #[derive(Default)]
 struct IndexSearchCache {
-    entries: HashMap<u64, Vec<u8>>,
+    entries: HashMap<u64, SearchCacheEntry>,
     order: VecDeque<u64>,
+}
+
+/// Réponse mémorisée avec sa provenance P1a. Le cache ne relance jamais le
+/// scorer : cette donnée conserve la sémantique du compteur lorsqu'une
+/// réponse RAM directe est servie depuis le cache.
+#[derive(Clone)]
+struct SearchCacheEntry {
+    bytes: Vec<u8>,
+    direct_must_fused: bool,
 }
 
 #[derive(Default)]
@@ -3432,22 +3441,27 @@ fn scalar_values(document: &Value, mapping: &IndexMapping, field: &str) -> Vec<S
 }
 
 impl AppState {
-    pub fn search_cache_get(&self, index: &str, key: u64) -> Option<Vec<u8>> {
+    pub fn search_cache_get(&self, index: &str, key: u64) -> Option<(Vec<u8>, bool)> {
         let cache = self
             .search_cache
             .read()
             .expect("search cache lock should not be poisoned");
         cache
             .get(index)
-            .and_then(|entry| entry.entries.get(&key).cloned())
+            .and_then(|entry| entry.entries.get(&key))
+            .map(|entry| (entry.bytes.clone(), entry.direct_must_fused))
     }
 
-    pub fn search_cache_put(&self, index: &str, key: u64, value: Vec<u8>) {
+    pub fn search_cache_put(&self, index: &str, key: u64, bytes: Vec<u8>, direct_must_fused: bool) {
         let mut cache = self
             .search_cache
             .write()
             .expect("search cache lock should not be poisoned");
         let entry = cache.entry(index.to_owned()).or_default();
+        let value = SearchCacheEntry {
+            bytes,
+            direct_must_fused,
+        };
         if entry.entries.insert(key, value).is_none() {
             entry.order.push_back(key);
             while entry.entries.len() > SEARCH_CACHE_CAPACITY {

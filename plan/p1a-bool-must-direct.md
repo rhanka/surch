@@ -58,10 +58,14 @@ Track A — perf / optimisation.
 
 ## Preuves et statut de merge
 
-- Preuves locales : diff relu, format et whitespace vérifiés; les tests Rust,
+- Preuves locales : diff relu, `cargo fmt`, `cargo fmt --check` et whitespace
+  vérifiés. Le cache conserve désormais la provenance P1a : un cache hit
+  incrémente `surch_bool_direct_must_fused_total` seulement si sa réponse a
+  été calculée par le chemin RAM mono-segment (commit local `[lecture S]`).
+  Les tests Rust,
   clippy et les gates externes restent volontairement non exécutés.
 - Preuves attendues : B1, CI et rapport de latence promu avec le compteur
   `surch_bool_direct_must_fused_total`.
-- Statut de merge : `e4f505e` puis son correctif de revue sont locaux et non
-  poussés; aucune preuve externe ne doit être inférée des vérifications
-  locales.
+- Statut de merge : P1a et le lot S jusqu'à `03c11fd` sont sur `origin/main`;
+  la correction locale `[lecture S]` n'est pas poussée. Aucune preuve externe ne
+  doit être inférée des vérifications locales.

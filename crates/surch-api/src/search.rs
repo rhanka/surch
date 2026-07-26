@@ -459,6 +459,10 @@ pub struct SearchResponse {
     /// continue to see the same response shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregations: Option<BTreeMap<String, AggResult>>,
+    /// Provenance interne, absente du contrat HTTP. Elle est transférée au
+    /// cache afin de conserver le compteur du chemin direct P1a.
+    #[serde(skip)]
+    direct_must_fused: bool,
 }
 
 /// A12.1+A12.2+A12.3+A12.4: shape of the per-aggregation payload.
@@ -562,6 +566,7 @@ pub fn build_search_response_with_total(
         },
         scroll_id: None,
         aggregations: None,
+        direct_must_fused: false,
     }
 }
 
@@ -877,8 +882,15 @@ pub async fn search_handler(
     };
 
     if let (Some(key), Some(index)) = (cache_key, indices.first()) {
-        if let Some(bytes) = state.search_cache_get(index, key) {
+        if let Some((bytes, direct_must_fused)) = state.search_cache_get(index, key) {
             metrics::counter!("surch_search_cache_hit_total").increment(1);
+            // Une réponse P1a RAM reste directe quand le cache évite de
+            // rejouer le scorer. La provenance est écrite à l'insertion :
+            // disque et multi-segment ne peuvent jamais incrémenter ce
+            // compteur depuis le cache.
+            if direct_must_fused {
+                metrics::counter!("surch_bool_direct_must_fused_total").increment(1);
+            }
             let query_type = classify_search_body(&body);
             metrics::counter!(
                 "surch_search_total",
@@ -954,7 +966,7 @@ pub async fn search_handler(
                 let mut cached = response.clone();
                 cached.took = 0;
                 if let Ok(cache_bytes) = serde_json::to_vec(&cached) {
-                    state.search_cache_put(index, key, cache_bytes);
+                    state.search_cache_put(index, key, cache_bytes, response.direct_must_fused);
                 }
             }
             metrics::counter!(
@@ -2015,8 +2027,11 @@ fn run_topk_exact_bool(
                 .record(t_recall.elapsed().as_micros() as f64);
             metrics::histogram!("surch_bool_candidates").record(scored.len() as f64);
             let t_fin = std::time::Instant::now();
-            let resp =
+            let mut resp =
                 finalize_fused_topk(state, &indices[0], request, scored, from, size, started_at);
+            if let Some(response) = resp.as_mut() {
+                response.direct_must_fused = true;
+            }
             metrics::histogram!("surch_bool_finalize_us")
                 .record(t_fin.elapsed().as_micros() as f64);
             return resp;
