@@ -10,6 +10,23 @@ use surch_codec::postings_block::{
 use crate::roaring::RoaringDocSet;
 use postings_segment::PostingsSegment;
 
+/// Erreur que le lecteur de postings ne peut pas confondre avec un terme
+/// absent. Les API historiques restent volontairement lossy et la
+/// transforment en `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostingsReadError {
+    /// La lecture positionnelle du segment a échoué.
+    Io,
+    /// Une métadonnée ou un payload présent ne respecte pas le codec.
+    Corrupt,
+    /// Le terme résolu n'a pas de couverture disque exploitable.
+    MissingCoverage,
+}
+
+/// Résultat de lecture qui distingue l'absence normale d'un terme d'une
+/// couverture disque illisible ou incomplète.
+pub type CheckedPostings<T> = Result<Option<T>, PostingsReadError>;
+
 /// Lot C `C1a-batché` (`docs/paper/c1b-disk-backed-design-2026-07-02.md`)
 /// SHADOW disk-backed FoR postings segment. Mirrors `DocumentIndex`'s
 /// historical `subfield_store` module (itself mirroring surch-api's
@@ -165,15 +182,21 @@ mod postings_segment {
             Some(offset)
         }
 
+        /// Lit `length` octets à `offset` via `pread` et conserve l'erreur
+        /// d'I/O pour les nouveaux lecteurs vérifiés.
+        pub(crate) fn read_checked(&self, offset: u64, length: u32) -> std::io::Result<Vec<u8>> {
+            let mut buf = vec![0u8; length as usize];
+            self.file.read_exact_at(&mut buf, offset)?;
+            Ok(buf)
+        }
+
         /// Read `length` bytes at `offset` via `pread`. Returns `None` on
         /// any I/O failure instead of panicking — this is only ever
         /// called from the SHADOW round-trip validation and the
         /// (not-yet-production) cold-path decode, never from a path RAM
         /// depends on.
         pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
-            let mut buf = vec![0u8; length as usize];
-            self.file.read_exact_at(&mut buf, offset).ok()?;
-            Some(buf)
+            self.read_checked(offset, length).ok()
         }
 
         /// Total bytes appended so far — feeds the
@@ -215,10 +238,23 @@ mod postings_segment {
             Some(offset)
         }
 
+        /// Variante vérifiée de la lecture : les bornes invalides restent
+        /// observables par le lecteur checked, même sans `pread` sur cette
+        /// cible.
+        pub(crate) fn read_checked(&self, offset: u64, length: u32) -> std::io::Result<Vec<u8>> {
+            let start = usize::try_from(offset)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            let end = start
+                .checked_add(length as usize)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            self.buf
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        }
+
         pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
-            let start = usize::try_from(offset).ok()?;
-            let end = start.checked_add(length as usize)?;
-            self.buf.get(start..end).map(<[u8]>::to_vec)
+            self.read_checked(offset, length).ok()
         }
 
         pub(crate) fn bytes_written(&self) -> u64 {
@@ -2027,6 +2063,59 @@ impl FieldPostings {
         }
     }
 
+    /// Variante vérifiée de [`Self::term_entry`]. Une fois l'index FST
+    /// résolu, toute métadonnée manquante ou illisible est une erreur et
+    /// non l'absence du terme.
+    fn term_entry_checked(
+        &self,
+        idx: usize,
+        segment: Option<&PostingsSegment>,
+    ) -> Result<TermEntry, PostingsReadError> {
+        match self.term_entries_directory {
+            Some((entries_base, term_count)) => {
+                if idx as u64 >= u64::from(term_count) {
+                    return Err(PostingsReadError::Corrupt);
+                }
+                let byte_offset = (idx as u64)
+                    .checked_mul(TERM_ENTRY_ENCODED_LEN)
+                    .and_then(|offset| entries_base.checked_add(offset))
+                    .ok_or(PostingsReadError::Corrupt)?;
+                let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
+                let bytes = segment
+                    .read_checked(byte_offset, TERM_ENTRY_ENCODED_LEN as u32)
+                    .map_err(|_| PostingsReadError::Io)?;
+                decode_term_entry(&bytes).ok_or(PostingsReadError::Corrupt)
+            }
+            None => {
+                let (postings_offset, postings_len) = *self
+                    .segment_descriptors
+                    .get(idx)
+                    .ok_or(PostingsReadError::Corrupt)?;
+                let start = *self.offsets.get(idx).ok_or(PostingsReadError::Corrupt)? as usize;
+                let end = *self
+                    .offsets
+                    .get(idx + 1)
+                    .ok_or(PostingsReadError::Corrupt)? as usize;
+                let (block_dir_offset, block_dir_count) = match (
+                    self.block_dir_offsets.get(idx),
+                    self.block_dir_offsets.get(idx + 1),
+                ) {
+                    (Some(&dir_start), Some(&dir_end)) => {
+                        (u64::from(dir_start), dir_end.saturating_sub(dir_start))
+                    }
+                    _ => (0, 0),
+                };
+                Ok(TermEntry {
+                    postings_offset,
+                    postings_len,
+                    postings_count: end.saturating_sub(start) as u32,
+                    block_dir_offset,
+                    block_dir_count,
+                })
+            }
+        }
+    }
+
     /// Plan segments S5b: fetch `entry`'s whole persisted per-block
     /// directory run in ONE grouped read — a slice copy of the resident
     /// [`Self::block_directory`] (spill fell back or never happened), or
@@ -2036,6 +2125,7 @@ impl FieldPostings {
     /// including every RAM-mode build) or on any I/O/decode failure —
     /// [`TermDictionary::disk_cursor`] then falls back to
     /// [`DiskPostingsCursor::open`]'s payload-recompute path.
+    #[allow(dead_code)] // Conservé pour les lecteurs historiques internes.
     fn block_directory_entries(
         &self,
         entry: TermEntry,
@@ -2058,6 +2148,46 @@ impl FieldPostings {
                 self.block_directory
                     .get(start..end)
                     .map(<[BlockDirEntry]>::to_vec)
+            }
+        }
+    }
+
+    /// Variante vérifiée de [`Self::block_directory_entries`]. L'absence
+    /// d'un répertoire persistant reste normale ; son illisibilité pourra
+    /// être compensée par la reconstruction depuis le payload.
+    fn block_directory_entries_checked(
+        &self,
+        entry: TermEntry,
+        segment: Option<&PostingsSegment>,
+    ) -> Result<Option<Vec<BlockDirEntry>>, PostingsReadError> {
+        if entry.block_dir_count == 0 {
+            return Ok(None);
+        }
+        match self.term_entries_directory {
+            Some(_) => {
+                let byte_len = entry
+                    .block_dir_count
+                    .checked_mul(BLOCK_DIR_ENTRY_ENCODED_LEN as u32)
+                    .ok_or(PostingsReadError::Corrupt)?;
+                let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
+                let bytes = segment
+                    .read_checked(entry.block_dir_offset, byte_len)
+                    .map_err(|_| PostingsReadError::Io)?;
+                decode_block_dir_entries(&bytes, entry.block_dir_count as usize)
+                    .map(Some)
+                    .ok_or(PostingsReadError::Corrupt)
+            }
+            None => {
+                let start = usize::try_from(entry.block_dir_offset)
+                    .map_err(|_| PostingsReadError::Corrupt)?;
+                let end = start
+                    .checked_add(entry.block_dir_count as usize)
+                    .ok_or(PostingsReadError::Corrupt)?;
+                self.block_directory
+                    .get(start..end)
+                    .map(<[BlockDirEntry]>::to_vec)
+                    .map(Some)
+                    .ok_or(PostingsReadError::Corrupt)
             }
         }
     }
@@ -2269,33 +2399,43 @@ impl TermDictionary {
         self.fields.keys().cloned().collect()
     }
 
-    /// Lot C `C1a-batché` SHADOW: decode `(field, term)`'s postings back
-    /// from the disk segment (`pread` + [`decode_postings_blocked`])
-    /// instead of reading `doc_ids_flat`/`freqs_flat` in RAM. Returns
-    /// `None` when the field or the term is unknown, `None` on a
-    /// malformed payload (never observed in practice — `build()` already
-    /// `debug_assert!`s this round-trip for every term at build time).
+    /// Variante vérifiée de la lecture SHADOW `(field, term)` depuis le
+    /// segment (`pread` + [`decode_postings_blocked`]). Elle réserve
+    /// `Ok(None)` au champ ou terme réellement absent et expose toute
+    /// couverture résolue mais illisible comme [`PostingsReadError`].
     ///
     /// NOT on any production read path — `lookup*`/[`PostingsList`]/
     /// scoring/the leapfrog all stay on the RAM buffers. This method
     /// exists for the shadow round-trip test and for a future cold path
     /// (C1b) to build on.
     ///
-    /// Returns `None` (in addition to the unknown-field/-term cases
-    /// above) when the term's descriptor is the sentinel `(0, 0)` — no
-    /// disk coverage, either because its encode failed at build time or
-    /// because the segment itself was absent/disabled (best-effort — see
-    /// [`PostingsBuilder::build`]) — or when the underlying `pread`
-    /// itself fails.
-    pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
-        let field_postings = self.fields.get(field)?;
+    pub fn decode_from_segment_checked(
+        &self,
+        field: &str,
+        term: &str,
+    ) -> CheckedPostings<(Vec<u32>, Vec<u32>)> {
+        let Some(field_postings) = self.fields.get(field) else {
+            return Ok(None);
+        };
+        let Some(idx) = field_postings.fst.get(term.as_bytes()) else {
+            return Ok(None);
+        };
         let segment = self.postings_segment.as_deref();
-        let ((offset, len), count) = field_postings.segment_slice(term, segment)?;
-        if len == 0 {
-            return None;
+        let entry = field_postings.term_entry_checked(idx as usize, segment)?;
+        if entry.postings_len == 0 {
+            return Err(PostingsReadError::MissingCoverage);
         }
-        let bytes = segment?.read(offset, len)?;
-        decode_postings_blocked(&bytes, count).ok()
+        let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
+        let bytes = segment
+            .read_checked(entry.postings_offset, entry.postings_len)
+            .map_err(|_| PostingsReadError::Io)?;
+        decode_postings_blocked(&bytes, entry.postings_count as usize)
+            .map(Some)
+            .map_err(|_| PostingsReadError::Corrupt)
+    }
+
+    pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
+        self.decode_from_segment_checked(field, term).ok().flatten()
     }
 
     /// Lot C `C1b` sous-pas 1: build a [`DiskPostingsCursor`] over
@@ -2326,34 +2466,50 @@ impl TermDictionary {
     /// (`block_dir_count == 0` with a readable payload — see
     /// [`TermEntry`]'s sentinel contract; such a term is NOT empty).
     ///
-    /// Returns `None` for the same reasons [`Self::decode_from_segment`]
-    /// does: unknown field/term, the sentinel `postings_len == 0` (no
-    /// disk coverage), an absent segment, or a directory-computation
-    /// failure inside [`DiskPostingsCursor::open`].
-    pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
-        let field_postings = self.fields.get(field)?;
+    /// Variante vérifiée du curseur : seul un champ ou terme absent donne
+    /// `Ok(None)` ; une couverture résolue mais illisible retourne une
+    /// [`PostingsReadError`].
+    pub fn disk_cursor_checked(
+        &self,
+        field: &str,
+        term: &str,
+    ) -> CheckedPostings<DiskPostingsCursor<'_>> {
+        let Some(field_postings) = self.fields.get(field) else {
+            return Ok(None);
+        };
+        let Some(idx) = field_postings.fst.get(term.as_bytes()) else {
+            return Ok(None);
+        };
         let segment = self.postings_segment.as_deref();
-        let idx = field_postings.fst.get(term.as_bytes())? as usize;
-        let entry = field_postings.term_entry(idx, segment)?;
+        let entry = field_postings.term_entry_checked(idx as usize, segment)?;
         if entry.postings_len == 0 {
-            return None;
+            return Err(PostingsReadError::MissingCoverage);
         }
-        let segment = segment?;
-        if let Some(directory) = field_postings.block_directory_entries(entry, Some(segment)) {
-            return Some(DiskPostingsCursor::open_with_directory(
+        let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
+
+        // Un répertoire persistant corrompu ou illisible ne rend pas le
+        // terme absent : on le reconstruit depuis le payload, qui reste la
+        // source de repli vérifiée.
+        match field_postings.block_directory_entries_checked(entry, Some(segment)) {
+            Ok(Some(directory)) => Ok(Some(DiskPostingsCursor::open_with_directory(
                 segment,
                 entry.postings_offset,
                 entry.postings_len,
                 directory,
                 entry.postings_count as usize,
-            ));
+            ))),
+            Ok(None) | Err(_) => DiskPostingsCursor::open_checked(
+                segment,
+                entry.postings_offset,
+                entry.postings_len,
+                entry.postings_count as usize,
+            )
+            .map(Some),
         }
-        DiskPostingsCursor::open(
-            segment,
-            entry.postings_offset,
-            entry.postings_len,
-            entry.postings_count as usize,
-        )
+    }
+
+    pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
+        self.disk_cursor_checked(field, term).ok().flatten()
     }
 
     /// Lot C `C1a-batché` gauge: total bytes physically written to the
@@ -2883,15 +3039,18 @@ impl<'seg> DiskPostingsCursor<'seg> {
     /// `private_interfaces` lint). External callers reach a cursor
     /// exclusively through [`TermDictionary::disk_cursor`], which never
     /// names `PostingsSegment` in ITS signature.
-    pub(crate) fn open(
+    fn open_checked(
         segment: &'seg PostingsSegment,
         term_base_offset: u64,
         term_payload_len: u32,
         total_count: usize,
-    ) -> Option<Self> {
-        let payload = segment.read(term_base_offset, term_payload_len)?;
-        let directory = block_directory(&payload, total_count).ok()?;
-        Some(Self {
+    ) -> Result<Self, PostingsReadError> {
+        let payload = segment
+            .read_checked(term_base_offset, term_payload_len)
+            .map_err(|_| PostingsReadError::Io)?;
+        let directory =
+            block_directory(&payload, total_count).map_err(|_| PostingsReadError::Corrupt)?;
+        Ok(Self {
             segment,
             term_base_offset,
             term_payload_len,
@@ -2902,6 +3061,16 @@ impl<'seg> DiskPostingsCursor<'seg> {
             last_freq: 0,
             total_count,
         })
+    }
+
+    #[allow(dead_code)] // Conservé comme adaptateur lossy historique interne.
+    pub(crate) fn open(
+        segment: &'seg PostingsSegment,
+        term_base_offset: u64,
+        term_payload_len: u32,
+        total_count: usize,
+    ) -> Option<Self> {
+        Self::open_checked(segment, term_base_offset, term_payload_len, total_count).ok()
     }
 
     /// Lot C `C1b` sous-pas 2: build a cursor from an ALREADY-COMPUTED
@@ -3351,6 +3520,122 @@ mod tests {
         );
         assert_eq!(
             malformed.advance_to_with_status(0),
+            DiskPostingsAdvance::Error
+        );
+    }
+
+    fn dictionnaire_checked_un_terme(disk_enabled: bool) -> TermDictionary {
+        let mut builder = PostingsBuilder::new();
+        builder
+            .add("body", "present", 7, vec![0, 1])
+            .expect("le posting de reference doit etre construit");
+        builder.build_with_disk_flag(disk_enabled)
+    }
+
+    #[test]
+    fn checked_postings_distingue_absence_et_erreurs_de_lecture() {
+        let dictionary = dictionnaire_checked_un_terme(false);
+        assert_eq!(
+            dictionary.decode_from_segment_checked("body", "absent"),
+            Ok(None),
+            "un terme absent doit rester distinct d'une erreur de lecture"
+        );
+        assert!(matches!(
+            dictionary.disk_cursor_checked("body", "absent"),
+            Ok(None)
+        ));
+
+        let mut missing_coverage = dictionnaire_checked_un_terme(false);
+        missing_coverage.postings_segment = None;
+        assert_eq!(
+            missing_coverage.decode_from_segment_checked("body", "present"),
+            Err(PostingsReadError::MissingCoverage)
+        );
+
+        let mut sentinel = dictionnaire_checked_un_terme(false);
+        sentinel
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .segment_descriptors[0] = (0, 0);
+        assert_eq!(
+            sentinel.decode_from_segment_checked("body", "present"),
+            Err(PostingsReadError::MissingCoverage)
+        );
+        assert!(matches!(
+            sentinel.disk_cursor_checked("body", "present"),
+            Err(PostingsReadError::MissingCoverage)
+        ));
+
+        let mut unreadable_entry = dictionnaire_checked_un_terme(true);
+        unreadable_entry
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .term_entries_directory = Some((0, 0));
+        assert_eq!(
+            unreadable_entry.decode_from_segment_checked("body", "present"),
+            Err(PostingsReadError::Corrupt),
+            "un TermEntry resolu mais incoherent ne doit pas devenir absent"
+        );
+
+        let mut io_failure = dictionnaire_checked_un_terme(false);
+        io_failure
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .segment_descriptors[0]
+            .0 = u64::MAX;
+        assert_eq!(
+            io_failure.decode_from_segment_checked("body", "present"),
+            Err(PostingsReadError::Io)
+        );
+
+        let mut corrupt_payload = dictionnaire_checked_un_terme(false);
+        corrupt_payload
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .segment_descriptors[0]
+            .1 = 1;
+        assert_eq!(
+            corrupt_payload.decode_from_segment_checked("body", "present"),
+            Err(PostingsReadError::Corrupt)
+        );
+        assert!(matches!(
+            corrupt_payload.disk_cursor_checked("body", "present"),
+            Err(PostingsReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn checked_cursor_abandonne_un_payload_corrompu_apres_un_prefixe_valide() {
+        let mut builder = PostingsBuilder::new();
+        for doc_id in 0..=(BLOCK_SIZE as u32) {
+            builder
+                .add("body", "large", doc_id, vec![0])
+                .expect("les postings de test doivent etre construits");
+        }
+        let dictionary = builder.build_with_disk_flag(true);
+        let mut cursor = dictionary
+            .disk_cursor_checked("body", "large")
+            .expect("ouverture checked")
+            .expect("terme present");
+        assert!(
+            cursor.directory.len() > 1,
+            "la corruption doit etre tardive"
+        );
+        assert!(matches!(
+            cursor.advance_to_with_status(0),
+            DiskPostingsAdvance::Found(0)
+        ));
+
+        // Le premier bloc reste lisible ; seul le dernier est tronqué pour
+        // vérifier que l'erreur tardive ne devient pas un épuisement normal.
+        let late_target = cursor.directory[0].max_doc_id + 1;
+        cursor.term_payload_len = cursor.directory[1].byte_offset_in_term_payload + 1;
+        assert_eq!(
+            cursor.advance_to_with_status(late_target),
             DiskPostingsAdvance::Error
         );
     }
