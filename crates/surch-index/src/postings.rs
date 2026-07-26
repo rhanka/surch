@@ -25,7 +25,7 @@ pub enum PostingsReadError {
 
 /// Résultat de lecture qui distingue l'absence normale d'un terme d'une
 /// couverture disque illisible ou incomplète.
-pub type CheckedPostings<T> = Result<Option<T>, PostingsReadError>;
+pub type CheckedPostings<T> = core::result::Result<Option<T>, PostingsReadError>;
 
 /// Lot C `C1a-batché` (`docs/paper/c1b-disk-backed-design-2026-07-02.md`)
 /// SHADOW disk-backed FoR postings segment. Mirrors `DocumentIndex`'s
@@ -185,6 +185,12 @@ mod postings_segment {
         /// Lit `length` octets à `offset` via `pread` et conserve l'erreur
         /// d'I/O pour les nouveaux lecteurs vérifiés.
         pub(crate) fn read_checked(&self, offset: u64, length: u32) -> std::io::Result<Vec<u8>> {
+            let end = offset
+                .checked_add(u64::from(length))
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            if end > self.next_offset {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
             let mut buf = vec![0u8; length as usize];
             self.file.read_exact_at(&mut buf, offset)?;
             Ok(buf)
@@ -1908,6 +1914,26 @@ struct TermEntry {
     block_dir_count: u32,
 }
 
+impl TermEntry {
+    /// Vérifie les invariants portés par l'entrée elle-même, avant toute
+    /// allocation ou interprétation du payload qu'elle désigne.
+    fn validate(&self) -> core::result::Result<(), PostingsReadError> {
+        if self.postings_len == 0 {
+            return if self.postings_offset == 0 {
+                Err(PostingsReadError::MissingCoverage)
+            } else {
+                Err(PostingsReadError::Corrupt)
+            };
+        }
+        if self.postings_count == 0
+            || u64::from(self.postings_count).saturating_mul(2) > u64::from(self.postings_len)
+        {
+            return Err(PostingsReadError::Corrupt);
+        }
+        Ok(())
+    }
+}
+
 /// Plan segments S5b: on-disk encoded length of one [`TermEntry`] — 28
 /// bytes packed with NO padding (`u64 + u32 + u32 + u64 + u32`), only
 /// ever read back through [`decode_term_entry`], never transmuted.
@@ -1975,6 +2001,24 @@ fn decode_block_dir_entries(bytes: &[u8], count: usize) -> Option<Vec<BlockDirEn
     Some(entries)
 }
 
+/// Décode un payload complet et impose sa forme canonique. Le codec accepte
+/// normalement un suffixe après le nombre annoncé de postings ; le
+/// ré-encodage exact interdit donc qu'un compteur corrompu masque des octets
+/// ou des blocs résiduels.
+fn decode_postings_payload_checked(
+    bytes: &[u8],
+    postings_count: usize,
+) -> core::result::Result<(Vec<u32>, Vec<u32>), PostingsReadError> {
+    let (doc_ids, freqs) =
+        decode_postings_blocked(bytes, postings_count).map_err(|_| PostingsReadError::Corrupt)?;
+    let canonical =
+        encode_postings_blocked(&doc_ids, &freqs).map_err(|_| PostingsReadError::Corrupt)?;
+    if canonical != bytes {
+        return Err(PostingsReadError::Corrupt);
+    }
+    Ok((doc_ids, freqs))
+}
+
 impl FieldPostings {
     /// Resolve `term` through the FST, then the term's `[start, end)` range
     /// in the CSR `offsets` table. Shared by every `lookup*` method below.
@@ -1994,35 +2038,14 @@ impl FieldPostings {
         ))
     }
 
-    /// Lot C `C1a-batché` SHADOW: this term's `(offset, len)` descriptor
-    /// into the shared segment, plus its posting count (`df`, needed by
-    /// [`decode_postings_blocked`] to know where the last block ends).
-    /// `segment` is only consulted when [`Self::term_entries_directory`]
-    /// is `Some(_)` (plan segments S5b, spilled per-term directory) —
-    /// pass `None` when no segment is available, which then makes this
-    /// method return `None` for such a term, matching every other
-    /// best-effort I/O failure in this file.
-    fn segment_slice(
-        &self,
-        term: &str,
-        segment: Option<&PostingsSegment>,
-    ) -> Option<((u64, u32), usize)> {
-        let idx = self.fst.get(term.as_bytes())? as usize;
-        let entry = self.term_entry(idx, segment)?;
-        Some((
-            (entry.postings_offset, entry.postings_len),
-            entry.postings_count as usize,
-        ))
-    }
-
     /// Plan segments S5b: resolve term idx `idx`'s whole [`TermEntry`],
     /// either assembled from the resident arrays (postings-disk flag was
     /// off at build time, or persisting the directory failed — see
     /// [`Self::term_entries_directory`]'s doc comment) or via ONE `pread`
     /// into the spilled per-term table (flag on). The single accessor
-    /// every consumer goes through: [`Self::segment_slice`] (thus
-    /// [`TermDictionary::decode_from_segment`]),
-    /// [`TermDictionary::disk_cursor`], and [`merge_term_dictionaries`]
+    /// every consumer goes through:
+    /// [`TermDictionary::decode_from_segment`], [`TermDictionary::disk_cursor`],
+    /// and [`merge_term_dictionaries`]
     /// (which needs a SOURCE dictionary's own metadata while merging, not
     /// just the merged dictionary's).
     fn term_entry(&self, idx: usize, segment: Option<&PostingsSegment>) -> Option<TermEntry> {
@@ -2070,7 +2093,7 @@ impl FieldPostings {
         &self,
         idx: usize,
         segment: Option<&PostingsSegment>,
-    ) -> Result<TermEntry, PostingsReadError> {
+    ) -> core::result::Result<TermEntry, PostingsReadError> {
         match self.term_entries_directory {
             Some((entries_base, term_count)) => {
                 if idx as u64 >= u64::from(term_count) {
@@ -2159,7 +2182,7 @@ impl FieldPostings {
         &self,
         entry: TermEntry,
         segment: Option<&PostingsSegment>,
-    ) -> Result<Option<Vec<BlockDirEntry>>, PostingsReadError> {
+    ) -> core::result::Result<Option<Vec<BlockDirEntry>>, PostingsReadError> {
         if entry.block_dir_count == 0 {
             return Ok(None);
         }
@@ -2218,6 +2241,58 @@ impl FieldPostings {
             block_metas: self.block_metas_flat.get(block_start..block_end)?,
             roaring: self.lookup_roaring(idx as u32),
         })
+    }
+
+    /// Variante vérifiée de [`Self::lookup_with_block_metas`]. Après une
+    /// résolution FST réussie, une table RAM incohérente ne doit jamais se
+    /// déguiser en terme absent.
+    fn lookup_with_block_metas_checked(&self, term: &str) -> CheckedPostings<PostingsList<'_>> {
+        let Some(raw_idx) = self.fst.get(term.as_bytes()) else {
+            return Ok(None);
+        };
+        let idx = usize::try_from(raw_idx).map_err(|_| PostingsReadError::Corrupt)?;
+        let start = usize::try_from(*self.offsets.get(idx).ok_or(PostingsReadError::Corrupt)?)
+            .map_err(|_| PostingsReadError::Corrupt)?;
+        let end = usize::try_from(
+            *self
+                .offsets
+                .get(idx + 1)
+                .ok_or(PostingsReadError::Corrupt)?,
+        )
+        .map_err(|_| PostingsReadError::Corrupt)?;
+        let block_start = usize::try_from(
+            *self
+                .block_offsets
+                .get(idx)
+                .ok_or(PostingsReadError::Corrupt)?,
+        )
+        .map_err(|_| PostingsReadError::Corrupt)?;
+        let block_end = usize::try_from(
+            *self
+                .block_offsets
+                .get(idx + 1)
+                .ok_or(PostingsReadError::Corrupt)?,
+        )
+        .map_err(|_| PostingsReadError::Corrupt)?;
+        let doc_ids = self
+            .doc_ids_flat
+            .get(start..end)
+            .ok_or(PostingsReadError::Corrupt)?;
+        let freqs = self
+            .freqs_flat
+            .get(start..end)
+            .ok_or(PostingsReadError::Corrupt)?;
+        let block_metas = self
+            .block_metas_flat
+            .get(block_start..block_end)
+            .ok_or(PostingsReadError::Corrupt)?;
+        let roaring_idx = u32::try_from(idx).map_err(|_| PostingsReadError::Corrupt)?;
+        Ok(Some(PostingsList {
+            doc_ids,
+            freqs,
+            block_metas,
+            roaring: self.lookup_roaring(roaring_idx),
+        }))
     }
 
     fn sorted_terms(&self) -> Vec<String> {
@@ -2378,6 +2453,20 @@ impl TermDictionary {
             .and_then(|field_postings| field_postings.lookup_with_block_metas(term))
     }
 
+    /// Variante vérifiée de [`Self::postings_with_block_metas`]. Elle garde
+    /// `Ok(None)` pour un champ ou terme absent et signale une table RAM
+    /// incohérente après résolution du terme.
+    pub fn postings_with_block_metas_checked(
+        &self,
+        field: &str,
+        term: &str,
+    ) -> CheckedPostings<PostingsList<'_>> {
+        let Some(field_postings) = self.fields.get(field) else {
+            return Ok(None);
+        };
+        field_postings.lookup_with_block_metas_checked(term)
+    }
+
     /// Pre-computed per-block stats for the given `(field, term)` pair,
     /// aligned with `postings(field, term)`'s `Vec::chunks(BLOCK_SIZE)`.
     /// Returns `None` if the field or the term is unknown. The slice is
@@ -2404,10 +2493,8 @@ impl TermDictionary {
     /// `Ok(None)` au champ ou terme réellement absent et expose toute
     /// couverture résolue mais illisible comme [`PostingsReadError`].
     ///
-    /// NOT on any production read path — `lookup*`/[`PostingsList`]/
-    /// scoring/the leapfrog all stay on the RAM buffers. This method
-    /// exists for the shadow round-trip test and for a future cold path
-    /// (C1b) to build on.
+    /// Les consommateurs checked passent par cet adaptateur, tandis que les
+    /// appels historiques conservent le wrapper lossy ci-dessous.
     ///
     pub fn decode_from_segment_checked(
         &self,
@@ -2422,16 +2509,12 @@ impl TermDictionary {
         };
         let segment = self.postings_segment.as_deref();
         let entry = field_postings.term_entry_checked(idx as usize, segment)?;
-        if entry.postings_len == 0 {
-            return Err(PostingsReadError::MissingCoverage);
-        }
+        entry.validate()?;
         let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
         let bytes = segment
             .read_checked(entry.postings_offset, entry.postings_len)
             .map_err(|_| PostingsReadError::Io)?;
-        decode_postings_blocked(&bytes, entry.postings_count as usize)
-            .map(Some)
-            .map_err(|_| PostingsReadError::Corrupt)
+        decode_postings_payload_checked(&bytes, entry.postings_count as usize).map(Some)
     }
 
     pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
@@ -2482,30 +2565,29 @@ impl TermDictionary {
         };
         let segment = self.postings_segment.as_deref();
         let entry = field_postings.term_entry_checked(idx as usize, segment)?;
-        if entry.postings_len == 0 {
-            return Err(PostingsReadError::MissingCoverage);
-        }
+        entry.validate()?;
         let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
 
-        // Un répertoire persistant corrompu ou illisible ne rend pas le
-        // terme absent : on le reconstruit depuis le payload, qui reste la
-        // source de repli vérifiée.
-        match field_postings.block_directory_entries_checked(entry, Some(segment)) {
-            Ok(Some(directory)) => Ok(Some(DiskPostingsCursor::open_with_directory(
-                segment,
-                entry.postings_offset,
-                entry.postings_len,
-                directory,
-                entry.postings_count as usize,
-            ))),
-            Ok(None) | Err(_) => DiskPostingsCursor::open_checked(
-                segment,
-                entry.postings_offset,
-                entry.postings_len,
-                entry.postings_count as usize,
-            )
-            .map(Some),
+        // Le payload reconstruit est la référence vérifiée : un répertoire
+        // persistant n'est utilisé que s'il lui est exactement identique.
+        // Sinon le curseur conserve le répertoire reconstruit, sans publier
+        // un préfixe ni transformer la corruption du répertoire en absence.
+        let mut cursor = DiskPostingsCursor::open_checked(
+            segment,
+            entry.postings_offset,
+            entry.postings_len,
+            entry.postings_count as usize,
+        )?;
+        if usize::try_from(entry.block_dir_count).ok() == Some(cursor.directory.len()) {
+            if let Ok(Some(directory)) =
+                field_postings.block_directory_entries_checked(entry, Some(segment))
+            {
+                if directory == cursor.directory {
+                    cursor.directory = directory;
+                }
+            }
         }
+        Ok(Some(cursor))
     }
 
     pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
@@ -2700,6 +2782,29 @@ impl TermDictionary {
             .get(field)
             .map(|field_postings| field_postings.collect_prefix_doc_ids(prefix.as_bytes()))
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_remove_postings_segment(&mut self) {
+        self.postings_segment = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_corrupt_ram_term_metadata(&mut self, field: &str, term: &str) -> bool {
+        let Some(field_postings) = self.fields.get_mut(field) else {
+            return false;
+        };
+        let Some(raw_idx) = field_postings.fst.get(term.as_bytes()) else {
+            return false;
+        };
+        let Ok(idx) = usize::try_from(raw_idx) else {
+            return false;
+        };
+        let Some(end) = field_postings.offsets.get_mut(idx + 1) else {
+            return false;
+        };
+        *end = u32::MAX;
+        true
     }
 }
 
@@ -3023,10 +3128,8 @@ impl<'seg> DiskPostingsCursor<'seg> {
     /// individually, on demand, by [`Self::advance_to`].
     ///
     /// `term_base_offset`/`term_payload_len` are the term's
-    /// `FieldPostings::segment_descriptors` entry; `total_count` is the
-    /// term's `df` (`offsets[i + 1] - offsets[i]`) — exactly the
-    /// arguments [`TermDictionary::disk_cursor`] passes through from
-    /// [`FieldPostings::segment_slice`].
+    /// `FieldPostings::segment_descriptors` entry; `total_count` est le
+    /// `df` porté par l'entrée de terme unifiée.
     ///
     /// Returns `None` if the initial `pread` or the directory computation
     /// fails (a malformed payload — should never happen for a term the
@@ -3044,12 +3147,15 @@ impl<'seg> DiskPostingsCursor<'seg> {
         term_base_offset: u64,
         term_payload_len: u32,
         total_count: usize,
-    ) -> Result<Self, PostingsReadError> {
+    ) -> core::result::Result<Self, PostingsReadError> {
         let payload = segment
             .read_checked(term_base_offset, term_payload_len)
             .map_err(|_| PostingsReadError::Io)?;
+        let (doc_ids, freqs) = decode_postings_payload_checked(&payload, total_count)?;
+        let canonical =
+            encode_postings_blocked(&doc_ids, &freqs).map_err(|_| PostingsReadError::Corrupt)?;
         let directory =
-            block_directory(&payload, total_count).map_err(|_| PostingsReadError::Corrupt)?;
+            block_directory(&canonical, total_count).map_err(|_| PostingsReadError::Corrupt)?;
         Ok(Self {
             segment,
             term_base_offset,
@@ -3606,6 +3712,96 @@ mod tests {
             corrupt_payload.disk_cursor_checked("body", "present"),
             Err(PostingsReadError::Corrupt)
         ));
+
+        let mut sentinelle_invalide = dictionnaire_checked_un_terme(false);
+        sentinelle_invalide
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .segment_descriptors[0] = (1, 0);
+        assert_eq!(
+            sentinelle_invalide.decode_from_segment_checked("body", "present"),
+            Err(PostingsReadError::Corrupt),
+            "seul le couple exact (0, 0) désigne une couverture absente"
+        );
+    }
+
+    #[test]
+    fn checked_postings_rejette_un_compteur_qui_cache_un_suffixe() {
+        let mut builder = PostingsBuilder::new();
+        for doc_id in 0..=BLOCK_SIZE as u32 {
+            builder
+                .add("body", "large", doc_id, vec![0])
+                .expect("les postings de test doivent etre construits");
+        }
+        let mut dictionary = builder.build_with_disk_flag(false);
+        dictionary
+            .fields
+            .get_mut("body")
+            .expect("field present")
+            .offsets[1] = BLOCK_SIZE as u32;
+
+        assert_eq!(
+            dictionary.decode_from_segment_checked("body", "large"),
+            Err(PostingsReadError::Corrupt),
+            "un compteur réduit ne doit pas rendre un préfixe apparemment complet"
+        );
+        assert!(matches!(
+            dictionary.disk_cursor_checked("body", "large"),
+            Err(PostingsReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn checked_cursor_reconstruit_un_repertoire_persistant_invalide() {
+        let mut builder = PostingsBuilder::new();
+        for doc_id in 0..=BLOCK_SIZE as u32 {
+            builder
+                .add("body", "large", doc_id, vec![0])
+                .expect("les postings de test doivent etre construits");
+        }
+        let mut dictionary = builder.build_with_disk_flag(true);
+        let segment = dictionary
+            .postings_segment
+            .as_deref()
+            .expect("le segment disque doit exister");
+        let field = dictionary.fields.get("body").expect("field present");
+        let idx = field.fst.get(b"large").expect("term present") as usize;
+        let entry = field
+            .term_entry(idx, Some(segment))
+            .expect("entry persisted present");
+
+        // Simule une table résidente de repli dont le répertoire a été
+        // corrompu après écriture, sans toucher au payload autoritatif.
+        let field = dictionary.fields.get_mut("body").expect("field present");
+        field.term_entries_directory = None;
+        field.segment_descriptors = vec![(entry.postings_offset, entry.postings_len)].into();
+        field.offsets = vec![0, entry.postings_count].into();
+        field.block_directory = vec![BlockDirEntry {
+            byte_offset_in_term_payload: 0,
+            count: BLOCK_SIZE as u16,
+            max_doc_id: 0,
+        }]
+        .into();
+        field.block_dir_offsets = vec![0, 1].into();
+
+        let mut cursor = dictionary
+            .disk_cursor_checked("body", "large")
+            .expect("le payload sain doit reconstruire le répertoire")
+            .expect("term present");
+        let mut found = Vec::new();
+        let mut target = 0;
+        loop {
+            match cursor.advance_to_with_status(target) {
+                DiskPostingsAdvance::Found(doc_id) => {
+                    found.push(doc_id);
+                    target = doc_id + 1;
+                }
+                DiskPostingsAdvance::Exhausted => break,
+                DiskPostingsAdvance::Error => panic!("le repli payload ne doit pas échouer"),
+            }
+        }
+        assert_eq!(found, (0..=BLOCK_SIZE as u32).collect::<Vec<_>>());
     }
 
     #[test]

@@ -2196,7 +2196,10 @@ impl DocumentIndex {
                     doc_ids.extend(ids);
                     freqs.extend(fr);
                 }
-            } else if let Some(list) = segment.terms.postings_with_block_metas(field, term) {
+            } else if let Some(list) = segment
+                .terms
+                .postings_with_block_metas_checked(field, term)?
+            {
                 any = true;
                 doc_ids.extend_from_slice(list.doc_ids());
                 freqs.extend_from_slice(list.freqs());
@@ -3676,10 +3679,14 @@ mod tests {
     /// by `materialize_terms_and_finalize_postings` (the `_refresh` call
     /// site), plus the fresh empty active segment = 3 segments.
     fn multi_segment_index() -> (DocumentIndex, IndexMapping) {
+        multi_segment_index_with_disk(false)
+    }
+
+    fn multi_segment_index_with_disk(disk_enabled: bool) -> (DocumentIndex, IndexMapping) {
         let mapping = nom_multi_field_mapping();
         let mut index = DocumentIndex::new();
         index.set_flush_budget_bytes_override(Some(1));
-        index.set_postings_disk_enabled(false);
+        index.set_postings_disk_enabled(disk_enabled);
         // Plan segments S3: merge pinned OFF so the exact 3-segment layout
         // asserted below stays deterministic under any ambient
         // `SURCH_MERGE_FANIN` (same rationale as the two pins above).
@@ -3747,6 +3754,37 @@ mod tests {
             .decode_from_segment("NOM", "bernard")
             .expect("NOM=bernard lives in the second sealed segment");
         assert_eq!(doc_ids, vec![2]);
+    }
+
+    #[test]
+    fn checked_multi_segment_propage_un_segment_disque_illisible() {
+        let (mut index, _mapping) = multi_segment_index_with_disk(true);
+        Arc::make_mut(&mut index.segments[1])
+            .terms
+            .test_remove_postings_segment();
+
+        assert_eq!(
+            index.decode_from_segment_checked("BODY", "commun"),
+            Err(crate::postings::PostingsReadError::MissingCoverage),
+            "un segment illisible ne doit pas publier les segments lus avant lui"
+        );
+    }
+
+    #[test]
+    fn checked_multi_segment_propage_une_table_ram_incoherente() {
+        let (mut index, _mapping) = multi_segment_index();
+        assert!(
+            Arc::make_mut(&mut index.segments[1])
+                .terms
+                .test_corrupt_ram_term_metadata("BODY", "commun"),
+            "la fixture doit contenir le terme RAM à corrompre"
+        );
+
+        assert_eq!(
+            index.decode_from_segment_checked("BODY", "commun"),
+            Err(crate::postings::PostingsReadError::Corrupt),
+            "une table RAM incohérente ne doit pas devenir une absence"
+        );
     }
 
     #[test]
