@@ -10,8 +10,8 @@ export LC_ALL=C
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FAIR_AB="${FAIR_AB:-$ROOT_DIR/deploy/bench-local/fair-ab.sh}"
-PAIR_REPORT="${PAIR_REPORT:-$ROOT_DIR/deploy/bench-local/p2-report.py}"
-GATE_REPORT="${GATE_REPORT:-$ROOT_DIR/deploy/bench-local/p2-gate.py}"
+PAIR_REPORT="${PAIR_REPORT:-$ROOT_DIR/deploy/bench-local/p2-report.sh}"
+GATE_REPORT="${GATE_REPORT:-$ROOT_DIR/deploy/bench-local/p2-gate.sh}"
 P2_A_SHA="${P2_A_SHA:-961ade10ffb74d78156aee8148f1e5c6bbbe6ba2}"
 P2_B_SHA="${P2_B_SHA:-6ce390e55da3593242ec11e2b09d4dee1057726d}"
 P2_MODE="${P2_MODE:-full}"             # full ou smoke
@@ -30,12 +30,12 @@ log(){ printf '\033[1;35m[p2-campaign]\033[0m %s\n' "$*"; }
 err(){ printf '\033[1;31m[p2-campaign]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
-for command in docker git jq python3 findmnt sha256sum sync; do
+for command in docker git jq findmnt sha256sum sync; do
   command -v "$command" >/dev/null 2>&1 || die "commande requise absente: $command"
 done
 [ -x "$FAIR_AB" ] || die "fair-ab.sh introuvable/exécutable: $FAIR_AB"
-[ -f "$PAIR_REPORT" ] || die "rapport de paire introuvable: $PAIR_REPORT"
-[ -f "$GATE_REPORT" ] || die "rapport de gates introuvable: $GATE_REPORT"
+[ -x "$PAIR_REPORT" ] || die "rapport de paire introuvable/exécutable: $PAIR_REPORT"
+[ -x "$GATE_REPORT" ] || die "rapport de gates introuvable/exécutable: $GATE_REPORT"
 [ -s "$BULK_FILE" ] || die "BULK_FILE obligatoire et non vide"
 [ -s "$MAPPING_FILE" ] || die "MAPPING_FILE obligatoire et non vide"
 case "$P2_MODE" in full|smoke) ;; *) die "P2_MODE doit valoir full ou smoke";; esac
@@ -184,7 +184,7 @@ compare_parity(){
     > "$report/parity.json"
   [ "$(jq -r .a_manifest_sha256 "$report/parity.json")" = "$(jq -r .b_manifest_sha256 "$report/parity.json")" ] \
     || die "manifestes différents pour $pair"
-  python3 "$PAIR_REPORT" --a "$P2_CAMPAIGN_DIR/runs/$a_name" --b "$P2_CAMPAIGN_DIR/runs/$b_name" --out "$report" \
+  "$PAIR_REPORT" --a "$P2_CAMPAIGN_DIR/runs/$a_name" --b "$P2_CAMPAIGN_DIR/runs/$b_name" --out "$report" \
     || die "rapport statistique invalide pour $pair"
 }
 
@@ -234,7 +234,7 @@ for scheduled in "${SCHEDULE[@]}"; do
 done
 
 if [ "$P2_MODE" = "full" ]; then
-  python3 "$GATE_REPORT" --campaign "$P2_CAMPAIGN_DIR" || die "gates P2 non satisfaites (voir $P2_CAMPAIGN_DIR/README.md)"
+  "$GATE_REPORT" --campaign "$P2_CAMPAIGN_DIR" || die "gates P2 non satisfaites (voir $P2_CAMPAIGN_DIR/README.md)"
 else
   printf 'SMOKE P2 valide : routage, réponses, métriques et corps vérifiés ; aucune conclusion de latence.\n' \
     > "$P2_CAMPAIGN_DIR/README.md"
