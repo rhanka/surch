@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
-    merge_term_dictionaries, postings_disk_enabled, BlockMeta, DiskPostingsCursor, PostingsBuilder,
-    PostingsEnum, PostingsError, PostingsList, TermDictionary, TermsEnum,
+    merge_term_dictionaries, postings_disk_enabled, BlockMeta, CheckedPostings, DiskPostingsCursor,
+    PostingsBuilder, PostingsEnum, PostingsError, PostingsList, TermDictionary, TermsEnum,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
@@ -2115,6 +2115,16 @@ impl DocumentIndex {
         self.segment().terms.disk_cursor(field, term)
     }
 
+    /// Variante vérifiée du curseur mono-segment. Les appelants historiques
+    /// conservent [`Self::disk_cursor`] et son `Option` volontairement lossy.
+    pub fn disk_cursor_checked(
+        &self,
+        field: &str,
+        term: &str,
+    ) -> CheckedPostings<DiskPostingsCursor<'_>> {
+        self.segment().terms.disk_cursor_checked(field, term)
+    }
+
     /// Lot C `C1b` sous-pas 2: decode `(field, term)`'s FULL postings
     /// from the disk segment into owned `Vec`s — the production read
     /// path for the OR-match scoring arena (`SearchScoringContext`,
@@ -2160,6 +2170,39 @@ impl DocumentIndex {
             }
         }
         any.then_some((doc_ids, freqs))
+    }
+
+    /// Variante vérifiée de la fusion des postings. Un terme absent d'un
+    /// segment n'ajoute rien ; une lecture disque impossible invalide toute
+    /// la fusion, afin qu'un futur chemin rapide ne publie jamais un préfixe.
+    pub fn decode_from_segment_checked(
+        &self,
+        field: &str,
+        term: &str,
+    ) -> CheckedPostings<(Vec<u32>, Vec<u32>)> {
+        if self.segments.len() == 1 {
+            return self
+                .segment()
+                .terms
+                .decode_from_segment_checked(field, term);
+        }
+        let mut doc_ids = Vec::new();
+        let mut freqs = Vec::new();
+        let mut any = false;
+        for segment in &self.segments {
+            if segment.terms.disk_backed() {
+                if let Some((ids, fr)) = segment.terms.decode_from_segment_checked(field, term)? {
+                    any = true;
+                    doc_ids.extend(ids);
+                    freqs.extend(fr);
+                }
+            } else if let Some(list) = segment.terms.postings_with_block_metas(field, term) {
+                any = true;
+                doc_ids.extend_from_slice(list.doc_ids());
+                freqs.extend_from_slice(list.freqs());
+            }
+        }
+        Ok(any.then_some((doc_ids, freqs)))
     }
 
     /// Lot C `C1b` sous-pas 2: per-index override for the disk-backed
