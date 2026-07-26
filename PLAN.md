@@ -65,8 +65,9 @@ single-threaded status loops advanced too little per user turn.
 
 ## Track A - Perf / Optimisation
 
-Reste estime: ~3% (Lots 1, 1.5, 1.6, 1.7, 2 closed; Lots 3 / 4
-open in `plan/wp-a-perf-followups.md`). **Surch now ingests the
+Statut de plan à réactualiser : P2 est livré localement mais ses gates
+externes restent ouvertes ; aucun pourcentage de reste n'est publié avant
+l'actualisation des plans de détail. **Surch now ingests the
 full 171 k TREC-COVID corpus `1.54x` FASTER than OpenSearch**
 (`56 s` vs `87 s`), reversing the `13.9x` OpenSearch advantage
 pre-Lot-1 (`~17.8x` Surch bulk speedup), and **Lot 2 skip lists
@@ -179,6 +180,10 @@ historical replay line lives in
 - [ ] P1a — `bool.must` direct single-pass exact : route stricte de deux
   `match` vers le scoring fusionné `must`, sans élargir le chemin `should`.
   Plan et gates externes : `plan/p1a-bool-must-direct.md`.
+- [ ] P2 — parcours checked des postings disque et multi-segments, avec
+  repli intégral sur erreur, `df` global et compteurs de blocs. Développement
+  livré localement ; gates externes ouvertes dans
+  `plan/p2-segmented-postings.md`.
 
 ## Track B - Test Automation / Perf Reporting
 

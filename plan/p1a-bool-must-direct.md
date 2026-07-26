@@ -22,8 +22,9 @@ Track A — perf / optimisation.
 - [x] Router uniquement la racine `bool.must` exacte à deux `match`, sans
   `should`, `filter`, `must_not` ni boost.
 - [x] Exécuter P1a sur le chemin RAM mono-segment avec un score `must` qui
-  conserve chaque contribution BM25, y compris `1.0`; décliner vers le
-  générique sur disque ou multi-segment tant que leur lecture reste ambiguë.
+  conserve chaque contribution BM25, y compris `1.0`. Le refus initial du
+  disque et du multi-segment a été remplacé par P2 livré localement, dont le
+  détail et les gates sont suivis dans `plan/p2-segmented-postings.md`.
 - [x] Distinguer la fin normale des postings d'une erreur `pread` ou de
   décodage dans le seul scorer `must`, qui décline alors vers le générique.
 - [x] Conserver `reduce_deces_conjunction_into`, le chemin `should`, la
@@ -35,8 +36,13 @@ Track A — perf / optimisation.
 ## Hors scope
 
 - Mono-`match` single-pass P1b.
-- Curseur multi-segment, format disque, `should` et P2.
 - Harnais P0, stockage `_source` et artefacts de mesure.
+
+## Articulation avec P2
+
+- [x] P2 couvre le curseur multi-segment, le format disque et le chemin
+  `should` en plus de `must`; il est livré localement sur `main` et suivi dans
+  `plan/p2-segmented-postings.md`.
 
 ## Lots et gates
 
@@ -46,9 +52,9 @@ Track A — perf / optimisation.
   vérifie la référence sur RAM, disque, mono-segment et multi-segment.
 - [x] Correction de revue — l'erreur tardive du curseur disque décline le
   chemin P1a au lieu de finaliser un préfixe scoré.
-- [x] Correction 2 de revue — Option A : P1a décline avant tout accès disque
-  ou multi-segment ambigu ; les matrices disque et multi-segment vérifient la
-  parité générique et l'absence d'incrément du compteur rapide.
+- [x] Correction 2 de revue — Option A historique : P1a déclinait avant tout
+  accès disque ou multi-segment ambigu ; P2 remplace désormais ce refus avec
+  une lecture checked par segment, suivie dans `plan/p2-segmented-postings.md`.
 - [x] Lot 3 — `cargo fmt`, `cargo fmt --check` et `git diff --check`.
 - [ ] Gate externe — tests Rust ciblés, clippy et CI : interdits dans cette
   mission, à rejouer par le conducteur.
@@ -66,6 +72,7 @@ Track A — perf / optimisation.
   clippy et les gates externes restent volontairement non exécutés.
 - Preuves attendues : B1, CI et rapport de latence promu avec le compteur
   `surch_bool_direct_must_fused_total`.
-- Statut de merge : P1a et le lot S jusqu'à `03c11fd` sont sur `origin/main`;
-  la correction locale `[lecture S]` n'est pas poussée. Aucune preuve externe ne
-  doit être inférée des vérifications locales.
+- Statut de merge : P1a et le lot S jusqu'à `03c11fd` sont sur `origin/main`.
+  P2 est livré localement sur `main` et détaillé dans
+  `plan/p2-segmented-postings.md`; ses gates externes restent ouvertes.
+  Aucune preuve externe ne doit être inférée des vérifications locales.

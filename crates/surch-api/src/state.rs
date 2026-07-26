@@ -12,12 +12,10 @@ use fst::{Map, MapBuilder, Streamer};
 use rayon::prelude::*;
 use serde_json::Value;
 use surch_index::{
-    document_index::DocumentIndex,
+    document_index::{DocumentIndex, SegmentPostingsAdvance, SegmentPostingsCursor},
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
-    postings::{
-        BlockMeta, DiskPostingsAdvance, DiskPostingsCursor, PostingsBlockSkipIter, PostingsList,
-    },
+    postings::{BlockMeta, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
 };
 use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor};
@@ -982,6 +980,33 @@ fn fused_bm25_contribution(score: Option<f64>, mode: FusedConjunctionScoreMode) 
     match mode {
         FusedConjunctionScoreMode::Should => score.filter(|score| *score != 1.0).unwrap_or(0.0),
         FusedConjunctionScoreMode::Must => score.filter(|score| *score > 0.0).unwrap_or(1.0),
+    }
+}
+
+/// Accumule les blocs FoR observés pendant UNE tentative P2. Les compteurs
+/// sont aussi publiés sur les replis : une erreur ou un segment sans toutes
+/// les clauses ne doit pas faire disparaître le travail disque déjà effectué.
+#[derive(Default)]
+struct P2DiskBlockMetrics {
+    blocks_read: u64,
+    blocks_total: u64,
+}
+
+impl P2DiskBlockMetrics {
+    fn observe(&mut self, cursors: &[&SegmentPostingsCursor<'_>]) {
+        for cursor in cursors {
+            if let Some((read, total)) = cursor.disk_block_counts() {
+                self.blocks_read = self.blocks_read.saturating_add(read);
+                self.blocks_total = self.blocks_total.saturating_add(total);
+            }
+        }
+    }
+
+    fn publish(&self) {
+        if self.blocks_total > 0 {
+            metrics::counter!("surch_postings_disk_blocks_read_total").increment(self.blocks_read);
+            metrics::counter!("surch_postings_disk_blocks_total").increment(self.blocks_total);
+        }
     }
 }
 
@@ -3010,56 +3035,97 @@ impl InMemoryIndex {
         out
     }
 
-    /// Lot C `C1b` sous-pas 2: disk-backed counterpart of
-    /// [`Self::conjunction_hits_internal`]. Block-addressed
-    /// leapfrog-join over one [`DiskPostingsCursor`] per term — a
-    /// classic Lucene `ConjunctionScorer` leapfrog generalised to N
-    /// terms (the RAM path's driver + N-1 followers shape doesn't
-    /// directly apply here: `DiskPostingsCursor` has no plain `&[u32]`
-    /// slice to drive a `for` loop over, only `advance_to`, so cursor 0
-    /// is walked via repeated `advance_to(next_probe)` calls instead —
-    /// same "return-and-consume" discipline as the RAM followers below
-    /// it). A missing/uncovered term (no disk coverage — best-effort,
-    /// should not happen post Correction fix) makes the whole AND empty,
-    /// matching the RAM path's `_ => return Vec::new()` for an unknown
-    /// term.
+    /// Lot P2 : conjonction checked segment par segment. Les segments sont
+    /// disjoints et ordonnés par doc id, donc leurs résultats s'ajoutent sans
+    /// k-way merge. Une erreur détruit l'accumulateur temporaire et revient au
+    /// chemin générique ; l'absence réelle d'un terme ne saute que le segment.
     fn conjunction_hits_disk(index: &DocumentIndex, terms: &[(String, String)]) -> Vec<u32> {
-        // Plan segments S2: `DiskPostingsCursor` is a single-segment,
-        // block-addressed streaming cursor — merging N of them into one
-        // monotonic cursor would need a genuine multi-cursor merge
-        // (deferred; correctness over that optimisation for now, same
-        // trade-off the design's S2 read-path note sanctions elsewhere).
-        // Route the genuinely multi-segment case through the "decode
-        // owned, correct-first" fallback instead — see
-        // `Self::conjunction_hits_merged`.
-        if index.segment_count() > 1 {
-            return Self::conjunction_hits_merged(index, terms);
-        }
-        let mut cursors: Vec<DiskPostingsCursor<'_>> = Vec::with_capacity(terms.len());
+        let mut segmented_terms = Vec::with_capacity(terms.len());
+        let mut block_metrics = P2DiskBlockMetrics::default();
         for (field, term) in terms {
-            match index.disk_cursor(field, term) {
-                Some(cursor) => cursors.push(cursor),
-                None => return Vec::new(),
+            match index.segmented_postings_checked(field, term) {
+                Ok(Some(postings)) => segmented_terms.push(postings),
+                // Terme absent de tous les segments : l'AND entier est vide.
+                Ok(None) => return Vec::new(),
+                // Ne jamais publier le préfixe des segments déjà lus.
+                Err(_) => return Self::conjunction_hits_merged(index, terms),
             }
         }
-        if cursors.is_empty() {
-            return Vec::new();
+
+        let mut out = Vec::new();
+        for segment_idx in 0..index.segment_count() {
+            let mut cursors = Vec::with_capacity(segmented_terms.len());
+            let mut missing_clause = false;
+            for postings in &mut segmented_terms {
+                match postings.cursor_at_mut(segment_idx) {
+                    Some(cursor) => cursors.push(cursor),
+                    // L'absence est locale : les autres segments restent
+                    // candidats et conservent leur `df` global au scoring.
+                    None => {
+                        missing_clause = true;
+                        break;
+                    }
+                }
+            }
+            if missing_clause {
+                let metric_cursors: Vec<_> = cursors.iter().map(|cursor| &**cursor).collect();
+                block_metrics.observe(&metric_cursors);
+                continue;
+            }
+            match Self::conjunction_hits_segment(&mut cursors) {
+                Ok(segment_hits) => {
+                    let metric_cursors: Vec<_> = cursors.iter().map(|cursor| &**cursor).collect();
+                    block_metrics.observe(&metric_cursors);
+                    out.extend(segment_hits);
+                }
+                Err(()) => {
+                    let metric_cursors: Vec<_> = cursors.iter().map(|cursor| &**cursor).collect();
+                    block_metrics.observe(&metric_cursors);
+                    block_metrics.publish();
+                    return Self::conjunction_hits_merged(index, terms);
+                }
+            }
         }
+        block_metrics.publish();
+        out
+    }
+
+    /// Leapfrog d'une conjonction dans un seul segment. Le driver est le
+    /// terme localement le plus rare, tandis que l'erreur reste observable
+    /// pour laisser l'appelant abandonner tous ses temporaires.
+    fn conjunction_hits_segment(
+        cursors: &mut [&mut SegmentPostingsCursor<'_>],
+    ) -> Result<Vec<u32>, ()> {
+        if cursors.is_empty() {
+            return Ok(Vec::new());
+        }
+        cursors.sort_by_key(|cursor| cursor.local_df());
         let (driver, followers) = cursors.split_at_mut(1);
         let driver = &mut driver[0];
-
-        // Same `cur[i]` "hold the last returned doc_id, only re-advance
-        // when behind" discipline as the RAM leapfrog — `advance_to`
-        // returns-and-consumes, so re-calling it with the SAME target
-        // would skip past the very entry it just returned.
-        let mut cur: Vec<Option<u32>> = followers.iter_mut().map(|it| it.advance_to(0)).collect();
+        let mut cur = Vec::with_capacity(followers.len());
+        for follower in followers.iter_mut() {
+            cur.push(match follower.advance_to_with_status(0) {
+                SegmentPostingsAdvance::Found(doc_id) => Some(doc_id),
+                SegmentPostingsAdvance::Exhausted => None,
+                SegmentPostingsAdvance::Error => return Err(()),
+            });
+        }
         let mut out = Vec::new();
         let mut next_probe = 0u32;
-        'docs: while let Some(target) = driver.advance_to(next_probe) {
+        'docs: loop {
+            let target = match driver.advance_to_with_status(next_probe) {
+                SegmentPostingsAdvance::Found(doc_id) => doc_id,
+                SegmentPostingsAdvance::Exhausted => break,
+                SegmentPostingsAdvance::Error => return Err(()),
+            };
             next_probe = target.saturating_add(1);
             for (i, it) in followers.iter_mut().enumerate() {
                 if cur[i].is_some_and(|c| c < target) {
-                    cur[i] = it.advance_to(target);
+                    cur[i] = match it.advance_to_with_status(target) {
+                        SegmentPostingsAdvance::Found(doc_id) => Some(doc_id),
+                        SegmentPostingsAdvance::Exhausted => None,
+                        SegmentPostingsAdvance::Error => return Err(()),
+                    };
                 }
                 if cur[i] != Some(target) {
                     continue 'docs;
@@ -3067,20 +3133,12 @@ impl InMemoryIndex {
             }
             out.push(target);
         }
-        out
+        Ok(out)
     }
 
-    /// Plan segments S2: genuinely multi-segment counterpart of
-    /// [`Self::conjunction_hits_disk`] (which delegates here when
-    /// `index.segment_count() > 1`, regardless of whether any individual
-    /// segment is itself disk-backed — see
-    /// `DocumentIndex::postings_disk_backed`'s doc). Decodes each
-    /// required term ONCE via [`DocumentIndex::decode_from_segment`]
-    /// (already merges across every sealed segment), then a plain
-    /// `BTreeSet` intersection — correctness-first, matching
-    /// [`Self::materialised_conjunction`]'s fallback shape rather than
-    /// the roaring/skip-list optimisations (out of scope until segment
-    /// merging, S3, bounds the segment count again).
+    /// Référence matérialisée de repli pour [`Self::conjunction_hits_disk`].
+    /// P2 n'y arrive plus pour le multi-segment nominal : elle ne sert qu'une
+    /// fois qu'une lecture checked refuse de publier un résultat partiel.
     fn conjunction_hits_merged(index: &DocumentIndex, terms: &[(String, String)]) -> Vec<u32> {
         let mut acc: Option<BTreeSet<u32>> = None;
         for (field, term) in terms {
@@ -4658,19 +4716,9 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
 
-        // P1a Option A : le chemin direct `must` ne peut prouver la
-        // distinction absence/erreur que sur les postings RAM mono-segment.
-        // `postings_disk_backed` couvre aussi le multi-segment ; décliner ici
-        // évite `disk_cursor` et `decode_from_segment` avant tout score,
-        // finalisation ou incrément de son compteur par le routeur.
-        if matches!(mode, FusedConjunctionScoreMode::Must) && data.index.postings_disk_backed() {
-            return None;
-        }
-
-        // Lot C `C1b` sous-pas 2: disk-backed path — MUST stay
-        // block-addressed (same rationale as `InMemoryIndex::conjunction_hits_disk`:
-        // this is the deces bool/full scoring tail). See
-        // `Self::fused_conjunction_scores_disk`.
+        // P2 couvre maintenant le disque et le multi-segment avec une lecture
+        // checked : un `bool.must` direct peut donc emprunter ce chemin sans
+        // confondre l'absence locale d'un terme avec une erreur de lecture.
         if data.index.postings_disk_backed() {
             return Self::fused_conjunction_scores_disk(data, clauses, mode);
         }
@@ -4826,63 +4874,37 @@ impl AppState {
         Some(scored)
     }
 
-    /// Lot C `C1b` sous-pas 2: disk-backed counterpart of
-    /// [`Self::fused_conjunction_scores`]. Same shape as
-    /// [`InMemoryIndex::conjunction_hits_disk`] (driver walked via
-    /// repeated `advance_to(next_probe)`, followers held in `cur[i]`),
-    /// with BM25 scoring folded in via `DiskPostingsCursor::freq()` at
-    /// the position each `advance_to` just landed on — mirrors the RAM
-    /// path's `freqs[idx]` O(1) lookup at the galloping cursor's matched
-    /// index. Does NOT include the RAM path's 2-term roaring fast path
-    /// (roaring bitmaps carry no `freq`, so that path only ever helped
-    /// pure recall — sous-pas 3 territory if it proves hot here).
+    /// Lot P2 : scoring fusionné checked, segment par segment. Chaque terme
+    /// porte son `df` global pour l'IDF, même lorsqu'il est absent d'un autre
+    /// segment ; seul le choix du driver utilise le `df` local. Une erreur de
+    /// lecture abandonne les scores temporaires et décline vers la référence.
     fn fused_conjunction_scores_disk(
         data: &InMemoryIndex,
         clauses: &[(&str, &str)],
         mode: FusedConjunctionScoreMode,
     ) -> Option<Vec<(f64, u32)>> {
-        // Plan segments S2: same rationale as
-        // `InMemoryIndex::conjunction_hits_disk` — `DiskPostingsCursor`
-        // streams ONE segment; a genuine multi-cursor merge across N
-        // segments is deferred, so route to the "decode owned,
-        // correct-first" fallback instead.
-        if data.index.segment_count() > 1 {
-            return Self::fused_conjunction_scores_merged(data, clauses, mode);
-        }
-        struct DiskTermCtx<'a> {
-            field_stats: FieldScoringStats<'a>,
-            doc_freq: u64,
-            cursor: DiskPostingsCursor<'a>,
-        }
-        let mut terms: Vec<DiskTermCtx<'_>> = Vec::with_capacity(clauses.len());
+        let mut segmented_terms = Vec::with_capacity(clauses.len());
+        let mut scoring_terms = Vec::with_capacity(clauses.len());
         for &(field, value) in clauses {
             let recall = normalized_terms_for_field(value, field, &data.mapping);
             if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
                 return None;
             }
             let token = recall.into_iter().next().expect("len checked == 1");
-            let Some(cursor) = data.index.disk_cursor(field, &token) else {
-                // A required term with no postings/no disk coverage ⇒ the
-                // intersection is empty.
-                return Some(Vec::new());
+            let postings = match data.index.segmented_postings_checked(field, &token) {
+                Ok(Some(postings)) => postings,
+                // Le terme est absent de tous les segments : l'AND est vide.
+                Ok(None) => return Some(Vec::new()),
+                // La distinction checked impose un repli, jamais un préfixe.
+                Err(_) => return Self::fused_conjunction_scores_merged(data, clauses, mode),
             };
             let field_stats = data.field_scoring_stats(field)?;
-            let doc_freq = cursor.doc_freq() as u64;
-            terms.push(DiskTermCtx {
-                field_stats,
-                doc_freq,
-                cursor,
-            });
+            scoring_terms.push((field_stats, postings.global_df()));
+            segmented_terms.push(postings);
         }
 
-        // Drive the rarest term; gallop the others — same ordering
-        // rationale as the RAM path.
-        terms.sort_by_key(|t| t.doc_freq);
         let config = Bm25Config::default();
 
-        // Same `term_contrib` closure as the RAM path, just taking the
-        // already-widened `doc_freq`/`freq` values directly instead of
-        // reading them off a `TermCtx`.
         let term_contrib =
             |field_stats: &FieldScoringStats<'_>, doc_freq: u64, doc_id: u32, freq: u32| -> f64 {
                 if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
@@ -4908,77 +4930,88 @@ impl AppState {
                 fused_bm25_contribution(score, mode)
             };
 
-        let (driver, followers) = terms.split_at_mut(1);
-        let driver = &mut driver[0];
-        let mut cur = Vec::with_capacity(followers.len());
-        for term in followers.iter_mut() {
-            let current = match mode {
-                FusedConjunctionScoreMode::Should => term.cursor.advance_to(0),
-                FusedConjunctionScoreMode::Must => match term.cursor.advance_to_with_status(0) {
-                    DiskPostingsAdvance::Found(doc_id) => Some(doc_id),
-                    DiskPostingsAdvance::Exhausted => None,
-                    // P1a ne doit jamais publier le préfixe déjà scoré :
-                    // l'erreur disque décline sans effet vers le générique.
-                    DiskPostingsAdvance::Error => return None,
-                },
-            };
-            cur.push(current);
-        }
         let mut scored: Vec<(f64, u32)> = Vec::new();
-        let mut next_probe = 0u32;
-        'docs: loop {
-            let next = match mode {
-                FusedConjunctionScoreMode::Should => driver.cursor.advance_to(next_probe),
-                FusedConjunctionScoreMode::Must => {
-                    match driver.cursor.advance_to_with_status(next_probe) {
-                        DiskPostingsAdvance::Found(doc_id) => Some(doc_id),
-                        DiskPostingsAdvance::Exhausted => None,
-                        DiskPostingsAdvance::Error => return None,
+        let mut block_metrics = P2DiskBlockMetrics::default();
+        for segment_idx in 0..data.index.segment_count() {
+            let mut cursors = Vec::with_capacity(segmented_terms.len());
+            let mut missing_clause = false;
+            for (clause_idx, postings) in segmented_terms.iter_mut().enumerate() {
+                match postings.cursor_at_mut(segment_idx) {
+                    Some(cursor) => cursors.push((clause_idx, cursor)),
+                    // Une clause absente rend seulement ce segment vide.
+                    None => {
+                        missing_clause = true;
+                        break;
                     }
                 }
-            };
-            let Some(doc_id) = next else {
-                break;
-            };
-            next_probe = doc_id.saturating_add(1);
-            let mut sum = term_contrib(
-                &driver.field_stats,
-                driver.doc_freq,
-                doc_id,
-                driver.cursor.freq(),
-            );
-            for (i, t) in followers.iter_mut().enumerate() {
-                if cur[i].is_some_and(|c| c < doc_id) {
-                    cur[i] = match mode {
-                        FusedConjunctionScoreMode::Should => t.cursor.advance_to(doc_id),
-                        FusedConjunctionScoreMode::Must => {
-                            match t.cursor.advance_to_with_status(doc_id) {
-                                DiskPostingsAdvance::Found(found) => Some(found),
-                                DiskPostingsAdvance::Exhausted => None,
-                                DiskPostingsAdvance::Error => return None,
-                            }
-                        }
-                    };
-                }
-                if cur[i] != Some(doc_id) {
-                    continue 'docs;
-                }
-                sum += term_contrib(&t.field_stats, t.doc_freq, doc_id, t.cursor.freq());
             }
-            scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+            if missing_clause {
+                let metric_cursors: Vec<_> = cursors.iter().map(|(_, cursor)| &**cursor).collect();
+                block_metrics.observe(&metric_cursors);
+                continue;
+            }
+            cursors.sort_by_key(|(_, cursor)| cursor.local_df());
+            let segment_result = (|| -> Result<(), ()> {
+                let (driver, followers) = cursors.split_at_mut(1);
+                let (driver_clause, driver_cursor) = &mut driver[0];
+                let mut current = Vec::with_capacity(followers.len());
+                for (_, follower) in followers.iter_mut() {
+                    current.push(match follower.advance_to_with_status(0) {
+                        SegmentPostingsAdvance::Found(doc_id) => Some(doc_id),
+                        SegmentPostingsAdvance::Exhausted => None,
+                        SegmentPostingsAdvance::Error => return Err(()),
+                    });
+                }
+
+                let mut next_probe = 0u32;
+                let mut frequencies = vec![0u32; scoring_terms.len()];
+                'docs: loop {
+                    let doc_id = match driver_cursor.advance_to_with_status(next_probe) {
+                        SegmentPostingsAdvance::Found(doc_id) => doc_id,
+                        SegmentPostingsAdvance::Exhausted => break,
+                        SegmentPostingsAdvance::Error => return Err(()),
+                    };
+                    next_probe = doc_id.saturating_add(1);
+                    frequencies[*driver_clause] = driver_cursor.freq();
+                    for (follower_idx, (clause_idx, follower)) in followers.iter_mut().enumerate() {
+                        if current[follower_idx].is_some_and(|found| found < doc_id) {
+                            current[follower_idx] = match follower.advance_to_with_status(doc_id) {
+                                SegmentPostingsAdvance::Found(found) => Some(found),
+                                SegmentPostingsAdvance::Exhausted => None,
+                                SegmentPostingsAdvance::Error => return Err(()),
+                            };
+                        }
+                        if current[follower_idx] != Some(doc_id) {
+                            continue 'docs;
+                        }
+                        frequencies[*clause_idx] = follower.freq();
+                    }
+                    // L'ordre de sommation suit les clauses de la requête,
+                    // jamais le tri local des drivers : les bits restent stables.
+                    let mut sum = 0.0;
+                    for (clause_idx, (field_stats, doc_freq)) in scoring_terms.iter().enumerate() {
+                        sum +=
+                            term_contrib(field_stats, *doc_freq, doc_id, frequencies[clause_idx]);
+                    }
+                    scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+                }
+                Ok(())
+            })();
+            let metric_cursors: Vec<_> = cursors.iter().map(|(_, cursor)| &**cursor).collect();
+            block_metrics.observe(&metric_cursors);
+            if segment_result.is_err() {
+                block_metrics.publish();
+                return Self::fused_conjunction_scores_merged(data, clauses, mode);
+            }
         }
+        block_metrics.publish();
         Some(scored)
     }
 
-    /// Plan segments S2: genuinely multi-segment counterpart of
-    /// [`Self::fused_conjunction_scores_disk`] (which delegates here when
-    /// `segment_count() > 1`). Each clause's single token is decoded ONCE
-    /// via [`DocumentIndex::decode_from_segment`] (merges across every
-    /// sealed segment, ascending `doc_id`), then the rarest term drives a
-    /// `binary_search`-per-follower walk — correctness-first (no
-    /// galloping-cursor state to carry across segments), same BM25
-    /// `term_contrib` kernel as the RAM/disk paths so the score formula
-    /// stays bit-identical.
+    /// Référence matérialisée de repli pour
+    /// [`Self::fused_conjunction_scores_disk`]. P2 la conserve uniquement
+    /// lorsqu'une lecture checked échoue, jamais comme parcours multi-segment
+    /// nominal.
     fn fused_conjunction_scores_merged(
         data: &InMemoryIndex,
         clauses: &[(&str, &str)],

@@ -271,16 +271,19 @@ async fn postings_disk_flag_on_matches_flag_off_bit_identical() {
     }
 
     let p1a_direct = r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":100}"#;
-    for (layout, router, direct_eligible) in
-        [("RAM", &router_off, true), ("disque", &router_on, false)]
-    {
+    for (layout, router, direct_eligible) in [
+        ("RAM", &router_off, true),
+        // Après le lot S (`cb0ada8`), P2 couvre le disque checked : le
+        // compteur P1a doit donc augmenter sans affaiblir la parité.
+        ("disque", &router_on, true),
+    ] {
         let counter_before = p1a_direct_must_fused_counter(router).await;
         let direct = search(router, index, p1a_direct).await;
         let counter_after = p1a_direct_must_fused_counter(router).await;
         assert_eq!(
             counter_after,
             counter_before + if direct_eligible { 1 } else { 0 },
-            "[P1a {layout}] le compteur ne doit augmenter que pour le RAM mono-segment"
+            "[P2 {layout}] le compteur doit augmenter exactement une fois"
         );
         let generic = search(router, index, &force_generic_bool_reference(p1a_direct)).await;
         assert_eq!(

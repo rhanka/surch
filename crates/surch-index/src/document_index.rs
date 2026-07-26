@@ -14,8 +14,9 @@ use thiserror::Error;
 
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
-    merge_term_dictionaries, postings_disk_enabled, BlockMeta, CheckedPostings, DiskPostingsCursor,
-    PostingsBuilder, PostingsEnum, PostingsError, PostingsList, TermDictionary, TermsEnum,
+    merge_term_dictionaries, postings_disk_enabled, BlockMeta, CheckedPostings,
+    DiskPostingsAdvance, DiskPostingsCursor, PostingsBuilder, PostingsEnum, PostingsError,
+    PostingsList, PostingsReadError, TermDictionary, TermsEnum,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
@@ -376,6 +377,97 @@ pub struct DocumentIndex {
     /// tiered-merge doc-count cap, same rationale/pattern as
     /// `merge_fanin_override` — see [`MergeMaxDocsOverride`].
     merge_max_docs_override: MergeMaxDocsOverride,
+}
+
+/// Avance commune aux curseurs RAM et disque d'un segment. Le chemin P2 doit
+/// distinguer une fin normale d'une lecture disque défaillante pour ne jamais
+/// publier les hits déjà accumulés avant l'erreur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentPostingsAdvance {
+    Found(u32),
+    Exhausted,
+    Error,
+}
+
+/// Curseur d'un terme dans un seul segment. Les variantes restent internes au
+/// constructeur : les consommateurs ne voient que les opérations communes
+/// d'avance, de fréquence et de `df` local.
+#[derive(Debug)]
+pub enum SegmentPostingsCursor<'a> {
+    Disk(DiskPostingsCursor<'a>),
+    Ram {
+        iter: PostingsBlockSkipIter<'a>,
+        freqs: &'a [u32],
+        local_df: u64,
+    },
+}
+
+impl SegmentPostingsCursor<'_> {
+    /// `df` du terme dans ce seul segment, utilisé pour choisir localement le
+    /// driver le plus rare. Le scoring conserve séparément le `df` global.
+    pub fn local_df(&self) -> u64 {
+        match self {
+            Self::Disk(cursor) => cursor.doc_freq() as u64,
+            Self::Ram { local_df, .. } => *local_df,
+        }
+    }
+
+    /// Avance monotone qui préserve la provenance d'une erreur disque.
+    pub fn advance_to_with_status(&mut self, target: u32) -> SegmentPostingsAdvance {
+        match self {
+            Self::Disk(cursor) => match cursor.advance_to_with_status(target) {
+                DiskPostingsAdvance::Found(doc_id) => SegmentPostingsAdvance::Found(doc_id),
+                DiskPostingsAdvance::Exhausted => SegmentPostingsAdvance::Exhausted,
+                DiskPostingsAdvance::Error => SegmentPostingsAdvance::Error,
+            },
+            Self::Ram { iter, .. } => match iter.advance_to(target) {
+                Some(doc_id) => SegmentPostingsAdvance::Found(doc_id),
+                None => SegmentPostingsAdvance::Exhausted,
+            },
+        }
+    }
+
+    /// Fréquence du document renvoyé par la dernière avance réussie.
+    pub fn freq(&self) -> u32 {
+        match self {
+            Self::Disk(cursor) => cursor.freq(),
+            Self::Ram { iter, freqs, .. } => freqs
+                .get(iter.position().saturating_sub(1))
+                .copied()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Compteurs de blocs pour un curseur disque ; un curseur RAM ne charge
+    /// aucun bloc FoR depuis le segment persistant.
+    pub fn disk_block_counts(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Disk(cursor) => Some((cursor.blocks_read() as u64, cursor.blocks_total() as u64)),
+            Self::Ram { .. } => None,
+        }
+    }
+}
+
+/// Vue checked d'un terme alignée sur tous les segments de l'index. Une case
+/// `None` désigne une absence réelle dans ce segment, jamais une erreur de
+/// lecture ; `global_df` additionne les `df` locaux avant tout scoring BM25.
+#[derive(Debug)]
+pub struct SegmentedPostings<'a> {
+    per_segment: Vec<Option<SegmentPostingsCursor<'a>>>,
+    global_df: u64,
+}
+
+impl<'a> SegmentedPostings<'a> {
+    /// Somme des `df` locaux sur tous les segments qui portent ce terme.
+    pub fn global_df(&self) -> u64 {
+        self.global_df
+    }
+
+    /// Curseur du terme dans le segment demandé, ou `None` si le terme y est
+    /// réellement absent.
+    pub fn cursor_at_mut(&mut self, segment_idx: usize) -> Option<&mut SegmentPostingsCursor<'a>> {
+        self.per_segment.get_mut(segment_idx)?.as_mut()
+    }
 }
 
 /// Plan segments S2: resolution mode for [`DocumentIndex::maybe_flush_by_budget`]
@@ -2104,13 +2196,9 @@ impl DocumentIndex {
     /// [`Self::postings_disk_backed`] is `true`. See
     /// [`crate::postings::TermDictionary::disk_cursor`].
     ///
-    /// Plan segments S2: `segments[0]` passthrough, still valid — a
-    /// `DiskPostingsCursor` streams ONE segment, and both call sites
-    /// (`conjunction_hits_disk`, `fused_conjunction_scores_disk` in
-    /// `surch-api::state`) explicitly route the `segment_count() > 1`
-    /// case to their `*_merged` counterparts BEFORE ever building a
-    /// cursor, so this is only reached when `segments[0]` is the only
-    /// segment.
+    /// Reste le wrapper historique mono-segment, volontairement lossy. P2
+    /// construit sa vue multi-segment avec [`Self::segmented_postings_checked`]
+    /// afin de préserver la distinction absence/erreur dans chaque segment.
     pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
         self.segment().terms.disk_cursor(field, term)
     }
@@ -2123,6 +2211,64 @@ impl DocumentIndex {
         term: &str,
     ) -> CheckedPostings<DiskPostingsCursor<'_>> {
         self.segment().terms.disk_cursor_checked(field, term)
+    }
+
+    /// Vue checked d'un terme sur tous les segments, destinée aux
+    /// conjonctions P2. Une absence réelle ne vide que la case du segment
+    /// concerné ; une erreur de lecture ou de métadonnée interrompt la
+    /// construction entière afin que l'appelant puisse revenir au chemin de
+    /// référence sans publier un résultat partiel.
+    pub fn segmented_postings_checked(
+        &self,
+        field: &str,
+        term: &str,
+    ) -> CheckedPostings<SegmentedPostings<'_>> {
+        let mut per_segment = Vec::with_capacity(self.segments.len());
+        let mut global_df = 0u64;
+        let mut any = false;
+
+        for segment in &self.segments {
+            let cursor = if segment.terms.disk_backed() {
+                segment
+                    .terms
+                    .disk_cursor_p2_checked(field, term)?
+                    .map(SegmentPostingsCursor::Disk)
+            } else {
+                match segment
+                    .terms
+                    .postings_with_block_metas_checked(field, term)?
+                {
+                    Some(list) => {
+                        let local_df = list.doc_freq_from_block_metas() as u64;
+                        let iter = list
+                            .skip_iter()
+                            .map_err(|_| PostingsReadError::Corrupt)?
+                            .ok_or(PostingsReadError::Corrupt)?;
+                        Some(SegmentPostingsCursor::Ram {
+                            iter,
+                            freqs: list.freqs(),
+                            local_df,
+                        })
+                    }
+                    None => None,
+                }
+            };
+
+            if let Some(cursor) = cursor {
+                global_df = global_df
+                    .checked_add(cursor.local_df())
+                    .ok_or(PostingsReadError::Corrupt)?;
+                any = true;
+                per_segment.push(Some(cursor));
+            } else {
+                per_segment.push(None);
+            }
+        }
+
+        Ok(any.then_some(SegmentedPostings {
+            per_segment,
+            global_df,
+        }))
     }
 
     /// Lot C `C1b` sous-pas 2: decode `(field, term)`'s FULL postings
@@ -3715,6 +3861,26 @@ mod tests {
         (index, mapping)
     }
 
+    fn collect_segmented_doc_ids(postings: &mut SegmentedPostings<'_>) -> Vec<u32> {
+        let mut doc_ids = Vec::new();
+        for cursor in postings.per_segment.iter_mut().flatten() {
+            let mut target = 0u32;
+            loop {
+                match cursor.advance_to_with_status(target) {
+                    SegmentPostingsAdvance::Found(doc_id) => {
+                        doc_ids.push(doc_id);
+                        target = doc_id.saturating_add(1);
+                    }
+                    SegmentPostingsAdvance::Exhausted => break,
+                    SegmentPostingsAdvance::Error => {
+                        panic!("la fixture P2 ne doit pas avoir d'erreur de lecture")
+                    }
+                }
+            }
+        }
+        doc_ids
+    }
+
     /// Fixture multi-segment avec un premier posting assez large pour que
     /// retirer sa dernière entrée laisse les slices RAM dans les bornes,
     /// mais désaligne le nombre de métadonnées de blocs.
@@ -3793,6 +3959,66 @@ mod tests {
             .decode_from_segment("NOM", "bernard")
             .expect("NOM=bernard lives in the second sealed segment");
         assert_eq!(doc_ids, vec![2]);
+    }
+
+    #[test]
+    fn p2_segmented_postings_checked_couvre_ram_disque_mixte_et_df_global() {
+        let (ram, _) = multi_segment_index_with_disk(false);
+        let (disk, _) = multi_segment_index_with_disk(true);
+        let (mut mixed, _) = multi_segment_index_with_disk(false);
+        Arc::make_mut(&mut mixed.segments[1]).terms = disk.segments[1].terms.clone();
+
+        let assert_layout =
+            |label: &str, index: &DocumentIndex, expected_first: bool, expected_second: bool| {
+                let mut postings = index
+                    .segmented_postings_checked("BODY", "commun")
+                    .expect("la lecture checked doit réussir")
+                    .expect("BODY=commun doit exister dans des segments");
+                assert_eq!(postings.global_df(), 4, "[{label}] df global");
+                assert_eq!(postings.per_segment.len(), 3, "[{label}] cases alignées");
+                assert_eq!(
+                    matches!(
+                        postings.per_segment[0].as_ref(),
+                        Some(SegmentPostingsCursor::Disk(_))
+                    ),
+                    expected_first,
+                    "[{label}] variante du premier segment"
+                );
+                assert_eq!(
+                    matches!(
+                        postings.per_segment[1].as_ref(),
+                        Some(SegmentPostingsCursor::Disk(_))
+                    ),
+                    expected_second,
+                    "[{label}] variante du second segment"
+                );
+                assert!(
+                    postings.per_segment[2].is_none(),
+                    "[{label}] le segment actif vide doit rester une absence locale"
+                );
+                assert_eq!(
+                    collect_segmented_doc_ids(&mut postings),
+                    vec![0, 1, 2, 3],
+                    "[{label}] les segments doivent se concaténer par doc_id"
+                );
+            };
+
+        assert_layout("RAM", &ram, false, false);
+        assert_layout("disque", &disk, true, true);
+        assert_layout("mixte", &mixed, false, true);
+    }
+
+    #[test]
+    fn p2_segmented_postings_checked_refuse_un_segment_illisible_sans_vue_partielle() {
+        let (mut index, _) = multi_segment_index_with_disk(true);
+        Arc::make_mut(&mut index.segments[1])
+            .terms
+            .test_remove_postings_segment();
+
+        assert!(matches!(
+            index.segmented_postings_checked("BODY", "commun"),
+            Err(crate::postings::PostingsReadError::MissingCoverage)
+        ));
     }
 
     #[test]
