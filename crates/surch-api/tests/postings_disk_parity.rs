@@ -170,6 +170,10 @@ async fn postings_disk_flag_on_matches_flag_off_bit_identical() {
             r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"category":"tools"}}]}},"size":100}"#,
         ),
         (
+            "2-clause bool.must duplicate (P1a direct must)",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":100}"#,
+        ),
+        (
             "3-clause bool.must single-token conjunction (N-cursor disk leapfrog-join)",
             r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"category":"tools"}},{"match":{"body":"common"}}]}},"size":100}"#,
         ),

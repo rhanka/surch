@@ -1158,6 +1158,57 @@ mod l2_search_guards_tests {
     }
 }
 
+#[cfg(test)]
+mod p1a_direct_must_tests {
+    use super::{reduce_direct_must_conjunction, MatchOperator, SearchQuery};
+
+    fn leaf(field: &str, value: &str) -> SearchQuery {
+        SearchQuery::Match {
+            field: field.to_owned(),
+            value: value.to_owned(),
+            operator: MatchOperator::Or,
+        }
+    }
+
+    fn direct_must(must: Vec<SearchQuery>) -> SearchQuery {
+        SearchQuery::Bool {
+            must,
+            filter: Vec::new(),
+            must_not: Vec::new(),
+            should: Vec::new(),
+            minimum_should_match: 0,
+            boost: 1.0,
+        }
+    }
+
+    #[test]
+    fn accepte_exactement_deux_match_must() {
+        assert_eq!(
+            reduce_direct_must_conjunction(&direct_must(vec![
+                leaf("NOM", "DUPONT"),
+                leaf("PRENOMS", "JEAN"),
+            ])),
+            Some([("NOM", "DUPONT"), ("PRENOMS", "JEAN")])
+        );
+    }
+
+    #[test]
+    fn decliner_les_formes_hors_contrat() {
+        assert!(reduce_direct_must_conjunction(&direct_must(vec![
+            leaf("NOM", "DUPONT"),
+            leaf("PRENOMS", "JEAN"),
+            leaf("COMMUNE", "PARIS"),
+        ]))
+        .is_none());
+
+        let mut with_filter = direct_must(vec![leaf("NOM", "DUPONT"), leaf("PRENOMS", "JEAN")]);
+        if let SearchQuery::Bool { filter, .. } = &mut with_filter {
+            filter.push(leaf("COMMUNE", "PARIS"));
+        }
+        assert!(reduce_direct_must_conjunction(&with_filter).is_none());
+    }
+}
+
 /// A matched document paired with its `_score`.
 #[derive(Clone, Debug)]
 struct ScoredDocument {
@@ -1956,6 +2007,22 @@ fn run_topk_exact_bool(
     let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
     let limit = requested_hit_window_limit(from, size);
 
+    if let Some(clauses) = reduce_direct_must_conjunction(query) {
+        let t_recall = std::time::Instant::now();
+        if let Some(scored) = state.fused_must_scores(&indices[0], &clauses) {
+            metrics::counter!("surch_bool_direct_must_fused_total").increment(1);
+            metrics::histogram!("surch_bool_recall_score_us")
+                .record(t_recall.elapsed().as_micros() as f64);
+            metrics::histogram!("surch_bool_candidates").record(scored.len() as f64);
+            let t_fin = std::time::Instant::now();
+            let resp =
+                finalize_fused_topk(state, &indices[0], request, scored, from, size, started_at);
+            metrics::histogram!("surch_bool_finalize_us")
+                .record(t_fin.elapsed().as_micros() as f64);
+            return resp;
+        }
+    }
+
     // Fused fast path (campaign #18): the deces `bool`/`full` shape reduces to a
     // single-token conjunction scored by a plain BM25 sum. Score it in ONE
     // intersection walk with the `freq` captured O(1) at each matched position,
@@ -2059,6 +2126,47 @@ fn run_topk_exact_bool(
             .record(t_gscore.elapsed().as_micros() as f64);
         Some(response)
     })
+}
+
+/// Réduit seulement une racine `bool.must` de deux `match` sans autre clause;
+/// tout écart doit garder le scorer générique comme référence.
+fn reduce_direct_must_conjunction(query: &SearchQuery) -> Option<[(&str, &str); 2]> {
+    let SearchQuery::Bool {
+        must,
+        filter,
+        must_not,
+        should,
+        boost,
+        ..
+    } = query
+    else {
+        return None;
+    };
+    if *boost != 1.0 || !filter.is_empty() || !must_not.is_empty() || !should.is_empty() {
+        return None;
+    }
+    let [first, second] = must.as_slice() else {
+        return None;
+    };
+    let (
+        SearchQuery::Match {
+            field: first_field,
+            value: first_value,
+            ..
+        },
+        SearchQuery::Match {
+            field: second_field,
+            value: second_value,
+            ..
+        },
+    ) = (first, second)
+    else {
+        return None;
+    };
+    Some([
+        (first_field.as_str(), first_value.as_str()),
+        (second_field.as_str(), second_value.as_str()),
+    ])
 }
 
 /// Reduce the deces `bool`/`function_score` shape to its required single-clause

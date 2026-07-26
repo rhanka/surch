@@ -176,6 +176,9 @@ historical replay line lives in
   `docs/ops/bench-reports/2026-05-21-A-replay-current-main-61a13f-insee-K8s/`.
 - [ ] Keep future Track A optimisation commits tied to a promoted perf
   report and an update to the Track A performance ledger.
+- [ ] P1a — `bool.must` direct single-pass exact : route stricte de deux
+  `match` vers le scoring fusionné `must`, sans élargir le chemin `should`.
+  Plan et gates externes : `plan/p1a-bool-must-direct.md`.
 
 ## Track B - Test Automation / Perf Reporting
 

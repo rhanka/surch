@@ -214,6 +214,10 @@ async fn tiered_merge_cascades_and_matches_mono_and_unmerged_bit_identical() {
             r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"category":"tools"}}]}},"size":400}"#,
         ),
         (
+            "2-clause bool.must duplicate (P1a direct must)",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":400}"#,
+        ),
+        (
             "3-clause bool.must single-token conjunction",
             r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"category":"tools"}},{"match":{"body":"common"}}]}},"size":400}"#,
         ),
