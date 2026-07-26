@@ -46,6 +46,17 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
   ou erreur d'avance avant repli.
 - [x] Lot 5 — ajouter les tests P2 ciblés RAM/disque/mixte, segment illisible
   et saut de blocs, sans modifier les goldens de réponse.
+  - [x] Correction de revue locale — une attestation canonique issue du
+    payload refuse un répertoire P2 dont offset, count ou maximum diverge ;
+    les cas maximum abaissé et haussé déclinent explicitement.
+  - [x] Correction de revue locale — le scorer P1a décline avec `None` avant
+    compteur/finalisation sur toute erreur checked ; les compteurs de blocs
+    incluent tous les curseurs déjà ouverts, sans dépendre de l'ordre des
+    clauses ; une injection tardive prouve que le préfixe temporaire n'est
+    jamais finalisé.
+  - [x] Correction de revue locale — parité forcé-générique étendue aux
+    termes distincts, `global_df` asymétrique, RAM/disque/mixte,
+    `min_score` et `from`/`size`.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
@@ -61,8 +72,9 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
 
 ## Preuves
 
-- Preuves locales : diff relu, formatage et whitespace vérifiés ; les tests
-  P2 restent non exécutés par contrainte de mission.
+- Preuves locales : diff relu, `cargo fmt --all`, `cargo fmt --all -- --check`
+  et `git diff --check` vérifiés ; les tests P2 restent non exécutés par
+  contrainte de mission.
 - Preuves externes attendues : CI, goldens de parité, compteurs de routage et
   rapport chiffré conservant `took`, p95/p99, ratio de blocs et contrôle
   négatif.

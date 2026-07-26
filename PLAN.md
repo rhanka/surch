@@ -182,7 +182,7 @@ historical replay line lives in
   Plan et gates externes : `plan/p1a-bool-must-direct.md`.
 - [ ] P2 — parcours checked des postings disque et multi-segments, avec
   repli intégral sur erreur, `df` global et compteurs de blocs. Développement
-  livré localement ; gates externes ouvertes dans
+  livré localement, correction de revue de robustesse intégrée ; gates externes ouvertes dans
   `plan/p2-segmented-postings.md`.
 
 ## Track B - Test Automation / Perf Reporting

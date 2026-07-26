@@ -123,6 +123,80 @@ async fn build_index(
     (router, app_state)
 }
 
+/// Trois segments disjoints : le premier est RAM, les deux suivants disque.
+/// `anchor` est absent du segment central, ce qui force P2 à garder son `df`
+/// global tout en ignorant localement ce segment.
+fn corpus_mixte_p2() -> Vec<String> {
+    ["anchor", "other", "anchor"]
+        .into_iter()
+        .enumerate()
+        .map(|(segment_idx, title)| {
+            let mut out = String::new();
+            for offset in 0..10 {
+                let doc_id = segment_idx * 10 + offset;
+                out.push_str(&format!(
+                    "{{\"index\":{{\"_id\":\"mixte-{doc_id}\"}}}}\n\
+                     {{\"title\":\"{title}\",\"category\":\"shared\"}}\n"
+                ));
+            }
+            out
+        })
+        .collect()
+}
+
+async fn build_index_mixte_p2(index: &str) -> axum::Router {
+    let app_state = AppState::default();
+    app_state.create_index(index, None, serde_json::json!({}), Default::default());
+    app_state.set_flush_budget_bytes_override(index, Some(1));
+    app_state.set_merge_fanin_override(index, 0);
+    app_state.set_postings_disk_enabled(index, false);
+    let router = app_router_with_state(AppRouterState {
+        app: app_state.clone(),
+        ..Default::default()
+    });
+
+    for (chunk_idx, chunk) in corpus_mixte_p2().into_iter().enumerate() {
+        if chunk_idx == 1 {
+            // Le premier segment est déjà scellé RAM ; les suivants doivent
+            // exercer les curseurs disque dans la même requête P2.
+            app_state.set_postings_disk_enabled(index, true);
+        }
+        let bulk_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/{index}/_bulk"))
+                    .header("content-type", "application/x-ndjson")
+                    .body(Body::from(chunk))
+                    .expect("bulk request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(bulk_response.status(), StatusCode::OK);
+        assert_eq!(response_json(bulk_response).await["errors"], false);
+    }
+
+    let refresh_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{index}/_refresh"))
+                .body(Body::empty())
+                .expect("refresh request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(refresh_response.status(), StatusCode::OK);
+    assert_eq!(
+        app_state.index_segment_count(index),
+        4,
+        "trois segments scellés plus le segment actif vide sont attendus"
+    );
+    router
+}
+
 async fn search(router: &axum::Router, index: &str, query_body: &str) -> Value {
     let response = router
         .clone()
@@ -204,6 +278,38 @@ fn p1a_scored_response_fingerprint(body: &Value) -> (Vec<(String, u64)>, Option<
         body["hits"]["max_score"].as_f64().map(f64::to_bits),
         body["hits"]["total"].clone(),
     )
+}
+
+#[tokio::test]
+async fn p2_mixte_multisegment_conserve_parite_df_global_et_finalisation() {
+    let index = "p2-mixte-parity-idx";
+    let router = build_index_mixte_p2(index).await;
+    let direct = r#"{"from":3,"size":5,"min_score":0.2,"query":{"bool":{"must":[{"match":{"title":"anchor"}},{"match":{"category":"shared"}}]}}}"#;
+
+    let counter_before = p1a_direct_must_fused_counter(&router).await;
+    let direct_response = search(&router, index, direct).await;
+    let counter_after = p1a_direct_must_fused_counter(&router).await;
+    assert_eq!(
+        counter_after,
+        counter_before + 1,
+        "P2 mixte doit finaliser exactement une réponse directe"
+    );
+    let generic_response = search(&router, index, &force_generic_bool_reference(direct)).await;
+    assert_eq!(
+        p1a_scored_response_fingerprint(&direct_response),
+        p1a_scored_response_fingerprint(&generic_response),
+        "P2 mixte doit conserver ids, bits de score, max_score et total"
+    );
+    assert_eq!(
+        direct_response["hits"]["total"]["value"].as_u64(),
+        Some(20),
+        "le segment sans `anchor` ne doit ni perdre ni inventer un hit"
+    );
+    assert_eq!(
+        direct_response["hits"]["hits"].as_array().map(Vec::len),
+        Some(5),
+        "`min_score`, `from` et `size` doivent conserver leur effet"
+    );
 }
 
 /// `(id, score)` pairs in response order — order matters, not just set
@@ -324,7 +430,11 @@ async fn tiered_merge_cascades_and_matches_mono_and_unmerged_bit_identical() {
         );
     }
 
-    let p1a_direct = r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":400}"#;
+    // `gadget` est distribué asymétriquement entre les petits segments,
+    // contrairement à `category:tools`. Cette requête vérifie donc que P2
+    // conserve le `df` global et l'ordre d'addition, y compris après
+    // `min_score` et la pagination, contre l'oracle forcé-générique.
+    let p1a_direct = r#"{"from":3,"size":17,"min_score":0.8,"query":{"bool":{"must":[{"match":{"title":"gadget"}},{"match":{"category":"tools"}}]}}}"#;
     for (layout, router, direct_eligible) in [
         ("mono-segment", &router_mono, true),
         // Après le lot S (`cb0ada8`), P2 couvre les segments checked : le
@@ -347,6 +457,11 @@ async fn tiered_merge_cascades_and_matches_mono_and_unmerged_bit_identical() {
             p1a_scored_response_fingerprint(&direct),
             p1a_scored_response_fingerprint(&generic),
             "[P1a {layout}] réponse rapide et référence générique divergent"
+        );
+        assert_eq!(
+            direct["hits"]["hits"].as_array().map(Vec::len),
+            Some(17),
+            "[P2 {layout}] `from`/`size` doit conserver la fenêtre demandée"
         );
     }
 
