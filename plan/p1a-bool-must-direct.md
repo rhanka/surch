@@ -45,6 +45,9 @@ Track A — perf / optimisation.
   vérifie la référence sur RAM, disque, mono-segment et multi-segment.
 - [x] Correction de revue — l'erreur tardive du curseur disque décline le
   chemin P1a au lieu de finaliser un préfixe scoré.
+- [x] Correction 2 de revue — Option A : P1a décline avant tout accès disque
+  ou multi-segment ambigu ; les matrices disque et multi-segment vérifient la
+  parité générique et l'absence d'incrément du compteur rapide.
 - [x] Lot 3 — `cargo fmt`, `cargo fmt --check` et `git diff --check`.
 - [ ] Gate externe — tests Rust ciblés, clippy et CI : interdits dans cette
   mission, à rejouer par le conducteur.

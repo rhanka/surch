@@ -142,6 +142,32 @@ fn force_generic_bool_reference(body: &str) -> String {
     serde_json::to_string(&request).expect("reference request must serialize")
 }
 
+async fn p1a_direct_must_fused_counter(router: &axum::Router) -> u64 {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_prometheus_metrics")
+                .body(Body::empty())
+                .expect("metrics request should build"),
+        )
+        .await
+        .expect("metrics router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("metrics body should be readable");
+    let exposition = std::str::from_utf8(&body).expect("metrics must be utf-8");
+    exposition
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("surch_bool_direct_must_fused_total ")
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn p1a_scored_response_fingerprint(body: &Value) -> (Vec<(String, u64)>, Option<u64>, Value) {
     let hits = body["hits"]["hits"]
         .as_array()
@@ -245,8 +271,17 @@ async fn postings_disk_flag_on_matches_flag_off_bit_identical() {
     }
 
     let p1a_direct = r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":100}"#;
-    for (layout, router) in [("RAM", &router_off), ("disque", &router_on)] {
+    for (layout, router, direct_eligible) in
+        [("RAM", &router_off, true), ("disque", &router_on, false)]
+    {
+        let counter_before = p1a_direct_must_fused_counter(router).await;
         let direct = search(router, index, p1a_direct).await;
+        let counter_after = p1a_direct_must_fused_counter(router).await;
+        assert_eq!(
+            counter_after,
+            counter_before + if direct_eligible { 1 } else { 0 },
+            "[P1a {layout}] le compteur ne doit augmenter que pour le RAM mono-segment"
+        );
         let generic = search(router, index, &force_generic_bool_reference(p1a_direct)).await;
         assert_eq!(
             p1a_scored_response_fingerprint(&direct),

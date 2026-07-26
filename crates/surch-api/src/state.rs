@@ -4644,6 +4644,15 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
 
+        // P1a Option A : le chemin direct `must` ne peut prouver la
+        // distinction absence/erreur que sur les postings RAM mono-segment.
+        // `postings_disk_backed` couvre aussi le multi-segment ; décliner ici
+        // évite `disk_cursor` et `decode_from_segment` avant tout score,
+        // finalisation ou incrément de son compteur par le routeur.
+        if matches!(mode, FusedConjunctionScoreMode::Must) && data.index.postings_disk_backed() {
+            return None;
+        }
+
         // Lot C `C1b` sous-pas 2: disk-backed path — MUST stay
         // block-addressed (same rationale as `InMemoryIndex::conjunction_hits_disk`:
         // this is the deces bool/full scoring tail). See
