@@ -1038,9 +1038,11 @@ impl TermDirectoryChannels {
     /// flag-off default and the target of every best-effort fallback in
     /// [`persist_or_keep_term_directory`].
     fn into_resident(self, retain_p2_attestation: bool) -> TermDirectoryTables {
-        let p2_term_payloads = retain_p2_attestation
-            .then(|| build_p2_term_payloads(&self.segment_descriptors, &self.offsets))
-            .unwrap_or_default();
+        let p2_term_payloads = if retain_p2_attestation {
+            build_p2_term_payloads(&self.segment_descriptors, &self.offsets)
+        } else {
+            Default::default()
+        };
         TermDirectoryTables {
             segment_descriptors: self.segment_descriptors.into_boxed_slice(),
             offsets: self.offsets.into_boxed_slice(),
