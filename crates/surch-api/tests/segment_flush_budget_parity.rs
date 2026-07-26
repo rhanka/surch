@@ -152,6 +152,42 @@ async fn search(router: &axum::Router, index: &str, query_body: &str) -> Value {
     response_json(response).await
 }
 
+fn force_generic_bool_reference(body: &str) -> String {
+    let mut request: Value = serde_json::from_str(body).expect("request must be json");
+    let request_object = request.as_object_mut().expect("request must be an object");
+    let query = request_object
+        .remove("query")
+        .expect("request must carry query");
+    request_object.insert(
+        "query".to_owned(),
+        serde_json::json!({"function_score":{"query":query}}),
+    );
+    serde_json::to_string(&request).expect("reference request must serialize")
+}
+
+fn p1a_scored_response_fingerprint(body: &Value) -> (Vec<(String, u64)>, Option<u64>, Value) {
+    let hits = body["hits"]["hits"]
+        .as_array()
+        .expect("hits must be an array");
+    let scored_hits = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit["_id"].as_str().expect("hit must carry _id").to_owned(),
+                hit["_score"]
+                    .as_f64()
+                    .expect("hit must carry score")
+                    .to_bits(),
+            )
+        })
+        .collect();
+    (
+        scored_hits,
+        body["hits"]["max_score"].as_f64().map(f64::to_bits),
+        body["hits"]["total"].clone(),
+    )
+}
+
 /// `(id, score)` pairs in response order — order matters, not just set
 /// membership, since a scoring divergence between the mono- and
 /// multi-segment paths could also reorder ties.
@@ -242,6 +278,20 @@ async fn budget_flush_forces_multi_segment_and_matches_mono_segment_bit_identica
         assert_eq!(
             hits_mono, hits_multi,
             "[{label}] (id, score) hits diverged between mono- and multi-segment for {query_body}"
+        );
+    }
+
+    let p1a_direct = r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":400}"#;
+    for (layout, router) in [
+        ("mono-segment", &router_mono),
+        ("multi-segment", &router_multi),
+    ] {
+        let direct = search(router, index, p1a_direct).await;
+        let generic = search(router, index, &force_generic_bool_reference(p1a_direct)).await;
+        assert_eq!(
+            p1a_scored_response_fingerprint(&direct),
+            p1a_scored_response_fingerprint(&generic),
+            "[P1a {layout}] réponse rapide et référence générique divergent"
         );
     }
 

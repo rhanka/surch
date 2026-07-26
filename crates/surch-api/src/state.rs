@@ -15,7 +15,9 @@ use surch_index::{
     document_index::DocumentIndex,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
-    postings::{BlockMeta, DiskPostingsCursor, PostingsBlockSkipIter, PostingsList},
+    postings::{
+        BlockMeta, DiskPostingsAdvance, DiskPostingsCursor, PostingsBlockSkipIter, PostingsList,
+    },
     roaring::RoaringDocSet,
 };
 use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor};
@@ -4885,13 +4887,36 @@ impl AppState {
 
         let (driver, followers) = terms.split_at_mut(1);
         let driver = &mut driver[0];
-        let mut cur: Vec<Option<u32>> = followers
-            .iter_mut()
-            .map(|t| t.cursor.advance_to(0))
-            .collect();
+        let mut cur = Vec::with_capacity(followers.len());
+        for term in followers.iter_mut() {
+            let current = match mode {
+                FusedConjunctionScoreMode::Should => term.cursor.advance_to(0),
+                FusedConjunctionScoreMode::Must => match term.cursor.advance_to_with_status(0) {
+                    DiskPostingsAdvance::Found(doc_id) => Some(doc_id),
+                    DiskPostingsAdvance::Exhausted => None,
+                    // P1a ne doit jamais publier le préfixe déjà scoré :
+                    // l'erreur disque décline sans effet vers le générique.
+                    DiskPostingsAdvance::Error => return None,
+                },
+            };
+            cur.push(current);
+        }
         let mut scored: Vec<(f64, u32)> = Vec::new();
         let mut next_probe = 0u32;
-        'docs: while let Some(doc_id) = driver.cursor.advance_to(next_probe) {
+        'docs: loop {
+            let next = match mode {
+                FusedConjunctionScoreMode::Should => driver.cursor.advance_to(next_probe),
+                FusedConjunctionScoreMode::Must => {
+                    match driver.cursor.advance_to_with_status(next_probe) {
+                        DiskPostingsAdvance::Found(doc_id) => Some(doc_id),
+                        DiskPostingsAdvance::Exhausted => None,
+                        DiskPostingsAdvance::Error => return None,
+                    }
+                }
+            };
+            let Some(doc_id) = next else {
+                break;
+            };
             next_probe = doc_id.saturating_add(1);
             let mut sum = term_contrib(
                 &driver.field_stats,
@@ -4901,7 +4926,16 @@ impl AppState {
             );
             for (i, t) in followers.iter_mut().enumerate() {
                 if cur[i].is_some_and(|c| c < doc_id) {
-                    cur[i] = t.cursor.advance_to(doc_id);
+                    cur[i] = match mode {
+                        FusedConjunctionScoreMode::Should => t.cursor.advance_to(doc_id),
+                        FusedConjunctionScoreMode::Must => {
+                            match t.cursor.advance_to_with_status(doc_id) {
+                                DiskPostingsAdvance::Found(found) => Some(found),
+                                DiskPostingsAdvance::Exhausted => None,
+                                DiskPostingsAdvance::Error => return None,
+                            }
+                        }
+                    };
                 }
                 if cur[i] != Some(doc_id) {
                     continue 'docs;

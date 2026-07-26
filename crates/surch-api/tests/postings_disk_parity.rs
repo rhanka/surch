@@ -129,6 +129,42 @@ async fn search(router: &axum::Router, index: &str, query_body: &str) -> Value {
     response_json(response).await
 }
 
+fn force_generic_bool_reference(body: &str) -> String {
+    let mut request: Value = serde_json::from_str(body).expect("request must be json");
+    let request_object = request.as_object_mut().expect("request must be an object");
+    let query = request_object
+        .remove("query")
+        .expect("request must carry query");
+    request_object.insert(
+        "query".to_owned(),
+        serde_json::json!({"function_score":{"query":query}}),
+    );
+    serde_json::to_string(&request).expect("reference request must serialize")
+}
+
+fn p1a_scored_response_fingerprint(body: &Value) -> (Vec<(String, u64)>, Option<u64>, Value) {
+    let hits = body["hits"]["hits"]
+        .as_array()
+        .expect("hits must be an array");
+    let scored_hits = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit["_id"].as_str().expect("hit must carry _id").to_owned(),
+                hit["_score"]
+                    .as_f64()
+                    .expect("hit must carry score")
+                    .to_bits(),
+            )
+        })
+        .collect();
+    (
+        scored_hits,
+        body["hits"]["max_score"].as_f64().map(f64::to_bits),
+        body["hits"]["total"].clone(),
+    )
+}
+
 /// `(id, score)` pairs in response order — order matters here, not just
 /// set membership, since a scoring divergence between the RAM and disk
 /// paths could also reorder ties. `_score` is absent on `match_all` (surch
@@ -205,6 +241,17 @@ async fn postings_disk_flag_on_matches_flag_off_bit_identical() {
         assert_eq!(
             hits_off, hits_on,
             "[{label}] (id, score) hits diverged between flag OFF and flag ON for {query_body}"
+        );
+    }
+
+    let p1a_direct = r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":100}"#;
+    for (layout, router) in [("RAM", &router_off), ("disque", &router_on)] {
+        let direct = search(router, index, p1a_direct).await;
+        let generic = search(router, index, &force_generic_bool_reference(p1a_direct)).await;
+        assert_eq!(
+            p1a_scored_response_fingerprint(&direct),
+            p1a_scored_response_fingerprint(&generic),
+            "[P1a {layout}] réponse rapide et référence générique divergent"
         );
     }
 }

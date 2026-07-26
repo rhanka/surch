@@ -781,6 +781,32 @@ fn force_generic_bool_reference(body: &str) -> String {
     serde_json::to_string(&request).expect("reference request must serialize")
 }
 
+async fn p1a_direct_must_fused_counter(router: &axum::Router) -> u64 {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/_prometheus_metrics")
+                .body(Body::empty())
+                .expect("metrics request should build"),
+        )
+        .await
+        .expect("metrics router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("metrics body should be readable");
+    let exposition = std::str::from_utf8(&body).expect("metrics must be utf-8");
+    exposition
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("surch_bool_direct_must_fused_total ")
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn p1a_scored_response_fingerprint(
     body: &serde_json::Value,
 ) -> (Vec<(String, u64)>, Option<u64>, serde_json::Value) {
@@ -847,6 +873,23 @@ async fn p1a_direct_must_is_bit_identical_to_forced_generic_reference() {
         .await;
     }
 
+    let positive_direct_body = r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"size":10,"_source":false}"#;
+    let counter_before = p1a_direct_must_fused_counter(&router).await;
+    let positive_direct = search_with_body(&router, positive_direct_body).await;
+    let counter_after = p1a_direct_must_fused_counter(&router).await;
+    assert_eq!(
+        counter_after,
+        counter_before + 1,
+        "une requête P1a positive doit incrémenter le compteur exactement une fois"
+    );
+    let positive_generic =
+        search_with_owned_body(&router, force_generic_bool_reference(positive_direct_body)).await;
+    assert_eq!(
+        p1a_scored_response_fingerprint(&positive_direct),
+        p1a_scored_response_fingerprint(&positive_generic),
+        "la requête positive instrumentée doit rester identique à la référence"
+    );
+
     let cases: &[(&str, &str)] = &[
         (
             "frequences asymetriques et normes active/inactive",
@@ -878,7 +921,7 @@ async fn p1a_direct_must_is_bit_identical_to_forced_generic_reference() {
         ),
         (
             "min_score",
-            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"min_score":1.0,"size":10,"_source":false}"#,
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"min_score":1.745,"size":10,"_source":false}"#,
         ),
         (
             "from et size",
@@ -912,6 +955,24 @@ async fn p1a_direct_must_is_bit_identical_to_forced_generic_reference() {
             "{label}"
         );
     }
+
+    let unfiltered = search_with_body(&router, positive_direct_body).await;
+    let min_score_filtered = search_with_body(
+        &router,
+        r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"min_score":1.745,"size":10,"_source":false}"#,
+    )
+    .await;
+    let unfiltered_total = unfiltered["hits"]["total"]["value"]
+        .as_u64()
+        .expect("unfiltered total must be numeric");
+    let filtered_total = min_score_filtered["hits"]["total"]["value"]
+        .as_u64()
+        .expect("filtered total must be numeric");
+    assert!(
+        filtered_total > 0 && filtered_total < unfiltered_total,
+        "min_score doit retirer une partie des candidats sans tous les retirer: \
+         filtered={filtered_total}, unfiltered={unfiltered_total}"
+    );
 }
 
 #[tokio::test]
