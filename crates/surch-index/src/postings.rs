@@ -614,6 +614,11 @@ impl PostingsBuilder {
                 Vec::with_capacity(if disk_enabled { 0 } else { total_postings });
             let mut doc_ids_flat: Vec<u32> =
                 Vec::with_capacity(if disk_enabled { 0 } else { total_postings });
+            // Compteur redondant par terme pour les lectures RAM vérifiées :
+            // il ne dérive pas des bornes CSR et détecte donc une borne de
+            // fin tronquée qui resterait autrement dans le même bloc.
+            let mut postings_counts: Vec<u32> =
+                Vec::with_capacity(if disk_enabled { 0 } else { term_count });
             let mut block_metas_flat: Vec<BlockMeta> =
                 Vec::with_capacity(if disk_enabled { 0 } else { total_blocks });
             let mut offsets: Vec<u32> = Vec::with_capacity(term_count + 1);
@@ -748,6 +753,7 @@ impl PostingsBuilder {
                     }
                     block_dir_offsets.push(block_directory_flat.len() as u32);
                 } else {
+                    postings_counts.push(term_postings.len() as u32);
                     // Per-block stats are computed once here, against the
                     // ascending-doc_id postings, then read back in O(1) by
                     // `maxscore_match` instead of being recomputed at every
@@ -955,6 +961,7 @@ impl PostingsBuilder {
                     fst,
                     doc_ids_flat: doc_ids_flat.into_boxed_slice(),
                     freqs_flat: freqs_flat.into_boxed_slice(),
+                    postings_counts: postings_counts.into_boxed_slice(),
                     block_metas_flat: block_metas_flat.into_boxed_slice(),
                     offsets: tables.offsets,
                     block_offsets: tables.block_offsets,
@@ -1298,6 +1305,7 @@ struct FieldMergeAccumulator {
     builder: MergeFstBuilder,
     doc_ids_flat: Vec<u32>,
     freqs_flat: Vec<u32>,
+    postings_counts: Vec<u32>,
     block_metas_flat: Vec<BlockMeta>,
     offsets: Vec<u32>,
     block_offsets: Vec<u32>,
@@ -1325,6 +1333,7 @@ impl FieldMergeAccumulator {
             builder: MergeFstBuilder::new(),
             doc_ids_flat: Vec::new(),
             freqs_flat: Vec::new(),
+            postings_counts: Vec::new(),
             block_metas_flat: Vec::new(),
             offsets: vec![0],
             block_offsets,
@@ -1396,6 +1405,7 @@ impl FieldMergeAccumulator {
             self.block_dir_offsets
                 .push(self.block_directory_flat.len() as u32);
         } else {
+            self.postings_counts.push(doc_ids.len() as u32);
             self.block_metas_flat
                 .extend(build_block_metas_from_freqs(freqs));
             self.block_offsets.push(self.block_metas_flat.len() as u32);
@@ -1511,6 +1521,7 @@ impl FieldMergeAccumulator {
                 fst,
                 doc_ids_flat: self.doc_ids_flat.into_boxed_slice(),
                 freqs_flat: self.freqs_flat.into_boxed_slice(),
+                postings_counts: self.postings_counts.into_boxed_slice(),
                 block_metas_flat: self.block_metas_flat.into_boxed_slice(),
                 offsets: tables.offsets,
                 block_offsets: tables.block_offsets,
@@ -1766,6 +1777,14 @@ pub struct FieldPostings {
     /// above — so this channel adds no cache pressure to the doc_id-only
     /// hot path.
     freqs_flat: Box<[u32]>,
+    /// Nombre de postings de chaque terme, construit avant les bornes CSR.
+    /// Les lecteurs vérifiés le comparent à la tranche RAM résolue pour ne
+    /// jamais publier un préfixe complet en apparence après une troncature
+    /// bornée de `offsets`.
+    ///
+    /// Vide en mode disque, où [`TermEntry::postings_count`] porte déjà ce
+    /// comptage indépendant de toute tranche RAM.
+    postings_counts: Box<[u32]>,
     /// All terms' `BlockMeta` chunks concatenated, in FST idx order. Term
     /// `i`'s blocks are `block_metas_flat[block_offsets[i]..
     /// block_offsets[i+1]]`; inside that range, block `j` describes
@@ -2301,11 +2320,17 @@ impl FieldPostings {
             .freqs_flat
             .get(start..end)
             .ok_or(PostingsReadError::Corrupt)?;
+        let expected_count = *self
+            .postings_counts
+            .get(idx)
+            .ok_or(PostingsReadError::Corrupt)? as usize;
         let block_metas = self
             .block_metas_flat
             .get(block_start..block_end)
             .ok_or(PostingsReadError::Corrupt)?;
         if doc_ids.is_empty()
+            || doc_ids.len() != expected_count
+            || freqs.len() != expected_count
             || !doc_ids.windows(2).all(|pair| pair[0] < pair[1])
             || block_metas.len() != doc_ids.len().div_ceil(BLOCK_SIZE)
         {
@@ -3198,9 +3223,9 @@ impl<'seg> DiskPostingsCursor<'seg> {
     /// `FieldPostings::segment_descriptors` entry; `total_count` est le
     /// `df` porté par l'entrée de terme unifiée.
     ///
-    /// Returns `None` if the initial `pread` or the directory computation
-    /// fails (a malformed payload — should never happen for a term the
-    /// build-time segment round-trip already validated).
+    /// Retourne `Err(PostingsReadError)` si le `pread` initial ou le
+    /// contrôle du payload échoue ; une erreur ne doit pas se confondre
+    /// avec l'absence normale d'un terme.
     ///
     /// `pub(crate)`, not `pub`: [`PostingsSegment`] itself is a
     /// crate-private type (the `postings_segment` submodule is not
@@ -3465,6 +3490,7 @@ mod tests {
         assert!(
             field_on.segment_descriptors.is_empty()
                 && field_on.offsets.is_empty()
+                && field_on.postings_counts.is_empty()
                 && field_on.block_offsets.is_empty()
                 && field_on.block_directory.is_empty()
                 && field_on.block_dir_offsets.is_empty(),
