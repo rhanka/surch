@@ -970,6 +970,36 @@ use surch_search::scoring::{bm25_score, Bm25Config};
 use crate::scroll::ScrollTable;
 use crate::stats::{clear_memory_gauges, refresh_jemalloc_purge, refresh_memory_gauges};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FusedConjunctionScoreMode {
+    Should,
+    Must,
+}
+
+fn fused_bm25_contribution(score: Option<f64>, mode: FusedConjunctionScoreMode) -> f64 {
+    match mode {
+        FusedConjunctionScoreMode::Should => score.filter(|score| *score != 1.0).unwrap_or(0.0),
+        FusedConjunctionScoreMode::Must => score.filter(|score| *score > 0.0).unwrap_or(1.0),
+    }
+}
+
+#[cfg(test)]
+mod p1a_fused_must_tests {
+    use super::{fused_bm25_contribution, FusedConjunctionScoreMode};
+
+    #[test]
+    fn must_conserve_un_score_bm25_unitaire() {
+        assert_eq!(
+            fused_bm25_contribution(Some(1.0), FusedConjunctionScoreMode::Must),
+            1.0
+        );
+        assert_eq!(
+            fused_bm25_contribution(Some(1.0), FusedConjunctionScoreMode::Should),
+            0.0
+        );
+    }
+}
+
 /// Shared in-memory API state used by API handlers.
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -4580,6 +4610,28 @@ impl AppState {
         index: &str,
         clauses: &[(&str, &str)],
     ) -> Option<Vec<(f64, u32)>> {
+        self.fused_conjunction_scores_with_mode(index, clauses, FusedConjunctionScoreMode::Should)
+    }
+
+    /// Calcule deux feuilles `bool.must` mono-token sans perdre une
+    /// contribution BM25 égale à `1.0`; toute autre forme décline.
+    pub fn fused_must_scores(
+        &self,
+        index: &str,
+        clauses: &[(&str, &str)],
+    ) -> Option<Vec<(f64, u32)>> {
+        if clauses.len() != 2 {
+            return None;
+        }
+        self.fused_conjunction_scores_with_mode(index, clauses, FusedConjunctionScoreMode::Must)
+    }
+
+    fn fused_conjunction_scores_with_mode(
+        &self,
+        index: &str,
+        clauses: &[(&str, &str)],
+        mode: FusedConjunctionScoreMode,
+    ) -> Option<Vec<(f64, u32)>> {
         if clauses.is_empty() {
             return None;
         }
@@ -4595,7 +4647,7 @@ impl AppState {
         // this is the deces bool/full scoring tail). See
         // `Self::fused_conjunction_scores_disk`.
         if data.index.postings_disk_backed() {
-            return Self::fused_conjunction_scores_disk(data, clauses);
+            return Self::fused_conjunction_scores_disk(data, clauses, mode);
         }
 
         // Per-term: field stats + the SoA doc_ids/freqs channels (Lot C Phase 1
@@ -4665,31 +4717,29 @@ impl AppState {
         };
 
         // One term's BM25 contribution — replicates `bm25_field_score` exactly
-        // (same `bm25_score` primitive + guards) but with the captured `freq`,
-        // and folds in the generic `should` sum's `!= 1.0` placeholder filter.
+        // (same `bm25_score` primitive + guards) but with the captured `freq`.
         let term_contrib = |t: &TermCtx<'_>, doc_id: u32, freq: u32| -> f64 {
             if freq == 0 || t.doc_freq == 0 || t.doc_freq > t.field_stats.doc_count {
-                return 0.0;
+                return fused_bm25_contribution(None, mode);
             }
             let doc_len = if t.field_stats.norms_enabled {
                 match t.field_stats.doc_len(doc_id) {
                     Some(len) => len,
-                    None => return 0.0,
+                    None => return fused_bm25_contribution(None, mode),
                 }
             } else {
                 1
             };
-            match bm25_score(
+            let score = bm25_score(
                 config,
                 t.field_stats.doc_count,
                 t.doc_freq,
                 u64::from(freq),
                 doc_len,
                 t.field_stats.avg_doc_len,
-            ) {
-                Ok(score) if score != 1.0 => score,
-                _ => 0.0,
-            }
+            )
+            .ok();
+            fused_bm25_contribution(score, mode)
         };
 
         // A1 fast path: two high-`df` terms (the deces bool/full tail) whose
@@ -4764,6 +4814,7 @@ impl AppState {
     fn fused_conjunction_scores_disk(
         data: &InMemoryIndex,
         clauses: &[(&str, &str)],
+        mode: FusedConjunctionScoreMode,
     ) -> Option<Vec<(f64, u32)>> {
         // Plan segments S2: same rationale as
         // `InMemoryIndex::conjunction_hits_disk` — `DiskPostingsCursor`
@@ -4771,7 +4822,7 @@ impl AppState {
         // segments is deferred, so route to the "decode owned,
         // correct-first" fallback instead.
         if data.index.segment_count() > 1 {
-            return Self::fused_conjunction_scores_merged(data, clauses);
+            return Self::fused_conjunction_scores_merged(data, clauses, mode);
         }
         struct DiskTermCtx<'a> {
             field_stats: FieldScoringStats<'a>,
@@ -4810,27 +4861,26 @@ impl AppState {
         let term_contrib =
             |field_stats: &FieldScoringStats<'_>, doc_freq: u64, doc_id: u32, freq: u32| -> f64 {
                 if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
-                    return 0.0;
+                    return fused_bm25_contribution(None, mode);
                 }
                 let doc_len = if field_stats.norms_enabled {
                     match field_stats.doc_len(doc_id) {
                         Some(len) => len,
-                        None => return 0.0,
+                        None => return fused_bm25_contribution(None, mode),
                     }
                 } else {
                     1
                 };
-                match bm25_score(
+                let score = bm25_score(
                     config,
                     field_stats.doc_count,
                     doc_freq,
                     u64::from(freq),
                     doc_len,
                     field_stats.avg_doc_len,
-                ) {
-                    Ok(score) if score != 1.0 => score,
-                    _ => 0.0,
-                }
+                )
+                .ok();
+                fused_bm25_contribution(score, mode)
             };
 
         let (driver, followers) = terms.split_at_mut(1);
@@ -4875,6 +4925,7 @@ impl AppState {
     fn fused_conjunction_scores_merged(
         data: &InMemoryIndex,
         clauses: &[(&str, &str)],
+        mode: FusedConjunctionScoreMode,
     ) -> Option<Vec<(f64, u32)>> {
         struct MergedTermCtx<'a> {
             field_stats: FieldScoringStats<'a>,
@@ -4915,27 +4966,26 @@ impl AppState {
         let term_contrib =
             |field_stats: &FieldScoringStats<'_>, doc_freq: u64, doc_id: u32, freq: u32| -> f64 {
                 if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
-                    return 0.0;
+                    return fused_bm25_contribution(None, mode);
                 }
                 let doc_len = if field_stats.norms_enabled {
                     match field_stats.doc_len(doc_id) {
                         Some(len) => len,
-                        None => return 0.0,
+                        None => return fused_bm25_contribution(None, mode),
                     }
                 } else {
                     1
                 };
-                match bm25_score(
+                let score = bm25_score(
                     config,
                     field_stats.doc_count,
                     doc_freq,
                     u64::from(freq),
                     doc_len,
                     field_stats.avg_doc_len,
-                ) {
-                    Ok(score) if score != 1.0 => score,
-                    _ => 0.0,
-                }
+                )
+                .ok();
+                fused_bm25_contribution(score, mode)
             };
 
         let mut scored: Vec<(f64, u32)> = Vec::new();

@@ -751,6 +751,169 @@ async fn search_with_body(router: &axum::Router, body: &'static str) -> serde_js
     response_json(response).await
 }
 
+async fn search_with_owned_body(router: &axum::Router, body: String) -> serde_json::Value {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/products/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    response_json(response).await
+}
+
+fn force_generic_bool_reference(body: &str) -> String {
+    let mut request: serde_json::Value = serde_json::from_str(body).expect("request must be json");
+    let request_object = request.as_object_mut().expect("request must be an object");
+    let query = request_object
+        .remove("query")
+        .expect("request must carry query");
+    request_object.insert(
+        "query".to_owned(),
+        serde_json::json!({"function_score":{"query":query}}),
+    );
+    serde_json::to_string(&request).expect("reference request must serialize")
+}
+
+fn p1a_scored_response_fingerprint(
+    body: &serde_json::Value,
+) -> (Vec<(String, u64)>, Option<u64>, serde_json::Value) {
+    let hits = body["hits"]["hits"]
+        .as_array()
+        .expect("hits must be an array");
+    let scored_hits = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit["_id"].as_str().expect("hit must carry _id").to_owned(),
+                hit["_score"]
+                    .as_f64()
+                    .expect("hit must carry score")
+                    .to_bits(),
+            )
+        })
+        .collect();
+    (
+        scored_hits,
+        body["hits"]["max_score"].as_f64().map(f64::to_bits),
+        body["hits"]["total"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn p1a_direct_must_is_bit_identical_to_forced_generic_reference() {
+    let router = app_router();
+    let create_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/products")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"mappings":{"properties":{"title":{"type":"text"},"category":{"type":"text","norms":false},"search_only":{"type":"text","analyzer":"standard","search_analyzer":"keyword"}}}}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    for (id, source) in [
+        (
+            "strong",
+            r#"{"title":"alpha alpha alpha alpha","category":"tools"}"#,
+        ),
+        ("short", r#"{"title":"alpha","category":"tools"}"#),
+        ("tie-a", r#"{"title":"alpha","category":"tools"}"#),
+        ("tie-b", r#"{"title":"alpha","category":"tools"}"#),
+        ("beta", r#"{"title":"alpha beta","category":"tools"}"#),
+        ("other", r#"{"title":"alpha","category":"other"}"#),
+    ] {
+        index_product(&router, id, source).await;
+    }
+    for index in 0..24 {
+        index_product(
+            &router,
+            &format!("noise-{index}"),
+            r#"{"title":"alpha","category":"other"}"#,
+        )
+        .await;
+    }
+
+    let cases: &[(&str, &str)] = &[
+        (
+            "frequences asymetriques et normes active/inactive",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"size":10,"_source":false}"#,
+        ),
+        (
+            "terme duplique",
+            r#"{"query":{"bool":{"must":[{"match":{"category":"tools"}},{"match":{"category":"tools"}}]}},"size":10,"_source":false}"#,
+        ),
+        (
+            "terme absent",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"missing"}}]}},"size":10,"_source":false}"#,
+        ),
+        (
+            "multi-token decliné",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha beta"}},{"match":{"category":"tools"}}]}},"size":10,"_source":false}"#,
+        ),
+        (
+            "valeur illisible declinée",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"!!!"}},{"match":{"category":"tools"}}]}},"size":10,"_source":false}"#,
+        ),
+        (
+            "analyseurs differents declinés",
+            r#"{"query":{"bool":{"must":[{"match":{"search_only":"alpha beta"}},{"match":{"category":"tools"}}]}},"size":10,"_source":false}"#,
+        ),
+        (
+            "trois clauses declinées",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}},{"match":{"title":"beta"}}]}},"size":10,"_source":false}"#,
+        ),
+        (
+            "min_score",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"min_score":1.0,"size":10,"_source":false}"#,
+        ),
+        (
+            "from et size",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"from":1,"size":2,"_source":false}"#,
+        ),
+        (
+            "size zero",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"size":0,"_source":false}"#,
+        ),
+        (
+            "track_total_hits true",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"track_total_hits":true,"size":10,"_source":false}"#,
+        ),
+        (
+            "track_total_hits false",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"track_total_hits":false,"size":10,"_source":false}"#,
+        ),
+        (
+            "track_total_hits numerique",
+            r#"{"query":{"bool":{"must":[{"match":{"title":"alpha"}},{"match":{"category":"tools"}}]}},"track_total_hits":2,"size":10,"_source":false}"#,
+        ),
+    ];
+
+    for &(label, direct_body) in cases {
+        let direct = search_with_body(&router, direct_body).await;
+        let generic =
+            search_with_owned_body(&router, force_generic_bool_reference(direct_body)).await;
+        assert_eq!(
+            p1a_scored_response_fingerprint(&direct),
+            p1a_scored_response_fingerprint(&generic),
+            "{label}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn search_router_returns_highlight_fragments_for_requested_match_field() {
     let router = app_router();
