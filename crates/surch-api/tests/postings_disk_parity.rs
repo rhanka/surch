@@ -38,7 +38,7 @@ async fn response_json(response: axum::response::Response<Body>) -> Value {
 /// EVERY doc (multi-block, the common-term tail the design worries about).
 fn corpus_ndjson() -> String {
     let mut out = String::new();
-    for i in 0..300 {
+    for i in 0usize..300 {
         let title = match i % 3 {
             0 => "alpha widget",
             1 => "beta widget",

@@ -69,6 +69,11 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
   - [x] Correction CI locale — `PostingsBlockSkipIter` est importé dans
     `document_index`, où P2 l'emploie pour le curseur RAM segmenté ; l'audit
     statique couvre les symboles ajoutés, retirés et rendus publics par P2.
+  - [x] Correction CI locale — la fixture de parité disque type explicitement
+    son compteur `usize` avant `is_multiple_of` ; le balayage statique des
+    tests P2 et des modules `#[cfg(test)]` ne relève aucune autre ambiguïté
+    numérique, méthode standard incompatible, import inutile ou symbole non
+    résolu.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
