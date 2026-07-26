@@ -3719,13 +3719,25 @@ mod tests {
     /// retirer sa dernière entrée laisse les slices RAM dans les bornes,
     /// mais désaligne le nombre de métadonnées de blocs.
     fn multi_segment_index_with_large_common_term() -> DocumentIndex {
+        multi_segment_index_with_common_term_postings(crate::postings::BLOCK_SIZE as u32 + 1)
+    }
+
+    /// Variante volontairement intra-bloc : 130 postings puis une
+    /// troncature `130 -> 129` gardent deux métadonnées de bloc. Elle
+    /// vérifie donc que la complétude checked ne dépend pas seulement de
+    /// l'alignement du nombre de blocs.
+    fn multi_segment_index_with_intra_block_common_term() -> DocumentIndex {
+        multi_segment_index_with_common_term_postings(crate::postings::BLOCK_SIZE as u32 + 2)
+    }
+
+    fn multi_segment_index_with_common_term_postings(first_segment_postings: u32) -> DocumentIndex {
         let mapping = IndexMapping::default();
         let mut index = DocumentIndex::new();
         index.set_flush_budget_bytes_override(Some(1));
         index.set_postings_disk_enabled(false);
         index.set_merge_fanin_override(0);
 
-        let first_segment: Vec<_> = (0..=crate::postings::BLOCK_SIZE as u32)
+        let first_segment: Vec<_> = (0..first_segment_postings)
             .map(|doc_id| (doc_id, [("BODY", "commun")]))
             .collect();
         index
@@ -3734,7 +3746,7 @@ mod tests {
         index.maybe_flush_by_budget();
         index
             .add_documents_with_mapping_deferred(
-                [(crate::postings::BLOCK_SIZE as u32 + 1, [("BODY", "commun")])],
+                [(first_segment_postings, [("BODY", "commun")])],
                 &mapping,
             )
             .expect("second segment");
@@ -3811,6 +3823,32 @@ mod tests {
             index.decode_from_segment_checked("BODY", "commun"),
             Err(crate::postings::PostingsReadError::Corrupt),
             "un préfixe RAM borné ne doit pas être publié par la fusion"
+        );
+    }
+
+    #[test]
+    fn checked_multi_segment_rejette_la_troncature_ram_intra_bloc_130_vers_129() {
+        let mut index = multi_segment_index_with_intra_block_common_term();
+        assert_eq!(
+            index.segments[0]
+                .terms
+                .postings("BODY", "commun")
+                .expect("la fixture doit contenir le terme")
+                .count(),
+            130,
+            "le premier segment doit reproduire le cas source 130 -> 129"
+        );
+        assert!(
+            Arc::make_mut(&mut index.segments[0])
+                .terms
+                .test_truncate_ram_term_metadata("BODY", "commun"),
+            "la fixture doit réduire exactement 130 postings RAM à 129"
+        );
+
+        assert_eq!(
+            index.decode_from_segment_checked("BODY", "commun"),
+            Err(crate::postings::PostingsReadError::Corrupt),
+            "la lecture checked doit refuser 130 -> 129 même avec deux blocs"
         );
     }
 
