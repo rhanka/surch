@@ -944,6 +944,13 @@ impl PostingsBuilder {
             // comment. No-op (returns every channel resident unchanged,
             // `term_entries_directory: None`) when `disk_enabled` is
             // `false`.
+            // P2 garde une copie canonique du répertoire, construite depuis
+            // le payload avant sa persistance. Elle authentifie les entrées
+            // relues depuis le segment sans redécoder tous les blocs à chaque
+            // ouverture : un maximum ou un count altéré ne peut donc pas
+            // autoriser un saut silencieux.
+            let p2_block_directory = block_directory_flat.clone().into_boxed_slice();
+            let p2_block_dir_offsets = block_dir_offsets.clone().into_boxed_slice();
             let tables = persist_or_keep_term_directory(
                 TermDirectoryChannels {
                     segment_descriptors,
@@ -970,6 +977,8 @@ impl PostingsBuilder {
                     term_entries_directory: tables.term_entries_directory,
                     block_directory: tables.block_directory,
                     block_dir_offsets: tables.block_dir_offsets,
+                    p2_block_directory,
+                    p2_block_dir_offsets,
                 },
             );
         }
@@ -1505,6 +1514,10 @@ impl FieldMergeAccumulator {
         // Plan segments S5b: same best-effort disk-back as
         // `PostingsBuilder::build_with_disk_flag` — see
         // `persist_or_keep_term_directory`'s doc comment.
+        // Comme la construction initiale, la fusion garde l'attestation P2
+        // issue du payload avant de délester le répertoire courant.
+        let p2_block_directory = self.block_directory_flat.clone().into_boxed_slice();
+        let p2_block_dir_offsets = self.block_dir_offsets.clone().into_boxed_slice();
         let tables = persist_or_keep_term_directory(
             TermDirectoryChannels {
                 segment_descriptors: self.segment_descriptors,
@@ -1530,6 +1543,8 @@ impl FieldMergeAccumulator {
                 term_entries_directory: tables.term_entries_directory,
                 block_directory: tables.block_directory,
                 block_dir_offsets: tables.block_dir_offsets,
+                p2_block_directory,
+                p2_block_dir_offsets,
             },
             self.postings_skipped_terms,
         )
@@ -1894,6 +1909,15 @@ pub struct FieldPostings {
     /// S5b: also empty once spilled (see
     /// [`Self::term_entries_directory`]).
     block_dir_offsets: Box<[u32]>,
+    /// Attestation canonique P2 du répertoire FoR. Cette copie est produite
+    /// directement depuis le payload lors de l'indexation et reste résidente
+    /// même lorsque le répertoire de service est déversé dans le segment.
+    /// Les sauts P2 ne font confiance à aucune entrée relue avant cette
+    /// comparaison exacte ; elle évite qu'un maximum abaissé transforme une
+    /// corruption en omission tout en conservant le chargement par blocs.
+    p2_block_directory: Box<[BlockDirEntry]>,
+    /// Offsets CSR de [`Self::p2_block_directory`], indexés comme le FST.
+    p2_block_dir_offsets: Box<[u32]>,
 }
 
 /// Plan segments S5b: one term's COMPLETE per-term metadata, unified
@@ -2251,6 +2275,33 @@ impl FieldPostings {
                     .ok_or(PostingsReadError::Corrupt)
             }
         }
+    }
+
+    /// Retourne l'attestation P2 du répertoire du terme `idx`. Elle provient
+    /// du payload encodé, non de la table de répertoire relue ensuite : une
+    /// divergence de count, d'offset ou de maximum est donc une corruption,
+    /// jamais une invitation à sauter un bloc.
+    fn p2_block_directory_entries_checked(
+        &self,
+        idx: usize,
+    ) -> core::result::Result<&[BlockDirEntry], PostingsReadError> {
+        let start = usize::try_from(
+            *self
+                .p2_block_dir_offsets
+                .get(idx)
+                .ok_or(PostingsReadError::Corrupt)?,
+        )
+        .map_err(|_| PostingsReadError::Corrupt)?;
+        let end = usize::try_from(
+            *self
+                .p2_block_dir_offsets
+                .get(idx + 1)
+                .ok_or(PostingsReadError::Corrupt)?,
+        )
+        .map_err(|_| PostingsReadError::Corrupt)?;
+        self.p2_block_directory
+            .get(start..end)
+            .ok_or(PostingsReadError::Corrupt)
     }
 
     fn lookup_block_metas(&self, term: &str) -> Option<&[BlockMeta]> {
@@ -2682,8 +2733,11 @@ impl TermDictionary {
     /// lisible et cohérent, elle le réutilise sans relire tout le payload : les
     /// blocs effectivement nécessaires sont alors chargés par
     /// [`DiskPostingsCursor::advance_to_with_status`]. Si le répertoire est
-    /// absent ou incohérent, elle conserve le repli checked historique qui
-    /// reconstruit le répertoire depuis le payload entier.
+    /// absent de façon cohérente avec son attestation vide, elle conserve le
+    /// repli checked historique qui reconstruit le répertoire depuis le
+    /// payload entier. Une erreur de lecture ou de décodage, comme une
+    /// divergence avec l'attestation construite depuis ce payload, est au
+    /// contraire une corruption explicite : P2 doit décliner.
     pub fn disk_cursor_p2_checked(
         &self,
         field: &str,
@@ -2700,41 +2754,46 @@ impl TermDictionary {
         entry.validate()?;
         let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
 
-        if let Ok(Some(directory)) =
-            field_postings.block_directory_entries_checked(entry, Some(segment))
-        {
-            let expected_count = entry.postings_count as usize;
-            let counts_match = directory.iter().try_fold(0usize, |count, block| {
-                count.checked_add(block.count as usize)
-            }) == Some(expected_count);
-            let offsets_and_bounds_match = directory
-                .first()
-                .is_some_and(|block| block.byte_offset_in_term_payload == 0)
-                && directory
-                    .last()
-                    .is_some_and(|block| block.byte_offset_in_term_payload < entry.postings_len)
-                && directory.windows(2).all(|pair| {
-                    pair[0].byte_offset_in_term_payload < pair[1].byte_offset_in_term_payload
-                        && pair[0].max_doc_id < pair[1].max_doc_id
-                });
-            if !directory.is_empty() && counts_match && offsets_and_bounds_match {
-                return Ok(Some(DiskPostingsCursor::open_with_directory(
+        let expected_directory = field_postings.p2_block_directory_entries_checked(idx as usize)?;
+        match field_postings.block_directory_entries_checked(entry, Some(segment)) {
+            Ok(Some(directory)) => {
+                let expected_count = usize::try_from(entry.postings_count)
+                    .map_err(|_| PostingsReadError::Corrupt)?;
+                if directory != expected_directory
+                    || !p2_directory_has_expected_shape(
+                        &directory,
+                        expected_count,
+                        entry.postings_len,
+                    )
+                {
+                    // Le répertoire est lu mais ne correspond plus au payload
+                    // qui l'a produit : P2 doit décliner, pas reconstruire un
+                    // résultat partiel à partir de métadonnées contradictoires.
+                    return Err(PostingsReadError::Corrupt);
+                }
+                Ok(Some(DiskPostingsCursor::open_with_directory(
                     segment,
                     entry.postings_offset,
                     entry.postings_len,
                     directory,
                     expected_count,
-                )));
+                )))
             }
+            // Sans répertoire de service, la reconstruction complète reste
+            // sûre seulement si l'attestation confirme qu'il n'en existait
+            // pas. Sinon `block_dir_count == 0` masque une corruption.
+            Ok(None) if expected_directory.is_empty() => DiskPostingsCursor::open_checked(
+                segment,
+                entry.postings_offset,
+                entry.postings_len,
+                entry.postings_count as usize,
+            )
+            .map(Some),
+            Ok(None) => Err(PostingsReadError::Corrupt),
+            // Une table présente mais illisible est une corruption, pas une
+            // absence : le fast path doit décliner vers le chemin générique.
+            Err(_) => Err(PostingsReadError::Corrupt),
         }
-
-        DiskPostingsCursor::open_checked(
-            segment,
-            entry.postings_offset,
-            entry.postings_len,
-            entry.postings_count as usize,
-        )
-        .map(Some)
     }
 
     /// Lot C `C1a-batché` gauge: total bytes physically written to the
@@ -2816,14 +2875,13 @@ impl TermDictionary {
     /// Plan segments S5 (`docs/paper/design-segments-pic-borne-2026-07-05.md`
     /// §"Dimensionnement S5"): total bytes held by the per-term CSR/directory
     /// metadata NO OTHER gauge counted before this — `offsets`,
-    /// `block_offsets`, `segment_descriptors`, `block_directory`, and
-    /// `block_dir_offsets`, RESIDENT bytes only. Summed over every field.
-    /// Plan segments S5b spills ALL five arrays into the shared segment
-    /// once `SURCH_POSTINGS_DISK` is on (see
-    /// [`FieldPostings::term_entries_directory`]'s doc comment), so this
-    /// gauge reads ~0 under the flag — it keeps measuring what actually
-    /// sits on the heap (including any best-effort resident fallback),
-    /// while the spilled bytes show up in
+    /// `block_offsets`, `segment_descriptors`, `block_directory`,
+    /// `block_dir_offsets` et l'attestation P2. Summed over every field.
+    /// Plan segments S5b spills the five service arrays into the shared
+    /// segment once `SURCH_POSTINGS_DISK` is on, mais P2 conserve son
+    /// attestation exacte en mémoire pour refuser une directory corrompue
+    /// avant un saut. Cette jauge mesure donc toutes les métadonnées encore
+    /// réellement résidentes, tandis que les octets déversés apparaissent dans
     /// [`Self::postings_segment_bytes`] (disk footprint, page-cache
     /// backed) instead.
     ///
@@ -2850,6 +2908,8 @@ impl TermDictionary {
                     + (fp.segment_descriptors.len() as u64).saturating_mul(descriptor_size)
                     + (fp.block_directory.len() as u64).saturating_mul(block_dir_entry_size)
                     + (fp.block_dir_offsets.len() as u64).saturating_mul(u32_size)
+                    + (fp.p2_block_directory.len() as u64).saturating_mul(block_dir_entry_size)
+                    + (fp.p2_block_dir_offsets.len() as u64).saturating_mul(u32_size)
             })
             .sum()
     }
@@ -2957,6 +3017,45 @@ impl TermDictionary {
         *end -= 1;
         true
     }
+}
+
+/// Invariants structurels du répertoire accepté par P2. La comparaison à
+/// l'attestation canonique lie déjà chaque valeur au payload source ; ces
+/// gardes bornent en plus toutes les arithmétiques qui déterminent les
+/// tranches de lecture avant l'ouverture du curseur.
+fn p2_directory_has_expected_shape(
+    directory: &[BlockDirEntry],
+    total_count: usize,
+    term_payload_len: u32,
+) -> bool {
+    if total_count == 0
+        || directory.len() != total_count.div_ceil(FOR_BLOCK_SIZE)
+        || directory
+            .first()
+            .map_or(true, |entry| entry.byte_offset_in_term_payload != 0)
+        || directory.last().map_or(true, |entry| {
+            entry.byte_offset_in_term_payload >= term_payload_len
+        })
+    {
+        return false;
+    }
+
+    let mut remaining = total_count;
+    for (idx, entry) in directory.iter().enumerate() {
+        let expected_count = remaining.min(FOR_BLOCK_SIZE);
+        if entry.count as usize != expected_count {
+            return false;
+        }
+        remaining -= expected_count;
+        if let Some(next) = directory.get(idx + 1) {
+            if entry.byte_offset_in_term_payload >= next.byte_offset_in_term_payload
+                || entry.max_doc_id >= next.max_doc_id
+            {
+                return false;
+            }
+        }
+    }
+    remaining == 0
 }
 
 #[derive(Debug, Clone)]
@@ -3430,6 +3529,17 @@ impl<'seg> DiskPostingsCursor<'seg> {
                 let Ok((doc_ids, freqs)) = decode_block(&block_bytes, entry.count as usize) else {
                     return DiskPostingsAdvance::Error;
                 };
+                if doc_ids.len() != entry.count as usize
+                    || freqs.len() != doc_ids.len()
+                    || doc_ids.last().copied() != Some(entry.max_doc_id)
+                {
+                    // Un bloc chargé doit confirmer le count et le maximum
+                    // annoncés par son répertoire. Sans cette preuve, un
+                    // maximum trop haut pourrait faire chercher hors bloc et
+                    // un maximum incohérent ne doit jamais être une fin
+                    // normale des postings.
+                    return DiskPostingsAdvance::Error;
+                }
                 self.loaded = Some((self.block_cursor, doc_ids, freqs));
                 self.local_pos = 0;
             }
@@ -3449,10 +3559,10 @@ impl<'seg> DiskPostingsCursor<'seg> {
             // as `PostingsBlockSkipIter::advance_to`'s scan — bounded
             // here to the decoded block (<= `FOR_BLOCK_SIZE` entries)
             // rather than the whole term, per the design's "galope dans
-            // les <=128 entrées décodées" contract. Same result either
-            // way: the landed block's `max_doc_id >= target` guarantees a
-            // match exists at or before the block's last entry, so this
-            // gallop always finds one — no "exhausted" branch needed.
+            // les <=128 entrées décodées" contract. La borne du
+            // répertoire n'est jamais suffisante à elle seule : le bloc
+            // décodé doit aussi confirmer son maximum avant toute lecture
+            // indexée, sinon une corruption devient une erreur explicite.
             let rest = &doc_ids[self.local_pos..];
             let mut hi = 1usize;
             while hi < rest.len() && rest[hi] < target {
@@ -3462,9 +3572,18 @@ impl<'seg> DiskPostingsCursor<'seg> {
             let hi = hi.min(rest.len());
             let offset = lo + rest[lo..hi].partition_point(|&doc_id| doc_id < target);
             let found_index = self.local_pos + offset;
+            let Some(&found_doc_id) = doc_ids.get(found_index) else {
+                return DiskPostingsAdvance::Error;
+            };
+            let Some(&found_freq) = freqs.get(found_index) else {
+                return DiskPostingsAdvance::Error;
+            };
+            if found_doc_id < target {
+                return DiskPostingsAdvance::Error;
+            }
             self.local_pos = found_index + 1;
-            self.last_freq = freqs[found_index];
-            return DiskPostingsAdvance::Found(doc_ids[found_index]);
+            self.last_freq = found_freq;
+            return DiskPostingsAdvance::Found(found_doc_id);
         }
     }
 
@@ -3510,15 +3629,13 @@ mod tests {
     /// `crates/surch-index/tests/postings.rs`'s read-parity tests — those
     /// can only observe PUBLIC behaviour; this one has access to the
     /// private `FieldPostings` fields and directly asserts the RAM-shrink
-    /// claim the S5 disk-back is FOR: ALL FIVE per-term arrays
+    /// claim the S5 disk-back is FOR: the five service arrays
     /// (`segment_descriptors`, `offsets`, `block_offsets`,
     /// `block_directory`, `block_dir_offsets`) drop to empty
-    /// (`Box::default()`, zero heap — the `postings_directory_bytes`
-    /// gauge reads exactly 0) and `term_entries_directory` becomes
-    /// `Some(_)` once the postings-disk flag is on, for a field that
-    /// carries terms, INCLUDING a multi-block one (so the spilled block
-    /// directory is non-trivial). Flag off stays BYTE-IDENTICAL to the
-    /// historical shape: `T`-sized descriptors, `T + 1` CSR tables,
+    /// (`Box::default()`), tandis que l'attestation P2 reste résidente et
+    /// que `term_entries_directory` devient `Some(_)` une fois le flag
+    /// disque actif. Flag off conserve la forme historique à l'identique :
+    /// descripteurs de taille `T`, tables CSR de taille `T + 1`,
     /// `term_entries_directory == None`.
     #[test]
     fn per_term_directory_moves_off_heap_when_disk_flag_is_on() {
@@ -3551,7 +3668,10 @@ mod tests {
         assert_eq!(field_off.offsets.len(), TERM_COUNT + 1);
         assert_eq!(field_off.block_offsets.len(), TERM_COUNT + 1);
         assert!(
-            field_off.block_directory.is_empty() && field_off.block_dir_offsets.is_empty(),
+            field_off.block_directory.is_empty()
+                && field_off.block_dir_offsets.is_empty()
+                && field_off.p2_block_directory.is_empty()
+                && field_off.p2_block_dir_offsets.is_empty(),
             "flag off never builds a persisted block directory (pre-existing C1b contract)"
         );
         assert!(
@@ -3571,16 +3691,19 @@ mod tests {
                 && field_on.block_offsets.is_empty()
                 && field_on.block_directory.is_empty()
                 && field_on.block_dir_offsets.is_empty(),
-            "flag on should shed every resident per-term array entirely"
+            "flag on should shed every resident service array entirely"
+        );
+        assert!(
+            !field_on.p2_block_directory.is_empty() && !field_on.p2_block_dir_offsets.is_empty(),
+            "P2 doit garder l'attestation canonique qui protège les sauts"
         );
         assert!(
             field_on.term_entries_directory.is_some(),
             "flag on should spill the unified per-term table instead"
         );
-        assert_eq!(
-            dict_on.postings_directory_bytes(),
-            0,
-            "the resident-directory gauge must read exactly 0 once spilled"
+        assert!(
+            dict_on.postings_directory_bytes() > 0,
+            "la jauge doit compter l'attestation P2 résidente"
         );
 
         // Read parity on the spilled side, through the unified accessor:
@@ -3970,6 +4093,112 @@ mod tests {
         assert!(
             cursor.blocks_read() < cursor.blocks_total(),
             "la métrique P2 doit rendre le saut de bloc observable"
+        );
+    }
+
+    fn dictionnaire_p2_deux_blocs() -> TermDictionary {
+        let mut builder = PostingsBuilder::new();
+        for doc_id in 0..(BLOCK_SIZE as u32 * 2) {
+            builder
+                .add("body", "large", doc_id, vec![0])
+                .expect("les postings P2 doivent être construits");
+        }
+        builder.build_with_disk_flag(true)
+    }
+
+    fn rend_repertoire_p2_resident(dictionary: &mut TermDictionary) -> Vec<BlockDirEntry> {
+        let segment = dictionary
+            .postings_segment
+            .as_deref()
+            .expect("le segment disque doit exister");
+        let (entry, canonical_directory) = {
+            let field = dictionary.fields.get("body").expect("field present");
+            let idx = field.fst.get(b"large").expect("term present") as usize;
+            (
+                field
+                    .term_entry(idx, Some(segment))
+                    .expect("entry persisted present"),
+                field.p2_block_directory.to_vec(),
+            )
+        };
+        let directory_len = canonical_directory.len() as u32;
+        let field = dictionary.fields.get_mut("body").expect("field present");
+        field.term_entries_directory = None;
+        field.segment_descriptors = vec![(entry.postings_offset, entry.postings_len)].into();
+        field.offsets = vec![0, entry.postings_count].into();
+        field.block_directory = canonical_directory.clone().into();
+        field.block_dir_offsets = vec![0, directory_len].into();
+        canonical_directory
+    }
+
+    #[test]
+    fn p2_rejette_un_maximum_de_repertoire_abaissé_avant_tout_saut() {
+        let mut dictionary = dictionnaire_p2_deux_blocs();
+        let canonical_directory = rend_repertoire_p2_resident(&mut dictionary);
+        let field = dictionary.fields.get_mut("body").expect("field present");
+        assert_eq!(canonical_directory.len(), 2, "deux blocs attendus");
+        field.block_directory[0].max_doc_id = canonical_directory[0].max_doc_id - 1;
+
+        assert!(matches!(
+            dictionary.disk_cursor_p2_checked("body", "large"),
+            Err(PostingsReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn p2_rejette_un_maximum_de_repertoire_haussé_sans_panique() {
+        let mut dictionary = dictionnaire_p2_deux_blocs();
+        let canonical_directory = rend_repertoire_p2_resident(&mut dictionary);
+        let field = dictionary.fields.get_mut("body").expect("field present");
+        assert_eq!(canonical_directory.len(), 2, "deux blocs attendus");
+        field.block_directory[0].max_doc_id = canonical_directory[1].max_doc_id - 1;
+
+        assert!(matches!(
+            dictionary.disk_cursor_p2_checked("body", "large"),
+            Err(PostingsReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn p2_rejette_un_repertoire_declare_absent_mais_atteste() {
+        let mut dictionary = dictionnaire_p2_deux_blocs();
+        rend_repertoire_p2_resident(&mut dictionary);
+        let field = dictionary.fields.get_mut("body").expect("field present");
+        field.block_dir_offsets = vec![0, 0].into();
+
+        assert!(matches!(
+            dictionary.disk_cursor_p2_checked("body", "large"),
+            Err(PostingsReadError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn curseur_disque_refuse_un_maximum_haussé_sans_indexer_hors_borne() {
+        let dictionary = dictionnaire_p2_deux_blocs();
+        let segment = dictionary
+            .postings_segment
+            .as_deref()
+            .expect("le segment disque doit exister");
+        let field = dictionary.fields.get("body").expect("field present");
+        let idx = field.fst.get(b"large").expect("term present") as usize;
+        let entry = field
+            .term_entry(idx, Some(segment))
+            .expect("entry persisted present");
+        let mut directory = field.p2_block_directory.to_vec();
+        assert_eq!(directory.len(), 2, "deux blocs attendus");
+        directory[0].max_doc_id = directory[1].max_doc_id - 1;
+        let mut cursor = DiskPostingsCursor::open_with_directory(
+            segment,
+            entry.postings_offset,
+            entry.postings_len,
+            directory,
+            entry.postings_count as usize,
+        );
+
+        assert_eq!(
+            cursor.advance_to_with_status(BLOCK_SIZE as u32),
+            DiskPostingsAdvance::Error,
+            "un maximum trop haut doit devenir une erreur, jamais un panic"
         );
     }
 

@@ -12,7 +12,9 @@ use fst::{Map, MapBuilder, Streamer};
 use rayon::prelude::*;
 use serde_json::Value;
 use surch_index::{
-    document_index::{DocumentIndex, SegmentPostingsAdvance, SegmentPostingsCursor},
+    document_index::{
+        DocumentIndex, SegmentPostingsAdvance, SegmentPostingsCursor, SegmentedPostings,
+    },
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
     postings::{BlockMeta, PostingsBlockSkipIter, PostingsList},
@@ -992,13 +994,29 @@ struct P2DiskBlockMetrics {
     blocks_total: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Injection locale : simule une erreur P2 après le premier candidat
+    /// scoré pour prouver que le routeur abandonne son buffer temporaire.
+    static P2_ERREUR_TARDIVE_INJECTEE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn injecter_erreur_p2_tardive_pour_test() {
+    P2_ERREUR_TARDIVE_INJECTEE.with(|injection| injection.set(true));
+}
+
+#[cfg(test)]
+fn consommer_erreur_p2_tardive_injectee() -> bool {
+    P2_ERREUR_TARDIVE_INJECTEE.with(|injection| injection.replace(false))
+}
+
 impl P2DiskBlockMetrics {
-    fn observe(&mut self, cursors: &[&SegmentPostingsCursor<'_>]) {
-        for cursor in cursors {
-            if let Some((read, total)) = cursor.disk_block_counts() {
-                self.blocks_read = self.blocks_read.saturating_add(read);
-                self.blocks_total = self.blocks_total.saturating_add(total);
-            }
+    fn observe_segmented(&mut self, postings: &[SegmentedPostings<'_>]) {
+        for term in postings {
+            let (read, total) = term.disk_block_counts();
+            self.blocks_read = self.blocks_read.saturating_add(read);
+            self.blocks_total = self.blocks_total.saturating_add(total);
         }
     }
 
@@ -1047,7 +1065,7 @@ struct IndexSearchCache {
 
 /// Réponse mémorisée avec sa provenance P1a. Le cache ne relance jamais le
 /// scorer : cette donnée conserve la sémantique du compteur lorsqu'une
-/// réponse RAM directe est servie depuis le cache.
+/// réponse directe saine, RAM, disque ou multi-segment, est servie du cache.
 #[derive(Clone)]
 struct SearchCacheEntry {
     bytes: Vec<u8>,
@@ -3046,9 +3064,17 @@ impl InMemoryIndex {
             match index.segmented_postings_checked(field, term) {
                 Ok(Some(postings)) => segmented_terms.push(postings),
                 // Terme absent de tous les segments : l'AND entier est vide.
-                Ok(None) => return Vec::new(),
+                Ok(None) => {
+                    block_metrics.observe_segmented(&segmented_terms);
+                    block_metrics.publish();
+                    return Vec::new();
+                }
                 // Ne jamais publier le préfixe des segments déjà lus.
-                Err(_) => return Self::conjunction_hits_merged(index, terms),
+                Err(_) => {
+                    block_metrics.observe_segmented(&segmented_terms);
+                    block_metrics.publish();
+                    return Self::conjunction_hits_merged(index, terms);
+                }
             }
         }
 
@@ -3063,29 +3089,26 @@ impl InMemoryIndex {
                     // candidats et conservent leur `df` global au scoring.
                     None => {
                         missing_clause = true;
-                        break;
                     }
                 }
             }
             if missing_clause {
-                let metric_cursors: Vec<_> = cursors.iter().map(|cursor| &**cursor).collect();
-                block_metrics.observe(&metric_cursors);
                 continue;
             }
-            match Self::conjunction_hits_segment(&mut cursors) {
+            let segment_result = Self::conjunction_hits_segment(&mut cursors);
+            drop(cursors);
+            match segment_result {
                 Ok(segment_hits) => {
-                    let metric_cursors: Vec<_> = cursors.iter().map(|cursor| &**cursor).collect();
-                    block_metrics.observe(&metric_cursors);
                     out.extend(segment_hits);
                 }
                 Err(()) => {
-                    let metric_cursors: Vec<_> = cursors.iter().map(|cursor| &**cursor).collect();
-                    block_metrics.observe(&metric_cursors);
+                    block_metrics.observe_segmented(&segmented_terms);
                     block_metrics.publish();
                     return Self::conjunction_hits_merged(index, terms);
                 }
             }
         }
+        block_metrics.observe_segmented(&segmented_terms);
         block_metrics.publish();
         out
     }
@@ -4885,20 +4908,39 @@ impl AppState {
     ) -> Option<Vec<(f64, u32)>> {
         let mut segmented_terms = Vec::with_capacity(clauses.len());
         let mut scoring_terms = Vec::with_capacity(clauses.len());
+        let mut block_metrics = P2DiskBlockMetrics::default();
         for &(field, value) in clauses {
             let recall = normalized_terms_for_field(value, field, &data.mapping);
             if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
+                block_metrics.observe_segmented(&segmented_terms);
+                block_metrics.publish();
                 return None;
             }
             let token = recall.into_iter().next().expect("len checked == 1");
             let postings = match data.index.segmented_postings_checked(field, &token) {
                 Ok(Some(postings)) => postings,
                 // Le terme est absent de tous les segments : l'AND est vide.
-                Ok(None) => return Some(Vec::new()),
-                // La distinction checked impose un repli, jamais un préfixe.
-                Err(_) => return Self::fused_conjunction_scores_merged(data, clauses, mode),
+                Ok(None) => {
+                    block_metrics.observe_segmented(&segmented_terms);
+                    block_metrics.publish();
+                    return Some(Vec::new());
+                }
+                // Une erreur checked doit décliner AVANT compteur et
+                // finalisation : le chemin générique reste seul autorisé à
+                // produire la réponse compatible.
+                Err(_) => {
+                    block_metrics.observe_segmented(&segmented_terms);
+                    block_metrics.publish();
+                    return None;
+                }
             };
-            let field_stats = data.field_scoring_stats(field)?;
+            let Some(field_stats) = data.field_scoring_stats(field) else {
+                // Même une construction de statistiques incomplète doit
+                // conserver le coût des termes déjà ouverts avant le déclin.
+                block_metrics.observe_segmented(&segmented_terms);
+                block_metrics.publish();
+                return None;
+            };
             scoring_terms.push((field_stats, postings.global_df()));
             segmented_terms.push(postings);
         }
@@ -4931,7 +4973,6 @@ impl AppState {
             };
 
         let mut scored: Vec<(f64, u32)> = Vec::new();
-        let mut block_metrics = P2DiskBlockMetrics::default();
         for segment_idx in 0..data.index.segment_count() {
             let mut cursors = Vec::with_capacity(segmented_terms.len());
             let mut missing_clause = false;
@@ -4941,13 +4982,10 @@ impl AppState {
                     // Une clause absente rend seulement ce segment vide.
                     None => {
                         missing_clause = true;
-                        break;
                     }
                 }
             }
             if missing_clause {
-                let metric_cursors: Vec<_> = cursors.iter().map(|(_, cursor)| &**cursor).collect();
-                block_metrics.observe(&metric_cursors);
                 continue;
             }
             cursors.sort_by_key(|(_, cursor)| cursor.local_df());
@@ -4994,113 +5032,22 @@ impl AppState {
                             term_contrib(field_stats, *doc_freq, doc_id, frequencies[clause_idx]);
                     }
                     scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+                    #[cfg(test)]
+                    if consommer_erreur_p2_tardive_injectee() {
+                        return Err(());
+                    }
                 }
                 Ok(())
             })();
-            let metric_cursors: Vec<_> = cursors.iter().map(|(_, cursor)| &**cursor).collect();
-            block_metrics.observe(&metric_cursors);
+            drop(cursors);
             if segment_result.is_err() {
+                block_metrics.observe_segmented(&segmented_terms);
                 block_metrics.publish();
-                return Self::fused_conjunction_scores_merged(data, clauses, mode);
-            }
-        }
-        block_metrics.publish();
-        Some(scored)
-    }
-
-    /// Référence matérialisée de repli pour
-    /// [`Self::fused_conjunction_scores_disk`]. P2 la conserve uniquement
-    /// lorsqu'une lecture checked échoue, jamais comme parcours multi-segment
-    /// nominal.
-    fn fused_conjunction_scores_merged(
-        data: &InMemoryIndex,
-        clauses: &[(&str, &str)],
-        mode: FusedConjunctionScoreMode,
-    ) -> Option<Vec<(f64, u32)>> {
-        struct MergedTermCtx<'a> {
-            field_stats: FieldScoringStats<'a>,
-            doc_freq: u64,
-            doc_ids: Vec<u32>,
-            freqs: Vec<u32>,
-        }
-        let mut terms: Vec<MergedTermCtx<'_>> = Vec::with_capacity(clauses.len());
-        for &(field, value) in clauses {
-            let recall = normalized_terms_for_field(value, field, &data.mapping);
-            if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
                 return None;
             }
-            let token = recall.into_iter().next().expect("len checked == 1");
-            let Some((doc_ids, freqs)) = data.index.decode_from_segment(field, &token) else {
-                // A required term with no postings ⇒ the intersection is empty.
-                return Some(Vec::new());
-            };
-            if doc_ids.is_empty() {
-                return Some(Vec::new());
-            }
-            let field_stats = data.field_scoring_stats(field)?;
-            let doc_freq = doc_ids.len() as u64;
-            terms.push(MergedTermCtx {
-                field_stats,
-                doc_freq,
-                doc_ids,
-                freqs,
-            });
         }
-
-        // Drive the rarest term; same ordering rationale as the RAM/disk
-        // paths.
-        terms.sort_by_key(|t| t.doc_ids.len());
-        let config = Bm25Config::default();
-
-        // Same `term_contrib` kernel as the RAM/disk paths.
-        let term_contrib =
-            |field_stats: &FieldScoringStats<'_>, doc_freq: u64, doc_id: u32, freq: u32| -> f64 {
-                if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
-                    return fused_bm25_contribution(None, mode);
-                }
-                let doc_len = if field_stats.norms_enabled {
-                    match field_stats.doc_len(doc_id) {
-                        Some(len) => len,
-                        None => return fused_bm25_contribution(None, mode),
-                    }
-                } else {
-                    1
-                };
-                let score = bm25_score(
-                    config,
-                    field_stats.doc_count,
-                    doc_freq,
-                    u64::from(freq),
-                    doc_len,
-                    field_stats.avg_doc_len,
-                )
-                .ok();
-                fused_bm25_contribution(score, mode)
-            };
-
-        let mut scored: Vec<(f64, u32)> = Vec::new();
-        'docs: for (idx, &doc_id) in terms[0].doc_ids.iter().enumerate() {
-            let mut sum = term_contrib(
-                &terms[0].field_stats,
-                terms[0].doc_freq,
-                doc_id,
-                terms[0].freqs[idx],
-            );
-            for follower in &terms[1..] {
-                match follower.doc_ids.binary_search(&doc_id) {
-                    Ok(pos) => {
-                        sum += term_contrib(
-                            &follower.field_stats,
-                            follower.doc_freq,
-                            doc_id,
-                            follower.freqs[pos],
-                        );
-                    }
-                    Err(_) => continue 'docs,
-                }
-            }
-            scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
-        }
+        block_metrics.observe_segmented(&segmented_terms);
+        block_metrics.publish();
         Some(scored)
     }
 

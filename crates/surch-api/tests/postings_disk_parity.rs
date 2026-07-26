@@ -270,7 +270,10 @@ async fn postings_disk_flag_on_matches_flag_off_bit_identical() {
         );
     }
 
-    let p1a_direct = r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":100}"#;
+    // Deux termes distincts, pagination et `min_score` évitent une fausse
+    // parité où le même `df` serait utilisé deux fois ou où la finalisation
+    // ignorerait ses filtres. Le chemin forcé-générique reste l'oracle.
+    let p1a_direct = r#"{"from":5,"size":17,"min_score":0.8,"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"category":"tools"}}]}}}"#;
     for (layout, router, direct_eligible) in [
         ("RAM", &router_off, true),
         // Après le lot S (`cb0ada8`), P2 couvre le disque checked : le
@@ -290,6 +293,11 @@ async fn postings_disk_flag_on_matches_flag_off_bit_identical() {
             p1a_scored_response_fingerprint(&direct),
             p1a_scored_response_fingerprint(&generic),
             "[P1a {layout}] réponse rapide et référence générique divergent"
+        );
+        assert_eq!(
+            direct["hits"]["hits"].as_array().map(Vec::len),
+            Some(17),
+            "[P2 {layout}] `from`/`size` doit conserver la fenêtre demandée"
         );
     }
 }

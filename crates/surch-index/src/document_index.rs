@@ -468,6 +468,22 @@ impl<'a> SegmentedPostings<'a> {
     pub fn cursor_at_mut(&mut self, segment_idx: usize) -> Option<&mut SegmentPostingsCursor<'a>> {
         self.per_segment.get_mut(segment_idx)?.as_mut()
     }
+
+    /// Compteurs cumulés des curseurs disque de cette vue. La collecte se
+    /// fait après la tentative P2 afin d'inclure aussi les termes ouverts
+    /// avant une erreur de construction ou un segment localement incomplet.
+    pub fn disk_block_counts(&self) -> (u64, u64) {
+        self.per_segment
+            .iter()
+            .flatten()
+            .filter_map(SegmentPostingsCursor::disk_block_counts)
+            .fold((0, 0), |(read, total), (cursor_read, cursor_total)| {
+                (
+                    read.saturating_add(cursor_read),
+                    total.saturating_add(cursor_total),
+                )
+            })
+    }
 }
 
 /// Plan segments S2: resolution mode for [`DocumentIndex::maybe_flush_by_budget`]
@@ -2511,9 +2527,9 @@ impl DocumentIndex {
     /// `block_directory`, `block_dir_offsets`) that no other gauge counted
     /// before this — see
     /// [`crate::postings::TermDictionary::postings_directory_bytes`] for
-    /// the full rationale (S5b spills all five under
-    /// `SURCH_POSTINGS_DISK`, so this reads ~0 with the flag on). Summed
-    /// over every sealed segment.
+    /// la justification complète. S5b déverse les cinq tableaux de service
+    /// sous `SURCH_POSTINGS_DISK`, mais P2 conserve une attestation exacte
+    /// des répertoires ; cette jauge la compte sur tous les segments scellés.
     pub fn postings_directory_bytes(&self) -> u64 {
         self.segments
             .iter()

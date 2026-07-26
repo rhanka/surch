@@ -103,10 +103,11 @@ pub struct MemoryUsage {
     /// the ~295 MiB gap between jemalloc `allocated` and the sum of every
     /// other gauge measured on the 1,36 M matchID corpus (design doc's
     /// dimensioning table). The S5b disk-back (see
-    /// `postings::FieldPostings::term_entries_directory`) spills all five
-    /// arrays into the shared postings segment under
-    /// `SURCH_POSTINGS_DISK`, so this gauge is expected to read ~0 with
-    /// the flag on — see
+    /// `postings::FieldPostings::term_entries_directory`) déverse les cinq
+    /// tableaux de service dans le segment partagé sous
+    /// `SURCH_POSTINGS_DISK`. P2 garde toutefois une attestation canonique
+    /// résidente pour vérifier les sauts ; cette jauge doit donc inclure ce
+    /// coût — voir
     /// `postings::TermDictionary::postings_directory_bytes` for the full
     /// byte-cost breakdown.
     pub postings_directory_bytes: u64,

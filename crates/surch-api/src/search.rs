@@ -884,10 +884,10 @@ pub async fn search_handler(
     if let (Some(key), Some(index)) = (cache_key, indices.first()) {
         if let Some((bytes, direct_must_fused)) = state.search_cache_get(index, key) {
             metrics::counter!("surch_search_cache_hit_total").increment(1);
-            // Une réponse P1a RAM reste directe quand le cache évite de
+            // Une réponse P1a directe reste directe quand le cache évite de
             // rejouer le scorer. La provenance est écrite à l'insertion :
-            // disque et multi-segment ne peuvent jamais incrémenter ce
-            // compteur depuis le cache.
+            // une réponse saine RAM, disque ou multi-segment peut donc
+            // incrémenter ce compteur depuis le cache.
             if direct_must_fused {
                 metrics::counter!("surch_bool_direct_must_fused_total").increment(1);
             }
@@ -1218,6 +1218,54 @@ mod p1a_direct_must_tests {
             filter.push(leaf("COMMUNE", "PARIS"));
         }
         assert!(reduce_direct_must_conjunction(&with_filter).is_none());
+    }
+}
+
+#[cfg(test)]
+mod p2_erreur_tardive_tests {
+    use serde_json::json;
+
+    use super::{parse_search_request, run_topk_exact_bool};
+    use crate::state::{injecter_erreur_p2_tardive_pour_test, AppState};
+
+    #[test]
+    fn erreur_p2_tardive_decline_avant_compteur_et_finalisation_directe() {
+        let index = "p2-erreur-tardive";
+        let state = AppState::default();
+        state.create_index(index, None, json!({}), Default::default());
+        state.set_postings_disk_enabled(index, true);
+        for doc_id in 0..4 {
+            state.index_document(
+                index,
+                &doc_id.to_string(),
+                json!({"title":"anchor", "category":"shared"}),
+            );
+        }
+        state.refresh_index(index);
+        let request = parse_search_request(
+            r#"{"query":{"bool":{"must":[{"match":{"title":"anchor"}},{"match":{"category":"shared"}}]}}}"#,
+        )
+        .expect("la requête P1a doit être valide");
+
+        injecter_erreur_p2_tardive_pour_test();
+        let response = run_topk_exact_bool(
+            &state,
+            &[index.to_owned()],
+            &request,
+            true,
+            std::time::Instant::now(),
+        )
+        .expect("le chemin générique doit reprendre la requête");
+
+        assert!(
+            !response.direct_must_fused,
+            "une erreur tardive ne doit ni finaliser ni marquer la réponse directe"
+        );
+        assert_eq!(
+            response.hits.hits.len(),
+            4,
+            "le chemin générique doit remplacer, jamais publier, le préfixe P2"
+        );
     }
 }
 

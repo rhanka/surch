@@ -787,8 +787,9 @@ fn term_dictionary_fst_terms_returns_lex_sorted() {
 /// white-box test `per_term_directory_moves_off_heap_when_disk_flag_is_on`
 /// (in `crates/surch-index/src/postings.rs`'s own `#[cfg(test)]` module,
 /// which has access to the private `FieldPostings` fields) covers the
-/// actual RAM-shrink claim from the inside, including the
-/// `postings_directory_bytes() == 0` gauge assertion.
+/// régression mémoire et l'attestation P2 depuis l'intérieur : les cinq
+/// tableaux de service sont déversés, mais `postings_directory_bytes()`
+/// conserve la copie canonique nécessaire à des sauts vérifiés.
 #[test]
 fn postings_disk_backed_descriptors_match_resident_descriptors() {
     // 200 DISTINCT terms per field (T = 200) so the per-term CSR/directory
@@ -819,6 +820,10 @@ fn postings_disk_backed_descriptors_match_resident_descriptors() {
     assert!(
         dict_off.postings_directory_bytes() > 0,
         "flag-off dictionary should carry non-zero directory bytes (resident segment_descriptors)"
+    );
+    assert!(
+        dict_on.postings_directory_bytes() > 0,
+        "l'attestation P2 résidente doit rester comptabilisée"
     );
 
     // Read parity: the disk-backed descriptor lookup (one extra `pread`)
