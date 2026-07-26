@@ -3715,6 +3715,33 @@ mod tests {
         (index, mapping)
     }
 
+    /// Fixture multi-segment avec un premier posting assez large pour que
+    /// retirer sa dernière entrée laisse les slices RAM dans les bornes,
+    /// mais désaligne le nombre de métadonnées de blocs.
+    fn multi_segment_index_with_large_common_term() -> DocumentIndex {
+        let mapping = IndexMapping::default();
+        let mut index = DocumentIndex::new();
+        index.set_flush_budget_bytes_override(Some(1));
+        index.set_postings_disk_enabled(false);
+        index.set_merge_fanin_override(0);
+
+        let first_segment: Vec<_> = (0..=crate::postings::BLOCK_SIZE as u32)
+            .map(|doc_id| (doc_id, [("BODY", "commun")]))
+            .collect();
+        index
+            .add_documents_with_mapping_deferred(first_segment, &mapping)
+            .expect("premier segment large");
+        index.maybe_flush_by_budget();
+        index
+            .add_documents_with_mapping_deferred(
+                [(crate::postings::BLOCK_SIZE as u32 + 1, [("BODY", "commun")])],
+                &mapping,
+            )
+            .expect("second segment");
+        index.materialize_terms_and_finalize_postings();
+        index
+    }
+
     #[test]
     fn budget_flush_seals_real_segments_with_global_reads_intact() {
         let (index, _mapping) = multi_segment_index();
@@ -3771,19 +3798,19 @@ mod tests {
     }
 
     #[test]
-    fn checked_multi_segment_propage_une_table_ram_incoherente() {
-        let (mut index, _mapping) = multi_segment_index();
+    fn checked_multi_segment_rejette_un_prefixe_ram_borne() {
+        let mut index = multi_segment_index_with_large_common_term();
         assert!(
-            Arc::make_mut(&mut index.segments[1])
+            Arc::make_mut(&mut index.segments[0])
                 .terms
-                .test_corrupt_ram_term_metadata("BODY", "commun"),
-            "la fixture doit contenir le terme RAM à corrompre"
+                .test_truncate_ram_term_metadata("BODY", "commun"),
+            "la fixture doit contenir un terme RAM dont le préfixe reste borné"
         );
 
         assert_eq!(
             index.decode_from_segment_checked("BODY", "commun"),
             Err(crate::postings::PostingsReadError::Corrupt),
-            "une table RAM incohérente ne doit pas devenir une absence"
+            "un préfixe RAM borné ne doit pas être publié par la fusion"
         );
     }
 

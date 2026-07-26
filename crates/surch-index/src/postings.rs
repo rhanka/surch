@@ -202,7 +202,9 @@ mod postings_segment {
         /// (not-yet-production) cold-path decode, never from a path RAM
         /// depends on.
         pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
-            self.read_checked(offset, length).ok()
+            let mut buf = vec![0u8; length as usize];
+            self.file.read_exact_at(&mut buf, offset).ok()?;
+            Some(buf)
         }
 
         /// Total bytes appended so far — feeds the
@@ -260,7 +262,9 @@ mod postings_segment {
         }
 
         pub(crate) fn read(&self, offset: u64, length: u32) -> Option<Vec<u8>> {
-            self.read_checked(offset, length).ok()
+            let start = usize::try_from(offset).ok()?;
+            let end = start.checked_add(length as usize)?;
+            self.buf.get(start..end).map(<[u8]>::to_vec)
         }
 
         pub(crate) fn bytes_written(&self) -> u64 {
@@ -2038,6 +2042,22 @@ impl FieldPostings {
         ))
     }
 
+    /// Accès historique à la couverture disque d'un terme. Les variantes
+    /// vérifiées lisent directement [`Self::term_entry_checked`] pour ne
+    /// pas modifier les appels existants qui conservent ce contrat lossy.
+    fn segment_slice(
+        &self,
+        term: &str,
+        segment: Option<&PostingsSegment>,
+    ) -> Option<((u64, u32), usize)> {
+        let idx = self.fst.get(term.as_bytes())? as usize;
+        let entry = self.term_entry(idx, segment)?;
+        Some((
+            (entry.postings_offset, entry.postings_len),
+            entry.postings_count as usize,
+        ))
+    }
+
     /// Plan segments S5b: resolve term idx `idx`'s whole [`TermEntry`],
     /// either assembled from the resident arrays (postings-disk flag was
     /// off at build time, or persisting the directory failed — see
@@ -2148,7 +2168,6 @@ impl FieldPostings {
     /// including every RAM-mode build) or on any I/O/decode failure —
     /// [`TermDictionary::disk_cursor`] then falls back to
     /// [`DiskPostingsCursor::open`]'s payload-recompute path.
-    #[allow(dead_code)] // Conservé pour les lecteurs historiques internes.
     fn block_directory_entries(
         &self,
         entry: TermEntry,
@@ -2286,6 +2305,12 @@ impl FieldPostings {
             .block_metas_flat
             .get(block_start..block_end)
             .ok_or(PostingsReadError::Corrupt)?;
+        if doc_ids.is_empty()
+            || !doc_ids.windows(2).all(|pair| pair[0] < pair[1])
+            || block_metas.len() != doc_ids.len().div_ceil(BLOCK_SIZE)
+        {
+            return Err(PostingsReadError::Corrupt);
+        }
         let roaring_idx = u32::try_from(idx).map_err(|_| PostingsReadError::Corrupt)?;
         Ok(Some(PostingsList {
             doc_ids,
@@ -2518,7 +2543,14 @@ impl TermDictionary {
     }
 
     pub fn decode_from_segment(&self, field: &str, term: &str) -> Option<(Vec<u32>, Vec<u32>)> {
-        self.decode_from_segment_checked(field, term).ok().flatten()
+        let field_postings = self.fields.get(field)?;
+        let segment = self.postings_segment.as_deref();
+        let ((offset, len), count) = field_postings.segment_slice(term, segment)?;
+        if len == 0 {
+            return None;
+        }
+        let bytes = segment?.read(offset, len)?;
+        decode_postings_blocked(&bytes, count).ok()
     }
 
     /// Lot C `C1b` sous-pas 1: build a [`DiskPostingsCursor`] over
@@ -2549,9 +2581,40 @@ impl TermDictionary {
     /// (`block_dir_count == 0` with a readable payload — see
     /// [`TermEntry`]'s sentinel contract; such a term is NOT empty).
     ///
+    /// Wrapper historique volontairement lossy. Son chemin rapide reste
+    /// strictement limité à la lecture de l'entrée et du répertoire par
+    /// blocs : aucune validation checked ni lecture intégrale du payload
+    /// n'est ajoutée avant le premier saut de bloc.
+    pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
+        let field_postings = self.fields.get(field)?;
+        let segment = self.postings_segment.as_deref();
+        let idx = field_postings.fst.get(term.as_bytes())? as usize;
+        let entry = field_postings.term_entry(idx, segment)?;
+        if entry.postings_len == 0 {
+            return None;
+        }
+        let segment = segment?;
+        if let Some(directory) = field_postings.block_directory_entries(entry, Some(segment)) {
+            return Some(DiskPostingsCursor::open_with_directory(
+                segment,
+                entry.postings_offset,
+                entry.postings_len,
+                directory,
+                entry.postings_count as usize,
+            ));
+        }
+        DiskPostingsCursor::open(
+            segment,
+            entry.postings_offset,
+            entry.postings_len,
+            entry.postings_count as usize,
+        )
+    }
+
     /// Variante vérifiée du curseur : seul un champ ou terme absent donne
     /// `Ok(None)` ; une couverture résolue mais illisible retourne une
-    /// [`PostingsReadError`].
+    /// [`PostingsReadError`]. Elle est distincte du wrapper historique
+    /// afin de ne pas modifier son coût ni sa surface d'erreur.
     pub fn disk_cursor_checked(
         &self,
         field: &str,
@@ -2588,10 +2651,6 @@ impl TermDictionary {
             }
         }
         Ok(Some(cursor))
-    }
-
-    pub fn disk_cursor(&self, field: &str, term: &str) -> Option<DiskPostingsCursor<'_>> {
-        self.disk_cursor_checked(field, term).ok().flatten()
     }
 
     /// Lot C `C1a-batché` gauge: total bytes physically written to the
@@ -2790,7 +2849,7 @@ impl TermDictionary {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_corrupt_ram_term_metadata(&mut self, field: &str, term: &str) -> bool {
+    pub(crate) fn test_truncate_ram_term_metadata(&mut self, field: &str, term: &str) -> bool {
         let Some(field_postings) = self.fields.get_mut(field) else {
             return false;
         };
@@ -2800,10 +2859,18 @@ impl TermDictionary {
         let Ok(idx) = usize::try_from(raw_idx) else {
             return false;
         };
+        let Some(&start) = field_postings.offsets.get(idx) else {
+            return false;
+        };
         let Some(end) = field_postings.offsets.get_mut(idx + 1) else {
             return false;
         };
-        *end = u32::MAX;
+        if *end <= start.saturating_add(1) {
+            return false;
+        }
+        // La borne reste dans les tableaux RAM : seule la fin logique du
+        // terme perd un posting, ce qui simule un préfixe encore lisible.
+        *end -= 1;
         true
     }
 }
@@ -3169,14 +3236,25 @@ impl<'seg> DiskPostingsCursor<'seg> {
         })
     }
 
-    #[allow(dead_code)] // Conservé comme adaptateur lossy historique interne.
     pub(crate) fn open(
         segment: &'seg PostingsSegment,
         term_base_offset: u64,
         term_payload_len: u32,
         total_count: usize,
     ) -> Option<Self> {
-        Self::open_checked(segment, term_base_offset, term_payload_len, total_count).ok()
+        let payload = segment.read(term_base_offset, term_payload_len)?;
+        let directory = block_directory(&payload, total_count).ok()?;
+        Some(Self {
+            segment,
+            term_base_offset,
+            term_payload_len,
+            directory,
+            block_cursor: 0,
+            loaded: None,
+            local_pos: 0,
+            last_freq: 0,
+            total_count,
+        })
     }
 
     /// Lot C `C1b` sous-pas 2: build a cursor from an ALREADY-COMPUTED
