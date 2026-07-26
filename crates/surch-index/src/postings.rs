@@ -2678,6 +2678,65 @@ impl TermDictionary {
         Ok(Some(cursor))
     }
 
+    /// Ouverture checked dédiée à P2. Quand le répertoire persistant est
+    /// lisible et cohérent, elle le réutilise sans relire tout le payload : les
+    /// blocs effectivement nécessaires sont alors chargés par
+    /// [`DiskPostingsCursor::advance_to_with_status`]. Si le répertoire est
+    /// absent ou incohérent, elle conserve le repli checked historique qui
+    /// reconstruit le répertoire depuis le payload entier.
+    pub fn disk_cursor_p2_checked(
+        &self,
+        field: &str,
+        term: &str,
+    ) -> CheckedPostings<DiskPostingsCursor<'_>> {
+        let Some(field_postings) = self.fields.get(field) else {
+            return Ok(None);
+        };
+        let Some(idx) = field_postings.fst.get(term.as_bytes()) else {
+            return Ok(None);
+        };
+        let segment = self.postings_segment.as_deref();
+        let entry = field_postings.term_entry_checked(idx as usize, segment)?;
+        entry.validate()?;
+        let segment = segment.ok_or(PostingsReadError::MissingCoverage)?;
+
+        if let Ok(Some(directory)) =
+            field_postings.block_directory_entries_checked(entry, Some(segment))
+        {
+            let expected_count = entry.postings_count as usize;
+            let counts_match = directory.iter().try_fold(0usize, |count, block| {
+                count.checked_add(block.count as usize)
+            }) == Some(expected_count);
+            let offsets_and_bounds_match = directory
+                .first()
+                .is_some_and(|block| block.byte_offset_in_term_payload == 0)
+                && directory
+                    .last()
+                    .is_some_and(|block| block.byte_offset_in_term_payload < entry.postings_len)
+                && directory.windows(2).all(|pair| {
+                    pair[0].byte_offset_in_term_payload < pair[1].byte_offset_in_term_payload
+                        && pair[0].max_doc_id < pair[1].max_doc_id
+                });
+            if !directory.is_empty() && counts_match && offsets_and_bounds_match {
+                return Ok(Some(DiskPostingsCursor::open_with_directory(
+                    segment,
+                    entry.postings_offset,
+                    entry.postings_len,
+                    directory,
+                    expected_count,
+                )));
+            }
+        }
+
+        DiskPostingsCursor::open_checked(
+            segment,
+            entry.postings_offset,
+            entry.postings_len,
+            entry.postings_count as usize,
+        )
+        .map(Some)
+    }
+
     /// Lot C `C1a-batché` gauge: total bytes physically written to the
     /// disk segment so far (`surch_index_disk_postings_bytes`). Mirrors
     /// `surch_index_disk_segment_bytes` (the `source.dat`/`_source`
@@ -3200,6 +3259,10 @@ pub struct DiskPostingsCursor<'seg> {
     /// `fused_conjunction_scores_disk` (surch-api) reads it per term per
     /// query BEFORE any `advance_to`, for idf and driver ordering.
     total_count: usize,
+    /// Nombre de blocs effectivement lus. Le repli checked qui reconstruit le
+    /// répertoire depuis le payload entier compte tous ses blocs, afin de ne
+    /// pas maquiller ce coût dans la métrique P2.
+    blocks_read: usize,
 }
 
 /// Résultat explicite d'une avance disque : la fin normale des postings et
@@ -3252,6 +3315,7 @@ impl<'seg> DiskPostingsCursor<'seg> {
             segment,
             term_base_offset,
             term_payload_len,
+            blocks_read: directory.len(),
             directory,
             block_cursor: 0,
             loaded: None,
@@ -3273,6 +3337,7 @@ impl<'seg> DiskPostingsCursor<'seg> {
             segment,
             term_base_offset,
             term_payload_len,
+            blocks_read: directory.len(),
             directory,
             block_cursor: 0,
             loaded: None,
@@ -3305,6 +3370,7 @@ impl<'seg> DiskPostingsCursor<'seg> {
             segment,
             term_base_offset,
             term_payload_len,
+            blocks_read: 0,
             directory,
             block_cursor: 0,
             loaded: None,
@@ -3354,6 +3420,7 @@ impl<'seg> DiskPostingsCursor<'seg> {
                 else {
                     return DiskPostingsAdvance::Error;
                 };
+                self.blocks_read = self.blocks_read.saturating_add(1);
                 let Some(block_bytes) = self.segment.read(
                     self.term_base_offset + u64::from(entry.byte_offset_in_term_payload),
                     block_len,
@@ -3421,6 +3488,16 @@ impl<'seg> DiskPostingsCursor<'seg> {
     /// build-time postings).
     pub fn doc_freq(&self) -> usize {
         self.total_count
+    }
+
+    /// Nombre de blocs effectivement lus par ce curseur.
+    pub fn blocks_read(&self) -> usize {
+        self.blocks_read
+    }
+
+    /// Nombre total de blocs de ce terme.
+    pub fn blocks_total(&self) -> usize {
+        self.directory.len()
     }
 }
 
@@ -3854,6 +3931,46 @@ mod tests {
             dictionary.disk_cursor_checked("body", "large"),
             Err(PostingsReadError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn p2_cursor_checked_lit_seulement_les_blocs_necessaires() {
+        let mut builder = PostingsBuilder::new();
+        for doc_id in 0..(BLOCK_SIZE as u32 * 3) {
+            builder
+                .add("body", "large", doc_id, vec![0])
+                .expect("les postings P2 doivent être construits");
+        }
+        let dictionary = builder.build_with_disk_flag(true);
+        let mut cursor = dictionary
+            .disk_cursor_p2_checked("body", "large")
+            .expect("ouverture P2 checked")
+            .expect("le terme doit exister");
+
+        assert_eq!(cursor.blocks_total(), 3, "trois blocs persistants attendus");
+        assert_eq!(
+            cursor.blocks_read(),
+            0,
+            "P2 doit réutiliser le répertoire sans relire le payload entier"
+        );
+        assert_eq!(
+            cursor.advance_to_with_status(0),
+            DiskPostingsAdvance::Found(0)
+        );
+        assert_eq!(cursor.blocks_read(), 1, "seul le premier bloc est chargé");
+        assert_eq!(
+            cursor.advance_to_with_status(BLOCK_SIZE as u32 * 2),
+            DiskPostingsAdvance::Found(BLOCK_SIZE as u32 * 2)
+        );
+        assert_eq!(
+            cursor.blocks_read(),
+            2,
+            "le bloc intermédiaire doit être sauté par son répertoire"
+        );
+        assert!(
+            cursor.blocks_read() < cursor.blocks_total(),
+            "la métrique P2 doit rendre le saut de bloc observable"
+        );
     }
 
     #[test]

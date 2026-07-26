@@ -327,8 +327,12 @@ async fn tiered_merge_cascades_and_matches_mono_and_unmerged_bit_identical() {
     let p1a_direct = r#"{"query":{"bool":{"must":[{"match":{"title":"widget"}},{"match":{"title":"widget"}}]}},"size":400}"#;
     for (layout, router, direct_eligible) in [
         ("mono-segment", &router_mono, true),
-        ("multi-segment non fusionné", &router_unmerged, false),
-        ("multi-segment fusionné", &router_merged, false),
+        // Après le lot S (`cb0ada8`), P2 couvre les segments checked : le
+        // compteur P1a doit donc augmenter sans affaiblir la parité.
+        ("multi-segment non fusionné", &router_unmerged, true),
+        // Après le lot S (`cb0ada8`), P2 couvre aussi les segments fusionnés :
+        // le compteur P1a doit donc augmenter sans affaiblir la parité.
+        ("multi-segment fusionné", &router_merged, true),
     ] {
         let counter_before = p1a_direct_must_fused_counter(router).await;
         let direct = search(router, index, p1a_direct).await;
@@ -336,7 +340,7 @@ async fn tiered_merge_cascades_and_matches_mono_and_unmerged_bit_identical() {
         assert_eq!(
             counter_after,
             counter_before + if direct_eligible { 1 } else { 0 },
-            "[P1a {layout}] le compteur ne doit augmenter que pour le mono-segment"
+            "[P2 {layout}] le compteur doit augmenter exactement une fois"
         );
         let generic = search(router, index, &force_generic_bool_reference(p1a_direct)).await;
         assert_eq!(
