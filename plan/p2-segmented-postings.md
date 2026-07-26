@@ -66,6 +66,9 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     construction, et les tests de métriques sont sérialisés.
   - [x] Correction 2 de revue locale — le golden P2 couvre `min_score`
     effectivement filtrant et trois clauses scorées dans l'ordre demandé.
+  - [x] Correction CI locale — `PostingsBlockSkipIter` est importé dans
+    `document_index`, où P2 l'emploie pour le curseur RAM segmenté ; l'audit
+    statique couvre les symboles ajoutés, retirés et rendus publics par P2.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
@@ -94,6 +97,7 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
 
 - [x] Développement livré localement sur `main` dans le commit
   `[latence P2] parcourir les postings checked par segment`.
-- [ ] Commit non poussé et non validé par les gates externes ; aucune preuve
-  de performance ou de parité externe ne doit être inférée des contrôles
-  locaux.
+- [x] P2 est poussé jusqu'à `3d33d8d` sur `main` ; la correction de
+  compilation CI reste locale et non poussée.
+- [ ] Gates externes non validées ; aucune preuve de performance ou de parité
+  ne doit être inférée des contrôles locaux.
