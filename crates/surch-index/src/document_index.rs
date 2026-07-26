@@ -15,8 +15,8 @@ use thiserror::Error;
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
     merge_term_dictionaries, postings_disk_enabled, BlockMeta, CheckedPostings,
-    DiskPostingsAdvance, DiskPostingsCursor, PostingsBuilder, PostingsEnum, PostingsError,
-    PostingsList, PostingsReadError, TermDictionary, TermsEnum,
+    DiskPostingsAdvance, DiskPostingsCursor, PostingsBlockSkipIter, PostingsBuilder, PostingsEnum,
+    PostingsError, PostingsList, PostingsReadError, TermDictionary, TermsEnum,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
