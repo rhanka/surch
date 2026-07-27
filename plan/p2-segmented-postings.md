@@ -87,6 +87,11 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     machine : le moteur et la sonde restent disjoints, la scorecard conserve
     `nproc` et les deux cpusets observés, et le rapport refuse une paire A/B
     dont cette configuration diffère.
+  - [x] Correction protocole — le contrôle `index_ready` exige seulement la
+    jauge présente dès l'indexation (`surch_index_segment_count`) ; les
+    compteurs Prometheus absents avant leur premier incrément sont lus comme
+    zéro pour établir le delta initial, puis leur présence et leurs deltas de
+    routage restent fail-closed à la fin de chaque phase `bool`.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs

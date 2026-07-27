@@ -941,11 +941,9 @@ probe_quantiles(){
 }
 
 # ---- P2 : preuve du routage et statistiques par corps ----
-p2_metric_names=(
-  surch_bool_direct_must_fused_total
-  surch_dbg_generic_total
-  surch_postings_disk_blocks_read_total
-  surch_postings_disk_blocks_total
+# Cette jauge est publiée pendant l'indexation : elle doit donc être présente
+# dès le contrôle index_ready, avant toute sonde.
+p2_index_ready_metric_names=(
   surch_index_segment_count
 )
 
@@ -965,6 +963,11 @@ p2_cpu_steal_percent(){
   '
 }
 
+p2_metric_present(){
+  local metric="$1" snapshot="$2"
+  grep -Eq "^${metric}(\\{|[[:space:]])" "$snapshot"
+}
+
 p2_snapshot_metrics(){
   local base="$1" out="$2" phase="$3" metric
   P2_METRICS_REASON=""
@@ -973,16 +976,8 @@ p2_snapshot_metrics(){
     P2_METRICS_REASON="${phase}_prometheus_curl_failed"
     return 1
   fi
-  for metric in "${p2_metric_names[@]}"; do
-    if ! grep -Eq "^${metric}(\\{|[[:space:]])" "$out"; then
-      # Les compteurs de blocs sont précisément l'instrumentation ajoutée par
-      # P2 : l'image A (961ade1) ne les publie pas. On conserve donc son scrape
-      # brut sans les inventer et les décode comme zéro dans le statut A ; B,
-      # lui, doit impérativement les exposer pour être recevable.
-      if [ "$P2_VARIANT" = "A" ] \
-        && { [ "$metric" = "surch_postings_disk_blocks_read_total" ] || [ "$metric" = "surch_postings_disk_blocks_total" ]; }; then
-        continue
-      fi
+  for metric in "${p2_index_ready_metric_names[@]}"; do
+    if ! p2_metric_present "$metric" "$out"; then
       P2_METRICS_REASON="${phase}_prometheus_metric_missing_${metric}"
       return 1
     fi
@@ -991,18 +986,29 @@ p2_snapshot_metrics(){
 
 p2_metric_value(){
   local metric="$1" snapshot="$2"
-  if ! grep -Eq "^${metric}(\\{|[[:space:]])" "$snapshot"; then
-    if [ "$P2_VARIANT" = "A" ] \
-      && { [ "$metric" = "surch_postings_disk_blocks_read_total" ] || [ "$metric" = "surch_postings_disk_blocks_total" ]; }; then
-      printf '0'
-      return 0
-    fi
+  if ! p2_metric_present "$metric" "$snapshot"; then
     return 1
   fi
   awk -v metric="$metric" '
     $0 ~ "^" metric "(\\{|[[:space:]])" { sum += $NF; found = 1 }
     END { if (!found) exit 1; printf "%.17g", sum }
   ' "$snapshot"
+}
+
+# Le recorder Prometheus crée une série de compteur lors de son premier
+# increment. Avant la première requête bool.must, les compteurs de route et de
+# blocs peuvent donc être absents des deux images sans signaler une anomalie.
+# Pour calculer le premier delta, cette absence représente le zéro initial ;
+# p2_write_phase_status exige ensuite, en fin de phase bool, la série attendue
+# et sa valeur de routage exacte. Ainsi le protocole reste fail-closed sans
+# demander à l'image A figée d'initialiser artificiellement ses compteurs.
+p2_counter_value(){
+  local metric="$1" snapshot="$2"
+  if ! p2_metric_present "$metric" "$snapshot"; then
+    printf '0'
+    return 0
+  fi
+  p2_metric_value "$metric" "$snapshot"
 }
 
 p2_number_equal(){ awk -v left="$1" -v right="$2" 'BEGIN { exit !((left + 0) == (right + 0)) }'; }
@@ -1021,23 +1027,24 @@ p2_write_phase_status(){
   local phase="$1" bool_requests="$2" match_requests="$3" before="$4" after="$5"
   local direct_before generic_before read_before total_before segments_before
   local direct_after generic_after read_after total_after segments_after
-  local direct_delta generic_delta read_delta total_delta segment_delta ratio="null" blocks_metrics_emitted=true
+  local direct_delta generic_delta read_delta total_delta segment_delta ratio="null" blocks_metrics_emitted=false
   local valid=true reason=""
-  direct_before=$(p2_metric_value surch_bool_direct_must_fused_total "$before") || valid=false
-  generic_before=$(p2_metric_value surch_dbg_generic_total "$before") || valid=false
-  read_before=$(p2_metric_value surch_postings_disk_blocks_read_total "$before") || valid=false
-  total_before=$(p2_metric_value surch_postings_disk_blocks_total "$before") || valid=false
+  direct_before=$(p2_counter_value surch_bool_direct_must_fused_total "$before") || valid=false
+  generic_before=$(p2_counter_value surch_dbg_generic_total "$before") || valid=false
+  read_before=$(p2_counter_value surch_postings_disk_blocks_read_total "$before") || valid=false
+  total_before=$(p2_counter_value surch_postings_disk_blocks_total "$before") || valid=false
   segments_before=$(p2_metric_value surch_index_segment_count "$before") || valid=false
-  direct_after=$(p2_metric_value surch_bool_direct_must_fused_total "$after") || valid=false
-  generic_after=$(p2_metric_value surch_dbg_generic_total "$after") || valid=false
-  read_after=$(p2_metric_value surch_postings_disk_blocks_read_total "$after") || valid=false
-  total_after=$(p2_metric_value surch_postings_disk_blocks_total "$after") || valid=false
+  direct_after=$(p2_counter_value surch_bool_direct_must_fused_total "$after") || valid=false
+  generic_after=$(p2_counter_value surch_dbg_generic_total "$after") || valid=false
+  read_after=$(p2_counter_value surch_postings_disk_blocks_read_total "$after") || valid=false
+  total_after=$(p2_counter_value surch_postings_disk_blocks_total "$after") || valid=false
   segments_after=$(p2_metric_value surch_index_segment_count "$after") || valid=false
   if [ "$valid" != true ]; then
     reason="metric_value_unreadable"
   else
-    if ! grep -Eq '^surch_postings_disk_blocks_read_total(\{|[[:space:]])' "$before"; then
-      blocks_metrics_emitted=false
+    if p2_metric_present surch_postings_disk_blocks_read_total "$after" \
+       && p2_metric_present surch_postings_disk_blocks_total "$after"; then
+      blocks_metrics_emitted=true
     fi
     direct_delta=$(awk -v a="$direct_after" -v b="$direct_before" 'BEGIN { printf "%.17g", a - b }')
     generic_delta=$(awk -v a="$generic_after" -v b="$generic_before" 'BEGIN { printf "%.17g", a - b }')
@@ -1049,9 +1056,15 @@ p2_write_phase_status(){
     elif [ "$P2_VARIANT" = "A" ]; then
       if ! p2_number_equal "$direct_delta" 0 || ! p2_number_equal "$generic_delta" "$bool_requests"; then
         valid=false; reason="route_A_direct_${direct_delta}_generic_${generic_delta}_expected_0_${bool_requests}"
+      elif [ "$bool_requests" -gt 0 ] \
+        && ! p2_metric_present surch_dbg_generic_total "$after"; then
+        valid=false; reason="route_A_generic_metric_missing_after_bool"
       fi
     elif ! p2_number_equal "$direct_delta" "$bool_requests" || ! p2_number_equal "$generic_delta" 0; then
       valid=false; reason="route_B_direct_${direct_delta}_generic_${generic_delta}_expected_${bool_requests}_0"
+    elif [ "$bool_requests" -gt 0 ] \
+      && ! p2_metric_present surch_bool_direct_must_fused_total "$after"; then
+      valid=false; reason="route_B_direct_metric_missing_after_bool"
     fi
     # Une phase sans bool (fixed match) doit être neutre pour chaque compteur
     # P2. Dans les phases alternées, l'égalité au nombre de bool prouve que les
@@ -1061,10 +1074,12 @@ p2_write_phase_status(){
         valid=false; reason="match_phase_p2_blocks_nonzero_read_${read_delta}_total_${total_delta}"
       fi
     fi
-    if [ "$valid" = true ] && [ "$P2_VARIANT" = "B" ] && [ "$bool_requests" -gt 0 ]; then
-      if ! p2_number_le 1 "$total_delta" || ! p2_number_le 0 "$read_delta"; then
+    if [ "$valid" = true ] && [ "$P2_VARIANT" = "B" ]; then
+      if [ "$blocks_metrics_emitted" != true ]; then
+        valid=false; reason="blocks_B_metrics_missing_after_phase"
+      elif [ "$bool_requests" -gt 0 ] && { ! p2_number_le 1 "$total_delta" || ! p2_number_le 0 "$read_delta"; }; then
         valid=false; reason="blocks_B_non_positive_read_${read_delta}_total_${total_delta}"
-      else
+      elif [ "$bool_requests" -gt 0 ]; then
         ratio=$(awk -v read="$read_delta" -v total="$total_delta" 'BEGIN { printf "%.9f", read / total }')
         if ! p2_number_le "$ratio" 0.25; then
           valid=false; reason="blocks_ratio_${ratio}_above_0_25"
