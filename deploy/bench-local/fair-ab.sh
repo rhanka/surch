@@ -37,6 +37,13 @@ ES_IMAGE="${ES_IMAGE:-docker.elastic.co/elasticsearch/elasticsearch:8.6.1}"
 SURCH_IMAGE="${SURCH_IMAGE:-ghcr.io/rhanka/surch:sha-b795b100682afcfa65ab7db14f36d543cf039b38}"
 POSTINGS_DISK="${POSTINGS_DISK:-1}"    # Surch : 1 = read-path disque (C1b)
 OUT_DIR="${OUT_DIR:-$HOME/.cache/fair-ab/$(printf '%s' "$MEM_LIMIT")}"   # HORS /tmp : tmpfs = RAM hôte
+# Le feeder matérialise une copie complète du bulk avant le premier envoi. Ce
+# bind mount évite donc l'overlay Docker ; le défaut suit OUT_DIR, usuellement
+# sur le disque système, et non le data-root Docker monté séparément sur VM.
+# Le répertoire choisi doit être sur un système de fichiers distinct du
+# data-root : le préflight refuse sinon un déplacement qui ne résoudrait rien.
+FEEDER_TMP_DIR="${FEEDER_TMP_DIR:-$OUT_DIR/feeder-tmp}"
+FEEDER_TMP_MARGIN_MIB="${FEEDER_TMP_MARGIN_MIB:-512}"
 PROBE_REQUESTS="${PROBE_REQUESTS:-1000}"
 REFRESH_EACH="${REFRESH_EACH:-0}"   # 1 = refresh après chaque chunk (counts corrects ; Surch perd sinon ~1 chunk sous bulk rapide)
 # ---- sonde random / cold (front #1 "latence honnête", brainstorm-4-fronts-2026-07-09.md b1) ----
@@ -85,9 +92,12 @@ P2_PROTOCOL_VERSION="p2-segmented-postings-v1"
 PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"
 NET="fair-ab-net"
 
-mkdir -p "$OUT_DIR"
 log(){ printf '\033[1;36m[fair-ab]\033[0m %s\n' "$*"; }
 err(){ printf '\033[1;31m[fair-ab]\033[0m %s\n' "$*" >&2; }
+mkdir -p "$OUT_DIR" || { err "création OUT_DIR impossible : $OUT_DIR"; exit 1; }
+mkdir -p "$FEEDER_TMP_DIR" || { err "création FEEDER_TMP_DIR impossible : $FEEDER_TMP_DIR"; exit 1; }
+FEEDER_TMP_DIR=$(readlink -f "$FEEDER_TMP_DIR") || { err "résolution FEEDER_TMP_DIR impossible : $FEEDER_TMP_DIR"; exit 1; }
+case "$FEEDER_TMP_MARGIN_MIB" in ''|*[!0-9]*) err "FEEDER_TMP_MARGIN_MIB doit être un entier en Mio"; exit 1;; esac
 case "$PROBE_REQUESTS" in ''|*[!0-9]*) err "PROBE_REQUESTS doit être un entier positif"; exit 1;; esac
 [ "$PROBE_REQUESTS" -gt 0 ] || { err "PROBE_REQUESTS doit être > 0"; exit 1; }
 case "$P2_MEASURE" in 0|1) ;; *) err "P2_MEASURE doit valoir 0 ou 1"; exit 1;; esac
@@ -283,9 +293,6 @@ fi
 swap_total_kib=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo); swap_free_kib=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
 [ "${swap_total_kib:-0}" -gt 0 ] && [ "${swap_free_kib:-0}" -lt $(( swap_total_kib / 10 )) ] \
   && err "AVERTISSEMENT swap hôte quasi plein ($(( (swap_total_kib - swap_free_kib) / 1024 ))/$(( swap_total_kib / 1024 ))MiB) : machine déjà sous pression mémoire"
-trap 'docker rm -f fairab-es fairab-surch >/dev/null 2>&1; docker volume rm fairab-vol-es fairab-vol-surch >/dev/null 2>&1; docker network rm "$NET" >/dev/null 2>&1' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 # BULK_FILE fourni => on n'a plus besoin du corpus brut INSEE ; sinon il est requis
 if [ -n "$BULK_FILE" ]; then
   [ -s "$BULK_FILE" ] || { err "BULK_FILE introuvable/vide : $BULK_FILE"; exit 1; }
@@ -700,6 +707,76 @@ fi
 printf '%s\nfingerprint=%s\n' "$PROBE_MANIFEST_PAYLOAD" "$PROBE_FINGERPRINT" > "$PROBE_MANIFEST" \
   || { err "écriture manifeste de sondes impossible"; exit 1; }
 fi
+
+# Le feeder ne doit jamais retomber dans l'overlay Docker. Chaque moteur reçoit
+# son sous-répertoire dédié ; cela permet de nettoyer sans toucher aux fichiers
+# éventuellement présents dans FEEDER_TMP_DIR, même après un échec ou un signal.
+FEEDER_TMP_ACTIVE_DIR=""
+cleanup_feeder_tmp(){
+  local dir="${1:-}"
+  [ -n "$dir" ] || return 0
+  rm -f -- "$dir"/chunk_* "$dir"/resp.json || {
+    err "nettoyage feeder impossible : $dir"
+    return 1
+  }
+  rmdir -- "$dir" 2>/dev/null || true
+}
+
+cleanup_fair_ab(){
+  cleanup_feeder_tmp "$FEEDER_TMP_ACTIVE_DIR" || true
+  docker rm -f fairab-es fairab-surch >/dev/null 2>&1
+  docker volume rm fairab-vol-es fairab-vol-surch >/dev/null 2>&1
+  docker network rm "$NET" >/dev/null 2>&1
+}
+
+prepare_feeder_tmp(){
+  local engine="$1" dir bulk_bytes required_bytes available_kib available_bytes
+  local required_mib available_mib docker_root feeder_fs docker_fs feeder_type
+  dir="$FEEDER_TMP_DIR/$engine"
+  mkdir -p "$dir" || { err "création répertoire feeder impossible : $dir"; return 1; }
+  cleanup_feeder_tmp "$dir" || return 1
+  mkdir -p "$dir" || { err "recréation répertoire feeder impossible : $dir"; return 1; }
+
+  # La copie split est de même taille que le bulk ; la marge couvre la réponse
+  # courante, les métadonnées de milliers de fichiers et les écarts de blocs.
+  bulk_bytes=$(wc -c < "$BULK" 2>/dev/null) || { err "taille bulk illisible : $BULK"; return 1; }
+  required_bytes=$(( bulk_bytes + FEEDER_TMP_MARGIN_MIB * 1024 * 1024 ))
+  available_kib=$(df -Pk "$dir" | awk 'NR == 2 { print $4 }')
+  available_bytes=$(( ${available_kib:-0} * 1024 ))
+  required_mib=$(( (required_bytes + 1024 * 1024 - 1) / 1024 / 1024 ))
+  available_mib=$(( available_bytes / 1024 / 1024 ))
+  if [ "$available_bytes" -lt "$required_bytes" ]; then
+    err "préflight feeder : FEEDER_TMP_DIR=$FEEDER_TMP_DIR manque d'espace — requis ${required_mib} Mio (bulk $(( bulk_bytes / 1024 / 1024 )) Mio + marge ${FEEDER_TMP_MARGIN_MIB} Mio), disponible ${available_mib} Mio"
+    return 1
+  fi
+
+  feeder_type=$(stat -fc %T "$dir" 2>/dev/null || true)
+  if [ "$feeder_type" = "tmpfs" ]; then
+    err "préflight feeder : FEEDER_TMP_DIR=$FEEDER_TMP_DIR est sur tmpfs ; choisir un disque hôte avec ${required_mib} Mio libres"
+    return 1
+  fi
+  docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null) || {
+    err "préflight feeder : docker info impossible (data-root inconnu)"
+    return 1
+  }
+  feeder_fs=$(df -Pk "$dir" | awk 'NR == 2 { print $1 }')
+  docker_fs=$(df -Pk "$docker_root" | awk 'NR == 2 { print $1 }')
+  if [ -z "$feeder_fs" ] || [ -z "$docker_fs" ]; then
+    err "préflight feeder : système de fichiers illisible (feeder=$dir, data-root=$docker_root)"
+    return 1
+  fi
+  if [ "$feeder_fs" = "$docker_fs" ]; then
+    err "préflight feeder : FEEDER_TMP_DIR=$FEEDER_TMP_DIR partage le système de fichiers $feeder_fs du data-root Docker=$docker_root ; choisir un disque distinct"
+    return 1
+  fi
+
+  FEEDER_TMP_ACTIVE_DIR="$dir"
+  log "feeder : chunks sur $dir (requis ${required_mib} Mio, disponible ${available_mib} Mio ; data-root Docker=$docker_root)"
+}
+
+trap cleanup_fair_ab EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 docker network create "$NET" >/dev/null 2>&1 || true
 
@@ -1336,6 +1413,7 @@ record_invalid_measurement(){
 run_engine(){
   local ENGINE="$1" CID PORT HEAP HALF
   local p2_cpu_before="" p2_cpu_after="" p2_cpu_steal_percent="null"
+  prepare_feeder_tmp "$ENGINE" || return 1
   if [ "$P2_MEASURE" = "1" ]; then
     [ "$ENGINE" = "surch" ] || { err "P2 ne mesure que Surch (ENGINE=$ENGINE refusé)"; return 1; }
     p2_cpu_before=$(p2_cpu_stat) || { err "P2 : lecture CPU steal initiale impossible"; return 1; }
@@ -1414,8 +1492,14 @@ run_engine(){
   local t0 t1 oom bulk_rc
   local BOUT="$OUT_DIR/$ENGINE.bulklog"
   t0=$(date +%s.%N)
-  docker run --rm $AUXCAP --network "$NET" -v "$BULK:/bulk.ndjson:ro" curlimages/curl:8.10.1 sh -c "
+  docker run --rm $AUXCAP --network "$NET" --user "$(id -u):$(id -g)" \
+    -v "$BULK:/bulk.ndjson:ro" -v "$FEEDER_TMP_ACTIVE_DIR:/tmp:rw" curlimages/curl:8.10.1 sh -c "
     BASE='$BASE'; REFRESH_EACH='$REFRESH_EACH'; MAXTRY='$BULK_RETRIES'
+    cleanup(){ rm -f -- /tmp/chunk_* /tmp/resp.json; }
+    trap cleanup 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     split -l 20000 -a 4 /bulk.ndjson /tmp/chunk_   # -a 4 : >676 chunks au 28M (57,8M lignes = 2892 chunks)
     indexed=0; item_err=0; hard=0; failed=''; n=0; dead=0
     for c in /tmp/chunk_*; do
@@ -1457,6 +1541,8 @@ run_engine(){
     [ \$hard -eq 0 ]
   " > "$BOUT" 2>&1
   bulk_rc=$?
+  cleanup_feeder_tmp "$FEEDER_TMP_ACTIVE_DIR" || bulk_rc=1
+  FEEDER_TMP_ACTIVE_DIR=""
   docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1
   t1=$(date +%s.%N)   # throughput = jusqu'au 1er refresh (loyal, hors matérialisation tardive)
   # 2e refresh + attente : surch ne matérialise pas le dernier lot sur un seul refresh final ;
