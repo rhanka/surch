@@ -48,8 +48,8 @@ if [ "$P2_MODE" = "full" ]; then
   [ -n "$P2_SMOKE_DIR" ] || die "P2_SMOKE_DIR est obligatoire : exécuter et conserver le smoke avant le full"
   [ -s "$P2_SMOKE_DIR/README.md" ] \
     && grep -q '^SMOKE P2 valide' "$P2_SMOKE_DIR/README.md" \
-    && jq -e '.measurement_valid == true and .p2.phase_records == 5' "$P2_SMOKE_DIR/runs/smoke-A/surch.json" >/dev/null \
-    && jq -e '.measurement_valid == true and .p2.phase_records == 5' "$P2_SMOKE_DIR/runs/smoke-B/surch.json" >/dev/null \
+    && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-A/surch.json" >/dev/null \
+    && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-B/surch.json" >/dev/null \
     || die "smoke P2 absent ou invalide: $P2_SMOKE_DIR"
 fi
 
@@ -69,21 +69,40 @@ findmnt -T "$P2_DOCKER_ROOT" > "$P2_CAMPAIGN_DIR/docker-data-root.findmnt.txt"
 mem_available_mib(){ awk '/^MemAvailable:/{print int($2 / 1024)}' /proc/meminfo; }
 load_one(){ awk '{print $1}' /proc/loadavg; }
 disk_free_mib(){ df -Pm "$P2_DOCKER_ROOT" | awk 'NR == 2 {print $4}'; }
+campaign_artifacts_on_docker_fs(){
+  local docker_fs campaign_fs
+  docker_fs=$(df -Pk "$P2_DOCKER_ROOT" | awk 'NR == 2 {print $1}')
+  campaign_fs=$(df -Pk "$P2_CAMPAIGN_DIR" | awk 'NR == 2 {print $1}')
+  [ -n "$docker_fs" ] && [ "$docker_fs" = "$campaign_fs" ]
+}
+campaign_artifacts_mib(){
+  if campaign_artifacts_on_docker_fs; then
+    du -sm -- "$P2_CAMPAIGN_DIR" | awk 'NR == 1 {print $1}'
+  else
+    printf '0'
+  fi
+}
+disk_free_effective_mib(){
+  local free artifacts
+  free=$(disk_free_mib); artifacts=$(campaign_artifacts_mib)
+  printf '%s' "$(( free + artifacts ))"
+}
 write_host_state(){
-  local path="$1"
+  local path="$1" artifacts_on_docker_fs=false
+  campaign_artifacts_on_docker_fs && artifacts_on_docker_fs=true
   jq -n \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg mount_source "$mount_source" \
     --arg findmnt "$(findmnt -T "$P2_DOCKER_ROOT" -n -o SOURCE,TARGET,FSTYPE)" \
     --argjson mem_available_mib "$(mem_available_mib)" \
     --argjson disk_free_mib "$(disk_free_mib)" \
-    --argjson load1 "$(load_one)" > "$path"
+    --argjson campaign_artifacts_mib "$(campaign_artifacts_mib)" \
+    --argjson disk_free_effective_mib "$(disk_free_effective_mib)" \
+    --argjson campaign_artifacts_on_docker_filesystem "$artifacts_on_docker_fs" \
+    --argjson load1 "$(load_one)" \
+    '{timestamp:$timestamp,mount_source:$mount_source,findmnt:$findmnt,mem_available_mib:$mem_available_mib,disk_free_mib:$disk_free_mib,campaign_artifacts_mib:$campaign_artifacts_mib,disk_free_effective_mib:$disk_free_effective_mib,campaign_artifacts_on_docker_filesystem:$campaign_artifacts_on_docker_filesystem,load1:$load1}' \
+    > "$path"
 }
-
-write_host_state "$P2_CAMPAIGN_DIR/host-baseline.json"
-baseline_mem=$(jq -r .mem_available_mib "$P2_CAMPAIGN_DIR/host-baseline.json")
-baseline_disk=$(jq -r .disk_free_mib "$P2_CAMPAIGN_DIR/host-baseline.json")
-baseline_load=$(jq -r .load1 "$P2_CAMPAIGN_DIR/host-baseline.json")
 
 image_metadata(){
   local image="$1" sha="$2" out="$3" image_id digest
@@ -106,6 +125,15 @@ build_image(){
 
 build_image A "$P2_A_SHA"; IMAGE_A="$BUILT_IMAGE"
 build_image B "$P2_B_SHA"; IMAGE_B="$BUILT_IMAGE"
+
+# Le baseline est pris après les builds : leurs couches et cache vivent sous
+# Docker, ne sont pas des artefacts de campagne et ne doivent pas être pris
+# pour une fuite lors du premier contrôle de récupération.
+write_host_state "$P2_CAMPAIGN_DIR/host-baseline.json"
+baseline_mem=$(jq -r .mem_available_mib "$P2_CAMPAIGN_DIR/host-baseline.json")
+baseline_disk=$(jq -r .disk_free_mib "$P2_CAMPAIGN_DIR/host-baseline.json")
+baseline_disk_effective=$(jq -r .disk_free_effective_mib "$P2_CAMPAIGN_DIR/host-baseline.json")
+baseline_load=$(jq -r .load1 "$P2_CAMPAIGN_DIR/host-baseline.json")
 
 if [ "$P2_MODE" = "full" ]; then
   PAIR_COUNT=1000
@@ -138,7 +166,8 @@ assert_scorecard(){
       .measurement_valid == true
       and .count == $docs and .indexed == $docs and .item_errors == 0
       and .p2.variant == $variant and .p2.expected_docs == $docs
-      and .p2.required_segments == $segments and .p2.phase_records == 5
+      and .p2.required_segments == $segments and .p2.hot_phase_records == 4
+      and (.p2.phase_records >= 4 and .p2.phase_records <= 5)
       and (.p2.observed_cpu_configuration.nproc == .probe_cpu_count)
       and (.p2.observed_cpu_configuration.engine_cpuset == .cpuset)
       and (.p2.observed_cpu_configuration.probe_cpuset == .probe_cpuset)
@@ -171,7 +200,7 @@ compare_parity(){
   local pair="$1" a_name="$2" b_name="$3" report="$P2_CAMPAIGN_DIR/pairs/$pair"
   local phase a_file b_file
   mkdir -p "$report" || die "création rapport impossible: $report"
-  for phase in warm fixed random no_source cold; do
+  for phase in warm fixed random no_source; do
     a_file="$P2_CAMPAIGN_DIR/runs/$a_name/surch.p2.responses.${phase}.canonical.ndjson"
     b_file="$P2_CAMPAIGN_DIR/runs/$b_name/surch.p2.responses.${phase}.canonical.ndjson"
     if ! cmp -s "$a_file" "$b_file"; then
@@ -187,12 +216,36 @@ compare_parity(){
     > "$report/parity.json"
   [ "$(jq -r .a_manifest_sha256 "$report/parity.json")" = "$(jq -r .b_manifest_sha256 "$report/parity.json")" ] \
     || die "manifestes différents pour $pair"
+  # Cold est conservé comme diagnostic quand les deux côtés l'ont produit,
+  # mais son reclaim dépend de droits hôte qui ne modifient pas les quatre
+  # phases chaudes, leurs corps gelés, leur routage ni leur parité A/B.
+  # Une divergence cold est donc rapportée sans annuler la comparaison P2.
+  local cold_a_ok cold_b_ok cold_a_file cold_b_file cold_parity=false cold_status
+  cold_a_ok=$(jq -r '.cold_probe_ok == true' "$P2_CAMPAIGN_DIR/runs/$a_name/surch.json")
+  cold_b_ok=$(jq -r '.cold_probe_ok == true' "$P2_CAMPAIGN_DIR/runs/$b_name/surch.json")
+  cold_a_file="$P2_CAMPAIGN_DIR/runs/$a_name/surch.p2.responses.cold.canonical.ndjson"
+  cold_b_file="$P2_CAMPAIGN_DIR/runs/$b_name/surch.p2.responses.cold.canonical.ndjson"
+  if [ "$cold_a_ok" = true ] && [ "$cold_b_ok" = true ] && [ -s "$cold_a_file" ] && [ -s "$cold_b_file" ]; then
+    if cmp -s "$cold_a_file" "$cold_b_file"; then
+      cold_parity=true; cold_status="available_and_equal"
+    else
+      diff -u "$cold_a_file" "$cold_b_file" > "$report/parity-cold-diagnostic.diff" || true
+      cold_status="available_but_different"
+    fi
+  else
+    cold_status="unavailable_or_incomplete"
+  fi
+  jq -n \
+    --arg pair "$pair" --arg a_run "$a_name" --arg b_run "$b_name" --arg status "$cold_status" \
+    --argjson a_cold_ok "$cold_a_ok" --argjson b_cold_ok "$cold_b_ok" --argjson parity "$cold_parity" \
+    '{pair:$pair,a_run:$a_run,b_run:$b_run,optional:true,status:$status,a_cold_ok:$a_cold_ok,b_cold_ok:$b_cold_ok,parity:$parity}' \
+    > "$report/cold-diagnostic.json"
   "$PAIR_REPORT" --a "$P2_CAMPAIGN_DIR/runs/$a_name" --b "$P2_CAMPAIGN_DIR/runs/$b_name" --out "$report" \
     || die "rapport statistique invalide pour $pair"
 }
 
 recover_host(){
-  local name="$1" state="$P2_CAMPAIGN_DIR/recovery-$name.json" mem disk load
+  local name="$1" state="$P2_CAMPAIGN_DIR/recovery-$name.json" mem disk disk_effective artifacts load
   docker ps -a --format '{{.Names}}' | grep -qx 'fairab-surch' && die "teardown incomplet: fairab-surch existe"
   docker volume inspect fairab-vol-surch >/dev/null 2>&1 && die "teardown incomplet: fairab-vol-surch existe"
   sync
@@ -207,11 +260,17 @@ recover_host(){
   write_host_state "$state"
   mem=$(jq -r .mem_available_mib "$state")
   disk=$(jq -r .disk_free_mib "$state")
+  disk_effective=$(jq -r .disk_free_effective_mib "$state")
+  artifacts=$(jq -r .campaign_artifacts_mib "$state")
   load=$(jq -r .load1 "$state")
   [ "$mem" -ge $(( baseline_mem - P2_RECOVERY_MEM_TOLERANCE_MIB )) ] \
     || die "mémoire non revenue: $mem MiB vs baseline $baseline_mem MiB"
-  [ "$disk" -ge $(( baseline_disk - P2_RECOVERY_DISK_TOLERANCE_MIB )) ] \
-    || die "espace disque non revenu: $disk MiB vs baseline $baseline_disk MiB"
+  # Sur un disque unique, les rapports et captures P2 volontairement conservés
+  # consomment le même FS que Docker. Les ajouter à l'espace libre sépare cette
+  # croissance d'artefacts traçables d'une fuite de volume/conteneur, sans
+  # relâcher le contrôle de teardown ou la marge disque réellement récupérée.
+  [ "$disk_effective" -ge $(( baseline_disk_effective - P2_RECOVERY_DISK_TOLERANCE_MIB )) ] \
+    || die "espace disque non revenu hors artefacts: libre=$disk MiB + artefacts=$artifacts MiB = $disk_effective MiB vs baseline_effective=$baseline_disk_effective MiB (brut baseline=$baseline_disk MiB)"
   awk -v after="$load" -v before="$baseline_load" -v tolerance="$P2_RECOVERY_LOAD_TOLERANCE" \
     'BEGIN { exit !(after <= before + tolerance) }' \
     || die "charge non revenue: $load vs baseline $baseline_load"

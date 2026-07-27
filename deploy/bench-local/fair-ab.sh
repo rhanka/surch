@@ -86,7 +86,7 @@ P2_EXPECTED_DOCS="${P2_EXPECTED_DOCS:-28917511}"
 P2_REQUIRED_SEGMENTS="${P2_REQUIRED_SEGMENTS:-12}"
 P2_SEGMENT_GATE="${P2_SEGMENT_GATE:-exact}" # exact (full) ou minimum (smoke)
 P2_CPU_STEAL_MAX_PERCENT="${P2_CPU_STEAL_MAX_PERCENT:-1}"
-P2_PROTOCOL_VERSION="p2-segmented-postings-v1"
+P2_PROTOCOL_VERSION="p2-segmented-postings-v2"
 # Déclaré ici aussi parce que P2 refuse explicitement un bypass avant le
 # bloc historique de préflight qui consomme cette variable.
 PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"
@@ -115,8 +115,12 @@ if [ "$P2_MEASURE" = "1" ]; then
   [ "$COLD_PROBE_REQUESTS" = "50" ] || {
     err "protocole P2 invalide : COLD_PROBE_REQUESTS doit rester 50 (reçu $COLD_PROBE_REQUESTS)"; exit 1;
   }
-  [ "$COLD_PROBE" = "1" ] || {
-    err "protocole P2 invalide : COLD_PROBE doit rester actif"; exit 1;
+  # Cold reste tenté par défaut, mais n'est plus une précondition des quatre
+  # phases chaudes. Son reclaim dépend des droits cgroup de l'hôte, alors que
+  # warm/fixed/random/no_source conservent à elles seules la comparaison A/B
+  # identique, le routage et la parité qui fondent la validité P2.
+  [ "$COLD_PROBE" = "0" ] || [ "$COLD_PROBE" = "1" ] || {
+    err "protocole P2 invalide : COLD_PROBE doit valoir 0 ou 1"; exit 1;
   }
   [ "$PREFLIGHT_FORCE" = "0" ] || {
     err "protocole P2 invalide : PREFLIGHT_FORCE=1 contourne le garde-fou mémoire"; exit 1;
@@ -1025,9 +1029,11 @@ p2_segment_value_valid(){
 
 p2_write_phase_status(){
   local phase="$1" bool_requests="$2" match_requests="$3" before="$4" after="$5"
+  local cpu_steal_percent="$6" cpu_steal_within_limit="$7" cpu_steal_reason="$8"
   local direct_before generic_before read_before total_before segments_before
   local direct_after generic_after read_after total_after segments_after
   local direct_delta generic_delta read_delta total_delta segment_delta ratio="null" blocks_metrics_emitted=false
+  local blocks_ratio_target_pass="null" blocks_ratio_verdict="not_applicable"
   local valid=true reason=""
   direct_before=$(p2_counter_value surch_bool_direct_must_fused_total "$before") || valid=false
   generic_before=$(p2_counter_value surch_dbg_generic_total "$before") || valid=false
@@ -1082,16 +1088,25 @@ p2_write_phase_status(){
       elif [ "$bool_requests" -gt 0 ]; then
         ratio=$(awk -v read="$read_delta" -v total="$total_delta" 'BEGIN { printf "%.9f", read / total }')
         if ! p2_number_le "$ratio" 0.25; then
-          valid=false; reason="blocks_ratio_${ratio}_above_0_25"
+          blocks_ratio_target_pass=false; blocks_ratio_verdict="fail"
+        else
+          blocks_ratio_target_pass=true; blocks_ratio_verdict="pass"
         fi
       fi
     fi
   fi
   P2_PHASE_VALID="$valid"
   P2_PHASE_REASON="$reason"
-  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"valid":%s,"reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}}}\n' \
+  # Le ratio de blocs qualifie l'effet du saut P2, pas la comparabilité de la
+  # mesure : routage, corps, segments et réponses restent déjà fail-closed.
+  # Un ratio hors cible est donc enregistré comme ÉCHEC P2 exploitable plutôt
+  # que de transformer la phase A/B correcte en mesure invalide.
+  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}}}\n' \
     "$phase" "$P2_VARIANT" "$bool_requests" "$match_requests" "$valid" \
-    "$( [ -n "$reason" ] && printf '\"%s\"' "$reason" || printf 'null' )" "$blocks_metrics_emitted" "$ratio" \
+    "$( [ -n "$reason" ] && printf '\"%s\"' "$reason" || printf 'null' )" \
+    "$cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT" "$cpu_steal_within_limit" \
+    "$( [ -n "$cpu_steal_reason" ] && printf '\"%s\"' "$cpu_steal_reason" || printf 'null' )" \
+    "$blocks_metrics_emitted" "$ratio" "$blocks_ratio_target_pass" "$blocks_ratio_verdict" \
     "${direct_before:-null}" "${direct_after:-null}" "${direct_delta:-null}" \
     "${generic_before:-null}" "${generic_after:-null}" "${generic_delta:-null}" \
     "${read_before:-null}" "${read_after:-null}" "${read_delta:-null}" \
@@ -1107,6 +1122,11 @@ p2_capture_phase(){
   local after="$OUT_DIR/$ENGINE.p2.prom.${phase}.after.prom"
   local responses_raw="$OUT_DIR/$ENGINE.p2.responses.${phase}.raw.ndjson"
   local responses_canonical="$OUT_DIR/$ENGINE.p2.responses.${phase}.canonical.ndjson"
+  local cpu_before="" cpu_after="" cpu_steal_percent="null" cpu_steal_within_limit=false cpu_steal_reason=""
+  # Le steal est borné à la fenêtre de chaque phase chaude. L'indexation peut
+  # durer des dizaines de minutes et accumuler un steal sans rapport avec les
+  # latences A/B observées ; une lecture locale protège réellement la mesure.
+  cpu_before=$(p2_cpu_stat 2>/dev/null || true)
   if ! p2_snapshot_metrics "$base" "$before" "${phase}_before"; then
     PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_prometheus_before_failed}"
     return 1
@@ -1124,7 +1144,20 @@ p2_capture_phase(){
     PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_prometheus_after_failed}"
     return 1
   fi
-  if ! p2_write_phase_status "$phase" "$bool_requests" "$match_requests" "$before" "$after"; then
+  cpu_after=$(p2_cpu_stat 2>/dev/null || true)
+  if [ -n "$cpu_before" ] && [ -n "$cpu_after" ] \
+     && p2_cpu_steal_percent "$cpu_before" "$cpu_after" >/dev/null 2>&1; then
+    cpu_steal_percent=$(p2_cpu_steal_percent "$cpu_before" "$cpu_after")
+    if p2_number_le "$cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT"; then
+      cpu_steal_within_limit=true
+    else
+      cpu_steal_reason="cpu_steal_${cpu_steal_percent}_above_${P2_CPU_STEAL_MAX_PERCENT}"
+    fi
+  else
+    cpu_steal_reason="cpu_steal_unreadable"
+  fi
+  if ! p2_write_phase_status "$phase" "$bool_requests" "$match_requests" "$before" "$after" \
+      "$cpu_steal_percent" "$cpu_steal_within_limit" "$cpu_steal_reason"; then
     PROBE_CAPTURE_REASON="${phase}_routing_invalid_${P2_PHASE_REASON:-unknown}"
     return 1
   fi
@@ -1438,11 +1471,9 @@ record_invalid_measurement(){
 
 run_engine(){
   local ENGINE="$1" CID PORT HEAP HALF
-  local p2_cpu_before="" p2_cpu_after="" p2_cpu_steal_percent="null"
   prepare_feeder_tmp "$ENGINE" || return 1
   if [ "$P2_MEASURE" = "1" ]; then
     [ "$ENGINE" = "surch" ] || { err "P2 ne mesure que Surch (ENGINE=$ENGINE refusé)"; return 1; }
-    p2_cpu_before=$(p2_cpu_stat) || { err "P2 : lecture CPU steal initiale impossible"; return 1; }
     P2_PHASE_STATUS="$OUT_DIR/$ENGINE.p2.phase-status.jsonl"
     P2_STATS_JSONL="$OUT_DIR/$ENGINE.p2.stats.jsonl"
     : > "$P2_PHASE_STATUS"; : > "$P2_STATS_JSONL"
@@ -1843,18 +1874,14 @@ run_engine(){
   local latc50="null" latc95="null" latc99="null" lat_cold_took50="null" lat_cold_took95="null" lat_cold_took99="null" lat_cold_probe50="null" lat_cold_probe95="null" lat_cold_probe99="null" cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
   local cold_raw="$OUT_DIR/$ENGINE.lat_cold_client_s" cold_took_raw="$OUT_DIR/$ENGINE.lat_cold_took_ms" cold_overhead_raw="$OUT_DIR/$ENGINE.lat_cold_probe_overhead_ms" cold_reclaimed_requests=0
   local cold_reclaim_audit="$OUT_DIR/$ENGINE.cold_reclaim.tsv" cold_reclaim_audit_records=0
-  local p2_cold_before="" p2_cold_after="" p2_cold_responses_raw="" p2_cold_responses_canonical="" p2_cold_phase_valid=true
+  local p2_cold_before="" p2_cold_after="" p2_cold_responses_raw="" p2_cold_responses_canonical="" p2_cold_phase_valid=true p2_cold_metrics_ready=true
+  local p2_cold_cpu_before="" p2_cold_cpu_after="" p2_cold_cpu_steal_percent="null" p2_cold_cpu_steal_within_limit=false p2_cold_cpu_steal_reason=""
   : > "$cold_reclaim_audit"
   if [ "$P2_MEASURE" = "1" ]; then
     p2_cold_before="$OUT_DIR/$ENGINE.p2.prom.cold.before.prom"
     p2_cold_after="$OUT_DIR/$ENGINE.p2.prom.cold.after.prom"
     p2_cold_responses_raw="$OUT_DIR/$ENGINE.p2.responses.cold.raw.ndjson"
     p2_cold_responses_canonical="$OUT_DIR/$ENGINE.p2.responses.cold.canonical.ndjson"
-    if ! p2_snapshot_metrics "$BASE" "$p2_cold_before" cold_before; then
-      err "$ENGINE : métriques P2 cold avant invalides : $P2_METRICS_REASON"
-      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "${P2_METRICS_REASON:-p2_cold_before_invalid}"
-      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
-    fi
   fi
   local mem_anon_warm="null" mem_file_warm="null" mem_anon_cold="null" mem_file_cold="null"
   local full_id cg_scope reclaim_path stat_path current_path reclaim_writer=""
@@ -1882,6 +1909,13 @@ run_engine(){
   if [ -n "$reclaim_writer" ]; then
     cold_attempted=true
     if [ "$P2_MEASURE" = "1" ]; then
+      p2_cold_cpu_before=$(p2_cpu_stat 2>/dev/null || true)
+      if ! p2_snapshot_metrics "$BASE" "$p2_cold_before" cold_before; then
+        # Un scrape cold indisponible décrit seulement ce diagnostic L2 ; il
+        # n'altère ni les quatre séries chaudes ni leurs preuves A/B.
+        p2_cold_metrics_ready=false
+        cold_skip_reason="${P2_METRICS_REASON:-p2_cold_before_invalid}"
+      fi
       capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS" "$p2_cold_responses_raw"
     else
       capture_cold_samples "$BASE" "$PROBE_BODIES" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$cold_reclaim_audit" "$reclaim_path" "$stat_path" "$current_path" "$reclaim_writer" "$COLD_PROBE_REQUESTS"
@@ -1922,16 +1956,36 @@ run_engine(){
     if [ "$cold_ok" != true ]; then
       p2_cold_phase_valid=false
       cold_skip_reason="${cold_skip_reason:-p2_cold_capture_failed}"
+    elif [ "$p2_cold_metrics_ready" != true ]; then
+      p2_cold_phase_valid=false
     elif ! jq -cS '{hits_total: .hits.total, max_score: .hits.max_score, hits: [.hits.hits[] | {_id: ._id, _score: ._score, _source: ._source}]}' \
         "$p2_cold_responses_raw" > "$p2_cold_responses_canonical" \
       || [ "$(wc -l < "$p2_cold_responses_canonical" 2>/dev/null || echo 0)" -ne 50 ]; then
       p2_cold_phase_valid=false
       cold_skip_reason="p2_cold_response_canonicalization_failed"
-    elif ! p2_snapshot_metrics "$BASE" "$p2_cold_after" cold_after \
-      || ! p2_write_phase_status cold 25 25 "$p2_cold_before" "$p2_cold_after"; then
+    elif ! p2_snapshot_metrics "$BASE" "$p2_cold_after" cold_after; then
       p2_cold_phase_valid=false
-      cold_skip_reason="${P2_METRICS_REASON:-${P2_PHASE_REASON:-p2_cold_routing_invalid}}"
-    elif ! p2_split_and_stat_phase cold "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" 25 25; then
+      cold_skip_reason="${P2_METRICS_REASON:-p2_cold_routing_invalid}"
+    else
+      p2_cold_cpu_after=$(p2_cpu_stat 2>/dev/null || true)
+      if [ -n "$p2_cold_cpu_before" ] && [ -n "$p2_cold_cpu_after" ] \
+         && p2_cpu_steal_percent "$p2_cold_cpu_before" "$p2_cold_cpu_after" >/dev/null 2>&1; then
+        p2_cold_cpu_steal_percent=$(p2_cpu_steal_percent "$p2_cold_cpu_before" "$p2_cold_cpu_after")
+        if p2_number_le "$p2_cold_cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT"; then
+          p2_cold_cpu_steal_within_limit=true
+        else
+          p2_cold_cpu_steal_reason="cpu_steal_${p2_cold_cpu_steal_percent}_above_${P2_CPU_STEAL_MAX_PERCENT}"
+        fi
+      else
+        p2_cold_cpu_steal_reason="cpu_steal_unreadable"
+      fi
+      if ! p2_write_phase_status cold 25 25 "$p2_cold_before" "$p2_cold_after" \
+          "$p2_cold_cpu_steal_percent" "$p2_cold_cpu_steal_within_limit" "$p2_cold_cpu_steal_reason"; then
+        p2_cold_phase_valid=false
+        cold_skip_reason="${P2_PHASE_REASON:-p2_cold_routing_invalid}"
+      fi
+    fi
+    if [ "$p2_cold_phase_valid" = true ] && ! p2_split_and_stat_phase cold "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" 25 25; then
       p2_cold_phase_valid=false
       cold_skip_reason="p2_cold_stats_invalid"
     fi
@@ -1955,7 +2009,8 @@ run_engine(){
   fi
 
   local measurement_valid=true measurement_invalid_reason="null"
-  if [ "$cold_reclaimed_requests" -ne 50 ] || [ "$cold_reclaim_audit_records" -ne 50 ] || [ "$cold_ok" != true ]; then
+  if [ "$P2_MEASURE" != "1" ] \
+     && { [ "$cold_reclaimed_requests" -ne 50 ] || [ "$cold_reclaim_audit_records" -ne 50 ] || [ "$cold_ok" != true ]; }; then
     measurement_valid=false
     measurement_invalid_reason="\"${cold_skip_reason:-cold_capture_failed}\""
   fi
@@ -1965,22 +2020,21 @@ run_engine(){
   fi
   local p2_json=""
   if [ "$P2_MEASURE" = "1" ]; then
-    local p2_phase_records p2_image_id p2_image_digest p2_bulk_sha256 p2_mapping_sha256
-    p2_cpu_after=$(p2_cpu_stat 2>/dev/null || true)
-    if [ -z "$p2_cpu_after" ] || ! p2_cpu_steal_percent "$p2_cpu_before" "$p2_cpu_after" >/dev/null; then
-      measurement_valid=false
-      measurement_invalid_reason="\"p2_cpu_steal_unreadable\""
-    else
-      p2_cpu_steal_percent=$(p2_cpu_steal_percent "$p2_cpu_before" "$p2_cpu_after")
-      if ! p2_number_le "$p2_cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT"; then
-        measurement_valid=false
-        measurement_invalid_reason="\"p2_cpu_steal_${p2_cpu_steal_percent}_above_${P2_CPU_STEAL_MAX_PERCENT}\""
-      fi
-    fi
+    local p2_phase_records p2_hot_phase_records p2_image_id p2_image_digest p2_bulk_sha256 p2_mapping_sha256 p2_cpu_steal_percent
     p2_phase_records=$(wc -l < "$P2_PHASE_STATUS" 2>/dev/null); p2_phase_records=${p2_phase_records:-0}
-    if [ "$p2_phase_records" -ne 5 ] || [ "$p2_cold_phase_valid" != true ]; then
+    p2_hot_phase_records=$(jq -se '[.[] | select(.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source")] | length' "$P2_PHASE_STATUS" 2>/dev/null || printf '0')
+    p2_cpu_steal_percent=$(jq -ser '[.[] | select(.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source") | .cpu_steal_percent | numbers] | if length == 4 then max else null end' "$P2_PHASE_STATUS" 2>/dev/null || printf 'null')
+    # Les quatre phases chaudes portent la causalité P2. Cold reste un
+    # diagnostic historique : ses droits de reclaim ne changent ni les corps,
+    # ni le routage, ni les réponses canoniques des mesures chaudes.
+    if ! jq -se '
+      ([.[] | select(.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source")]) as $hot
+      | ($hot | length == 4)
+      and ([ $hot[] | .phase ] | sort == ["fixed", "no_source", "random", "warm"])
+      and all($hot[]; .valid == true and .cpu_steal_within_limit == true)
+    ' "$P2_PHASE_STATUS" 2>/dev/null | grep -qx true; then
       measurement_valid=false
-      measurement_invalid_reason="\"${cold_skip_reason:-p2_phase_status_incomplete_${p2_phase_records}_of_5}\""
+      measurement_invalid_reason="\"p2_required_hot_phase_invalid_${p2_hot_phase_records}_of_4\""
     fi
     p2_image_id=$(docker image inspect -f '{{.Id}}' "$SURCH_IMAGE" 2>/dev/null || true)
     p2_image_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$SURCH_IMAGE" 2>/dev/null || true)
@@ -1988,7 +2042,7 @@ run_engine(){
     [ -n "$p2_image_digest" ] || p2_image_digest="$p2_image_id"
     p2_bulk_sha256=$(p2_manifest_value bulk_sha256 "$PROBE_MANIFEST")
     p2_mapping_sha256=$(p2_manifest_value mapping_sha256 "$PROBE_MANIFEST")
-    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
+    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_required_hot_phase\",\"required_hot_phase_records\":4,\"hot_phase_records\":$p2_hot_phase_records,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
   fi
   local source_fetch_profile_reason_json="null" source_fetch_random_gate_json="null"
   [ -n "$source_fetch_profile_reason" ] && source_fetch_profile_reason_json="\"$source_fetch_profile_reason\""
