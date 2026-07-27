@@ -767,9 +767,18 @@ prepare_feeder_tmp(){
     err "préflight feeder : système de fichiers illisible (feeder=$dir, data-root=$docker_root)"
     return 1
   fi
+  # Partager le système de fichiers du data-root n'est un problème que si l'espace
+  # ne suffit pas aux DEUX simultanément : chunks du feeder (~15 Gio) + index Surch
+  # (~12,3 Gio) + images. C'est ce cumul qui a fait échouer la VM OVH (volume de
+  # 30 Gio), pas le partage en soi — une machine à disque unique de 150 Gio l'absorbe
+  # sans difficulté. On exige donc l'espace cumulé, pas des disques distincts.
   if [ "$feeder_fs" = "$docker_fs" ]; then
-    err "préflight feeder : FEEDER_TMP_DIR=$FEEDER_TMP_DIR partage le système de fichiers $feeder_fs du data-root Docker=$docker_root ; choisir un disque distinct"
-    return 1
+    feeder_shared_required=$(( required_mib + 20480 ))
+    if [ "$available_mib" -lt "$feeder_shared_required" ]; then
+      err "préflight feeder : FEEDER_TMP_DIR=$FEEDER_TMP_DIR partage $feeder_fs avec le data-root Docker=$docker_root et l'espace cumulé est insuffisant (${available_mib} Mio disponibles < ${feeder_shared_required} requis = ${required_mib} chunks + 20480 index/images) ; choisir un disque distinct ou libérer de l'espace"
+      return 1
+    fi
+    log "feeder : système de fichiers $feeder_fs partagé avec le data-root, mais espace cumulé suffisant (${available_mib} Mio >= ${feeder_shared_required})"
   fi
 
   FEEDER_TMP_ACTIVE_DIR="$dir"
