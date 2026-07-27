@@ -44,6 +44,37 @@ trap 'rm -rf "$tmp_dir"' EXIT
 records_file="$tmp_dir/records.jsonl"
 : > "$records_file"
 
+# Une taille d'hôte différente ne fausse pas une paire P2 : le moteur et la
+# sonde sont pinnés. En revanche, comparer deux cpusets ou deux hôtes
+# différents casserait l'appariement A/B. La scorecard porte donc la
+# configuration observée, et le rapport la valide avant toute statistique.
+p2_cpu_configuration(){
+  local scorecard="$1"
+  jq -ce '
+    .p2.observed_cpu_configuration as $cpu
+    | if (
+        ($cpu | type) == "object"
+        and ($cpu.nproc | type == "number" and . >= 2 and floor == .)
+        and ($cpu.engine_cpuset | type == "string" and length > 0)
+        and ($cpu.probe_cpuset | type == "string" and length > 0)
+        and .probe_cpu_count == $cpu.nproc
+        and .cpuset == $cpu.engine_cpuset
+        and .probe_cpuset == $cpu.probe_cpuset
+      ) then $cpu else error("configuration CPU P2 absente ou incohérente") end
+  ' "$scorecard"
+}
+
+a_scorecard="$a_dir/surch.json"
+b_scorecard="$b_dir/surch.json"
+[ -r "$a_scorecard" ] || die "scorecard A illisible: $a_scorecard"
+[ -r "$b_scorecard" ] || die "scorecard B illisible: $b_scorecard"
+a_cpu_configuration=$(p2_cpu_configuration "$a_scorecard") \
+  || die "P2 invalide: configuration CPU A absente ou incohérente"
+b_cpu_configuration=$(p2_cpu_configuration "$b_scorecard") \
+  || die "P2 invalide: configuration CPU B absente ou incohérente"
+[ "$a_cpu_configuration" = "$b_cpu_configuration" ] \
+  || die "P2 invalide: configuration CPU A/B différente (nproc, cpuset moteur ou cpuset sonde)"
+
 # Refuse les entrées non numériques/non finies. Les lignes vides sont
 # volontairement ignorées comme dans l'ancien lecteur Python.
 series_count(){
@@ -231,7 +262,8 @@ bootstrap_json=$(jq -n \
   '{metric:"took",phase:"random",kind:"bool",quantile:"p95",resamples:$samples,seed:$seed,
     ratio_median:$median,ci95_low:$low,ci95_high:$high,raw_file:$raw_file}')
 jq -s --arg a_dir "$a_dir" --arg b_dir "$b_dir" --argjson bootstrap "$bootstrap_json" \
-  '{schema:"surch.bench.p2.pair.v1",a_dir:$a_dir,b_dir:$b_dir,nearest_rank:true,records:.,primary_bootstrap:$bootstrap}' \
+  --argjson observed_cpu_configuration "$a_cpu_configuration" \
+  '{schema:"surch.bench.p2.pair.v1",a_dir:$a_dir,b_dir:$b_dir,nearest_rank:true,observed_cpu_configuration:$observed_cpu_configuration,records:.,primary_bootstrap:$bootstrap}' \
   "$records_file" > "$out_dir/pair-summary.json"
 
 awk -v a="$primary_a_p95" -v b="$primary_b_p95" -v ratio="$primary_ratio_p95" -v low="$bootstrap_low" -v high="$bootstrap_high" '
@@ -240,6 +272,10 @@ awk -v a="$primary_a_p95" -v b="$primary_b_p95" -v ratio="$primary_ratio_p95" -v
 {
   printf '# P2 — paire A/B\n\n'
   printf 'La parité des réponses doit déjà avoir été validée par le pilote avant cette lecture.\n\n'
+  printf 'Configuration CPU observée et identique A/B : `nproc=%s`, moteur `%s`, sonde `%s`.\n\n' \
+    "$(jq -r .nproc <<< "$a_cpu_configuration")" \
+    "$(jq -r .engine_cpuset <<< "$a_cpu_configuration")" \
+    "$(jq -r .probe_cpuset <<< "$a_cpu_configuration")"
   printf '| Série primaire | A p95 took | B p95 took | B/A | IC95 bootstrap |\n'
   printf '|---|---:|---:|---:|---:|\n'
   cat "$tmp_dir/primary-row"

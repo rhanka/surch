@@ -183,7 +183,9 @@ historical replay line lives in
 - [ ] P2 — parcours checked des postings disque et multi-segments, avec
   repli intégral sur erreur, `df` global et compteurs de blocs. Développement
   livré localement, correction de revue de robustesse et harnais de mesure
-  contrebalancé intégré localement ; gates externes ouvertes dans
+  contrebalancé intégré localement ; le protocole apparie désormais la
+  configuration CPU observée plutôt que de figer une taille d'hôte impossible
+  avec ses caps mémoire. Gates externes ouvertes dans
   `plan/p2-segmented-postings.md`.
 
 ## Track B - Test Automation / Perf Reporting

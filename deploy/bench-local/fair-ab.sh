@@ -184,6 +184,7 @@ AUXCAP="--memory=$AUX_MEM --memory-swap=$AUX_MEM"
 # l'ensemble complémentaire de CPUSET, borné par nproc, est la seule source.
 HOST_CPU_COUNT=$(nproc)
 case "$HOST_CPU_COUNT" in ''|*[!0-9]*|0) err "nproc invalide : $HOST_CPU_COUNT"; exit 1;; esac
+[ -n "$CPUSET" ] || { err "CPUSET ne doit pas être vide"; exit 1; }
 PROBE_CPUSET=$(awk -v n="$HOST_CPU_COUNT" -v selected="$CPUSET" '
   BEGIN {
     if (n < 2) exit 1
@@ -212,14 +213,15 @@ if [ "$probe_cpuset_rc" -ne 0 ] || [ -z "$PROBE_CPUSET" ]; then
   exit 1
 fi
 if [ "$P2_MEASURE" = "1" ]; then
-  # La campagne décisive est attachée à la b3-16 : trois vCPU moteur et le
-  # quatrième exclusivement pour la sonde. Toute autre topologie est un autre
-  # protocole, pas une approximation silencieuse de P2.
-  [ "$HOST_CPU_COUNT" -eq 4 ] && [ "$CPUSET" = "0-2" ] && [ "$PROBE_CPUSET" = "3" ] || {
-    err "protocole P2 invalide : b3-16 attendue (nproc=4, CPUSET=0-2, sonde=3 ; reçu nproc=$HOST_CPU_COUNT, CPUSET=$CPUSET, sonde=$PROBE_CPUSET)"
-    exit 1
-  }
-  for p2_cpu in 0 1 2 3; do
+  # L'ancienne exigence d'une b3-16 (nproc=4, CPUSET=0-2, sonde=3) était
+  # erronée : le nombre total de cœurs n'influence pas une paire A/B quand
+  # chaque moteur reçoit le même cpuset et que la sonde est isolée. Elle
+  # rendait en outre P2 impossible avec ses caps mémoire fixes. Le cpuset
+  # moteur est validé non vide ci-dessus ; PROBE_CPUSET est son complément
+  # calculé et non vide, donc la sonde est forcément pinnée hors du moteur.
+  # La configuration effectivement observée est inscrite dans chaque
+  # scorecard et p2-report.sh refuse toute paire A/B qui ne l'apparie pas.
+  for ((p2_cpu = 0; p2_cpu < HOST_CPU_COUNT; p2_cpu++)); do
     p2_cpu_gov=$(cat "/sys/devices/system/cpu/cpu${p2_cpu}/cpufreq/scaling_governor" 2>/dev/null || true)
     # Même distinction qu'au garde-fou global : cpufreq absent = VM (accepté),
     # gouverneur présent mais non-performance = corrigible donc refusé.
@@ -1962,7 +1964,7 @@ run_engine(){
     [ -n "$p2_image_digest" ] || p2_image_digest="$p2_image_id"
     p2_bulk_sha256=$(p2_manifest_value bulk_sha256 "$PROBE_MANIFEST")
     p2_mapping_sha256=$(p2_manifest_value mapping_sha256 "$PROBE_MANIFEST")
-    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
+    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
   fi
   local source_fetch_profile_reason_json="null" source_fetch_random_gate_json="null"
   [ -n "$source_fetch_profile_reason" ] && source_fetch_profile_reason_json="\"$source_fetch_profile_reason\""
