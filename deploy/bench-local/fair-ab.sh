@@ -135,9 +135,18 @@ esac
 [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] || { err "cgroup v2 requis"; exit 1; }
 gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo '?')"
 if [ "$gov" != "performance" ]; then
-  if [ "$P2_MEASURE" = "1" ]; then
-    err "protocole P2 invalide : gouverneur=$gov, performance obligatoire"
+  # Sur une VM virtualisée, `cpufreq` n'est pas exposé du tout : la fréquence est
+  # pilotée par l'hyperviseur et le gouverneur est INCONTRÔLABLE, pas mal réglé.
+  # On distingue donc les deux cas : absence de cpufreq (accepté, tracé dans la
+  # scorecard, le bruit résiduel étant identique pour A et B et compensé par les
+  # paires contrebalancées) versus gouverneur présent mais non-performance (refusé,
+  # car là on POURRAIT le corriger et ne pas le faire biaiserait la mesure).
+  if [ "$P2_MEASURE" = "1" ] && [ "$gov" != "?" ]; then
+    err "protocole P2 invalide : gouverneur=$gov, performance obligatoire (corrigible sur cette machine)"
     exit 1
+  fi
+  if [ "$P2_MEASURE" = "1" ]; then
+    err "AVERTISSEMENT protocole P2 : cpufreq absent (VM) — fréquence non contrôlable, biais assumé et identique A/B"
   fi
   err "AVERTISSEMENT gouverneur=$gov (biais fréquence ; 'sudo cpupower frequency-set -g performance' pour un run rigoureux)"
 fi
@@ -202,8 +211,10 @@ if [ "$P2_MEASURE" = "1" ]; then
   }
   for p2_cpu in 0 1 2 3; do
     p2_cpu_gov=$(cat "/sys/devices/system/cpu/cpu${p2_cpu}/cpufreq/scaling_governor" 2>/dev/null || true)
-    [ "$p2_cpu_gov" = "performance" ] || {
-      err "protocole P2 invalide : gouverneur cpu$p2_cpu=${p2_cpu_gov:-absent}, performance obligatoire"
+    # Même distinction qu'au garde-fou global : cpufreq absent = VM (accepté),
+    # gouverneur présent mais non-performance = corrigible donc refusé.
+    [ -z "$p2_cpu_gov" ] || [ "$p2_cpu_gov" = "performance" ] || {
+      err "protocole P2 invalide : gouverneur cpu$p2_cpu=$p2_cpu_gov, performance obligatoire (corrigible)"
       exit 1
     }
   done
