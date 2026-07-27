@@ -98,6 +98,11 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     blocs devient un résultat `PASS/ÉCHEC P2` séparé de `measurement_valid`.
     Le pilote soustrait aussi la croissance volontaire des artefacts de
     campagne du contrôle de récupération disque sur FS partagé.
+  - [x] Correction pilote de statistiques — l'émetteur des quantiles P2
+    termine désormais sa ligne. Le `read` contrôlé par le pilote refusait à
+    tort une série fixed complète à EOF sans nouvelle ligne ; les contrôles
+    de cardinalité, format numérique, quantiles, routage et parité restent
+    strictement identiques pour fixed, random, no_source et cold.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs

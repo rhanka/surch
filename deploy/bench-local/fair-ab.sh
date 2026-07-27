@@ -1173,7 +1173,11 @@ p2_quantiles_with_max(){
     { a[NR] = $1 }
     END {
       if (NR == 0) exit 1
-      printf "%.2f %.2f %.2f %.2f", a[nearest_rank(NR, 0.50)] * scale, a[nearest_rank(NR, 0.95)] * scale, a[nearest_rank(NR, 0.99)] * scale, a[NR] * scale
+      # La nouvelle ligne est contractuelle : p2_write_stat vérifie le statut
+      # de `read`. Sans délimiteur final, Bash renseigne les quatre quantiles
+      # mais retourne 1 à EOF, ce qui invalide à tort une série pourtant
+      # complète et numérique. Elle ne relâche donc aucune gate de mesure.
+      printf "%.2f %.2f %.2f %.2f\n", a[nearest_rank(NR, 0.50)] * scale, a[nearest_rank(NR, 0.95)] * scale, a[nearest_rank(NR, 0.99)] * scale, a[NR] * scale
     }
   '
 }
