@@ -79,6 +79,10 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
   réponses canoniques A/B, séries bool/match et bootstrap apparié. Le pilote
   `deploy/bench-local/p2-campaign.sh` impose le smoke puis les trois paires
   contrebalancées, sans lancer la campagne depuis le dépôt.
+  - [x] Correction feeder — `FEEDER_TMP_DIR` monte un répertoire hôte dédié
+    sous `OUT_DIR` dans `/tmp` du feeder ; préflight `bulk + 512 Mio`, refus
+    tmpfs ou système de fichiers du data-root Docker, nettoyage sur succès,
+    échec et signal.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
