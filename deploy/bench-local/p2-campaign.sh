@@ -139,6 +139,9 @@ assert_scorecard(){
       and .count == $docs and .indexed == $docs and .item_errors == 0
       and .p2.variant == $variant and .p2.expected_docs == $docs
       and .p2.required_segments == $segments and .p2.phase_records == 5
+      and (.p2.observed_cpu_configuration.nproc == .probe_cpu_count)
+      and (.p2.observed_cpu_configuration.engine_cpuset == .cpuset)
+      and (.p2.observed_cpu_configuration.probe_cpuset == .probe_cpuset)
     ' "$score" >/dev/null || die "scorecard P2 invalide: $score"
 }
 

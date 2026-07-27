@@ -83,6 +83,10 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     sous `OUT_DIR` dans `/tmp` du feeder ; préflight `bulk + 512 Mio`, refus
     tmpfs ou système de fichiers du data-root Docker, nettoyage sur succès,
     échec et signal.
+  - [x] Correction protocole — P2 ne fige plus la taille totale de la
+    machine : le moteur et la sonde restent disjoints, la scorecard conserve
+    `nproc` et les deux cpusets observés, et le rapport refuse une paire A/B
+    dont cette configuration diffère.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
