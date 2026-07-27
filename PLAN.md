@@ -185,7 +185,9 @@ historical replay line lives in
   livré localement, correction de revue de robustesse et harnais de mesure
   contrebalancé intégré localement ; le protocole apparie désormais la
   configuration CPU observée plutôt que de figer une taille d'hôte impossible
-  avec ses caps mémoire. Gates externes ouvertes dans
+  avec ses caps mémoire. Les quatre phases chaudes restent fail-closed ; cold
+  est diagnostique, le steal est local à chaque phase et le ratio de blocs est
+  un résultat distinct de la validité. Gates externes ouvertes dans
   `plan/p2-segmented-postings.md`.
 
 ## Track B - Test Automation / Perf Reporting

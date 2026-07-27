@@ -207,7 +207,26 @@ bootstrap_primary(){
 
 primary_a=""
 primary_b=""
+cold_records_available(){
+  local dir kind metric suffix
+  for dir in "$a_dir" "$b_dir"; do
+    for kind in bool match; do
+      for metric in client took probe; do
+        case "$metric" in client) suffix=_s ;; *) suffix=_ms ;; esac
+        [ -s "$dir/surch.p2.cold.$kind.$metric$suffix" ] || return 1
+      done
+    done
+  done
+}
+
+# Cold demeure dans les scorecards comme diagnostic. Si les deux côtés ont une
+# série complète, ses records restent présents pour les lecteurs existants ;
+# sinon il est omis sans bloquer les quatre phases chaudes qui établissent la
+# validité P2 (corps gelés, routage et parité A/B).
 for phase in fixed random no_source cold; do
+  if [ "$phase" = cold ] && ! cold_records_available; then
+    continue
+  fi
   case "$phase" in
     fixed) kinds='match' ;;
     *) kinds='bool match' ;;

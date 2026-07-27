@@ -92,6 +92,12 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     compteurs Prometheus absents avant leur premier incrément sont lus comme
     zéro pour établir le delta initial, puis leur présence et leurs deltas de
     routage restent fail-closed à la fin de chaque phase `bool`.
+  - [x] Assouplissement des gates non causaux — les quatre phases chaudes
+    `warm/fixed/random/no_source` restent obligatoires ; cold est un
+    diagnostic optionnel, le steal CPU est mesuré par phase, et le ratio de
+    blocs devient un résultat `PASS/ÉCHEC P2` séparé de `measurement_valid`.
+    Le pilote soustrait aussi la croissance volontaire des artefacts de
+    campagne du contrôle de récupération disque sur FS partagé.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
@@ -99,8 +105,9 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
 - [ ] Gate externe — comparer `961ade1` et P2 sur 28 917 511 documents,
   6 Gio, douze segments et trois paires contrebalancées.
 - [ ] Gate externe — valider p95 `took` P2/baseline <= 0,50, p99 <= 0,70,
-  ratio `blocks_read / blocks_total` <= 25 %, couverture compteur +500,
-  contrôle `match` <= 1,05x et parité verte.
+  couverture compteur +500, contrôle `match` <= 1,05x et parité verte ;
+  rapporter séparément le ratio `blocks_read / blocks_total` (cible <= 25 %)
+  comme résultat P2, sans invalider la mesure.
 - [ ] Décision de poursuite — abandonner P2 après trois paires valides si le
   saut est prouvé mais que le p95 gagne moins de 30 % ; autoriser une seule
   itération de profilage entre 30 et 50 % de gain.
