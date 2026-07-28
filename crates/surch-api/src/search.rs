@@ -5541,7 +5541,14 @@ fn parse_yyyymmdd_to_days(text: &str) -> Option<i64> {
 }
 
 fn is_leap_year(year: i64) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    // Garde-fou CI P3 : sur `i64`, `is_multiple_of` est fourni par le trait
+    // `num_integer::Integer`, pas par une méthode inhérente ni une dépendance
+    // directe de ce crate. Conserver `rem_euclid` (pas `%`, refusé par
+    // `clippy::manual_is_multiple_of`) ; revue sans compilation :
+    // `rg -n '\\.is_multiple_of\\(' crates/surch-api`, puis vérifier que
+    // chaque receveur est explicitement non signé.
+    (year.rem_euclid(4_i64) == 0_i64 && year.rem_euclid(100_i64) != 0_i64)
+        || year.rem_euclid(400_i64) == 0_i64
 }
 
 fn days_in_month(year: i64, month: u32) -> Option<u32> {

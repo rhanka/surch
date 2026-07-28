@@ -414,7 +414,7 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
 
     // 5. Bulk-index 24 docs; every third doc is `category=science`.
     let mut ndjson = String::new();
-    for id in 0..24 {
+    for id in 0_u32..24_u32 {
         ndjson.push_str(&format!(
             "{{\"index\":{{\"_index\":\"source\",\"_id\":\"{id}\"}}}}\n"
         ));
