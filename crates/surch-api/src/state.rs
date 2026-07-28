@@ -40,8 +40,15 @@ use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor}
 /// Le module reste a l'interieur de `state.rs` — il n'a pas vocation a
 /// etre reutilise par d'autres crates, et P2 (manifest atomique) le
 /// migrera vers `surch-store` avec une API segments multi-instances.
+///
+/// Chantier D1 (`.remote/d1-source-blocs.md`) : ce module ne connait plus
+/// que des BYTES OPAQUES (append / pread / reset / jauges). Toute la
+/// logique de regroupement en blocs compresses vit dans [`SourceStore`],
+/// un wrapper de niveau parent qui l'enveloppe — de sorte que les deux
+/// branches `cfg` (linux `pwrite` / fallback `Vec<u8>`) restent triviales
+/// et qu'il n'y ait qu'UNE implementation du format de bloc.
 #[cfg(target_os = "linux")]
-mod source_store {
+mod source_segment {
     use std::{
         fs::{File, OpenOptions},
         os::unix::{fs::FileExt, io::AsRawFd},
@@ -65,7 +72,7 @@ mod source_store {
     /// Linux `pread` (`FileExt::read_exact_at`) — concurrent search
     /// share `Arc<File>` sans verrou applicatif.
     #[derive(Debug)]
-    pub(super) struct SourceStore {
+    pub(super) struct SourceSegment {
         file: Arc<File>,
         next_offset: u64,
         /// Taille deja `posix_fallocate`-ee, en octets. On
@@ -84,7 +91,7 @@ mod source_store {
         path: PathBuf,
     }
 
-    impl Default for SourceStore {
+    impl Default for SourceSegment {
         fn default() -> Self {
             let id = uuid::Uuid::new_v4();
             let path = std::env::temp_dir().join(format!("surch-source-{id}.dat"));
@@ -107,7 +114,7 @@ mod source_store {
         }
     }
 
-    impl SourceStore {
+    impl SourceSegment {
         /// `posix_fallocate(fd, 0, fallocated_len + extra)` via
         /// l'appel direct `libc::posix_fallocate`. Mute
         /// `fallocated_len`. Pas d'erreur fatale si le syscall echoue
@@ -208,7 +215,7 @@ mod source_store {
         }
     }
 
-    impl Drop for SourceStore {
+    impl Drop for SourceSegment {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -220,13 +227,13 @@ mod source_store {
 /// continuer a builder/tester sur macOS dev sans pulling `libc::
 /// posix_fallocate`.
 #[cfg(not(target_os = "linux"))]
-mod source_store {
+mod source_segment {
     #[derive(Debug, Default)]
-    pub(super) struct SourceStore {
+    pub(super) struct SourceSegment {
         buf: Vec<u8>,
     }
 
-    impl SourceStore {
+    impl SourceSegment {
         pub(super) fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
             let offset = self.buf.len() as u64;
             self.buf.extend_from_slice(bytes);
@@ -257,7 +264,343 @@ mod source_store {
     }
 }
 
-use source_store::SourceStore;
+use source_segment::SourceSegment;
+
+// ---------------------------------------------------------------------------
+// Chantier D1 — compression `_source` PAR BLOCS
+// (rapport : `.remote/d1-source-blocs.md`)
+// ---------------------------------------------------------------------------
+
+/// Taille CIBLE d'un bloc `_source`, en octets BRUTS (avant zstd). Un bloc
+/// est scelle des que le tampon d'accumulation atteint ou depasse cette
+/// taille : un document commence donc TOUJOURS a un `intra_offset`
+/// strictement inferieur a cette valeur (invariant qui borne
+/// [`SOURCE_BLOCK_INTRA_BITS`]), mais un bloc peut la depasser du dernier
+/// document ecrit (et un document plus gros qu'un bloc forme son propre
+/// bloc a lui seul).
+///
+/// 16 Kio : mesure locale sur `tests/matchid_compat/deces/slice-10000`
+/// (10 000 docs reels, zstd -3) — par-doc ×1,45, blocs 8 Kio ×5,29, blocs
+/// 16 Kio ×5,76, blocs 32 Kio ×6,11. Le rendement decroit nettement
+/// au-dela de 16 Kio alors que le cout de decompression par hit croit
+/// lineairement : 16 Kio est le point ou l'on prend l'essentiel du gain
+/// disque en payant ~9 µs de decompression par bloc (mesure `zstd -b3
+/// -B16384` : 1 815 Mo/s en decompression sur cette machine).
+const SOURCE_BLOCK_TARGET_BYTES: usize = 16 * 1024;
+
+/// Largeur du champ `intra_offset` dans le locator de bloc. 14 bits =
+/// 0..16 383, exactement l'intervalle des positions de DEBUT possibles
+/// garanti par l'invariant de scellement ci-dessus.
+const SOURCE_BLOCK_INTRA_BITS: u32 = 14;
+const SOURCE_BLOCK_INTRA_MAX: u64 = (1u64 << SOURCE_BLOCK_INTRA_BITS) - 1;
+/// Le locator tient dans le champ `offset` (40 bits) du slot packe : il
+/// reste donc 40 − 14 = 26 bits d'identifiant de bloc, soit 67,1 M blocs
+/// × 16 Kio = 1 Tio de `_source` BRUT adressable — meme enveloppe que les
+/// 1 Tio d'offsets fichier du contrat 2c.
+const SOURCE_BLOCK_ID_MAX: u64 = (1u64 << (PACKED_OFFSET_BITS - SOURCE_BLOCK_INTRA_BITS)) - 1;
+
+/// Taille max d'un bloc DECOMPRESSE que le cache thread-local accepte de
+/// retenir. Borne DURE du cout memoire du cache : au plus 64 Kio par
+/// thread qui hydrate (~32 threads observes = ~2 Mio), et un bloc geant
+/// (document unique > 64 Kio) n'est jamais retenu.
+const SOURCE_BLOCK_CACHE_MAX_BYTES: usize = 64 * 1024;
+
+/// Largeur du champ `compressed_len` d'une entree du repertoire de blocs
+/// (`[compressed_len:24][file_offset:40]`, MSB -> LSB). 24 bits = 16 Mio,
+/// tres au-dessus du `ZSTD_compressBound` d'un bloc (borne haute : un
+/// document de 4 Mio − 1 incompressible, cf. [`PACKED_LENGTH_MAX`]).
+const BLOCK_DIR_CLEN_BITS: u32 = 24;
+const BLOCK_DIR_CLEN_MAX: u32 = (1u32 << BLOCK_DIR_CLEN_BITS) - 1;
+
+/// Numero d'epoque global des `SourceStore`. Chaque instance en tire un a
+/// la construction ET a chaque [`SourceStore::reset`] : c'est ce qui rend
+/// la cle `(epoch, block_id)` du cache thread-local sure entre plusieurs
+/// index vivant dans le meme process ET a travers un `reset()` qui remet
+/// les `block_id` a zero sur un contenu DIFFERENT.
+static SOURCE_STORE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_source_store_epoch() -> u64 {
+    SOURCE_STORE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Empaquete `(block_id, intra_offset)` dans le champ `offset` (40 bits)
+/// du slot packe. Panique plutot que de tronquer (meme doctrine que
+/// [`pack_document_slot`]).
+fn pack_block_locator(block_id: u64, intra_offset: u32) -> u64 {
+    assert!(
+        block_id <= SOURCE_BLOCK_ID_MAX,
+        "bloc _source #{block_id} au-dela de 2^26 blocs (1 Tio de _source brut) — hors contrat D1"
+    );
+    assert!(
+        u64::from(intra_offset) <= SOURCE_BLOCK_INTRA_MAX,
+        "offset intra-bloc {intra_offset} >= 16 Kio — viole l'invariant de scellement D1"
+    );
+    (block_id << SOURCE_BLOCK_INTRA_BITS) | u64::from(intra_offset)
+}
+
+/// Inverse de [`pack_block_locator`].
+fn unpack_block_locator(locator: u64) -> (u64, u32) {
+    (
+        locator >> SOURCE_BLOCK_INTRA_BITS,
+        (locator & SOURCE_BLOCK_INTRA_MAX) as u32,
+    )
+}
+
+/// Entree du repertoire de blocs : `[compressed_len:24][file_offset:40]`.
+fn pack_block_dir_entry(file_offset: u64, compressed_len: u32) -> u64 {
+    assert!(
+        file_offset <= PACKED_OFFSET_MAX,
+        "offset _source > 1 TiB non supporté par la side-table packée"
+    );
+    assert!(
+        compressed_len <= BLOCK_DIR_CLEN_MAX,
+        "bloc _source compresse > 16 Mio — hors contrat D1"
+    );
+    (u64::from(compressed_len) << PACKED_OFFSET_BITS) | file_offset
+}
+
+fn unpack_block_dir_entry(entry: u64) -> (u64, u32) {
+    (
+        entry & PACKED_OFFSET_MAX,
+        (entry >> PACKED_OFFSET_BITS) as u32,
+    )
+}
+
+/// Mode d'ecriture d'un `_source` dans le store, resolu UNE fois par
+/// process a partir des drapeaux d'environnement (cf.
+/// [`source_write_mode`]). Existe comme type explicite pour que les tests
+/// puissent exercer les TROIS chemins d'ecriture sans dependre d'un
+/// `OnceLock` deja fige par un autre test du meme binaire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceWriteMode {
+    /// JSON brut, tag [`SOURCE_CODEC_RAW`] — defaut historique.
+    Raw,
+    /// zstd PAR DOCUMENT, tag [`SOURCE_CODEC_ZSTD`] — tranche 2b.
+    ZstdPerDoc,
+    /// zstd PAR BLOC de [`SOURCE_BLOCK_TARGET_BYTES`], tag
+    /// [`SOURCE_CODEC_BLOCK`] — chantier D1.
+    ZstdBlock,
+}
+
+/// Store `_source` : enveloppe le segment d'octets bruts
+/// ([`SourceSegment`]) et y ajoute le format de blocs D1.
+///
+/// Cout MEMOIRE assume (la contrainte etant « a memoire equivalente ») :
+/// - `blocks` : 8 octets par bloc. A 28,9 M docs × ~500 o = 13,8 Gio de
+///   `_source` brut / 16 Kio = ~900 k blocs = **~7 Mio**.
+/// - `pending` : UN tampon d'accumulation, capacite bornee par
+///   16 Kio + la taille du plus gros document vu (le `clear()` conserve la
+///   capacite exprès, pour ne pas re-allouer a chaque bloc).
+/// - le cache de blocs decompresses est thread-local et borne a 1 entree
+///   de ≤ 64 Kio par thread (cf. [`SOURCE_BLOCK_CACHE_MAX_BYTES`]).
+///
+/// Aucun autre poste : les blocs scelles ne vivent QUE sur disque.
+#[derive(Debug)]
+struct SourceStore {
+    segment: SourceSegment,
+    /// Repertoire des blocs SCELLES, indexe par `block_id`, entrees
+    /// packees par [`pack_block_dir_entry`]. Append-only : une entree
+    /// n'est jamais reecrite, ce qui rend un bloc scelle IMMUABLE — la
+    /// condition qui autorise le cache thread-local.
+    blocks: Vec<u64>,
+    /// Bloc en cours d'accumulation, en octets BRUTS. Son `block_id`
+    /// implicite est `blocks.len()` : un document ecrit dedans est donc
+    /// adressable IMMEDIATEMENT, avant meme que le bloc soit compresse et
+    /// ecrit — c'est ce qui evite toute reprise de slot apres coup.
+    pending: Vec<u8>,
+    epoch: u64,
+}
+
+impl Default for SourceStore {
+    fn default() -> Self {
+        Self {
+            segment: SourceSegment::default(),
+            blocks: Vec::new(),
+            pending: Vec::new(),
+            epoch: next_source_store_epoch(),
+        }
+    }
+}
+
+thread_local! {
+    /// Cache d'UN SEUL bloc decompresse, cle par `(epoch, block_id)`.
+    ///
+    /// Raison d'etre : les chemins qui balayent les `doc_id` en ordre
+    /// croissant (`rebuild_index`, `documents_paginated`) toucheraient
+    /// sinon le MEME bloc ~30 fois de suite, en le decompressant a chaque
+    /// fois — une regression O(docs_par_bloc) sur ces chemins. Une entree
+    /// suffit a l'annuler car `doc_id` croissant = `block_id` croissant.
+    ///
+    /// Sur le hot path top-K (10 hits disperses) il ne sert quasiment
+    /// jamais : c'est un filet contre la regression de balayage, pas une
+    /// optimisation de latence.
+    static SOURCE_BLOCK_CACHE: RefCell<Option<CachedSourceBlock>> = const { RefCell::new(None) };
+}
+
+/// `(epoch du store, block_id, octets BRUTS du bloc decompresse)`.
+type CachedSourceBlock = (u64, u64, Vec<u8>);
+
+impl SourceStore {
+    /// Append d'octets OPAQUES (codecs `raw` / zstd par-doc). Inchange
+    /// depuis `mmap M1`.
+    fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
+        self.segment.append(bytes)
+    }
+
+    /// `pread` d'octets OPAQUES (codecs `raw` / zstd par-doc).
+    fn read(&self, offset: u64, length: u32) -> Vec<u8> {
+        self.segment.read(offset, length)
+    }
+
+    fn reset(&mut self) {
+        self.segment.reset();
+        self.blocks.clear();
+        self.blocks.shrink_to_fit();
+        self.pending.clear();
+        self.pending.shrink_to_fit();
+        // Nouvelle epoque : les `block_id` repartent de 0 sur un contenu
+        // DIFFERENT, toute entree de cache portant l'ancienne epoque
+        // devient donc inatteignable (et non « fausse »).
+        self.epoch = next_source_store_epoch();
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.segment.bytes_written()
+    }
+
+    fn peak_bytes_written(&self) -> u64 {
+        self.segment.peak_bytes_written()
+    }
+
+    /// Ecrit `raw` dans le bloc courant et retourne le LOCATOR
+    /// (`[block_id][intra_offset]`) a ranger dans le champ `offset` du
+    /// slot. Le `block_id` est connu AVANT le scellement, donc le slot est
+    /// definitif des cette ligne : aucune reprise differee n'est
+    /// necessaire (et aucune structure « docs de ce bloc » n'existe).
+    ///
+    /// Cout indexation : **zero** `pwrite` par document. Un seul `pwrite`
+    /// et une seule compression zstd par bloc (~30-70 documents) — c'est
+    /// strictement MOINS de syscalls et de contextes zstd que le chemin
+    /// par-document qu'il remplace.
+    fn append_block_doc(&mut self, raw: &[u8]) -> u64 {
+        let block_id = self.blocks.len() as u64;
+        let intra_offset = self.pending.len() as u32;
+        let locator = pack_block_locator(block_id, intra_offset);
+        self.pending.extend_from_slice(raw);
+        if self.pending.len() >= SOURCE_BLOCK_TARGET_BYTES {
+            self.flush_pending_block();
+        }
+        locator
+    }
+
+    /// Scelle le bloc en cours : compression zstd + UN `pwrite` + une
+    /// entree de repertoire. No-op si le tampon est vide (donc idempotent,
+    /// et appelable a chaque `densify` sans condition).
+    fn flush_pending_block(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let compressed = SourceBlob::encode_zstd(&self.pending);
+        let (file_offset, compressed_len) = self.segment.append(&compressed);
+        self.blocks
+            .push(pack_block_dir_entry(file_offset, compressed_len));
+        // `clear()` et NON `= Vec::new()` : la capacite survit d'un bloc
+        // au suivant, donc zero re-allocation dans la boucle de bulk.
+        self.pending.clear();
+    }
+
+    /// Restitue les `raw_len` octets du document situe a `locator`.
+    /// Fail-closed : toute incoherence (bloc inconnu, tranche hors bornes)
+    /// panique avec un message de contrat plutot que de rendre des octets
+    /// arbitraires.
+    fn read_block_doc(&self, locator: u64, raw_len: u32) -> Vec<u8> {
+        self.read_block_doc_inner(locator, raw_len, None)
+    }
+
+    fn read_block_doc_inner(
+        &self,
+        locator: u64,
+        raw_len: u32,
+        profile: Option<&mut SourceFetchProfile>,
+    ) -> Vec<u8> {
+        let (block_id, intra_offset) = unpack_block_locator(locator);
+        let start = intra_offset as usize;
+        let end = start + raw_len as usize;
+
+        // Bloc encore en cours d'accumulation : il n'est PAS sur disque,
+        // ses octets bruts sont dans `pending`.
+        if block_id == self.blocks.len() as u64 {
+            assert!(
+                end <= self.pending.len(),
+                "tranche _source [{start}..{end}) hors du bloc en cours ({} o) — contrat D1",
+                self.pending.len()
+            );
+            let bytes = self.pending[start..end].to_vec();
+            if let Some(profile) = profile {
+                profile.source_bytes += u64::from(raw_len);
+            }
+            return bytes;
+        }
+
+        let Some(&entry) = self.blocks.get(block_id as usize) else {
+            panic!(
+                "bloc _source #{block_id} absent du repertoire ({} blocs scelles) — contrat D1",
+                self.blocks.len()
+            );
+        };
+        let (file_offset, compressed_len) = unpack_block_dir_entry(entry);
+
+        let cached = SOURCE_BLOCK_CACHE.with(|cell| {
+            let borrowed = cell.borrow();
+            match borrowed.as_ref() {
+                Some((epoch, cached_id, bytes))
+                    if *epoch == self.epoch && *cached_id == block_id =>
+                {
+                    assert!(
+                        end <= bytes.len(),
+                        "tranche _source [{start}..{end}) hors du bloc #{block_id} ({} o) — contrat D1",
+                        bytes.len()
+                    );
+                    Some(bytes[start..end].to_vec())
+                }
+                _ => None,
+            }
+        });
+        if let Some(bytes) = cached {
+            return bytes;
+        }
+
+        let decoded = match profile {
+            Some(profile) => {
+                let pread_started = Instant::now();
+                let compressed = self.segment.read(file_offset, compressed_len);
+                profile.record_pread(pread_started.elapsed());
+                profile.source_bytes += u64::from(compressed_len);
+                let decode_started = Instant::now();
+                let decoded = SourceBlob::decode_zstd_block(&compressed);
+                profile.record_zstd_decode(decode_started.elapsed());
+                decoded
+            }
+            None => {
+                let compressed = self.segment.read(file_offset, compressed_len);
+                SourceBlob::decode_zstd_block(&compressed)
+            }
+        };
+
+        assert!(
+            end <= decoded.len(),
+            "tranche _source [{start}..{end}) hors du bloc #{block_id} ({} o) — contrat D1",
+            decoded.len()
+        );
+        let bytes = decoded[start..end].to_vec();
+        if decoded.len() <= SOURCE_BLOCK_CACHE_MAX_BYTES {
+            SOURCE_BLOCK_CACHE.with(|cell| {
+                *cell.borrow_mut() = Some((self.epoch, block_id, decoded));
+            });
+        }
+        bytes
+    }
+}
 
 /// Campagne mémoire — option B (cf. `docs/paper/memory-pivot-decision.md`)
 /// **composee avec `mmap M1` (P1 persistance)**.
@@ -301,6 +644,15 @@ enum SourceBlob {
     /// vie du process). Tient dans le padding existant de la variante
     /// (`offset: u64` + `length: u32` occupe deja 16 o alignes, `codec: u8`
     /// n'agrandit pas `size_of::<SourceBlob>()`).
+    ///
+    /// Chantier D1 — REINTERPRETATION des deux champs selon `codec` :
+    /// - `SOURCE_CODEC_RAW` / `SOURCE_CODEC_ZSTD` : `offset` = offset
+    ///   fichier, `length` = octets ECRITS (compresses ou non).
+    /// - [`SOURCE_CODEC_BLOCK`] : `offset` = locator
+    ///   `[block_id:26][intra_offset:14]` ([`pack_block_locator`]),
+    ///   `length` = longueur BRUTE (decompressee) du document dans le
+    ///   bloc. Les octets ecrits, eux, sont ceux du bloc entier et ne sont
+    ///   attribuables a aucun document en particulier.
     OnDisk { offset: u64, length: u32, codec: u8 },
     /// Bytes deflate-bruts produits par `compact_after_refresh()`.
     /// Decode via [`SourceBlob::decode_compressed`] (Decompress thread-local).
@@ -311,8 +663,19 @@ enum SourceBlob {
 /// `0` = bytes JSON bruts (comportement historique, bit-identique).
 const SOURCE_CODEC_RAW: u8 = 0;
 /// `1` = bytes zstd (niveau [`ZSTD_SOURCE_LEVEL`]), produits quand
-/// `SURCH_SOURCE_COMPRESS=1` (cf. [`source_compress_enabled`]).
+/// `SURCH_SOURCE_COMPRESS=1` et `SURCH_SOURCE_COMPRESS_MODE=doc`
+/// (cf. [`source_write_mode`]).
 const SOURCE_CODEC_ZSTD: u8 = 1;
+/// `2` = chantier D1 : le document vit dans un BLOC zstd partage. Le
+/// champ `offset` du slot ne porte alors plus un offset fichier mais un
+/// LOCATOR `[block_id:26][intra_offset:14]` ([`pack_block_locator`]), et
+/// le champ `length` la longueur BRUTE (decompressee) du document.
+///
+/// C'est exactement l'usage prevu par le contrat 2b amendement 3 pour le
+/// champ `codec` : la LECTURE reste dirigee par le tag, donc un store
+/// dont une partie a ete ecrite en `raw` ou en zstd par-doc reste
+/// integralement relisible sans reindexation.
+const SOURCE_CODEC_BLOCK: u8 = 2;
 
 /// Niveau zstd par defaut pour la compression PAR-DOC du `_source`
 /// (contrat 2b, amendement 2 : par-doc d'abord, pas de dictionnaire).
@@ -325,9 +688,10 @@ const ZSTD_SOURCE_LEVEL: i32 = 3;
 /// — un flip mid-run n'est pas supporte, coherent avec tous les autres
 /// `SURCH_*` du process). `0`/absent/invalide = OFF (comportement actuel
 /// bit-identique, tag [`SOURCE_CODEC_RAW`]) ; `1` = ON (tag
-/// [`SOURCE_CODEC_ZSTD`]). La lecture (`parse_source_blob`) gere les DEUX
-/// tags dans tous les cas, flag ou pas — un store a codec mixte pendant un
-/// flip de flag reste valide.
+/// [`SOURCE_CODEC_ZSTD`] ou [`SOURCE_CODEC_BLOCK`] selon
+/// [`source_block_mode_enabled`]). La lecture (`parse_source_blob`) gere
+/// les TROIS tags dans tous les cas, flag ou pas — un store a codec mixte
+/// pendant un flip de flag reste valide.
 fn source_compress_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -336,6 +700,80 @@ fn source_compress_enabled() -> bool {
             .map(|value| value.trim() == "1")
             .unwrap_or(false)
     })
+}
+
+/// Chantier D1 — `SURCH_SOURCE_COMPRESS_MODE`, lu UNE FOIS par process
+/// comme les autres `SURCH_*`. N'a d'effet que si
+/// [`source_compress_enabled`] est vrai (le maitre reste
+/// `SURCH_SOURCE_COMPRESS`).
+///
+/// - `doc` : compression zstd PAR DOCUMENT (comportement tranche 2b,
+///   conserve pour le A/B disque : c'est le temoin du chantier D1).
+/// - toute autre valeur, ou variable absente : compression PAR BLOC
+///   (defaut D1). Le defaut est le bloc parce que c'est le seul mode qui
+///   rend l'axe disque competitif ; il n'y a aucun scenario ou l'on
+///   souhaite « compresser mais mal ».
+fn source_block_mode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SURCH_SOURCE_COMPRESS_MODE")
+            .ok()
+            .map(|value| !value.trim().eq_ignore_ascii_case("doc"))
+            .unwrap_or(true)
+    })
+}
+
+/// Mode d'ecriture effectif resolu depuis les deux drapeaux.
+fn source_write_mode() -> SourceWriteMode {
+    if !source_compress_enabled() {
+        return SourceWriteMode::Raw;
+    }
+    if source_block_mode_enabled() {
+        SourceWriteMode::ZstdBlock
+    } else {
+        SourceWriteMode::ZstdPerDoc
+    }
+}
+
+/// Ecrit `serialized` (le `_source` JSON deja serialise) dans le store
+/// selon `mode` et rend le [`SourceBlob`] a ranger dans le slot.
+///
+/// Extrait de `upsert_document_deferred` exprès : c'est le point unique
+/// ou le format d'ecriture est choisi, donc le point que les tests
+/// exercent pour les TROIS modes sans dependre d'un `OnceLock` deja fige
+/// par un autre test du meme binaire.
+fn store_source_bytes(
+    store: &mut SourceStore,
+    serialized: &[u8],
+    mode: SourceWriteMode,
+) -> SourceBlob {
+    match mode {
+        SourceWriteMode::Raw => {
+            let (offset, length) = store.append(serialized);
+            SourceBlob::OnDisk {
+                offset,
+                length,
+                codec: SOURCE_CODEC_RAW,
+            }
+        }
+        SourceWriteMode::ZstdPerDoc => {
+            let compressed = SourceBlob::encode_zstd(serialized);
+            let (offset, length) = store.append(&compressed);
+            SourceBlob::OnDisk {
+                offset,
+                length,
+                codec: SOURCE_CODEC_ZSTD,
+            }
+        }
+        SourceWriteMode::ZstdBlock => {
+            let locator = store.append_block_doc(serialized);
+            SourceBlob::OnDisk {
+                offset: locator,
+                length: serialized.len() as u32,
+                codec: SOURCE_CODEC_BLOCK,
+            }
+        }
+    }
 }
 
 /// Flag `SURCH_SOURCE_FETCH_PARALLEL` : lu UNE FOIS par process, comme
@@ -773,6 +1211,25 @@ impl SourceBlob {
     /// construction — cf. contrat 2b §A6 — donc ce plafond ne devrait
     /// jamais etre atteint en usage normal).
     fn decode_zstd(bytes: &[u8]) -> Vec<u8> {
+        Self::decode_zstd_from(bytes, bytes.len().saturating_mul(4).max(4096))
+    }
+
+    /// Variante D1 pour un BLOC : meme decodeur, mais la capacite de
+    /// depart tient compte du ratio observe sur des blocs (×5 a ×6, contre
+    /// ×1,4 a ×1,9 par document). Sans cela le chemin bloc paierait
+    /// systematiquement une tentative `decompress` ratee suivie d'un
+    /// doublement, sur CHAQUE hit.
+    fn decode_zstd_block(bytes: &[u8]) -> Vec<u8> {
+        Self::decode_zstd_from(
+            bytes,
+            bytes
+                .len()
+                .saturating_mul(8)
+                .max(SOURCE_BLOCK_TARGET_BYTES * 2),
+        )
+    }
+
+    fn decode_zstd_from(bytes: &[u8], initial_capacity: usize) -> Vec<u8> {
         thread_local! {
             static DECOMPRESSOR: RefCell<ZstdDecompressor<'static>> = RefCell::new(
                 ZstdDecompressor::new().expect("zstd decompressor context initialises"),
@@ -780,7 +1237,7 @@ impl SourceBlob {
         }
         DECOMPRESSOR.with(|cell| {
             let mut decompressor = cell.borrow_mut();
-            let mut capacity = bytes.len().saturating_mul(4).max(4096);
+            let mut capacity = initial_capacity;
             for _ in 0..20 {
                 match decompressor.decompress(bytes, capacity) {
                     Ok(out) => return out,
@@ -801,12 +1258,14 @@ impl SourceBlob {
 /// codec MIXTE (flip de `SURCH_SOURCE_COMPRESS` en cours de vie du
 /// process) reste toujours relisible, blob par blob.
 fn read_on_disk_bytes(store: &SourceStore, offset: u64, length: u32, codec: u8) -> Vec<u8> {
-    let bytes = store.read(offset, length);
     match codec {
-        SOURCE_CODEC_RAW => bytes,
-        SOURCE_CODEC_ZSTD => SourceBlob::decode_zstd(&bytes),
+        SOURCE_CODEC_RAW => store.read(offset, length),
+        SOURCE_CODEC_ZSTD => SourceBlob::decode_zstd(&store.read(offset, length)),
+        // D1 : `offset` est un LOCATOR de bloc, PAS un offset fichier —
+        // aucun `store.read` direct ici.
+        SOURCE_CODEC_BLOCK => store.read_block_doc(offset, length),
         other => panic!(
-            "unknown _source codec tag {other} on OnDisk blob (contrat 2b : raw={SOURCE_CODEC_RAW}, zstd={SOURCE_CODEC_ZSTD})"
+            "unknown _source codec tag {other} on OnDisk blob (contrat 2b amendement 3 : raw={SOURCE_CODEC_RAW}, zstd={SOURCE_CODEC_ZSTD}, bloc={SOURCE_CODEC_BLOCK})"
         ),
     }
 }
@@ -821,6 +1280,13 @@ fn read_on_disk_bytes_profiled(
     codec: u8,
     profile: &mut SourceFetchProfile,
 ) -> Vec<u8> {
+    // D1 : le chemin bloc a sa propre instrumentation (le `pread` porte
+    // sur le BLOC compresse, pas sur `length` octets) — il ne passe donc
+    // pas par le `store.read` ci-dessous.
+    if codec == SOURCE_CODEC_BLOCK {
+        return store.read_block_doc_inner(offset, length, Some(profile));
+    }
+
     let pread_started = Instant::now();
     let bytes = store.read(offset, length);
     profile.record_pread(pread_started.elapsed());
@@ -835,7 +1301,7 @@ fn read_on_disk_bytes_profiled(
             decoded
         }
         other => panic!(
-            "unknown _source codec tag {other} on OnDisk blob (contrat 2b : raw={SOURCE_CODEC_RAW}, zstd={SOURCE_CODEC_ZSTD})"
+            "unknown _source codec tag {other} on OnDisk blob (contrat 2b amendement 3 : raw={SOURCE_CODEC_RAW}, zstd={SOURCE_CODEC_ZSTD}, bloc={SOURCE_CODEC_BLOCK})"
         ),
     }
 }
@@ -1099,20 +1565,23 @@ struct MemoryStore {
 // pour eviter un piege future.
 /// Largeur en bits de chaque champ du `u64` packe de
 /// [`DenseIdMaps::documents`] (plan 2c,
-/// `docs/paper/plan-packing-sidetable-2026-07-12.md`) : `[codec:1]
-/// [length:23][offset:40]`, MSB -> LSB.
+/// `docs/paper/plan-packing-sidetable-2026-07-12.md`) : `[codec:2]
+/// [length:22][offset:40]`, MSB -> LSB.
 /// - `offset` (40 bits) = 1 Tio adressables dans `source.dat` — a 28,9M
-///   docs on mesure ~15 Go orphelins compris, marge 64×.
-/// - `length` (23 bits) = 8 Mio/doc max — les `_source` observes
+///   docs on mesure ~15 Go orphelins compris, marge 64×. Pour le codec
+///   D1 [`SOURCE_CODEC_BLOCK`], ce champ porte un LOCATOR de bloc
+///   `[block_id:26][intra_offset:14]` et non un offset fichier (cf.
+///   [`pack_block_locator`]) — meme enveloppe de 1 Tio, exprimee en
+///   `_source` BRUT plutot qu'en octets fichier.
+/// - `length` (22 bits) = 4 Mio/doc max — les `_source` observes
 ///   (matchID/BEIR) font < 1 Mio ; l'ancien contrat `u32` (4 Gio) etait
-///   deja theorique.
-/// - `codec` (1 bit) = les 2 valeurs actuelles ([`SOURCE_CODEC_RAW`] /
-///   [`SOURCE_CODEC_ZSTD`]). Un 3e codec grignotera un bit de `length`
-///   ou d'`offset` — a trancher au moment du dictionnaire zstd, pas
-///   avant (cf. le plan).
+///   deja theorique. **Retreci de 23 a 22 bits par D1**, c'est le bit qui
+///   finance le 3e codec, exactement comme le plan 2c le prevoyait.
+/// - `codec` (2 bits) = [`SOURCE_CODEC_RAW`] / [`SOURCE_CODEC_ZSTD`] /
+///   [`SOURCE_CODEC_BLOCK`], 4e valeur libre.
 const PACKED_OFFSET_BITS: u32 = 40;
-const PACKED_LENGTH_BITS: u32 = 23;
-const PACKED_CODEC_BITS: u32 = 1;
+const PACKED_LENGTH_BITS: u32 = 22;
+const PACKED_CODEC_BITS: u32 = 2;
 const _: () = assert!(PACKED_OFFSET_BITS + PACKED_LENGTH_BITS + PACKED_CODEC_BITS == 64);
 
 const PACKED_OFFSET_SHIFT: u32 = 0;
@@ -1121,8 +1590,10 @@ const PACKED_CODEC_SHIFT: u32 = PACKED_OFFSET_BITS + PACKED_LENGTH_BITS;
 
 /// Offset maximal representable (2^40 − 1, soit 1 Tio − 1 o).
 const PACKED_OFFSET_MAX: u64 = (1u64 << PACKED_OFFSET_BITS) - 1;
-/// Length maximale representable (2^23 − 1, soit 8 Mio − 1 o).
+/// Length maximale representable (2^22 − 1, soit 4 Mio − 1 o).
 const PACKED_LENGTH_MAX: u32 = (1u32 << PACKED_LENGTH_BITS) - 1;
+/// Tag de codec maximal representable sur [`PACKED_CODEC_BITS`] bits.
+const PACKED_CODEC_MAX: u8 = (1u8 << PACKED_CODEC_BITS) - 1;
 
 /// Empaquete un pointeur `OnDisk { offset, length, codec }` en un `u64`
 /// pour un slot de [`DenseIdMaps::documents`] (plan 2c). `length == 0`
@@ -1130,26 +1601,27 @@ const PACKED_LENGTH_MAX: u32 = (1u32 << PACKED_LENGTH_BITS) - 1;
 /// un `_source` reel (meme `{}` serialise deja sur 2 octets).
 ///
 /// Panique plutot que de tronquer silencieusement : un doc dont le
-/// `_source` (compresse ou non) depasse 8 Mio, ou un `source.dat` qui
+/// `_source` (compresse ou non) depasse 4 Mio (plafond abaisse de 8 a
+/// 4 Mio par D1, cf. [`PACKED_LENGTH_BITS`]), ou un `source.dat` qui
 /// depasse 1 Tio, sortent du contrat de cette side-table packee. Le plan
 /// prevoit une `HashMap<u32, SourceBlob>` d'exceptions comme escape-hatch
 /// si ce cas se presente un jour — non implementee ici, pas encore
-/// necessaire (aucun `_source` deces/matchID/BEIR n'approche 8 Mio).
+/// necessaire (aucun `_source` deces/matchID/BEIR n'approche 4 Mio).
 fn pack_document_slot(offset: u64, length: u32, codec: u8) -> u64 {
     assert!(
         length <= PACKED_LENGTH_MAX,
-        "doc _source > 8 MiB non supporté par la side-table packée"
+        "doc _source > 4 MiB non supporté par la side-table packée"
     );
     assert!(
         offset <= PACKED_OFFSET_MAX,
         "offset _source > 1 TiB non supporté par la side-table packée"
     );
     debug_assert!(
-        codec <= 1,
-        "codec _source doit tenir sur 1 bit (0=raw, 1=zstd) — voir \
-         SOURCE_CODEC_RAW/SOURCE_CODEC_ZSTD"
+        codec <= PACKED_CODEC_MAX,
+        "codec _source doit tenir sur 2 bits (0=raw, 1=zstd par-doc, 2=bloc) — voir \
+         SOURCE_CODEC_RAW/SOURCE_CODEC_ZSTD/SOURCE_CODEC_BLOCK"
     );
-    ((u64::from(codec) & 0x1) << PACKED_CODEC_SHIFT)
+    ((u64::from(codec) & u64::from(PACKED_CODEC_MAX)) << PACKED_CODEC_SHIFT)
         | (u64::from(length) << PACKED_LENGTH_SHIFT)
         | (offset << PACKED_OFFSET_SHIFT)
 }
@@ -1163,7 +1635,7 @@ fn unpack_document_slot(packed: u64) -> Option<(u64, u32, u8)> {
         return None;
     }
     let offset = (packed >> PACKED_OFFSET_SHIFT) & PACKED_OFFSET_MAX;
-    let codec = (packed >> PACKED_CODEC_SHIFT) as u8;
+    let codec = ((packed >> PACKED_CODEC_SHIFT) as u8) & PACKED_CODEC_MAX;
     Some((offset, length, codec))
 }
 
@@ -1294,17 +1766,20 @@ impl DenseIdMaps {
 mod packed_document_slot_tests {
     use super::{
         pack_document_slot, unpack_document_slot, PACKED_LENGTH_MAX, PACKED_OFFSET_MAX,
-        SOURCE_CODEC_RAW, SOURCE_CODEC_ZSTD,
+        SOURCE_CODEC_BLOCK, SOURCE_CODEC_RAW, SOURCE_CODEC_ZSTD,
     };
 
     /// Round-trip : ce que `pack` encode, `unpack` le retrouve a
-    /// l'identique, pour les deux codecs.
+    /// l'identique, pour les TROIS codecs (D1 elargit le champ a 2 bits).
     #[test]
     fn round_trip_raw_and_zstd() {
         for (offset, length, codec) in [
             (0u64, 2u32, SOURCE_CODEC_RAW),
             (1_234_567u64, 512u32, SOURCE_CODEC_ZSTD),
             (PACKED_OFFSET_MAX, PACKED_LENGTH_MAX, SOURCE_CODEC_ZSTD),
+            (0u64, 2u32, SOURCE_CODEC_BLOCK),
+            (1_234_567u64, 512u32, SOURCE_CODEC_BLOCK),
+            (PACKED_OFFSET_MAX, PACKED_LENGTH_MAX, SOURCE_CODEC_BLOCK),
         ] {
             let packed = pack_document_slot(offset, length, codec);
             assert_eq!(
@@ -1328,7 +1803,7 @@ mod packed_document_slot_tests {
     }
 
     /// Bornes maximales : `offset`/`length` a leur plafond exact
-    /// (2^40 − 1 / 2^23 − 1) round-trippent sans troncature ni panic.
+    /// (2^40 − 1 / 2^22 − 1) round-trippent sans troncature ni panic.
     #[test]
     fn max_bounds_round_trip() {
         let packed = pack_document_slot(PACKED_OFFSET_MAX, PACKED_LENGTH_MAX, SOURCE_CODEC_ZSTD);
@@ -1338,10 +1813,11 @@ mod packed_document_slot_tests {
         );
     }
 
-    /// `length` au-dela de 2^23 − 1 (8 Mio) doit paniquer explicitement
-    /// plutot que tronquer silencieusement — le garde-fou du plan 2c.
+    /// `length` au-dela de 2^22 − 1 (4 Mio) doit paniquer explicitement
+    /// plutot que tronquer silencieusement — le garde-fou du plan 2c,
+    /// plafond abaisse par D1 (le bit finance le 3e codec).
     #[test]
-    #[should_panic(expected = "doc _source > 8 MiB non supporté par la side-table packée")]
+    #[should_panic(expected = "doc _source > 4 MiB non supporté par la side-table packée")]
     fn length_overflow_panics_with_explicit_message() {
         pack_document_slot(0, PACKED_LENGTH_MAX + 1, SOURCE_CODEC_RAW);
     }
@@ -1352,6 +1828,339 @@ mod packed_document_slot_tests {
     #[should_panic(expected = "offset _source > 1 TiB non supporté par la side-table packée")]
     fn offset_overflow_panics_with_explicit_message() {
         pack_document_slot(PACKED_OFFSET_MAX + 1, 2, SOURCE_CODEC_RAW);
+    }
+}
+
+/// Chantier D1 — aller-retour ecriture/lecture du format de bloc.
+///
+/// Ces tests s'appuient sur [`store_source_bytes`] (le point UNIQUE ou le
+/// format d'ecriture est choisi) et sur [`read_on_disk_bytes`] (le point
+/// unique de lecture), pas sur les drapeaux d'environnement : un
+/// `OnceLock` fige par un autre test du meme binaire ne peut donc pas
+/// rendre ces tests inoperants sans qu'ils echouent.
+#[cfg(test)]
+mod source_block_store_tests {
+    use super::{
+        pack_block_locator, read_on_disk_bytes, store_source_bytes, unpack_block_locator,
+        SourceBlob, SourceStore, SourceWriteMode, SOURCE_BLOCK_CACHE_MAX_BYTES,
+        SOURCE_BLOCK_ID_MAX, SOURCE_BLOCK_INTRA_MAX, SOURCE_BLOCK_TARGET_BYTES, SOURCE_CODEC_BLOCK,
+        SOURCE_CODEC_RAW, SOURCE_CODEC_ZSTD,
+    };
+
+    /// Ecrit `payload` dans `store` selon `mode` et rend `(blob, attendu)`.
+    fn write(store: &mut SourceStore, payload: &[u8], mode: SourceWriteMode) -> SourceBlob {
+        store_source_bytes(store, payload, mode)
+    }
+
+    /// Relit un blob et exige l'egalite STRICTE, octet pour octet.
+    fn assert_reads_back(store: &SourceStore, blob: &SourceBlob, expected: &[u8], label: &str) {
+        let SourceBlob::OnDisk {
+            offset,
+            length,
+            codec,
+        } = blob
+        else {
+            panic!("{label}: store_source_bytes doit toujours produire un OnDisk");
+        };
+        let got = read_on_disk_bytes(store, *offset, *length, *codec);
+        assert_eq!(
+            got,
+            expected,
+            "{label}: _source restitue different de l'original ({} o attendus, {} o obtenus)",
+            expected.len(),
+            got.len()
+        );
+    }
+
+    /// Documents deterministes et compressibles, style etat civil.
+    fn doc(i: usize) -> Vec<u8> {
+        format!(
+            r#"{{"NOM":"MARTIN","PRENOMS":"JEAN","SEXE":"M","DATE_NAISSANCE":"1930{:04}","COMMUNE_DECES":"01004","SOURCE_LINE":{i}}}"#,
+            i % 1231
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn block_locator_round_trip() {
+        for (block_id, intra) in [
+            (0u64, 0u32),
+            (1, 1),
+            (12_345, 9_999),
+            (SOURCE_BLOCK_ID_MAX, SOURCE_BLOCK_INTRA_MAX as u32),
+        ] {
+            let locator = pack_block_locator(block_id, intra);
+            assert_eq!(unpack_block_locator(locator), (block_id, intra));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "hors contrat D1")]
+    fn block_id_overflow_panics() {
+        pack_block_locator(SOURCE_BLOCK_ID_MAX + 1, 0);
+    }
+
+    /// Bloc PARTIEL, jamais scelle : les documents doivent etre lisibles
+    /// immediatement, avant tout `pwrite` (c'est le cas de la fin de
+    /// segment et celui de l'index minuscule).
+    #[test]
+    fn pending_block_is_readable_before_flush() {
+        let mut store = SourceStore::default();
+        let payloads: Vec<Vec<u8>> = (0..5).map(doc).collect();
+        let blobs: Vec<SourceBlob> = payloads
+            .iter()
+            .map(|p| write(&mut store, p, SourceWriteMode::ZstdBlock))
+            .collect();
+        assert_eq!(
+            store.bytes_written(),
+            0,
+            "5 petits documents ne doivent declencher AUCUNE ecriture disque"
+        );
+        for (i, (blob, payload)) in blobs.iter().zip(payloads.iter()).enumerate() {
+            assert_reads_back(&store, blob, payload, &format!("pending doc {i}"));
+        }
+    }
+
+    /// Plusieurs blocs scelles + un bloc partiel en queue : TOUS les
+    /// documents se relisent a l'identique, dans les deux etats.
+    #[test]
+    fn sealed_and_partial_blocks_round_trip() {
+        let mut store = SourceStore::default();
+        // ~2 000 docs de ~120 o = ~240 Kio bruts = ~15 blocs de 16 Kio,
+        // le dernier restant partiel.
+        let payloads: Vec<Vec<u8>> = (0..2_000).map(doc).collect();
+        let blobs: Vec<SourceBlob> = payloads
+            .iter()
+            .map(|p| write(&mut store, p, SourceWriteMode::ZstdBlock))
+            .collect();
+        assert!(
+            store.blocks.len() > 3,
+            "le corpus de test doit sceller plusieurs blocs, obtenu {}",
+            store.blocks.len()
+        );
+        // Bloc PARTIEL en queue, DETERMINISTE : on scelle tout ce qui
+        // precede puis on ecrit un unique document — le tampon ne peut
+        // alors ni etre vide ni avoir declenche un scellement.
+        store.flush_pending_block();
+        let tail = doc(999_999);
+        let blob_tail = write(&mut store, &tail, SourceWriteMode::ZstdBlock);
+        assert!(
+            !store.pending.is_empty(),
+            "le dernier bloc doit rester partiel"
+        );
+        assert_reads_back(&store, &blob_tail, &tail, "bloc partiel de queue");
+        // Lecture en ordre croissant (chemin balayage) ...
+        for (i, (blob, payload)) in blobs.iter().zip(payloads.iter()).enumerate() {
+            assert_reads_back(&store, blob, payload, &format!("scan doc {i}"));
+        }
+        // ... puis en ordre disperse (chemin top-K), pour ne pas dependre
+        // du cache de bloc.
+        for i in (0..blobs.len()).rev().step_by(37) {
+            assert_reads_back(&store, &blobs[i], &payloads[i], &format!("random doc {i}"));
+        }
+        // Le scellement a bien produit des octets disque, et MOINS que le
+        // brut : c'est la propriete que le chantier achete.
+        let raw_total: usize = payloads.iter().map(Vec::len).sum();
+        assert!(
+            store.bytes_written() > 0 && (store.bytes_written() as usize) < raw_total,
+            "les blocs scelles doivent etre plus petits que le brut ({} o ecrits pour {raw_total} o bruts)",
+            store.bytes_written()
+        );
+    }
+
+    /// Construit un `_source` synthetique d'au moins `bytes` octets.
+    fn oversized(bytes: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(bytes + 256);
+        let mut i = 0usize;
+        while v.len() < bytes {
+            v.extend_from_slice(&doc(i));
+            i += 1;
+        }
+        v
+    }
+
+    /// Un document PLUS GROS qu'un bloc se relit a l'identique dans les
+    /// DEUX positions possibles : accole a un document precedent (il
+    /// deborde alors le bloc courant), et seul en tete d'un bloc. Le
+    /// second cas depasse aussi [`SOURCE_BLOCK_CACHE_MAX_BYTES`], donc il
+    /// exerce la branche « bloc trop gros pour etre mis en cache ».
+    #[test]
+    fn document_larger_than_a_block_round_trips() {
+        let mut store = SourceStore::default();
+        let before = doc(1);
+        let huge_tail = oversized(SOURCE_BLOCK_TARGET_BYTES * 3);
+        let huge_alone = oversized(SOURCE_BLOCK_CACHE_MAX_BYTES + SOURCE_BLOCK_TARGET_BYTES);
+        let after = doc(2);
+
+        // Cas 1 : le geant commence a un `intra_offset` non nul.
+        let blob_before = write(&mut store, &before, SourceWriteMode::ZstdBlock);
+        let blob_huge_tail = write(&mut store, &huge_tail, SourceWriteMode::ZstdBlock);
+        // Cas 2 : le geant est seul dans son bloc (le precedent vient
+        // d'etre scelle par son propre debordement).
+        let blob_huge_alone = write(&mut store, &huge_alone, SourceWriteMode::ZstdBlock);
+        let blob_after = write(&mut store, &after, SourceWriteMode::ZstdBlock);
+
+        assert_reads_back(&store, &blob_before, &before, "avant le geant");
+        assert_reads_back(
+            &store,
+            &blob_huge_tail,
+            &huge_tail,
+            "geant en queue de bloc",
+        );
+        assert_reads_back(
+            &store,
+            &blob_huge_alone,
+            &huge_alone,
+            "geant seul dans son bloc",
+        );
+        assert_reads_back(&store, &blob_after, &after, "apres le geant");
+        // Relecture APRES avoir touche d'autres blocs : verifie que le
+        // bloc geant, non mis en cache, se redecompresse correctement.
+        assert_reads_back(&store, &blob_huge_alone, &huge_alone, "geant relu");
+    }
+
+    /// `_source` minimal (`{}`, 2 octets — le plus petit qu'un document
+    /// reel puisse produire) et documents adjacents de taille nulle en
+    /// bordure de bloc.
+    #[test]
+    fn tiny_documents_round_trip() {
+        let mut store = SourceStore::default();
+        let empty_object = b"{}".to_vec();
+        let first = write(&mut store, &empty_object, SourceWriteMode::ZstdBlock);
+        // Un document de longueur 0 est representable au niveau du STORE
+        // (mais pas au niveau du slot packe, ou `length == 0` signifie
+        // trou) : on verifie que le store lui-meme reste coherent.
+        let zero = write(&mut store, b"", SourceWriteMode::ZstdBlock);
+        let third = write(&mut store, &empty_object, SourceWriteMode::ZstdBlock);
+        assert_reads_back(&store, &first, &empty_object, "{} initial");
+        assert_reads_back(&store, &zero, b"", "document de longueur nulle");
+        assert_reads_back(&store, &third, &empty_object, "{} final");
+    }
+
+    /// COMPATIBILITE : un store MIXTE (ancien format par-doc, ancien
+    /// format brut, nouveau format bloc) se relit integralement. C'est la
+    /// preuve que le choix « pas de reindexation » tient.
+    #[test]
+    fn mixed_codec_store_stays_readable() {
+        let mut store = SourceStore::default();
+        let a = doc(11);
+        let b = doc(22);
+        let c = doc(33);
+        let d = doc(44);
+
+        let blob_raw = write(&mut store, &a, SourceWriteMode::Raw);
+        let blob_perdoc = write(&mut store, &b, SourceWriteMode::ZstdPerDoc);
+        let blob_block = write(&mut store, &c, SourceWriteMode::ZstdBlock);
+        let blob_raw2 = write(&mut store, &d, SourceWriteMode::Raw);
+
+        assert_eq!(codec_of(&blob_raw), SOURCE_CODEC_RAW);
+        assert_eq!(codec_of(&blob_perdoc), SOURCE_CODEC_ZSTD);
+        assert_eq!(codec_of(&blob_block), SOURCE_CODEC_BLOCK);
+
+        assert_reads_back(&store, &blob_raw, &a, "ancien codec brut");
+        assert_reads_back(&store, &blob_perdoc, &b, "ancien codec zstd par-doc");
+        assert_reads_back(&store, &blob_block, &c, "nouveau codec bloc");
+        assert_reads_back(&store, &blob_raw2, &d, "brut apres un bloc");
+    }
+
+    /// Le format bloc doit rester ecrit APRES un scellement force
+    /// (l'equivalent d'un `_refresh`), sans changer un seul octet
+    /// restitue, et sans laisser de tampon en RAM.
+    #[test]
+    fn explicit_flush_is_transparent_and_idempotent() {
+        let mut store = SourceStore::default();
+        let payloads: Vec<Vec<u8>> = (0..7).map(doc).collect();
+        let blobs: Vec<SourceBlob> = payloads
+            .iter()
+            .map(|p| write(&mut store, p, SourceWriteMode::ZstdBlock))
+            .collect();
+        store.flush_pending_block();
+        store.flush_pending_block(); // idempotent : ne cree pas un bloc vide
+        assert_eq!(store.blocks.len(), 1);
+        assert!(store.pending.is_empty());
+        assert!(store.bytes_written() > 0);
+        for (i, (blob, payload)) in blobs.iter().zip(payloads.iter()).enumerate() {
+            assert_reads_back(&store, blob, payload, &format!("post-flush doc {i}"));
+        }
+    }
+
+    /// DEUX stores vivants dans le meme process (deux index) partagent le
+    /// cache thread-local de blocs : leurs `block_id` se recouvrent, seule
+    /// l'epoque les distingue. Une confusion rendrait ici le `_source` de
+    /// l'index A pour l'index B.
+    #[test]
+    fn two_stores_do_not_share_cached_blocks() {
+        let mut store_a = SourceStore::default();
+        let mut store_b = SourceStore::default();
+        let payload_a = doc(101);
+        let payload_b = doc(202);
+        // Assez d'octets pour sceller le bloc 0 des deux cotes.
+        let filler: Vec<u8> = vec![b'x'; SOURCE_BLOCK_TARGET_BYTES];
+
+        let blob_a = write(&mut store_a, &payload_a, SourceWriteMode::ZstdBlock);
+        write(&mut store_a, &filler, SourceWriteMode::ZstdBlock);
+        let blob_b = write(&mut store_b, &payload_b, SourceWriteMode::ZstdBlock);
+        write(&mut store_b, &filler, SourceWriteMode::ZstdBlock);
+
+        for _ in 0..3 {
+            assert_reads_back(&store_a, &blob_a, &payload_a, "store A");
+            assert_reads_back(&store_b, &blob_b, &payload_b, "store B");
+        }
+    }
+
+    /// `reset()` remet les `block_id` a zero sur un contenu DIFFERENT :
+    /// sans changement d'epoque, une entree de cache survivante rendrait
+    /// l'ANCIEN contenu. Ce test echoue si l'epoque n'est pas re-tiree.
+    #[test]
+    fn reset_invalidates_the_block_cache() {
+        let mut store = SourceStore::default();
+        let old = doc(7);
+        let filler: Vec<u8> = vec![b'a'; SOURCE_BLOCK_TARGET_BYTES];
+        let blob_old = write(&mut store, &old, SourceWriteMode::ZstdBlock);
+        write(&mut store, &filler, SourceWriteMode::ZstdBlock);
+        assert_reads_back(&store, &blob_old, &old, "avant reset");
+
+        store.reset();
+        let new = doc(9_999);
+        let blob_new = write(&mut store, &new, SourceWriteMode::ZstdBlock);
+        write(&mut store, &filler, SourceWriteMode::ZstdBlock);
+        // Meme block_id (0) et meme intra_offset (0) qu'avant le reset.
+        assert_eq!(blob_new_locator(&blob_new), blob_new_locator(&blob_old));
+        assert_reads_back(&store, &blob_new, &new, "apres reset");
+    }
+
+    fn blob_new_locator(blob: &SourceBlob) -> u64 {
+        let SourceBlob::OnDisk { offset, .. } = blob else {
+            panic!("OnDisk attendu")
+        };
+        *offset
+    }
+
+    fn codec_of(blob: &SourceBlob) -> u8 {
+        let SourceBlob::OnDisk { codec, .. } = blob else {
+            panic!("OnDisk attendu")
+        };
+        *codec
+    }
+
+    /// Un locator qui designe un bloc inexistant doit paniquer avec un
+    /// message de contrat (fail-closed), jamais rendre des octets
+    /// arbitraires.
+    #[test]
+    #[should_panic(expected = "absent du repertoire")]
+    fn unknown_block_fails_closed() {
+        let store = SourceStore::default();
+        let _ = store.read_block_doc(pack_block_locator(42, 0), 8);
+    }
+
+    /// Une tranche qui deborde du bloc doit paniquer, pas tronquer.
+    #[test]
+    #[should_panic(expected = "hors du bloc en cours")]
+    fn out_of_range_slice_fails_closed() {
+        let mut store = SourceStore::default();
+        let payload = doc(3);
+        let _ = write(&mut store, &payload, SourceWriteMode::ZstdBlock);
+        let _ = store.read_block_doc(pack_block_locator(0, 0), payload.len() as u32 + 1);
     }
 }
 
@@ -1791,13 +2600,16 @@ impl InMemoryIndex {
         // Gate indexation >= 14 000 docs/s preserve.
         //
         // Tranche 2b (`docs/paper/contre-expertise-2b-source-2026-07-10.md`
-        // §D) : compression zstd PAR-DOC inline, juste avant l'append,
-        // gatee par `SURCH_SOURCE_COMPRESS` (cf. [`source_compress_enabled`]).
-        // OFF (defaut) = bytes bruts ecrits tels quels, tag
-        // [`SOURCE_CODEC_RAW`] — comportement bit-identique a avant 2b. ON
-        // = bytes zstd niveau [`ZSTD_SOURCE_LEVEL`], tag
-        // [`SOURCE_CODEC_ZSTD`]. Zero buffering supplementaire : toujours
-        // 1 seul `pwrite`/doc, juste plus petit quand compresse.
+        // §D) puis chantier D1 (`.remote/d1-source-blocs.md`) : le format
+        // d'ecriture est choisi par [`source_write_mode`] et materialise
+        // par [`store_source_bytes`].
+        // - OFF (defaut) = bytes bruts, tag [`SOURCE_CODEC_RAW`],
+        //   1 `pwrite`/doc — comportement bit-identique a avant 2b.
+        // - ON + mode `doc` = zstd par document, tag
+        //   [`SOURCE_CODEC_ZSTD`], 1 `pwrite`/doc.
+        // - ON + mode bloc (defaut D1) = le document est accumule dans un
+        //   bloc de 16 Kio, tag [`SOURCE_CODEC_BLOCK`], **0 `pwrite` pour
+        //   ce document** — un seul `pwrite` par bloc scelle.
         //
         // `ensure_fields` a besoin du `Value` parse, donc analyse AVANT
         // serialisation. Updates (meme `id`) ecrasent le slot dirty — les
@@ -1808,17 +2620,7 @@ impl InMemoryIndex {
         self.mapping.ensure_fields(&source);
         let serialized =
             serde_json::to_vec(&source).expect("a validated _source serialises to JSON");
-        let (stored_bytes, codec) = if source_compress_enabled() {
-            (SourceBlob::encode_zstd(&serialized), SOURCE_CODEC_ZSTD)
-        } else {
-            (serialized, SOURCE_CODEC_RAW)
-        };
-        let (offset, length) = self.source_store.append(&stored_bytes);
-        let blob = SourceBlob::OnDisk {
-            offset,
-            length,
-            codec,
-        };
+        let blob = store_source_bytes(&mut self.source_store, &serialized, source_write_mode());
 
         if let Some(doc_id) = self.resolve_uid(id) {
             // Update : le `doc_id` ne change JAMAIS, seul le blob
@@ -2150,6 +2952,14 @@ impl InMemoryIndex {
     /// l'algorithme EXISTANT (from-scratch, correct et inchange pour ce
     /// cas).
     fn densify(&mut self) {
+        // D1 : scelle le bloc `_source` en cours a chaque densify. Sans
+        // cet appel, un index de petite taille (< 16 Kio de `_source`)
+        // n'ecrirait JAMAIS rien dans `source.dat` et les jauges disque
+        // (`surch_index_disk_segment_bytes`) resteraient a 0 alors que les
+        // documents existent. Idempotent et O(bloc courant) : sans effet
+        // quand le tampon est vide, donc pose AVANT le retour anticipe.
+        self.source_store.flush_pending_block();
+
         if self.forward_dirty.is_empty()
             && self.deleted_since_dense.is_empty()
             && self.documents_dirty.is_empty()
