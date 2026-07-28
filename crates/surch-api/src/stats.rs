@@ -12,7 +12,11 @@
 //! tentative de chemin à sauts ; cela ne modifie ni le résultat ni le chemin
 //! `match` historique.
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, OnceLock, TryLockError},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{Query, State},
@@ -56,22 +60,74 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         segment_count,
     );
     set_p2_integrity_gauges(index, p2_integrity_metrics);
-    refresh_process_memory_gauges();
-    // Lot C Phase 0b : stats internes jemalloc. Appelé ici, donc APRÈS
-    // `finalize_terms_for_refresh` sur le chemin `_refresh` (le builder
-    // est déjà droppé), pour lire l'`allocated` à l'état steady et non
-    // gonflé par le `PostingsBuilder` vivant.
-    refresh_jemalloc_gauges();
+    refresh_runtime_memory_gauges();
 }
 
-/// Rafraîchit les jauges mémoire propres au processus sans relire un index.
+const RUNTIME_MEMORY_REFRESH_MAX_AGE: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct RuntimeMemoryRefreshCache {
+    last_attempt: Option<Instant>,
+    last_success: Option<Instant>,
+    success: bool,
+}
+
+static RUNTIME_MEMORY_REFRESH_CACHE: OnceLock<Mutex<RuntimeMemoryRefreshCache>> = OnceLock::new();
+
+fn publish_runtime_memory_refresh(cache: &RuntimeMemoryRefreshCache, now: Instant) {
+    let age_seconds = cache
+        .last_success
+        .map(|success| now.duration_since(success).as_secs_f64())
+        .unwrap_or(-1.0);
+    metrics::gauge!("surch_runtime_memory_refresh_success").set(if cache.success {
+        1.0
+    } else {
+        0.0
+    });
+    metrics::gauge!("surch_runtime_memory_refresh_age_seconds").set(age_seconds);
+}
+
+/// Rafraîchit au plus une fois par seconde les jauges mémoire propres au
+/// processus sans relire un index.
 ///
-/// Le scrape Prometheus doit observer l'état présent entre deux requêtes de
-/// recherche : attendre une écriture ou `/_refresh` laisserait les statistiques
-/// jemalloc cachées à l'epoch précédente et fausserait les dérivés P3.
+/// Un scrape concurrent ne bloque pas derrière une lecture de `/proc` ou un
+/// `mallctl` : il sert le dernier état publié. Chaque échec est visible via
+/// `surch_runtime_memory_refresh_success=0` et
+/// `surch_runtime_memory_refresh_errors_total`, de sorte qu'une valeur
+/// précédente ne puisse jamais être confondue avec une mesure fraîche.
 pub(crate) fn refresh_runtime_memory_gauges() {
-    refresh_process_memory_gauges();
-    refresh_jemalloc_gauges();
+    let now = Instant::now();
+    let cache = RUNTIME_MEMORY_REFRESH_CACHE
+        .get_or_init(|| Mutex::new(RuntimeMemoryRefreshCache::default()));
+    let mut cache = match cache.try_lock() {
+        Ok(cache) => cache,
+        Err(TryLockError::WouldBlock) => return,
+        Err(TryLockError::Poisoned(_)) => {
+            metrics::gauge!("surch_runtime_memory_refresh_success").set(0.0);
+            metrics::counter!("surch_runtime_memory_refresh_errors_total").increment(1);
+            return;
+        }
+    };
+    if cache
+        .last_attempt
+        .is_some_and(|attempt| now.duration_since(attempt) < RUNTIME_MEMORY_REFRESH_MAX_AGE)
+    {
+        publish_runtime_memory_refresh(&cache, now);
+        return;
+    }
+
+    cache.last_attempt = Some(now);
+    match refresh_process_memory_gauges().and_then(|()| refresh_jemalloc_gauges()) {
+        Ok(()) => {
+            cache.last_success = Some(now);
+            cache.success = true;
+        }
+        Err(_) => {
+            cache.success = false;
+            metrics::counter!("surch_runtime_memory_refresh_errors_total").increment(1);
+        }
+    }
+    publish_runtime_memory_refresh(&cache, now);
 }
 
 /// Jauges P3 mises à jour à l'indexation et après chaque tentative P2. Les
@@ -103,40 +159,62 @@ pub(crate) fn set_p2_integrity_gauges(index: &str, integrity: P2IntegrityMetrics
 /// Process-wide RSS accounting (#17b). Reads `/proc/self/status` to
 /// surface VmRSS / VmAnon / VmData / VmHWM as Prometheus gauges. Combined
 /// with the per-index `surch_index_*` gauges this isolates the gap
-/// between "what Surch thinks it stores" (~2.8 GiB after inc1) and "what
-/// the kernel reports resident" (~8.0 GiB). Zero allocations on the
-/// scrape path — the file is short and parsed line by line. Linux-only.
+/// between "what Surch thinks it stores" (~2.8 GiB after inc1) and the
+/// kernel's resident view (~8.0 GiB). Linux-only.
 #[cfg(target_os = "linux")]
-fn refresh_process_memory_gauges() {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return;
-    };
+fn refresh_process_memory_gauges() -> Result<(), String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("lecture /proc/self/status impossible: {error}"))?;
+    let mut rss = false;
+    let mut hwm = false;
+    let mut anon = false;
     for line in status.lines() {
         let Some((key, rest)) = line.split_once(':') else {
             continue;
         };
+        let wanted = matches!(
+            key,
+            "VmRSS" | "VmHWM" | "VmData" | "RssAnon" | "RssFile" | "VmSize"
+        );
+        if !wanted {
+            continue;
+        }
         // `rest` looks like "    123456 kB"; jemalloc and the kernel both
         // expose this field in kibibytes. `split_whitespace` already skips
         // the leading run of whitespace, no trim needed.
         let kib_str = rest.split_whitespace().next().unwrap_or("0");
-        let Ok(kib) = kib_str.parse::<u64>() else {
-            continue;
-        };
+        let kib = kib_str
+            .parse::<u64>()
+            .map_err(|error| format!("valeur mémoire /proc invalide pour {key}: {error}"))?;
         let bytes = kib.saturating_mul(1024) as f64;
         match key {
-            "VmRSS" => metrics::gauge!("surch_process_rss_bytes").set(bytes),
-            "VmHWM" => metrics::gauge!("surch_process_rss_peak_bytes").set(bytes),
+            "VmRSS" => {
+                metrics::gauge!("surch_process_rss_bytes").set(bytes);
+                rss = true;
+            }
+            "VmHWM" => {
+                metrics::gauge!("surch_process_rss_peak_bytes").set(bytes);
+                hwm = true;
+            }
             "VmData" => metrics::gauge!("surch_process_data_bytes").set(bytes),
-            "RssAnon" => metrics::gauge!("surch_process_rss_anon_bytes").set(bytes),
+            "RssAnon" => {
+                metrics::gauge!("surch_process_rss_anon_bytes").set(bytes);
+                anon = true;
+            }
             "RssFile" => metrics::gauge!("surch_process_rss_file_bytes").set(bytes),
             "VmSize" => metrics::gauge!("surch_process_vsize_bytes").set(bytes),
-            _ => {}
+            _ => unreachable!("filtre wanted incohérent"),
         }
     }
+    (rss && hwm && anon)
+        .then_some(())
+        .ok_or_else(|| "champs VmRSS, VmHWM ou RssAnon absents de /proc/self/status".to_owned())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn refresh_process_memory_gauges() {}
+fn refresh_process_memory_gauges() -> Result<(), String> {
+    Err("rafraîchissement mémoire runtime non pris en charge hors Linux".to_owned())
+}
 
 /// Lot C Phase 0b : stats INTERNES de l'allocateur jemalloc, exposées en
 /// gauges Prometheus pour EXPLIQUER le gap heap anonyme (~1,5-2 GiB que
@@ -156,42 +234,42 @@ fn refresh_process_memory_gauges() {}
 /// avançant l'`epoch`. Sans cet advance on relirait des valeurs figées.
 /// Nécessite la feature `stats` sur `tikv-jemalloc-ctl` (sinon le module
 /// n'est pas compilé) ET sur le `tikv-jemalloc-sys` sous-jacent (sinon
-/// jemalloc est `--disable-stats` et chaque `read()` renvoie une erreur,
-/// ignorée silencieusement ici comme le reste du module). Zéro `unwrap`.
+/// jemalloc est `--disable-stats` et chaque `read()` renvoie une erreur),
+/// laquelle remonte au rafraîchisseur runtime et est publiée par ses jauges
+/// de succès, d'âge et d'erreurs. Zéro `unwrap`.
 /// Linux-only : jemalloc n'est le `#[global_allocator]` que sur Linux.
 #[cfg(target_os = "linux")]
-fn refresh_jemalloc_gauges() {
+fn refresh_jemalloc_gauges() -> Result<(), String> {
     use tikv_jemalloc_ctl::{epoch, stats};
 
     // Rafraîchit le cache de stats. `advance()` renvoie l'ancienne valeur
     // d'epoch (`Result<u64>`) ; on l'ignore, seul l'effet de bord compte.
-    // En cas d'erreur (jemalloc compilé sans stats), on abandonne sans
-    // émettre : les gauges gardent leur dernière valeur plutôt que 0.
-    if epoch::advance().is_err() {
-        return;
-    }
+    epoch::advance().map_err(|error| format!("jemalloc epoch::advance impossible: {error}"))?;
 
     // `read()` renvoie `Result<usize>` (`libc::size_t`). `usize as f64`
     // est exact jusqu'à 2^53 octets, très au-delà des tailles heap ici.
-    if let Ok(bytes) = stats::allocated::read() {
-        metrics::gauge!("surch_jemalloc_allocated_bytes").set(bytes as f64);
-    }
-    if let Ok(bytes) = stats::active::read() {
-        metrics::gauge!("surch_jemalloc_active_bytes").set(bytes as f64);
-    }
-    if let Ok(bytes) = stats::resident::read() {
-        metrics::gauge!("surch_jemalloc_resident_bytes").set(bytes as f64);
-    }
-    if let Ok(bytes) = stats::retained::read() {
-        metrics::gauge!("surch_jemalloc_retained_bytes").set(bytes as f64);
-    }
-    if let Ok(bytes) = stats::mapped::read() {
-        metrics::gauge!("surch_jemalloc_mapped_bytes").set(bytes as f64);
-    }
+    let allocated = stats::allocated::read()
+        .map_err(|error| format!("lecture jemalloc allocated impossible: {error}"))?;
+    let active = stats::active::read()
+        .map_err(|error| format!("lecture jemalloc active impossible: {error}"))?;
+    let resident = stats::resident::read()
+        .map_err(|error| format!("lecture jemalloc resident impossible: {error}"))?;
+    let retained = stats::retained::read()
+        .map_err(|error| format!("lecture jemalloc retained impossible: {error}"))?;
+    let mapped = stats::mapped::read()
+        .map_err(|error| format!("lecture jemalloc mapped impossible: {error}"))?;
+    metrics::gauge!("surch_jemalloc_allocated_bytes").set(allocated as f64);
+    metrics::gauge!("surch_jemalloc_active_bytes").set(active as f64);
+    metrics::gauge!("surch_jemalloc_resident_bytes").set(resident as f64);
+    metrics::gauge!("surch_jemalloc_retained_bytes").set(retained as f64);
+    metrics::gauge!("surch_jemalloc_mapped_bytes").set(mapped as f64);
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn refresh_jemalloc_gauges() {}
+fn refresh_jemalloc_gauges() -> Result<(), String> {
+    Err("rafraîchissement jemalloc non pris en charge hors Linux".to_owned())
+}
 
 /// Lot C Phase 1 : purge EXPLICITE et SYNCHRONE des extents jemalloc
 /// libérés par le free-storm du build aplati
@@ -308,7 +386,10 @@ pub fn refresh_jemalloc_purge() {
     // POST-purge au prochain scrape, plutôt que le pic pré-purge
     // (sinon la gauge resterait gonflée jusqu'à la prochaine activité
     // allocateur qui avance l'epoch).
-    refresh_jemalloc_gauges();
+    if refresh_jemalloc_gauges().is_err() {
+        metrics::gauge!("surch_runtime_memory_refresh_success").set(0.0);
+        metrics::counter!("surch_runtime_memory_refresh_errors_total").increment(1);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

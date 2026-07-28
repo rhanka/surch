@@ -135,12 +135,24 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     snapshots JSONL couvrent P3, mémoire processus/jemalloc et cgroup à
     `index_ready` puis autour de chaque phase ; une métrique absente invalide
     le run. Le mix 50/50 historique ne subsiste que comme replay opt-in.
-  - [x] Correctifs de revue P3 B1-B9 et M1-M7 intégrés localement : JSON
-    cgroup validé par `jq`, identité des `NOM` sur le terme ASCII analysé,
-    SHA A/B/C gelés, ordre latin et hard-stops restaurés, provenance/image et
-    JSONL relus par le gate, dérivés mémoire/compaction et seuils P3 complets,
-    verdict non-PASS non nul. Preuves légères :
-    `deploy/bench-local/test-p3-harness.sh` et fixture synthétique du gate.
+  - [x] Correctifs de première revue P3 B1-B9 et M1-M7 intégrés localement :
+    JSON cgroup validé par `jq`, SHA A/B/C gelés, ordre latin et hard-stops,
+    provenance/image, JSONL, dérivés mémoire/compaction et verdict non-PASS
+    non nul. Cette ligne ne vaut pas preuve de campagne externe.
+  - [x] Correctif de re-revue P3 : imposer la bijection exacte des neuf runs
+    A1/A2/A3, B1/B2/B3 et C1/C2/C3 (scorecards, manifests,
+    `pair-summary.json` et `parity.json` liés), compléter le schéma P3,
+    versionner la matrice du gate et verrouiller le smoke v4. Le sélectionneur
+    applique désormais la table awk `asciifolding` + lowercase sur les champs
+    réellement interrogés ; les entrées non mono-token restent refusées. La
+    matrice `test-p3-harness.sh` exécute le gate et couvre PASS/ÉCHEC/INVALIDE/
+    REJOUER, dont la duplication N1.
+  - [x] Fraîcheur jemalloc P3 : C reste volontairement pinné à `d0accd6`, qui
+    n'embarque pas le refresh runtime. Les valeurs jemalloc sont donc retirées
+    des dérivés et gates de récupération fraîche ; les diagnostics bruts ne
+    portent aucune revendication. Dans HEAD, le refresh runtime est borné à
+    une seconde et expose succès, âge et erreurs. Aucun protocole ultérieur ne
+    doit repinner C sans preuve de coût de scrape concurrent.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.

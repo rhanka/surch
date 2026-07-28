@@ -5,7 +5,7 @@
 # Les images sont reconstruites depuis les trois SHA dans cette même
 # session Docker ; les corps P2 vivent dans un répertoire partagé, gelé par
 # SHA-256 dès la première exécution.
-set -uo pipefail
+set -euo pipefail
 export LC_ALL=C
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -15,6 +15,7 @@ GATE_REPORT="${GATE_REPORT:-$ROOT_DIR/deploy/bench-local/p2-gate.sh}"
 P3_A_SHA="961ade10ffb74d78156aee8148f1e5c6bbbe6ba2"
 P3_B_SHA="6ce390e55da3593242ec11e2b09d4dee1057726d"
 P3_C_SHA="d0accd6e4809bc7340a6cd55cef0a94fcb6c062d"
+P3_PROTOCOL_VERSION="p2-segmented-postings-v4-termes-analyses"
 # Les trois variantes sont celles du protocole pré-engagé. Une surcharge qui
 # change un SHA est un autre protocole, donc un refus plutôt qu'un replay
 # silencieusement différent.
@@ -38,6 +39,52 @@ log(){ printf '\033[1;35m[p2-campaign]\033[0m %s\n' "$*"; }
 err(){ printf '\033[1;31m[p2-campaign]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
+verify_smoke_prerequisite(){
+  local smoke="$1" proof provenance metadata manifest manifest_sha formula formula_sha score variant expected
+  proof="$smoke/smoke-proof.json"
+  [ -s "$proof" ] || return 1
+  jq -e --arg protocol "$P3_PROTOCOL_VERSION" --arg a "$P3_A_SHA" --arg b "$P3_B_SHA" --arg c "$P3_C_SHA" '
+    .schema == "surch.bench.p3.smoke.v1" and .verdict == "PASS SMOKE P3"
+    and .protocol == $protocol
+    and .variants.A.commit == $a and .variants.B.commit == $b and .variants.C.commit == $c
+    and ([.variants[] | .image, .image_id, .digest] | all(type == "string" and length > 0))
+    and (.inputs.manifest | type == "string" and length > 0)
+    and (.inputs.manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+    and (.formula_fixture.path | type == "string" and length > 0)
+    and (.formula_fixture.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$proof" >/dev/null || return 1
+  provenance="$smoke/campaign-provenance.json"
+  [ -s "$provenance" ] || return 1
+  jq -e --slurpfile proof "$proof" '
+    .schema == "surch.bench.p3.provenance.v1"
+    and .protocol == "p3-campagne-plan-v1"
+    and .variants == $proof[0].variants
+  ' "$provenance" >/dev/null || return 1
+  manifest=$(jq -er '.inputs.manifest | strings' "$proof") || return 1
+  manifest_sha=$(jq -er '.inputs.manifest_sha256 | strings' "$proof") || return 1
+  [ -r "$manifest" ] && [ "$(sha256sum "$manifest" | awk '{print $1}')" = "$manifest_sha" ] || return 1
+  formula=$(jq -er '.formula_fixture.path | strings' "$proof") || return 1
+  formula_sha=$(jq -er '.formula_fixture.sha256 | strings' "$proof") || return 1
+  [ -r "$formula" ] && [ "$(sha256sum "$formula" | awk '{print $1}')" = "$formula_sha" ] || return 1
+  jq -e '.compaction_directory_c_over_b == 0.01 and .recovery.rss == 0.9 and .recovery.rss_anon == 0.9 and .recovery.file == 0.9 and .undefined_denominator_rejected == true' "$formula" >/dev/null || return 1
+  for variant in A B C; do
+    score="$smoke/runs/smoke-$variant/surch.json"
+    [ -s "$score" ] || return 1
+    expected=$(jq -c --arg variant "$variant" '.variants[$variant]' "$proof") || return 1
+    metadata="$smoke/image-$variant.json"
+    [ -s "$metadata" ] || return 1
+    jq -e --argjson expected "$expected" '. == $expected' "$metadata" >/dev/null || return 1
+    jq -e --arg variant "$variant" --arg protocol "$P3_PROTOCOL_VERSION" --arg manifest "$(readlink -f -- "$manifest")" --arg sha "$manifest_sha" --argjson expected "$expected" '
+      .measurement_valid == true and .p2.variant == $variant and .p2.protocol == $protocol
+      and .p2.input_manifest == $manifest and .p2.input_manifest_sha256 == $sha
+      and .p2.image == $expected.image and .p2.image_id == $expected.image_id and .p2.image_digest == $expected.digest
+      and .p2.causal_phase_records == 5
+      and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))
+    ' "$score" >/dev/null || return 1
+  done
+  grep -qx 'SMOKE P3 valide : protocole v4, images, manifeste et formule vérifiés ; aucune conclusion de latence.' "$smoke/README.md"
+}
+
 for command in docker git jq findmnt sha256sum sync; do
   command -v "$command" >/dev/null 2>&1 || die "commande requise absente: $command"
 done
@@ -58,12 +105,8 @@ case "$P2_REPLAY_MIX_5050" in 0|1) ;; *) die "P2_REPLAY_MIX_5050 doit valoir 0 o
 [ -n "$P2_DOCKER_CLASSIC_SOURCE" ] || die "P2_DOCKER_CLASSIC_SOURCE est obligatoire (ex. /dev/sdb du volume classic)"
 if [ "$P2_MODE" = "full" ]; then
   [ -n "$P2_SMOKE_DIR" ] || die "P2_SMOKE_DIR est obligatoire : exécuter et conserver le smoke avant le full"
-  [ -s "$P2_SMOKE_DIR/README.md" ] \
-    && grep -q '^SMOKE P2 valide' "$P2_SMOKE_DIR/README.md" \
-    && jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$P2_SMOKE_DIR/runs/smoke-A/surch.json" >/dev/null \
-    && jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$P2_SMOKE_DIR/runs/smoke-B/surch.json" >/dev/null \
-    && jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$P2_SMOKE_DIR/runs/smoke-C/surch.json" >/dev/null \
-    || die "smoke P2 absent ou invalide: $P2_SMOKE_DIR"
+  verify_smoke_prerequisite "$P2_SMOKE_DIR" \
+    || die "smoke P3 v4 absent ou invalide (pins, images, manifeste ou formule): $P2_SMOKE_DIR"
 fi
 
 mkdir -p "$P2_CAMPAIGN_DIR" || die "création impossible: $P2_CAMPAIGN_DIR"
@@ -364,6 +407,50 @@ p3_recovery_ratio(){
   '
 }
 
+# Le smoke ne publie aucune latence, mais il doit exercer les mêmes formules
+# de compaction/récupération que le gate final. Les valeurs sont synthétiques,
+# déterministes et le dénominateur indéfini doit être rejeté.
+p3_smoke_formula_fixture(){
+  local compaction rss anon file
+  compaction=$(awk 'BEGIN { printf "%.12g", 10 / 1000 }') || return 1
+  rss=$(p3_recovery_ratio 100 200 110 rss) || return 1
+  anon=$(p3_recovery_ratio 100 200 110 rss) || return 1
+  file=$(p3_recovery_ratio 200 100 190 file) || return 1
+  if p3_recovery_ratio 100 100 100 rss >/dev/null 2>&1; then
+    return 1
+  fi
+  jq -n --argjson compaction "$compaction" --argjson rss "$rss" --argjson anon "$anon" --argjson file "$file" \
+    '{schema:"surch.bench.p3.smoke-formulas.v1",compaction_directory_c_over_b:$compaction,recovery:{rss:$rss,rss_anon:$anon,file:$file},undefined_denominator_rejected:true}' \
+    > "$P2_CAMPAIGN_DIR/smoke-formulas.json" || return 1
+  jq -e '.compaction_directory_c_over_b == 0.01 and .recovery.rss == 0.9 and .recovery.rss_anon == 0.9 and .recovery.file == 0.9 and .undefined_denominator_rejected == true' "$P2_CAMPAIGN_DIR/smoke-formulas.json" >/dev/null
+}
+
+write_smoke_proof(){
+  local manifest="" manifest_sha="" candidate_sha variant score candidate_manifest formula formula_sha
+  [ "$P2_MODE" = smoke ] || return 1
+  p3_smoke_formula_fixture || return 1
+  for variant in A B C; do
+    score="$P2_CAMPAIGN_DIR/runs/smoke-$variant/surch.json"
+    [ -s "$score" ] || return 1
+    candidate_manifest=$(jq -er '.p2.input_manifest | strings' "$score") || return 1
+    candidate_manifest=$(readlink -f -- "$candidate_manifest") || return 1
+    candidate_sha=$(jq -er '.p2.input_manifest_sha256 | strings' "$score") || return 1
+    [ -r "$candidate_manifest" ] && [ "$(sha256sum "$candidate_manifest" | awk '{print $1}')" = "$candidate_sha" ] || return 1
+    if [ -z "$manifest" ]; then
+      manifest="$candidate_manifest"; manifest_sha="$candidate_sha"
+    elif [ "$candidate_manifest" != "$manifest" ] || [ "$candidate_sha" != "$manifest_sha" ]; then
+      return 1
+    fi
+  done
+  formula="$P2_CAMPAIGN_DIR/smoke-formulas.json"
+  formula_sha=$(sha256sum "$formula" | awk '{print $1}') || return 1
+  jq -n --arg protocol "$P3_PROTOCOL_VERSION" --arg manifest "$manifest" --arg manifest_sha "$manifest_sha" \
+    --arg formula "$formula" --arg formula_sha "$formula_sha" \
+    --slurpfile provenance "$P2_CAMPAIGN_DIR/campaign-provenance.json" \
+    '{schema:"surch.bench.p3.smoke.v1",verdict:"PASS SMOKE P3",protocol:$protocol,variants:$provenance[0].variants,inputs:{manifest:$manifest,manifest_sha256:$manifest_sha},formula_fixture:{path:$formula,sha256:$formula_sha}}' \
+    > "$P2_CAMPAIGN_DIR/smoke-proof.json" || return 1
+}
+
 p3_c1_hard_stop(){
   local score="$P2_CAMPAIGN_DIR/runs/C1/surch.json" status
   [ -s "$score" ] || die 'C1: scorecard introuvable'
@@ -448,7 +535,13 @@ done
 if [ "$P2_MODE" = "full" ]; then
   "$GATE_REPORT" --campaign "$P2_CAMPAIGN_DIR" || die "gates P2 non satisfaites (voir $P2_CAMPAIGN_DIR/README.md)"
 else
-  printf 'SMOKE P2 valide : routage, réponses, métriques et corps vérifiés ; aucune conclusion de latence.\n' \
-    > "$P2_CAMPAIGN_DIR/README.md"
+  # README fait partie du contrat de reprise : ni son écriture ni son verdict
+  # ne peuvent être avalés par le dernier `log` du script.
+  # Le proof porte aussi les identités image et manifeste ; l'écrire avant le
+  # README rend un disque plein fail-closed et exerce la fixture de formules.
+  write_smoke_proof || die 'preuve smoke P3 impossible à écrire ou invalide'
+  printf 'SMOKE P3 valide : protocole v4, images, manifeste et formule vérifiés ; aucune conclusion de latence.\n' \
+    > "$P2_CAMPAIGN_DIR/README.md" || die 'écriture impossible du verdict smoke P3'
+  verify_smoke_prerequisite "$P2_CAMPAIGN_DIR" || die 'verdict smoke P3 non rejouable après écriture'
 fi
 log "campagne $P2_MODE terminée: $P2_CAMPAIGN_DIR"

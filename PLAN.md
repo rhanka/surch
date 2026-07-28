@@ -194,6 +194,10 @@ historical replay line lives in
   disjoints, avant tout bool, et conserve les états P3/mémoire/cgroup par
   phase ; la prochaine preuve reste la campagne externe A/B/C. Gates externes
   détaillées dans `plan/p2-segmented-postings.md`.
+  La correction versionnée de re-revue verrouille la bijection des neuf runs,
+  la matrice du gate et le smoke v4 ; toute publication reste bloquée jusqu'à
+  la gate externe. Le pin C demeure `d0accd6`, donc aucune fraîcheur jemalloc
+  issue de HEAD n'est revendiquée par la campagne contractuelle.
 
 ## Track B - Test Automation / Perf Reporting
 

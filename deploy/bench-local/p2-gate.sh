@@ -12,9 +12,27 @@ P3_B_SHA="6ce390e55da3593242ec11e2b09d4dee1057726d"
 P3_C_SHA="d0accd6e4809bc7340a6cd55cef0a94fcb6c062d"
 P3_INTEGRITY_TARGET_BYTES=17825792
 P3_PROTOCOL_VERSION="p2-segmented-postings-v4-termes-analyses"
+P3_RUNS=(A1 A2 A3 B1 B2 B3 C1 C2 C3)
 
 usage(){ printf 'usage: p2-gate.sh --campaign RÉPERTOIRE\n' >&2; }
 die(){ printf '[p2-gate] %s\n' "$*" >&2; exit 1; }
+
+# Un artefact structurel absent ou incohérent n'est pas un échec de
+# performance : il invalide la campagne. Écrire un verdict lisible avant de
+# sortir évite qu'un appelant réduise un arrêt précoce à un simple log perdu.
+invalidate_campaign(){
+  local detail="$1"
+  printf '[p2-gate] INVALIDE P3: %s\n' "$detail" >&2
+  jq -n --arg detail "$detail" \
+    '{schema:"surch.bench.p3.campaign.v1",verdict:"INVALIDE P3",invalid_reason:$detail,checks:[]}' \
+    > "$CAMPAIGN/campaign-summary.json" || die 'écriture impossible de campaign-summary.json invalide'
+  {
+    printf '%s\n\n' '# P3 — verdict de campagne'
+    printf 'Verdict: **INVALIDE P3**.\n\n'
+    printf 'Raison: %s\n' "$detail"
+  } > "$CAMPAIGN/README.md" || die 'écriture impossible de README.md invalide'
+  exit 1
+}
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -25,7 +43,9 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$CAMPAIGN" ] || { usage; die '--campaign est obligatoire'; }
 [ -d "$CAMPAIGN" ] || die "campagne introuvable: $CAMPAIGN"
-command -v jq >/dev/null 2>&1 || die 'commande requise absente: jq'
+for command in jq sha256sum readlink; do
+  command -v "$command" >/dev/null 2>&1 || die "commande requise absente: $command"
+done
 [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ] || die 'la campagne P3 exige P2_REQUIRE_P3_INTEGRITY=1'
 
 telemetry_jsonl_valid(){
@@ -61,7 +81,7 @@ telemetry_jsonl_valid(){
       and all(.cgroup.io_stat[]; (.device | type == "string" and length > 0) and (.metric | type == "string" and length > 0) and (.value | number))
       and (if $require_p3 then
         (.metrics.p3_integrity | type == "object")
-        and ([.metrics.p3_integrity.bytes,.metrics.p3_integrity.pages,.metrics.p3_integrity.verified_bytes,.metrics.p3_integrity.hash_failures,.metrics.p3_integrity.fallbacks,.metrics.p3_integrity.fallback_fields,.metrics.p3_integrity.directory_bytes] | all(number))
+        and ([.metrics.p3_integrity.bytes,.metrics.p3_integrity.pages,.metrics.p3_integrity.verified_bytes,.metrics.p3_integrity.hash_failures,.metrics.p3_integrity.fallbacks,.metrics.p3_integrity.fallback_fields,.metrics.p3_integrity.term_occurrences,.metrics.p3_integrity.blocks,.metrics.p3_integrity.fields,.metrics.p3_integrity.term_payload_bytes,.metrics.p3_integrity.csr_bytes,.metrics.p3_integrity.directory_bytes] | all(number))
       else .metrics.p3_integrity == null end);
     (length == $expected)
     and all(.[]; (.phase | type == "string") and (.boundary | type == "string") and snapshot)
@@ -73,27 +93,38 @@ telemetry_jsonl_valid(){
 }
 
 validate_campaign_provenance(){
-  local provenance score variant metadata count_a=0 count_b=0 count_c=0
+  local provenance score variant metadata manifest manifest_sha canonical_manifest="" expected_variant run_dir
+  local -a run_dirs
   provenance="$CAMPAIGN/campaign-provenance.json"
-  [ -r "$provenance" ] || die "provenance P3 absente: $provenance"
+  [ -r "$provenance" ] || return 1
   jq -e --arg a "$P3_A_SHA" --arg b "$P3_B_SHA" --arg c "$P3_C_SHA" '
     .schema == "surch.bench.p3.provenance.v1"
     and .protocol == "p3-campagne-plan-v1"
     and .variants.A.commit == $a and .variants.B.commit == $b and .variants.C.commit == $c
     and ([.variants[] | .image, .image_id, .digest] | all(type == "string" and length > 0))
-  ' "$provenance" >/dev/null || die 'provenance P3 invalide ou SHA hors contrat'
+  ' "$provenance" >/dev/null || return 1
   RUN_SCORES=("$CAMPAIGN"/runs/*/surch.json)
   [ -e "${RUN_SCORES[0]}" ] || RUN_SCORES=()
-  [ "${#RUN_SCORES[@]}" -eq 9 ] || die "P3 exige exactement neuf scorecards, trouvé ${#RUN_SCORES[@]}"
-  for score in "${RUN_SCORES[@]}"; do
-    variant=$(jq -er '.p2.variant | strings' "$score") || die "variante P3 absente: $score"
+  [ "${#RUN_SCORES[@]}" -eq 9 ] || return 1
+  run_dirs=("$CAMPAIGN"/runs/*)
+  [ -e "${run_dirs[0]}" ] || run_dirs=()
+  [ "${#run_dirs[@]}" -eq 9 ] || return 1
+  for run_dir in "${run_dirs[@]}"; do
+    [ -d "$run_dir" ] || return 1
+  done
+  for run in "${P3_RUNS[@]}"; do
+    run_dir="$CAMPAIGN/runs/$run"
+    [ -d "$run_dir" ] || return 1
+    score="$CAMPAIGN/runs/$run/surch.json"
+    [ -s "$score" ] || return 1
+    expected_variant=${run:0:1}
+    variant=$(jq -er '.p2.variant | strings' "$score") || return 1
+    [ "$variant" = "$expected_variant" ] || return 1
     case "$variant" in
-      A) metadata="$CAMPAIGN/image-A.json"; count_a=$(( count_a + 1 )) ;;
-      B) metadata="$CAMPAIGN/image-B.json"; count_b=$(( count_b + 1 )) ;;
-      C) metadata="$CAMPAIGN/image-C.json"; count_c=$(( count_c + 1 )) ;;
-      *) die "variante P3 inattendue dans $score: $variant" ;;
+      A|B|C) metadata="$CAMPAIGN/image-$variant.json" ;;
+      *) return 1 ;;
     esac
-    [ -r "$metadata" ] || die "métadonnée image absente: $metadata"
+    [ -r "$metadata" ] || return 1
     jq -e --arg variant "$variant" --arg protocol "$P3_PROTOCOL_VERSION" \
       --slurpfile provenance "$provenance" --slurpfile metadata "$metadata" '
         ($provenance[0].variants[$variant]) as $expected
@@ -103,11 +134,65 @@ validate_campaign_provenance(){
         and .p2.image == $expected.image
         and .p2.image_id == $expected.image_id
         and .p2.image_digest == $expected.digest
-      ' "$score" >/dev/null || die "image/commit non gelé ou différent entre répétitions: $score"
-    telemetry_jsonl_valid "$score" || die "télémétrie JSONL P3 incomplète ou invalide: $score"
+      ' "$score" >/dev/null || return 1
+    manifest=$(jq -er '.p2.input_manifest | strings' "$score") || return 1
+    [ -r "$manifest" ] || return 1
+    manifest_sha=$(sha256sum "$manifest" | awk '{print $1}') || return 1
+    [ "$(jq -er '.p2.input_manifest_sha256 | strings' "$score")" = "$manifest_sha" ] || return 1
+    manifest=$(readlink -f -- "$manifest") || return 1
+    if [ -z "$canonical_manifest" ]; then
+      canonical_manifest="$manifest"
+    elif [ "$manifest" != "$canonical_manifest" ]; then
+      return 1
+    fi
+    telemetry_jsonl_valid "$score" || return 1
   done
-  [ "$count_a" -eq 3 ] && [ "$count_b" -eq 3 ] && [ "$count_c" -eq 3 ] \
-    || die "P3 exige trois répétitions par variante (A=$count_a, B=$count_b, C=$count_c)"
+}
+
+# Les trois contrastes ne sont valides que s'ils décrivent exactement les
+# trois mêmes triplets. Le nom du répertoire, parity.json, pair-summary.json,
+# scorecard et manifeste sont tous liés ici : une cardinalité de trois ne
+# suffit jamais à prouver l'identité des répétitions.
+validate_pair_group(){
+  local root="$1"; shift
+  local summary pair_dir parity pair a_run b_run expected_a expected_b
+  local summary_a summary_b score_a score_b manifest_a manifest_b
+  local summaries=("$root"/*/pair-summary.json)
+  local pair_dirs=("$root"/*)
+  [ -e "${summaries[0]}" ] || summaries=()
+  [ -e "${pair_dirs[0]}" ] || pair_dirs=()
+  [ "${#summaries[@]}" -eq "$#" ] || return 1
+  [ "${#pair_dirs[@]}" -eq "$#" ] || return 1
+  for pair in "$@"; do
+    expected_a=${pair%%-*}; expected_b=${pair#*-}
+    pair_dir="$root/$pair"
+    summary="$pair_dir/pair-summary.json"
+    parity="$pair_dir/parity.json"
+    [ -d "$pair_dir" ] && [ -r "$summary" ] && [ -r "$parity" ] || return 1
+    a_run=$(jq -er '.a_run | strings' "$parity") || return 1
+    b_run=$(jq -er '.b_run | strings' "$parity") || return 1
+    [ "$a_run" = "$expected_a" ] && [ "$b_run" = "$expected_b" ] || return 1
+    score_a="$CAMPAIGN/runs/$a_run/surch.json"
+    score_b="$CAMPAIGN/runs/$b_run/surch.json"
+    [ -r "$score_a" ] && [ -r "$score_b" ] || return 1
+    summary_a=$(jq -er '.a_dir | strings' "$summary" 2>/dev/null) || return 1
+    summary_b=$(jq -er '.b_dir | strings' "$summary" 2>/dev/null) || return 1
+    jq -e '.schema == "surch.bench.p2.pair.v1"' "$summary" >/dev/null || return 1
+    [ "$(readlink -f -- "$summary_a")" = "$(readlink -f -- "$CAMPAIGN/runs/$a_run")" ] || return 1
+    [ "$(readlink -f -- "$summary_b")" = "$(readlink -f -- "$CAMPAIGN/runs/$b_run")" ] || return 1
+    manifest_a=$(jq -er '.p2.input_manifest_sha256 | strings' "$score_a") || return 1
+    manifest_b=$(jq -er '.p2.input_manifest_sha256 | strings' "$score_b") || return 1
+    jq -e --arg pair "$pair" --arg a "$a_run" --arg b "$b_run" --arg ma "$manifest_a" --arg mb "$manifest_b" '
+      .pair == $pair and .a_run == $a and .b_run == $b and .parity == true
+      and .a_manifest_sha256 == $ma and .b_manifest_sha256 == $mb and $ma == $mb
+    ' "$parity" >/dev/null || return 1
+  done
+}
+
+validate_p3_bijection(){
+  validate_pair_group "$CAMPAIGN/pairs" A1-B1 A2-B2 A3-B3 \
+    && validate_pair_group "$CAMPAIGN/p3-primary-pairs" A1-C1 A2-C2 A3-C3 \
+    && validate_pair_group "$CAMPAIGN/p3-cost-pairs" B1-C1 B2-C2 B3-C3
 }
 
 phase_status_valid(){
@@ -187,14 +272,20 @@ numbers_json(){ printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 
 
 BASELINE_PAIR_SUMMARIES=("$CAMPAIGN"/pairs/*/pair-summary.json)
 [ -e "${BASELINE_PAIR_SUMMARIES[0]}" ] || BASELINE_PAIR_SUMMARIES=()
-[ "${#BASELINE_PAIR_SUMMARIES[@]}" -eq 3 ] || die "P2 exige exactement trois paires A/B, trouvé ${#BASELINE_PAIR_SUMMARIES[@]}"
+[ "${#BASELINE_PAIR_SUMMARIES[@]}" -eq 3 ] \
+  || invalidate_campaign "P3 exige exactement trois paires A/B, trouvé ${#BASELINE_PAIR_SUMMARIES[@]}"
 PAIR_SUMMARIES=("$CAMPAIGN"/p3-primary-pairs/*/pair-summary.json)
 [ -e "${PAIR_SUMMARIES[0]}" ] || PAIR_SUMMARIES=()
-[ "${#PAIR_SUMMARIES[@]}" -eq 3 ] || die "P3 exige exactement trois paires C/A, trouvé ${#PAIR_SUMMARIES[@]}"
+[ "${#PAIR_SUMMARIES[@]}" -eq 3 ] \
+  || invalidate_campaign "P3 exige exactement trois paires C/A, trouvé ${#PAIR_SUMMARIES[@]}"
 COST_PAIR_SUMMARIES=("$CAMPAIGN"/p3-cost-pairs/*/pair-summary.json)
 [ -e "${COST_PAIR_SUMMARIES[0]}" ] || COST_PAIR_SUMMARIES=()
-[ "${#COST_PAIR_SUMMARIES[@]}" -eq 3 ] || die "P3 exige exactement trois paires C/B, trouvé ${#COST_PAIR_SUMMARIES[@]}"
-validate_campaign_provenance
+[ "${#COST_PAIR_SUMMARIES[@]}" -eq 3 ] \
+  || invalidate_campaign "P3 exige exactement trois paires C/B, trouvé ${#COST_PAIR_SUMMARIES[@]}"
+validate_campaign_provenance \
+  || invalidate_campaign 'provenance, scorecards, image ou manifeste P3 incohérents (bijection impossible)'
+validate_p3_bijection \
+  || invalidate_campaign 'bijection P3 A1/A2/A3, B1/B2/B3, C1/C2/C3 ou liens de paires incohérents'
 
 VALIDITIES=()
 PRODUCT_TOOK=()
@@ -366,7 +457,6 @@ COMPACTION=()
 RSS_RECOVERY=()
 RSS_ANON_RECOVERY=()
 FILE_RECOVERY=()
-JEMALLOC_RESIDENT_RECOVERY=()
 P3_MEMORY_DERIVATIVES=()
 for index in 0 1 2; do
   a_run="${PRIMARY_A_RUNS[$index]}"
@@ -388,13 +478,9 @@ for index in 0 1 2; do
   a_file=$(telemetry_value "$a_run" cgroup.memory_stat.file) || die "cache fichier A absent: $a_run"
   b_file=$(telemetry_value "$b_run" cgroup.memory_stat.file) || die "cache fichier B absent: $b_run"
   c_file=$(telemetry_value "$c_run" cgroup.memory_stat.file) || die "cache fichier C absent: $c_run"
-  a_resident=$(telemetry_value "$a_run" metrics.jemalloc.resident) || die "jemalloc resident A absent: $a_run"
-  b_resident=$(telemetry_value "$b_run" metrics.jemalloc.resident) || die "jemalloc resident B absent: $b_run"
-  c_resident=$(telemetry_value "$c_run" metrics.jemalloc.resident) || die "jemalloc resident C absent: $c_run"
   rss_recovery=$(recovery_ratio "$a_rss" "$b_rss" "$c_rss" rss) || die "récupération RSS indéfinie: $pair"
   anon_recovery=$(recovery_ratio "$a_anon" "$b_anon" "$c_anon" rss) || die "récupération RssAnon indéfinie: $pair"
   file_recovery=$(recovery_ratio "$a_file" "$b_file" "$c_file" file) || die "récupération cache fichier indéfinie: $pair"
-  resident_recovery=$(recovery_ratio "$a_resident" "$b_resident" "$c_resident" rss) || die "récupération jemalloc resident indéfinie: $pair"
   a_match=$(match_control_derivatives "$a_run") || die "dérivés match_control A absents: $a_run"
   b_match=$(match_control_derivatives "$b_run") || die "dérivés match_control B absents: $b_run"
   c_match=$(match_control_derivatives "$c_run") || die "dérivés match_control C absents: $c_run"
@@ -402,11 +488,10 @@ for index in 0 1 2; do
   RSS_RECOVERY+=("$rss_recovery")
   RSS_ANON_RECOVERY+=("$anon_recovery")
   FILE_RECOVERY+=("$file_recovery")
-  JEMALLOC_RESIDENT_RECOVERY+=("$resident_recovery")
   P3_MEMORY_DERIVATIVES+=("$(jq -cn --arg pair "$pair" --arg a_run "$a_run" --arg b_run "$b_run" --arg c_run "$c_run" \
-    --argjson compaction "$compaction" --argjson rss_recovery "$rss_recovery" --argjson rss_anon_recovery "$anon_recovery" --argjson file_recovery "$file_recovery" --argjson jemalloc_resident_recovery "$resident_recovery" \
+    --argjson compaction "$compaction" --argjson rss_recovery "$rss_recovery" --argjson rss_anon_recovery "$anon_recovery" --argjson file_recovery "$file_recovery" \
     --argjson a_match "$a_match" --argjson b_match "$b_match" --argjson c_match "$c_match" \
-    '{pair:$pair,runs:{A:$a_run,B:$b_run,C:$c_run},compaction_directory_c_over_b:$compaction,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery,jemalloc_resident:$jemalloc_resident_recovery},match_control:{A:$a_match,B:$b_match,C:$c_match}}')")
+    '{pair:$pair,runs:{A:$a_run,B:$b_run,C:$c_run},compaction_directory_c_over_b:$compaction,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery},match_control:{A:$a_match,B:$b_match,C:$c_match}}')")
 done
 
 MEDIAN_CORE95=$(median_three "${CORE_TOOK95[@]}")
@@ -429,7 +514,6 @@ COMPACTION_JSON=$(numbers_json "${COMPACTION[@]}")
 RSS_RECOVERY_JSON=$(numbers_json "${RSS_RECOVERY[@]}")
 RSS_ANON_RECOVERY_JSON=$(numbers_json "${RSS_ANON_RECOVERY[@]}")
 FILE_RECOVERY_JSON=$(numbers_json "${FILE_RECOVERY[@]}")
-JEMALLOC_RESIDENT_RECOVERY_JSON=$(numbers_json "${JEMALLOC_RESIDENT_RECOVERY[@]}")
 P3_MEMORY_DERIVATIVES_JSON=$(printf '%s\n' "${P3_MEMORY_DERIVATIVES[@]}" | jq -sc '.')
 CHECKS_JSONL=$(mktemp "${TMPDIR:-/tmp}/surch-p2-gate.XXXXXX") || die 'mktemp impossible'
 trap 'rm -f -- "$CHECKS_JSONL"' EXIT
@@ -481,9 +565,9 @@ numbers_all_le 1.10 "${RANDOM_MATCH_CLIENT[@]}" && pass=true || pass=false
 add_check 'témoin match autonome : aucune p95 client > 1.10' "$pass" "ratios=$(numbers_json "${RANDOM_MATCH_CLIENT[@]}")"
 numbers_all_le 2.0 "${PROBE_DELTA[@]}" && pass=true || pass=false
 add_check 'écart sonde p95' "$pass" "écarts ms=$(numbers_json "${PROBE_DELTA[@]}"), cible <= 2"
-[ "${#BLOCK_RATIO_DIAGNOSTICS[@]}" -eq 9 ] && jq -e 'all(.[]; .pass == true)' <<< "$BLOCK_RATIO_JSON" >/dev/null && pass=true || pass=false
+[ "${#BLOCK_RATIO_DIAGNOSTICS[@]}" -eq 9 ] && jq -e 'all(.[]; (.ratio | type) == "number" and .ratio <= 0.25 and .target == 0.25 and .pass == true)' <<< "$BLOCK_RATIO_JSON" >/dev/null && pass=true || pass=false
 add_check 'ratio de blocs B (résultat)' "$pass" "observations=$BLOCK_RATIO_JSON, cible <= 0.25"
-[ "${#BLOCK_RATIO_C_DIAGNOSTICS[@]}" -eq 9 ] && jq -e 'all(.[]; .pass == true)' <<< "$BLOCK_RATIO_C_JSON" >/dev/null && pass=true || pass=false
+[ "${#BLOCK_RATIO_C_DIAGNOSTICS[@]}" -eq 9 ] && jq -e 'all(.[]; (.ratio | type) == "number" and .ratio <= 0.25 and .target == 0.25 and .pass == true)' <<< "$BLOCK_RATIO_C_JSON" >/dev/null && pass=true || pass=false
 add_check 'ratio de blocs C (résultat)' "$pass" "observations=$BLOCK_RATIO_C_JSON, cible <= 0.25"
 MEDIAN_P3_COST_TOOK=$(median_three "${P3_COST_TOOK[@]}")
 MEDIAN_P3_COST_SIZE0_TOOK=$(median_three "${P3_COST_SIZE0_TOOK[@]}")
@@ -504,7 +588,7 @@ add_check 'intégrité P3 technique' "$pass" "observations=$P3_INTEGRITY_JSON, p
   && pass=true || pass=false
 add_check 'cible intégrité P3' "$pass" "observations=$P3_INTEGRITY_JSON, cible <= $P3_INTEGRITY_TARGET_BYTES (17 Mio)"
 [ "${#P3_MEMORY_DERIVATIVES[@]}" -eq 3 ] \
-  && jq -e 'all(.[]; (.compaction_directory_c_over_b | type) == "number" and (.recovery.rss | type) == "number" and (.recovery.rss_anon | type) == "number" and (.recovery.file | type) == "number" and (.recovery.jemalloc_resident | type) == "number" and ([.match_control.A,.match_control.B,.match_control.C] | all(type == "object")))' <<< "$P3_MEMORY_DERIVATIVES_JSON" >/dev/null \
+  && jq -e 'all(.[]; (.compaction_directory_c_over_b | type) == "number" and (.recovery.rss | type) == "number" and (.recovery.rss_anon | type) == "number" and (.recovery.file | type) == "number" and ([.match_control.A,.match_control.B,.match_control.C] | all(type == "object")))' <<< "$P3_MEMORY_DERIVATIVES_JSON" >/dev/null \
   && pass=true || pass=false
 add_check 'télémétrie P3 et dérivés match_control' "$pass" "triplets=$P3_MEMORY_DERIVATIVES_JSON"
 numbers_all_le 0.0100 "${COMPACTION[@]}" && pass=true || pass=false
@@ -542,8 +626,8 @@ jq -n \
   --argjson fixed_match "$(numbers_json "${FIXED_MATCH[@]}")" --argjson random_match "$(numbers_json "${RANDOM_MATCH[@]}")" --argjson random_match_client "$(numbers_json "${RANDOM_MATCH_CLIENT[@]}")" \
   --argjson probe_delta "$(numbers_json "${PROBE_DELTA[@]}")" --argjson bootstrap_upper "$(numbers_json "${BOOTSTRAP_UPPER[@]}")" \
   --argjson median_product_took "$MEDIAN_PRODUCT_TOOK" --argjson median_product_client "$MEDIAN_PRODUCT_CLIENT" --argjson median_random_match_client "$MEDIAN_RANDOM_MATCH_CLIENT" \
-  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" --argjson blocks_ratio_c_diagnostics "$BLOCK_RATIO_C_JSON" --argjson p3_integrity_diagnostics "$P3_INTEGRITY_JSON" --argjson p3_integrity_target "$P3_INTEGRITY_TARGET_BYTES" --argjson baseline_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${BASELINE_PAIR_DIRS[@]}")" --argjson p3_cost_took "$P3_COST_TOOK_JSON" --argjson p3_cost_size0_took "$P3_COST_SIZE0_TOOK_JSON" --argjson p3_cost_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${COST_PAIR_DIRS[@]}")" --argjson memory_derivatives "$P3_MEMORY_DERIVATIVES_JSON" --argjson compaction "$COMPACTION_JSON" --argjson rss_recovery "$RSS_RECOVERY_JSON" --argjson rss_anon_recovery "$RSS_ANON_RECOVERY_JSON" --argjson file_recovery "$FILE_RECOVERY_JSON" --argjson jemalloc_resident_recovery "$JEMALLOC_RESIDENT_RECOVERY_JSON" --argjson replay_required "$REPLAY_REQUIRED" \
-  '{schema:"surch.bench.p3.campaign.v1", verdict:$verdict, replay_required:$replay_required,pair_directories:$pair_directories,baseline_pair_directories:$baseline_pair_directories,ratios:{bool_size10_took_p95:$product_took,bool_size10_client_p95:$product_client,bool_size0_took_p95:$core95,bool_size0_took_p99:$core99,fixed_martin_match_took_p95:$fixed_match,match_control_took_p95:$random_match,match_control_client_p95:$random_match_client,probe_p95_delta_ms:$probe_delta,bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper},medians:{bool_size10_took_p95:$median_product_took,bool_size10_client_p95:$median_product_client,bool_size0_took_p95:$median_core95,bool_size0_took_p99:$median_core99,match_control_client_p95:$median_random_match_client},blocks_ratio:{target:0.25,B:$blocks_ratio_diagnostics,C:$blocks_ratio_c_diagnostics},p3_integrity:{target_bytes:$p3_integrity_target,observations:$p3_integrity_diagnostics,c_over_b_bool_size10_took_p95:$p3_cost_took,c_over_b_bool_size0_took_p95:$p3_cost_size0_took,pair_directories:$p3_cost_pair_directories},memory:{derivatives:$memory_derivatives,compaction_directory_c_over_b:$compaction,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery,jemalloc_resident:$jemalloc_resident_recovery}},checks:$checks}' \
+  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" --argjson blocks_ratio_c_diagnostics "$BLOCK_RATIO_C_JSON" --argjson p3_integrity_diagnostics "$P3_INTEGRITY_JSON" --argjson p3_integrity_target "$P3_INTEGRITY_TARGET_BYTES" --argjson baseline_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${BASELINE_PAIR_DIRS[@]}")" --argjson p3_cost_took "$P3_COST_TOOK_JSON" --argjson p3_cost_size0_took "$P3_COST_SIZE0_TOOK_JSON" --argjson p3_cost_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${COST_PAIR_DIRS[@]}")" --argjson memory_derivatives "$P3_MEMORY_DERIVATIVES_JSON" --argjson compaction "$COMPACTION_JSON" --argjson rss_recovery "$RSS_RECOVERY_JSON" --argjson rss_anon_recovery "$RSS_ANON_RECOVERY_JSON" --argjson file_recovery "$FILE_RECOVERY_JSON" --argjson replay_required "$REPLAY_REQUIRED" \
+  '{schema:"surch.bench.p3.campaign.v1", verdict:$verdict, replay_required:$replay_required,pair_directories:$pair_directories,baseline_pair_directories:$baseline_pair_directories,ratios:{bool_size10_took_p95:$product_took,bool_size10_client_p95:$product_client,bool_size0_took_p95:$core95,bool_size0_took_p99:$core99,fixed_martin_match_took_p95:$fixed_match,match_control_took_p95:$random_match,match_control_client_p95:$random_match_client,probe_p95_delta_ms:$probe_delta,bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper},medians:{bool_size10_took_p95:$median_product_took,bool_size10_client_p95:$median_product_client,bool_size0_took_p95:$median_core95,bool_size0_took_p99:$median_core99,match_control_client_p95:$median_random_match_client},blocks_ratio:{target:0.25,B:$blocks_ratio_diagnostics,C:$blocks_ratio_c_diagnostics},p3_integrity:{target_bytes:$p3_integrity_target,observations:$p3_integrity_diagnostics,c_over_b_bool_size10_took_p95:$p3_cost_took,c_over_b_bool_size0_took_p95:$p3_cost_size0_took,pair_directories:$p3_cost_pair_directories},memory:{derivatives:$memory_derivatives,compaction_directory_c_over_b:$compaction,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery}},checks:$checks}' \
   > "$CAMPAIGN/campaign-summary.json" || die 'écriture impossible de campaign-summary.json'
 
 {

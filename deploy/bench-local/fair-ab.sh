@@ -356,19 +356,36 @@ NDOCS=$(( $(wc -l < "$BULK") / 2 ))
 log "corpus prêt : $NDOCS docs ($(du -h "$BULK" | cut -f1))"
 
 # ---- P2 : entrées gelées, strictement éligibles au chemin bool.must disque ----
-# Les analyseurs découpent les blancs, apostrophes et ponctuation. La sélection
-# est volontairement plus stricte : ASCII alphanumérique seulement. Rejeter un
-# terme potentiellement multi-token vaut mieux que mesurer le repli générique.
+# Les analyseurs découpent les blancs, apostrophes et ponctuation. La clé de
+# sélection est la même chaîne que le mapping : asciifolding latin puis
+# lowercase. Une forme brute non ASCII est donc admise si, et seulement si,
+# son terme analysé est mono-token ASCII alphanumérique.
 p2_sha256(){ sha256sum "$1" | awk '{print $1}'; }
 
 p2_validate_pairs(){
   local pairs="$1" wanted="$2"
   awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
-    # Le mapping NOM applique asciifolding puis lowercase. La sélection refuse
-    # donc tout NOM non ASCII (au lieu d approximer asciifolding) et déduit la
-    # clé exacte des termes ASCII par lowercase sous LC_ALL=C.
-    function analysed_nom(value) { return tolower(value) }
-    NF != 3 || $1 != NR || $2 !~ /^[A-Za-z0-9]+$/ || $3 !~ /^[A-Za-z0-9]+$/ \
+    # Table déterministe : Latin-1 Supplement et Latin Extended-A. Les
+    # substitutions explicites restent byte-stables sous LC_ALL=C, y compris
+    # avec mawk, qui ne fournit pas de normalisation Unicode implicite.
+    function asciifold(value) {
+      # ĸ et ſ survivent au NFD du moteur : les rendre non mono-token ici
+      # préserve exactement leur exclusion sans les rabattre sur k ou s.
+      gsub(/ĸ|ſ/, "!", value)
+      gsub(/À|Á|Â|Ã|Ä|Å|Ā|Ă|Ą/, "A", value); gsub(/à|á|â|ã|ä|å|ā|ă|ą/, "a", value)
+      gsub(/Æ/, "AE", value); gsub(/æ/, "ae", value); gsub(/Ç|Ć|Ĉ|Ċ|Č/, "C", value); gsub(/ç|ć|ĉ|ċ|č/, "c", value)
+      gsub(/Ð|Ď|Đ/, "D", value); gsub(/ð|ď|đ/, "d", value); gsub(/È|É|Ê|Ë|Ē|Ĕ|Ė|Ę|Ě/, "E", value); gsub(/è|é|ê|ë|ē|ĕ|ė|ę|ě/, "e", value)
+      gsub(/Ĝ|Ğ|Ġ|Ģ/, "G", value); gsub(/ĝ|ğ|ġ|ģ/, "g", value); gsub(/Ĥ|Ħ/, "H", value); gsub(/ĥ|ħ/, "h", value)
+      gsub(/Ì|Í|Î|Ï|Ĩ|Ī|Ĭ|Į|İ/, "I", value); gsub(/ì|í|î|ï|ĩ|ī|ĭ|į|ı/, "i", value); gsub(/Ĳ/, "IJ", value); gsub(/ĳ/, "ij", value); gsub(/Ĵ/, "J", value); gsub(/ĵ/, "j", value)
+      gsub(/Ķ/, "K", value); gsub(/ķ|ĸ/, "k", value); gsub(/Ĺ|Ļ|Ľ|Ŀ|Ł/, "L", value); gsub(/ĺ|ļ|ľ|ŀ|ł/, "l", value)
+      gsub(/Ñ|Ń|Ņ|Ň|Ŋ/, "N", value); gsub(/ñ|ń|ņ|ň|ŋ/, "n", value); gsub(/Ò|Ó|Ô|Õ|Ö|Ø|Ō|Ŏ|Ő/, "O", value); gsub(/ò|ó|ô|õ|ö|ø|ō|ŏ|ő/, "o", value); gsub(/Œ/, "OE", value); gsub(/œ/, "oe", value)
+      gsub(/Ŕ|Ŗ|Ř/, "R", value); gsub(/ŕ|ŗ|ř/, "r", value); gsub(/Ś|Ŝ|Ş|Š/, "S", value); gsub(/ś|ŝ|ş|š|ſ/, "s", value); gsub(/ß/, "ss", value)
+      gsub(/Ţ|Ť|Ŧ/, "T", value); gsub(/Þ/, "TH", value); gsub(/ţ|ť|ŧ/, "t", value); gsub(/þ/, "th", value); gsub(/Ù|Ú|Û|Ü|Ũ|Ū|Ŭ|Ů|Ű|Ų/, "U", value); gsub(/ù|ú|û|ü|ũ|ū|ŭ|ů|ű|ų/, "u", value)
+      gsub(/Ŵ/, "W", value); gsub(/ŵ/, "w", value); gsub(/Ý|Ÿ|Ŷ/, "Y", value); gsub(/ý|ÿ|ŷ/, "y", value); gsub(/Ź|Ż|Ž/, "Z", value); gsub(/ź|ż|ž/, "z", value)
+      return value
+    }
+    function analysed_nom(value) { return tolower(asciifold(value)) }
+    NF != 3 || $1 != NR || analysed_nom($2) !~ /^[a-z0-9]+$/ || analysed_nom($3) !~ /^[a-z0-9]+$/ \
       || analysed_nom($2) == analysed_nom(fixed) || (analysed_nom($2) in seen) { invalid = 1; exit }
     { seen[analysed_nom($2)] = 1 }
     END { exit (invalid || NR != wanted) }
@@ -378,8 +395,14 @@ p2_validate_pairs(){
 p2_validate_control_names(){
   local names="$1" wanted="$2"
   awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
-    function analysed_nom(value) { return tolower(value) }
-    NF != 2 || $1 != NR || $2 !~ /^[A-Za-z0-9]+$/ \
+    function asciifold(value) {
+      # ĸ et ſ survivent au NFD du moteur : les rendre non mono-token ici
+      # préserve exactement leur exclusion sans les rabattre sur k ou s.
+      gsub(/ĸ|ſ/, "!", value)
+      gsub(/À|Á|Â|Ã|Ä|Å|Ā|Ă|Ą/, "A", value); gsub(/à|á|â|ã|ä|å|ā|ă|ą/, "a", value); gsub(/Æ/, "AE", value); gsub(/æ/, "ae", value); gsub(/Ç|Ć|Ĉ|Ċ|Č/, "C", value); gsub(/ç|ć|ĉ|ċ|č/, "c", value); gsub(/Ð|Ď|Đ/, "D", value); gsub(/ð|ď|đ/, "d", value); gsub(/È|É|Ê|Ë|Ē|Ĕ|Ė|Ę|Ě/, "E", value); gsub(/è|é|ê|ë|ē|ĕ|ė|ę|ě/, "e", value); gsub(/Ĝ|Ğ|Ġ|Ģ/, "G", value); gsub(/ĝ|ğ|ġ|ģ/, "g", value); gsub(/Ĥ|Ħ/, "H", value); gsub(/ĥ|ħ/, "h", value); gsub(/Ì|Í|Î|Ï|Ĩ|Ī|Ĭ|Į|İ/, "I", value); gsub(/ì|í|î|ï|ĩ|ī|ĭ|į|ı/, "i", value); gsub(/Ĳ/, "IJ", value); gsub(/ĳ/, "ij", value); gsub(/Ĵ/, "J", value); gsub(/ĵ/, "j", value); gsub(/Ķ/, "K", value); gsub(/ķ|ĸ/, "k", value); gsub(/Ĺ|Ļ|Ľ|Ŀ|Ł/, "L", value); gsub(/ĺ|ļ|ľ|ŀ|ł/, "l", value); gsub(/Ñ|Ń|Ņ|Ň|Ŋ/, "N", value); gsub(/ñ|ń|ņ|ň|ŋ/, "n", value); gsub(/Ò|Ó|Ô|Õ|Ö|Ø|Ō|Ŏ|Ő/, "O", value); gsub(/ò|ó|ô|õ|ö|ø|ō|ŏ|ő/, "o", value); gsub(/Œ/, "OE", value); gsub(/œ/, "oe", value); gsub(/Ŕ|Ŗ|Ř/, "R", value); gsub(/ŕ|ŗ|ř/, "r", value); gsub(/Ś|Ŝ|Ş|Š/, "S", value); gsub(/ś|ŝ|ş|š|ſ/, "s", value); gsub(/ß/, "ss", value); gsub(/Ţ|Ť|Ŧ/, "T", value); gsub(/Þ/, "TH", value); gsub(/ţ|ť|ŧ/, "t", value); gsub(/þ/, "th", value); gsub(/Ù|Ú|Û|Ü|Ũ|Ū|Ŭ|Ů|Ű|Ų/, "U", value); gsub(/ù|ú|û|ü|ũ|ū|ŭ|ů|ű|ų/, "u", value); gsub(/Ŵ/, "W", value); gsub(/ŵ/, "w", value); gsub(/Ý|Ÿ|Ŷ/, "Y", value); gsub(/ý|ÿ|ŷ/, "y", value); gsub(/Ź|Ż|Ž/, "Z", value); gsub(/ź|ż|ž/, "z", value); return value
+    }
+    function analysed_nom(value) { return tolower(asciifold(value)) }
+    NF != 2 || $1 != NR || analysed_nom($2) !~ /^[a-z0-9]+$/ \
       || analysed_nom($2) == analysed_nom(fixed) || (analysed_nom($2) in seen) { invalid = 1; exit }
     { seen[analysed_nom($2)] = 1 }
     END { exit (invalid || NR != wanted) }
@@ -396,7 +419,13 @@ p2_validate_term_sets(){
     && p2_validate_control_names "$control_names" "$P2_PAIR_COUNT" \
     && p2_validate_pairs "$warm_pairs" "$P2_WARM_TERM_COUNT" || return 1
   awk -F '\t' -v bool_pairs="$bool_pairs" -v control_names="$control_names" -v warm_pairs="$warm_pairs" '
-    function analysed_nom(value) { return tolower(value) }
+    function asciifold(value) {
+      # ĸ et ſ survivent au NFD du moteur : les rendre non mono-token ici
+      # préserve exactement leur exclusion sans les rabattre sur k ou s.
+      gsub(/ĸ|ſ/, "!", value)
+      gsub(/À|Á|Â|Ã|Ä|Å|Ā|Ă|Ą/, "A", value); gsub(/à|á|â|ã|ä|å|ā|ă|ą/, "a", value); gsub(/Æ/, "AE", value); gsub(/æ/, "ae", value); gsub(/Ç|Ć|Ĉ|Ċ|Č/, "C", value); gsub(/ç|ć|ĉ|ċ|č/, "c", value); gsub(/Ð|Ď|Đ/, "D", value); gsub(/ð|ď|đ/, "d", value); gsub(/È|É|Ê|Ë|Ē|Ĕ|Ė|Ę|Ě/, "E", value); gsub(/è|é|ê|ë|ē|ĕ|ė|ę|ě/, "e", value); gsub(/Ĝ|Ğ|Ġ|Ģ/, "G", value); gsub(/ĝ|ğ|ġ|ģ/, "g", value); gsub(/Ĥ|Ħ/, "H", value); gsub(/ĥ|ħ/, "h", value); gsub(/Ì|Í|Î|Ï|Ĩ|Ī|Ĭ|Į|İ/, "I", value); gsub(/ì|í|î|ï|ĩ|ī|ĭ|į|ı/, "i", value); gsub(/Ĳ/, "IJ", value); gsub(/ĳ/, "ij", value); gsub(/Ĵ/, "J", value); gsub(/ĵ/, "j", value); gsub(/Ķ/, "K", value); gsub(/ķ|ĸ/, "k", value); gsub(/Ĺ|Ļ|Ľ|Ŀ|Ł/, "L", value); gsub(/ĺ|ļ|ľ|ŀ|ł/, "l", value); gsub(/Ñ|Ń|Ņ|Ň|Ŋ/, "N", value); gsub(/ñ|ń|ņ|ň|ŋ/, "n", value); gsub(/Ò|Ó|Ô|Õ|Ö|Ø|Ō|Ŏ|Ő/, "O", value); gsub(/ò|ó|ô|õ|ö|ø|ō|ŏ|ő/, "o", value); gsub(/Œ/, "OE", value); gsub(/œ/, "oe", value); gsub(/Ŕ|Ŗ|Ř/, "R", value); gsub(/ŕ|ŗ|ř/, "r", value); gsub(/Ś|Ŝ|Ş|Š/, "S", value); gsub(/ś|ŝ|ş|š|ſ/, "s", value); gsub(/ß/, "ss", value); gsub(/Ţ|Ť|Ŧ/, "T", value); gsub(/Þ/, "TH", value); gsub(/ţ|ť|ŧ/, "t", value); gsub(/þ/, "th", value); gsub(/Ù|Ú|Û|Ü|Ũ|Ū|Ŭ|Ů|Ű|Ų/, "U", value); gsub(/ù|ú|û|ü|ũ|ū|ŭ|ů|ű|ų/, "u", value); gsub(/Ŵ/, "W", value); gsub(/ŵ/, "w", value); gsub(/Ý|Ÿ|Ŷ/, "Y", value); gsub(/ý|ÿ|ŷ/, "y", value); gsub(/Ź|Ż|Ž/, "Z", value); gsub(/ź|ż|ž/, "z", value); return value
+    }
+    function analysed_nom(value) { return tolower(asciifold(value)) }
     FILENAME == bool_pairs { bool[analysed_nom($2)] = 1; next }
     FILENAME == control_names {
       term = analysed_nom($2)
@@ -574,10 +603,18 @@ p2_prepare_inputs(){
       sub(/^"[^"]*":"/, "", val); sub(/"$/, "", val)
       return val
     }
-    # Le contrat impose asciifolding + lowercase. Sans implémentation exacte
-    # d asciifolding en awk, tout caractère non ASCII est refusé fail-closed.
-    function mono(value) { return value ~ /^[A-Za-z0-9]+$/ }
-    function analysed_nom(value) { return tolower(value) }
+    # Même table que les validateurs indépendants ci-dessus. Le mapping de
+    # Surch applique asciifolding puis lowercase : cette clé, et non la forme
+    # brute, décide de la disjonction des postings.
+    function asciifold(value) {
+      # ĸ et ſ survivent au NFD du moteur : les rendre non mono-token ici
+      # préserve exactement leur exclusion sans les rabattre sur k ou s.
+      gsub(/ĸ|ſ/, "!", value)
+      gsub(/À|Á|Â|Ã|Ä|Å|Ā|Ă|Ą/, "A", value); gsub(/à|á|â|ã|ä|å|ā|ă|ą/, "a", value); gsub(/Æ/, "AE", value); gsub(/æ/, "ae", value); gsub(/Ç|Ć|Ĉ|Ċ|Č/, "C", value); gsub(/ç|ć|ĉ|ċ|č/, "c", value); gsub(/Ð|Ď|Đ/, "D", value); gsub(/ð|ď|đ/, "d", value); gsub(/È|É|Ê|Ë|Ē|Ĕ|Ė|Ę|Ě/, "E", value); gsub(/è|é|ê|ë|ē|ĕ|ė|ę|ě/, "e", value); gsub(/Ĝ|Ğ|Ġ|Ģ/, "G", value); gsub(/ĝ|ğ|ġ|ģ/, "g", value); gsub(/Ĥ|Ħ/, "H", value); gsub(/ĥ|ħ/, "h", value); gsub(/Ì|Í|Î|Ï|Ĩ|Ī|Ĭ|Į|İ/, "I", value); gsub(/ì|í|î|ï|ĩ|ī|ĭ|į|ı/, "i", value); gsub(/Ĳ/, "IJ", value); gsub(/ĳ/, "ij", value); gsub(/Ĵ/, "J", value); gsub(/ĵ/, "j", value); gsub(/Ķ/, "K", value); gsub(/ķ|ĸ/, "k", value); gsub(/Ĺ|Ļ|Ľ|Ŀ|Ł/, "L", value); gsub(/ĺ|ļ|ľ|ŀ|ł/, "l", value); gsub(/Ñ|Ń|Ņ|Ň|Ŋ/, "N", value); gsub(/ñ|ń|ņ|ň|ŋ/, "n", value); gsub(/Ò|Ó|Ô|Õ|Ö|Ø|Ō|Ŏ|Ő/, "O", value); gsub(/ò|ó|ô|õ|ö|ø|ō|ŏ|ő/, "o", value); gsub(/Œ/, "OE", value); gsub(/œ/, "oe", value); gsub(/Ŕ|Ŗ|Ř/, "R", value); gsub(/ŕ|ŗ|ř/, "r", value); gsub(/Ś|Ŝ|Ş|Š/, "S", value); gsub(/ś|ŝ|ş|š|ſ/, "s", value); gsub(/ß/, "ss", value); gsub(/Ţ|Ť|Ŧ/, "T", value); gsub(/Þ/, "TH", value); gsub(/ţ|ť|ŧ/, "t", value); gsub(/þ/, "th", value); gsub(/Ù|Ú|Û|Ü|Ũ|Ū|Ŭ|Ů|Ű|Ų/, "U", value); gsub(/ù|ú|û|ü|ũ|ū|ŭ|ů|ű|ų/, "u", value); gsub(/Ŵ/, "W", value); gsub(/ŵ/, "w", value); gsub(/Ý|Ÿ|Ŷ/, "Y", value); gsub(/ý|ÿ|ŷ/, "y", value); gsub(/Ź|Ż|Ž/, "Z", value); gsub(/ź|ż|ž/, "z", value); return value
+    }
+    function mono(value) { return value ~ /^[a-z0-9]+$/ }
+    function analysed_nom(value) { return tolower(asciifold(value)) }
+    function pre_eligible(value) { return mono(analysed_nom(value)) }
     function target_for_bucket(kind) {
       # Ordonnancement pondéré déterministe : la plus petite fraction déjà
       # attribuée reçoit le bucket suivant. Il respecte exactement les tailles
@@ -603,7 +640,7 @@ p2_prepare_inputs(){
       doc++
       nom = extract($0, fnom); pre = extract($0, fpre)
       term = analysed_nom(nom)
-      if (!mono(nom) || !mono(pre) || term == analysed_nom(fixed)) next
+      if (!mono(term) || term == analysed_nom(fixed)) next
       bucket = int((doc - 1) * (bool_wanted + control_wanted + warm_wanted) / ndocs) + 1
       if (bucket >= 1 && bucket <= bool_wanted + control_wanted + warm_wanted \
           && bucket_count[bucket] < 32 && !((bucket SUBSEP term) in bucket_seen)) {
@@ -622,15 +659,15 @@ p2_prepare_inputs(){
         kind = target_for_bucket(bucket)
         for (candidate = 1; candidate <= bucket_count[bucket]; candidate++) {
           nom = bucket_nom[bucket, candidate]
-          if (!(analysed_nom(nom) in used)) { take(kind, nom, bucket_pre[bucket, candidate]); break }
+          if (!(analysed_nom(nom) in used) && (kind == "control" || pre_eligible(bucket_pre[bucket, candidate]))) { take(kind, nom, bucket_pre[bucket, candidate]); break }
         }
       }
       for (i = 1; i <= fallback_count; i++) {
         nom = fallback_nom[i]
         if (analysed_nom(nom) in used) continue
-        if (bool_count < bool_wanted) take("bool", nom, fallback_pre[i])
+        if (bool_count < bool_wanted && pre_eligible(fallback_pre[i])) take("bool", nom, fallback_pre[i])
         else if (control_count < control_wanted) take("control", nom, fallback_pre[i])
-        else if (warm_count < warm_wanted) take("warm", nom, fallback_pre[i])
+        else if (warm_count < warm_wanted && pre_eligible(fallback_pre[i])) take("warm", nom, fallback_pre[i])
       }
       if (bool_count != bool_wanted || control_count != control_wanted || warm_count != warm_wanted) exit 1
       for (i = 1; i <= bool_wanted; i++) print i "\t" bool_nom[i] "\t" bool_pre[i] > bool_out
