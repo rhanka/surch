@@ -968,12 +968,13 @@ fn merge_forward_fst(
     Some(Map::new(bytes).expect("fst::Map from valid MapBuilder bytes"))
 }
 
-use surch_search::scoring::{bm25_score, Bm25Config};
+use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
 
 use crate::scroll::ScrollTable;
 use crate::stats::{
     clear_memory_gauges, refresh_jemalloc_purge, refresh_memory_gauges, set_p2_integrity_gauges,
 };
+use crate::topn::TopN;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FusedConjunctionScoreMode {
@@ -3428,6 +3429,19 @@ impl<'a> IndexReader<'a> {
         self.data.index.decode_from_segment(field, term)
     }
 
+    /// Chantier C2 : top-K d'un `match` mono-terme en une seule lecture
+    /// streamée, lu à travers le même garde partagé que le reste de la
+    /// requête. `None` = déclin, la référence reprend la requête. Voir
+    /// `AppState::single_term_match_topk_streamed` pour le contrat exact.
+    pub(crate) fn single_term_match_topk(
+        &self,
+        field: &str,
+        value: &str,
+        limit: usize,
+    ) -> Option<(Vec<(f64, u32)>, u64)> {
+        AppState::single_term_match_topk_streamed(self.data, field, value, limit)
+    }
+
     /// Internal candidate ids for an OR/AND `match` over `field`.
     /// Identical to [`AppState::documents_for_match_internal`] but reads
     /// through the shared guard.
@@ -5066,6 +5080,140 @@ impl AppState {
         block_metrics.observe_segmented(&segmented_terms);
         block_metrics.publish(index_name, &data.index);
         Some(scored)
+    }
+
+    /// Chantier C2 : top-K d'un `match` mono-terme en UNE SEULE lecture
+    /// streamée des postings, sans aucune structure dimensionnée sur `df`.
+    ///
+    /// Le chemin de référence (`search::topk_scored_documents_reference`)
+    /// paie, pour rendre `size` documents : un décodage intégral du terme au
+    /// rappel (`InMemoryIndex::match_hits_disk`), un SECOND décodage dans
+    /// l'arène de scoring (`SearchScoringContext::new`), une reconstruction
+    /// des `BlockMeta` en rebalayant les `freqs`, un balayage de plus pour
+    /// `max_term_freq`, puis une `BTreeMap<u32, f64>` de `df` entrées
+    /// convertie en `Vec<(f64, u32)>` de `df` éléments — trois structures de
+    /// taille `df` pour n'en garder que `size`.
+    ///
+    /// Cette fonction applique au `match` mono-terme le patron que
+    /// [`Self::fused_conjunction_scores_disk`] utilise déjà pour la
+    /// conjonction : des curseurs checked par segment
+    /// ([`DocumentIndex::segmented_postings_checked`]), une avance monotone
+    /// qui capture la `freq` à la position trouvée, et le score poussé
+    /// directement dans le TopN borné à `limit`. Aucune allocation en O(df) :
+    /// seuls le répertoire de blocs (`df/128`) et le TopN (`limit`) vivent.
+    ///
+    /// **Équivalence.** Pour un token unique, la boucle MaxScore de référence
+    /// dégénère : `threshold` reste à `-inf`, donc `allow_new_docs` est
+    /// toujours vrai, aucun bloc n'est jamais sauté et `block_max_contribs` /
+    /// `max_term_freq` n'influencent aucune décision. Le résultat est donc
+    /// exactement « pour chaque posting de `df`, dans l'ordre croissant de
+    /// `doc_id` : ignorer `freq == 0`, ignorer une `doc_len` absente ou
+    /// nulle, sinon `bm25(freq, doc_len) * boost` », avec `boost == 1` puisque
+    /// la garde ci-dessous impose un token unique. `total` reste le `df` du
+    /// terme, comme `candidates.len()` du rappel : le contrat `total` et
+    /// `track_total_hits` n'est pas touché (périmètre C1, non engagé).
+    ///
+    /// Retourne `None` pour DÉCLINER — le chemin de référence reprend alors
+    /// la requête intégralement. Le déclin est la seule réponse à toute
+    /// situation où l'équivalence bit-à-bit n'est pas démontrable : requête
+    /// multi-token, analyse de rappel différente de l'analyse de scoring,
+    /// statistiques de champ absentes, `df` incohérent, ou erreur de lecture
+    /// checked (`SegmentPostingsAdvance::Error`), qui n'est jamais contournée.
+    fn single_term_match_topk_streamed(
+        data: &InMemoryIndex,
+        field: &str,
+        value: &str,
+        limit: usize,
+    ) -> Option<(Vec<(f64, u32)>, u64)> {
+        if field.trim().is_empty() || value.is_empty() {
+            return None;
+        }
+        // Le rappel et le scoring doivent porter sur EXACTEMENT le même
+        // token unique. C'est cette garde qui rend le boost de répétition
+        // égal à 1 et le `total` égal au `df` du terme.
+        let recall = normalized_terms_for_field(value, field, &data.mapping);
+        if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
+            return None;
+        }
+        let token = recall.into_iter().next().expect("len checked == 1");
+
+        let field_stats = data.field_scoring_stats(field)?;
+        if field_stats.doc_count == 0 {
+            return None;
+        }
+
+        let mut postings = match data.index.segmented_postings_checked(field, &token) {
+            Ok(Some(postings)) => postings,
+            // Terme absent de tous les segments : `df == 0`, aucun hit —
+            // identique au `candidates.is_empty()` de la référence.
+            Ok(None) => return Some((Vec::new(), 0)),
+            // Une erreur checked décline vers la référence sans jamais
+            // publier de préfixe partiel.
+            Err(_) => return None,
+        };
+
+        let total = postings.global_df();
+        // `size:0` : la référence calcule le total puis retourne avant tout
+        // contexte de scoring. Même valeur, sans lire un seul bloc.
+        if limit == 0 {
+            return Some((Vec::new(), total));
+        }
+        // Les deux gardes sur lesquelles `maxscore_match` abandonne au
+        // profit de la boucle générique. Décliner les reproduit.
+        if total == 0 || total > field_stats.doc_count {
+            return None;
+        }
+        let scorer = Bm25TermScorer::new(
+            Bm25Config::default(),
+            field_stats.doc_count,
+            total,
+            field_stats.avg_doc_len,
+        )
+        .ok()?;
+        let norms_enabled = field_stats.norms_enabled;
+
+        // Le comparateur est LE comparateur du top-K scoré, importé et non
+        // recopié : score décroissant puis `doc_id` croissant. Sur ce corpus
+        // presque tous les scores sont égaux, le départage par `doc_id` est
+        // donc la règle nominale, pas un cas limite.
+        let mut topn = TopN::new(limit, crate::search::scored_pair_ordering);
+        for segment_idx in 0..data.index.segment_count() {
+            let Some(cursor) = postings.cursor_at_mut(segment_idx) else {
+                continue;
+            };
+            // Avance monotone `doc_id + 1` : le même « next » streamé que le
+            // driver de `fused_conjunction_scores_disk`. Les segments sont
+            // parcourus dans l'ordre croissant de `doc_base` et chacun ne
+            // couvre que sa propre plage, donc les `doc_id` sortent
+            // globalement croissants — l'ordre exact de la `BTreeMap` de la
+            // référence.
+            let mut next_probe = 0u32;
+            loop {
+                let doc_id = match cursor.advance_to_with_status(next_probe) {
+                    SegmentPostingsAdvance::Found(doc_id) => doc_id,
+                    SegmentPostingsAdvance::Exhausted => break,
+                    SegmentPostingsAdvance::Error => return None,
+                };
+                next_probe = doc_id.saturating_add(1);
+                let freq = cursor.freq();
+                if freq == 0 {
+                    continue;
+                }
+                let doc_len = if norms_enabled {
+                    match field_stats.doc_len(doc_id) {
+                        Some(len) if len > 0 => len,
+                        _ => continue,
+                    }
+                } else {
+                    1
+                };
+                // `* boost` est omis : la garde impose `boost == 1.0`, et
+                // `x * 1.0 == x` bit-à-bit pour tout `f64` non-NaN (le
+                // scorer, validé fini, n'en produit pas).
+                topn.push((scorer.score(u64::from(freq), doc_len), doc_id));
+            }
+        }
+        Some((topn.into_sorted_vec(), total))
     }
 
     /// Candidate set of a `should`-all-required conjunction of `match` clauses
