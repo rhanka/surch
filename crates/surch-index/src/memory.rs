@@ -105,9 +105,9 @@ pub struct MemoryUsage {
     /// dimensioning table). The S5b disk-back (see
     /// `postings::FieldPostings::term_entries_directory`) déverse les cinq
     /// tableaux de service dans le segment partagé sous
-    /// `SURCH_POSTINGS_DISK`. P2 garde toutefois une attestation canonique
-    /// résidente pour vérifier les sauts ; cette jauge doit donc inclure ce
-    /// coût — voir
+    /// `SURCH_POSTINGS_DISK`. P3 garde toutefois les empreintes BLAKE3 et
+    /// descripteurs de pages résidents pour vérifier les sauts ; cette jauge
+    /// doit donc inclure ce coût — voir
     /// `postings::TermDictionary::postings_directory_bytes` for the full
     /// byte-cost breakdown.
     pub postings_directory_bytes: u64,

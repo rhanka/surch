@@ -103,6 +103,21 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     tort une série fixed complète à EOF sans nouvelle ligne ; les contrôles
     de cardinalité, format numérique, quantiles, routage et parité restent
     strictement identiques pour fixed, random, no_source et cold.
+- [ ] P3 — attestation BLAKE3-256 par pages de 4 Kio des deux régions
+  canoniques P2, sans copies résidentes des scalaires ni du répertoire.
+  - [x] Le producteur unique seal/merge publie atomiquement deux descripteurs
+    de région et une table de digests partagée, ou garde le fallback résident
+    compté ; le plafond de 32 Mio refuse toute dérive silencieuse.
+  - [x] Le lecteur authentifie la page de `TermEntry`, borne le payload,
+    déduit exactement `ceil(df/128)`, puis authentifie le répertoire avant
+    tout saut ; il décline intégralement sur incohérence.
+  - [x] Les jauges P3 exposent digests, pages, octets vérifiés, échecs de
+    hash, déclins, champs fallback et les composantes Lot 0 `T/B/F`.
+  - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
+    les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
+    digest altéré et l'absence de `pread` variable avant l'échec scalaire.
+  - [ ] Gate externe — exécuter les tests Rust ciblés, Clippy, les oracles de
+    parité et la campagne mémoire/latence C ; interdits dans cette mission.
 - [ ] Gate externe — exécuter les tests Rust ciblés, clippy et CI ; interdits
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
