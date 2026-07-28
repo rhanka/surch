@@ -57,7 +57,9 @@ execution_id_valid(){
 }
 
 scorecard_contract_valid(){
-  local score="$1" variant="$2" execution_id="$3"
+  local score="$1"
+  local variant="$2"
+  local execution_id="$3"
   jq -e --arg variant "$variant" --arg execution_id "$execution_id" '
     .measurement_valid == true
     and .count == 28917511 and .expected == 28917511 and .indexed == 28917511 and .item_errors == 0
@@ -77,7 +79,13 @@ scorecard_contract_valid(){
 }
 
 telemetry_jsonl_valid(){
-  local score="$1" expected_execution_id="$2" telemetry replay expected variant require_p3=false
+  local score="$1"
+  local expected_execution_id="$2"
+  local telemetry
+  local replay
+  local expected
+  local variant
+  local require_p3=false
   replay=$(jq -er '.p2.replay_mix_5050 | select(. == 0 or . == 1)' "$score") || return 1
   variant=$(jq -er '.p2.variant | strings' "$score") || return 1
   [ "$variant" != C ] || require_p3=true
@@ -121,7 +129,19 @@ telemetry_jsonl_valid(){
 }
 
 validate_campaign_provenance(){
-  local provenance score variant metadata manifest manifest_sha canonical_manifest="" expected_variant run_dir canonical_run physical_id execution_id other_run
+  local provenance
+  local score
+  local variant
+  local metadata
+  local manifest
+  local manifest_sha
+  local canonical_manifest=""
+  local expected_variant
+  local run_dir
+  local canonical_run
+  local physical_id
+  local execution_id
+  local other_run
   local -a run_dirs
   provenance="$CAMPAIGN/campaign-provenance.json"
   [ -r "$provenance" ] || return 1
@@ -198,9 +218,24 @@ validate_campaign_provenance(){
 # scorecard et manifeste sont tous liés ici : une cardinalité de trois ne
 # suffit jamais à prouver l'identité des répétitions.
 validate_pair_group(){
-  local root="$1"; shift
-  local summary pair_dir parity pair a_run b_run expected_a expected_b
-  local summary_a summary_b score_a score_b manifest_a manifest_b a_execution_id b_execution_id
+  local root="$1"
+  shift
+  local summary
+  local pair_dir
+  local parity
+  local pair
+  local a_run
+  local b_run
+  local expected_a
+  local expected_b
+  local summary_a
+  local summary_b
+  local score_a
+  local score_b
+  local manifest_a
+  local manifest_b
+  local a_execution_id
+  local b_execution_id
   local summaries=("$root"/*/pair-summary.json)
   local pair_dirs=("$root"/*)
   [ -e "${summaries[0]}" ] || summaries=()
@@ -247,7 +282,11 @@ validate_p3_bijection(){
 }
 
 phase_status_valid(){
-  local run_dir="$1" require_p3="$2" score status execution_id
+  local run_dir="$1"
+  local require_p3="$2"
+  local score
+  local status
+  local execution_id
   score="$run_dir/surch.json"
   jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$score" >/dev/null 2>&1 || return 1
   execution_id=$(jq -er '.p2.execution_id | strings' "$score" 2>/dev/null) || return 1
@@ -317,7 +356,11 @@ phase_status_valid(){
 }
 
 record_ratio(){
-  local summary="$1" phase="$2" kind="$3" metric="$4" quantile="$5"
+  local summary="$1"
+  local phase="$2"
+  local kind="$3"
+  local metric="$4"
+  local quantile="$5"
   jq -er --arg phase "$phase" --arg kind "$kind" --arg metric "$metric" --arg quantile "$quantile" '
     first(.records[] | select(.phase == $phase and .kind == $kind and .metric == $metric) | .b_over_a[$quantile])
     | if . == null then error("ratio indéfini") else tonumber end
@@ -493,7 +536,10 @@ for summary in "${COST_PAIR_SUMMARIES[@]}"; do
 done
 
 telemetry_value(){
-  local run="$1" path="$2" score telemetry
+  local run="$1"
+  local path="$2"
+  local score
+  local telemetry
   score="$CAMPAIGN/runs/$run/surch.json"
   telemetry=$(jq -er '.p2.telemetry_jsonl | strings' "$score") || return 1
   jq -ser --arg path "$path" '
@@ -506,7 +552,9 @@ telemetry_value(){
 }
 
 match_control_derivatives(){
-  local run="$1" score telemetry
+  local run="$1"
+  local score
+  local telemetry
   score="$CAMPAIGN/runs/$run/surch.json"
   telemetry=$(jq -er '.p2.telemetry_jsonl | strings' "$score") || return 1
   jq -ser '
@@ -526,7 +574,10 @@ match_control_derivatives(){
 }
 
 recovery_ratio(){
-  local a="$1" b="$2" c="$3" mode="$4"
+  local a="$1"
+  local b="$2"
+  local c="$3"
+  local mode="$4"
   awk -v a="$a" -v b="$b" -v c="$c" -v mode="$mode" '
     BEGIN {
       if (mode == "rss") { denominator = b - a; numerator = b - c }
@@ -611,7 +662,9 @@ trap 'rm -f -- "$CHECKS_JSONL"' EXIT
 ALL_PASSED=true
 
 add_check(){
-  local name="$1" passed="$2" detail="$3"
+  local name="$1"
+  local passed="$2"
+  local detail="$3"
   jq -n --arg name "$name" --arg detail "$detail" --argjson passed "$passed" '{name:$name, pass:$passed, detail:$detail}' >> "$CHECKS_JSONL"
   [ "$passed" = true ] || ALL_PASSED=false
 }

@@ -371,7 +371,8 @@ log "corpus prêt : $NDOCS docs ($(du -h "$BULK" | cut -f1))"
 p2_sha256(){ sha256sum "$1" | awk '{print $1}'; }
 
 p2_validate_pairs(){
-  local pairs="$1" wanted="$2"
+  local pairs="$1"
+  local wanted="$2"
   awk -f "$P2_ASCIIFOLD_AWK" -f <(printf '%s\n' '
     NF != 3 || $1 != NR || p2_analysed_nom($2) !~ /^[a-z0-9]+$/ || p2_analysed_nom($3) !~ /^[a-z0-9]+$/ \
       || p2_analysed_nom($2) == p2_analysed_nom(fixed) || (p2_analysed_nom($2) in seen) { invalid = 1; exit }
@@ -381,7 +382,8 @@ p2_validate_pairs(){
 }
 
 p2_validate_control_names(){
-  local names="$1" wanted="$2"
+  local names="$1"
+  local wanted="$2"
   awk -f "$P2_ASCIIFOLD_AWK" -f <(printf '%s\n' '
     NF != 2 || $1 != NR || p2_analysed_nom($2) !~ /^[a-z0-9]+$/ \
       || p2_analysed_nom($2) == p2_analysed_nom(fixed) || (p2_analysed_nom($2) in seen) { invalid = 1; exit }
@@ -395,7 +397,9 @@ p2_validate_control_names(){
 # sélection : une intersection est une invalidité de protocole, jamais une
 # occasion de retomber sur les corps historiques.
 p2_validate_term_sets(){
-  local bool_pairs="$1" control_names="$2" warm_pairs="$3"
+  local bool_pairs="$1"
+  local control_names="$2"
+  local warm_pairs="$3"
   p2_validate_pairs "$bool_pairs" "$P2_PAIR_COUNT" \
     && p2_validate_control_names "$control_names" "$P2_PAIR_COUNT" \
     && p2_validate_pairs "$warm_pairs" "$P2_WARM_TERM_COUNT" || return 1
@@ -416,11 +420,18 @@ p2_validate_term_sets(){
 }
 
 p2_validate_body_files(){
-  local bool_pairs="$1" control_names="$2" warm_pairs="$3"
-  local bool10="$4" bool0="$5" control10="$6" warm="$7" fixed="$8"
+  local bool_pairs="$1"
+  local control_names="$2"
+  local warm_pairs="$3"
+  local bool10="$4"
+  local bool0="$5"
+  local control10="$6"
+  local warm="$7"
+  local fixed="$8"
   local replay="${9:-}"
-  local replay_input=()
-  local expected_bool="$P2_PAIR_COUNT" expected_warm="$P2_WARM_TERM_COUNT"
+  local -a awk_inputs=("$bool_pairs" "$control_names" "$warm_pairs" "$bool10" "$bool0" "$control10" "$warm")
+  local expected_bool="$P2_PAIR_COUNT"
+  local expected_warm="$P2_WARM_TERM_COUNT"
   [ "$(wc -l < "$bool10" 2>/dev/null || echo 0)" -eq "$expected_bool" ] \
     && [ "$(wc -l < "$bool0" 2>/dev/null || echo 0)" -eq "$expected_bool" ] \
     && [ "$(wc -l < "$control10" 2>/dev/null || echo 0)" -eq "$expected_bool" ] \
@@ -428,7 +439,7 @@ p2_validate_body_files(){
     && [ "$(wc -l < "$fixed" 2>/dev/null || echo 0)" -eq "$expected_bool" ] || return 1
   if [ "$P2_REPLAY_MIX_5050" = "1" ]; then
     [ -n "$replay" ] && [ "$(wc -l < "$replay" 2>/dev/null || echo 0)" -eq $(( 2 * expected_bool )) ] || return 1
-    replay_input=("$replay")
+    awk_inputs+=("$replay")
   fi
   awk -v bool_pairs="$bool_pairs" -v control_names="$control_names" -v warm_pairs="$warm_pairs" \
       -v bool10="$bool10" -v bool0="$bool0" -v control10="$control10" -v warm="$warm" -v replay="$replay" \
@@ -482,7 +493,7 @@ p2_validate_body_files(){
           || warm_body_count != 2 * warm_wanted || (replay_enabled == "1" && replay_count != 2 * wanted)) invalid = 1
       exit invalid
     }
-  ' "$bool_pairs" "$control_names" "$warm_pairs" "$bool10" "$bool0" "$control10" "$warm" "${replay_input[@]}" || return 1
+  ' "${awk_inputs[@]}" || return 1
   awk -v n="$expected_bool" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" '
     { expected = "{\"query\":{\"match\":{\"" fnom "\":\"" term "\"}},\"size\":10}"; if ($0 != expected) { invalid = 1; exit } }
     END { exit (invalid || NR != n) }
@@ -490,12 +501,17 @@ p2_validate_body_files(){
 }
 
 p2_manifest_value(){
-  local key="$1" file="$2"
+  local key="$1"
+  local file="$2"
   sed -n "s/^${key}=//p" "$file" | tail -n 1
 }
 
 p2_validate_frozen_inputs(){
-  local manifest="$1" expected actual key file
+  local manifest="$1"
+  local expected
+  local actual
+  local key
+  local file
   [ "$(p2_manifest_value protocol "$manifest")" = "$P2_PROTOCOL_VERSION" ] || return 1
   [ "$(p2_manifest_value replay_mix_5050 "$manifest")" = "$P2_REPLAY_MIX_5050" ] || return 1
   for key_file in \
@@ -529,7 +545,12 @@ p2_validate_frozen_inputs(){
 }
 
 p2_prepare_inputs(){
-  local manifest bool_tmp control_tmp warm_tmp fixed_tmp replay_tmp
+  local manifest
+  local bool_tmp
+  local control_tmp
+  local warm_tmp
+  local fixed_tmp
+  local replay_tmp
   P2_BOOL_PAIRS="$P2_INPUT_DIR/probe_p2_bool_pairs.tsv"
   P2_MATCH_CONTROL_NAMES="$P2_INPUT_DIR/probe_p2_match_control_names.tsv"
   P2_WARM_PAIRS="$P2_INPUT_DIR/probe_p2_warm_pairs.tsv"
@@ -911,8 +932,18 @@ cleanup_fair_ab(){
 }
 
 prepare_feeder_tmp(){
-  local engine="$1" dir bulk_bytes required_bytes available_kib available_bytes
-  local required_mib available_mib docker_root feeder_fs docker_fs feeder_type
+  local engine="$1"
+  local dir
+  local bulk_bytes
+  local required_bytes
+  local available_kib
+  local available_bytes
+  local required_mib
+  local available_mib
+  local docker_root
+  local feeder_fs
+  local docker_fs
+  local feeder_type
   dir="$FEEDER_TMP_DIR/$engine"
   mkdir -p "$dir" || { err "création répertoire feeder impossible : $dir"; return 1; }
   cleanup_feeder_tmp "$dir" || return 1
@@ -978,7 +1009,11 @@ sample_rss(){ docker stats --no-stream --format '{{.MemUsage}}' "$1" 2>/dev/null
 # sur sa sortie standard : aucun UID de curlimages/curl ne peut alors rendre
 # un bind mount hôte vide ou partiellement écrit.
 probe_series_file_is_valid(){
-  local raw="$1" wanted="$2" phase="$3" series="$4" got
+  local raw="$1"
+  local wanted="$2"
+  local phase="$3"
+  local series="$4"
+  local got
   got=$(wc -l < "$raw" 2>/dev/null); got=${got:-0}
   if [ "$got" -ne "$wanted" ]; then
     PROBE_CAPTURE_REASON="${phase}_${series}_line_count_${got}_of_${wanted}"
@@ -993,7 +1028,10 @@ probe_series_file_is_valid(){
 # Le coût de sonde peut être légèrement négatif à l'unité près : `took` est
 # arrondi par le moteur, alors que le temps client est une durée continue.
 probe_overhead_file_is_valid(){
-  local raw="$1" wanted="$2" phase="$3" got
+  local raw="$1"
+  local wanted="$2"
+  local phase="$3"
+  local got
   got=$(wc -l < "$raw" 2>/dev/null); got=${got:-0}
   if [ "$got" -ne "$wanted" ]; then
     PROBE_CAPTURE_REASON="${phase}_probe_overhead_line_count_${got}_of_${wanted}"
@@ -1009,7 +1047,12 @@ probe_overhead_file_is_valid(){
 # font partie du contrat Elasticsearch compatible ; une réponse sans l'un des
 # deux, ou une requête qui ne matche rien, invalide la phase entière.
 decode_probe_capture(){
-  local capture="$1" client_raw="$2" took_raw="$3" overhead_raw="$4" wanted="$5" phase="$6"
+  local capture="$1"
+  local client_raw="$2"
+  local took_raw="$3"
+  local overhead_raw="$4"
+  local wanted="$5"
+  local phase="$6"
   if ! awk -F '\t' '
     NF != 2 || $1 !~ /^[0-9]+([.][0-9]+)?$/ || $2 !~ /^\{/ { exit 1 }
     { print $1 }
@@ -1048,7 +1091,14 @@ decode_probe_capture(){
 # son shard request cache, y compris pour le témoin `size:0`. Le démarrage du
 # conteneur reste hors `time_total`.
 capture_probe_samples(){
-  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" wanted="$6" phase="$7" responses_raw="${8:-}"
+  local base="$1"
+  local bodies="$2"
+  local client_raw="$3"
+  local took_raw="$4"
+  local overhead_raw="$5"
+  local wanted="$6"
+  local phase="$7"
+  local responses_raw="${8:-}"
   local capture="$client_raw.capture"
   PROBE_CAPTURE_REASON=""
   : > "$client_raw"; : > "$took_raw"; : > "$overhead_raw"; : > "$capture"
@@ -1101,7 +1151,8 @@ capture_probe_samples(){
 }
 
 probe_quantiles(){
-  local raw="$1" scale="$2"
+  local raw="$1"
+  local scale="$2"
   sort -n "$raw" | awk -v scale="$scale" '
     function nearest_rank(n, q, raw, rank) {
       raw = n * q
@@ -1194,7 +1245,8 @@ p2_cpu_stat(){
 }
 
 p2_cpu_steal_percent(){
-  local before="$1" after="$2"
+  local before="$1"
+  local after="$2"
   awk -v before="$before" -v after="$after" '
     BEGIN {
       split(before, b, " "); split(after, a, " ")
@@ -1206,12 +1258,16 @@ p2_cpu_steal_percent(){
 }
 
 p2_metric_present(){
-  local metric="$1" snapshot="$2"
+  local metric="$1"
+  local snapshot="$2"
   grep -Eq "^${metric}(\\{|[[:space:]])" "$snapshot"
 }
 
 p2_snapshot_metrics(){
-  local base="$1" out="$2" phase="$3" metric
+  local base="$1"
+  local out="$2"
+  local phase="$3"
+  local metric
   P2_METRICS_REASON=""
   if ! docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
     --fail-with-body --silent --show-error "$base/_prometheus_metrics" > "$out"; then
@@ -1227,7 +1283,8 @@ p2_snapshot_metrics(){
 }
 
 p2_metric_value(){
-  local metric="$1" snapshot="$2"
+  local metric="$1"
+  local snapshot="$2"
   if ! p2_metric_present "$metric" "$snapshot"; then
     return 1
   fi
@@ -1249,7 +1306,8 @@ p2_metric_value(){
 }
 
 p2_proc_status_bytes(){
-  local pid="$1" key="$2"
+  local pid="$1"
+  local key="$2"
   awk -v key="$key" '
     $1 == key ":" {
       if ($2 !~ /^[0-9]+$/) exit 1
@@ -1262,7 +1320,9 @@ p2_proc_status_bytes(){
 }
 
 p2_cgroup_directory(){
-  local cid="$1" pid path
+  local cid="$1"
+  local pid
+  local path
   pid=$(docker inspect -f '{{.State.Pid}}' "$cid" 2>/dev/null) || return 1
   case "$pid" in ''|*[!0-9]*|0) return 1;; esac
   path=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$pid/cgroup" 2>/dev/null) || return 1
@@ -1272,7 +1332,8 @@ p2_cgroup_directory(){
 }
 
 p2_cgroup_stat_value(){
-  local file="$1" key="$2"
+  local file="$1"
+  local key="$2"
   awk -v key="$key" '
     $1 == key {
       if ($2 !~ /^[0-9]+$/) exit 1
@@ -1285,7 +1346,8 @@ p2_cgroup_stat_value(){
 }
 
 p2_cgroup_io_json(){
-  local file="$1" json
+  local file="$1"
+  local json
   json=$(awk '
     BEGIN { printf "[" }
     function emit(device, metric, value) {
@@ -1313,7 +1375,8 @@ p2_cgroup_io_json(){
 }
 
 p2_cgroup_io_delta_json(){
-  local before="$1" after="$2"
+  local before="$1"
+  local after="$2"
   awk '
     function read_sample(which, device, metric, value, pair, key) {
       device = $1
@@ -1376,7 +1439,14 @@ p2_psi_json(){
 }
 
 p2_metric_bundle_json(){
-  local snapshot="$1" postings_directory total_bytes allocated active resident retained integrity='null'
+  local snapshot="$1"
+  local postings_directory
+  local total_bytes
+  local allocated
+  local active
+  local resident
+  local retained
+  local integrity='null'
   postings_directory=$(p2_metric_value surch_index_postings_directory_bytes "$snapshot") || return 1
   total_bytes=$(p2_metric_value surch_index_total_bytes "$snapshot") || return 1
   allocated=$(p2_metric_value surch_jemalloc_allocated_bytes "$snapshot") || return 1
@@ -1384,7 +1454,18 @@ p2_metric_bundle_json(){
   resident=$(p2_metric_value surch_jemalloc_resident_bytes "$snapshot") || return 1
   retained=$(p2_metric_value surch_jemalloc_retained_bytes "$snapshot") || return 1
   if [ "$P2_VARIANT" = "C" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
-    local bytes pages verified hash_failures fallbacks fallback_fields occurrences blocks fields payload csr directory
+    local bytes
+    local pages
+    local verified
+    local hash_failures
+    local fallbacks
+    local fallback_fields
+    local occurrences
+    local blocks
+    local fields
+    local payload
+    local csr
+    local directory
     bytes=$(p2_metric_value surch_postings_p2_integrity_bytes "$snapshot") || return 1
     pages=$(p2_metric_value surch_postings_p2_integrity_pages "$snapshot") || return 1
     verified=$(p2_metric_value surch_postings_p2_verified_bytes "$snapshot") || return 1
@@ -1415,10 +1496,31 @@ p2_metric_bundle_json(){
 # plus le delta io.stat depuis le `before` homologue, sans calculer un faux zéro
 # lorsqu'une métrique ou un fichier cgroup est absent.
 p2_capture_telemetry(){
-  local cid="$1" phase="$2" boundary="$3" snapshot="$4" before_io="${5:-}"
-  local pid cgroup io_file metric_json rss rss_anon vmhwm memory_current
-  local mem_anon mem_file refault activate pgmajfault cpu_file nr_throttled throttled_usec
-  local memory_psi io_psi io_json io_delta='null'
+  local cid="$1"
+  local phase="$2"
+  local boundary="$3"
+  local snapshot="$4"
+  local before_io="${5:-}"
+  local pid
+  local cgroup
+  local io_file
+  local metric_json
+  local rss
+  local rss_anon
+  local vmhwm
+  local memory_current
+  local mem_anon
+  local mem_file
+  local refault
+  local activate
+  local pgmajfault
+  local cpu_file
+  local nr_throttled
+  local throttled_usec
+  local memory_psi
+  local io_psi
+  local io_json
+  local io_delta='null'
   P2_METRICS_REASON=""
   pid=$(docker inspect -f '{{.State.Pid}}' "$cid" 2>/dev/null) || { P2_METRICS_REASON="${phase}_${boundary}_pid_unreadable"; return 1; }
   case "$pid" in ''|*[!0-9]*|0) P2_METRICS_REASON="${phase}_${boundary}_pid_invalid"; return 1;; esac
@@ -1467,7 +1569,8 @@ p2_capture_telemetry(){
 # et sa valeur de routage exacte. Ainsi le protocole reste fail-closed sans
 # demander à l'image A figée d'initialiser artificiellement ses compteurs.
 p2_counter_value(){
-  local metric="$1" snapshot="$2"
+  local metric="$1"
+  local snapshot="$2"
   if ! p2_metric_present "$metric" "$snapshot"; then
     printf '0'
     return 0
@@ -1488,15 +1591,46 @@ p2_segment_value_valid(){
 }
 
 p2_write_phase_status(){
-  local phase="$1" bool_requests="$2" match_requests="$3" before="$4" after="$5"
-  local cpu_steal_percent="$6" cpu_steal_within_limit="$7" cpu_steal_reason="$8"
-  local direct_before generic_before read_before total_before segments_before
-  local direct_after generic_after read_after total_after segments_after
-  local integrity_bytes_before integrity_hash_failures_before integrity_fallbacks_before integrity_fallback_fields_before integrity_verified_bytes_before
-  local integrity_bytes_after integrity_hash_failures_after integrity_fallbacks_after integrity_fallback_fields_after integrity_verified_bytes_after
-  local direct_delta generic_delta read_delta total_delta segment_delta ratio="null" blocks_metrics_emitted=false
-  local blocks_ratio_target_pass="null" blocks_ratio_verdict="not_applicable"
-  local integrity_required=false valid=true reason=""
+  local phase="$1"
+  local bool_requests="$2"
+  local match_requests="$3"
+  local before="$4"
+  local after="$5"
+  local cpu_steal_percent="$6"
+  local cpu_steal_within_limit="$7"
+  local cpu_steal_reason="$8"
+  local direct_before
+  local generic_before
+  local read_before
+  local total_before
+  local segments_before
+  local direct_after
+  local generic_after
+  local read_after
+  local total_after
+  local segments_after
+  local integrity_bytes_before
+  local integrity_hash_failures_before
+  local integrity_fallbacks_before
+  local integrity_fallback_fields_before
+  local integrity_verified_bytes_before
+  local integrity_bytes_after
+  local integrity_hash_failures_after
+  local integrity_fallbacks_after
+  local integrity_fallback_fields_after
+  local integrity_verified_bytes_after
+  local direct_delta
+  local generic_delta
+  local read_delta
+  local total_delta
+  local segment_delta
+  local ratio="null"
+  local blocks_metrics_emitted=false
+  local blocks_ratio_target_pass="null"
+  local blocks_ratio_verdict="not_applicable"
+  local integrity_required=false
+  local valid=true
+  local reason=""
   direct_before=$(p2_counter_value surch_bool_direct_must_fused_total "$before") || valid=false
   generic_before=$(p2_counter_value surch_dbg_generic_total "$before") || valid=false
   read_before=$(p2_counter_value surch_postings_disk_blocks_read_total "$before") || valid=false
@@ -1614,19 +1748,35 @@ p2_write_phase_status(){
 }
 
 p2_extract_warm_bodies(){
-  local source="$1" destination="$2" first="$3" count="$4" actual
+  local source="$1"
+  local destination="$2"
+  local first="$3"
+  local count="$4"
+  local actual
   awk -v first="$first" -v count="$count" 'NR >= first && NR < first + count { print }' "$source" > "$destination" || return 1
   actual=$(wc -l < "$destination" 2>/dev/null); actual=${actual:-0}
   [ "$actual" -eq "$count" ]
 }
 
 p2_capture_phase(){
-  local base="$1" phase="$2" bodies="$3" client_raw="$4" took_raw="$5" overhead_raw="$6" wanted="$7" bool_requests="$8" match_requests="$9"
+  local base="$1"
+  local phase="$2"
+  local bodies="$3"
+  local client_raw="$4"
+  local took_raw="$5"
+  local overhead_raw="$6"
+  local wanted="$7"
+  local bool_requests="$8"
+  local match_requests="$9"
   local before="$OUT_DIR/$ENGINE.p2.prom.${phase}.before.prom"
   local after="$OUT_DIR/$ENGINE.p2.prom.${phase}.after.prom"
   local responses_raw="$OUT_DIR/$ENGINE.p2.responses.${phase}.raw.ndjson"
   local responses_canonical="$OUT_DIR/$ENGINE.p2.responses.${phase}.canonical.ndjson"
-  local cpu_before="" cpu_after="" cpu_steal_percent="null" cpu_steal_within_limit=false cpu_steal_reason=""
+  local cpu_before=""
+  local cpu_after=""
+  local cpu_steal_percent="null"
+  local cpu_steal_within_limit=false
+  local cpu_steal_reason=""
   # Le steal est borné à la fenêtre de chaque phase chaude. L'indexation peut
   # durer des dizaines de minutes et accumuler un steal sans rapport avec les
   # latences A/B observées ; une lecture locale protège réellement la mesure.
@@ -1676,7 +1826,8 @@ p2_capture_phase(){
 }
 
 p2_quantiles_with_max(){
-  local raw="$1" scale="$2"
+  local raw="$1"
+  local scale="$2"
   sort -n "$raw" | awk -v scale="$scale" '
     function nearest_rank(n, q, raw, rank) {
       raw = n * q; rank = int(raw); if (rank < raw) rank++
@@ -1695,8 +1846,17 @@ p2_quantiles_with_max(){
 }
 
 p2_write_stat(){
-  local phase="$1" kind="$2" metric="$3" raw="$4" scale="$5" wanted="$6"
-  local p50 p95 p99 max actual
+  local phase="$1"
+  local kind="$2"
+  local metric="$3"
+  local raw="$4"
+  local scale="$5"
+  local wanted="$6"
+  local p50
+  local p95
+  local p99
+  local max
+  local actual
   actual=$(wc -l < "$raw" 2>/dev/null); actual=${actual:-0}
   [ "$actual" -eq "$wanted" ] || return 1
   if [ "$metric" = "probe" ]; then
@@ -1710,8 +1870,18 @@ p2_write_stat(){
 }
 
 p2_split_and_stat_phase(){
-  local phase="$1" client="$2" took="$3" overhead="$4" bool_count="$5" match_count="$6"
-  local kind src out metric scale wanted
+  local phase="$1"
+  local client="$2"
+  local took="$3"
+  local overhead="$4"
+  local bool_count="$5"
+  local match_count="$6"
+  local kind
+  local src
+  local out
+  local metric
+  local scale
+  local wanted
   for kind in bool match; do
     case "$kind" in
       bool) wanted="$bool_count" ;;
@@ -1737,7 +1907,10 @@ p2_split_and_stat_phase(){
 # serveur; les distributions exactes sont dans le JSONL, jamais dans des
 # summaries Prometheus.
 snapshot_source_fetch_metrics(){
-  local base="$1" out="$2" phase="$3" require_metrics="$4"
+  local base="$1"
+  local out="$2"
+  local phase="$3"
+  local require_metrics="$4"
   SOURCE_FETCH_SCRAPE_REASON=""
   : > "$out"
   if ! docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
@@ -1760,7 +1933,9 @@ snapshot_source_fetch_metrics(){
 # Soustrait seulement les compteurs monotones. Les summaries et les gauges ne
 # passent jamais cette barrière : aucun quantile Prometheus n'est donc delta.
 source_fetch_phase_delta(){
-  local before="$1" after="$2" out="$3"
+  local before="$1"
+  local after="$2"
+  local out="$3"
   awk '
     function key(line, value_start, result) {
       result = line
@@ -1781,7 +1956,8 @@ source_fetch_phase_delta(){
 # Somme un compteur dans un delta Prometheus. Les familles sont connues et
 # sans labels libres; un nom absent vaut zero pour rendre les gates explicites.
 source_fetch_counter_total(){
-  local delta="$1" metric="$2"
+  local delta="$1"
+  local metric="$2"
   awk -v metric="$metric" '
     substr($1, 1, length(metric)) == metric && (substr($1, length(metric) + 1, 1) == "" || substr($1, length(metric) + 1, 1) == "{") {
       total += $NF
@@ -1795,13 +1971,19 @@ source_fetch_counter_total(){
 # donc pas de lecture concurrente d'une ligne en cours d'ecriture. Le JSONL
 # annote la phase ici, sous controle du harnais, pour les filtres/bootstrap.
 source_fetch_export_phase(){
-  local cid="$1" container_file="$2" snapshot="$3" out="$4" phase="$5" previous="$6"
+  local cid="$1"
+  local container_file="$2"
+  local snapshot="$3"
+  local out="$4"
+  local phase="$5"
+  local previous="$6"
   SOURCE_FETCH_ARTIFACT_REASON=""
   if ! docker cp "$cid:$container_file" "$snapshot" >/dev/null 2>&1; then
     SOURCE_FETCH_ARTIFACT_REASON="${phase}_profile_jsonl_copy_failed"
     return 1
   fi
-  local total start
+  local total
+  local start
   total=$(wc -l < "$snapshot" 2>/dev/null); total=${total:-0}
   case "$total:$previous" in *[!0-9:]* )
     SOURCE_FETCH_ARTIFACT_REASON="${phase}_profile_jsonl_count_invalid"; return 1;;
@@ -1833,8 +2015,12 @@ source_fetch_export_phase(){
 # Le nombre de lignes exportees doit être celui que le compteur monotone dit
 # avoir ecrit. Toute erreur d'I/O ou troncature de la borne 4096 invalide L2.
 source_fetch_artifact_matches_delta(){
-  local delta="$1" artifact="$2"
-  local expected actual dropped failures
+  local delta="$1"
+  local artifact="$2"
+  local expected
+  local actual
+  local dropped
+  local failures
   expected=$(source_fetch_counter_total "$delta" surch_source_fetch_profile_records_total)
   dropped=$(source_fetch_counter_total "$delta" surch_source_fetch_profile_dropped_total)
   failures=$(source_fetch_counter_total "$delta" surch_source_fetch_profile_write_failures_total)
@@ -1868,9 +2054,31 @@ source_fetch_no_source_delta_is_zero(){
 # quantité demandée vise le cache `file` réellement observé. Chaque couple
 # before/after est conservé : aucune éviction partielle ambigüe n'est admise.
 capture_cold_samples(){
-  local base="$1" bodies="$2" client_raw="$3" took_raw="$4" overhead_raw="$5" audit="$6" reclaim_path="$7" stat_path="$8" current_path="$9" writer="${10}" wanted="${11}" responses_raw="${12:-}"
-  local body file_before file_after file_after_max memory_current reclaim_target
-  local completed=0 request_no one_body one_client one_took one_overhead one_responses
+  local base="$1"
+  local bodies="$2"
+  local client_raw="$3"
+  local took_raw="$4"
+  local overhead_raw="$5"
+  local audit="$6"
+  local reclaim_path="$7"
+  local stat_path="$8"
+  local current_path="$9"
+  local writer="${10}"
+  local wanted="${11}"
+  local responses_raw="${12:-}"
+  local body
+  local file_before
+  local file_after
+  local file_after_max
+  local memory_current
+  local reclaim_target
+  local completed=0
+  local request_no
+  local one_body
+  local one_client
+  local one_took
+  local one_overhead
+  local one_responses
   COLD_CAPTURE_REASON=""
   COLD_CAPTURE_COMPLETED=0
   : > "$client_raw"; : > "$took_raw"; : > "$overhead_raw"
@@ -1980,13 +2188,21 @@ capture_cold_samples(){
 # quantiles à zéro. Le code appelant reçoit aussi un statut non nul pour
 # arrêter le run avec un échec fermé après avoir conservé ce diagnostic.
 record_invalid_measurement(){
-  local engine="$1" count="$2" indexed="$3" item_errors="$4" reason="$5"
+  local engine="$1"
+  local count="$2"
+  local indexed="$3"
+  local item_errors="$4"
+  local reason="$5"
   printf '{"engine":"%s","mem_limit":"%s","cpuset":"%s","probe_cpuset":"%s","survived_boot":true,"survived_index":true,"count":%s,"expected":%s,"indexed":%s,"item_errors":%s,"measurement_valid":false,"measurement_invalid_reason":"%s","lat_p50_ms":null,"lat_p95_ms":null,"lat_p99_ms":null,"lat_rand_p50_ms":null,"lat_rand_p95_ms":null,"lat_rand_p99_ms":null,"lat_no_source_p50_ms":null,"lat_no_source_p95_ms":null,"lat_no_source_p99_ms":null,"lat_cold_p50_ms":null,"lat_cold_p95_ms":null,"lat_cold_p99_ms":null,"lat_fixed_client_s_file":null,"lat_fixed_took_ms_file":null,"lat_fixed_probe_overhead_ms_file":null,"lat_fixed_client_p50_ms":null,"lat_fixed_client_p95_ms":null,"lat_fixed_client_p99_ms":null,"lat_fixed_took_p50_ms":null,"lat_fixed_took_p95_ms":null,"lat_fixed_took_p99_ms":null,"lat_fixed_probe_overhead_p50_ms":null,"lat_fixed_probe_overhead_p95_ms":null,"lat_fixed_probe_overhead_p99_ms":null,"lat_rand_client_s_file":null,"lat_rand_took_ms_file":null,"lat_rand_probe_overhead_ms_file":null,"lat_rand_client_p50_ms":null,"lat_rand_client_p95_ms":null,"lat_rand_client_p99_ms":null,"lat_rand_took_p50_ms":null,"lat_rand_took_p95_ms":null,"lat_rand_took_p99_ms":null,"lat_rand_probe_overhead_p50_ms":null,"lat_rand_probe_overhead_p95_ms":null,"lat_rand_probe_overhead_p99_ms":null,"lat_no_source_client_s_file":null,"lat_no_source_took_ms_file":null,"lat_no_source_probe_overhead_ms_file":null,"lat_no_source_client_p50_ms":null,"lat_no_source_client_p95_ms":null,"lat_no_source_client_p99_ms":null,"lat_no_source_took_p50_ms":null,"lat_no_source_took_p95_ms":null,"lat_no_source_took_p99_ms":null,"lat_no_source_probe_overhead_p50_ms":null,"lat_no_source_probe_overhead_p95_ms":null,"lat_no_source_probe_overhead_p99_ms":null,"lat_cold_client_s_file":null,"lat_cold_took_ms_file":null,"lat_cold_probe_overhead_ms_file":null,"lat_cold_client_p50_ms":null,"lat_cold_client_p95_ms":null,"lat_cold_client_p99_ms":null,"lat_cold_took_p50_ms":null,"lat_cold_took_p95_ms":null,"lat_cold_took_p99_ms":null,"lat_cold_probe_overhead_p50_ms":null,"lat_cold_probe_overhead_p95_ms":null,"lat_cold_probe_overhead_p99_ms":null}\n' \
     "$engine" "$MEM_LIMIT" "$CPUSET" "$PROBE_CPUSET" "$count" "$NDOCS" "$indexed" "$item_errors" "$reason" > "$OUT_DIR/$engine.json"
 }
 
 run_engine(){
-  local ENGINE="$1" CID PORT HEAP HALF
+  local ENGINE="$1"
+  local CID
+  local PORT
+  local HEAP
+  local HALF
   prepare_feeder_tmp "$ENGINE" || return 1
   if [ "$P2_MEASURE" = "1" ]; then
     [ "$ENGINE" = "surch" ] || { err "P2 ne mesure que Surch (ENGINE=$ENGINE refusé)"; return 1; }
@@ -1998,7 +2214,9 @@ run_engine(){
   CID="fairab-$ENGINE"
   docker rm -f "$CID" >/dev/null 2>&1 || true
   # heap ES = M/2 (Lucene mmap = l'autre moitié = page-cache, analogue au disque Surch)
-  local MB; MB=$(mem_to_mib "$MEM_LIMIT"); HALF=$(( MB / 2 ))
+  local MB
+  MB=$(mem_to_mib "$MEM_LIMIT")
+  local HALF=$(( MB / 2 ))
   local VOL="fairab-vol-$ENGINE"
   docker volume rm "$VOL" >/dev/null 2>&1 || true; docker volume create "$VOL" >/dev/null 2>&1
   local BASE="http://$CID:9200"
@@ -2030,7 +2248,8 @@ run_engine(){
   fi
 
   # attendre healthy (ou détecter OOM précoce)
-  local up=0 i
+  local up=0
+  local i
   for i in $(seq 1 60); do
     if docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
       --fail-with-body --silent --show-error "$BASE/" >/dev/null 2>&1; then up=1; break; fi
@@ -2063,7 +2282,10 @@ run_engine(){
   # ROBUSTE : par chunk on vérifie http_code==200 ET réponse non-vide ET on parse les items ;
   # RETRY (jusqu'à $BULK_RETRIES) un chunk transient (code!=200 / réponse vide / tronquée) ;
   # ÉCHEC DUR consigné si un chunk reste KO après retries (au lieu d'un count silencieusement court).
-  local t0 t1 oom bulk_rc
+  local t0
+  local t1
+  local oom
+  local bulk_rc
   local BOUT="$OUT_DIR/$ENGINE.bulklog"
   t0=$(date +%s.%N)
   docker run --rm $AUXCAP --network "$NET" --user "$(id -u):$(id -g)" \
@@ -2123,11 +2345,18 @@ run_engine(){
   # ES insensible. Hors timing pour ne léser personne.
   sleep 2; docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s -XPOST "$BASE/deces_bench/_refresh" >/dev/null 2>&1; sleep 1
   oom=$(docker inspect -f '{{.State.OOMKilled}}' "$CID" 2>/dev/null)
-  local running; running=$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)
-  local cnt; cnt=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s "$BASE/deces_bench/_count" 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
+  local running
+  running=$(docker inspect -f '{{.State.Running}}' "$CID" 2>/dev/null)
+  local cnt
+  cnt=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 -s "$BASE/deces_bench/_count" 2>/dev/null | grep -o '"count":[0-9]*' | cut -d: -f2)
   cnt=${cnt:-0}
   # résumé machine du bulk (indexé / erreurs item / échec dur / chunks KO)
-  local summary indexed item_err hard_fail failed_chunks expected_indexed
+  local summary
+  local indexed
+  local item_err
+  local hard_fail
+  local failed_chunks
+  local expected_indexed
   summary=$(grep '^BULKRESULT' "$BOUT" 2>/dev/null | tail -1)
   indexed=$(printf '%s' "$summary" | sed -n 's/.*indexed=\([0-9]*\).*/\1/p'); indexed=${indexed:-0}
   item_err=$(printf '%s' "$summary" | sed -n 's/.*item_errors=\([0-9]*\).*/\1/p'); item_err=${item_err:-0}
@@ -2160,7 +2389,9 @@ run_engine(){
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
 
-  local dps rss disk
+  local dps
+  local rss
+  local disk
   dps=$(awk -v c="$NDOCS" -v a="$t0" -v b="$t1" 'BEGIN{printf "%.0f", c/(b-a)}')
   rss=$(sample_rss "$CID")
   # disque : du du volume de données côté hôte (via alpine, l'image moteur n'a pas de shell)
@@ -2174,10 +2405,21 @@ run_engine(){
   # segment_count, un Arc<Segment> est retenu par un registre après merge/Drop -> fichier(s)
   # orphelin(s) invisibles à un simple comptage de segments logiques. null côté ES (pas de
   # gauge segment_count ; le disque agrégé est déjà couvert par disk_mib ci-dessus).
-  local disk_bytes_postings="null" disk_bytes_subfields="null" disk_bytes_source="null" \
-        disk_bytes_fst_merge="null" disk_bytes_other="null" files_postings_count="null" segment_count="null"
+  local disk_bytes_postings="null"
+  local disk_bytes_subfields="null"
+  local disk_bytes_source="null"
+  local disk_bytes_fst_merge="null"
+  local disk_bytes_other="null"
+  local files_postings_count="null"
+  local segment_count="null"
   if [ "$ENGINE" = "surch" ]; then
-    local bp=0 bsub=0 bsrc=0 bfst=0 both=0 fpc=0 vent_listing
+    local bp=0
+    local bsub=0
+    local bsrc=0
+    local bfst=0
+    local both=0
+    local fpc=0
+    local vent_listing
     vent_listing=$(docker run --rm $AUXCAP -v "fairab-vol-$ENGINE:/d" alpine:3 sh -c '
       cd /d 2>/dev/null || exit 0
       for f in *; do
@@ -2203,7 +2445,8 @@ run_engine(){
     [ -z "$segment_count" ] && segment_count="null"
   fi
   if [ "$P2_MEASURE" = "1" ]; then
-    local p2_index_snapshot p2_index_segments
+    local p2_index_snapshot
+    local p2_index_segments
     p2_index_snapshot="$OUT_DIR/$ENGINE.p2.prom.index_ready.prom"
     if ! p2_snapshot_metrics "$BASE" "$p2_index_snapshot" index_ready; then
       err "$ENGINE : P2 métriques initiales invalides : $P2_METRICS_REASON"
@@ -2244,14 +2487,27 @@ run_engine(){
   local warm_match_raw="$OUT_DIR/$ENGINE.p2.warm_match_client_s"
   local warm_match_took_raw="$OUT_DIR/$ENGINE.p2.warm_match_took_ms"
   local warm_match_overhead_raw="$OUT_DIR/$ENGINE.p2.warm_match_probe_overhead_ms"
-  local source_fetch_profile_enabled=false source_fetch_profile_valid=true source_fetch_profile_reason=""
-  local source_fetch_before_fixed="null" source_fetch_after_fixed="null" source_fetch_after_random="null"
-  local source_fetch_after_no_source="null" source_fetch_after_cold="null"
-  local source_fetch_fixed_delta="null" source_fetch_random_delta="null" source_fetch_no_source_delta="null"
-  local source_fetch_cold_delta="null" source_fetch_random_hydrated_8plus_requests="null"
-  local source_fetch_random_hydrated_8plus_gate="null" source_fetch_random_worker_participations="null"
-  local source_fetch_profile_snapshot="null" source_fetch_fixed_jsonl="null" source_fetch_random_jsonl="null"
-  local source_fetch_no_source_jsonl="null" source_fetch_cold_jsonl="null" source_fetch_profile_previous=0
+  local source_fetch_profile_enabled=false
+  local source_fetch_profile_valid=true
+  local source_fetch_profile_reason=""
+  local source_fetch_before_fixed="null"
+  local source_fetch_after_fixed="null"
+  local source_fetch_after_random="null"
+  local source_fetch_after_no_source="null"
+  local source_fetch_after_cold="null"
+  local source_fetch_fixed_delta="null"
+  local source_fetch_random_delta="null"
+  local source_fetch_no_source_delta="null"
+  local source_fetch_cold_delta="null"
+  local source_fetch_random_hydrated_8plus_requests="null"
+  local source_fetch_random_hydrated_8plus_gate="null"
+  local source_fetch_random_worker_participations="null"
+  local source_fetch_profile_snapshot="null"
+  local source_fetch_fixed_jsonl="null"
+  local source_fetch_random_jsonl="null"
+  local source_fetch_no_source_jsonl="null"
+  local source_fetch_cold_jsonl="null"
+  local source_fetch_profile_previous=0
   if [ "$ENGINE" = "surch" ] && [ "$SURCH_SOURCE_FETCH_PROFILE" = "1" ]; then
     source_fetch_profile_enabled=true
     source_fetch_before_fixed="$OUT_DIR/$ENGINE.source_fetch.before_fixed.prom"
@@ -2310,7 +2566,15 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
-  local lat50 lat95 lat99 lat_fixed_took50 lat_fixed_took95 lat_fixed_took99 lat_fixed_probe50 lat_fixed_probe95 lat_fixed_probe99
+  local lat50
+  local lat95
+  local lat99
+  local lat_fixed_took50
+  local lat_fixed_took95
+  local lat_fixed_took99
+  local lat_fixed_probe50
+  local lat_fixed_probe95
+  local lat_fixed_probe99
   read -r lat50 lat95 lat99 < <(probe_quantiles "$fixed_raw" 1000)
   read -r lat_fixed_took50 lat_fixed_took95 lat_fixed_took99 < <(probe_quantiles "$fixed_took_raw" 1)
   read -r lat_fixed_probe50 lat_fixed_probe95 lat_fixed_probe99 < <(probe_quantiles "$fixed_overhead_raw" 1)
@@ -2344,7 +2608,15 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
-  local latr50 latr95 latr99 lat_rand_took50 lat_rand_took95 lat_rand_took99 lat_rand_probe50 lat_rand_probe95 lat_rand_probe99
+  local latr50
+  local latr95
+  local latr99
+  local lat_rand_took50
+  local lat_rand_took95
+  local lat_rand_took99
+  local lat_rand_probe50
+  local lat_rand_probe95
+  local lat_rand_probe99
   read -r latr50 latr95 latr99 < <(probe_quantiles "$random_raw" 1000)
   read -r lat_rand_took50 lat_rand_took95 lat_rand_took99 < <(probe_quantiles "$random_took_raw" 1)
   read -r lat_rand_probe50 lat_rand_probe95 lat_rand_probe99 < <(probe_quantiles "$random_overhead_raw" 1)
@@ -2387,7 +2659,15 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
-  local latn50 latn95 latn99 lat_no_source_took50 lat_no_source_took95 lat_no_source_took99 lat_no_source_probe50 lat_no_source_probe95 lat_no_source_probe99
+  local latn50
+  local latn95
+  local latn99
+  local lat_no_source_took50
+  local lat_no_source_took95
+  local lat_no_source_took99
+  local lat_no_source_probe50
+  local lat_no_source_probe95
+  local lat_no_source_probe99
   read -r latn50 latn95 latn99 < <(probe_quantiles "$no_source_raw" 1000)
   read -r lat_no_source_took50 lat_no_source_took95 lat_no_source_took99 < <(probe_quantiles "$no_source_took_raw" 1)
   read -r lat_no_source_probe50 lat_no_source_probe95 lat_no_source_probe99 < <(probe_quantiles "$no_source_overhead_raw" 1)
@@ -2433,7 +2713,9 @@ run_engine(){
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
     }
     if [ "$P2_REPLAY_MIX_5050" = "1" ]; then
-      local replay_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_client_s" replay_took_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_took_ms" replay_overhead_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_probe_overhead_ms"
+      local replay_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_client_s"
+      local replay_took_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_took_ms"
+      local replay_overhead_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_probe_overhead_ms"
       if ! p2_capture_phase "$BASE" replay_mix_5050 "$P2_REPLAY_MIX_5050_BODIES" "$replay_raw" "$replay_took_raw" "$replay_overhead_raw" "$(( 2 * P2_PAIR_COUNT ))" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT"; then
         err "$ENGINE : replay 50/50 optionnel invalide : $PROBE_CAPTURE_REASON"
         record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
@@ -2450,11 +2732,36 @@ run_engine(){
   # Une unique éviction avant 1 000 requêtes se réchauffait et ne mesurait pas
   # un accès froid. Le protocole L2 garde au plus COLD_PROBE_REQUESTS corps
   # random, et invalide toute série où un reclaim n'est pas vérifié.
-  local latc50="null" latc95="null" latc99="null" lat_cold_took50="null" lat_cold_took95="null" lat_cold_took99="null" lat_cold_probe50="null" lat_cold_probe95="null" lat_cold_probe99="null" cold_attempted=false cold_ok=false cold_skip_reason="" cold_method=""
-  local cold_raw="$OUT_DIR/$ENGINE.lat_cold_client_s" cold_took_raw="$OUT_DIR/$ENGINE.lat_cold_took_ms" cold_overhead_raw="$OUT_DIR/$ENGINE.lat_cold_probe_overhead_ms" cold_reclaimed_requests=0
-  local cold_reclaim_audit="$OUT_DIR/$ENGINE.cold_reclaim.tsv" cold_reclaim_audit_records=0
-  local p2_cold_before="" p2_cold_after="" p2_cold_responses_raw="" p2_cold_responses_canonical="" p2_cold_phase_valid=true p2_cold_metrics_ready=true
-  local p2_cold_cpu_before="" p2_cold_cpu_after="" p2_cold_cpu_steal_percent="null" p2_cold_cpu_steal_within_limit=false p2_cold_cpu_steal_reason=""
+  local latc50="null"
+  local latc95="null"
+  local latc99="null"
+  local lat_cold_took50="null"
+  local lat_cold_took95="null"
+  local lat_cold_took99="null"
+  local lat_cold_probe50="null"
+  local lat_cold_probe95="null"
+  local lat_cold_probe99="null"
+  local cold_attempted=false
+  local cold_ok=false
+  local cold_skip_reason=""
+  local cold_method=""
+  local cold_raw="$OUT_DIR/$ENGINE.lat_cold_client_s"
+  local cold_took_raw="$OUT_DIR/$ENGINE.lat_cold_took_ms"
+  local cold_overhead_raw="$OUT_DIR/$ENGINE.lat_cold_probe_overhead_ms"
+  local cold_reclaimed_requests=0
+  local cold_reclaim_audit="$OUT_DIR/$ENGINE.cold_reclaim.tsv"
+  local cold_reclaim_audit_records=0
+  local p2_cold_before=""
+  local p2_cold_after=""
+  local p2_cold_responses_raw=""
+  local p2_cold_responses_canonical=""
+  local p2_cold_phase_valid=true
+  local p2_cold_metrics_ready=true
+  local p2_cold_cpu_before=""
+  local p2_cold_cpu_after=""
+  local p2_cold_cpu_steal_percent="null"
+  local p2_cold_cpu_steal_within_limit=false
+  local p2_cold_cpu_steal_reason=""
   : > "$cold_reclaim_audit"
   if [ "$P2_MEASURE" = "1" ]; then
     p2_cold_before="$OUT_DIR/$ENGINE.p2.prom.cold.before.prom"
@@ -2462,8 +2769,16 @@ run_engine(){
     p2_cold_responses_raw="$OUT_DIR/$ENGINE.p2.responses.cold.raw.ndjson"
     p2_cold_responses_canonical="$OUT_DIR/$ENGINE.p2.responses.cold.canonical.ndjson"
   fi
-  local mem_anon_warm="null" mem_file_warm="null" mem_anon_cold="null" mem_file_cold="null"
-  local full_id cg_scope reclaim_path stat_path current_path reclaim_writer=""
+  local mem_anon_warm="null"
+  local mem_file_warm="null"
+  local mem_anon_cold="null"
+  local mem_file_cold="null"
+  local full_id
+  local cg_scope
+  local reclaim_path
+  local stat_path
+  local current_path
+  local reclaim_writer=""
   full_id=$(docker inspect -f '{{.Id}}' "$CID" 2>/dev/null)
   cg_scope="/sys/fs/cgroup/system.slice/docker-${full_id}.scope"
   reclaim_path="$cg_scope/memory.reclaim"
@@ -2569,8 +2884,10 @@ run_engine(){
       cold_skip_reason="p2_cold_stats_invalid"
     fi
   fi
-  local cold_skip_json="null"; [ -n "$cold_skip_reason" ] && cold_skip_json="\"$cold_skip_reason\""
-  local cold_method_json="null"; [ -n "$cold_method" ] && cold_method_json="\"$cold_method\""
+  local cold_skip_json="null"
+  [ -n "$cold_skip_reason" ] && cold_skip_json="\"$cold_skip_reason\""
+  local cold_method_json="null"
+  [ -n "$cold_method" ] && cold_method_json="\"$cold_method\""
 
   if [ "$source_fetch_profile_enabled" = true ] && [ "$cold_ok" = true ]; then
     if ! snapshot_source_fetch_metrics "$BASE" "$source_fetch_after_cold" after_cold 1; then
@@ -2587,7 +2904,8 @@ run_engine(){
     fi
   fi
 
-  local measurement_valid=true measurement_invalid_reason="null"
+  local measurement_valid=true
+  local measurement_invalid_reason="null"
   if [ "$P2_MEASURE" != "1" ] \
      && { [ "$cold_reclaimed_requests" -ne 50 ] || [ "$cold_reclaim_audit_records" -ne 50 ] || [ "$cold_ok" != true ]; }; then
     measurement_valid=false
@@ -2599,7 +2917,16 @@ run_engine(){
   fi
   local p2_json=""
   if [ "$P2_MEASURE" = "1" ]; then
-    local p2_phase_records p2_causal_phase_records p2_expected_phase_records p2_telemetry_records p2_expected_telemetry_records p2_image_id p2_image_digest p2_bulk_sha256 p2_mapping_sha256 p2_cpu_steal_percent
+    local p2_phase_records
+    local p2_causal_phase_records
+    local p2_expected_phase_records
+    local p2_telemetry_records
+    local p2_expected_telemetry_records
+    local p2_image_id
+    local p2_image_digest
+    local p2_bulk_sha256
+    local p2_mapping_sha256
+    local p2_cpu_steal_percent
     p2_phase_records=$(wc -l < "$P2_PHASE_STATUS" 2>/dev/null); p2_phase_records=${p2_phase_records:-0}
     p2_causal_phase_records=$(jq -se '[.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0")] | length' "$P2_PHASE_STATUS" 2>/dev/null || printf '0')
     p2_cpu_steal_percent=$(jq -ser '[.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0") | .cpu_steal_percent | numbers] | if length == 5 then max else null end' "$P2_PHASE_STATUS" 2>/dev/null || printf 'null')
@@ -2645,15 +2972,23 @@ run_engine(){
     p2_mapping_sha256=$(p2_manifest_value mapping_sha256 "$PROBE_MANIFEST")
     p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"execution_id\":\"$P2_EXECUTION_ID\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"telemetry_jsonl\":\"$P2_TELEMETRY_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_causal_phase\",\"required_causal_phase_records\":5,\"causal_phase_records\":$p2_causal_phase_records,\"secondary_fixed_phase_records\":1,\"expected_phase_records\":$p2_expected_phase_records,\"expected_telemetry_records\":$p2_expected_telemetry_records,\"telemetry_records\":$p2_telemetry_records,\"replay_mix_5050\":$P2_REPLAY_MIX_5050,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
   fi
-  local source_fetch_profile_reason_json="null" source_fetch_random_gate_json="null"
+  local source_fetch_profile_reason_json="null"
+  local source_fetch_random_gate_json="null"
   [ -n "$source_fetch_profile_reason" ] && source_fetch_profile_reason_json="\"$source_fetch_profile_reason\""
   [ "$source_fetch_random_hydrated_8plus_gate" != "null" ] && source_fetch_random_gate_json="\"$source_fetch_random_hydrated_8plus_gate\""
-  local source_fetch_before_json="null" source_fetch_fixed_json="null" source_fetch_random_json="null"
-  local source_fetch_no_source_json="null" source_fetch_cold_json="null"
-  local source_fetch_fixed_delta_json="null" source_fetch_random_delta_json="null"
-  local source_fetch_no_source_delta_json="null" source_fetch_cold_delta_json="null"
-  local source_fetch_fixed_jsonl_json="null" source_fetch_random_jsonl_json="null"
-  local source_fetch_no_source_jsonl_json="null" source_fetch_cold_jsonl_json="null"
+  local source_fetch_before_json="null"
+  local source_fetch_fixed_json="null"
+  local source_fetch_random_json="null"
+  local source_fetch_no_source_json="null"
+  local source_fetch_cold_json="null"
+  local source_fetch_fixed_delta_json="null"
+  local source_fetch_random_delta_json="null"
+  local source_fetch_no_source_delta_json="null"
+  local source_fetch_cold_delta_json="null"
+  local source_fetch_fixed_jsonl_json="null"
+  local source_fetch_random_jsonl_json="null"
+  local source_fetch_no_source_jsonl_json="null"
+  local source_fetch_cold_jsonl_json="null"
   [ "$source_fetch_before_fixed" = "null" ] || source_fetch_before_json="\"$source_fetch_before_fixed\""
   [ "$source_fetch_after_fixed" = "null" ] || source_fetch_fixed_json="\"$source_fetch_after_fixed\""
   [ "$source_fetch_after_random" = "null" ] || source_fetch_random_json="\"$source_fetch_after_random\""
