@@ -7,9 +7,11 @@
 # (aggregated by `bench_report --dir`). NFCorpus (~3.6k docs) and FiQA
 # (~57k docs) are far smaller than TREC-COVID, so the envelope is ample.
 #
-# First-run intent: OBSERVE Surch vs OpenSearch NDCG@10/Recall@10 (no SLO
-# floor yet — floors are set after seeing the actuals, like trec-covid).
-# Requires 00b-init-beir-extra to have hydrated the BEIR PVC.
+# Gate: the current Surch result must meet the explicit NDCG@10 floor from
+# the raw 2026-05-26 baseline (run 26476471207) and remain within the
+# declared gap of the OpenSearch 2.17.1 sidecar measured in this same Pod.
+# Missing data, output or metric is a failure. Requires 00b-init-beir-extra
+# to have hydrated the BEIR PVC.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -94,6 +96,17 @@ spec:
             - { name: OPENSEARCH_URL, value: "http://127.0.0.1:9200" }
             - { name: BEIR_DIR,       value: "/data/beir" }
             - { name: REPORTS_DIR,    value: "/reports" }
+            - { name: BEIR_REQUIRE_LOCAL_DATA, value: "1" }
+            - { name: BEIR_BASELINE_DATE, value: "2026-05-26" }
+            - { name: BEIR_BASELINE_RUN,  value: "26476471207" }
+            - { name: NFCORPUS_NDCG_FLOOR, value: "0.3033" }
+            - { name: FIQA_NDCG_FLOOR,     value: "0.2294" }
+            - { name: NFCORPUS_MAX_OS_GAP, value: "0.0010" }
+            - { name: FIQA_MAX_OS_GAP,     value: "0.0100" }
+            - { name: NFCORPUS_EXPECTED_DOCS,      value: "3633" }
+            - { name: NFCORPUS_EXPECTED_TEST_QIDS, value: "323" }
+            - { name: FIQA_EXPECTED_DOCS,          value: "57638" }
+            - { name: FIQA_EXPECTED_TEST_QIDS,     value: "648" }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 1Gi }
@@ -107,11 +120,96 @@ spec:
               echo "Both engines healthy."
               mkdir -p "$REPORTS_DIR"
               for ds in nfcorpus fiqa; do
-                /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-surch-k8s" "$REPORTS_DIR/$ds-surch.out" "$SURCH_URL"
-                /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-os-k8s"    "$REPORTS_DIR/$ds-os.out"    "$OPENSEARCH_URL"
+                case "$ds" in
+                  nfcorpus)
+                    expected_docs="$NFCORPUS_EXPECTED_DOCS"
+                    expected_test_qids="$NFCORPUS_EXPECTED_TEST_QIDS"
+                    ;;
+                  fiqa)
+                    expected_docs="$FIQA_EXPECTED_DOCS"
+                    expected_test_qids="$FIQA_EXPECTED_TEST_QIDS"
+                    ;;
+                  *)
+                    echo "BEIR_GATE status=FAIL reason=unknown_dataset:$ds" >&2
+                    exit 1
+                    ;;
+                esac
+                BEIR_EXPECTED_DOCS="$expected_docs" BEIR_EXPECTED_TEST_QIDS="$expected_test_qids" \
+                  /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-surch-k8s" "$REPORTS_DIR/$ds-surch.out" "$SURCH_URL"
+                BEIR_EXPECTED_DOCS="$expected_docs" BEIR_EXPECTED_TEST_QIDS="$expected_test_qids" \
+                  /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-os-k8s"    "$REPORTS_DIR/$ds-os.out"    "$OPENSEARCH_URL"
               done
+              gate_fail() {
+                echo "BEIR_GATE status=FAIL reason=$*" >&2
+                exit 1
+              }
+              metric_value() {
+                file="$1"
+                metric="$2"
+                awk -v metric="$metric" '
+                  $1 == metric && $2 == "=" { seen++; value = $3 }
+                  END {
+                    if (seen != 1 || value !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+                    print value
+                  }
+                ' "$file"
+              }
+              assert_all_queries_processed() {
+                file="$1"
+                awk '
+                  /^queries_processed=/ {
+                    seen++
+                    split($1, field, "=")
+                    processed = field[2]
+                    total = $4
+                    if ($2 != "(out" || $3 != "of" || $5 != "unique" || $6 != "test" || $7 != "qids)" || processed !~ /^[0-9]+$/ || total !~ /^[0-9]+$/) invalid = 1
+                  }
+                  END {
+                    if (seen != 1 || invalid || processed + 0 <= 0 || processed + 0 != total + 0) exit 1
+                  }
+                ' "$file"
+              }
+              assert_floor() {
+                observed="$1"
+                floor="$2"
+                dataset="$3"
+                if ! awk -v observed="$observed" -v floor="$floor" 'BEGIN { exit observed + 0 >= floor + 0 ? 0 : 1 }'; then
+                  gate_fail "$dataset NDCG@10=$observed below frozen floor=$floor"
+                fi
+              }
+              assert_current_os_gap() {
+                surch="$1"
+                opensearch="$2"
+                maximum_gap="$3"
+                dataset="$4"
+                if ! awk -v surch="$surch" -v opensearch="$opensearch" -v maximum_gap="$maximum_gap" 'BEGIN { exit surch - opensearch >= -maximum_gap ? 0 : 1 }'; then
+                  gate_fail "$dataset NDCG@10 gap to current OpenSearch exceeds $maximum_gap (surch=$surch opensearch=$opensearch)"
+                fi
+              }
+              check_dataset() {
+                dataset="$1"
+                floor="$2"
+                maximum_gap="$3"
+                surch_out="$REPORTS_DIR/$dataset-surch.out"
+                os_out="$REPORTS_DIR/$dataset-os.out"
+                for output in "$surch_out" "$os_out"; do
+                  [ -s "$output" ] || gate_fail "$dataset missing output $output"
+                  assert_all_queries_processed "$output" || gate_fail "$dataset incomplete or malformed query count in $output"
+                done
+                surch_ndcg="$(metric_value "$surch_out" 'NDCG@10')" || gate_fail "$dataset missing or malformed Surch NDCG@10"
+                os_ndcg="$(metric_value "$os_out" 'NDCG@10')" || gate_fail "$dataset missing or malformed OpenSearch NDCG@10"
+                assert_floor "$surch_ndcg" "$floor" "$dataset"
+                assert_current_os_gap "$surch_ndcg" "$os_ndcg" "$maximum_gap" "$dataset"
+                printf 'BEIR_GATE dataset=%s status=PASS baseline_date=%s baseline_run=%s surch_ndcg=%s opensearch_ndcg=%s floor=%s max_os_gap=%s\n' \
+                  "$dataset" "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" "$surch_ndcg" "$os_ndcg" "$floor" "$maximum_gap"
+              }
+              check_dataset nfcorpus "$NFCORPUS_NDCG_FLOOR" "$NFCORPUS_MAX_OS_GAP"
+              check_dataset fiqa "$FIQA_NDCG_FLOOR" "$FIQA_MAX_OS_GAP"
               {
                 echo "# Extra BEIR NDCG gate (NFCorpus + FiQA)"
+                echo
+                echo "- Baseline historique brute : $BEIR_BASELINE_DATE (run $BEIR_BASELINE_RUN)"
+                echo "- Décision : PASS seulement si le plancher historique et la comparaison OpenSearch courante tiennent."
                 for ds in nfcorpus fiqa; do
                   echo
                   echo "## $ds / Surch"
@@ -121,9 +219,10 @@ spec:
                   cat "$REPORTS_DIR/$ds-os.out"
                 done
               } > "$REPORTS_DIR/summary.md"
-              cat > "$REPORTS_DIR/bench.json" <<EOF
-              {"schema":"surch.bench.ndcg_gate.v1","nfcorpus_surch_out":"$REPORTS_DIR/nfcorpus-surch.out","nfcorpus_opensearch_out":"$REPORTS_DIR/nfcorpus-os.out","fiqa_surch_out":"$REPORTS_DIR/fiqa-surch.out","fiqa_opensearch_out":"$REPORTS_DIR/fiqa-os.out"}
-              EOF
+              printf '{"schema":"surch.bench.ndcg_gate.v2","baseline_date":"%s","baseline_run":"%s","metric":"NDCG@10","nfcorpus":{"surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/nfcorpus-surch.out","opensearch_out":"%s/nfcorpus-os.out"},"fiqa":{"surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/fiqa-surch.out","opensearch_out":"%s/fiqa-os.out"}}\n' \
+                "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" "$NFCORPUS_NDCG_FLOOR" "$NFCORPUS_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
+                "$FIQA_NDCG_FLOOR" "$FIQA_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
+                > "$REPORTS_DIR/bench.json"
               echo "BEGIN_SURCH_K8S_SUMMARY"
               cat "$REPORTS_DIR/summary.md"
               echo "END_SURCH_K8S_SUMMARY"
