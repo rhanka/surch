@@ -418,7 +418,11 @@ async fn s3_repository_snapshot_restore_round_trip_against_local_s3() {
         ndjson.push_str(&format!(
             "{{\"index\":{{\"_index\":\"source\",\"_id\":\"{id}\"}}}}\n"
         ));
-        let category = if id % 3 == 0 { "science" } else { "other" };
+        let category = if id.is_multiple_of(3) {
+            "science"
+        } else {
+            "other"
+        };
         ndjson.push_str(&format!(
             "{{\"title\":\"alpha document {id}\",\"category\":\"{category}\"}}\n"
         ));

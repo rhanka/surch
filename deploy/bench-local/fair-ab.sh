@@ -76,9 +76,9 @@ MAPPING_FILE="${MAPPING_FILE:-}"
 BULK_RETRIES="${BULK_RETRIES:-3}"   # nb de tentatives par chunk avant échec dur
 # P2 est un protocole fermé, volontairement opt-in : les usages historiques
 # (L1/L2 et comparaison ES) gardent donc exactement leur comportement par
-# défaut. Le pilote p2-campaign.sh active cette voie pour les six mesures.
+# défaut. Le pilote p2-campaign.sh active cette voie pour les neuf mesures.
 P2_MEASURE="${P2_MEASURE:-0}"
-P2_VARIANT="${P2_VARIANT:-}"          # A = avant, B = parcours P2
+P2_VARIANT="${P2_VARIANT:-}"          # A = avant P2, B = P2, C = P3
 P2_INPUT_DIR="${P2_INPUT_DIR:-$OUT_DIR/p2-inputs}"
 P2_PAIR_COUNT="${P2_PAIR_COUNT:-1000}" # 1000 full ; 100 seulement pour le smoke
 P2_WARM_PAIR_COUNT="${P2_WARM_PAIR_COUNT:-100}"
@@ -104,8 +104,8 @@ case "$PROBE_REQUESTS" in ''|*[!0-9]*) err "PROBE_REQUESTS doit être un entier 
 [ "$PROBE_REQUESTS" -gt 0 ] || { err "PROBE_REQUESTS doit être > 0"; exit 1; }
 case "$P2_MEASURE" in 0|1) ;; *) err "P2_MEASURE doit valoir 0 ou 1"; exit 1;; esac
 if [ "$P2_MEASURE" = "1" ]; then
-  [ "$P2_VARIANT" = "A" ] || [ "$P2_VARIANT" = "B" ] || {
-    err "P2_VARIANT doit valoir A ou B quand P2_MEASURE=1"; exit 1;
+  [ "$P2_VARIANT" = "A" ] || [ "$P2_VARIANT" = "B" ] || [ "$P2_VARIANT" = "C" ] || {
+    err "P2_VARIANT doit valoir A, B ou C quand P2_MEASURE=1"; exit 1;
   }
   case "$P2_REQUIRE_P3_INTEGRITY" in 0|1) ;; *) err "P2_REQUIRE_P3_INTEGRITY doit valoir 0 ou 1"; exit 1;; esac
   case "$P2_PAIR_COUNT:$P2_WARM_PAIR_COUNT" in *[!0-9:]*|:*|*::*) err "P2_PAIR_COUNT/P2_WARM_PAIR_COUNT invalides"; exit 1;; esac
@@ -953,7 +953,7 @@ probe_quantiles(){
 p2_index_ready_metric_names=(
   surch_index_segment_count
 )
-if [ "$P2_MEASURE" = "1" ] && [ "$P2_VARIANT" = "B" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+if [ "$P2_MEASURE" = "1" ] && [ "$P2_VARIANT" = "C" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
   # Ces trois jauges sont agrégées par index : elles rendent le plafond P3
   # global aux segments et tout fallback résident bloquants avant les sondes.
   p2_index_ready_metric_names+=(
@@ -1059,7 +1059,7 @@ p2_write_phase_status(){
   read_after=$(p2_counter_value surch_postings_disk_blocks_read_total "$after") || valid=false
   total_after=$(p2_counter_value surch_postings_disk_blocks_total "$after") || valid=false
   segments_after=$(p2_metric_value surch_index_segment_count "$after") || valid=false
-  if [ "$P2_VARIANT" = "B" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+  if [ "$P2_VARIANT" = "C" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
     integrity_required=true
     integrity_bytes_before=$(p2_metric_value surch_postings_p2_integrity_bytes "$before") || valid=false
     integrity_hash_failures_before=$(p2_metric_value surch_postings_p2_hash_failures "$before") || valid=false
@@ -1098,10 +1098,10 @@ p2_write_phase_status(){
         valid=false; reason="route_A_generic_metric_missing_after_bool"
       fi
     elif ! p2_number_equal "$direct_delta" "$bool_requests" || ! p2_number_equal "$generic_delta" 0; then
-      valid=false; reason="route_B_direct_${direct_delta}_generic_${generic_delta}_expected_${bool_requests}_0"
+      valid=false; reason="route_P2_direct_${direct_delta}_generic_${generic_delta}_expected_${bool_requests}_0"
     elif [ "$bool_requests" -gt 0 ] \
       && ! p2_metric_present surch_bool_direct_must_fused_total "$after"; then
-      valid=false; reason="route_B_direct_metric_missing_after_bool"
+      valid=false; reason="route_P2_direct_metric_missing_after_bool"
     fi
     # Une phase sans bool (fixed match) doit être neutre pour chaque compteur
     # P2. Dans les phases alternées, l'égalité au nombre de bool prouve que les
@@ -1111,11 +1111,11 @@ p2_write_phase_status(){
         valid=false; reason="match_phase_p2_blocks_nonzero_read_${read_delta}_total_${total_delta}"
       fi
     fi
-    if [ "$valid" = true ] && [ "$P2_VARIANT" = "B" ]; then
+    if [ "$valid" = true ] && [ "$P2_VARIANT" != "A" ]; then
       if [ "$blocks_metrics_emitted" != true ]; then
-        valid=false; reason="blocks_B_metrics_missing_after_phase"
+        valid=false; reason="blocks_P2_metrics_missing_after_phase"
       elif [ "$bool_requests" -gt 0 ] && { ! p2_number_le 1 "$total_delta" || ! p2_number_le 0 "$read_delta"; }; then
-        valid=false; reason="blocks_B_non_positive_read_${read_delta}_total_${total_delta}"
+        valid=false; reason="blocks_P2_non_positive_read_${read_delta}_total_${total_delta}"
       elif [ "$bool_requests" -gt 0 ]; then
         if [ "$integrity_required" = true ] && ! awk -v before="$integrity_verified_bytes_before" -v after="$integrity_verified_bytes_after" 'BEGIN { exit !((after + 0) > (before + 0)) }'; then
           valid=false; reason="p3_verified_bytes_not_increasing"

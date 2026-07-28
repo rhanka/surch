@@ -415,7 +415,7 @@ fn boolean_query_leapfrog_matches_single_clause_score_sum_across_blocks() {
         builder
             .add("body", "alpha", doc_id as u32, vec![0])
             .expect("alpha posting");
-        if doc_id % 2 == 0 {
+        if doc_id.is_multiple_of(2) {
             builder
                 .add("body", "beta", doc_id as u32, vec![0, 1])
                 .expect("beta posting");

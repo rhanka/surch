@@ -85,8 +85,9 @@ impl P2IntegrityTable {
 /// Constructeur unique des preuves P2, partagé par le seal initial et le
 /// merge. Les digests ne sont publiés qu'après les deux `append` de régions ;
 /// une erreur garde les canaux résidents, sans demi-preuve exploitable.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct P2IntegrityBuilder {
+    max_bytes: u64,
     digests: Vec<P2Digest>,
     protected_fields: u32,
     fallback_fields: u64,
@@ -96,6 +97,13 @@ struct P2IntegrityBuilder {
 }
 
 impl P2IntegrityBuilder {
+    fn with_max_bytes(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            ..Self::default()
+        }
+    }
+
     fn record_fallback(&mut self) {
         self.fallback_fields = self.fallback_fields.saturating_add(1);
     }
@@ -142,7 +150,7 @@ impl P2IntegrityBuilder {
                     })
                     .and_then(|descriptors| bytes.checked_add(descriptors))
             })
-            .is_some_and(|bytes| bytes <= P2_INTEGRITY_MAX_BYTES)
+            .is_some_and(|bytes| bytes <= self.max_bytes)
     }
 
     fn finish(self) -> P2IntegrityTable {
@@ -175,7 +183,7 @@ impl P2IntegrityBuilder {
                     .checked_mul(2)?
                     .checked_mul(std::mem::size_of::<P2VerifiedRegion>() as u64)?,
             )?;
-        if byte_cost > P2_INTEGRITY_MAX_BYTES {
+        if byte_cost > self.max_bytes {
             return None;
         }
 
@@ -186,6 +194,20 @@ impl P2IntegrityBuilder {
             entries: entries.region,
             directory: directory.region,
         })
+    }
+}
+
+impl Default for P2IntegrityBuilder {
+    fn default() -> Self {
+        Self {
+            max_bytes: P2_INTEGRITY_MAX_BYTES,
+            digests: Vec::new(),
+            protected_fields: 0,
+            fallback_fields: 0,
+            term_occurrences: 0,
+            blocks: 0,
+            fields: 0,
+        }
     }
 }
 
@@ -233,7 +255,7 @@ fn p2_digest_region(
 
 fn p2_digest_count(data_len: usize) -> Option<usize> {
     let full_pages = data_len / P2_INTEGRITY_PAGE_LEN as usize;
-    let partial_page = usize::from(data_len % P2_INTEGRITY_PAGE_LEN as usize != 0);
+    let partial_page = usize::from(!data_len.is_multiple_of(P2_INTEGRITY_PAGE_LEN as usize));
     full_pages.checked_add(partial_page)
 }
 
@@ -1016,7 +1038,18 @@ impl PostingsBuilder {
     /// of truth) and persists the per-block directory
     /// ([`FieldPostings::block_directory`]) so the disk read path never
     /// re-decodes a whole term just to skip blocks.
-    pub fn build_with_disk_flag(mut self, disk_enabled: bool) -> TermDictionary {
+    pub fn build_with_disk_flag(self, disk_enabled: bool) -> TermDictionary {
+        self.build_with_disk_flag_and_p2_integrity_limit(disk_enabled, P2_INTEGRITY_MAX_BYTES)
+    }
+
+    /// Construit un segment avec la part du plafond P3 réservée par son
+    /// index. Un budget épuisé conserve le déclin P2 explicite : il ne rend
+    /// jamais une attestation partielle utilisable par le lecteur à sauts.
+    pub(crate) fn build_with_disk_flag_and_p2_integrity_limit(
+        mut self,
+        disk_enabled: bool,
+        p2_integrity_max_bytes: u64,
+    ) -> TermDictionary {
         // Sort each posting list by ascending doc_id (the query engine
         // relies on this to do single-pass conjunctions and unions), then
         // merge same-doc_id runs into a single Lucene-shaped posting: see
@@ -1047,7 +1080,7 @@ impl PostingsBuilder {
         let mut postings_skipped_terms: u64 = 0;
 
         let mut fields: BTreeMap<String, FieldPostings> = BTreeMap::new();
-        let mut p2_integrity = P2IntegrityBuilder::default();
+        let mut p2_integrity = P2IntegrityBuilder::with_max_bytes(p2_integrity_max_bytes);
         for (field_ordinal, (field, terms)) in self.fields.into_iter().enumerate() {
             // `BTreeMap` already yields keys in lexicographic order, so
             // we can feed `MapBuilder` directly without an extra sort.
@@ -2147,6 +2180,7 @@ impl FieldMergeAccumulator {
 pub(crate) fn merge_term_dictionaries(
     sources: &[&TermDictionary],
     disk_enabled: bool,
+    p2_integrity_max_bytes: u64,
 ) -> TermDictionary {
     let mut field_names: BTreeSet<&str> = BTreeSet::new();
     for source in sources {
@@ -2156,7 +2190,7 @@ pub(crate) fn merge_term_dictionaries(
     let mut postings_segment = PostingsSegment::try_new();
     let mut postings_skipped_terms: u64 = 0;
     let mut fields: BTreeMap<String, FieldPostings> = BTreeMap::new();
-    let mut p2_integrity = P2IntegrityBuilder::default();
+    let mut p2_integrity = P2IntegrityBuilder::with_max_bytes(p2_integrity_max_bytes);
 
     for (field_ordinal, field) in field_names.into_iter().enumerate() {
         let participants: Vec<(&TermDictionary, &FieldPostings)> = sources
@@ -4456,7 +4490,7 @@ mod tests {
                 .map(|s| build_segment(s, disk_enabled))
                 .collect();
             let refs: Vec<&TermDictionary> = segments.iter().collect();
-            let merged = merge_term_dictionaries(&refs, disk_enabled);
+            let merged = merge_term_dictionaries(&refs, disk_enabled, P2_INTEGRITY_MAX_BYTES);
 
             // Every segment-unique term resolves to EXACTLY its own
             // doc_id — proves the merge-joined FST correctly threads

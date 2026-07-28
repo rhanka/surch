@@ -256,7 +256,7 @@ fn skip_executor_matches_brute_force_on_seeded_multi_token_corpus() {
         // `freqs` is derived by walking it in that same ascending order —
         // same RNG draw sequence/count as the historical single-pass
         // `Posting::new(d, (n() % 9) + 1)` map.
-        let doc_ids: Vec<u32> = (0..n_docs).filter(|d| d % modulo == 0).collect();
+        let doc_ids: Vec<u32> = (0..n_docs).filter(|d| d.is_multiple_of(modulo)).collect();
         let freqs: Vec<u32> = doc_ids.iter().map(|_| (n() % 9) + 1).collect();
         let doc_freq = doc_ids.len() as u64;
         Token {

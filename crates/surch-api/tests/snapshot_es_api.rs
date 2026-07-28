@@ -222,7 +222,11 @@ async fn snapshot_take_and_get_reports_success() {
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<(String, Value)> = (0..100)
         .map(|n| {
-            let category = if n % 2 == 0 { "science" } else { "fiction" };
+            let category = if n.is_multiple_of(2) {
+                "science"
+            } else {
+                "fiction"
+            };
             (
                 format!("doc-{n}"),
                 json!({
@@ -377,7 +381,11 @@ async fn snapshot_restore_round_trip_brings_docs_back() {
     assert_eq!(status, StatusCode::OK);
     let docs: Vec<(String, Value)> = (0..100)
         .map(|n| {
-            let category = if n % 2 == 0 { "science" } else { "fiction" };
+            let category = if n.is_multiple_of(2) {
+                "science"
+            } else {
+                "fiction"
+            };
             (
                 format!("doc-{n}"),
                 json!({
