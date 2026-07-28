@@ -7,8 +7,10 @@
 //! field-length stats, the term block metas, and the stored `_source`
 //! payloads consume.
 //!
-//! The numbers are refreshed at indexing time only (`_bulk`, `_doc`,
-//! delete, snapshot import) so the hot search path is untouched.
+//! Les tailles sont rafraîchies à l'indexation (`_bulk`, `_doc`, delete,
+//! import de snapshot). P3 publie aussi ses compteurs d'attestation après une
+//! tentative de chemin à sauts ; cela ne modifie ni le résultat ni le chemin
+//! `match` historique.
 
 use std::collections::BTreeMap;
 
@@ -53,7 +55,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         disk_subfield_values_bytes,
         segment_count,
     );
-    set_p2_integrity_gauges(p2_integrity_metrics);
+    set_p2_integrity_gauges(index, p2_integrity_metrics);
     refresh_process_memory_gauges();
     // Lot C Phase 0b : stats internes jemalloc. Appelé ici, donc APRÈS
     // `finalize_terms_for_refresh` sur le chemin `_refresh` (le builder
@@ -65,20 +67,27 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
 /// Jauges P3 mises à jour à l'indexation et après chaque tentative P2. Les
 /// tailles sont instantanées ; les compteurs de vérification et de déclin sont
 /// cumulatifs pour la génération de segments courante.
-pub(crate) fn set_p2_integrity_gauges(integrity: P2IntegrityMetrics) {
-    metrics::gauge!("surch_postings_p2_integrity_bytes").set(integrity.integrity_bytes as f64);
-    metrics::gauge!("surch_postings_p2_integrity_pages").set(integrity.integrity_pages as f64);
-    metrics::gauge!("surch_postings_p2_verified_bytes").set(integrity.verified_bytes as f64);
-    metrics::gauge!("surch_postings_p2_hash_failures").set(integrity.hash_failures as f64);
-    metrics::gauge!("surch_postings_p2_fallbacks").set(integrity.fallbacks as f64);
-    metrics::gauge!("surch_postings_p2_fallback_fields").set(integrity.fallback_fields as f64);
-    metrics::gauge!("surch_postings_p2_term_occurrences").set(integrity.term_occurrences as f64);
-    metrics::gauge!("surch_postings_p2_blocks").set(integrity.blocks as f64);
-    metrics::gauge!("surch_postings_p2_fields").set(integrity.fields as f64);
-    metrics::gauge!("surch_postings_p2_term_payload_bytes")
+pub(crate) fn set_p2_integrity_gauges(index: &str, integrity: P2IntegrityMetrics) {
+    let label = [("index", index.to_owned())];
+    metrics::gauge!("surch_postings_p2_integrity_bytes", &label)
+        .set(integrity.integrity_bytes as f64);
+    metrics::gauge!("surch_postings_p2_integrity_pages", &label)
+        .set(integrity.integrity_pages as f64);
+    metrics::gauge!("surch_postings_p2_verified_bytes", &label)
+        .set(integrity.verified_bytes as f64);
+    metrics::gauge!("surch_postings_p2_hash_failures", &label).set(integrity.hash_failures as f64);
+    metrics::gauge!("surch_postings_p2_fallbacks", &label).set(integrity.fallbacks as f64);
+    metrics::gauge!("surch_postings_p2_fallback_fields", &label)
+        .set(integrity.fallback_fields as f64);
+    metrics::gauge!("surch_postings_p2_term_occurrences", &label)
+        .set(integrity.term_occurrences as f64);
+    metrics::gauge!("surch_postings_p2_blocks", &label).set(integrity.blocks as f64);
+    metrics::gauge!("surch_postings_p2_fields", &label).set(integrity.fields as f64);
+    metrics::gauge!("surch_postings_p2_term_payload_bytes", &label)
         .set(integrity.term_payload_bytes as f64);
-    metrics::gauge!("surch_postings_p2_csr_bytes").set(integrity.csr_bytes as f64);
-    metrics::gauge!("surch_postings_p2_directory_bytes").set(integrity.directory_bytes as f64);
+    metrics::gauge!("surch_postings_p2_csr_bytes", &label).set(integrity.csr_bytes as f64);
+    metrics::gauge!("surch_postings_p2_directory_bytes", &label)
+        .set(integrity.directory_bytes as f64);
 }
 
 /// Process-wide RSS accounting (#17b). Reads `/proc/self/status` to
@@ -299,7 +308,7 @@ pub fn refresh_jemalloc_purge() {}
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
     set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0, 0, 0, 0);
-    set_p2_integrity_gauges(P2IntegrityMetrics::default());
+    set_p2_integrity_gauges(index, P2IntegrityMetrics::default());
 }
 
 // Internal gauge-fan-out helper: one positional arg per Prometheus gauge

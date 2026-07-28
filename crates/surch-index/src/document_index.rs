@@ -17,7 +17,7 @@ use crate::postings::{
     merge_term_dictionaries, postings_disk_enabled, BlockMeta, CheckedPostings,
     DiskPostingsAdvance, DiskPostingsCursor, P2IntegrityMetrics, PostingsBlockSkipIter,
     PostingsBuilder, PostingsEnum, PostingsError, PostingsList, PostingsReadError, TermDictionary,
-    TermsEnum,
+    TermsEnum, P2_INTEGRITY_MAX_BYTES,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
@@ -2278,6 +2278,17 @@ impl DocumentIndex {
         field: &str,
         term: &str,
     ) -> core::result::Result<Option<SegmentedPostings<'_>>, SegmentedPostingsError> {
+        let integrity = self.postings_p2_integrity_metrics();
+        if integrity.integrity_bytes > P2_INTEGRITY_MAX_BYTES || integrity.fallback_fields != 0 {
+            // Le plafond est global à l'index, pas local à un segment. Une
+            // attestation incomplète ou trop grande ne peut donc servir aucun
+            // saut P2 : le routeur repartira du lecteur générique sans publier
+            // de résultat partiel ni d'état de scoring intermédiaire.
+            return Err(SegmentedPostingsError::from_partial(
+                PostingsReadError::Corrupt,
+                &[],
+            ));
+        }
         let mut per_segment = Vec::with_capacity(self.segments.len());
         let mut global_df = 0u64;
         let mut any = false;

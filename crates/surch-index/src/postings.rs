@@ -18,7 +18,7 @@ use postings_segment::PostingsSegment;
 /// page est résidente.
 const P2_INTEGRITY_PAGE_LEN: u64 = 4 * 1024;
 const P2_INTEGRITY_DIGEST_LEN: u64 = 32;
-const P2_INTEGRITY_MAX_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const P2_INTEGRITY_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const P2_INTEGRITY_DOMAIN: &[u8] = b"surch.p2.meta.v1";
 
 type P2Digest = [u8; P2_INTEGRITY_DIGEST_LEN as usize];
@@ -1593,7 +1593,7 @@ fn persist_or_keep_term_directory(
     {
         return keep_term_directory_resident(channels, disk_enabled, p2_integrity);
     }
-    let Some(term_count_u32) = u32::try_from(term_count).ok() else {
+    let Ok(term_count_u32) = u32::try_from(term_count) else {
         return keep_term_directory_resident(channels, disk_enabled, p2_integrity);
     };
     let Some(segment) = postings_segment.as_mut() else {
@@ -1627,7 +1627,7 @@ fn persist_or_keep_term_directory(
     // La première région est déjà canonique dans le segment. Son digest est
     // calculé sur le buffer qui vient d'être écrit, mais reste privé jusqu'à
     // l'append réussi des `TermEntry` ci-dessous.
-    let Some(directory_digest_start) = u32::try_from(p2_integrity.digests.len()).ok() else {
+    let Ok(directory_digest_start) = u32::try_from(p2_integrity.digests.len()) else {
         return keep_term_directory_resident(channels, disk_enabled, p2_integrity);
     };
     let Some(directory_integrity) = p2_digest_region(
@@ -2665,6 +2665,12 @@ impl FieldPostings {
     /// and [`merge_term_dictionaries`]
     /// (which needs a SOURCE dictionary's own metadata while merging, not
     /// just the merged dictionary's).
+    ///
+    /// Ce lecteur historique est volontairement lossy et n'emploie pas les
+    /// digests P3 : il existait avant P2 et reste le repli compatible après
+    /// un déclin. L'attestation P3 protège exclusivement
+    /// [`Self::disk_cursor_p2_checked`], c'est-à-dire le chemin à sauts ; elle
+    /// ne prétend pas authentifier les consommateurs génériques.
     fn term_entry(&self, idx: usize, segment: Option<&PostingsSegment>) -> Option<TermEntry> {
         match self.term_entries_directory {
             Some((entries_base, term_count)) => {

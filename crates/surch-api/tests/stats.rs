@@ -276,6 +276,13 @@ async fn prometheus_exposes_memory_gauges_after_indexing() {
         r#"{"name":"a moderately long description for one product"}"#,
     )
     .await;
+    index_one(
+        &router,
+        "secondary",
+        "sku-2",
+        r#"{"name":"a second independently gauged product"}"#,
+    )
+    .await;
 
     let scrape = router
         .clone()
@@ -305,6 +312,8 @@ async fn prometheus_exposes_memory_gauges_after_indexing() {
         // identified candidate for the ~295 MiB non-gaugé gap — see
         // `surch_index::memory::MemoryUsage::postings_directory_bytes`).
         "surch_index_postings_directory_bytes",
+        "surch_postings_p2_integrity_bytes",
+        "surch_postings_p2_fallback_fields",
     ] {
         assert!(
             body.contains(metric),
@@ -314,5 +323,13 @@ async fn prometheus_exposes_memory_gauges_after_indexing() {
     assert!(
         body.contains("index=\"products\""),
         "scrape body should label gauges with the index name, got:\n{body}",
+    );
+    assert!(
+        body.contains("surch_postings_p2_integrity_bytes{index=\"products\"}"),
+        "les gauges P3 doivent rester séparées par index, reçu :\n{body}",
+    );
+    assert!(
+        body.contains("surch_postings_p2_integrity_bytes{index=\"secondary\"}"),
+        "une seconde indexation ne doit pas écraser la photo P3 de products, reçu :\n{body}",
     );
 }
