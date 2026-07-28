@@ -91,7 +91,11 @@ P2_SEGMENT_GATE="${P2_SEGMENT_GATE:-exact}" # exact (full) ou minimum (smoke)
 P2_CPU_STEAL_MAX_PERCENT="${P2_CPU_STEAL_MAX_PERCENT:-1}"
 P2_REQUIRE_P3_INTEGRITY="${P2_REQUIRE_P3_INTEGRITY:-1}"
 P2_INTEGRITY_MAX_BYTES=$((32 * 1024 * 1024))
-P2_PROTOCOL_VERSION="p2-segmented-postings-v3-temoin-autonome"
+# v4 : les ensembles NOM sont maintenant identifiés par le terme réellement
+# analysé. Les entrées v3, validées sur la chaîne brute, sont refusées : les
+# réutiliser rendrait possible une collision de postings entre ``Dupont`` et
+# ``DUPONT``.
+P2_PROTOCOL_VERSION="p2-segmented-postings-v4-termes-analyses"
 # Déclaré ici aussi parce que P2 refuse explicitement un bypass avant le
 # bloc historique de préflight qui consomme cette variable.
 PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"
@@ -360,8 +364,13 @@ p2_sha256(){ sha256sum "$1" | awk '{print $1}'; }
 p2_validate_pairs(){
   local pairs="$1" wanted="$2"
   awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
-    NF != 3 || $1 != NR || $2 !~ /^[[:alnum:]]+$/ || $3 !~ /^[[:alnum:]]+$/ || $2 == fixed || ($2 in seen) { invalid = 1; exit }
-    { seen[$2] = 1 }
+    # Le mapping NOM applique asciifolding puis lowercase. La sélection refuse
+    # donc tout NOM non ASCII (au lieu d approximer asciifolding) et déduit la
+    # clé exacte des termes ASCII par lowercase sous LC_ALL=C.
+    function analysed_nom(value) { return tolower(value) }
+    NF != 3 || $1 != NR || $2 !~ /^[A-Za-z0-9]+$/ || $3 !~ /^[A-Za-z0-9]+$/ \
+      || analysed_nom($2) == analysed_nom(fixed) || (analysed_nom($2) in seen) { invalid = 1; exit }
+    { seen[analysed_nom($2)] = 1 }
     END { exit (invalid || NR != wanted) }
   ' "$pairs"
 }
@@ -369,8 +378,10 @@ p2_validate_pairs(){
 p2_validate_control_names(){
   local names="$1" wanted="$2"
   awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
-    NF != 2 || $1 != NR || $2 !~ /^[[:alnum:]]+$/ || $2 == fixed || ($2 in seen) { invalid = 1; exit }
-    { seen[$2] = 1 }
+    function analysed_nom(value) { return tolower(value) }
+    NF != 2 || $1 != NR || $2 !~ /^[A-Za-z0-9]+$/ \
+      || analysed_nom($2) == analysed_nom(fixed) || (analysed_nom($2) in seen) { invalid = 1; exit }
+    { seen[analysed_nom($2)] = 1 }
     END { exit (invalid || NR != wanted) }
   ' "$names"
 }
@@ -385,14 +396,17 @@ p2_validate_term_sets(){
     && p2_validate_control_names "$control_names" "$P2_PAIR_COUNT" \
     && p2_validate_pairs "$warm_pairs" "$P2_WARM_TERM_COUNT" || return 1
   awk -F '\t' -v bool_pairs="$bool_pairs" -v control_names="$control_names" -v warm_pairs="$warm_pairs" '
-    FILENAME == bool_pairs { bool[$2] = 1; next }
+    function analysed_nom(value) { return tolower(value) }
+    FILENAME == bool_pairs { bool[analysed_nom($2)] = 1; next }
     FILENAME == control_names {
-      if (($2 in bool) || ($2 in control)) { invalid = 1; exit }
-      control[$2] = 1; next
+      term = analysed_nom($2)
+      if ((term in bool) || (term in control)) { invalid = 1; exit }
+      control[term] = 1; next
     }
     FILENAME == warm_pairs {
-      if (($2 in bool) || ($2 in control) || ($2 in warm)) { invalid = 1; exit }
-      warm[$2] = 1
+      term = analysed_nom($2)
+      if ((term in bool) || (term in control) || (term in warm)) { invalid = 1; exit }
+      warm[term] = 1
     }
     END { exit invalid }
   ' "$bool_pairs" "$control_names" "$warm_pairs"
@@ -544,7 +558,7 @@ p2_prepare_inputs(){
     err "P2 : $P2_INPUT_DIR contient déjà des fichiers sans manifeste, écrasement refusé"
     return 1
   fi
-  printf '%s' "$PROBE_FIXED_TERM" | awk '/^[[:alnum:]]+$/ { ok = 1 } END { exit !ok }' || {
+  printf '%s' "$PROBE_FIXED_TERM" | awk '/^[A-Za-z0-9]+$/ { ok = 1 } END { exit !ok }' || {
     err "P2 : PROBE_FIXED_TERM doit être mono-token ASCII"; return 1;
   }
 
@@ -560,7 +574,10 @@ p2_prepare_inputs(){
       sub(/^"[^"]*":"/, "", val); sub(/"$/, "", val)
       return val
     }
-    function mono(value) { return value ~ /^[[:alnum:]]+$/ }
+    # Le contrat impose asciifolding + lowercase. Sans implémentation exacte
+    # d asciifolding en awk, tout caractère non ASCII est refusé fail-closed.
+    function mono(value) { return value ~ /^[A-Za-z0-9]+$/ }
+    function analysed_nom(value) { return tolower(value) }
     function target_for_bucket(kind) {
       # Ordonnancement pondéré déterministe : la plus petite fraction déjà
       # attribuée reçoit le bucket suivant. Il respecte exactement les tailles
@@ -577,7 +594,7 @@ p2_prepare_inputs(){
       return kind
     }
     function take(kind, nom, pre) {
-      used[nom] = 1
+      used[analysed_nom(nom)] = 1
       if (kind == "bool") { bool_nom[++bool_count] = nom; bool_pre[bool_count] = pre }
       else if (kind == "control") control_nom[++control_count] = nom
       else { warm_nom[++warm_count] = nom; warm_pre[warm_count] = pre }
@@ -585,16 +602,17 @@ p2_prepare_inputs(){
     NR % 2 == 0 {
       doc++
       nom = extract($0, fnom); pre = extract($0, fpre)
-      if (!mono(nom) || !mono(pre) || nom == fixed) next
+      term = analysed_nom(nom)
+      if (!mono(nom) || !mono(pre) || term == analysed_nom(fixed)) next
       bucket = int((doc - 1) * (bool_wanted + control_wanted + warm_wanted) / ndocs) + 1
       if (bucket >= 1 && bucket <= bool_wanted + control_wanted + warm_wanted \
-          && bucket_count[bucket] < 32 && !((bucket SUBSEP nom) in bucket_seen)) {
-        bucket_seen[bucket, nom] = 1
+          && bucket_count[bucket] < 32 && !((bucket SUBSEP term) in bucket_seen)) {
+        bucket_seen[bucket, term] = 1
         bucket_nom[bucket, ++bucket_count[bucket]] = nom
         bucket_pre[bucket, bucket_count[bucket]] = pre
       }
-      if (fallback_count < (bool_wanted + control_wanted + warm_wanted) * 32 && !(nom in fallback_seen)) {
-        fallback_seen[nom] = 1
+      if (fallback_count < (bool_wanted + control_wanted + warm_wanted) * 32 && !(term in fallback_seen)) {
+        fallback_seen[term] = 1
         fallback_nom[++fallback_count] = nom; fallback_pre[fallback_count] = pre
       }
     }
@@ -604,12 +622,12 @@ p2_prepare_inputs(){
         kind = target_for_bucket(bucket)
         for (candidate = 1; candidate <= bucket_count[bucket]; candidate++) {
           nom = bucket_nom[bucket, candidate]
-          if (!(nom in used)) { take(kind, nom, bucket_pre[bucket, candidate]); break }
+          if (!(analysed_nom(nom) in used)) { take(kind, nom, bucket_pre[bucket, candidate]); break }
         }
       }
       for (i = 1; i <= fallback_count; i++) {
         nom = fallback_nom[i]
-        if (nom in used) continue
+        if (analysed_nom(nom) in used) continue
         if (bool_count < bool_wanted) take("bool", nom, fallback_pre[i])
         else if (control_count < control_wanted) take("control", nom, fallback_pre[i])
         else if (warm_count < warm_wanted) take("warm", nom, fallback_pre[i])
@@ -1125,7 +1143,43 @@ if [ "$P2_MEASURE" = "1" ] && [ "$P2_VARIANT" = "C" ] && [ "$P2_REQUIRE_P3_INTEG
 fi
 
 p2_cpu_stat(){
-  awk '/^cpu / { total = 0; for (i = 2; i <= NF; i++) total += $i; print total, $9; exit }' /proc/stat
+  # La sonde est hors du CPUSET moteur. Mesurer la ligne agrégée ``cpu``
+  # dilue donc exactement le steal qui peut fausser les requêtes. On somme
+  # uniquement les lignes cpuN du CPUSET effectivement attribué au moteur.
+  awk -v selected="$CPUSET" '
+    BEGIN {
+      parts = split(selected, ranges, ",")
+      for (i = 1; i <= parts; i++) {
+        if (ranges[i] ~ /^[0-9]+$/) {
+          first = ranges[i]; last = ranges[i]
+        } else if (ranges[i] ~ /^[0-9]+-[0-9]+$/) {
+          split(ranges[i], bounds, "-"); first = bounds[1]; last = bounds[2]
+        } else {
+          invalid = 1; continue
+        }
+        if (first < 0 || last < first) { invalid = 1; continue }
+        for (cpu = first; cpu <= last; cpu++) selected_cpu[cpu] = 1
+      }
+      for (cpu in selected_cpu) expected++
+      if (invalid || expected == 0) exit 1
+    }
+    $1 ~ /^cpu[0-9]+$/ {
+      cpu = substr($1, 4)
+      if (!(cpu in selected_cpu)) next
+      if (NF < 9) { invalid = 1; next }
+      for (i = 2; i <= NF; i++) {
+        if ($i !~ /^[0-9]+$/) { invalid = 1; next }
+        total += $i
+      }
+      steal += $9
+      seen[cpu] = 1
+    }
+    END {
+      for (cpu in selected_cpu) if (!(cpu in seen)) invalid = 1
+      if (invalid || total <= 0) exit 1
+      printf "%.0f %.0f", total, steal
+    }
+  ' /proc/stat
 }
 
 p2_cpu_steal_percent(){
@@ -1167,8 +1221,19 @@ p2_metric_value(){
     return 1
   fi
   awk -v metric="$metric" '
-    $0 ~ "^" metric "(\\{|[[:space:]])" { sum += $NF; found = 1 }
-    END { if (!found) exit 1; printf "%.17g", sum }
+    function finite(value, rendered) {
+      if (value !~ /^[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][-+]?[0-9]+)?$/) return 0
+      rendered = tolower(sprintf("%.17g", value + 0))
+      return rendered != "inf" && rendered != "-inf" && rendered != "nan"
+    }
+    $0 ~ "^" metric "(\\{|[[:space:]])" {
+      if (!finite($NF)) { invalid = 1; next }
+      sum += $NF; found = 1
+    }
+    END {
+      if (!found || invalid || !finite(sprintf("%.17g", sum))) exit 1
+      printf "%.17g", sum
+    }
   ' "$snapshot"
 }
 
@@ -1209,10 +1274,11 @@ p2_cgroup_stat_value(){
 }
 
 p2_cgroup_io_json(){
-  local file="$1"
-  awk '
+  local file="$1" json
+  json=$(awk '
+    BEGIN { printf "[" }
     function emit(device, metric, value) {
-      if (!first++) printf ","
+      if (first++) printf ","
       printf "{\"device\":\"%s\",\"metric\":\"%s\",\"value\":%s}", device, metric, value
     }
     $1 ~ /^[0-9]+:[0-9]+$/ {
@@ -1227,9 +1293,12 @@ p2_cgroup_io_json(){
     NF != 0 { invalid = 1 }
     END {
       if (invalid || !seen || !first) exit 1
-      printf "\n"
+      printf "]"
     }
-  ' "$file" | awk 'BEGIN { printf "[" } { printf "%s", $0 } END { printf "]" }'
+  ' "$file") || return 1
+  # Une sortie lexicalement produite par awk n'est jamais présumée JSON : le
+  # parseur utilisé ensuite par --argjson doit l'accepter explicitement.
+  jq -ce . <<< "$json"
 }
 
 p2_cgroup_io_delta_json(){
