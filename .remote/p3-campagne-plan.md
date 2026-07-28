@@ -185,4 +185,34 @@ Le mode A/C seul coûterait six runs, soit `5 h`, mais économiserait seulement
 mémoire, contamination du témoin et coût BLAKE3. Il n'est donc retenu que pour
 une simple décision de livraison, pas pour la campagne causale demandée.
 
+## Contrainte consignée pour le prochain essai full — stockage containerd
+
+Constatée lors du smoke2 (VM `feec7dc2-68d5-48fd-9cf4-022a49363504`,
+serveur détruit) : Docker 29 utilise le snapshotter
+`io.containerd.snapshotter.v1`, dont les couches et snapshots résident en
+pratique dans `/var/lib/containerd`, sur la racine `/dev/sda1`, et non sur
+`/dev/sdb` monté sur `/var/lib/docker` (là où `DockerRootDir` pointait bien
+et où `P2_DOCKER_CLASSIC_SOURCE=/dev/sdb` avait été fourni). Chiffre constaté
+avant destruction : `7 385 217 699` octets (≈ 7,4 Gio) sous
+`/var/lib/containerd`. Le dimensionnement disque d'un prochain essai à pleine
+échelle ne peut donc pas présumer que les 64 Gio du volume Docker dédié
+suffisent : une part significative de l'empreinte (couches d'image, layers
+de build) s'accumule sur la racine, dont l'espace libre doit être
+dimensionné et vérifié séparément. Cette contrainte est consignée sans
+implémentation ni changement de seuil : elle reste à trancher explicitement
+(déplacer `data-root` containerd, agrandir la racine, ou revalider que la
+marge actuelle de la racine suffit) avant tout prochain full.
+
+## Fait de mesure consigné, sans conclusion — ratio de blocs de B
+
+Pendant le smoke v4, la variante B a terminé techniquement valide avec un
+ratio de blocs observé de `0,278468388` puis `0,253467300` sur ses deux
+phases bool mesurées, l'un et l'autre au-dessus de la cible `0,25` du gate
+P3 (`blocks_read/blocks_total <= 0,25`). Ceci est reporté comme une
+information brute à vérifier à pleine échelle, PAS comme une conclusion : le
+smoke à 1,36 M documents et trois segments seulement n'a pas vocation à
+trancher un ratio de blocs qui dépend de la taille de l'index et du nombre
+de segments réels (12 en full contre 3 au smoke). Aucune inférence sur le
+p95 ni sur le RSS ne doit être tirée de ce seul chiffre.
+
 PLAN_C_DONE

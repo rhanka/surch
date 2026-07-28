@@ -84,6 +84,10 @@ jobs:
         run: P3_MATRIX_EXHAUSTIVE=1 bash deploy/bench-local/test-p3-harness.sh
       - name: Exécuter le pilote P3 sans Docker ni VM
         run: bash deploy/bench-local/test-p3-campaign.sh
+      - name: Auditer les liaisons jq (--arg/--argjson vs $variables du filtre)
+        run: bash deploy/bench-local/test-jq-bindings.sh
+      - name: Exécuter la télémétrie réelle de fair-ab.sh (bundle P3, sans Docker)
+        run: bash deploy/bench-local/test-p3-telemetry.sh
 
   # Manual scoring-side perf regression gate. Kept disabled (`if: false`)
   # because the criterion harness takes 5–10 minutes for the four groups
