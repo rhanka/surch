@@ -2446,7 +2446,38 @@ fn topk_scored_documents(
     })
 }
 
+/// Chantier C2 : le `match` mono-terme (moitié de la sonde aléatoire deces)
+/// est servi par une seule lecture streamée des postings, qui alimente
+/// directement un TopN borné à `limit` — aucune structure de taille `df`.
+/// Tout le reste, et tout déclin, retombe INTÉGRALEMENT sur
+/// [`topk_scored_documents_reference`], le chemin historique inchangé.
 fn topk_scored_documents_inner(
+    reader: &IndexReader<'_>,
+    query: &SearchQuery,
+    limit: usize,
+) -> Option<(Vec<ScoredDocument>, u64)> {
+    // `AND` mono-champ ne passe pas par `maxscore_match` mais par la boucle
+    // générique `score_for_query` : hors périmètre, on n'y touche pas.
+    let streame = match query {
+        SearchQuery::Match {
+            field,
+            value,
+            operator,
+        } if *operator != MatchOperator::And => reader.single_term_match_topk(field, value, limit),
+        _ => None,
+    };
+    if let Some((fenetre, total)) = streame {
+        metrics::counter!("surch_dbg_c2_single_term_stream_total").increment(1);
+        return hydrate_topk(reader, fenetre, total);
+    }
+    topk_scored_documents_reference(reader, query, limit)
+}
+
+/// Chemin historique, mot pour mot : rappel matérialisé, contexte de
+/// scoring, MaxScore, puis top-K. Il reste la RÉFÉRENCE d'équivalence du
+/// chantier C2 et le seul chemin pour toutes les formes que le streamé
+/// décline.
+fn topk_scored_documents_reference(
     reader: &IndexReader<'_>,
     query: &SearchQuery,
     limit: usize,
@@ -2529,27 +2560,43 @@ fn topk_scored_documents_inner(
     finalize_topk(reader, scored, total, limit)
 }
 
+/// LE comparateur du top-K scoré : score décroissant, puis `doc_id`
+/// croissant pour départager les ex æquo. Défini une seule fois et partagé
+/// avec le chemin streamé mono-terme (`state.rs`) : sur le corpus deces
+/// presque tous les documents d'un terme ont le MÊME score (`tf = 1`,
+/// `doc_len = 1`), le départage par `doc_id` est donc la règle nominale.
+/// Comme les `doc_id` sont uniques, cet ordre est TOTAL — le résultat d'un
+/// TopN ne dépend donc pas de l'ordre d'arrivée des candidats.
+pub(crate) fn scored_pair_ordering(a: &(f64, u32), b: &(f64, u32)) -> std::cmp::Ordering {
+    b.0.partial_cmp(&a.0)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.1.cmp(&b.1))
+}
+
 fn finalize_topk(
     reader: &IndexReader<'_>,
     scored: Vec<(f64, u32)>,
     total: u64,
     limit: usize,
 ) -> Option<(Vec<ScoredDocument>, u64)> {
-    let cmp = |a: &(f64, u32), b: &(f64, u32)| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.cmp(&b.1))
-    };
-
     // Scalar top-K: K-sized sorted array, O(1) compare against the
     // current worst on the hot path. Replaces the prior
     // select_nth_unstable_by + sort_by pair (Tantivy 0.22 optim #2).
-    let mut topn = TopN::new(limit, cmp);
+    let mut topn = TopN::new(limit, scored_pair_ordering);
     for entry in scored {
         topn.push(entry);
     }
-    let scored = topn.into_sorted_vec();
+    hydrate_topk(reader, topn.into_sorted_vec(), total)
+}
 
+/// Hydratation `_source` de la fenêtre top-K DÉJÀ triée. Extrait de
+/// [`finalize_topk`] pour que le chemin streamé mono-terme, qui produit sa
+/// fenêtre directement, partage exactement la même finalisation.
+fn hydrate_topk(
+    reader: &IndexReader<'_>,
+    scored: Vec<(f64, u32)>,
+    total: u64,
+) -> Option<(Vec<ScoredDocument>, u64)> {
     let winner_ids: Vec<u32> = scored.iter().map(|(_, id)| *id).collect();
     // Le temoin `size:0` du protocole L2 garde le calcul du total, mais
     // court-circuite reellement l'hydratation `_source`.
@@ -7580,5 +7627,330 @@ mod a7_date_tests {
             lte: None,
         };
         assert!(!date_in_bounds(value, &out_of_range, "yyyyMMdd"));
+    }
+}
+
+/// Chantier C2 — verrou d'ÉQUIVALENCE du chemin `match` mono-terme streamé.
+///
+/// Chaque test compare, sur le MÊME lecteur et la MÊME requête, l'empreinte
+/// de [`topk_scored_documents_inner`] (streamé quand il s'engage) à celle de
+/// [`topk_scored_documents_reference`] (le chemin historique, conservé
+/// intact). L'empreinte porte sur ce qui est observable : les identifiants
+/// publics rendus, DANS L'ORDRE, leurs scores au BIT près (`f64::to_bits`) et
+/// le `total`. Une divergence d'ordre sur des ex æquo, un score différent
+/// d'un ulp ou un total décalé font échouer le test.
+///
+/// Les cas limites couverts : ex æquo massifs (le cas NOMINAL du corpus
+/// deces, où `tf = 1` et `doc_len = 1` rendent tous les scores égaux),
+/// `df = 0`, `size` supérieur au nombre de résultats, `size:0`, `df`
+/// franchissant plusieurs blocs de 128, postings sur plusieurs segments,
+/// documents supprimés, scores réellement variés, et les deux formes que le
+/// chemin streamé doit DÉCLINER (multi-token, opérateur `AND`).
+#[cfg(test)]
+mod c2_lecture_streamee_tests {
+    use serde_json::{json, Value};
+
+    use super::{
+        topk_scored_documents_inner, topk_scored_documents_reference, MatchOperator,
+        ScoredDocument, SearchQuery,
+    };
+    use crate::state::{AppState, DocumentWriteOperation};
+
+    /// Tailles de fenêtre balayées par chaque cas : sous le `df`, autour des
+    /// frontières de blocs de 128, exactement au `df`, et au-delà.
+    const FENETRES: [usize; 8] = [0, 1, 2, 10, 128, 129, 500, 5_000];
+
+    /// Ce qu'un client observe d'un top-K : les `_id` dans l'ordre, les
+    /// scores au bit près, et le total.
+    type Empreinte = Option<(Vec<(String, u64)>, u64)>;
+
+    fn empreinte(result: Option<(Vec<ScoredDocument>, u64)>) -> Empreinte {
+        result.map(|(documents, total)| {
+            (
+                documents
+                    .into_iter()
+                    .map(|scored| (scored.doc.id, scored.score.to_bits()))
+                    .collect(),
+                total,
+            )
+        })
+    }
+
+    fn requete(field: &str, value: &str, operator: MatchOperator) -> SearchQuery {
+        SearchQuery::Match {
+            field: field.to_owned(),
+            value: value.to_owned(),
+            operator,
+        }
+    }
+
+    /// Compare les deux chemins et retourne `true` si le chemin streamé s'est
+    /// réellement engagé (pour que les tests puissent exiger l'un ou l'autre
+    /// et ne jamais prouver l'équivalence à vide).
+    fn comparer(state: &AppState, index: &str, query: &SearchQuery, limit: usize) -> bool {
+        state.with_search_reader(index, |reader| {
+            let reader = reader.expect("l'index de test doit exister");
+            let engage = match query {
+                SearchQuery::Match {
+                    field,
+                    value,
+                    operator,
+                } if *operator != MatchOperator::And => {
+                    reader.single_term_match_topk(field, value, limit).is_some()
+                }
+                _ => false,
+            };
+            let streame = empreinte(topk_scored_documents_inner(&reader, query, limit));
+            let reference = empreinte(topk_scored_documents_reference(&reader, query, limit));
+            assert_eq!(
+                streame, reference,
+                "équivalence rompue à limit={limit} pour {query:?}"
+            );
+            engage
+        })
+    }
+
+    /// Balaie toutes les fenêtres et exige que l'engagement du chemin streamé
+    /// soit STABLE : soit il sert toutes les fenêtres, soit aucune. Un
+    /// engagement intermittent masquerait une équivalence prouvée à vide.
+    fn comparer_toutes_fenetres(state: &AppState, index: &str, query: &SearchQuery) -> bool {
+        let mut attendu: Option<bool> = None;
+        for limit in FENETRES {
+            let engage = comparer(state, index, query, limit);
+            match attendu {
+                None => attendu = Some(engage),
+                Some(precedent) => assert_eq!(
+                    precedent, engage,
+                    "l'engagement du chemin streamé doit être stable d'une fenêtre à \
+                     l'autre (limit={limit}, {query:?})"
+                ),
+            }
+        }
+        attendu.expect("FENETRES n'est jamais vide")
+    }
+
+    fn indexer_par_lots(state: &AppState, index: &str, docs: &[(String, Value)], par_lot: usize) {
+        for lot in docs.chunks(par_lot) {
+            let operations = lot
+                .iter()
+                .map(|(id, source)| DocumentWriteOperation::Index {
+                    index: index.to_owned(),
+                    id: id.clone(),
+                    source: source.clone(),
+                    status: 201,
+                })
+                .collect();
+            state.apply_document_writes(operations);
+        }
+        state.refresh_index(index);
+    }
+
+    /// Corpus « deces » : `nom` porte un mot unique partagé par presque tous
+    /// les documents (`tf = 1`, `doc_len = 1` → scores TOUS égaux, le cas
+    /// nominal et le principal risque de régression d'ordre), `corps` porte
+    /// des longueurs et des répétitions variables (scores réellement
+    /// distincts), et un terme rare sert de témoin `df` faible.
+    fn corpus(docs: usize) -> Vec<(String, Value)> {
+        (0..docs)
+            .map(|doc_id| {
+                let nom = if doc_id.is_multiple_of(97) {
+                    "durand"
+                } else {
+                    "martin"
+                };
+                // Longueur et fréquence du terme `commun` variables : le
+                // scoring cesse d'être dégénéré sur ce champ.
+                let repetitions = (doc_id % 5) + 1;
+                let mut corps = String::new();
+                for _ in 0..repetitions {
+                    corps.push_str("commun ");
+                }
+                for mot in 0..(doc_id % 7) {
+                    corps.push_str(&format!("mot{mot} "));
+                }
+                (
+                    doc_id.to_string(),
+                    json!({ "nom": nom, "corps": corps.trim_end() }),
+                )
+            })
+            .collect()
+    }
+
+    fn construire(index: &str, disque: bool, budget: Option<u64>, docs: usize) -> AppState {
+        let state = AppState::default();
+        state.create_index(index, None, json!({}), Default::default());
+        // Les surcharges doivent précéder le premier document : elles ne
+        // prennent effet qu'au prochain `PostingsBuilder`.
+        state.set_postings_disk_enabled(index, disque);
+        state.set_flush_budget_bytes_override(index, budget);
+        state.set_merge_fanin_override(index, 0);
+        indexer_par_lots(&state, index, &corpus(docs), 50);
+        state
+    }
+
+    #[test]
+    fn ex_aequo_massifs_ram_rendent_le_meme_ordre() {
+        let index = "c2-ex-aequo-ram";
+        let state = construire(index, false, None, 600);
+        assert!(
+            comparer_toutes_fenetres(&state, index, &requete("nom", "martin", MatchOperator::Or)),
+            "le chemin streamé doit s'engager sur un `match` mono-terme"
+        );
+    }
+
+    #[test]
+    fn ex_aequo_massifs_disque_rendent_le_meme_ordre() {
+        let index = "c2-ex-aequo-disque";
+        let state = construire(index, true, None, 600);
+        assert!(
+            comparer_toutes_fenetres(&state, index, &requete("nom", "martin", MatchOperator::Or)),
+            "le chemin streamé doit s'engager en mode postings disque"
+        );
+    }
+
+    #[test]
+    fn plusieurs_segments_rendent_le_meme_ordre() {
+        for disque in [false, true] {
+            let index = "c2-multi-segments";
+            // Budget d'un octet : chaque lot scelle un segment.
+            let state = construire(index, disque, Some(1), 600);
+            assert!(
+                state.index_segment_count(index) > 1,
+                "le cas multi-segment doit réellement produire plusieurs segments \
+                 (disque={disque}), sinon le test ne prouve rien"
+            );
+            assert!(
+                comparer_toutes_fenetres(
+                    &state,
+                    index,
+                    &requete("nom", "martin", MatchOperator::Or)
+                ),
+                "le chemin streamé doit s'engager sur un index multi-segment \
+                 (disque={disque})"
+            );
+            assert!(comparer_toutes_fenetres(
+                &state,
+                index,
+                &requete("corps", "commun", MatchOperator::Or)
+            ));
+            assert!(comparer_toutes_fenetres(
+                &state,
+                index,
+                &requete("nom", "durand", MatchOperator::Or)
+            ));
+        }
+    }
+
+    #[test]
+    fn scores_varies_restent_bit_a_bit_identiques() {
+        for disque in [false, true] {
+            let index = "c2-scores-varies";
+            let state = construire(index, disque, None, 600);
+            assert!(
+                comparer_toutes_fenetres(
+                    &state,
+                    index,
+                    &requete("corps", "commun", MatchOperator::Or)
+                ),
+                "le chemin streamé doit s'engager (disque={disque})"
+            );
+        }
+    }
+
+    #[test]
+    fn df_faible_et_df_nul() {
+        let index = "c2-df-limites";
+        let state = construire(index, true, None, 600);
+        // `df` faible : 7 documents seulement, donc `size` >> nombre de
+        // résultats sur toutes les fenêtres au-delà de 7.
+        assert!(comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("nom", "durand", MatchOperator::Or)
+        ));
+        // `df = 0` : terme absent du dictionnaire.
+        assert!(comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("nom", "inexistant", MatchOperator::Or)
+        ));
+        // Champ inconnu : ni postings ni statistiques.
+        assert!(!comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("champ_absent", "martin", MatchOperator::Or)
+        ));
+    }
+
+    #[test]
+    fn size_zero_conserve_le_total_sans_hydrater() {
+        let index = "c2-size-zero";
+        let state = construire(index, true, None, 600);
+        let query = requete("nom", "martin", MatchOperator::Or);
+        assert!(comparer(&state, index, &query, 0));
+        let total = state.with_search_reader(index, |reader| {
+            let reader = reader.expect("index présent");
+            topk_scored_documents_inner(&reader, &query, 0)
+                .expect("le chemin top-K doit répondre")
+                .1
+        });
+        // 600 documents, un sur 97 porte `durand` (0, 97, …, 582 = 7 docs).
+        assert_eq!(
+            total, 593,
+            "`size:0` doit rendre le `df` exact du terme, contrat `total` inchangé"
+        );
+    }
+
+    #[test]
+    fn documents_supprimes_traites_a_l_identique() {
+        let index = "c2-supprimes";
+        let state = construire(index, true, None, 600);
+        for doc_id in [0usize, 1, 250, 599] {
+            state.delete_document(index, &doc_id.to_string());
+        }
+        state.refresh_index(index);
+        assert!(comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("nom", "martin", MatchOperator::Or)
+        ));
+        assert!(comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("corps", "commun", MatchOperator::Or)
+        ));
+    }
+
+    #[test]
+    fn multi_token_et_operateur_and_sont_declines() {
+        let index = "c2-declins";
+        let state = construire(index, true, None, 600);
+        // Deux tokens : le boost de répétition et l'union multi-token sortent
+        // du contrat du chemin streamé.
+        assert!(!comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("nom", "martin durand", MatchOperator::Or)
+        ));
+        // Token répété : le boost ne vaut plus 1.
+        assert!(!comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("nom", "martin martin", MatchOperator::Or)
+        ));
+        // `AND` mono-champ passe par la boucle générique `score_for_query`,
+        // pas par `maxscore_match` : le chemin streamé ne doit jamais s'y
+        // substituer.
+        assert!(!comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("nom", "martin", MatchOperator::And)
+        ));
+        // Valeur vide : rien à analyser.
+        assert!(!comparer_toutes_fenetres(
+            &state,
+            index,
+            &requete("nom", "", MatchOperator::Or)
+        ));
     }
 }
