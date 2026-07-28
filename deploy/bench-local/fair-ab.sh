@@ -91,6 +91,8 @@ P2_SEGMENT_GATE="${P2_SEGMENT_GATE:-exact}" # exact (full) ou minimum (smoke)
 P2_CPU_STEAL_MAX_PERCENT="${P2_CPU_STEAL_MAX_PERCENT:-1}"
 P2_REQUIRE_P3_INTEGRITY="${P2_REQUIRE_P3_INTEGRITY:-1}"
 P2_INTEGRITY_MAX_BYTES=$((32 * 1024 * 1024))
+P2_EXECUTION_ID="${P2_EXECUTION_ID:-}"
+P2_ASCIIFOLD_AWK="${P2_ASCIIFOLD_AWK:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/p2-asciifold.awk}"
 # v4 : les ensembles NOM sont maintenant identifiés par le terme réellement
 # analysé. Les entrées v3, validées sur la chaîne brute, sont refusées : les
 # réutiliser rendrait possible une collision de postings entre ``Dupont`` et
@@ -113,6 +115,12 @@ case "$P2_MEASURE" in 0|1) ;; *) err "P2_MEASURE doit valoir 0 ou 1"; exit 1;; e
 if [ "$P2_MEASURE" = "1" ]; then
   [ "$P2_VARIANT" = "A" ] || [ "$P2_VARIANT" = "B" ] || [ "$P2_VARIANT" = "C" ] || {
     err "P2_VARIANT doit valoir A, B ou C quand P2_MEASURE=1"; exit 1;
+  }
+  [[ "$P2_EXECUTION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || {
+    err "P2_EXECUTION_ID UUID v4 obligatoire quand P2_MEASURE=1"; exit 1;
+  }
+  [ -r "$P2_ASCIIFOLD_AWK" ] || {
+    err "table asciifolding P2 introuvable: $P2_ASCIIFOLD_AWK"; exit 1;
   }
   case "$P2_REQUIRE_P3_INTEGRITY" in 0|1) ;; *) err "P2_REQUIRE_P3_INTEGRITY doit valoir 0 ou 1"; exit 1;; esac
   case "$P2_PAIR_COUNT:$P2_WARM_TERM_COUNT" in *[!0-9:]*|:*|*::*) err "P2_PAIR_COUNT/P2_WARM_TERM_COUNT invalides"; exit 1;; esac
@@ -364,49 +372,22 @@ p2_sha256(){ sha256sum "$1" | awk '{print $1}'; }
 
 p2_validate_pairs(){
   local pairs="$1" wanted="$2"
-  awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
-    # Table déterministe : Latin-1 Supplement et Latin Extended-A. Les
-    # substitutions explicites restent byte-stables sous LC_ALL=C, y compris
-    # avec mawk, qui ne fournit pas de normalisation Unicode implicite.
-    function asciifold(value) {
-      # ĸ et ſ survivent au NFD du moteur : les rendre non mono-token ici
-      # préserve exactement leur exclusion sans les rabattre sur k ou s.
-      gsub(/ĸ|ſ/, "!", value)
-      gsub(/À|Á|Â|Ã|Ä|Å|Ā|Ă|Ą/, "A", value); gsub(/à|á|â|ã|ä|å|ā|ă|ą/, "a", value)
-      gsub(/Æ/, "AE", value); gsub(/æ/, "ae", value); gsub(/Ç|Ć|Ĉ|Ċ|Č/, "C", value); gsub(/ç|ć|ĉ|ċ|č/, "c", value)
-      gsub(/Ð|Ď|Đ/, "D", value); gsub(/ð|ď|đ/, "d", value); gsub(/È|É|Ê|Ë|Ē|Ĕ|Ė|Ę|Ě/, "E", value); gsub(/è|é|ê|ë|ē|ĕ|ė|ę|ě/, "e", value)
-      gsub(/Ĝ|Ğ|Ġ|Ģ/, "G", value); gsub(/ĝ|ğ|ġ|ģ/, "g", value); gsub(/Ĥ|Ħ/, "H", value); gsub(/ĥ|ħ/, "h", value)
-      gsub(/Ì|Í|Î|Ï|Ĩ|Ī|Ĭ|Į|İ/, "I", value); gsub(/ì|í|î|ï|ĩ|ī|ĭ|į|ı/, "i", value); gsub(/Ĳ/, "IJ", value); gsub(/ĳ/, "ij", value); gsub(/Ĵ/, "J", value); gsub(/ĵ/, "j", value)
-      gsub(/Ķ/, "K", value); gsub(/ķ|ĸ/, "k", value); gsub(/Ĺ|Ļ|Ľ|Ŀ|Ł/, "L", value); gsub(/ĺ|ļ|ľ|ŀ|ł/, "l", value)
-      gsub(/Ñ|Ń|Ņ|Ň|Ŋ/, "N", value); gsub(/ñ|ń|ņ|ň|ŋ/, "n", value); gsub(/Ò|Ó|Ô|Õ|Ö|Ø|Ō|Ŏ|Ő/, "O", value); gsub(/ò|ó|ô|õ|ö|ø|ō|ŏ|ő/, "o", value); gsub(/Œ/, "OE", value); gsub(/œ/, "oe", value)
-      gsub(/Ŕ|Ŗ|Ř/, "R", value); gsub(/ŕ|ŗ|ř/, "r", value); gsub(/Ś|Ŝ|Ş|Š/, "S", value); gsub(/ś|ŝ|ş|š|ſ/, "s", value); gsub(/ß/, "ss", value)
-      gsub(/Ţ|Ť|Ŧ/, "T", value); gsub(/Þ/, "TH", value); gsub(/ţ|ť|ŧ/, "t", value); gsub(/þ/, "th", value); gsub(/Ù|Ú|Û|Ü|Ũ|Ū|Ŭ|Ů|Ű|Ų/, "U", value); gsub(/ù|ú|û|ü|ũ|ū|ŭ|ů|ű|ų/, "u", value)
-      gsub(/Ŵ/, "W", value); gsub(/ŵ/, "w", value); gsub(/Ý|Ÿ|Ŷ/, "Y", value); gsub(/ý|ÿ|ŷ/, "y", value); gsub(/Ź|Ż|Ž/, "Z", value); gsub(/ź|ż|ž/, "z", value)
-      return value
-    }
-    function analysed_nom(value) { return tolower(asciifold(value)) }
-    NF != 3 || $1 != NR || analysed_nom($2) !~ /^[a-z0-9]+$/ || analysed_nom($3) !~ /^[a-z0-9]+$/ \
-      || analysed_nom($2) == analysed_nom(fixed) || (analysed_nom($2) in seen) { invalid = 1; exit }
-    { seen[analysed_nom($2)] = 1 }
+  awk -f "$P2_ASCIIFOLD_AWK" -f <(printf '%s\n' '
+    NF != 3 || $1 != NR || p2_analysed_nom($2) !~ /^[a-z0-9]+$/ || p2_analysed_nom($3) !~ /^[a-z0-9]+$/ \
+      || p2_analysed_nom($2) == p2_analysed_nom(fixed) || (p2_analysed_nom($2) in seen) { invalid = 1; exit }
+    { seen[p2_analysed_nom($2)] = 1 }
     END { exit (invalid || NR != wanted) }
-  ' "$pairs"
+  ') -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" "$pairs"
 }
 
 p2_validate_control_names(){
   local names="$1" wanted="$2"
-  awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
-    function asciifold(value) {
-      # ĸ et ſ survivent au NFD du moteur : les rendre non mono-token ici
-      # préserve exactement leur exclusion sans les rabattre sur k ou s.
-      gsub(/ĸ|ſ/, "!", value)
-      gsub(/À|Á|Â|Ã|Ä|Å|Ā|Ă|Ą/, "A", value); gsub(/à|á|â|ã|ä|å|ā|ă|ą/, "a", value); gsub(/Æ/, "AE", value); gsub(/æ/, "ae", value); gsub(/Ç|Ć|Ĉ|Ċ|Č/, "C", value); gsub(/ç|ć|ĉ|ċ|č/, "c", value); gsub(/Ð|Ď|Đ/, "D", value); gsub(/ð|ď|đ/, "d", value); gsub(/È|É|Ê|Ë|Ē|Ĕ|Ė|Ę|Ě/, "E", value); gsub(/è|é|ê|ë|ē|ĕ|ė|ę|ě/, "e", value); gsub(/Ĝ|Ğ|Ġ|Ģ/, "G", value); gsub(/ĝ|ğ|ġ|ģ/, "g", value); gsub(/Ĥ|Ħ/, "H", value); gsub(/ĥ|ħ/, "h", value); gsub(/Ì|Í|Î|Ï|Ĩ|Ī|Ĭ|Į|İ/, "I", value); gsub(/ì|í|î|ï|ĩ|ī|ĭ|į|ı/, "i", value); gsub(/Ĳ/, "IJ", value); gsub(/ĳ/, "ij", value); gsub(/Ĵ/, "J", value); gsub(/ĵ/, "j", value); gsub(/Ķ/, "K", value); gsub(/ķ|ĸ/, "k", value); gsub(/Ĺ|Ļ|Ľ|Ŀ|Ł/, "L", value); gsub(/ĺ|ļ|ľ|ŀ|ł/, "l", value); gsub(/Ñ|Ń|Ņ|Ň|Ŋ/, "N", value); gsub(/ñ|ń|ņ|ň|ŋ/, "n", value); gsub(/Ò|Ó|Ô|Õ|Ö|Ø|Ō|Ŏ|Ő/, "O", value); gsub(/ò|ó|ô|õ|ö|ø|ō|ŏ|ő/, "o", value); gsub(/Œ/, "OE", value); gsub(/œ/, "oe", value); gsub(/Ŕ|Ŗ|Ř/, "R", value); gsub(/ŕ|ŗ|ř/, "r", value); gsub(/Ś|Ŝ|Ş|Š/, "S", value); gsub(/ś|ŝ|ş|š|ſ/, "s", value); gsub(/ß/, "ss", value); gsub(/Ţ|Ť|Ŧ/, "T", value); gsub(/Þ/, "TH", value); gsub(/ţ|ť|ŧ/, "t", value); gsub(/þ/, "th", value); gsub(/Ù|Ú|Û|Ü|Ũ|Ū|Ŭ|Ů|Ű|Ų/, "U", value); gsub(/ù|ú|û|ü|ũ|ū|ŭ|ů|ű|ų/, "u", value); gsub(/Ŵ/, "W", value); gsub(/ŵ/, "w", value); gsub(/Ý|Ÿ|Ŷ/, "Y", value); gsub(/ý|ÿ|ŷ/, "y", value); gsub(/Ź|Ż|Ž/, "Z", value); gsub(/ź|ż|ž/, "z", value); return value
-    }
-    function analysed_nom(value) { return tolower(asciifold(value)) }
-    NF != 2 || $1 != NR || analysed_nom($2) !~ /^[a-z0-9]+$/ \
-      || analysed_nom($2) == analysed_nom(fixed) || (analysed_nom($2) in seen) { invalid = 1; exit }
-    { seen[analysed_nom($2)] = 1 }
+  awk -f "$P2_ASCIIFOLD_AWK" -f <(printf '%s\n' '
+    NF != 2 || $1 != NR || p2_analysed_nom($2) !~ /^[a-z0-9]+$/ \
+      || p2_analysed_nom($2) == p2_analysed_nom(fixed) || (p2_analysed_nom($2) in seen) { invalid = 1; exit }
+    { seen[p2_analysed_nom($2)] = 1 }
     END { exit (invalid || NR != wanted) }
-  ' "$names"
+  ') -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" "$names"
 }
 
 # Les trois ensembles sont des ensembles de NOM, pas seulement des lignes de
@@ -418,27 +399,20 @@ p2_validate_term_sets(){
   p2_validate_pairs "$bool_pairs" "$P2_PAIR_COUNT" \
     && p2_validate_control_names "$control_names" "$P2_PAIR_COUNT" \
     && p2_validate_pairs "$warm_pairs" "$P2_WARM_TERM_COUNT" || return 1
-  awk -F '\t' -v bool_pairs="$bool_pairs" -v control_names="$control_names" -v warm_pairs="$warm_pairs" '
-    function asciifold(value) {
-      # ĸ et ſ survivent au NFD du moteur : les rendre non mono-token ici
-      # préserve exactement leur exclusion sans les rabattre sur k ou s.
-      gsub(/ĸ|ſ/, "!", value)
-      gsub(/À|Á|Â|Ã|Ä|Å|Ā|Ă|Ą/, "A", value); gsub(/à|á|â|ã|ä|å|ā|ă|ą/, "a", value); gsub(/Æ/, "AE", value); gsub(/æ/, "ae", value); gsub(/Ç|Ć|Ĉ|Ċ|Č/, "C", value); gsub(/ç|ć|ĉ|ċ|č/, "c", value); gsub(/Ð|Ď|Đ/, "D", value); gsub(/ð|ď|đ/, "d", value); gsub(/È|É|Ê|Ë|Ē|Ĕ|Ė|Ę|Ě/, "E", value); gsub(/è|é|ê|ë|ē|ĕ|ė|ę|ě/, "e", value); gsub(/Ĝ|Ğ|Ġ|Ģ/, "G", value); gsub(/ĝ|ğ|ġ|ģ/, "g", value); gsub(/Ĥ|Ħ/, "H", value); gsub(/ĥ|ħ/, "h", value); gsub(/Ì|Í|Î|Ï|Ĩ|Ī|Ĭ|Į|İ/, "I", value); gsub(/ì|í|î|ï|ĩ|ī|ĭ|į|ı/, "i", value); gsub(/Ĳ/, "IJ", value); gsub(/ĳ/, "ij", value); gsub(/Ĵ/, "J", value); gsub(/ĵ/, "j", value); gsub(/Ķ/, "K", value); gsub(/ķ|ĸ/, "k", value); gsub(/Ĺ|Ļ|Ľ|Ŀ|Ł/, "L", value); gsub(/ĺ|ļ|ľ|ŀ|ł/, "l", value); gsub(/Ñ|Ń|Ņ|Ň|Ŋ/, "N", value); gsub(/ñ|ń|ņ|ň|ŋ/, "n", value); gsub(/Ò|Ó|Ô|Õ|Ö|Ø|Ō|Ŏ|Ő/, "O", value); gsub(/ò|ó|ô|õ|ö|ø|ō|ŏ|ő/, "o", value); gsub(/Œ/, "OE", value); gsub(/œ/, "oe", value); gsub(/Ŕ|Ŗ|Ř/, "R", value); gsub(/ŕ|ŗ|ř/, "r", value); gsub(/Ś|Ŝ|Ş|Š/, "S", value); gsub(/ś|ŝ|ş|š|ſ/, "s", value); gsub(/ß/, "ss", value); gsub(/Ţ|Ť|Ŧ/, "T", value); gsub(/Þ/, "TH", value); gsub(/ţ|ť|ŧ/, "t", value); gsub(/þ/, "th", value); gsub(/Ù|Ú|Û|Ü|Ũ|Ū|Ŭ|Ů|Ű|Ų/, "U", value); gsub(/ù|ú|û|ü|ũ|ū|ŭ|ů|ű|ų/, "u", value); gsub(/Ŵ/, "W", value); gsub(/ŵ/, "w", value); gsub(/Ý|Ÿ|Ŷ/, "Y", value); gsub(/ý|ÿ|ŷ/, "y", value); gsub(/Ź|Ż|Ž/, "Z", value); gsub(/ź|ż|ž/, "z", value); return value
-    }
-    function analysed_nom(value) { return tolower(asciifold(value)) }
-    FILENAME == bool_pairs { bool[analysed_nom($2)] = 1; next }
+  awk -f "$P2_ASCIIFOLD_AWK" -f <(printf '%s\n' '
+    FILENAME == bool_pairs { bool[p2_analysed_nom($2)] = 1; next }
     FILENAME == control_names {
-      term = analysed_nom($2)
+      term = p2_analysed_nom($2)
       if ((term in bool) || (term in control)) { invalid = 1; exit }
       control[term] = 1; next
     }
     FILENAME == warm_pairs {
-      term = analysed_nom($2)
+      term = p2_analysed_nom($2)
       if ((term in bool) || (term in control) || (term in warm)) { invalid = 1; exit }
       warm[term] = 1
     }
     END { exit invalid }
-  ' "$bool_pairs" "$control_names" "$warm_pairs"
+  ') -F '\t' -v bool_pairs="$bool_pairs" -v control_names="$control_names" -v warm_pairs="$warm_pairs" "$bool_pairs" "$control_names" "$warm_pairs"
 }
 
 p2_validate_body_files(){
@@ -1475,13 +1449,13 @@ p2_capture_telemetry(){
     io_delta=$(p2_cgroup_io_delta_json "$before_io" "$io_file") || { P2_METRICS_REASON="${phase}_${boundary}_io_stat_delta_invalid"; return 1; }
   fi
   jq -cn \
-    --arg phase "$phase" --arg boundary "$boundary" --arg snapshot "$snapshot" --arg cgroup "$cgroup" --arg io_file "$io_file" \
+    --arg execution_id "$P2_EXECUTION_ID" --arg phase "$phase" --arg boundary "$boundary" --arg snapshot "$snapshot" --arg cgroup "$cgroup" --arg io_file "$io_file" \
     --argjson metrics "$metric_json" --argjson rss "$rss" --argjson rss_anon "$rss_anon" --argjson vmhwm "$vmhwm" \
     --argjson memory_current "$memory_current" --argjson mem_anon "$mem_anon" --argjson mem_file "$mem_file" \
     --argjson refault "$refault" --argjson activate "$activate" --argjson pgmajfault "$pgmajfault" \
     --argjson nr_throttled "$nr_throttled" --argjson throttled_usec "$throttled_usec" \
     --argjson memory_psi "$memory_psi" --argjson io_psi "$io_psi" --argjson io_stat "$io_json" --argjson io_delta "$io_delta" \
-    '{phase:$phase,boundary:$boundary,prometheus_snapshot:$snapshot,metrics:$metrics,process:{rss_bytes:$rss,rss_anon_bytes:$rss_anon,vmhwm_bytes:$vmhwm},cgroup:{path:$cgroup,memory_current:$memory_current,memory_stat:{anon:$mem_anon,file:$mem_file,workingset_refault_file:$refault,workingset_activate_file:$activate,pgmajfault:$pgmajfault},io_stat_file:$io_file,io_stat:$io_stat,io_stat_delta_from_before:$io_delta,memory_psi:$memory_psi,io_psi:$io_psi,cpu_stat:{nr_throttled:$nr_throttled,throttled_usec:$throttled_usec}}}' \
+    '{execution_id:$execution_id,phase:$phase,boundary:$boundary,prometheus_snapshot:$snapshot,metrics:$metrics,process:{rss_bytes:$rss,rss_anon_bytes:$rss_anon,vmhwm_bytes:$vmhwm},cgroup:{path:$cgroup,memory_current:$memory_current,memory_stat:{anon:$mem_anon,file:$mem_file,workingset_refault_file:$refault,workingset_activate_file:$activate,pgmajfault:$pgmajfault},io_stat_file:$io_file,io_stat:$io_stat,io_stat_delta_from_before:$io_delta,memory_psi:$memory_psi,io_psi:$io_psi,cpu_stat:{nr_throttled:$nr_throttled,throttled_usec:$throttled_usec}}}' \
     >> "$P2_TELEMETRY_JSONL" || { P2_METRICS_REASON="${phase}_${boundary}_telemetry_json_write_failed"; return 1; }
 }
 
@@ -1618,8 +1592,8 @@ p2_write_phase_status(){
   # mesure : routage, corps, segments et réponses restent déjà fail-closed.
   # Un ratio hors cible est donc enregistré comme ÉCHEC P2 exploitable plutôt
   # que de transformer la phase A/B correcte en mesure invalide.
-  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"request_cache":false,"hits_total_positive":true,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}},"integrity":{"required":%s,"bytes":{"before":%s,"after":%s},"hash_failures":{"before":%s,"after":%s},"fallbacks":{"before":%s,"after":%s},"fallback_fields":{"before":%s,"after":%s},"verified_bytes":{"before":%s,"after":%s}}}\n' \
-    "$phase" "$P2_VARIANT" "$bool_requests" "$match_requests" "$valid" \
+  printf '{"execution_id":"%s","phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"request_cache":false,"hits_total_positive":true,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}},"integrity":{"required":%s,"bytes":{"before":%s,"after":%s},"hash_failures":{"before":%s,"after":%s},"fallbacks":{"before":%s,"after":%s},"fallback_fields":{"before":%s,"after":%s},"verified_bytes":{"before":%s,"after":%s}}}\n' \
+    "$P2_EXECUTION_ID" "$phase" "$P2_VARIANT" "$bool_requests" "$match_requests" "$valid" \
     "$( [ -n "$reason" ] && printf '\"%s\"' "$reason" || printf 'null' )" \
     "$cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT" "$cpu_steal_within_limit" \
     "$( [ -n "$cpu_steal_reason" ] && printf '\"%s\"' "$cpu_steal_reason" || printf 'null' )" \
@@ -2669,7 +2643,7 @@ run_engine(){
     [ -n "$p2_image_digest" ] || p2_image_digest="$p2_image_id"
     p2_bulk_sha256=$(p2_manifest_value bulk_sha256 "$PROBE_MANIFEST")
     p2_mapping_sha256=$(p2_manifest_value mapping_sha256 "$PROBE_MANIFEST")
-    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"telemetry_jsonl\":\"$P2_TELEMETRY_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_causal_phase\",\"required_causal_phase_records\":5,\"causal_phase_records\":$p2_causal_phase_records,\"secondary_fixed_phase_records\":1,\"expected_phase_records\":$p2_expected_phase_records,\"expected_telemetry_records\":$p2_expected_telemetry_records,\"telemetry_records\":$p2_telemetry_records,\"replay_mix_5050\":$P2_REPLAY_MIX_5050,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
+    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"execution_id\":\"$P2_EXECUTION_ID\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"telemetry_jsonl\":\"$P2_TELEMETRY_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_causal_phase\",\"required_causal_phase_records\":5,\"causal_phase_records\":$p2_causal_phase_records,\"secondary_fixed_phase_records\":1,\"expected_phase_records\":$p2_expected_phase_records,\"expected_telemetry_records\":$p2_expected_telemetry_records,\"telemetry_records\":$p2_telemetry_records,\"replay_mix_5050\":$P2_REPLAY_MIX_5050,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
   fi
   local source_fetch_profile_reason_json="null" source_fetch_random_gate_json="null"
   [ -n "$source_fetch_profile_reason" ] && source_fetch_profile_reason_json="\"$source_fetch_profile_reason\""

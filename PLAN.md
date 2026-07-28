@@ -197,7 +197,9 @@ historical replay line lives in
   La correction versionnée de re-revue verrouille la bijection des neuf runs,
   la matrice du gate et le smoke v4 ; toute publication reste bloquée jusqu'à
   la gate externe. Le pin C demeure `d0accd6`, donc aucune fraîcheur jemalloc
-  issue de HEAD n'est revendiquée par la campagne contractuelle.
+  issue de HEAD n'est revendiquée par la campagne contractuelle. La réduction
+  M3 est ratifiée dans `.remote/p3-campagne-plan.md` : seules RSS/RssAnon et
+  cache fichier sont décisionnels; jemalloc reste diagnostique.
 
 ## Track B - Test Automation / Perf Reporting
 

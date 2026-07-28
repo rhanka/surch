@@ -43,13 +43,41 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$CAMPAIGN" ] || { usage; die '--campaign est obligatoire'; }
 [ -d "$CAMPAIGN" ] || die "campagne introuvable: $CAMPAIGN"
-for command in jq sha256sum readlink; do
+for command in jq sha256sum readlink stat; do
   command -v "$command" >/dev/null 2>&1 || die "commande requise absente: $command"
 done
 [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ] || die 'la campagne P3 exige P2_REQUIRE_P3_INTEGRITY=1'
 
+declare -A RUN_CANONICAL_PATHS=()
+declare -A RUN_PHYSICAL_IDS=()
+declare -A RUN_EXECUTION_IDS=()
+
+execution_id_valid(){
+  [[ "$1" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+}
+
+scorecard_contract_valid(){
+  local score="$1" variant="$2" execution_id="$3"
+  jq -e --arg variant "$variant" --arg execution_id "$execution_id" '
+    .measurement_valid == true
+    and .count == 28917511 and .expected == 28917511 and .indexed == 28917511 and .item_errors == 0
+    and .mem_limit == "6g"
+    and (.cpuset | type == "string" and length > 0)
+    and (.probe_cpuset | type == "string" and length > 0)
+    and .p2.variant == $variant
+    and .p2.execution_id == $execution_id
+    and .p2.expected_docs == 28917511 and .p2.required_segments == 12 and .p2.segment_gate == "exact"
+    and (.p2.cpu_steal_percent | type == "number" and . <= 1)
+    and .p2.cpu_steal_limit_percent == 1
+    and (.p2.observed_cpu_configuration | type == "object")
+    and (.p2.observed_cpu_configuration.nproc | type == "number" and . >= 2 and floor == .)
+    and .p2.observed_cpu_configuration.engine_cpuset == .cpuset
+    and .p2.observed_cpu_configuration.probe_cpuset == .probe_cpuset
+  ' "$score" >/dev/null
+}
+
 telemetry_jsonl_valid(){
-  local score="$1" telemetry replay expected variant require_p3=false
+  local score="$1" expected_execution_id="$2" telemetry replay expected variant require_p3=false
   replay=$(jq -er '.p2.replay_mix_5050 | select(. == 0 or . == 1)' "$score") || return 1
   variant=$(jq -er '.p2.variant | strings' "$score") || return 1
   [ "$variant" != C ] || require_p3=true
@@ -57,7 +85,7 @@ telemetry_jsonl_valid(){
   [ -r "$telemetry" ] || return 1
   expected=13
   [ "$replay" = 0 ] || expected=15
-  jq -se --argjson expected "$expected" --argjson require_p3 "$require_p3" '
+  jq -se --argjson expected "$expected" --argjson require_p3 "$require_p3" --arg execution_id "$expected_execution_id" '
     def number: type == "number";
     def psi:
       type == "object"
@@ -84,7 +112,7 @@ telemetry_jsonl_valid(){
         and ([.metrics.p3_integrity.bytes,.metrics.p3_integrity.pages,.metrics.p3_integrity.verified_bytes,.metrics.p3_integrity.hash_failures,.metrics.p3_integrity.fallbacks,.metrics.p3_integrity.fallback_fields,.metrics.p3_integrity.term_occurrences,.metrics.p3_integrity.blocks,.metrics.p3_integrity.fields,.metrics.p3_integrity.term_payload_bytes,.metrics.p3_integrity.csr_bytes,.metrics.p3_integrity.directory_bytes] | all(number))
       else .metrics.p3_integrity == null end);
     (length == $expected)
-    and all(.[]; (.phase | type == "string") and (.boundary | type == "string") and snapshot)
+    and all(.[]; .execution_id == $execution_id and (.phase | type == "string") and (.boundary | type == "string") and snapshot)
     and ([.[] | select(.phase == "index_ready" and .boundary == "snapshot")] | length == 1)
     and ([.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0" or .phase == "fixed_martin") | .phase + ":" + .boundary] | sort == ["bool_size0:after","bool_size0:before","bool_size10:after","bool_size10:before","fixed_martin:after","fixed_martin:before","match_control:after","match_control:before","warm_bool:after","warm_bool:before","warm_match:after","warm_match:before"])
     and all(.[] | select(.boundary == "before" or .boundary == "snapshot"); .cgroup.io_stat_delta_from_before == null)
@@ -93,7 +121,7 @@ telemetry_jsonl_valid(){
 }
 
 validate_campaign_provenance(){
-  local provenance score variant metadata manifest manifest_sha canonical_manifest="" expected_variant run_dir
+  local provenance score variant metadata manifest manifest_sha canonical_manifest="" expected_variant run_dir canonical_run physical_id execution_id other_run
   local -a run_dirs
   provenance="$CAMPAIGN/campaign-provenance.json"
   [ -r "$provenance" ] || return 1
@@ -109,17 +137,33 @@ validate_campaign_provenance(){
   run_dirs=("$CAMPAIGN"/runs/*)
   [ -e "${run_dirs[0]}" ] || run_dirs=()
   [ "${#run_dirs[@]}" -eq 9 ] || return 1
+  [ ! -L "$CAMPAIGN/runs" ] || return 1
   for run_dir in "${run_dirs[@]}"; do
-    [ -d "$run_dir" ] || return 1
+    [ -d "$run_dir" ] && [ ! -L "$run_dir" ] || return 1
   done
   for run in "${P3_RUNS[@]}"; do
     run_dir="$CAMPAIGN/runs/$run"
-    [ -d "$run_dir" ] || return 1
+    [ -d "$run_dir" ] && [ ! -L "$run_dir" ] || return 1
+    canonical_run=$(readlink -f -- "$run_dir") || return 1
+    physical_id=$(stat -Lc '%d:%i' -- "$run_dir") || return 1
+    for other_run in "${!RUN_CANONICAL_PATHS[@]}"; do
+      [ "$canonical_run" != "${RUN_CANONICAL_PATHS[$other_run]}" ] || return 1
+      [ "$physical_id" != "${RUN_PHYSICAL_IDS[$other_run]}" ] || return 1
+    done
+    RUN_CANONICAL_PATHS[$run]="$canonical_run"
+    RUN_PHYSICAL_IDS[$run]="$physical_id"
     score="$CAMPAIGN/runs/$run/surch.json"
-    [ -s "$score" ] || return 1
+    [ -s "$score" ] && [ ! -L "$score" ] || return 1
     expected_variant=${run:0:1}
     variant=$(jq -er '.p2.variant | strings' "$score") || return 1
     [ "$variant" = "$expected_variant" ] || return 1
+    execution_id=$(jq -er '.p2.execution_id | strings' "$score") || return 1
+    execution_id_valid "$execution_id" || return 1
+    for other_run in "${!RUN_EXECUTION_IDS[@]}"; do
+      [ "$execution_id" != "${RUN_EXECUTION_IDS[$other_run]}" ] || return 1
+    done
+    RUN_EXECUTION_IDS[$run]="$execution_id"
+    scorecard_contract_valid "$score" "$variant" "$execution_id" || return 1
     case "$variant" in
       A|B|C) metadata="$CAMPAIGN/image-$variant.json" ;;
       *) return 1 ;;
@@ -145,7 +189,7 @@ validate_campaign_provenance(){
     elif [ "$manifest" != "$canonical_manifest" ]; then
       return 1
     fi
-    telemetry_jsonl_valid "$score" || return 1
+    telemetry_jsonl_valid "$score" "$execution_id" || return 1
   done
 }
 
@@ -156,36 +200,43 @@ validate_campaign_provenance(){
 validate_pair_group(){
   local root="$1"; shift
   local summary pair_dir parity pair a_run b_run expected_a expected_b
-  local summary_a summary_b score_a score_b manifest_a manifest_b
+  local summary_a summary_b score_a score_b manifest_a manifest_b a_execution_id b_execution_id
   local summaries=("$root"/*/pair-summary.json)
   local pair_dirs=("$root"/*)
   [ -e "${summaries[0]}" ] || summaries=()
   [ -e "${pair_dirs[0]}" ] || pair_dirs=()
   [ "${#summaries[@]}" -eq "$#" ] || return 1
   [ "${#pair_dirs[@]}" -eq "$#" ] || return 1
+  [ ! -L "$root" ] || return 1
   for pair in "$@"; do
     expected_a=${pair%%-*}; expected_b=${pair#*-}
     pair_dir="$root/$pair"
     summary="$pair_dir/pair-summary.json"
     parity="$pair_dir/parity.json"
-    [ -d "$pair_dir" ] && [ -r "$summary" ] && [ -r "$parity" ] || return 1
+    [ -d "$pair_dir" ] && [ ! -L "$pair_dir" ] && [ -r "$summary" ] && [ ! -L "$summary" ] && [ -r "$parity" ] && [ ! -L "$parity" ] || return 1
     a_run=$(jq -er '.a_run | strings' "$parity") || return 1
     b_run=$(jq -er '.b_run | strings' "$parity") || return 1
     [ "$a_run" = "$expected_a" ] && [ "$b_run" = "$expected_b" ] || return 1
     score_a="$CAMPAIGN/runs/$a_run/surch.json"
     score_b="$CAMPAIGN/runs/$b_run/surch.json"
     [ -r "$score_a" ] && [ -r "$score_b" ] || return 1
+    a_execution_id="${RUN_EXECUTION_IDS[$a_run]:-}"
+    b_execution_id="${RUN_EXECUTION_IDS[$b_run]:-}"
+    execution_id_valid "$a_execution_id" && execution_id_valid "$b_execution_id" && [ "$a_execution_id" != "$b_execution_id" ] || return 1
     summary_a=$(jq -er '.a_dir | strings' "$summary" 2>/dev/null) || return 1
     summary_b=$(jq -er '.b_dir | strings' "$summary" 2>/dev/null) || return 1
     jq -e '.schema == "surch.bench.p2.pair.v1"' "$summary" >/dev/null || return 1
-    [ "$(readlink -f -- "$summary_a")" = "$(readlink -f -- "$CAMPAIGN/runs/$a_run")" ] || return 1
-    [ "$(readlink -f -- "$summary_b")" = "$(readlink -f -- "$CAMPAIGN/runs/$b_run")" ] || return 1
+    [ "$(readlink -f -- "$summary_a")" = "${RUN_CANONICAL_PATHS[$a_run]}" ] || return 1
+    [ "$(readlink -f -- "$summary_b")" = "${RUN_CANONICAL_PATHS[$b_run]}" ] || return 1
     manifest_a=$(jq -er '.p2.input_manifest_sha256 | strings' "$score_a") || return 1
     manifest_b=$(jq -er '.p2.input_manifest_sha256 | strings' "$score_b") || return 1
-    jq -e --arg pair "$pair" --arg a "$a_run" --arg b "$b_run" --arg ma "$manifest_a" --arg mb "$manifest_b" '
-      .pair == $pair and .a_run == $a and .b_run == $b and .parity == true
+    jq -e --arg pair "$pair" --arg a "$a_run" --arg b "$b_run" --arg ae "$a_execution_id" --arg be "$b_execution_id" --arg ma "$manifest_a" --arg mb "$manifest_b" '
+      .pair == $pair and .a_run == $a and .b_run == $b and .a_execution_id == $ae and .b_execution_id == $be and .parity == true
       and .a_manifest_sha256 == $ma and .b_manifest_sha256 == $mb and $ma == $mb
     ' "$parity" >/dev/null || return 1
+    jq -e --arg ae "$a_execution_id" --arg be "$b_execution_id" '
+      .a_execution_id == $ae and .b_execution_id == $be
+    ' "$summary" >/dev/null || return 1
   done
 }
 
@@ -196,21 +247,46 @@ validate_p3_bijection(){
 }
 
 phase_status_valid(){
-  local run_dir="$1" require_p3="$2" score status
+  local run_dir="$1" require_p3="$2" score status execution_id
   score="$run_dir/surch.json"
   jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$score" >/dev/null 2>&1 || return 1
+  execution_id=$(jq -er '.p2.execution_id | strings' "$score" 2>/dev/null) || return 1
+  execution_id_valid "$execution_id" || return 1
   status=$(jq -er '.p2.phase_status_jsonl | strings' "$score" 2>/dev/null) || return 1
-  [ -f "$status" ] || return 1
+  [ -f "$status" ] && [ ! -L "$status" ] || return 1
   # Les cinq phases causales portent la preuve A/B. Cold reste disponible
   # dans les scorecards, mais ses droits de reclaim ne peuvent pas invalider
   # le routage, les corps ou la parité déjà vérifiés sur ces cinq phases.
-  jq -se --argjson require_p3 "$require_p3" '
+  jq -se --argjson require_p3 "$require_p3" --arg execution_id "$execution_id" '
+    def number: type == "number";
+    def counter: type == "object" and (.before | number) and (.after | number) and (.delta | number);
+    def phase_metrics:
+      (.metrics | type == "object")
+      and (.metrics.direct | counter) and (.metrics.generic | counter)
+      and (.metrics.blocks_read | counter) and (.metrics.blocks_total | counter)
+      and (.metrics.segments | counter)
+      and .metrics.segments.before == 12 and .metrics.segments.after == 12 and .metrics.segments.delta == 0;
+    def bool_phase: .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0";
+    def route_valid:
+      phase_metrics
+      and (.bool_requests | number) and (.match_requests | number)
+      and (if bool_phase then .bool_requests > 0 else .bool_requests == 0 and .match_requests > 0 end)
+      and (if .variant == "A" then
+        if bool_phase then .metrics.direct.delta == 0 and .metrics.generic.delta == .bool_requests
+        else .metrics.direct.delta == 0 and .metrics.generic.delta == 0 and .metrics.blocks_read.delta == 0 and .metrics.blocks_total.delta == 0 end
+      else
+        if bool_phase then
+          .metrics.direct.delta == .bool_requests and .metrics.generic.delta == 0
+          and .metrics.blocks_total.delta > 0 and .metrics.blocks_read.delta >= 0
+          and (.metrics.blocks_read.delta / .metrics.blocks_total.delta) <= 0.25
+        else .metrics.direct.delta == 0 and .metrics.generic.delta == 0 and .metrics.blocks_read.delta == 0 and .metrics.blocks_total.delta == 0 end
+      end);
     ([.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0")]) as $causal
     | ($causal | length == 5)
     and ([ $causal[] | .phase ] | sort == ["bool_size0", "bool_size10", "match_control", "warm_bool", "warm_match"])
-    and all($causal[]; .valid == true and .cpu_steal_within_limit == true and .request_cache == false and .hits_total_positive == true)
+    and all($causal[]; .execution_id == $execution_id and .valid == true and .cpu_steal_within_limit == true and (.cpu_steal_percent | number) and .cpu_steal_percent <= 1 and .cpu_steal_limit_percent == 1 and .request_cache == false and .hits_total_positive == true and route_valid)
     and ([.[] | select(.phase == "fixed_martin")] | length == 1)
-    and ([.[] | select(.phase == "fixed_martin")] | all(.[]; .valid == true and .cpu_steal_within_limit == true))
+    and ([.[] | select(.phase == "fixed_martin")] | all(.[]; .execution_id == $execution_id and .valid == true and .cpu_steal_within_limit == true and (.cpu_steal_percent | number) and .cpu_steal_percent <= 1 and .cpu_steal_limit_percent == 1 and .request_cache == false and .hits_total_positive == true and route_valid))
     and (if $require_p3 then
       all((.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0" or .phase == "fixed_martin"));
         .integrity.required == true
@@ -220,6 +296,8 @@ phase_status_valid(){
         and (.integrity.hash_failures.after | type) == "number"
         and (.integrity.fallback_fields.before | type) == "number"
         and (.integrity.fallback_fields.after | type) == "number"
+        and (.integrity.verified_bytes.before | type) == "number"
+        and (.integrity.verified_bytes.after | type) == "number"
         and .integrity.bytes.before > 0 and .integrity.bytes.after > 0
         and .integrity.bytes.before <= 33554432
         and .integrity.bytes.after <= 33554432
@@ -232,6 +310,8 @@ phase_status_valid(){
         and .integrity.fallback_fields.before == 0
         and .integrity.fallback_fields.after == 0
       )
+      and all((.[] | select(.phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0")); .integrity.verified_bytes.after > .integrity.verified_bytes.before)
+      and all((.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "fixed_martin")); .integrity.verified_bytes.after == .integrity.verified_bytes.before)
     else true end)
   ' "$status" 2>/dev/null | grep -qx true
 }
@@ -248,7 +328,9 @@ record_probe_delta(){
   jq -er '
     (first(.records[] | select(.phase == "bool_size10" and .kind == "bool" and .metric == "probe") | .b.p95)) as $b
     | (first(.records[] | select(.phase == "bool_size10" and .kind == "bool" and .metric == "probe") | .a.p95)) as $a
-    | ($b - $a | abs)
+    | if (($a | type) != "number" or ($b | type) != "number") then error("sonde non numérique")
+      else ($b - $a) as $delta | if $delta < 0 then -$delta else $delta end
+      end
   ' "$1"
 }
 
@@ -415,7 +497,10 @@ telemetry_value(){
   score="$CAMPAIGN/runs/$run/surch.json"
   telemetry=$(jq -er '.p2.telemetry_jsonl | strings' "$score") || return 1
   jq -ser --arg path "$path" '
-    first(.[] | select(.phase == "index_ready" and .boundary == "snapshot") | getpath($path | split(".")))
+    def safe_path($keys):
+      reduce $keys[] as $key (.;
+        if type == "object" and has($key) then .[$key] else null end);
+    first(.[] | select(.phase == "index_ready" and .boundary == "snapshot") | safe_path($path | split(".")))
     | if type == "number" then . else error("valeur index_ready absente") end
   ' "$telemetry"
 }
@@ -502,6 +587,12 @@ MEDIAN_RANDOM_MATCH_CLIENT=$(median_three "${RANDOM_MATCH_CLIENT[@]}")
 MEDIAN_RSS_RECOVERY=$(median_three "${RSS_RECOVERY[@]}")
 MEDIAN_RSS_ANON_RECOVERY=$(median_three "${RSS_ANON_RECOVERY[@]}")
 MEDIAN_FILE_RECOVERY=$(median_three "${FILE_RECOVERY[@]}")
+HISTORICAL_GAIN_MEDIAN_PASS=false
+HISTORICAL_GAIN_CI95_PASS=false
+number_le "$MEDIAN_PRODUCT_TOOK" 0.50 && HISTORICAL_GAIN_MEDIAN_PASS=true
+numbers_all_le 0.50 "${BOOTSTRAP_UPPER[@]}" && HISTORICAL_GAIN_CI95_PASS=true
+HISTORICAL_GAIN_VERDICT='NON CONSERVE'
+[ "$HISTORICAL_GAIN_MEDIAN_PASS" = true ] && [ "$HISTORICAL_GAIN_CI95_PASS" = true ] && HISTORICAL_GAIN_VERDICT='CONSERVE'
 VALIDITIES_JSON=$(printf '%s\n' "${VALIDITIES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) == "true")')
 BASELINE_VALIDITIES_JSON=$(printf '%s\n' "${BASELINE_VALIDITIES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) == "true")')
 COST_VALIDITIES_JSON=$(printf '%s\n' "${COST_VALIDITIES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) == "true")')
@@ -626,16 +717,17 @@ jq -n \
   --argjson fixed_match "$(numbers_json "${FIXED_MATCH[@]}")" --argjson random_match "$(numbers_json "${RANDOM_MATCH[@]}")" --argjson random_match_client "$(numbers_json "${RANDOM_MATCH_CLIENT[@]}")" \
   --argjson probe_delta "$(numbers_json "${PROBE_DELTA[@]}")" --argjson bootstrap_upper "$(numbers_json "${BOOTSTRAP_UPPER[@]}")" \
   --argjson median_product_took "$MEDIAN_PRODUCT_TOOK" --argjson median_product_client "$MEDIAN_PRODUCT_CLIENT" --argjson median_random_match_client "$MEDIAN_RANDOM_MATCH_CLIENT" \
-  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" --argjson blocks_ratio_c_diagnostics "$BLOCK_RATIO_C_JSON" --argjson p3_integrity_diagnostics "$P3_INTEGRITY_JSON" --argjson p3_integrity_target "$P3_INTEGRITY_TARGET_BYTES" --argjson baseline_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${BASELINE_PAIR_DIRS[@]}")" --argjson p3_cost_took "$P3_COST_TOOK_JSON" --argjson p3_cost_size0_took "$P3_COST_SIZE0_TOOK_JSON" --argjson p3_cost_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${COST_PAIR_DIRS[@]}")" --argjson memory_derivatives "$P3_MEMORY_DERIVATIVES_JSON" --argjson compaction "$COMPACTION_JSON" --argjson rss_recovery "$RSS_RECOVERY_JSON" --argjson rss_anon_recovery "$RSS_ANON_RECOVERY_JSON" --argjson file_recovery "$FILE_RECOVERY_JSON" --argjson replay_required "$REPLAY_REQUIRED" \
-  '{schema:"surch.bench.p3.campaign.v1", verdict:$verdict, replay_required:$replay_required,pair_directories:$pair_directories,baseline_pair_directories:$baseline_pair_directories,ratios:{bool_size10_took_p95:$product_took,bool_size10_client_p95:$product_client,bool_size0_took_p95:$core95,bool_size0_took_p99:$core99,fixed_martin_match_took_p95:$fixed_match,match_control_took_p95:$random_match,match_control_client_p95:$random_match_client,probe_p95_delta_ms:$probe_delta,bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper},medians:{bool_size10_took_p95:$median_product_took,bool_size10_client_p95:$median_product_client,bool_size0_took_p95:$median_core95,bool_size0_took_p99:$median_core99,match_control_client_p95:$median_random_match_client},blocks_ratio:{target:0.25,B:$blocks_ratio_diagnostics,C:$blocks_ratio_c_diagnostics},p3_integrity:{target_bytes:$p3_integrity_target,observations:$p3_integrity_diagnostics,c_over_b_bool_size10_took_p95:$p3_cost_took,c_over_b_bool_size0_took_p95:$p3_cost_size0_took,pair_directories:$p3_cost_pair_directories},memory:{derivatives:$memory_derivatives,compaction_directory_c_over_b:$compaction,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery}},checks:$checks}' \
+  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" --argjson blocks_ratio_c_diagnostics "$BLOCK_RATIO_C_JSON" --argjson p3_integrity_diagnostics "$P3_INTEGRITY_JSON" --argjson p3_integrity_target "$P3_INTEGRITY_TARGET_BYTES" --argjson baseline_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${BASELINE_PAIR_DIRS[@]}")" --argjson p3_cost_took "$P3_COST_TOOK_JSON" --argjson p3_cost_size0_took "$P3_COST_SIZE0_TOOK_JSON" --argjson p3_cost_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${COST_PAIR_DIRS[@]}")" --argjson memory_derivatives "$P3_MEMORY_DERIVATIVES_JSON" --argjson compaction "$COMPACTION_JSON" --argjson rss_recovery "$RSS_RECOVERY_JSON" --argjson rss_anon_recovery "$RSS_ANON_RECOVERY_JSON" --argjson file_recovery "$FILE_RECOVERY_JSON" --arg verdict_historical "$HISTORICAL_GAIN_VERDICT" --argjson historical_median_pass "$HISTORICAL_GAIN_MEDIAN_PASS" --argjson historical_ci95_pass "$HISTORICAL_GAIN_CI95_PASS" --argjson replay_required "$REPLAY_REQUIRED" \
+  '{schema:"surch.bench.p3.campaign.v1", verdict:$verdict, replay_required:$replay_required,pair_directories:$pair_directories,baseline_pair_directories:$baseline_pair_directories,ratios:{bool_size10_took_p95:$product_took,bool_size10_client_p95:$product_client,bool_size0_took_p95:$core95,bool_size0_took_p99:$core99,fixed_martin_match_took_p95:$fixed_match,match_control_took_p95:$random_match,match_control_client_p95:$random_match_client,probe_p95_delta_ms:$probe_delta,bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper},medians:{bool_size10_took_p95:$median_product_took,bool_size10_client_p95:$median_product_client,bool_size0_took_p95:$median_core95,bool_size0_took_p99:$median_core99,match_control_client_p95:$median_random_match_client},historical_gain:{label:"conservation du gain historique",verdict:$verdict_historical,target_ratio:0.50,target_ci95_high:0.50,median_ratio:$median_product_took,ci95_high:$bootstrap_upper,median_pass:$historical_median_pass,ci95_pass:$historical_ci95_pass,product_verdict_independent:true},blocks_ratio:{target:0.25,B:$blocks_ratio_diagnostics,C:$blocks_ratio_c_diagnostics},p3_integrity:{target_bytes:$p3_integrity_target,observations:$p3_integrity_diagnostics,c_over_b_bool_size10_took_p95:$p3_cost_took,c_over_b_bool_size0_took_p95:$p3_cost_size0_took,pair_directories:$p3_cost_pair_directories},memory:{scope:"RSS, RssAnon et cache fichier; jemalloc diagnostic seulement",derivatives:$memory_derivatives,compaction_directory_c_over_b:$compaction,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery}},checks:$checks}' \
   > "$CAMPAIGN/campaign-summary.json" || die 'écriture impossible de campaign-summary.json'
 
 {
   printf '%s\n\n' '# P3 — verdict de campagne'
   printf 'Verdict: **%s**.\n\n' "$VERDICT"
+  printf 'Conservation du gain historique: **%s** (médiane C/A size:10 p95 took <= 0,50 et chaque borne haute IC95 <= 0,50 ; information distincte du verdict produit).\n\n' "$HISTORICAL_GAIN_VERDICT"
   printf '%s\n%s\n' '| Gate | Verdict | Détail |' '|---|---|---|'
   jq -r '"| \(.name) | \(if .pass then "pass" else "fail" end) | \(.detail) |"' "$CHECKS_JSONL"
-  printf '\n%s\n' 'Les nombres A/B, C/A et les coûts C/B sont conservés sous `pairs/*/`, `p3-primary-pairs/*/` et `p3-cost-pairs/*/`.'
+  printf '\n%s\n' 'Les nombres A/B, C/A et les coûts C/B sont conservés sous `pairs/*/`, `p3-primary-pairs/*/` et `p3-cost-pairs/*/`. La conclusion mémoire porte sur RSS/RssAnon/cache fichier ; jemalloc reste diagnostique.'
 } > "$CAMPAIGN/README.md" || die 'écriture impossible de README.md'
 
 # Le statut du processus est le contrat d'automatisation : seul PASS P3 peut
