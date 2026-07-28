@@ -210,7 +210,7 @@ primary_b=""
 cold_records_available(){
   local dir kind metric suffix
   for dir in "$a_dir" "$b_dir"; do
-    for kind in bool match; do
+    for kind in bool; do
       for metric in client took probe; do
         case "$metric" in client) suffix=_s ;; *) suffix=_ms ;; esac
         [ -s "$dir/surch.p2.cold.$kind.$metric$suffix" ] || return 1
@@ -219,17 +219,32 @@ cold_records_available(){
   done
 }
 
+replay_records_available(){
+  local dir kind metric suffix
+  for dir in "$a_dir" "$b_dir"; do
+    for kind in bool match; do
+      for metric in client took probe; do
+        case "$metric" in client) suffix=_s ;; *) suffix=_ms ;; esac
+        [ -s "$dir/surch.p2.replay_mix_5050.$kind.$metric$suffix" ] || return 1
+      done
+    done
+  done
+}
+
 # Cold demeure dans les scorecards comme diagnostic. Si les deux côtés ont une
 # série complète, ses records restent présents pour les lecteurs existants ;
-# sinon il est omis sans bloquer les quatre phases chaudes qui établissent la
+# sinon il est omis sans bloquer les phases causales qui établissent la
 # validité P2 (corps gelés, routage et parité A/B).
-for phase in fixed random no_source cold; do
+phases=(warm_match match_control warm_bool bool_size10 bool_size0 fixed_martin cold)
+replay_records_available && phases+=(replay_mix_5050)
+for phase in "${phases[@]}"; do
   if [ "$phase" = cold ] && ! cold_records_available; then
     continue
   fi
   case "$phase" in
-    fixed) kinds='match' ;;
-    *) kinds='bool match' ;;
+    warm_match|match_control|fixed_martin) kinds='match' ;;
+    warm_bool|bool_size10|bool_size0|cold) kinds='bool' ;;
+    replay_mix_5050) kinds='bool match' ;;
   esac
   for kind in $kinds; do
     for metric in client took probe; do
@@ -259,7 +274,7 @@ for phase in fixed random no_source cold; do
           b:{p50:$b_p50,p95:$b_p95,p99:$b_p99,max:$b_max},
           b_over_a:{p50:$r_p50,p95:$r_p95,p99:$r_p99,max:$r_max},
           paired_ratios_file:$ratio_file,paired_ratios_zero_denominator:$zero}' >> "$records_file"
-      if [ "$phase/$kind/$metric" = 'random/bool/took' ]; then
+      if [ "$phase/$kind/$metric" = 'bool_size10/bool/took' ]; then
         primary_a=$a_file
         primary_b=$b_file
         primary_a_p95=$a_p95
@@ -270,15 +285,15 @@ for phase in fixed random no_source cold; do
   done
 done
 
-[ -n "$primary_a" ] && [ -n "$primary_b" ] || die 'P2 invalide: série primaire random/bool/took absente'
-bootstrap_tsv="$out_dir/bootstrap-random-bool-took-p95.tsv"
+[ -n "$primary_a" ] && [ -n "$primary_b" ] || die 'P2 invalide: série primaire bool_size10/bool/took absente'
+bootstrap_tsv="$out_dir/bootstrap-bool-size10-bool-took-p95.tsv"
 bootstrap_values="$tmp_dir/bootstrap-values"
 bootstrap_primary "$primary_a" "$primary_b" "$bootstrap_tsv" "$bootstrap_values"
 read -r bootstrap_median bootstrap_low bootstrap_high < "$bootstrap_values"
 bootstrap_json=$(jq -n \
   --arg raw_file "$bootstrap_tsv" --argjson samples "$bootstrap_samples" --argjson seed "$bootstrap_seed" \
   --argjson median "$bootstrap_median" --argjson low "$bootstrap_low" --argjson high "$bootstrap_high" \
-  '{metric:"took",phase:"random",kind:"bool",quantile:"p95",resamples:$samples,seed:$seed,
+  '{metric:"took",phase:"bool_size10",kind:"bool",quantile:"p95",resamples:$samples,seed:$seed,
     ratio_median:$median,ci95_low:$low,ci95_high:$high,raw_file:$raw_file}')
 jq -s --arg a_dir "$a_dir" --arg b_dir "$b_dir" --argjson bootstrap "$bootstrap_json" \
   --argjson observed_cpu_configuration "$a_cpu_configuration" \
@@ -286,7 +301,7 @@ jq -s --arg a_dir "$a_dir" --arg b_dir "$b_dir" --argjson bootstrap "$bootstrap_
   "$records_file" > "$out_dir/pair-summary.json"
 
 awk -v a="$primary_a_p95" -v b="$primary_b_p95" -v ratio="$primary_ratio_p95" -v low="$bootstrap_low" -v high="$bootstrap_high" '
-  BEGIN { printf "| random / bool / took | %.2f ms | %.2f ms | %.4f | [%.4f; %.4f] |\n", a, b, ratio, low, high }
+  BEGIN { printf "| bool_size10 / bool / took | %.2f ms | %.2f ms | %.4f | [%.4f; %.4f] |\n", a, b, ratio, low, high }
 ' > "$tmp_dir/primary-row"
 {
   printf '# P2 — paire A/B\n\n'

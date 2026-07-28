@@ -129,6 +129,12 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     des trois paires A/B, B/C et A/C, applique les SLO principaux à C/A,
     puis refuse un coût moteur p95 C/B supérieur à `1,05`; l'intégrité P3
     n'est exigée que pour C.
+  - [x] Le harnais P3 sélectionne maintenant trois ensembles mono-token
+    disjoints sur `NOM` (bool, témoin match et chauffe), gèle les quatre
+    corps causaux par SHA-256 et mesure le témoin match avant tout bool. Les
+    snapshots JSONL couvrent P3, mémoire processus/jemalloc et cgroup à
+    `index_ready` puis autour de chaque phase ; une métrique absente invalide
+    le run. Le mix 50/50 historique ne subsiste que comme replay opt-in.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.
