@@ -73,8 +73,12 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Exécuter la matrice fail-closed du gate P3
+      - name: Exécuter la matrice normale du gate P3
+        run: bash deploy/bench-local/test-p3-harness.sh
+      - name: Exécuter la matrice exhaustive du gate P3
         run: P3_MATRIX_EXHAUSTIVE=1 bash deploy/bench-local/test-p3-harness.sh
+      - name: Exécuter le pilote P3 sans Docker ni VM
+        run: bash deploy/bench-local/test-p3-campaign.sh
 
   # Manual scoring-side perf regression gate. Kept disabled (`if: false`)
   # because the criterion harness takes 5–10 minutes for the four groups

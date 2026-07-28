@@ -160,6 +160,15 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     AWK/Rust. Le protocole réduit ratifié ne décide que sur RSS/RssAnon/cache
     fichier ; jemalloc reste diagnostique. La conservation historique
     `C/A <= 0,50` est rapportée séparément du PASS produit `<= 0,70`.
+  - [x] Correctif smoke v4 / Fix4 local : le pilote sépare toutes les
+    déclarations locales multiples, notamment `build_image`; une régression
+    versionnée exécute le vrai `p2-campaign.sh` sous `set -euo pipefail` avec
+    Docker/fair-ab/rapport/gate simulés. Elle couvre smoke, neuf runs latins,
+    artefacts, hard-stops C1/premier triplet et propagations fair-ab,
+    p2-report et gate; l'entrée AWK optionnelle reste non vide sous Bash 4.3
+    avec `set -u`, et `mawk` ne reçoit plus `-v match=...`. La configuration
+    CI exécute désormais matrice normale, exhaustive et pilote. La validation
+    CI externe reste explicitement ouverte.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.

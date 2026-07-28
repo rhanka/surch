@@ -196,7 +196,11 @@ historical replay line lives in
   détaillées dans `plan/p2-segmented-postings.md`.
   La correction versionnée de re-revue verrouille la bijection des neuf runs,
   la matrice du gate et le smoke v4 ; toute publication reste bloquée jusqu'à
-  la gate externe. Le pin C demeure `d0accd6`, donc aucune fraîcheur jemalloc
+  la gate externe. Le smoke v4 a néanmoins révélé un arrêt avant mesure sur
+  une variable locale non liée; Fix4 sépare les déclarations, corrige aussi
+  le tableau replay vide sous Bash 4.3 et versionne la régression du vrai
+  pilote sans Docker/VM, mais ne vaut pas encore une CI ni un smoke externe
+  vert. Le pin C demeure `d0accd6`, donc aucune fraîcheur jemalloc
   issue de HEAD n'est revendiquée par la campagne contractuelle. La réduction
   M3 est ratifiée dans `.remote/p3-campagne-plan.md` : seules RSS/RssAnon et
   cache fichier sont décisionnels; jemalloc reste diagnostique.

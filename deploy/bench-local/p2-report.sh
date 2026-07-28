@@ -115,7 +115,8 @@ series_count(){
 
 # Retourne p50, p95, p99 et max en rang le plus proche, dans l'unité finale.
 series_stats(){
-  local path=$1 scale=$2
+  local path=$1
+  local scale=$2
   sort -g "$path" | awk -v scale="$scale" '
     function rank_nearest(n, q, raw, rank) {
       raw = n * q; rank = int(raw); if (rank < raw) rank++
@@ -140,7 +141,9 @@ ratio_or_null(){
 # explicitement NA. Les valeurs client restent en secondes dans ce TSV, comme
 # auparavant, tandis que le résumé est exprimé en millisecondes.
 write_ratios(){
-  local a_file=$1 b_file=$2 output=$3
+  local a_file=$1
+  local b_file=$2
+  local output=$3
   awk '
     NR == FNR { if ($0 != "") a[++count_a] = $1; next }
     $0 != "" { b[++count_b] = $1 }
@@ -161,7 +164,10 @@ write_ratios(){
 # Les constantes sont identiques à fair-ab.sh, donc l'échantillonnage est
 # reproductible d'une exécution à l'autre sur le même awk.
 bootstrap_primary(){
-  local a_file=$1 b_file=$2 output=$3 values=$4
+  local a_file=$1
+  local b_file=$2
+  local output=$3
+  local values=$4
   awk -v samples="$bootstrap_samples" -v initial_seed="$bootstrap_seed" -v output="$output" '
     function rank_nearest(n, q, raw, rank) {
       raw = n * q; rank = int(raw); if (rank < raw) rank++
@@ -222,7 +228,10 @@ bootstrap_primary(){
 primary_a=""
 primary_b=""
 cold_records_available(){
-  local dir kind metric suffix
+  local dir
+  local kind
+  local metric
+  local suffix
   for dir in "$a_dir" "$b_dir"; do
     for kind in bool; do
       for metric in client took probe; do
@@ -234,7 +243,10 @@ cold_records_available(){
 }
 
 replay_records_available(){
-  local dir kind metric suffix
+  local dir
+  local kind
+  local metric
+  local suffix
   for dir in "$a_dir" "$b_dir"; do
     for kind in bool match; do
       for metric in client took probe; do

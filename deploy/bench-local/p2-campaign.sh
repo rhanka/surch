@@ -40,7 +40,17 @@ err(){ printf '\033[1;31m[p2-campaign]\033[0m %s\n' "$*" >&2; }
 die(){ err "$*"; exit 1; }
 
 verify_smoke_prerequisite(){
-  local smoke="$1" proof provenance metadata manifest manifest_sha formula formula_sha score variant expected
+  local smoke="$1"
+  local proof
+  local provenance
+  local metadata
+  local manifest
+  local manifest_sha
+  local formula
+  local formula_sha
+  local score
+  local variant
+  local expected
   proof="$smoke/smoke-proof.json"
   [ -s "$proof" ] || return 1
   jq -e --arg protocol "$P3_PROTOCOL_VERSION" --arg a "$P3_A_SHA" --arg b "$P3_B_SHA" --arg c "$P3_C_SHA" '
@@ -126,7 +136,8 @@ mem_available_mib(){ awk '/^MemAvailable:/{print int($2 / 1024)}' /proc/meminfo;
 load_one(){ awk '{print $1}' /proc/loadavg; }
 disk_free_mib(){ df -Pm "$P2_DOCKER_ROOT" | awk 'NR == 2 {print $4}'; }
 campaign_artifacts_on_docker_fs(){
-  local docker_fs campaign_fs
+  local docker_fs
+  local campaign_fs
   docker_fs=$(df -Pk "$P2_DOCKER_ROOT" | awk 'NR == 2 {print $1}')
   campaign_fs=$(df -Pk "$P2_CAMPAIGN_DIR" | awk 'NR == 2 {print $1}')
   [ -n "$docker_fs" ] && [ "$docker_fs" = "$campaign_fs" ]
@@ -139,12 +150,14 @@ campaign_artifacts_mib(){
   fi
 }
 disk_free_effective_mib(){
-  local free artifacts
+  local free
+  local artifacts
   free=$(disk_free_mib); artifacts=$(campaign_artifacts_mib)
   printf '%s' "$(( free + artifacts ))"
 }
 write_host_state(){
-  local path="$1" artifacts_on_docker_fs=false
+  local path="$1"
+  local artifacts_on_docker_fs=false
   campaign_artifacts_on_docker_fs && artifacts_on_docker_fs=true
   jq -n \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -161,7 +174,11 @@ write_host_state(){
 }
 
 image_metadata(){
-  local image="$1" sha="$2" out="$3" image_id digest
+  local image="$1"
+  local sha="$2"
+  local out="$3"
+  local image_id
+  local digest
   image_id=$(docker image inspect -f '{{.Id}}' "$image") || return 1
   digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$image" 2>/dev/null || true)
   [ -n "$digest" ] || digest="$image_id"
@@ -170,7 +187,9 @@ image_metadata(){
 }
 
 build_image(){
-  local variant="$1" sha="$2" image="surch-p2-${variant,,}:${sha:0:12}"
+  local variant="$1"
+  local sha="$2"
+  local image="surch-p2-${variant,,}:${sha:0:12}"
   git -C "$ROOT_DIR" cat-file -e "${sha}^{commit}" || die "SHA absent du clone local: $sha"
   log "construction image $variant depuis $sha (sans pull, session courante)"
   if ! git -C "$ROOT_DIR" archive --format=tar "$sha" | docker build --pull=false -t "$image" -; then
@@ -230,7 +249,11 @@ fi
 [ "$EXPECTED_DOCS" -gt 0 ] || die "corpus smoke vide ou NDJSON invalide"
 
 assert_scorecard(){
-  local out="$1" variant="$2" image_metadata_file="$3" execution_id="$4" score="$out/surch.json"
+  local out="$1"
+  local variant="$2"
+  local image_metadata_file="$3"
+  local execution_id="$4"
+  local score="$out/surch.json"
   [ -s "$score" ] || die "scorecard absente: $score"
   jq -e \
     --arg variant "$variant" \
@@ -271,7 +294,13 @@ new_execution_id(){
 declare -A P2_RUN_EXECUTION_IDS=()
 
 run_variant(){
-  local name="$1" variant="$2" image="$3" metadata="$4" require_p3=0 execution_id out="$P2_CAMPAIGN_DIR/runs/$name"
+  local name="$1"
+  local variant="$2"
+  local image="$3"
+  local metadata="$4"
+  local require_p3=0
+  local execution_id
+  local out="$P2_CAMPAIGN_DIR/runs/$name"
   [ "$variant" = "C" ] && require_p3=1
   [ -z "${P2_RUN_EXECUTION_IDS[$name]:-}" ] || die "identifiant d'exécution déjà attribué à $name"
   execution_id=$(new_execution_id) || die "UUID d'exécution impossible pour $name"
@@ -297,8 +326,17 @@ run_variant(){
 }
 
 compare_parity(){
-  local pair="$1" a_name="$2" b_name="$3" report_group="$4" report="$P2_CAMPAIGN_DIR/$report_group/$pair" a_execution_id b_execution_id
-  local phase a_file b_file phases=(warm_match match_control warm_bool bool_size10 bool_size0 fixed_martin)
+  local pair="$1"
+  local a_name="$2"
+  local b_name="$3"
+  local report_group="$4"
+  local report="$P2_CAMPAIGN_DIR/$report_group/$pair"
+  local a_execution_id
+  local b_execution_id
+  local phase
+  local a_file
+  local b_file
+  local phases=(warm_match match_control warm_bool bool_size10 bool_size0 fixed_martin)
   mkdir -p "$report" || die "création rapport impossible: $report"
   [ "$P2_REPLAY_MIX_5050" = "0" ] || phases+=(replay_mix_5050)
   for phase in "${phases[@]}"; do
@@ -325,7 +363,12 @@ compare_parity(){
   # mais son reclaim dépend de droits hôte qui ne modifient pas les quatre
   # phases chaudes, leurs corps gelés, leur routage ni leur parité A/B.
   # Une divergence cold est donc rapportée sans annuler la comparaison P2.
-  local cold_a_ok cold_b_ok cold_a_file cold_b_file cold_parity=false cold_status
+  local cold_a_ok
+  local cold_b_ok
+  local cold_a_file
+  local cold_b_file
+  local cold_parity=false
+  local cold_status
   cold_a_ok=$(jq -r '.cold_probe_ok == true' "$P2_CAMPAIGN_DIR/runs/$a_name/surch.json")
   cold_b_ok=$(jq -r '.cold_probe_ok == true' "$P2_CAMPAIGN_DIR/runs/$b_name/surch.json")
   cold_a_file="$P2_CAMPAIGN_DIR/runs/$a_name/surch.p2.responses.cold.canonical.ndjson"
@@ -350,7 +393,15 @@ compare_parity(){
 }
 
 recover_host(){
-  local name="$1" state="$P2_CAMPAIGN_DIR/recovery-$name.json" mem disk disk_effective artifacts load containers volumes
+  local name="$1"
+  local state="$P2_CAMPAIGN_DIR/recovery-$name.json"
+  local mem
+  local disk
+  local disk_effective
+  local artifacts
+  local load
+  local containers
+  local volumes
   containers=$(docker ps -a --format '{{.Names}}') || die 'docker ps impossible pendant la récupération'
   if grep -qx 'fairab-surch' <<< "$containers"; then
     die 'teardown incomplet: fairab-surch existe'
@@ -388,7 +439,10 @@ recover_host(){
 }
 
 p3_ratio(){
-  local summary="$1" phase="$2" metric="$3" quantile="$4"
+  local summary="$1"
+  local phase="$2"
+  local metric="$3"
+  local quantile="$4"
   jq -er --arg phase "$phase" --arg metric "$metric" --arg quantile "$quantile" '
     first(.records[] | select(.phase == $phase and .kind == "bool" and .metric == $metric) | .b_over_a[$quantile])
     | if type == "number" then . else error("ratio P3 absent") end
@@ -404,7 +458,9 @@ p3_match_ratio(){
 }
 
 p3_index_telemetry_value(){
-  local score="$1" filter="$2" telemetry
+  local score="$1"
+  local filter="$2"
+  local telemetry
   telemetry=$(jq -er '.p2.telemetry_jsonl | strings' "$score") || return 1
   [ -r "$telemetry" ] || return 1
   jq -ser --arg filter "$filter" '
@@ -417,7 +473,10 @@ p3_index_telemetry_value(){
 }
 
 p3_recovery_ratio(){
-  local a="$1" b="$2" c="$3" mode="$4"
+  local a="$1"
+  local b="$2"
+  local c="$3"
+  local mode="$4"
   awk -v a="$a" -v b="$b" -v c="$c" -v mode="$mode" '
     BEGIN {
       if (mode == "rss") denominator = b - a
@@ -435,7 +494,10 @@ p3_recovery_ratio(){
 # de compaction/récupération que le gate final. Les valeurs sont synthétiques,
 # déterministes et le dénominateur indéfini doit être rejeté.
 p3_smoke_formula_fixture(){
-  local compaction rss anon file
+  local compaction
+  local rss
+  local anon
+  local file
   compaction=$(awk 'BEGIN { printf "%.12g", 10 / 1000 }') || return 1
   rss=$(p3_recovery_ratio 100 200 110 rss) || return 1
   anon=$(p3_recovery_ratio 100 200 110 rss) || return 1
@@ -450,7 +512,14 @@ p3_smoke_formula_fixture(){
 }
 
 write_smoke_proof(){
-  local manifest="" manifest_sha="" candidate_sha variant score candidate_manifest formula formula_sha
+  local manifest=""
+  local manifest_sha=""
+  local candidate_sha
+  local variant
+  local score
+  local candidate_manifest
+  local formula
+  local formula_sha
   [ "$P2_MODE" = smoke ] || return 1
   p3_smoke_formula_fixture || return 1
   for variant in A B C; do
@@ -476,7 +545,8 @@ write_smoke_proof(){
 }
 
 p3_c1_hard_stop(){
-  local score="$P2_CAMPAIGN_DIR/runs/C1/surch.json" status
+  local score="$P2_CAMPAIGN_DIR/runs/C1/surch.json"
+  local status
   [ -s "$score" ] || die 'C1: scorecard introuvable'
   status=$(jq -er '.p2.phase_status_jsonl | strings' "$score") || die 'C1: statut de phases absent'
   [ -r "$status" ] || die 'C1: statut de phases illisible'
@@ -500,14 +570,34 @@ p3_c1_hard_stop(){
 }
 
 p3_first_triplet_hard_stop(){
-  local a="$1" b="$2" c="$3" primary cost c_a c_b_10 c_b_0 match a_rss b_rss c_rss a_anon b_anon c_anon a_file b_file c_file rss_recovery anon_recovery file_recovery
+  local a="$1"
+  local b="$2"
+  local c="$3"
+  local primary
+  local cost
+  local c_a
+  local c_b_10
+  local c_b_0
+  local match_ratio
+  local a_rss
+  local b_rss
+  local c_rss
+  local a_anon
+  local b_anon
+  local c_anon
+  local a_file
+  local b_file
+  local c_file
+  local rss_recovery
+  local anon_recovery
+  local file_recovery
   primary="$P2_CAMPAIGN_DIR/p3-primary-pairs/$a-$c/pair-summary.json"
   cost="$P2_CAMPAIGN_DIR/p3-cost-pairs/$b-$c/pair-summary.json"
   [ -r "$primary" ] && [ -r "$cost" ] || die 'hard-stop premier triplet: rapports de paires absents'
   c_a=$(p3_ratio "$primary" bool_size10 took p95) || die 'hard-stop premier triplet: C/A produit absent'
   c_b_10=$(p3_ratio "$cost" bool_size10 took p95) || die 'hard-stop premier triplet: C/B size:10 absent'
   c_b_0=$(p3_ratio "$cost" bool_size0 took p95) || die 'hard-stop premier triplet: C/B size:0 absent'
-  match=$(p3_match_ratio "$primary") || die 'hard-stop premier triplet: témoin C/A absent'
+  match_ratio=$(p3_match_ratio "$primary") || die 'hard-stop premier triplet: témoin C/A absent'
   a_rss=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$a/surch.json" process.rss_bytes) || die 'hard-stop premier triplet: RSS A absent'
   b_rss=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$b/surch.json" process.rss_bytes) || die 'hard-stop premier triplet: RSS B absent'
   c_rss=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$c/surch.json" process.rss_bytes) || die 'hard-stop premier triplet: RSS C absent'
@@ -520,12 +610,12 @@ p3_first_triplet_hard_stop(){
   rss_recovery=$(p3_recovery_ratio "$a_rss" "$b_rss" "$c_rss" rss) || die 'hard-stop premier triplet: formule RSS indéfinie'
   anon_recovery=$(p3_recovery_ratio "$a_anon" "$b_anon" "$c_anon" rss) || die 'hard-stop premier triplet: formule RssAnon indéfinie'
   file_recovery=$(p3_recovery_ratio "$a_file" "$b_file" "$c_file" file) || die 'hard-stop premier triplet: formule cache fichier indéfinie'
-  jq -n --argjson c_a "$c_a" --argjson c_b_size10 "$c_b_10" --argjson c_b_size0 "$c_b_0" --argjson match "$match" \
+  jq -n --argjson c_a "$c_a" --argjson c_b_size10 "$c_b_10" --argjson c_b_size0 "$c_b_0" --argjson match "$match_ratio" \
     --argjson rss_recovery "$rss_recovery" --argjson rss_anon_recovery "$anon_recovery" --argjson file_recovery "$file_recovery" \
     '{c_over_a_bool_size10_took_p95:$c_a,c_over_b_bool_size10_took_p95:$c_b_size10,c_over_b_bool_size0_took_p95:$c_b_size0,match_control_c_over_a_took_p95:$match,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery}}' \
     > "$P2_CAMPAIGN_DIR/preselection-triplet-1.json" || die 'écriture impossible du hard-stop premier triplet'
-  awk -v c_a="$c_a" -v c_b_10="$c_b_10" -v c_b_0="$c_b_0" -v match="$match" -v rss="$rss_recovery" -v anon="$anon_recovery" -v file="$file_recovery" '
-    BEGIN { exit !(c_a <= .80 && c_b_10 <= 1.10 && c_b_0 <= 1.10 && match <= 1.10 && rss >= .80 && anon >= .80 && file >= .80) }
+  awk -v c_a="$c_a" -v c_b_10="$c_b_10" -v c_b_0="$c_b_0" -v match_ratio="$match_ratio" -v rss="$rss_recovery" -v anon="$anon_recovery" -v file="$file_recovery" '
+    BEGIN { exit !(c_a <= .80 && c_b_10 <= 1.10 && c_b_0 <= 1.10 && match_ratio <= 1.10 && rss >= .80 && anon >= .80 && file >= .80) }
   ' || die 'hard-stop premier triplet: présélection P3 rouge; campagne arrêtée avant les six runs restants'
 }
 

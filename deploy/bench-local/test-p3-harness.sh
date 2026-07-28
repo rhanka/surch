@@ -83,8 +83,23 @@ GATE="$ROOT_DIR/deploy/bench-local/p2-gate.sh"
 PAIR_REPORT="$ROOT_DIR/deploy/bench-local/p2-report.sh"
 
 make_gate_fixture(){
-  local campaign="$1" run variant status telemetry value directory rss anon file p3 phase boundary delta execution_id
-  local manifest="$campaign/inputs/probe_p2_inputs.manifest" manifest_sha
+  local campaign="$1"
+  local run
+  local variant
+  local status
+  local telemetry
+  local value
+  local directory
+  local rss
+  local anon
+  local file
+  local p3
+  local phase
+  local boundary
+  local delta
+  local execution_id
+  local manifest="$campaign/inputs/probe_p2_inputs.manifest"
+  local manifest_sha
   mkdir -p "$campaign/inputs" "$campaign/runs"
   printf '%s\n' 'protocol=p2-segmented-postings-v4-termes-analyses' > "$manifest"
   manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
@@ -144,7 +159,13 @@ make_gate_fixture(){
     done
   done
   write_pair(){
-    local group="$1" pair="$2" a="$3" b="$4" out a_execution_id b_execution_id
+    local group="$1"
+    local pair="$2"
+    local a="$3"
+    local b="$4"
+    local out
+    local a_execution_id
+    local b_execution_id
     out="$campaign/$group/$pair"
     mkdir -p "$out"
     a_execution_id=$(jq -er '.p2.execution_id' "$campaign/runs/$a/surch.json")
@@ -164,7 +185,12 @@ make_gate_fixture(){
   # producteur. Si le sens A/B ou le bootstrap régresse dans p2-report.sh,
   # cette paire alimente le gate et son seuil par répétition échoue.
   write_raw_series(){
-    local run="$1" phase metric suffix value index
+    local run="$1"
+    local phase
+    local metric
+    local suffix
+    local value
+    local index
     for phase in warm_match match_control warm_bool bool_size10 bool_size0 fixed_martin; do
       for metric in client took probe; do
         suffix=_ms; [ "$metric" = client ] && suffix=_s
@@ -187,7 +213,8 @@ make_gate_fixture(){
 }
 
 copy_fixture(){
-  local target="$1" file
+  local target="$1"
+  local file
   cp -a "$TMP_DIR/gate-base" "$target"
   # pair-summary.json conserve des chemins absolus : les réancrer dans la
   # copie est indispensable pour tester la liaison répertoire/run du gate.
@@ -200,7 +227,16 @@ copy_fixture(){
 }
 
 set_ratio(){
-  local campaign="$1" group="$2" phase="$3" kind="$4" metric="$5" quantile="$6" value="$7" pair file tmp
+  local campaign="$1"
+  local group="$2"
+  local phase="$3"
+  local kind="$4"
+  local metric="$5"
+  local quantile="$6"
+  local value="$7"
+  local pair
+  local file
+  local tmp
   for pair in "$campaign/$group"/*; do
     file="$pair/pair-summary.json"; tmp="$file.tmp"
     jq --arg phase "$phase" --arg kind "$kind" --arg metric "$metric" --arg quantile "$quantile" --argjson value "$value" '
@@ -210,7 +246,16 @@ set_ratio(){
 }
 
 set_ratio_one(){
-  local campaign="$1" group="$2" pair="$3" phase="$4" kind="$5" metric="$6" quantile="$7" value="$8" file tmp
+  local campaign="$1"
+  local group="$2"
+  local pair="$3"
+  local phase="$4"
+  local kind="$5"
+  local metric="$6"
+  local quantile="$7"
+  local value="$8"
+  local file
+  local tmp
   file="$campaign/$group/$pair/pair-summary.json"; tmp="$campaign/$group/$pair/pair-summary.tmp"
   jq --arg phase "$phase" --arg kind "$kind" --arg metric "$metric" --arg quantile "$quantile" --argjson value "$value" '
     .records |= map(if .phase == $phase and .kind == $kind and .metric == $metric then .b_over_a[$quantile] = $value | .b.p95 = (.a.p95 * $value) else . end)
@@ -218,14 +263,23 @@ set_ratio_one(){
 }
 
 set_bootstrap(){
-  local campaign="$1" value="$2" file tmp
+  local campaign="$1"
+  local value="$2"
+  local file
+  local tmp
   for file in "$campaign/p3-primary-pairs"/*/pair-summary.json; do
     tmp="$file.tmp"; jq --argjson value "$value" '.primary_bootstrap.ci95_high = $value' "$file" > "$tmp" && mv "$tmp" "$file"
   done
 }
 
 set_status_value(){
-  local campaign="$1" variant="$2" filter="$3" value="$4" run file tmp
+  local campaign="$1"
+  local variant="$2"
+  local filter="$3"
+  local value="$4"
+  local run
+  local file
+  local tmp
   for run in "$campaign/runs/$variant"[123]; do
     file="$run/status.jsonl"; tmp="$file.tmp"
     jq -c --arg filter "$filter" --argjson value "$value" '
@@ -239,7 +293,13 @@ set_status_value(){
 }
 
 set_telemetry_value(){
-  local campaign="$1" variant="$2" path="$3" value="$4" run file tmp
+  local campaign="$1"
+  local variant="$2"
+  local path="$3"
+  local value="$4"
+  local run
+  local file
+  local tmp
   for run in "$campaign/runs/$variant"[123]; do
     file="$run/telemetry.jsonl"; tmp="$file.tmp"
     jq -c --arg path "$path" --argjson value "$value" 'setpath($path | split("."); $value)' "$file" > "$tmp" && mv "$tmp" "$file"
@@ -247,13 +307,24 @@ set_telemetry_value(){
 }
 
 set_telemetry_one(){
-  local campaign="$1" run="$2" path="$3" value="$4" file tmp
+  local campaign="$1"
+  local run="$2"
+  local path="$3"
+  local value="$4"
+  local file
+  local tmp
   file="$campaign/runs/$run/telemetry.jsonl"; tmp="$campaign/runs/$run/telemetry.tmp"
   jq -c --arg path "$path" --argjson value "$value" 'setpath($path | split("."); $value)' "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
 set_score_value(){
-  local campaign="$1" variant="$2" path="$3" value="$4" run file tmp
+  local campaign="$1"
+  local variant="$2"
+  local path="$3"
+  local value="$4"
+  local run
+  local file
+  local tmp
   for run in "$campaign/runs/$variant"[123]; do
     file="$run/surch.json"; tmp="$file.tmp"
     jq --arg path "$path" --argjson value "$value" 'setpath($path | split("."); $value)' "$file" > "$tmp" && mv "$tmp" "$file"
@@ -261,7 +332,14 @@ set_score_value(){
 }
 
 set_status_value_for_phase(){
-  local campaign="$1" variant="$2" phase="$3" path="$4" value="$5" run file tmp
+  local campaign="$1"
+  local variant="$2"
+  local phase="$3"
+  local path="$4"
+  local value="$5"
+  local run
+  local file
+  local tmp
   for run in "$campaign/runs/$variant"[123]; do
     file="$run/status.jsonl"; tmp="$file.tmp"
     jq -c --arg phase "$phase" --arg path "$path" --argjson value "$value" '
@@ -271,7 +349,15 @@ set_status_value_for_phase(){
 }
 
 rewire_pair(){
-  local campaign="$1" group="$2" pair="$3" a="$4" b="$5" parity summary a_execution_id b_execution_id
+  local campaign="$1"
+  local group="$2"
+  local pair="$3"
+  local a="$4"
+  local b="$5"
+  local parity
+  local summary
+  local a_execution_id
+  local b_execution_id
   parity="$campaign/$group/$pair/parity.json"
   summary="$campaign/$group/$pair/pair-summary.json"
   a_execution_id=$(jq -er '.p2.execution_id' "$campaign/runs/$a/surch.json")
@@ -285,7 +371,10 @@ rewire_pair(){
 }
 
 run_gate(){
-  local campaign="$1" verdict="$2" expected_code="$3" code
+  local campaign="$1"
+  local verdict="$2"
+  local expected_code="$3"
+  local code
   set +e
   "$GATE" --campaign "$campaign" > "$campaign/gate.stdout" 2> "$campaign/gate.stderr"
   code=$?
@@ -299,7 +388,18 @@ run_gate(){
 }
 
 matrix_upper(){
-  local name="$1" group="$2" phase="$3" kind="$4" metric="$5" quantile="$6" below="$7" equal="$8" above="$9" ok edge bad
+  local name="$1"
+  local group="$2"
+  local phase="$3"
+  local kind="$4"
+  local metric="$5"
+  local quantile="$6"
+  local below="$7"
+  local equal="$8"
+  local above="$9"
+  local ok
+  local edge
+  local bad
   ok="$TMP_DIR/$name-ok"; edge="$TMP_DIR/$name-equality"; bad="$TMP_DIR/$name-bad"
   copy_fixture "$ok"; set_ratio "$ok" "$group" "$phase" "$kind" "$metric" "$quantile" "$below"; run_gate "$ok" 'PASS P3' 0
   copy_fixture "$edge"; set_ratio "$edge" "$group" "$phase" "$kind" "$metric" "$quantile" "$equal"; run_gate "$edge" 'PASS P3' 0
@@ -307,7 +407,19 @@ matrix_upper(){
 }
 
 matrix_lower(){
-  local name="$1" group="$2" phase="$3" kind="$4" metric="$5" quantile="$6" above="$7" equal="$8" below="$9" bad_verdict="${10}" ok edge bad
+  local name="$1"
+  local group="$2"
+  local phase="$3"
+  local kind="$4"
+  local metric="$5"
+  local quantile="$6"
+  local above="$7"
+  local equal="$8"
+  local below="$9"
+  local bad_verdict="${10}"
+  local ok
+  local edge
+  local bad
   ok="$TMP_DIR/$name-ok"; edge="$TMP_DIR/$name-equality"; bad="$TMP_DIR/$name-bad"
   copy_fixture "$ok"; set_ratio "$ok" "$group" "$phase" "$kind" "$metric" "$quantile" "$above"; run_gate "$ok" 'PASS P3' 0
   copy_fixture "$edge"; set_ratio "$edge" "$group" "$phase" "$kind" "$metric" "$quantile" "$equal"; run_gate "$edge" 'PASS P3' 0
@@ -315,7 +427,19 @@ matrix_lower(){
 }
 
 matrix_repetition_upper(){
-  local name="$1" group="$2" phase="$3" kind="$4" metric="$5" quantile="$6" below="$7" equal="$8" above="$9" ok edge bad pair=A1-C1
+  local name="$1"
+  local group="$2"
+  local phase="$3"
+  local kind="$4"
+  local metric="$5"
+  local quantile="$6"
+  local below="$7"
+  local equal="$8"
+  local above="$9"
+  local ok
+  local edge
+  local bad
+  local pair=A1-C1
   ok="$TMP_DIR/$name-ok"; edge="$TMP_DIR/$name-equality"; bad="$TMP_DIR/$name-bad"
   [ "$group" = p3-cost-pairs ] && pair=B1-C1
   copy_fixture "$ok"; set_ratio_one "$ok" "$group" "$pair" "$phase" "$kind" "$metric" "$quantile" "$below"; run_gate "$ok" 'PASS P3' 0
@@ -385,7 +509,8 @@ done
 fi
 
 checks_at_boundary(){
-  local campaign="$1" expected="$2"
+  local campaign="$1"
+  local expected="$2"
   jq -e --argjson expected "$expected" '
     ([.checks[] | select(.pass == false) | .name]) as $failed
     | all($expected[]; . as $name | ($failed | index($name)) != null)
