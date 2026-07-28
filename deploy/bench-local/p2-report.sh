@@ -64,6 +64,14 @@ p2_cpu_configuration(){
   ' "$scorecard"
 }
 
+p2_execution_id(){
+  jq -er '
+    .p2.execution_id
+    | strings
+    | select(test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+  ' "$1"
+}
+
 a_scorecard="$a_dir/surch.json"
 b_scorecard="$b_dir/surch.json"
 [ -r "$a_scorecard" ] || die "scorecard A illisible: $a_scorecard"
@@ -74,6 +82,12 @@ b_cpu_configuration=$(p2_cpu_configuration "$b_scorecard") \
   || die "P2 invalide: configuration CPU B absente ou incohérente"
 [ "$a_cpu_configuration" = "$b_cpu_configuration" ] \
   || die "P2 invalide: configuration CPU A/B différente (nproc, cpuset moteur ou cpuset sonde)"
+a_execution_id=$(p2_execution_id "$a_scorecard") \
+  || die "P2 invalide: identifiant d'exécution A absent ou invalide"
+b_execution_id=$(p2_execution_id "$b_scorecard") \
+  || die "P2 invalide: identifiant d'exécution B absent ou invalide"
+[ "$a_execution_id" != "$b_execution_id" ] \
+  || die "P2 invalide: A et B partagent le même identifiant d'exécution"
 
 # Refuse les entrées non numériques/non finies. Les lignes vides sont
 # volontairement ignorées comme dans l'ancien lecteur Python.
@@ -295,9 +309,9 @@ bootstrap_json=$(jq -n \
   --argjson median "$bootstrap_median" --argjson low "$bootstrap_low" --argjson high "$bootstrap_high" \
   '{metric:"took",phase:"bool_size10",kind:"bool",quantile:"p95",resamples:$samples,seed:$seed,
     ratio_median:$median,ci95_low:$low,ci95_high:$high,raw_file:$raw_file}')
-jq -s --arg a_dir "$a_dir" --arg b_dir "$b_dir" --argjson bootstrap "$bootstrap_json" \
+jq -s --arg a_dir "$a_dir" --arg b_dir "$b_dir" --arg a_execution_id "$a_execution_id" --arg b_execution_id "$b_execution_id" --argjson bootstrap "$bootstrap_json" \
   --argjson observed_cpu_configuration "$a_cpu_configuration" \
-  '{schema:"surch.bench.p2.pair.v1",a_dir:$a_dir,b_dir:$b_dir,nearest_rank:true,observed_cpu_configuration:$observed_cpu_configuration,records:.,primary_bootstrap:$bootstrap}' \
+  '{schema:"surch.bench.p2.pair.v1",a_dir:$a_dir,b_dir:$b_dir,a_execution_id:$a_execution_id,b_execution_id:$b_execution_id,nearest_rank:true,observed_cpu_configuration:$observed_cpu_configuration,records:.,primary_bootstrap:$bootstrap}' \
   "$records_file" > "$out_dir/pair-summary.json"
 
 awk -v a="$primary_a_p95" -v b="$primary_b_p95" -v ratio="$primary_ratio_p95" -v low="$bootstrap_low" -v high="$bootstrap_high" '

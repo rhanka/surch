@@ -153,6 +153,13 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     portent aucune revendication. Dans HEAD, le refresh runtime est borné à
     une seconde et expose succès, âge et erreurs. Aucun protocole ultérieur ne
     doit repinner C sans preuve de coût de scrape concurrent.
+  - [ ] Correctif de re-revue P3 tour 3 : CI externe encore requise avant
+    fermeture. Le code local rend le gate compatible jq 1.6, impose l'identité
+    physique et l'UUID des neuf runs, produit une paire A1/C1 par le vrai
+    `p2-report.sh`, exécute la matrice exhaustive et ajoute l'oracle
+    AWK/Rust. Le protocole réduit ratifié ne décide que sur RSS/RssAnon/cache
+    fichier ; jemalloc reste diagnostique. La conservation historique
+    `C/A <= 0,50` est rapportée séparément du PASS produit `<= 0,70`.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.

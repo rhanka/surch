@@ -230,7 +230,7 @@ fi
 [ "$EXPECTED_DOCS" -gt 0 ] || die "corpus smoke vide ou NDJSON invalide"
 
 assert_scorecard(){
-  local out="$1" variant="$2" image_metadata_file="$3" score="$out/surch.json"
+  local out="$1" variant="$2" image_metadata_file="$3" execution_id="$4" score="$out/surch.json"
   [ -s "$score" ] || die "scorecard absente: $score"
   jq -e \
     --arg variant "$variant" \
@@ -248,6 +248,10 @@ assert_scorecard(){
       and (.p2.image_id | strings | length > 0)
       and (.p2.image_digest | strings | length > 0)
     ' "$score" >/dev/null || die "scorecard P2 invalide: $score"
+  jq -e --arg execution_id "$execution_id" '
+    .p2.execution_id == $execution_id
+    and ($execution_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+  ' "$score" >/dev/null || die "identifiant d'exécution P2 incohérent: $score"
   jq -e --slurpfile metadata "$image_metadata_file" '
     ($metadata | length) == 1
     and .p2.image == $metadata[0].image
@@ -256,9 +260,22 @@ assert_scorecard(){
   ' "$score" >/dev/null || die "provenance image incohérente: $score"
 }
 
+new_execution_id(){
+  local execution_id
+  [ -r /proc/sys/kernel/random/uuid ] || return 1
+  execution_id=$(cat /proc/sys/kernel/random/uuid) || return 1
+  [[ "$execution_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+  printf '%s' "$execution_id"
+}
+
+declare -A P2_RUN_EXECUTION_IDS=()
+
 run_variant(){
-  local name="$1" variant="$2" image="$3" metadata="$4" require_p3=0 out="$P2_CAMPAIGN_DIR/runs/$name"
+  local name="$1" variant="$2" image="$3" metadata="$4" require_p3=0 execution_id out="$P2_CAMPAIGN_DIR/runs/$name"
   [ "$variant" = "C" ] && require_p3=1
+  [ -z "${P2_RUN_EXECUTION_IDS[$name]:-}" ] || die "identifiant d'exécution déjà attribué à $name"
+  execution_id=$(new_execution_id) || die "UUID d'exécution impossible pour $name"
+  P2_RUN_EXECUTION_IDS[$name]="$execution_id"
   mkdir -p "$out" || die "création run impossible: $out"
   log "run $name ($variant, image=$image)"
   if ! env \
@@ -270,17 +287,17 @@ run_variant(){
     "SURCH_DENSIFY_BUDGET_DOCS=1000000" "SURCH_MERGE_MAX_DOCS=7000000" \
     "SURCH_SOURCE_FETCH_PROFILE=0" "PREFLIGHT_FORCE=0" \
     "PROBE_REQUESTS=$PROBE_REQUESTS" "COLD_PROBE_REQUESTS=50" "COLD_PROBE=1" \
-    "P2_MEASURE=1" "P2_VARIANT=$variant" "P2_REQUIRE_P3_INTEGRITY=$require_p3" "P2_PAIR_COUNT=$PAIR_COUNT" "P2_WARM_TERM_COUNT=200" "P2_REPLAY_MIX_5050=$P2_REPLAY_MIX_5050" \
+    "P2_MEASURE=1" "P2_VARIANT=$variant" "P2_EXECUTION_ID=$execution_id" "P2_REQUIRE_P3_INTEGRITY=$require_p3" "P2_PAIR_COUNT=$PAIR_COUNT" "P2_WARM_TERM_COUNT=200" "P2_REPLAY_MIX_5050=$P2_REPLAY_MIX_5050" \
     "P2_EXPECTED_DOCS=$EXPECTED_DOCS" "P2_REQUIRED_SEGMENTS=$REQUIRED_SEGMENTS" "P2_SEGMENT_GATE=$SEGMENT_GATE" \
     "P2_INPUT_DIR=$P2_INPUT_DIR" "SURCH_IMAGE=$image" "ENGINES=surch" "OUT_DIR=$out" \
     "$FAIR_AB" > "$out/fair-ab.log" 2>&1; then
     die "run $name invalide, voir $out/fair-ab.log"
   fi
-  assert_scorecard "$out" "$variant" "$metadata"
+  assert_scorecard "$out" "$variant" "$metadata" "$execution_id"
 }
 
 compare_parity(){
-  local pair="$1" a_name="$2" b_name="$3" report_group="$4" report="$P2_CAMPAIGN_DIR/$report_group/$pair"
+  local pair="$1" a_name="$2" b_name="$3" report_group="$4" report="$P2_CAMPAIGN_DIR/$report_group/$pair" a_execution_id b_execution_id
   local phase a_file b_file phases=(warm_match match_control warm_bool bool_size10 bool_size0 fixed_martin)
   mkdir -p "$report" || die "création rapport impossible: $report"
   [ "$P2_REPLAY_MIX_5050" = "0" ] || phases+=(replay_mix_5050)
@@ -292,11 +309,15 @@ compare_parity(){
       die "parité divergente pour $pair/$phase (diff: $report/parity-${phase}.diff)"
     fi
   done
+  a_execution_id=$(jq -er '.p2.execution_id | strings' "$P2_CAMPAIGN_DIR/runs/$a_name/surch.json") || die "UUID A absent pour $pair"
+  b_execution_id=$(jq -er '.p2.execution_id | strings' "$P2_CAMPAIGN_DIR/runs/$b_name/surch.json") || die "UUID B absent pour $pair"
+  [ "$a_execution_id" != "$b_execution_id" ] || die "UUID identique pour $pair"
   jq -n \
     --arg pair "$pair" --arg a_run "$a_name" --arg b_run "$b_name" \
+    --arg a_execution_id "$a_execution_id" --arg b_execution_id "$b_execution_id" \
     --arg a_manifest "$(jq -r '.p2.input_manifest_sha256' "$P2_CAMPAIGN_DIR/runs/$a_name/surch.json")" \
     --arg b_manifest "$(jq -r '.p2.input_manifest_sha256' "$P2_CAMPAIGN_DIR/runs/$b_name/surch.json")" \
-    '{pair:$pair,a_run:$a_run,b_run:$b_run,parity:true,a_manifest_sha256:$a_manifest,b_manifest_sha256:$b_manifest}' \
+    '{pair:$pair,a_run:$a_run,b_run:$b_run,a_execution_id:$a_execution_id,b_execution_id:$b_execution_id,parity:true,a_manifest_sha256:$a_manifest,b_manifest_sha256:$b_manifest}' \
     > "$report/parity.json"
   [ "$(jq -r .a_manifest_sha256 "$report/parity.json")" = "$(jq -r .b_manifest_sha256 "$report/parity.json")" ] \
     || die "manifestes différents pour $pair"
@@ -387,7 +408,10 @@ p3_index_telemetry_value(){
   telemetry=$(jq -er '.p2.telemetry_jsonl | strings' "$score") || return 1
   [ -r "$telemetry" ] || return 1
   jq -ser --arg filter "$filter" '
-    first(.[] | select(.phase == "index_ready" and .boundary == "snapshot") | getpath($filter | split(".") | map(if test("^[0-9]+$") then tonumber else . end)))
+    def safe_path($keys):
+      reduce $keys[] as $key (.;
+        if type == "object" and ($key | type) == "string" and has($key) then .[$key] else null end);
+    first(.[] | select(.phase == "index_ready" and .boundary == "snapshot") | safe_path($filter | split(".")))
     | if type == "number" then . else error("télémétrie index_ready absente") end
   ' "$telemetry"
 }
