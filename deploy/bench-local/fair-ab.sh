@@ -81,14 +81,17 @@ P2_MEASURE="${P2_MEASURE:-0}"
 P2_VARIANT="${P2_VARIANT:-}"          # A = avant P2, B = P2, C = P3
 P2_INPUT_DIR="${P2_INPUT_DIR:-$OUT_DIR/p2-inputs}"
 P2_PAIR_COUNT="${P2_PAIR_COUNT:-1000}" # 1000 full ; 100 seulement pour le smoke
-P2_WARM_PAIR_COUNT="${P2_WARM_PAIR_COUNT:-100}"
+P2_WARM_TERM_COUNT="${P2_WARM_TERM_COUNT:-200}"
+# Le mix historique bool/match 50/50 reste disponible seulement pour rejouer
+# son effet produit. Il ne participe jamais au témoin causal ni à ses gates.
+P2_REPLAY_MIX_5050="${P2_REPLAY_MIX_5050:-0}"
 P2_EXPECTED_DOCS="${P2_EXPECTED_DOCS:-28917511}"
 P2_REQUIRED_SEGMENTS="${P2_REQUIRED_SEGMENTS:-12}"
 P2_SEGMENT_GATE="${P2_SEGMENT_GATE:-exact}" # exact (full) ou minimum (smoke)
 P2_CPU_STEAL_MAX_PERCENT="${P2_CPU_STEAL_MAX_PERCENT:-1}"
 P2_REQUIRE_P3_INTEGRITY="${P2_REQUIRE_P3_INTEGRITY:-1}"
 P2_INTEGRITY_MAX_BYTES=$((32 * 1024 * 1024))
-P2_PROTOCOL_VERSION="p2-segmented-postings-v2"
+P2_PROTOCOL_VERSION="p2-segmented-postings-v3-temoin-autonome"
 # Déclaré ici aussi parce que P2 refuse explicitement un bypass avant le
 # bloc historique de préflight qui consomme cette variable.
 PREFLIGHT_FORCE="${PREFLIGHT_FORCE:-0}"
@@ -108,10 +111,11 @@ if [ "$P2_MEASURE" = "1" ]; then
     err "P2_VARIANT doit valoir A, B ou C quand P2_MEASURE=1"; exit 1;
   }
   case "$P2_REQUIRE_P3_INTEGRITY" in 0|1) ;; *) err "P2_REQUIRE_P3_INTEGRITY doit valoir 0 ou 1"; exit 1;; esac
-  case "$P2_PAIR_COUNT:$P2_WARM_PAIR_COUNT" in *[!0-9:]*|:*|*::*) err "P2_PAIR_COUNT/P2_WARM_PAIR_COUNT invalides"; exit 1;; esac
-  [ "$P2_WARM_PAIR_COUNT" -eq 100 ] || {
-    err "protocole P2 invalide : P2_WARM_PAIR_COUNT doit rester 100"; exit 1;
+  case "$P2_PAIR_COUNT:$P2_WARM_TERM_COUNT" in *[!0-9:]*|:*|*::*) err "P2_PAIR_COUNT/P2_WARM_TERM_COUNT invalides"; exit 1;; esac
+  [ "$P2_WARM_TERM_COUNT" -eq 200 ] || {
+    err "protocole P2 invalide : P2_WARM_TERM_COUNT doit rester 200"; exit 1;
   }
+  case "$P2_REPLAY_MIX_5050" in 0|1) ;; *) err "P2_REPLAY_MIX_5050 doit valoir 0 ou 1"; exit 1;; esac
   [ "$PROBE_REQUESTS" -eq $(( 2 * P2_PAIR_COUNT )) ] || {
     err "protocole P2 invalide : PROBE_REQUESTS doit valoir 2 × P2_PAIR_COUNT (reçu $PROBE_REQUESTS pour $P2_PAIR_COUNT paires)"; exit 1;
   }
@@ -354,45 +358,115 @@ log "corpus prêt : $NDOCS docs ($(du -h "$BULK" | cut -f1))"
 p2_sha256(){ sha256sum "$1" | awk '{print $1}'; }
 
 p2_validate_pairs(){
-  local pairs="$1" wanted="$P2_PAIR_COUNT"
-  awk -F '\t' -v wanted="$wanted" '
-    NF != 3 || $1 != NR || $2 !~ /^[[:alnum:]]+$/ || $3 !~ /^[[:alnum:]]+$/ { invalid = 1; exit }
+  local pairs="$1" wanted="$2"
+  awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
+    NF != 3 || $1 != NR || $2 !~ /^[[:alnum:]]+$/ || $3 !~ /^[[:alnum:]]+$/ || $2 == fixed || ($2 in seen) { invalid = 1; exit }
+    { seen[$2] = 1 }
     END { exit (invalid || NR != wanted) }
   ' "$pairs"
 }
 
+p2_validate_control_names(){
+  local names="$1" wanted="$2"
+  awk -F '\t' -v wanted="$wanted" -v fixed="$PROBE_FIXED_TERM" '
+    NF != 2 || $1 != NR || $2 !~ /^[[:alnum:]]+$/ || $2 == fixed || ($2 in seen) { invalid = 1; exit }
+    { seen[$2] = 1 }
+    END { exit (invalid || NR != wanted) }
+  ' "$names"
+}
+
+# Les trois ensembles sont des ensembles de NOM, pas seulement des lignes de
+# corpus différentes. Cette vérification est délibérément distincte de la
+# sélection : une intersection est une invalidité de protocole, jamais une
+# occasion de retomber sur les corps historiques.
+p2_validate_term_sets(){
+  local bool_pairs="$1" control_names="$2" warm_pairs="$3"
+  p2_validate_pairs "$bool_pairs" "$P2_PAIR_COUNT" \
+    && p2_validate_control_names "$control_names" "$P2_PAIR_COUNT" \
+    && p2_validate_pairs "$warm_pairs" "$P2_WARM_TERM_COUNT" || return 1
+  awk -F '\t' -v bool_pairs="$bool_pairs" -v control_names="$control_names" -v warm_pairs="$warm_pairs" '
+    FILENAME == bool_pairs { bool[$2] = 1; next }
+    FILENAME == control_names {
+      if (($2 in bool) || ($2 in control)) { invalid = 1; exit }
+      control[$2] = 1; next
+    }
+    FILENAME == warm_pairs {
+      if (($2 in bool) || ($2 in control) || ($2 in warm)) { invalid = 1; exit }
+      warm[$2] = 1
+    }
+    END { exit invalid }
+  ' "$bool_pairs" "$control_names" "$warm_pairs"
+}
+
 p2_validate_body_files(){
-  local pairs="$1" random="$2" no_source="$3" warm="$4" fixed="$5"
-  local expected_random=$(( 2 * P2_PAIR_COUNT )) expected_warm=$(( 2 * P2_WARM_PAIR_COUNT ))
-  [ "$(wc -l < "$random" 2>/dev/null || echo 0)" -eq "$expected_random" ] \
-    && [ "$(wc -l < "$no_source" 2>/dev/null || echo 0)" -eq "$expected_random" ] \
-    && [ "$(wc -l < "$warm" 2>/dev/null || echo 0)" -eq "$expected_warm" ] \
-    && [ "$(wc -l < "$fixed" 2>/dev/null || echo 0)" -eq "$expected_random" ] || return 1
-  awk -F '\t' -v bodies="$random" -v control="$no_source" -v warm="$warm" \
-      -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" \
-      -v wanted="$P2_PAIR_COUNT" -v warm_pairs="$P2_WARM_PAIR_COUNT" '
+  local bool_pairs="$1" control_names="$2" warm_pairs="$3"
+  local bool10="$4" bool0="$5" control10="$6" warm="$7" fixed="$8"
+  local replay="${9:-}"
+  local replay_input=()
+  local expected_bool="$P2_PAIR_COUNT" expected_warm="$P2_WARM_TERM_COUNT"
+  [ "$(wc -l < "$bool10" 2>/dev/null || echo 0)" -eq "$expected_bool" ] \
+    && [ "$(wc -l < "$bool0" 2>/dev/null || echo 0)" -eq "$expected_bool" ] \
+    && [ "$(wc -l < "$control10" 2>/dev/null || echo 0)" -eq "$expected_bool" ] \
+    && [ "$(wc -l < "$warm" 2>/dev/null || echo 0)" -eq $(( 2 * expected_warm )) ] \
+    && [ "$(wc -l < "$fixed" 2>/dev/null || echo 0)" -eq "$expected_bool" ] || return 1
+  if [ "$P2_REPLAY_MIX_5050" = "1" ]; then
+    [ -n "$replay" ] && [ "$(wc -l < "$replay" 2>/dev/null || echo 0)" -eq $(( 2 * expected_bool )) ] || return 1
+    replay_input=("$replay")
+  fi
+  awk -v bool_pairs="$bool_pairs" -v control_names="$control_names" -v warm_pairs="$warm_pairs" \
+      -v bool10="$bool10" -v bool0="$bool0" -v control10="$control10" -v warm="$warm" -v replay="$replay" \
+      -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" -v wanted="$expected_bool" -v warm_wanted="$expected_warm" \
+      -v replay_enabled="$P2_REPLAY_MIX_5050" '
     function bool_body(nom, pre, size) {
       return "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"" fnom "\":\"" nom "\"}},{\"match\":{\"" fpre "\":\"" pre "\"}}]}},\"size\":" size "}"
     }
     function match_body(nom, size) {
       return "{\"query\":{\"match\":{\"" fnom "\":\"" nom "\"}},\"size\":" size "}"
     }
-    {
-      if ((getline b1 < bodies) <= 0 || (getline b2 < bodies) <= 0) { invalid = 1; exit }
-      if ((getline c1 < control) <= 0 || (getline c2 < control) <= 0) { invalid = 1; exit }
-      if (b1 != bool_body($2, $3, 10) || b2 != match_body($2, 10)) { invalid = 1; exit }
-      if (c1 != bool_body($2, $3, 0) || c2 != match_body($2, 0)) { invalid = 1; exit }
-      if (NR <= warm_pairs) {
-        if ((getline w1 < warm) <= 0 || (getline w2 < warm) <= 0) { invalid = 1; exit }
-        if (w1 != bool_body($2, $3, 10) || w2 != match_body($2, 10)) { invalid = 1; exit }
+    FILENAME == bool_pairs { bool_nom[++bool_count] = $2; bool_pre[bool_count] = $3; next }
+    FILENAME == control_names { control_nom[++control_count] = $2; next }
+    FILENAME == warm_pairs { warm_nom[++warm_count] = $2; warm_pre[warm_count] = $3; next }
+    FILENAME == bool10 {
+      ++bool10_count
+      if ($0 != bool_body(bool_nom[bool10_count], bool_pre[bool10_count], 10)) invalid = 1
+      next
+    }
+    FILENAME == bool0 {
+      ++bool0_count
+      if ($0 != bool_body(bool_nom[bool0_count], bool_pre[bool0_count], 0)) invalid = 1
+      next
+    }
+    FILENAME == control10 {
+      ++control10_count
+      if ($0 != match_body(control_nom[control10_count], 10)) invalid = 1
+      next
+    }
+    FILENAME == warm {
+      ++warm_body_count
+      if (warm_body_count <= warm_wanted) {
+        if ($0 != match_body(warm_nom[warm_body_count], 10)) invalid = 1
+      } else {
+        warm_index = warm_body_count - warm_wanted
+        if ($0 != bool_body(warm_nom[warm_index], warm_pre[warm_index], 10)) invalid = 1
       }
+      next
+    }
+    FILENAME == replay {
+      ++replay_count
+      replay_index = int((replay_count + 1) / 2)
+      if (replay_count % 2 == 1) {
+        if ($0 != bool_body(bool_nom[replay_index], bool_pre[replay_index], 10)) invalid = 1
+      } else if ($0 != match_body(bool_nom[replay_index], 10)) invalid = 1
+      next
     }
     END {
-      close(bodies); close(control); close(warm)
-      exit (invalid || NR != wanted)
+      if (bool_count != wanted || control_count != wanted || warm_count != warm_wanted \
+          || bool10_count != wanted || bool0_count != wanted || control10_count != wanted \
+          || warm_body_count != 2 * warm_wanted || (replay_enabled == "1" && replay_count != 2 * wanted)) invalid = 1
+      exit invalid
     }
-  ' "$pairs" || return 1
-  awk -v n="$expected_random" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" '
+  ' "$bool_pairs" "$control_names" "$warm_pairs" "$bool10" "$bool0" "$control10" "$warm" "${replay_input[@]}" || return 1
+  awk -v n="$expected_bool" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" '
     { expected = "{\"query\":{\"match\":{\"" fnom "\":\"" term "\"}},\"size\":10}"; if ($0 != expected) { invalid = 1; exit } }
     END { exit (invalid || NR != n) }
   ' "$fixed"
@@ -406,34 +480,52 @@ p2_manifest_value(){
 p2_validate_frozen_inputs(){
   local manifest="$1" expected actual key file
   [ "$(p2_manifest_value protocol "$manifest")" = "$P2_PROTOCOL_VERSION" ] || return 1
+  [ "$(p2_manifest_value replay_mix_5050 "$manifest")" = "$P2_REPLAY_MIX_5050" ] || return 1
   for key_file in \
     "bulk_sha256:$BULK" \
     "mapping_sha256:$MAPPING_FILE" \
-    "pairs_sha256:$P2_PAIRS" \
+    "bool_pairs_sha256:$P2_BOOL_PAIRS" \
+    "match_control_names_sha256:$P2_MATCH_CONTROL_NAMES" \
+    "warm_pairs_sha256:$P2_WARM_PAIRS" \
+    "bool_size10_bodies_sha256:$P2_BOOL_SIZE10_BODIES" \
+    "bool_size0_bodies_sha256:$P2_BOOL_SIZE0_BODIES" \
+    "match_control_size10_bodies_sha256:$P2_MATCH_CONTROL_SIZE10_BODIES" \
     "warm_bodies_sha256:$P2_WARM_BODIES" \
-    "fixed_bodies_sha256:$PROBE_FIXED_BODIES" \
-    "random_bodies_sha256:$PROBE_BODIES" \
-    "no_source_bodies_sha256:$PROBE_CONTROL_BODIES" \
-    "random_kinds_sha256:$P2_RANDOM_KINDS"; do
+    "fixed_bodies_sha256:$PROBE_FIXED_BODIES"; do
     key=${key_file%%:*}; file=${key_file#*:}
     expected=$(p2_manifest_value "$key" "$manifest")
     actual=$(p2_sha256 "$file" 2>/dev/null) || return 1
     [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
   done
+  if [ "$P2_REPLAY_MIX_5050" = "1" ]; then
+    expected=$(p2_manifest_value replay_mix_5050_bodies_sha256 "$manifest")
+    actual=$(p2_sha256 "$P2_REPLAY_MIX_5050_BODIES" 2>/dev/null) || return 1
+    [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
+  fi
   expected=$(cat "$manifest.sha256" 2>/dev/null | awk '{print $1}')
   actual=$(p2_sha256 "$manifest" 2>/dev/null) || return 1
   [ -n "$expected" ] && [ "$expected" = "$actual" ] || return 1
-  p2_validate_pairs "$P2_PAIRS" && p2_validate_body_files "$P2_PAIRS" "$PROBE_BODIES" "$PROBE_CONTROL_BODIES" "$P2_WARM_BODIES" "$PROBE_FIXED_BODIES"
+  p2_validate_term_sets "$P2_BOOL_PAIRS" "$P2_MATCH_CONTROL_NAMES" "$P2_WARM_PAIRS" \
+    && p2_validate_body_files "$P2_BOOL_PAIRS" "$P2_MATCH_CONTROL_NAMES" "$P2_WARM_PAIRS" \
+      "$P2_BOOL_SIZE10_BODIES" "$P2_BOOL_SIZE0_BODIES" "$P2_MATCH_CONTROL_SIZE10_BODIES" \
+      "$P2_WARM_BODIES" "$PROBE_FIXED_BODIES" "$P2_REPLAY_MIX_5050_BODIES"
 }
 
 p2_prepare_inputs(){
-  local manifest tmp pairs_tmp fixed_term_ok expected_random=$(( 2 * P2_PAIR_COUNT ))
-  P2_PAIRS="$P2_INPUT_DIR/probe_p2_pairs.tsv"
+  local manifest bool_tmp control_tmp warm_tmp fixed_tmp replay_tmp
+  P2_BOOL_PAIRS="$P2_INPUT_DIR/probe_p2_bool_pairs.tsv"
+  P2_MATCH_CONTROL_NAMES="$P2_INPUT_DIR/probe_p2_match_control_names.tsv"
+  P2_WARM_PAIRS="$P2_INPUT_DIR/probe_p2_warm_pairs.tsv"
+  P2_BOOL_SIZE10_BODIES="$P2_INPUT_DIR/probe_p2_bool_size10_bodies.ndjson"
+  P2_BOOL_SIZE0_BODIES="$P2_INPUT_DIR/probe_p2_bool_size0_bodies.ndjson"
+  P2_MATCH_CONTROL_SIZE10_BODIES="$P2_INPUT_DIR/probe_p2_match_control_size10_bodies.ndjson"
   P2_WARM_BODIES="$P2_INPUT_DIR/probe_p2_warm_bodies.ndjson"
   PROBE_FIXED_BODIES="$P2_INPUT_DIR/probe_p2_fixed_bodies.ndjson"
-  PROBE_BODIES="$P2_INPUT_DIR/probe_p2_random_bodies.ndjson"
-  PROBE_CONTROL_BODIES="$P2_INPUT_DIR/probe_p2_no_source_bodies.ndjson"
-  P2_RANDOM_KINDS="$P2_INPUT_DIR/probe_p2_random_kinds.tsv"
+  P2_REPLAY_MIX_5050_BODIES="$P2_INPUT_DIR/probe_p2_replay_mix_5050_bodies.ndjson"
+  # Les chemins génériques L2 réutilisent ces variables ; P2 les fixe sur les
+  # formes bool explicites, sans jamais les employer pour le témoin autonome.
+  PROBE_BODIES="$P2_BOOL_SIZE10_BODIES"
+  PROBE_CONTROL_BODIES="$P2_BOOL_SIZE0_BODIES"
   PROBE_MANIFEST="$P2_INPUT_DIR/probe_p2_inputs.manifest"
   manifest="$PROBE_MANIFEST"
   P2_INPUT_MANIFEST_SHA_FILE="$manifest.sha256"
@@ -456,9 +548,11 @@ p2_prepare_inputs(){
     err "P2 : PROBE_FIXED_TERM doit être mono-token ASCII"; return 1;
   }
 
-  log "P2 : sélection déterministe de $P2_PAIR_COUNT documents NOM/PRENOMS mono-token"
-  pairs_tmp="$P2_PAIRS.tmp"
-  if ! awk -v ndocs="$NDOCS" -v wanted="$P2_PAIR_COUNT" -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" '
+  log "P2 : sélection déterministe de $P2_PAIR_COUNT bool, $P2_PAIR_COUNT témoins et $P2_WARM_TERM_COUNT termes de chauffe mono-token"
+  bool_tmp="$P2_BOOL_PAIRS.tmp"; control_tmp="$P2_MATCH_CONTROL_NAMES.tmp"; warm_tmp="$P2_WARM_PAIRS.tmp"
+  if ! awk -v ndocs="$NDOCS" -v bool_wanted="$P2_PAIR_COUNT" -v control_wanted="$P2_PAIR_COUNT" \
+      -v warm_wanted="$P2_WARM_TERM_COUNT" -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" \
+      -v fixed="$PROBE_FIXED_TERM" -v bool_out="$bool_tmp" -v control_out="$control_tmp" -v warm_out="$warm_tmp" '
     function extract(line, key,    pat, val) {
       pat = "\"" key "\":\"[^\"]*\""
       if (!match(line, pat)) return ""
@@ -467,87 +561,136 @@ p2_prepare_inputs(){
       return val
     }
     function mono(value) { return value ~ /^[[:alnum:]]+$/ }
+    function target_for_bucket(kind) {
+      # Ordonnancement pondéré déterministe : la plus petite fraction déjà
+      # attribuée reçoit le bucket suivant. Il respecte exactement les tailles
+      # demandées, y compris le smoke 100/100/200, tout en répartissant les
+      # trois ensembles sur tout le corpus sans shuffle.
+      kind = "bool"
+      if (scheduled_bool >= bool_wanted || (scheduled_control < control_wanted && scheduled_control * bool_wanted < scheduled_bool * control_wanted)) kind = "control"
+      if (kind == "bool") {
+        if (scheduled_warm < warm_wanted && (scheduled_bool >= bool_wanted || scheduled_warm * bool_wanted < scheduled_bool * warm_wanted)) kind = "warm"
+      } else if (scheduled_warm < warm_wanted && (scheduled_control >= control_wanted || scheduled_warm * control_wanted < scheduled_control * warm_wanted)) kind = "warm"
+      if (kind == "bool") scheduled_bool++
+      else if (kind == "control") scheduled_control++
+      else scheduled_warm++
+      return kind
+    }
+    function take(kind, nom, pre) {
+      used[nom] = 1
+      if (kind == "bool") { bool_nom[++bool_count] = nom; bool_pre[bool_count] = pre }
+      else if (kind == "control") control_nom[++control_count] = nom
+      else { warm_nom[++warm_count] = nom; warm_pre[warm_count] = pre }
+    }
     NR % 2 == 0 {
       doc++
       nom = extract($0, fnom); pre = extract($0, fpre)
-      if (!mono(nom) || !mono(pre)) next
-      bucket = int((doc - 1) * wanted / ndocs) + 1
-      if (!(bucket in bucket_value)) {
-        bucket_value[bucket] = nom "\t" pre; bucket_doc[bucket] = doc
+      if (!mono(nom) || !mono(pre) || nom == fixed) next
+      bucket = int((doc - 1) * (bool_wanted + control_wanted + warm_wanted) / ndocs) + 1
+      if (bucket >= 1 && bucket <= bool_wanted + control_wanted + warm_wanted \
+          && bucket_count[bucket] < 32 && !((bucket SUBSEP nom) in bucket_seen)) {
+        bucket_seen[bucket, nom] = 1
+        bucket_nom[bucket, ++bucket_count[bucket]] = nom
+        bucket_pre[bucket, bucket_count[bucket]] = pre
       }
-      if (fallback_count < wanted * 2) {
-        fallback_count++; fallback_value[fallback_count] = nom "\t" pre; fallback_doc[fallback_count] = doc
+      if (fallback_count < (bool_wanted + control_wanted + warm_wanted) * 32 && !(nom in fallback_seen)) {
+        fallback_seen[nom] = 1
+        fallback_nom[++fallback_count] = nom; fallback_pre[fallback_count] = pre
       }
     }
     END {
-      for (bucket = 1; bucket <= wanted; bucket++) {
-        if (bucket in bucket_value) {
-          selected_doc[bucket_doc[bucket]] = 1
-          selected[++selected_count] = bucket_value[bucket]
+      total = bool_wanted + control_wanted + warm_wanted
+      for (bucket = 1; bucket <= total; bucket++) {
+        kind = target_for_bucket(bucket)
+        for (candidate = 1; candidate <= bucket_count[bucket]; candidate++) {
+          nom = bucket_nom[bucket, candidate]
+          if (!(nom in used)) { take(kind, nom, bucket_pre[bucket, candidate]); break }
         }
       }
-      for (i = 1; i <= fallback_count && selected_count < wanted; i++) {
-        if (!(fallback_doc[i] in selected_doc)) {
-          selected_doc[fallback_doc[i]] = 1
-          selected[++selected_count] = fallback_value[i]
-        }
+      for (i = 1; i <= fallback_count; i++) {
+        nom = fallback_nom[i]
+        if (nom in used) continue
+        if (bool_count < bool_wanted) take("bool", nom, fallback_pre[i])
+        else if (control_count < control_wanted) take("control", nom, fallback_pre[i])
+        else if (warm_count < warm_wanted) take("warm", nom, fallback_pre[i])
       }
-      if (selected_count != wanted) exit 1
-      for (i = 1; i <= wanted; i++) print i "\t" selected[i]
+      if (bool_count != bool_wanted || control_count != control_wanted || warm_count != warm_wanted) exit 1
+      for (i = 1; i <= bool_wanted; i++) print i "\t" bool_nom[i] "\t" bool_pre[i] > bool_out
+      for (i = 1; i <= control_wanted; i++) print i "\t" control_nom[i] > control_out
+      for (i = 1; i <= warm_wanted; i++) print i "\t" warm_nom[i] "\t" warm_pre[i] > warm_out
     }
-  ' "$BULK" > "$pairs_tmp"; then
-    rm -f "$pairs_tmp"
-    err "P2 : moins de $P2_PAIR_COUNT documents éligibles NOM/PRENOMS mono-token"
+  ' "$BULK"; then
+    rm -f "$bool_tmp" "$control_tmp" "$warm_tmp"
+    err "P2 : moins de termes mono-token uniques/disjoints pour les ensembles bool, témoin et chauffe"
     return 1
   fi
-  if ! p2_validate_pairs "$pairs_tmp"; then
-    rm -f "$pairs_tmp"
-    err "P2 : sélection contient un terme multi-token ou est incomplète"
+  if ! p2_validate_term_sets "$bool_tmp" "$control_tmp" "$warm_tmp"; then
+    rm -f "$bool_tmp" "$control_tmp" "$warm_tmp"
+    err "P2 : ensembles de termes non mono-token, incomplets ou non disjoints sur NOM"
     return 1
   fi
-  mv "$pairs_tmp" "$P2_PAIRS" || return 1
+  mv "$bool_tmp" "$P2_BOOL_PAIRS" && mv "$control_tmp" "$P2_MATCH_CONTROL_NAMES" && mv "$warm_tmp" "$P2_WARM_PAIRS" || return 1
 
-  if ! awk -F '\t' -v random="$PROBE_BODIES" -v control="$PROBE_CONTROL_BODIES" \
-      -v warm="$P2_WARM_BODIES" -v kinds="$P2_RANDOM_KINDS" \
+  if ! awk -F '\t' -v bool_pairs="$P2_BOOL_PAIRS" -v control_names="$P2_MATCH_CONTROL_NAMES" -v warm_pairs="$P2_WARM_PAIRS" \
+      -v bool10="$P2_BOOL_SIZE10_BODIES" -v bool0="$P2_BOOL_SIZE0_BODIES" \
+      -v control10="$P2_MATCH_CONTROL_SIZE10_BODIES" -v warm="$P2_WARM_BODIES" -v replay="$P2_REPLAY_MIX_5050_BODIES" \
       -v fnom="$PROBE_FIELD_NOM" -v fpre="$PROBE_FIELD_PRENOMS" \
-      -v warm_pairs="$P2_WARM_PAIR_COUNT" '
+      -v replay_enabled="$P2_REPLAY_MIX_5050" '
     function bool_body(nom, pre, size) {
       return "{\"query\":{\"bool\":{\"must\":[{\"match\":{\"" fnom "\":\"" nom "\"}},{\"match\":{\"" fpre "\":\"" pre "\"}}]}},\"size\":" size "}"
     }
     function match_body(nom, size) {
       return "{\"query\":{\"match\":{\"" fnom "\":\"" nom "\"}},\"size\":" size "}"
     }
-    {
-      bool10 = bool_body($2, $3, 10); match10 = match_body($2, 10)
-      print bool10 >> random; print match10 >> random
-      print bool_body($2, $3, 0) >> control; print match_body($2, 0) >> control
-      print (2 * NR - 1) "\tbool" >> kinds; print (2 * NR) "\tmatch" >> kinds
-      if (NR <= warm_pairs) { print bool10 >> warm; print match10 >> warm }
+    FILENAME == bool_pairs {
+      print bool_body($2, $3, 10) >> bool10
+      print bool_body($2, $3, 0) >> bool0
+      if (replay_enabled == "1") { print bool_body($2, $3, 10) >> replay; print match_body($2, 10) >> replay }
+      next
     }
-  ' "$P2_PAIRS"; then
-    err "P2 : génération des corps random/warm impossible"
+    FILENAME == control_names { print match_body($2, 10) >> control10; next }
+    FILENAME == warm_pairs {
+      # Un fichier gelé unique : les 200 match, puis les 200 bool. Les deux
+      # moitiés sont extraites sans les mélanger avant leur phase dédiée.
+      print match_body($2, 10) >> warm
+      warm_nom[++warm_count] = $2; warm_pre[warm_count] = $3
+      next
+    }
+    END {
+      for (i = 1; i <= warm_count; i++) print bool_body(warm_nom[i], warm_pre[i], 10) >> warm
+    }
+  ' "$P2_BOOL_PAIRS" "$P2_MATCH_CONTROL_NAMES" "$P2_WARM_PAIRS"; then
+    err "P2 : génération des corps bool/témoin/chauffe impossible"
     return 1
   fi
-  if ! awk -v n="$expected_random" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" '
+  if ! awk -v n="$P2_PAIR_COUNT" -v fnom="$PROBE_FIELD_NOM" -v term="$PROBE_FIXED_TERM" '
     BEGIN { for (i = 1; i <= n; i++) print "{\"query\":{\"match\":{\"" fnom "\":\"" term "\"}},\"size\":10}" }
   ' > "$PROBE_FIXED_BODIES"; then
-    err "P2 : génération des $expected_random témoins fixed impossible"
+    err "P2 : génération des $P2_PAIR_COUNT témoins fixes MARTIN impossible"
     return 1
   fi
-  if ! p2_validate_body_files "$P2_PAIRS" "$PROBE_BODIES" "$PROBE_CONTROL_BODIES" "$P2_WARM_BODIES" "$PROBE_FIXED_BODIES"; then
+  if ! p2_validate_body_files "$P2_BOOL_PAIRS" "$P2_MATCH_CONTROL_NAMES" "$P2_WARM_PAIRS" \
+      "$P2_BOOL_SIZE10_BODIES" "$P2_BOOL_SIZE0_BODIES" "$P2_MATCH_CONTROL_SIZE10_BODIES" \
+      "$P2_WARM_BODIES" "$PROBE_FIXED_BODIES" "$P2_REPLAY_MIX_5050_BODIES"; then
     err "P2 : corps générés invalides"
     return 1
   fi
   {
     printf 'protocol=%s\n' "$P2_PROTOCOL_VERSION"
+    printf 'replay_mix_5050=%s\n' "$P2_REPLAY_MIX_5050"
     printf 'bulk_sha256=%s\n' "$(p2_sha256 "$BULK")"
     printf 'mapping_sha256=%s\n' "$(p2_sha256 "$MAPPING_FILE")"
-    printf 'pairs_sha256=%s\n' "$(p2_sha256 "$P2_PAIRS")"
+    printf 'bool_pairs_sha256=%s\n' "$(p2_sha256 "$P2_BOOL_PAIRS")"
+    printf 'match_control_names_sha256=%s\n' "$(p2_sha256 "$P2_MATCH_CONTROL_NAMES")"
+    printf 'warm_pairs_sha256=%s\n' "$(p2_sha256 "$P2_WARM_PAIRS")"
+    printf 'bool_size10_bodies_sha256=%s\n' "$(p2_sha256 "$P2_BOOL_SIZE10_BODIES")"
+    printf 'bool_size0_bodies_sha256=%s\n' "$(p2_sha256 "$P2_BOOL_SIZE0_BODIES")"
+    printf 'match_control_size10_bodies_sha256=%s\n' "$(p2_sha256 "$P2_MATCH_CONTROL_SIZE10_BODIES")"
     printf 'warm_bodies_sha256=%s\n' "$(p2_sha256 "$P2_WARM_BODIES")"
     printf 'fixed_bodies_sha256=%s\n' "$(p2_sha256 "$PROBE_FIXED_BODIES")"
-    printf 'random_bodies_sha256=%s\n' "$(p2_sha256 "$PROBE_BODIES")"
-    printf 'no_source_bodies_sha256=%s\n' "$(p2_sha256 "$PROBE_CONTROL_BODIES")"
-    printf 'random_kinds_sha256=%s\n' "$(p2_sha256 "$P2_RANDOM_KINDS")"
+    if [ "$P2_REPLAY_MIX_5050" = "1" ]; then
+      printf 'replay_mix_5050_bodies_sha256=%s\n' "$(p2_sha256 "$P2_REPLAY_MIX_5050_BODIES")"
+    fi
   } > "$manifest" || return 1
   p2_sha256 "$manifest" > "$P2_INPUT_MANIFEST_SHA_FILE" || return 1
   P2_INPUT_MANIFEST_SHA256=$(cat "$P2_INPUT_MANIFEST_SHA_FILE")
@@ -953,14 +1096,32 @@ probe_quantiles(){
 p2_index_ready_metric_names=(
   surch_index_segment_count
 )
+p2_integrity_metric_names=(
+  surch_postings_p2_integrity_bytes
+  surch_postings_p2_integrity_pages
+  surch_postings_p2_verified_bytes
+  surch_postings_p2_hash_failures
+  surch_postings_p2_fallbacks
+  surch_postings_p2_fallback_fields
+  surch_postings_p2_term_occurrences
+  surch_postings_p2_blocks
+  surch_postings_p2_fields
+  surch_postings_p2_term_payload_bytes
+  surch_postings_p2_csr_bytes
+  surch_postings_p2_directory_bytes
+)
+p2_engine_memory_metric_names=(
+  surch_index_postings_directory_bytes
+  surch_index_total_bytes
+  surch_jemalloc_allocated_bytes
+  surch_jemalloc_active_bytes
+  surch_jemalloc_resident_bytes
+  surch_jemalloc_retained_bytes
+)
 if [ "$P2_MEASURE" = "1" ] && [ "$P2_VARIANT" = "C" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
-  # Ces trois jauges sont agrégées par index : elles rendent le plafond P3
-  # global aux segments et tout fallback résident bloquants avant les sondes.
-  p2_index_ready_metric_names+=(
-    surch_postings_p2_integrity_bytes
-    surch_postings_p2_hash_failures
-    surch_postings_p2_fallback_fields
-  )
+  # Chaque jauge P3 est obligatoire pour C. Une absence ne peut pas être
+  # transformée en zéro : elle rend le run invalide avant toute conclusion.
+  p2_index_ready_metric_names+=("${p2_integrity_metric_names[@]}")
 fi
 
 p2_cpu_stat(){
@@ -1011,6 +1172,213 @@ p2_metric_value(){
   ' "$snapshot"
 }
 
+p2_proc_status_bytes(){
+  local pid="$1" key="$2"
+  awk -v key="$key" '
+    $1 == key ":" {
+      if ($2 !~ /^[0-9]+$/) exit 1
+      printf "%.0f", ($2 + 0) * 1024
+      found = 1
+      exit
+    }
+    END { exit !found }
+  ' "/proc/$pid/status"
+}
+
+p2_cgroup_directory(){
+  local cid="$1" pid path
+  pid=$(docker inspect -f '{{.State.Pid}}' "$cid" 2>/dev/null) || return 1
+  case "$pid" in ''|*[!0-9]*|0) return 1;; esac
+  path=$(awk -F: '$1 == "0" && $2 == "" { print $3; exit }' "/proc/$pid/cgroup" 2>/dev/null) || return 1
+  case "$path" in /*) ;; *) return 1;; esac
+  [ -d "/sys/fs/cgroup$path" ] || return 1
+  printf '%s' "/sys/fs/cgroup$path"
+}
+
+p2_cgroup_stat_value(){
+  local file="$1" key="$2"
+  awk -v key="$key" '
+    $1 == key {
+      if ($2 !~ /^[0-9]+$/) exit 1
+      print $2
+      found = 1
+      exit
+    }
+    END { exit !found }
+  ' "$file"
+}
+
+p2_cgroup_io_json(){
+  local file="$1"
+  awk '
+    function emit(device, metric, value) {
+      if (!first++) printf ","
+      printf "{\"device\":\"%s\",\"metric\":\"%s\",\"value\":%s}", device, metric, value
+    }
+    $1 ~ /^[0-9]+:[0-9]+$/ {
+      device = $1; seen = 1
+      for (i = 2; i <= NF; i++) {
+        if ($i !~ /^[[:alpha:]_]+=[0-9]+$/) { invalid = 1; continue }
+        split($i, pair, "=")
+        emit(device, pair[1], pair[2])
+      }
+      next
+    }
+    NF != 0 { invalid = 1 }
+    END {
+      if (invalid || !seen || !first) exit 1
+      printf "\n"
+    }
+  ' "$file" | awk 'BEGIN { printf "[" } { printf "%s", $0 } END { printf "]" }'
+}
+
+p2_cgroup_io_delta_json(){
+  local before="$1" after="$2"
+  awk '
+    function read_sample(which, device, metric, value, pair, key) {
+      device = $1
+      if (device !~ /^[0-9]+:[0-9]+$/) { invalid = 1; return }
+      for (i = 2; i <= NF; i++) {
+        if ($i !~ /^[[:alpha:]_]+=[0-9]+$/) { invalid = 1; continue }
+        split($i, pair, "="); metric = pair[1]; value = pair[2]
+        key = device SUBSEP metric
+        if (which == "before") before_value[key] = value
+        else after_value[key] = value
+      }
+    }
+    NR == FNR { if (NF != 0) { before_seen = 1; read_sample("before") }; next }
+    { if (NF != 0) { after_seen = 1; read_sample("after") } }
+    END {
+      if (invalid || !before_seen || !after_seen) exit 1
+      for (key in before_value) if (!(key in after_value)) invalid = 1
+      for (key in after_value) if (!(key in before_value)) invalid = 1
+      if (invalid) exit 1
+      printf "["
+      for (key in after_value) {
+        split(key, parts, SUBSEP)
+        delta = (after_value[key] + 0) - (before_value[key] + 0)
+        if (delta < 0) exit 1
+        if (emitted++) printf ","
+        printf "{\"device\":\"%s\",\"metric\":\"%s\",\"delta\":%.0f}", parts[1], parts[2], delta
+      }
+      if (!emitted) exit 1
+      printf "]"
+    }
+  ' "$before" "$after"
+}
+
+p2_psi_json(){
+  local file="$1"
+  awk '
+    ($1 == "some" || $1 == "full") {
+      scope = $1; seen[scope] = 1
+      for (i = 2; i <= NF; i++) {
+        if ($i !~ /^(avg10|avg60|avg300|total)=[0-9]+([.][0-9]+)?$/) { invalid = 1; continue }
+        split($i, pair, "=")
+        value[scope SUBSEP pair[1]] = pair[2]
+      }
+      next
+    }
+    NF != 0 { invalid = 1 }
+    END {
+      split("avg10 avg60 avg300 total", fields, " ")
+      for (scope_index = 1; scope_index <= 2; scope_index++) {
+        scope = scope_index == 1 ? "some" : "full"
+        if (!(scope in seen)) invalid = 1
+        for (field_index = 1; field_index <= 4; field_index++) if (!((scope SUBSEP fields[field_index]) in value)) invalid = 1
+      }
+      if (invalid) exit 1
+      printf "{\"some\":{\"avg10\":%s,\"avg60\":%s,\"avg300\":%s,\"total\":%s},\"full\":{\"avg10\":%s,\"avg60\":%s,\"avg300\":%s,\"total\":%s}}", \
+        value["some" SUBSEP "avg10"], value["some" SUBSEP "avg60"], value["some" SUBSEP "avg300"], value["some" SUBSEP "total"], \
+        value["full" SUBSEP "avg10"], value["full" SUBSEP "avg60"], value["full" SUBSEP "avg300"], value["full" SUBSEP "total"]
+    }
+  ' "$file"
+}
+
+p2_metric_bundle_json(){
+  local snapshot="$1" postings_directory total_bytes allocated active resident retained integrity='null'
+  postings_directory=$(p2_metric_value surch_index_postings_directory_bytes "$snapshot") || return 1
+  total_bytes=$(p2_metric_value surch_index_total_bytes "$snapshot") || return 1
+  allocated=$(p2_metric_value surch_jemalloc_allocated_bytes "$snapshot") || return 1
+  active=$(p2_metric_value surch_jemalloc_active_bytes "$snapshot") || return 1
+  resident=$(p2_metric_value surch_jemalloc_resident_bytes "$snapshot") || return 1
+  retained=$(p2_metric_value surch_jemalloc_retained_bytes "$snapshot") || return 1
+  if [ "$P2_VARIANT" = "C" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+    local bytes pages verified hash_failures fallbacks fallback_fields occurrences blocks fields payload csr directory
+    bytes=$(p2_metric_value surch_postings_p2_integrity_bytes "$snapshot") || return 1
+    pages=$(p2_metric_value surch_postings_p2_integrity_pages "$snapshot") || return 1
+    verified=$(p2_metric_value surch_postings_p2_verified_bytes "$snapshot") || return 1
+    hash_failures=$(p2_metric_value surch_postings_p2_hash_failures "$snapshot") || return 1
+    fallbacks=$(p2_metric_value surch_postings_p2_fallbacks "$snapshot") || return 1
+    fallback_fields=$(p2_metric_value surch_postings_p2_fallback_fields "$snapshot") || return 1
+    occurrences=$(p2_metric_value surch_postings_p2_term_occurrences "$snapshot") || return 1
+    blocks=$(p2_metric_value surch_postings_p2_blocks "$snapshot") || return 1
+    fields=$(p2_metric_value surch_postings_p2_fields "$snapshot") || return 1
+    payload=$(p2_metric_value surch_postings_p2_term_payload_bytes "$snapshot") || return 1
+    csr=$(p2_metric_value surch_postings_p2_csr_bytes "$snapshot") || return 1
+    directory=$(p2_metric_value surch_postings_p2_directory_bytes "$snapshot") || return 1
+    integrity=$(jq -cn \
+      --argjson bytes "$bytes" --argjson pages "$pages" --argjson verified_bytes "$verified" \
+      --argjson hash_failures "$hash_failures" --argjson fallbacks "$fallbacks" --argjson fallback_fields "$fallback_fields" \
+      --argjson term_occurrences "$occurrences" --argjson blocks "$blocks" --argjson fields "$fields" \
+      --argjson term_payload_bytes "$payload" --argjson csr_bytes "$csr" --argjson directory_bytes "$directory" \
+      '{bytes:$bytes,pages:$pages,verified_bytes:$verified_bytes,hash_failures:$hash_failures,fallbacks:$fallbacks,fallback_fields:$fallback_fields,term_occurrences:$term_occurrences,blocks:$blocks,fields:$fields,term_payload_bytes:$term_payload_bytes,csr_bytes:$csr_bytes,directory_bytes:$directory}') || return 1
+  fi
+  jq -cn \
+    --argjson postings_directory_bytes "$postings_directory" --argjson total_bytes "$total_bytes" \
+    --argjson allocated "$allocated" --argjson active "$active" --argjson resident "$resident" --argjson retained "$retained" \
+    --argjson integrity "$integrity" \
+    '{index:{postings_directory_bytes:$postings_directory_bytes,total_bytes:$total_bytes},jemalloc:{allocated:$allocated,active:$active,resident:$resident,retained:$retained},p3_integrity:$integrity}'
+}
+
+# Chaque ligne est un état instantané complet. Les lignes `after` portent en
+# plus le delta io.stat depuis le `before` homologue, sans calculer un faux zéro
+# lorsqu'une métrique ou un fichier cgroup est absent.
+p2_capture_telemetry(){
+  local cid="$1" phase="$2" boundary="$3" snapshot="$4" before_io="${5:-}"
+  local pid cgroup io_file metric_json rss rss_anon vmhwm memory_current
+  local mem_anon mem_file refault activate pgmajfault cpu_file nr_throttled throttled_usec
+  local memory_psi io_psi io_json io_delta='null'
+  P2_METRICS_REASON=""
+  pid=$(docker inspect -f '{{.State.Pid}}' "$cid" 2>/dev/null) || { P2_METRICS_REASON="${phase}_${boundary}_pid_unreadable"; return 1; }
+  case "$pid" in ''|*[!0-9]*|0) P2_METRICS_REASON="${phase}_${boundary}_pid_invalid"; return 1;; esac
+  cgroup=$(p2_cgroup_directory "$cid") || { P2_METRICS_REASON="${phase}_${boundary}_cgroup_unreadable"; return 1; }
+  [ -r "$cgroup/memory.current" ] && [ -r "$cgroup/memory.stat" ] && [ -r "$cgroup/io.stat" ] \
+    && [ -r "$cgroup/memory.pressure" ] && [ -r "$cgroup/io.pressure" ] && [ -r "$cgroup/cpu.stat" ] || {
+      P2_METRICS_REASON="${phase}_${boundary}_cgroup_metric_missing"; return 1;
+    }
+  io_file="$OUT_DIR/$ENGINE.p2.cgroup.${phase}.${boundary}.io.stat"
+  cat "$cgroup/io.stat" > "$io_file" || { P2_METRICS_REASON="${phase}_${boundary}_io_stat_unreadable"; return 1; }
+  metric_json=$(p2_metric_bundle_json "$snapshot") || { P2_METRICS_REASON="${phase}_${boundary}_prometheus_metric_missing"; return 1; }
+  rss=$(p2_proc_status_bytes "$pid" VmRSS) || { P2_METRICS_REASON="${phase}_${boundary}_rss_missing"; return 1; }
+  rss_anon=$(p2_proc_status_bytes "$pid" RssAnon) || { P2_METRICS_REASON="${phase}_${boundary}_rssanon_missing"; return 1; }
+  vmhwm=$(p2_proc_status_bytes "$pid" VmHWM) || { P2_METRICS_REASON="${phase}_${boundary}_vmhwm_missing"; return 1; }
+  memory_current=$(cat "$cgroup/memory.current")
+  case "$memory_current" in ''|*[!0-9]*) P2_METRICS_REASON="${phase}_${boundary}_memory_current_invalid"; return 1;; esac
+  mem_anon=$(p2_cgroup_stat_value "$cgroup/memory.stat" anon) || { P2_METRICS_REASON="${phase}_${boundary}_memory_stat_anon_missing"; return 1; }
+  mem_file=$(p2_cgroup_stat_value "$cgroup/memory.stat" file) || { P2_METRICS_REASON="${phase}_${boundary}_memory_stat_file_missing"; return 1; }
+  refault=$(p2_cgroup_stat_value "$cgroup/memory.stat" workingset_refault_file) || { P2_METRICS_REASON="${phase}_${boundary}_memory_stat_refault_missing"; return 1; }
+  activate=$(p2_cgroup_stat_value "$cgroup/memory.stat" workingset_activate_file) || { P2_METRICS_REASON="${phase}_${boundary}_memory_stat_activate_missing"; return 1; }
+  pgmajfault=$(p2_cgroup_stat_value "$cgroup/memory.stat" pgmajfault) || { P2_METRICS_REASON="${phase}_${boundary}_memory_stat_pgmajfault_missing"; return 1; }
+  nr_throttled=$(p2_cgroup_stat_value "$cgroup/cpu.stat" nr_throttled) || { P2_METRICS_REASON="${phase}_${boundary}_cpu_stat_nr_throttled_missing"; return 1; }
+  throttled_usec=$(p2_cgroup_stat_value "$cgroup/cpu.stat" throttled_usec) || { P2_METRICS_REASON="${phase}_${boundary}_cpu_stat_throttled_usec_missing"; return 1; }
+  memory_psi=$(p2_psi_json "$cgroup/memory.pressure") || { P2_METRICS_REASON="${phase}_${boundary}_memory_psi_missing"; return 1; }
+  io_psi=$(p2_psi_json "$cgroup/io.pressure") || { P2_METRICS_REASON="${phase}_${boundary}_io_psi_missing"; return 1; }
+  io_json=$(p2_cgroup_io_json "$io_file") || { P2_METRICS_REASON="${phase}_${boundary}_io_stat_invalid"; return 1; }
+  if [ -n "$before_io" ]; then
+    io_delta=$(p2_cgroup_io_delta_json "$before_io" "$io_file") || { P2_METRICS_REASON="${phase}_${boundary}_io_stat_delta_invalid"; return 1; }
+  fi
+  jq -cn \
+    --arg phase "$phase" --arg boundary "$boundary" --arg snapshot "$snapshot" --arg cgroup "$cgroup" --arg io_file "$io_file" \
+    --argjson metrics "$metric_json" --argjson rss "$rss" --argjson rss_anon "$rss_anon" --argjson vmhwm "$vmhwm" \
+    --argjson memory_current "$memory_current" --argjson mem_anon "$mem_anon" --argjson mem_file "$mem_file" \
+    --argjson refault "$refault" --argjson activate "$activate" --argjson pgmajfault "$pgmajfault" \
+    --argjson nr_throttled "$nr_throttled" --argjson throttled_usec "$throttled_usec" \
+    --argjson memory_psi "$memory_psi" --argjson io_psi "$io_psi" --argjson io_stat "$io_json" --argjson io_delta "$io_delta" \
+    '{phase:$phase,boundary:$boundary,prometheus_snapshot:$snapshot,metrics:$metrics,process:{rss_bytes:$rss,rss_anon_bytes:$rss_anon,vmhwm_bytes:$vmhwm},cgroup:{path:$cgroup,memory_current:$memory_current,memory_stat:{anon:$mem_anon,file:$mem_file,workingset_refault_file:$refault,workingset_activate_file:$activate,pgmajfault:$pgmajfault},io_stat_file:$io_file,io_stat:$io_stat,io_stat_delta_from_before:$io_delta,memory_psi:$memory_psi,io_psi:$io_psi,cpu_stat:{nr_throttled:$nr_throttled,throttled_usec:$throttled_usec}}}' \
+    >> "$P2_TELEMETRY_JSONL" || { P2_METRICS_REASON="${phase}_${boundary}_telemetry_json_write_failed"; return 1; }
+}
+
 # Le recorder Prometheus crée une série de compteur lors de son premier
 # increment. Avant la première requête bool.must, les compteurs de route et de
 # blocs peuvent donc être absents des deux images sans signaler une anomalie.
@@ -1044,8 +1412,8 @@ p2_write_phase_status(){
   local cpu_steal_percent="$6" cpu_steal_within_limit="$7" cpu_steal_reason="$8"
   local direct_before generic_before read_before total_before segments_before
   local direct_after generic_after read_after total_after segments_after
-  local integrity_bytes_before integrity_hash_failures_before integrity_fallback_fields_before integrity_verified_bytes_before
-  local integrity_bytes_after integrity_hash_failures_after integrity_fallback_fields_after integrity_verified_bytes_after
+  local integrity_bytes_before integrity_hash_failures_before integrity_fallbacks_before integrity_fallback_fields_before integrity_verified_bytes_before
+  local integrity_bytes_after integrity_hash_failures_after integrity_fallbacks_after integrity_fallback_fields_after integrity_verified_bytes_after
   local direct_delta generic_delta read_delta total_delta segment_delta ratio="null" blocks_metrics_emitted=false
   local blocks_ratio_target_pass="null" blocks_ratio_verdict="not_applicable"
   local integrity_required=false valid=true reason=""
@@ -1063,10 +1431,12 @@ p2_write_phase_status(){
     integrity_required=true
     integrity_bytes_before=$(p2_metric_value surch_postings_p2_integrity_bytes "$before") || valid=false
     integrity_hash_failures_before=$(p2_metric_value surch_postings_p2_hash_failures "$before") || valid=false
+    integrity_fallbacks_before=$(p2_metric_value surch_postings_p2_fallbacks "$before") || valid=false
     integrity_fallback_fields_before=$(p2_metric_value surch_postings_p2_fallback_fields "$before") || valid=false
     integrity_verified_bytes_before=$(p2_metric_value surch_postings_p2_verified_bytes "$before") || valid=false
     integrity_bytes_after=$(p2_metric_value surch_postings_p2_integrity_bytes "$after") || valid=false
     integrity_hash_failures_after=$(p2_metric_value surch_postings_p2_hash_failures "$after") || valid=false
+    integrity_fallbacks_after=$(p2_metric_value surch_postings_p2_fallbacks "$after") || valid=false
     integrity_fallback_fields_after=$(p2_metric_value surch_postings_p2_fallback_fields "$after") || valid=false
     integrity_verified_bytes_after=$(p2_metric_value surch_postings_p2_verified_bytes "$after") || valid=false
   fi
@@ -1086,8 +1456,12 @@ p2_write_phase_status(){
       valid=false; reason="segment_count_${segments_before}_to_${segments_after}_invalid"
     elif [ "$integrity_required" = true ] && { ! p2_number_le "$integrity_bytes_before" "$P2_INTEGRITY_MAX_BYTES" || ! p2_number_le "$integrity_bytes_after" "$P2_INTEGRITY_MAX_BYTES"; }; then
       valid=false; reason="p3_integrity_bytes_above_${P2_INTEGRITY_MAX_BYTES}"
+    elif [ "$integrity_required" = true ] && ! awk -v before="$integrity_bytes_before" -v after="$integrity_bytes_after" 'BEGIN { exit !((before + 0) > 0 && (after + 0) > 0) }'; then
+      valid=false; reason="p3_integrity_bytes_non_positive"
     elif [ "$integrity_required" = true ] && { ! p2_number_equal "$integrity_hash_failures_before" 0 || ! p2_number_equal "$integrity_hash_failures_after" 0; }; then
       valid=false; reason="p3_hash_failures_nonzero"
+    elif [ "$integrity_required" = true ] && { ! p2_number_equal "$integrity_fallbacks_before" 0 || ! p2_number_equal "$integrity_fallbacks_after" 0; }; then
+      valid=false; reason="p3_fallbacks_nonzero"
     elif [ "$integrity_required" = true ] && { ! p2_number_equal "$integrity_fallback_fields_before" 0 || ! p2_number_equal "$integrity_fallback_fields_after" 0; }; then
       valid=false; reason="p3_fallback_fields_nonzero"
     elif [ "$P2_VARIANT" = "A" ]; then
@@ -1103,16 +1477,19 @@ p2_write_phase_status(){
       && ! p2_metric_present surch_bool_direct_must_fused_total "$after"; then
       valid=false; reason="route_P2_direct_metric_missing_after_bool"
     fi
-    # Une phase sans bool (fixed match) doit être neutre pour chaque compteur
-    # P2. Dans les phases alternées, l'égalité au nombre de bool prouve que les
-    # 1000 (ou 25/100) match n'ont ajouté aucun passage direct/générique.
+    # Une phase sans bool doit être neutre pour chaque compteur P2. C'est le
+    # garde-fou causal du témoin autonome : un match ne peut pas emprunter le
+    # chemin bool, ni authentifier une page P3 à la place de la phase bool.
     if [ "$valid" = true ] && [ "$bool_requests" -eq 0 ]; then
-      if ! p2_number_equal "$read_delta" 0 || ! p2_number_equal "$total_delta" 0; then
-        valid=false; reason="match_phase_p2_blocks_nonzero_read_${read_delta}_total_${total_delta}"
+      if ! p2_number_equal "$direct_delta" 0 || ! p2_number_equal "$generic_delta" 0 \
+         || ! p2_number_equal "$read_delta" 0 || ! p2_number_equal "$total_delta" 0; then
+        valid=false; reason="match_phase_p2_routing_nonzero_direct_${direct_delta}_generic_${generic_delta}_read_${read_delta}_total_${total_delta}"
+      elif [ "$integrity_required" = true ] && ! p2_number_equal "$integrity_verified_bytes_before" "$integrity_verified_bytes_after"; then
+        valid=false; reason="p3_verified_bytes_changed_during_match_control"
       fi
     fi
     if [ "$valid" = true ] && [ "$P2_VARIANT" != "A" ]; then
-      if [ "$blocks_metrics_emitted" != true ]; then
+      if [ "$bool_requests" -gt 0 ] && [ "$blocks_metrics_emitted" != true ]; then
         valid=false; reason="blocks_P2_metrics_missing_after_phase"
       elif [ "$bool_requests" -gt 0 ] && { ! p2_number_le 1 "$total_delta" || ! p2_number_le 0 "$read_delta"; }; then
         valid=false; reason="blocks_P2_non_positive_read_${read_delta}_total_${total_delta}"
@@ -1135,7 +1512,7 @@ p2_write_phase_status(){
   # mesure : routage, corps, segments et réponses restent déjà fail-closed.
   # Un ratio hors cible est donc enregistré comme ÉCHEC P2 exploitable plutôt
   # que de transformer la phase A/B correcte en mesure invalide.
-  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}},"integrity":{"required":%s,"bytes":{"before":%s,"after":%s},"hash_failures":{"before":%s,"after":%s},"fallback_fields":{"before":%s,"after":%s},"verified_bytes":{"before":%s,"after":%s}}}\n' \
+  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"request_cache":false,"hits_total_positive":true,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}},"integrity":{"required":%s,"bytes":{"before":%s,"after":%s},"hash_failures":{"before":%s,"after":%s},"fallbacks":{"before":%s,"after":%s},"fallback_fields":{"before":%s,"after":%s},"verified_bytes":{"before":%s,"after":%s}}}\n' \
     "$phase" "$P2_VARIANT" "$bool_requests" "$match_requests" "$valid" \
     "$( [ -n "$reason" ] && printf '\"%s\"' "$reason" || printf 'null' )" \
     "$cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT" "$cpu_steal_within_limit" \
@@ -1149,10 +1526,18 @@ p2_write_phase_status(){
     "$integrity_required" \
     "${integrity_bytes_before:-null}" "${integrity_bytes_after:-null}" \
     "${integrity_hash_failures_before:-null}" "${integrity_hash_failures_after:-null}" \
+    "${integrity_fallbacks_before:-null}" "${integrity_fallbacks_after:-null}" \
     "${integrity_fallback_fields_before:-null}" "${integrity_fallback_fields_after:-null}" \
     "${integrity_verified_bytes_before:-null}" "${integrity_verified_bytes_after:-null}" \
     >> "$P2_PHASE_STATUS"
   [ "$valid" = true ]
+}
+
+p2_extract_warm_bodies(){
+  local source="$1" destination="$2" first="$3" count="$4" actual
+  awk -v first="$first" -v count="$count" 'NR >= first && NR < first + count { print }' "$source" > "$destination" || return 1
+  actual=$(wc -l < "$destination" 2>/dev/null); actual=${actual:-0}
+  [ "$actual" -eq "$count" ]
 }
 
 p2_capture_phase(){
@@ -1170,6 +1555,10 @@ p2_capture_phase(){
     PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_prometheus_before_failed}"
     return 1
   fi
+  if ! p2_capture_telemetry "$CID" "$phase" before "$before"; then
+    PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_telemetry_before_failed}"
+    return 1
+  fi
   if ! capture_probe_samples "$base" "$bodies" "$client_raw" "$took_raw" "$overhead_raw" "$wanted" "$phase" "$responses_raw"; then
     return 1
   fi
@@ -1181,6 +1570,10 @@ p2_capture_phase(){
   fi
   if ! p2_snapshot_metrics "$base" "$after" "${phase}_after"; then
     PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_prometheus_after_failed}"
+    return 1
+  fi
+  if ! p2_capture_telemetry "$CID" "$phase" after "$after" "$OUT_DIR/$ENGINE.p2.cgroup.${phase}.before.io.stat"; then
+    PROBE_CAPTURE_REASON="${P2_METRICS_REASON:-${phase}_telemetry_after_failed}"
     return 1
   fi
   cpu_after=$(p2_cpu_stat 2>/dev/null || true)
@@ -1519,7 +1912,8 @@ run_engine(){
     [ "$ENGINE" = "surch" ] || { err "P2 ne mesure que Surch (ENGINE=$ENGINE refusé)"; return 1; }
     P2_PHASE_STATUS="$OUT_DIR/$ENGINE.p2.phase-status.jsonl"
     P2_STATS_JSONL="$OUT_DIR/$ENGINE.p2.stats.jsonl"
-    : > "$P2_PHASE_STATUS"; : > "$P2_STATS_JSONL"
+    P2_TELEMETRY_JSONL="$OUT_DIR/$ENGINE.p2.telemetry.jsonl"
+    : > "$P2_PHASE_STATUS"; : > "$P2_STATS_JSONL"; : > "$P2_TELEMETRY_JSONL"
   fi
   CID="fairab-$ENGINE"
   docker rm -f "$CID" >/dev/null 2>&1 || true
@@ -1736,6 +2130,11 @@ run_engine(){
       record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "${P2_METRICS_REASON:-p2_index_prometheus_invalid}"
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
     fi
+    if ! p2_capture_telemetry "$CID" index_ready snapshot "$p2_index_snapshot"; then
+      err "$ENGINE : P2 télémétrie index_ready invalide : $P2_METRICS_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "${P2_METRICS_REASON:-p2_index_telemetry_invalid}"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
     p2_index_segments=$(p2_metric_value surch_index_segment_count "$p2_index_snapshot") || p2_index_segments=""
     if ! p2_segment_value_valid "${p2_index_segments:-invalid}"; then
       err "$ENGINE : P2 segments invalides : $p2_index_segments (gate $P2_SEGMENT_GATE/$P2_REQUIRED_SEGMENTS)"
@@ -1757,6 +2156,14 @@ run_engine(){
   local no_source_raw="$OUT_DIR/$ENGINE.lat_no_source_client_s"
   local no_source_took_raw="$OUT_DIR/$ENGINE.lat_no_source_took_ms"
   local no_source_overhead_raw="$OUT_DIR/$ENGINE.lat_no_source_probe_overhead_ms"
+  local match_control_raw="$OUT_DIR/$ENGINE.p2.match_control_client_s"
+  local match_control_took_raw="$OUT_DIR/$ENGINE.p2.match_control_took_ms"
+  local match_control_overhead_raw="$OUT_DIR/$ENGINE.p2.match_control_probe_overhead_ms"
+  local warm_match_bodies="$OUT_DIR/$ENGINE.p2.warm_match_bodies.ndjson"
+  local warm_bool_bodies="$OUT_DIR/$ENGINE.p2.warm_bool_bodies.ndjson"
+  local warm_match_raw="$OUT_DIR/$ENGINE.p2.warm_match_client_s"
+  local warm_match_took_raw="$OUT_DIR/$ENGINE.p2.warm_match_took_ms"
+  local warm_match_overhead_raw="$OUT_DIR/$ENGINE.p2.warm_match_probe_overhead_ms"
   local source_fetch_profile_enabled=false source_fetch_profile_valid=true source_fetch_profile_reason=""
   local source_fetch_before_fixed="null" source_fetch_after_fixed="null" source_fetch_after_random="null"
   local source_fetch_after_no_source="null" source_fetch_after_cold="null"
@@ -1787,20 +2194,39 @@ run_engine(){
     fi
   fi
   if [ "$P2_MEASURE" = "1" ]; then
-    local warm_raw="$OUT_DIR/$ENGINE.p2.warm_client_s" warm_took_raw="$OUT_DIR/$ENGINE.p2.warm_took_ms" warm_overhead_raw="$OUT_DIR/$ENGINE.p2.warm_probe_overhead_ms"
-    if ! p2_capture_phase "$BASE" warm "$P2_WARM_BODIES" "$warm_raw" "$warm_took_raw" "$warm_overhead_raw" "$(( 2 * P2_WARM_PAIR_COUNT ))" "$P2_WARM_PAIR_COUNT" "$P2_WARM_PAIR_COUNT"; then
-      err "$ENGINE : chauffe P2 invalide : $PROBE_CAPTURE_REASON"
+    if ! p2_extract_warm_bodies "$P2_WARM_BODIES" "$warm_match_bodies" 1 "$P2_WARM_TERM_COUNT" \
+       || ! p2_capture_phase "$BASE" warm_match "$warm_match_bodies" "$warm_match_raw" "$warm_match_took_raw" "$warm_match_overhead_raw" "$P2_WARM_TERM_COUNT" 0 "$P2_WARM_TERM_COUNT"; then
+      err "$ENGINE : chauffe match P2 invalide : $PROBE_CAPTURE_REASON"
       record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
     fi
+    p2_split_and_stat_phase warm_match "$warm_match_raw" "$warm_match_took_raw" "$warm_match_overhead_raw" 0 "$P2_WARM_TERM_COUNT" || {
+      err "$ENGINE : statistiques P2 warm_match invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_warm_match_stats_invalid"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
+    }
+    if ! p2_capture_phase "$BASE" match_control "$P2_MATCH_CONTROL_SIZE10_BODIES" "$match_control_raw" "$match_control_took_raw" "$match_control_overhead_raw" "$P2_PAIR_COUNT" 0 "$P2_PAIR_COUNT"; then
+      err "$ENGINE : témoin match autonome invalide : $PROBE_CAPTURE_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
+    p2_split_and_stat_phase match_control "$match_control_raw" "$match_control_took_raw" "$match_control_overhead_raw" 0 "$P2_PAIR_COUNT" || {
+      err "$ENGINE : statistiques P2 match_control invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_match_control_stats_invalid"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
+    }
   fi
   if [ "$P2_MEASURE" = "1" ]; then
-    p2_capture_phase "$BASE" fixed "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS" 0 "$PROBE_REQUESTS"
+    if ! p2_extract_warm_bodies "$P2_WARM_BODIES" "$warm_bool_bodies" "$(( P2_WARM_TERM_COUNT + 1 ))" "$P2_WARM_TERM_COUNT"; then
+      PROBE_CAPTURE_REASON="warm_bool_bodies_extract_failed"
+      err "$ENGINE : chauffe bool P2 invalide : $PROBE_CAPTURE_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
+    p2_capture_phase "$BASE" warm_bool "$warm_bool_bodies" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$P2_WARM_TERM_COUNT" "$P2_WARM_TERM_COUNT" 0
   else
     capture_probe_samples "$BASE" "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS" fixed
   fi
   if [ "$?" -ne 0 ]; then
-    err "$ENGINE : série fixe invalide : $PROBE_CAPTURE_REASON"
+    err "$ENGINE : chauffe bool invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
@@ -1809,8 +2235,8 @@ run_engine(){
   read -r lat_fixed_took50 lat_fixed_took95 lat_fixed_took99 < <(probe_quantiles "$fixed_took_raw" 1)
   read -r lat_fixed_probe50 lat_fixed_probe95 lat_fixed_probe99 < <(probe_quantiles "$fixed_overhead_raw" 1)
   if [ "$P2_MEASURE" = "1" ]; then
-    p2_split_and_stat_phase fixed "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" 0 "$PROBE_REQUESTS" || {
-      err "$ENGINE : statistiques P2 fixed invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_fixed_stats_invalid"
+    p2_split_and_stat_phase warm_bool "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$P2_WARM_TERM_COUNT" 0 || {
+      err "$ENGINE : statistiques P2 warm_bool invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_warm_bool_stats_invalid"
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
     }
   fi
@@ -1829,12 +2255,12 @@ run_engine(){
     fi
   fi
   if [ "$P2_MEASURE" = "1" ]; then
-    p2_capture_phase "$BASE" random "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT"
+    p2_capture_phase "$BASE" bool_size10 "$P2_BOOL_SIZE10_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" 0
   else
     capture_probe_samples "$BASE" "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS" random
   fi
   if [ "$?" -ne 0 ]; then
-    err "$ENGINE : série random invalide : $PROBE_CAPTURE_REASON"
+    err "$ENGINE : bool.must size:10 invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
@@ -1843,8 +2269,8 @@ run_engine(){
   read -r lat_rand_took50 lat_rand_took95 lat_rand_took99 < <(probe_quantiles "$random_took_raw" 1)
   read -r lat_rand_probe50 lat_rand_probe95 lat_rand_probe99 < <(probe_quantiles "$random_overhead_raw" 1)
   if [ "$P2_MEASURE" = "1" ]; then
-    p2_split_and_stat_phase random "$random_raw" "$random_took_raw" "$random_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" || {
-      err "$ENGINE : statistiques P2 random invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_random_stats_invalid"
+    p2_split_and_stat_phase bool_size10 "$random_raw" "$random_took_raw" "$random_overhead_raw" "$P2_PAIR_COUNT" 0 || {
+      err "$ENGINE : statistiques P2 bool_size10 invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_bool_size10_stats_invalid"
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
     }
   fi
@@ -1872,12 +2298,12 @@ run_engine(){
     fi
   fi
   if [ "$P2_MEASURE" = "1" ]; then
-    p2_capture_phase "$BASE" no_source "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT"
+    p2_capture_phase "$BASE" bool_size0 "$P2_BOOL_SIZE0_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" 0
   else
     capture_probe_samples "$BASE" "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS" no_source
   fi
   if [ "$?" -ne 0 ]; then
-    err "$ENGINE : série témoin size:0 invalide : $PROBE_CAPTURE_REASON"
+    err "$ENGINE : bool.must size:0 invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   fi
@@ -1886,8 +2312,8 @@ run_engine(){
   read -r lat_no_source_took50 lat_no_source_took95 lat_no_source_took99 < <(probe_quantiles "$no_source_took_raw" 1)
   read -r lat_no_source_probe50 lat_no_source_probe95 lat_no_source_probe99 < <(probe_quantiles "$no_source_overhead_raw" 1)
   if [ "$P2_MEASURE" = "1" ]; then
-    p2_split_and_stat_phase no_source "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" || {
-      err "$ENGINE : statistiques P2 size:0 invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_no_source_stats_invalid"
+    p2_split_and_stat_phase bool_size0 "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$P2_PAIR_COUNT" 0 || {
+      err "$ENGINE : statistiques P2 bool_size0 invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_bool_size0_stats_invalid"
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
     }
   fi
@@ -1907,6 +2333,36 @@ run_engine(){
     if ! source_fetch_no_source_delta_is_zero "$source_fetch_no_source_delta"; then
       source_fetch_profile_valid=false
       source_fetch_profile_reason="${source_fetch_profile_reason:-size_zero_hydration_delta_nonzero}"
+    fi
+  fi
+
+  # MARTIN demeure un contrôle secondaire. Il est volontairement exécuté
+  # après les cinq phases causales : il ne peut ni préchauffer le témoin
+  # autonome, ni servir de substitut à ce témoin.
+  if [ "$P2_MEASURE" = "1" ]; then
+    if ! p2_capture_phase "$BASE" fixed_martin "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$P2_PAIR_COUNT" 0 "$P2_PAIR_COUNT"; then
+      err "$ENGINE : contrôle secondaire MARTIN invalide : $PROBE_CAPTURE_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    fi
+    read -r lat50 lat95 lat99 < <(probe_quantiles "$fixed_raw" 1000)
+    read -r lat_fixed_took50 lat_fixed_took95 lat_fixed_took99 < <(probe_quantiles "$fixed_took_raw" 1)
+    read -r lat_fixed_probe50 lat_fixed_probe95 lat_fixed_probe99 < <(probe_quantiles "$fixed_overhead_raw" 1)
+    p2_split_and_stat_phase fixed_martin "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" 0 "$P2_PAIR_COUNT" || {
+      err "$ENGINE : statistiques P2 fixed_martin invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_fixed_martin_stats_invalid"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
+    }
+    if [ "$P2_REPLAY_MIX_5050" = "1" ]; then
+      local replay_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_client_s" replay_took_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_took_ms" replay_overhead_raw="$OUT_DIR/$ENGINE.p2.replay_mix_5050_probe_overhead_ms"
+      if ! p2_capture_phase "$BASE" replay_mix_5050 "$P2_REPLAY_MIX_5050_BODIES" "$replay_raw" "$replay_took_raw" "$replay_overhead_raw" "$(( 2 * P2_PAIR_COUNT ))" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT"; then
+        err "$ENGINE : replay 50/50 optionnel invalide : $PROBE_CAPTURE_REASON"
+        record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
+        docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+      fi
+      p2_split_and_stat_phase replay_mix_5050 "$replay_raw" "$replay_took_raw" "$replay_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" || {
+        err "$ENGINE : statistiques P2 replay_mix_5050 invalides"; record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "p2_replay_mix_5050_stats_invalid"
+        docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
+      }
     fi
   fi
 
@@ -2022,13 +2478,13 @@ run_engine(){
       else
         p2_cold_cpu_steal_reason="cpu_steal_unreadable"
       fi
-      if ! p2_write_phase_status cold 25 25 "$p2_cold_before" "$p2_cold_after" \
+      if ! p2_write_phase_status cold 50 0 "$p2_cold_before" "$p2_cold_after" \
           "$p2_cold_cpu_steal_percent" "$p2_cold_cpu_steal_within_limit" "$p2_cold_cpu_steal_reason"; then
         p2_cold_phase_valid=false
         cold_skip_reason="${P2_PHASE_REASON:-p2_cold_routing_invalid}"
       fi
     fi
-    if [ "$p2_cold_phase_valid" = true ] && ! p2_split_and_stat_phase cold "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" 25 25; then
+    if [ "$p2_cold_phase_valid" = true ] && ! p2_split_and_stat_phase cold "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" 50 0; then
       p2_cold_phase_valid=false
       cold_skip_reason="p2_cold_stats_invalid"
     fi
@@ -2063,21 +2519,43 @@ run_engine(){
   fi
   local p2_json=""
   if [ "$P2_MEASURE" = "1" ]; then
-    local p2_phase_records p2_hot_phase_records p2_image_id p2_image_digest p2_bulk_sha256 p2_mapping_sha256 p2_cpu_steal_percent
+    local p2_phase_records p2_causal_phase_records p2_expected_phase_records p2_telemetry_records p2_expected_telemetry_records p2_image_id p2_image_digest p2_bulk_sha256 p2_mapping_sha256 p2_cpu_steal_percent
     p2_phase_records=$(wc -l < "$P2_PHASE_STATUS" 2>/dev/null); p2_phase_records=${p2_phase_records:-0}
-    p2_hot_phase_records=$(jq -se '[.[] | select(.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source")] | length' "$P2_PHASE_STATUS" 2>/dev/null || printf '0')
-    p2_cpu_steal_percent=$(jq -ser '[.[] | select(.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source") | .cpu_steal_percent | numbers] | if length == 4 then max else null end' "$P2_PHASE_STATUS" 2>/dev/null || printf 'null')
-    # Les quatre phases chaudes portent la causalité P2. Cold reste un
-    # diagnostic historique : ses droits de reclaim ne changent ni les corps,
-    # ni le routage, ni les réponses canoniques des mesures chaudes.
+    p2_causal_phase_records=$(jq -se '[.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0")] | length' "$P2_PHASE_STATUS" 2>/dev/null || printf '0')
+    p2_cpu_steal_percent=$(jq -ser '[.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0") | .cpu_steal_percent | numbers] | if length == 5 then max else null end' "$P2_PHASE_STATUS" 2>/dev/null || printf 'null')
+    p2_expected_phase_records=6
+    p2_expected_telemetry_records=13
+    if [ "$P2_REPLAY_MIX_5050" = "1" ]; then
+      p2_expected_phase_records=7
+      p2_expected_telemetry_records=15
+    fi
+    p2_telemetry_records=$(wc -l < "$P2_TELEMETRY_JSONL" 2>/dev/null); p2_telemetry_records=${p2_telemetry_records:-0}
+    # Les cinq phases causales portent la preuve. MARTIN est une sonde
+    # secondaire mesurée à part ; cold dépend des droits de reclaim et reste
+    # diagnostique, sans pouvoir sauver ni invalider les phases causales.
     if ! jq -se '
-      ([.[] | select(.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source")]) as $hot
-      | ($hot | length == 4)
-      and ([ $hot[] | .phase ] | sort == ["fixed", "no_source", "random", "warm"])
-      and all($hot[]; .valid == true and .cpu_steal_within_limit == true)
+      ([.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0")]) as $causal
+      | ($causal | length == 5)
+      and ([ $causal[] | .phase ] | sort == ["bool_size0", "bool_size10", "match_control", "warm_bool", "warm_match"])
+      and all($causal[]; .valid == true and .cpu_steal_within_limit == true and .request_cache == false and .hits_total_positive == true)
+      and ([.[] | select(.phase == "fixed_martin")] | length == 1)
+      and ([.[] | select(.phase == "fixed_martin")] | all(.[]; .valid == true and .cpu_steal_within_limit == true))
     ' "$P2_PHASE_STATUS" 2>/dev/null | grep -qx true; then
       measurement_valid=false
-      measurement_invalid_reason="\"p2_required_hot_phase_invalid_${p2_hot_phase_records}_of_4\""
+      measurement_invalid_reason="\"p2_required_causal_phase_invalid_${p2_causal_phase_records}_of_5\""
+    elif [ "$p2_phase_records" -ne "$p2_expected_phase_records" ]; then
+      measurement_valid=false
+      measurement_invalid_reason="\"p2_phase_records_${p2_phase_records}_of_${p2_expected_phase_records}\""
+    elif [ "$p2_telemetry_records" -ne "$p2_expected_telemetry_records" ] \
+      || ! jq -se '
+        ([.[] | select(.phase == "index_ready" and .boundary == "snapshot")]) as $ready
+        | ([.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0" or .phase == "fixed_martin")]) as $phases
+        | ($ready | length == 1)
+        and ($phases | length == 12)
+        and ([ $phases[] | .phase + ":" + .boundary ] | sort == ["bool_size0:after", "bool_size0:before", "bool_size10:after", "bool_size10:before", "fixed_martin:after", "fixed_martin:before", "match_control:after", "match_control:before", "warm_bool:after", "warm_bool:before", "warm_match:after", "warm_match:before"])
+      ' "$P2_TELEMETRY_JSONL" 2>/dev/null | grep -qx true; then
+      measurement_valid=false
+      measurement_invalid_reason="\"p2_telemetry_incomplete_${p2_telemetry_records}_of_${p2_expected_telemetry_records}\""
     fi
     p2_image_id=$(docker image inspect -f '{{.Id}}' "$SURCH_IMAGE" 2>/dev/null || true)
     p2_image_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$SURCH_IMAGE" 2>/dev/null || true)
@@ -2085,7 +2563,7 @@ run_engine(){
     [ -n "$p2_image_digest" ] || p2_image_digest="$p2_image_id"
     p2_bulk_sha256=$(p2_manifest_value bulk_sha256 "$PROBE_MANIFEST")
     p2_mapping_sha256=$(p2_manifest_value mapping_sha256 "$PROBE_MANIFEST")
-    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_required_hot_phase\",\"required_hot_phase_records\":4,\"hot_phase_records\":$p2_hot_phase_records,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
+    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"telemetry_jsonl\":\"$P2_TELEMETRY_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_causal_phase\",\"required_causal_phase_records\":5,\"causal_phase_records\":$p2_causal_phase_records,\"secondary_fixed_phase_records\":1,\"expected_phase_records\":$p2_expected_phase_records,\"expected_telemetry_records\":$p2_expected_telemetry_records,\"telemetry_records\":$p2_telemetry_records,\"replay_mix_5050\":$P2_REPLAY_MIX_5050,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
   fi
   local source_fetch_profile_reason_json="null" source_fetch_random_gate_json="null"
   [ -n "$source_fetch_profile_reason" ] && source_fetch_profile_reason_json="\"$source_fetch_profile_reason\""

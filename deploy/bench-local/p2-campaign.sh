@@ -27,6 +27,7 @@ P2_REST_SECONDS="${P2_REST_SECONDS:-300}"
 P2_RECOVERY_MEM_TOLERANCE_MIB="${P2_RECOVERY_MEM_TOLERANCE_MIB:-512}"
 P2_RECOVERY_DISK_TOLERANCE_MIB="${P2_RECOVERY_DISK_TOLERANCE_MIB:-128}"
 P2_RECOVERY_LOAD_TOLERANCE="${P2_RECOVERY_LOAD_TOLERANCE:-0.25}"
+P2_REPLAY_MIX_5050="${P2_REPLAY_MIX_5050:-0}"
 BULK_FILE="${BULK_FILE:-}"
 MAPPING_FILE="${MAPPING_FILE:-}"
 
@@ -46,15 +47,16 @@ case "$P2_MODE" in full|smoke) ;; *) die "P2_MODE doit valoir full ou smoke";; e
 case "$P2_REST_SECONDS:$P2_RECOVERY_MEM_TOLERANCE_MIB:$P2_RECOVERY_DISK_TOLERANCE_MIB" in
   *[!0-9:]*|:*|*::*) die "paramètres P2 de récupération invalides";;
 esac
+case "$P2_REPLAY_MIX_5050" in 0|1) ;; *) die "P2_REPLAY_MIX_5050 doit valoir 0 ou 1";; esac
 [ "$P2_REST_SECONDS" -eq 300 ] || die "P2_REST_SECONDS doit rester 300 secondes"
 [ -n "$P2_DOCKER_CLASSIC_SOURCE" ] || die "P2_DOCKER_CLASSIC_SOURCE est obligatoire (ex. /dev/sdb du volume classic)"
 if [ "$P2_MODE" = "full" ]; then
   [ -n "$P2_SMOKE_DIR" ] || die "P2_SMOKE_DIR est obligatoire : exécuter et conserver le smoke avant le full"
   [ -s "$P2_SMOKE_DIR/README.md" ] \
     && grep -q '^SMOKE P2 valide' "$P2_SMOKE_DIR/README.md" \
-    && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-A/surch.json" >/dev/null \
-    && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-B/surch.json" >/dev/null \
-    && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-C/surch.json" >/dev/null \
+    && jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$P2_SMOKE_DIR/runs/smoke-A/surch.json" >/dev/null \
+    && jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$P2_SMOKE_DIR/runs/smoke-B/surch.json" >/dev/null \
+    && jq -e '.measurement_valid == true and .p2.causal_phase_records == 5 and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))' "$P2_SMOKE_DIR/runs/smoke-C/surch.json" >/dev/null \
     || die "smoke P2 absent ou invalide: $P2_SMOKE_DIR"
 fi
 
@@ -174,8 +176,8 @@ assert_scorecard(){
       .measurement_valid == true
       and .count == $docs and .indexed == $docs and .item_errors == 0
       and .p2.variant == $variant and .p2.expected_docs == $docs
-      and .p2.required_segments == $segments and .p2.hot_phase_records == 4
-      and (.p2.phase_records >= 4 and .p2.phase_records <= 5)
+      and .p2.required_segments == $segments and .p2.causal_phase_records == 5
+      and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))
       and (.p2.observed_cpu_configuration.nproc == .probe_cpu_count)
       and (.p2.observed_cpu_configuration.engine_cpuset == .cpuset)
       and (.p2.observed_cpu_configuration.probe_cpuset == .probe_cpuset)
@@ -196,7 +198,7 @@ run_variant(){
     "SURCH_DENSIFY_BUDGET_DOCS=1000000" "SURCH_MERGE_MAX_DOCS=7000000" \
     "SURCH_SOURCE_FETCH_PROFILE=0" "PREFLIGHT_FORCE=0" \
     "PROBE_REQUESTS=$PROBE_REQUESTS" "COLD_PROBE_REQUESTS=50" "COLD_PROBE=1" \
-    "P2_MEASURE=1" "P2_VARIANT=$variant" "P2_REQUIRE_P3_INTEGRITY=$require_p3" "P2_PAIR_COUNT=$PAIR_COUNT" \
+    "P2_MEASURE=1" "P2_VARIANT=$variant" "P2_REQUIRE_P3_INTEGRITY=$require_p3" "P2_PAIR_COUNT=$PAIR_COUNT" "P2_WARM_TERM_COUNT=200" "P2_REPLAY_MIX_5050=$P2_REPLAY_MIX_5050" \
     "P2_EXPECTED_DOCS=$EXPECTED_DOCS" "P2_REQUIRED_SEGMENTS=$REQUIRED_SEGMENTS" "P2_SEGMENT_GATE=$SEGMENT_GATE" \
     "P2_INPUT_DIR=$P2_INPUT_DIR" "SURCH_IMAGE=$image" "ENGINES=surch" "OUT_DIR=$out" \
     "$FAIR_AB" > "$out/fair-ab.log" 2>&1; then
@@ -207,9 +209,10 @@ run_variant(){
 
 compare_parity(){
   local pair="$1" a_name="$2" b_name="$3" report_group="$4" report="$P2_CAMPAIGN_DIR/$report_group/$pair"
-  local phase a_file b_file
+  local phase a_file b_file phases=(warm_match match_control warm_bool bool_size10 bool_size0 fixed_martin)
   mkdir -p "$report" || die "création rapport impossible: $report"
-  for phase in warm fixed random no_source; do
+  [ "$P2_REPLAY_MIX_5050" = "0" ] || phases+=(replay_mix_5050)
+  for phase in "${phases[@]}"; do
     a_file="$P2_CAMPAIGN_DIR/runs/$a_name/surch.p2.responses.${phase}.canonical.ndjson"
     b_file="$P2_CAMPAIGN_DIR/runs/$b_name/surch.p2.responses.${phase}.canonical.ndjson"
     if ! cmp -s "$a_file" "$b_file"; then

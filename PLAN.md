@@ -190,8 +190,10 @@ historical replay line lives in
   un résultat distinct de la validité. P3 remplace localement les trois copies
   résidentes par des digests BLAKE3-256 de pages de `TermEntry` et répertoire,
   avec repli checked intégral ; ses gates externes mémoire/latence restent
-  ouvertes. Gates externes détaillées dans
-  `plan/p2-segmented-postings.md`.
+  ouvertes. Le harnais P3 prépare désormais le témoin match sur des `NOM`
+  disjoints, avant tout bool, et conserve les états P3/mémoire/cgroup par
+  phase ; la prochaine preuve reste la campagne externe A/B/C. Gates externes
+  détaillées dans `plan/p2-segmented-postings.md`.
 
 ## Track B - Test Automation / Perf Reporting
 
