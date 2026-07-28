@@ -62,9 +62,10 @@ fn handle() -> &'static PrometheusHandle {
 /// scraper expects (`text/plain; version=0.0.4`) so the endpoint is
 /// usable as a drop-in scrape target.
 pub async fn prometheus_handler() -> Response {
-    // Les stats jemalloc sont mises en cache jusqu'à l'avancement de leur
-    // epoch. Un scrape est une borne de télémétrie P3 : il doit donc rafraîchir
-    // les jauges processus/allocateur avant de rendre l'exposition.
+    // Les jauges runtime sont rafraîchies hors du chemin de requête avec un
+    // cache borné. Les métriques succès/âge rendent visible une valeur en
+    // cache ou un échec : elles ne constituent pas une preuve de fraîcheur
+    // pour une campagne P3 épinglée sur une image plus ancienne.
     crate::stats::refresh_runtime_memory_gauges();
     let body = handle().render();
     (
