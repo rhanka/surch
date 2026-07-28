@@ -17,3 +17,5 @@ thiserror = { workspace = true }
 fst = { workspace = true }
 rayon = { workspace = true }
 tracing = { workspace = true }
+blake3 = { workspace = true }
+constant_time_eq = { workspace = true }

@@ -20,7 +20,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use surch_index::memory::MemoryUsage;
+use surch_index::{memory::MemoryUsage, postings::P2IntegrityMetrics};
 
 use crate::state::AppState;
 
@@ -38,6 +38,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     let disk_postings_bytes = state.index_disk_postings_bytes(index).unwrap_or(0);
     let disk_postings_skipped_terms = state.index_disk_postings_skipped_terms(index).unwrap_or(0);
     let disk_subfield_values_bytes = state.index_disk_subfield_values_bytes(index).unwrap_or(0);
+    let p2_integrity_metrics = state.index_p2_integrity_metrics(index).unwrap_or_default();
     let segment_count = state.index_segment_count(index);
     set_gauges(
         index,
@@ -52,12 +53,32 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         disk_subfield_values_bytes,
         segment_count,
     );
+    set_p2_integrity_gauges(p2_integrity_metrics);
     refresh_process_memory_gauges();
     // Lot C Phase 0b : stats internes jemalloc. Appelé ici, donc APRÈS
     // `finalize_terms_for_refresh` sur le chemin `_refresh` (le builder
     // est déjà droppé), pour lire l'`allocated` à l'état steady et non
     // gonflé par le `PostingsBuilder` vivant.
     refresh_jemalloc_gauges();
+}
+
+/// Jauges P3 mises à jour à l'indexation et après chaque tentative P2. Les
+/// tailles sont instantanées ; les compteurs de vérification et de déclin sont
+/// cumulatifs pour la génération de segments courante.
+pub(crate) fn set_p2_integrity_gauges(integrity: P2IntegrityMetrics) {
+    metrics::gauge!("surch_postings_p2_integrity_bytes").set(integrity.integrity_bytes as f64);
+    metrics::gauge!("surch_postings_p2_integrity_pages").set(integrity.integrity_pages as f64);
+    metrics::gauge!("surch_postings_p2_verified_bytes").set(integrity.verified_bytes as f64);
+    metrics::gauge!("surch_postings_p2_hash_failures").set(integrity.hash_failures as f64);
+    metrics::gauge!("surch_postings_p2_fallbacks").set(integrity.fallbacks as f64);
+    metrics::gauge!("surch_postings_p2_fallback_fields").set(integrity.fallback_fields as f64);
+    metrics::gauge!("surch_postings_p2_term_occurrences").set(integrity.term_occurrences as f64);
+    metrics::gauge!("surch_postings_p2_blocks").set(integrity.blocks as f64);
+    metrics::gauge!("surch_postings_p2_fields").set(integrity.fields as f64);
+    metrics::gauge!("surch_postings_p2_term_payload_bytes")
+        .set(integrity.term_payload_bytes as f64);
+    metrics::gauge!("surch_postings_p2_csr_bytes").set(integrity.csr_bytes as f64);
+    metrics::gauge!("surch_postings_p2_directory_bytes").set(integrity.directory_bytes as f64);
 }
 
 /// Process-wide RSS accounting (#17b). Reads `/proc/self/status` to
@@ -278,6 +299,7 @@ pub fn refresh_jemalloc_purge() {}
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
     set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0, 0, 0, 0);
+    set_p2_integrity_gauges(P2IntegrityMetrics::default());
 }
 
 // Internal gauge-fan-out helper: one positional arg per Prometheus gauge
@@ -367,9 +389,10 @@ fn set_gauges(
     // pour le gap ~295 MiB non gaugé mesuré à 1,36 M (cf. design doc §S5).
     // Scale avec le nombre de termes DISTINCTS, pas le nombre de docs.
     // S5b : les 5 tableaux sont spillés dans le segment pread sous
-    // SURCH_POSTINGS_DISK (table TermEntry unifiée 28 o/terme) — cette
-    // gauge doit lire ~0 flag on ; les octets déplacés apparaissent dans
-    // surch_index_disk_postings_bytes (footprint disque, page cache).
+    // SURCH_POSTINGS_DISK (table TermEntry unifiée 28 o/terme). P3 ne
+    // réintroduit pas leurs copies : cette gauge ne garde plus que les
+    // digests BLAKE3 et descripteurs de pages ; les octets de service restent
+    // dans surch_index_disk_postings_bytes (footprint disque, page cache).
     metrics::gauge!("surch_index_postings_directory_bytes", &label)
         .set(usage.postings_directory_bytes as f64);
     metrics::gauge!("surch_index_total_bytes", &label).set(usage.total_bytes() as f64);

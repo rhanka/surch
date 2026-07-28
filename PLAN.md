@@ -187,7 +187,10 @@ historical replay line lives in
   configuration CPU observée plutôt que de figer une taille d'hôte impossible
   avec ses caps mémoire. Les quatre phases chaudes restent fail-closed ; cold
   est diagnostique, le steal est local à chaque phase et le ratio de blocs est
-  un résultat distinct de la validité. Gates externes ouvertes dans
+  un résultat distinct de la validité. P3 remplace localement les trois copies
+  résidentes par des digests BLAKE3-256 de pages de `TermEntry` et répertoire,
+  avec repli checked intégral ; ses gates externes mémoire/latence restent
+  ouvertes. Gates externes détaillées dans
   `plan/p2-segmented-postings.md`.
 
 ## Track B - Test Automation / Perf Reporting

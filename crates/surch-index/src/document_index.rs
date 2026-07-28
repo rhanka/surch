@@ -15,8 +15,9 @@ use thiserror::Error;
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
     merge_term_dictionaries, postings_disk_enabled, BlockMeta, CheckedPostings,
-    DiskPostingsAdvance, DiskPostingsCursor, PostingsBlockSkipIter, PostingsBuilder, PostingsEnum,
-    PostingsError, PostingsList, PostingsReadError, TermDictionary, TermsEnum,
+    DiskPostingsAdvance, DiskPostingsCursor, P2IntegrityMetrics, PostingsBlockSkipIter,
+    PostingsBuilder, PostingsEnum, PostingsError, PostingsList, PostingsReadError, TermDictionary,
+    TermsEnum,
 };
 use crate::stored_fields::{StoredDocument, StoredFieldsError};
 
@@ -2577,13 +2578,50 @@ impl DocumentIndex {
     /// before this — see
     /// [`crate::postings::TermDictionary::postings_directory_bytes`] for
     /// la justification complète. S5b déverse les cinq tableaux de service
-    /// sous `SURCH_POSTINGS_DISK`, mais P2 conserve une attestation exacte
-    /// des répertoires ; cette jauge la compte sur tous les segments scellés.
+    /// sous `SURCH_POSTINGS_DISK`, mais P3 conserve les digests BLAKE3 et
+    /// descripteurs de pages ; cette jauge les compte sur tous les segments
+    /// scellés.
     pub fn postings_directory_bytes(&self) -> u64 {
         self.segments
             .iter()
             .map(|s| s.terms.postings_directory_bytes())
             .sum()
+    }
+
+    /// Agrège les compteurs P3 de tous les segments scellés. Les réponses de
+    /// recherche restent indépendantes de ces métriques : elles servent au
+    /// gate mémoire/intégrité et à diagnostiquer un déclin vers le générique.
+    pub fn postings_p2_integrity_metrics(&self) -> P2IntegrityMetrics {
+        self.segments
+            .iter()
+            .fold(P2IntegrityMetrics::default(), |mut total, segment| {
+                let metrics = segment.terms.p2_integrity_metrics();
+                total.integrity_bytes = total
+                    .integrity_bytes
+                    .saturating_add(metrics.integrity_bytes);
+                total.integrity_pages = total
+                    .integrity_pages
+                    .saturating_add(metrics.integrity_pages);
+                total.verified_bytes = total.verified_bytes.saturating_add(metrics.verified_bytes);
+                total.hash_failures = total.hash_failures.saturating_add(metrics.hash_failures);
+                total.fallbacks = total.fallbacks.saturating_add(metrics.fallbacks);
+                total.fallback_fields = total
+                    .fallback_fields
+                    .saturating_add(metrics.fallback_fields);
+                total.term_occurrences = total
+                    .term_occurrences
+                    .saturating_add(metrics.term_occurrences);
+                total.blocks = total.blocks.saturating_add(metrics.blocks);
+                total.fields = total.fields.saturating_add(metrics.fields);
+                total.term_payload_bytes = total
+                    .term_payload_bytes
+                    .saturating_add(metrics.term_payload_bytes);
+                total.csr_bytes = total.csr_bytes.saturating_add(metrics.csr_bytes);
+                total.directory_bytes = total
+                    .directory_bytes
+                    .saturating_add(metrics.directory_bytes);
+                total
+            })
     }
 
     /// #17c memory accounting: Vec capacity slack across every term's

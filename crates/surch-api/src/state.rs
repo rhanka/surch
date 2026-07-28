@@ -971,7 +971,9 @@ fn merge_forward_fst(
 use surch_search::scoring::{bm25_score, Bm25Config};
 
 use crate::scroll::ScrollTable;
-use crate::stats::{clear_memory_gauges, refresh_jemalloc_purge, refresh_memory_gauges};
+use crate::stats::{
+    clear_memory_gauges, refresh_jemalloc_purge, refresh_memory_gauges, set_p2_integrity_gauges,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FusedConjunctionScoreMode {
@@ -1027,11 +1029,12 @@ impl P2DiskBlockMetrics {
         self.blocks_total = self.blocks_total.saturating_add(total);
     }
 
-    fn publish(&self) {
+    fn publish(&self, index: &DocumentIndex) {
         if self.blocks_total > 0 {
             metrics::counter!("surch_postings_disk_blocks_read_total").increment(self.blocks_read);
             metrics::counter!("surch_postings_disk_blocks_total").increment(self.blocks_total);
         }
+        set_p2_integrity_gauges(index.postings_p2_integrity_metrics());
     }
 }
 
@@ -3073,14 +3076,14 @@ impl InMemoryIndex {
                 // Terme absent de tous les segments : l'AND entier est vide.
                 Ok(None) => {
                     block_metrics.observe_segmented(&segmented_terms);
-                    block_metrics.publish();
+                    block_metrics.publish(index);
                     return Vec::new();
                 }
                 // Ne jamais publier le préfixe des segments déjà lus.
                 Err(error) => {
                     block_metrics.observe_segmented(&segmented_terms);
                     block_metrics.observe_construction_error(&error);
-                    block_metrics.publish();
+                    block_metrics.publish(index);
                     return Self::conjunction_hits_merged(index, terms);
                 }
             }
@@ -3111,13 +3114,13 @@ impl InMemoryIndex {
                 }
                 Err(()) => {
                     block_metrics.observe_segmented(&segmented_terms);
-                    block_metrics.publish();
+                    block_metrics.publish(index);
                     return Self::conjunction_hits_merged(index, terms);
                 }
             }
         }
         block_metrics.observe_segmented(&segmented_terms);
-        block_metrics.publish();
+        block_metrics.publish(index);
         out
     }
 
@@ -4921,7 +4924,7 @@ impl AppState {
             let recall = normalized_terms_for_field(value, field, &data.mapping);
             if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
                 block_metrics.observe_segmented(&segmented_terms);
-                block_metrics.publish();
+                block_metrics.publish(&data.index);
                 return None;
             }
             let token = recall.into_iter().next().expect("len checked == 1");
@@ -4930,7 +4933,7 @@ impl AppState {
                 // Le terme est absent de tous les segments : l'AND est vide.
                 Ok(None) => {
                     block_metrics.observe_segmented(&segmented_terms);
-                    block_metrics.publish();
+                    block_metrics.publish(&data.index);
                     return Some(Vec::new());
                 }
                 // Une erreur checked doit décliner AVANT compteur et
@@ -4939,7 +4942,7 @@ impl AppState {
                 Err(error) => {
                     block_metrics.observe_segmented(&segmented_terms);
                     block_metrics.observe_construction_error(&error);
-                    block_metrics.publish();
+                    block_metrics.publish(&data.index);
                     return None;
                 }
             };
@@ -4947,7 +4950,7 @@ impl AppState {
                 // Même une construction de statistiques incomplète doit
                 // conserver le coût des termes déjà ouverts avant le déclin.
                 block_metrics.observe_segmented(&segmented_terms);
-                block_metrics.publish();
+                block_metrics.publish(&data.index);
                 return None;
             };
             scoring_terms.push((field_stats, postings.global_df()));
@@ -5051,12 +5054,12 @@ impl AppState {
             drop(cursors);
             if segment_result.is_err() {
                 block_metrics.observe_segmented(&segmented_terms);
-                block_metrics.publish();
+                block_metrics.publish(&data.index);
                 return None;
             }
         }
         block_metrics.observe_segmented(&segmented_terms);
-        block_metrics.publish();
+        block_metrics.publish(&data.index);
         Some(scored)
     }
 
@@ -5598,6 +5601,24 @@ impl AppState {
             .indices
             .get(index)
             .map(|data| data.index.postings_segment_skipped_terms())
+    }
+
+    /// Photo des preuves P3 après matérialisation des termes en attente. Elle
+    /// alimente les gauges de mémoire avant la première requête P2, puis les
+    /// mêmes gauges sont rafraîchies par les tentatives de recherche.
+    pub fn index_p2_integrity_metrics(
+        &self,
+        index: &str,
+    ) -> Option<surch_index::postings::P2IntegrityMetrics> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.index.postings_p2_integrity_metrics())
     }
 
     /// Plan segments S5c : taille on-disk des segments de spill sub-field
