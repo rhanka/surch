@@ -200,7 +200,11 @@ historical replay line lives in
   une variable locale non liée; Fix4 sépare les déclarations, corrige aussi
   le tableau replay vide sous Bash 4.3 et versionne la régression du vrai
   pilote sans Docker/VM, mais ne vaut pas encore une CI ni un smoke externe
-  vert. Le pin C demeure `d0accd6`, donc aucune fraîcheur jemalloc
+  vert. Le job CI de Fix4 a échoué avant le smoke : son checkout
+  `fetch-depth: 1` ne contenait pas les SHA A/B/C que le vrai pilote archive.
+  Fix5 reproduit ce code 1 muet dans un clone superficiel, demande désormais
+  l'historique complet au seul job P3 et imprime les diagnostics capturés ; la
+  CI externe de ce correctif reste requise. Le pin C demeure `d0accd6`, donc aucune fraîcheur jemalloc
   issue de HEAD n'est revendiquée par la campagne contractuelle. La réduction
   M3 est ratifiée dans `.remote/p3-campagne-plan.md` : seules RSS/RssAnon et
   cache fichier sont décisionnels; jemalloc reste diagnostique.

@@ -1,21 +1,87 @@
 #!/usr/bin/env bash
 # Régressions unitaires sans Docker ni charge pour les garde-fous P3.
-set -euo pipefail
+set -Eeuo pipefail
 export LC_ALL=C
+
+CURRENT_STEP='initialisation du test'
+CURRENT_ASSERTION='aucune'
+FAILED_COMMAND='aucune'
+FAILED_LINE='inconnue'
+TMP_DIR=''
+
+tool_version(){
+  local tool="$1"
+  local output=''
+  local status=0
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'absent'
+    return
+  fi
+  case "$tool" in
+    awk) output=$(awk -W version 2>&1) || status=$? ;;
+    *) output=$("$tool" --version 2>&1) || status=$? ;;
+  esac
+  output=${output%%$'\n'*}
+  if [ "$status" -eq 0 ]; then
+    printf '%s' "$output"
+  else
+    printf 'échec(code=%s): %s' "$status" "$output"
+  fi
+}
+
+print_versions(){
+  printf 'test-p3-harness: versions bash=%s jq=%s awk=%s git=%s\n' \
+    "$BASH_VERSION" "$(tool_version jq)" "$(tool_version awk)" "$(tool_version git)" >&2
+}
+
+set_step(){
+  CURRENT_STEP="$1"
+  CURRENT_ASSERTION="$2"
+}
+
+remember_error(){
+  local status="$1"
+  FAILED_COMMAND="$2"
+  FAILED_LINE="$3"
+  return "$status"
+}
+
+cleanup_and_report(){
+  local status=$?
+  trap - EXIT
+  set +e
+  if [ "$status" -ne 0 ]; then
+    printf 'test-p3-harness: ECHEC (code de sortie %s)\n' "$status" >&2
+    printf 'test-p3-harness: étape: %s\n' "$CURRENT_STEP" >&2
+    printf 'test-p3-harness: assertion/commande: %s\n' "$CURRENT_ASSERTION" >&2
+    printf 'test-p3-harness: commande observée (ligne %s): %s\n' \
+      "$FAILED_LINE" "$FAILED_COMMAND" >&2
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+      printf 'test-p3-harness: artefacts temporaires disponibles:\n' >&2
+      find "$TMP_DIR" -maxdepth 2 -type f -printf '  %P (%s octets)\n' | tail -n 80 >&2
+    fi
+  fi
+  if [ -n "$TMP_DIR" ] && [ "${KEEP_P3_FIXTURES:-0}" = 1 ]; then
+    printf 'test-p3-harness: fixtures conservées dans %s\n' "$TMP_DIR" >&2
+  elif [ -n "$TMP_DIR" ]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+  exit "$status"
+}
+
+trap 'remember_error "$?" "$BASH_COMMAND" "$LINENO"' ERR
+trap cleanup_and_report EXIT
+print_versions
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 HARNESS="$ROOT_DIR/deploy/bench-local/fair-ab.sh"
 P2_ASCIIFOLD_AWK="$ROOT_DIR/deploy/bench-local/p2-asciifold.awk"
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/surch-p3-harness.XXXXXX")
-if [ "${KEEP_P3_FIXTURES:-0}" = 1 ]; then
-  trap 'printf "test-p3-harness: fixtures conservées dans %s\n" "$TMP_DIR" >&2' EXIT
-else
-  trap 'rm -rf -- "$TMP_DIR"' EXIT
-fi
 
-fail(){ printf '[test-p3-harness] %s\n' "$*" >&2; exit 1; }
+fail(){ CURRENT_ASSERTION="$*"; printf '[test-p3-harness] %s\n' "$*" >&2; exit 1; }
 
 # Charge seulement les helpers purs : sourcer fair-ab.sh exécuterait un run.
+set_step 'extraction des helpers purs' 'les helpers P3 attendus doivent être extraits de fair-ab.sh'
 awk '
   /^p2_validate_pairs\(\)\{/ { capture = 1 }
   /^p2_validate_body_files\(\)\{/ { capture = 0 }
@@ -33,6 +99,7 @@ awk '
 ' "$HARNESS" > "$TMP_DIR/io-helpers.sh"
 
 # B1 : la forme cgroup v2 minimale doit être un JSON consommable par jq.
+set_step 'B1 — sérialisation cgroup v2' 'io.stat doit devenir le JSON attendu'
 printf '%s\n' '8:0 rbytes=1 wbytes=2 rios=3 wios=4' > "$TMP_DIR/io.stat"
 source "$TMP_DIR/io-helpers.sh"
 p2_cgroup_io_json "$TMP_DIR/io.stat" > "$TMP_DIR/io.json"
@@ -41,6 +108,7 @@ jq -e 'type == "array" and length == 4 and .[0] == {device:"8:0",metric:"rbytes"
 
 # B2 : Dupont et DUPONT désignent le même posting ASCII après lowercase ; le
 # validateur indépendant doit refuser leur placement dans deux ensembles.
+set_step 'B2/N2 — disjonction des termes analysés' 'les collisions lowercase/asciifold doivent être refusées'
 source "$TMP_DIR/term-helpers.sh"
 P2_PAIR_COUNT=1
 P2_WARM_TERM_COUNT=1
@@ -67,6 +135,7 @@ if p2_validate_term_sets "$TMP_DIR/accented.tsv" "$TMP_DIR/accented-control.tsv"
 fi
 
 # M4 : une jauge non finie n est jamais convertie silencieusement en zéro.
+set_step 'M4 — métrique Prometheus finie' 'NaN doit être refusé et zéro préservé'
 source "$TMP_DIR/metric-helpers.sh"
 printf '%s\n' 'surch_jemalloc_resident_bytes NaN' > "$TMP_DIR/prometheus.bad"
 if p2_metric_value surch_jemalloc_resident_bytes "$TMP_DIR/prometheus.bad" >/dev/null; then
@@ -375,6 +444,8 @@ run_gate(){
   local verdict="$2"
   local expected_code="$3"
   local code
+  set_step 'exécution synthétique du gate P3' \
+    "gate $campaign: verdict attendu=$verdict, code attendu=$expected_code"
   set +e
   "$GATE" --campaign "$campaign" > "$campaign/gate.stdout" 2> "$campaign/gate.stderr"
   code=$?

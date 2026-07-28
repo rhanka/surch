@@ -169,6 +169,13 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     avec `set -u`, et `mawk` ne reçoit plus `-v match=...`. La configuration
     CI exécute désormais matrice normale, exhaustive et pilote. La validation
     CI externe reste explicitement ouverte.
+  - [ ] Correctif CI Fix5 — l'échec CI de Fix4 est reproduit à l'identique
+    dans un clone `--depth 1` : le pilote réel exige les SHA A/B/C mais le
+    checkout ne contient que HEAD. Le job P3 demande maintenant
+    `fetch-depth: 0`; les deux tests affichent Bash/jq/awk/git et, sur erreur,
+    l'étape, la commande ou assertion, les artefacts attendus et les journaux
+    capturés. La preuve CI externe de ce correctif reste obligatoire avant
+    toute fermeture.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.
