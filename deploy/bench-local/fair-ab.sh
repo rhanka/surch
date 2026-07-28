@@ -1438,6 +1438,14 @@ p2_psi_json(){
   ' "$file"
 }
 
+# Contrat de sortie : cette fonction NE DOIT PAS être appelée via une
+# substitution de commande ($(...)) par son appelant, car un échec jq doit
+# rester distinguable d'une métrique Prometheus réellement absente. Le
+# résultat est publié dans la globale P2_METRIC_BUNDLE_JSON (succès) et la
+# cause d'échec dans P2_METRIC_BUNDLE_REASON (échec) : un $(...) autour de
+# l'appel forkerait un sous-shell et ces globales ne survivraient pas au
+# retour, comme un tour précédent l'a appris à ses dépens (jq: $directory is
+# not defined rendu indiscernable d'une jauge manquante).
 p2_metric_bundle_json(){
   local snapshot="$1"
   local postings_directory
@@ -1447,12 +1455,15 @@ p2_metric_bundle_json(){
   local resident
   local retained
   local integrity='null'
-  postings_directory=$(p2_metric_value surch_index_postings_directory_bytes "$snapshot") || return 1
-  total_bytes=$(p2_metric_value surch_index_total_bytes "$snapshot") || return 1
-  allocated=$(p2_metric_value surch_jemalloc_allocated_bytes "$snapshot") || return 1
-  active=$(p2_metric_value surch_jemalloc_active_bytes "$snapshot") || return 1
-  resident=$(p2_metric_value surch_jemalloc_resident_bytes "$snapshot") || return 1
-  retained=$(p2_metric_value surch_jemalloc_retained_bytes "$snapshot") || return 1
+  local jq_err_file
+  P2_METRIC_BUNDLE_JSON=""
+  P2_METRIC_BUNDLE_REASON=""
+  postings_directory=$(p2_metric_value surch_index_postings_directory_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_index_postings_directory_bytes"; return 1; }
+  total_bytes=$(p2_metric_value surch_index_total_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_index_total_bytes"; return 1; }
+  allocated=$(p2_metric_value surch_jemalloc_allocated_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_jemalloc_allocated_bytes"; return 1; }
+  active=$(p2_metric_value surch_jemalloc_active_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_jemalloc_active_bytes"; return 1; }
+  resident=$(p2_metric_value surch_jemalloc_resident_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_jemalloc_resident_bytes"; return 1; }
+  retained=$(p2_metric_value surch_jemalloc_retained_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_jemalloc_retained_bytes"; return 1; }
   if [ "$P2_VARIANT" = "C" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
     local bytes
     local pages
@@ -1466,30 +1477,46 @@ p2_metric_bundle_json(){
     local payload
     local csr
     local directory
-    bytes=$(p2_metric_value surch_postings_p2_integrity_bytes "$snapshot") || return 1
-    pages=$(p2_metric_value surch_postings_p2_integrity_pages "$snapshot") || return 1
-    verified=$(p2_metric_value surch_postings_p2_verified_bytes "$snapshot") || return 1
-    hash_failures=$(p2_metric_value surch_postings_p2_hash_failures "$snapshot") || return 1
-    fallbacks=$(p2_metric_value surch_postings_p2_fallbacks "$snapshot") || return 1
-    fallback_fields=$(p2_metric_value surch_postings_p2_fallback_fields "$snapshot") || return 1
-    occurrences=$(p2_metric_value surch_postings_p2_term_occurrences "$snapshot") || return 1
-    blocks=$(p2_metric_value surch_postings_p2_blocks "$snapshot") || return 1
-    fields=$(p2_metric_value surch_postings_p2_fields "$snapshot") || return 1
-    payload=$(p2_metric_value surch_postings_p2_term_payload_bytes "$snapshot") || return 1
-    csr=$(p2_metric_value surch_postings_p2_csr_bytes "$snapshot") || return 1
-    directory=$(p2_metric_value surch_postings_p2_directory_bytes "$snapshot") || return 1
-    integrity=$(jq -cn \
+    bytes=$(p2_metric_value surch_postings_p2_integrity_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_integrity_bytes"; return 1; }
+    pages=$(p2_metric_value surch_postings_p2_integrity_pages "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_integrity_pages"; return 1; }
+    verified=$(p2_metric_value surch_postings_p2_verified_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_verified_bytes"; return 1; }
+    hash_failures=$(p2_metric_value surch_postings_p2_hash_failures "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_hash_failures"; return 1; }
+    fallbacks=$(p2_metric_value surch_postings_p2_fallbacks "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_fallbacks"; return 1; }
+    fallback_fields=$(p2_metric_value surch_postings_p2_fallback_fields "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_fallback_fields"; return 1; }
+    occurrences=$(p2_metric_value surch_postings_p2_term_occurrences "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_term_occurrences"; return 1; }
+    blocks=$(p2_metric_value surch_postings_p2_blocks "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_blocks"; return 1; }
+    fields=$(p2_metric_value surch_postings_p2_fields "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_fields"; return 1; }
+    payload=$(p2_metric_value surch_postings_p2_term_payload_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_term_payload_bytes"; return 1; }
+    csr=$(p2_metric_value surch_postings_p2_csr_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_csr_bytes"; return 1; }
+    directory=$(p2_metric_value surch_postings_p2_directory_bytes "$snapshot") || { P2_METRIC_BUNDLE_REASON="prometheus_metric_missing_surch_postings_p2_directory_bytes"; return 1; }
+    jq_err_file="$OUT_DIR/.p2_jq_stderr.$$"
+    if ! integrity=$(jq -cn \
       --argjson bytes "$bytes" --argjson pages "$pages" --argjson verified_bytes "$verified" \
       --argjson hash_failures "$hash_failures" --argjson fallbacks "$fallbacks" --argjson fallback_fields "$fallback_fields" \
       --argjson term_occurrences "$occurrences" --argjson blocks "$blocks" --argjson fields "$fields" \
       --argjson term_payload_bytes "$payload" --argjson csr_bytes "$csr" --argjson directory_bytes "$directory" \
-      '{bytes:$bytes,pages:$pages,verified_bytes:$verified_bytes,hash_failures:$hash_failures,fallbacks:$fallbacks,fallback_fields:$fallback_fields,term_occurrences:$term_occurrences,blocks:$blocks,fields:$fields,term_payload_bytes:$term_payload_bytes,csr_bytes:$csr_bytes,directory_bytes:$directory}') || return 1
+      '{bytes:$bytes,pages:$pages,verified_bytes:$verified_bytes,hash_failures:$hash_failures,fallbacks:$fallbacks,fallback_fields:$fallback_fields,term_occurrences:$term_occurrences,blocks:$blocks,fields:$fields,term_payload_bytes:$term_payload_bytes,csr_bytes:$csr_bytes,directory_bytes:$directory_bytes}' \
+      2>"$jq_err_file"); then
+      err "p2_metric_bundle_json : jq a échoué en construisant p3_integrity (bug de construction, pas une métrique manquante) : $(cat "$jq_err_file" 2>/dev/null)"
+      rm -f "$jq_err_file"
+      P2_METRIC_BUNDLE_REASON="prometheus_bundle_jq_error"
+      return 1
+    fi
+    rm -f "$jq_err_file"
   fi
-  jq -cn \
+  jq_err_file="$OUT_DIR/.p2_jq_stderr.$$"
+  if ! P2_METRIC_BUNDLE_JSON=$(jq -cn \
     --argjson postings_directory_bytes "$postings_directory" --argjson total_bytes "$total_bytes" \
     --argjson allocated "$allocated" --argjson active "$active" --argjson resident "$resident" --argjson retained "$retained" \
     --argjson integrity "$integrity" \
-    '{index:{postings_directory_bytes:$postings_directory_bytes,total_bytes:$total_bytes},jemalloc:{allocated:$allocated,active:$active,resident:$resident,retained:$retained},p3_integrity:$integrity}'
+    '{index:{postings_directory_bytes:$postings_directory_bytes,total_bytes:$total_bytes},jemalloc:{allocated:$allocated,active:$active,resident:$resident,retained:$retained},p3_integrity:$integrity}' \
+    2>"$jq_err_file"); then
+    err "p2_metric_bundle_json : jq a échoué en construisant le bundle métrique (bug de construction, pas une métrique manquante) : $(cat "$jq_err_file" 2>/dev/null)"
+    rm -f "$jq_err_file"
+    P2_METRIC_BUNDLE_REASON="prometheus_bundle_jq_error"
+    return 1
+  fi
+  rm -f "$jq_err_file"
 }
 
 # Chaque ligne est un état instantané complet. Les lignes `after` portent en
@@ -1531,7 +1558,11 @@ p2_capture_telemetry(){
     }
   io_file="$OUT_DIR/$ENGINE.p2.cgroup.${phase}.${boundary}.io.stat"
   cat "$cgroup/io.stat" > "$io_file" || { P2_METRICS_REASON="${phase}_${boundary}_io_stat_unreadable"; return 1; }
-  metric_json=$(p2_metric_bundle_json "$snapshot") || { P2_METRICS_REASON="${phase}_${boundary}_prometheus_metric_missing"; return 1; }
+  if ! p2_metric_bundle_json "$snapshot"; then
+    P2_METRICS_REASON="${phase}_${boundary}_${P2_METRIC_BUNDLE_REASON:-prometheus_metric_missing}"
+    return 1
+  fi
+  metric_json="$P2_METRIC_BUNDLE_JSON"
   rss=$(p2_proc_status_bytes "$pid" VmRSS) || { P2_METRICS_REASON="${phase}_${boundary}_rss_missing"; return 1; }
   rss_anon=$(p2_proc_status_bytes "$pid" RssAnon) || { P2_METRICS_REASON="${phase}_${boundary}_rssanon_missing"; return 1; }
   vmhwm=$(p2_proc_status_bytes "$pid" VmHWM) || { P2_METRICS_REASON="${phase}_${boundary}_vmhwm_missing"; return 1; }
