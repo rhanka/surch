@@ -177,7 +177,11 @@ async fn export_then_import_preserves_hits_total() {
     // count.
     let docs: Vec<(String, Value)> = (0..100)
         .map(|n| {
-            let category = if n % 2 == 0 { "science" } else { "fiction" };
+            let category = if n.is_multiple_of(2) {
+                "science"
+            } else {
+                "fiction"
+            };
             (
                 format!("doc-{n}"),
                 json!({

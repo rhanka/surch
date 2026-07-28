@@ -500,7 +500,7 @@ mod tests {
         // `Posting::new(d, (n() % 7) + 1)` map.
         let make = |modulo: u32, n: &mut dyn FnMut() -> u32| -> (Vec<u32>, Vec<u32>) {
             let doc_ids: Vec<u32> = (0..(4 * BLOCK_SIZE as u32))
-                .filter(|d| d % modulo == 0)
+                .filter(|d| d.is_multiple_of(modulo))
                 .collect();
             let freqs: Vec<u32> = doc_ids.iter().map(|_| (n() % 7) + 1).collect();
             (doc_ids, freqs)

@@ -90,9 +90,15 @@ numbers_all_le(){ local limit="$1"; shift; for value in "$@"; do number_le "$val
 numbers_all_between(){ local low="$1" high="$2"; shift 2; for value in "$@"; do awk -v value="$value" -v low="$low" -v high="$high" 'BEGIN { exit !((value + 0) >= (low + 0) && (value + 0) <= (high + 0)) }' || return 1; done; }
 numbers_json(){ printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 0) | tonumber)'; }
 
-PAIR_SUMMARIES=("$CAMPAIGN"/pairs/*/pair-summary.json)
+BASELINE_PAIR_SUMMARIES=("$CAMPAIGN"/pairs/*/pair-summary.json)
+[ -e "${BASELINE_PAIR_SUMMARIES[0]}" ] || BASELINE_PAIR_SUMMARIES=()
+[ "${#BASELINE_PAIR_SUMMARIES[@]}" -eq 3 ] || die "P2 exige exactement trois paires A/B, trouvé ${#BASELINE_PAIR_SUMMARIES[@]}"
+PAIR_SUMMARIES=("$CAMPAIGN"/p3-primary-pairs/*/pair-summary.json)
 [ -e "${PAIR_SUMMARIES[0]}" ] || PAIR_SUMMARIES=()
-[ "${#PAIR_SUMMARIES[@]}" -eq 3 ] || die "P2 exige exactement trois paires, trouvé ${#PAIR_SUMMARIES[@]}"
+[ "${#PAIR_SUMMARIES[@]}" -eq 3 ] || die "P3 exige exactement trois paires C/A, trouvé ${#PAIR_SUMMARIES[@]}"
+COST_PAIR_SUMMARIES=("$CAMPAIGN"/p3-cost-pairs/*/pair-summary.json)
+[ -e "${COST_PAIR_SUMMARIES[0]}" ] || COST_PAIR_SUMMARIES=()
+[ "${#COST_PAIR_SUMMARIES[@]}" -eq 3 ] || die "P3 exige exactement trois paires C/B, trouvé ${#COST_PAIR_SUMMARIES[@]}"
 
 VALIDITIES=()
 PRODUCT_TOOK=()
@@ -106,30 +112,27 @@ BOOTSTRAP_UPPER=()
 PAIR_DIRS=()
 BLOCK_RATIO_DIAGNOSTICS=()
 P3_INTEGRITY_DIAGNOSTICS=()
+BASELINE_VALIDITIES=()
+BASELINE_PAIR_DIRS=()
+COST_VALIDITIES=()
+COST_PAIR_DIRS=()
+P3_COST_TOOK=()
 
-for summary in "${PAIR_SUMMARIES[@]}"; do
+for summary in "${BASELINE_PAIR_SUMMARIES[@]}"; do
   pair_dir=${summary%/pair-summary.json}
   parity="$pair_dir/parity.json"
-  [ -f "$parity" ] || die "artefact illisible: $parity"
-  a_run=$(jq -er '.a_run | strings' "$parity") || die "artefact illisible: $parity"
-  b_run=$(jq -er '.b_run | strings' "$parity") || die "artefact illisible: $parity"
-  pair=$(jq -er '.pair | strings' "$parity") || die "artefact illisible: $parity"
+  [ -f "$parity" ] || die "artefact A/B illisible: $parity"
+  a_run=$(jq -er '.a_run | strings' "$parity") || die "artefact A/B illisible: $parity"
+  b_run=$(jq -er '.b_run | strings' "$parity") || die "artefact A/B illisible: $parity"
+  pair=$(jq -er '.pair | strings' "$parity") || die "artefact A/B illisible: $parity"
   valid=false
   if jq -e '.parity == true and .a_manifest_sha256 == .b_manifest_sha256' "$parity" >/dev/null 2>&1 \
-     && phase_status_valid "$CAMPAIGN/runs/$a_run" 0 \
-     && phase_status_valid "$CAMPAIGN/runs/$b_run" "$P2_REQUIRE_P3_INTEGRITY"; then
+     && phase_status_valid "$CAMPAIGN/runs/$a_run" false \
+     && phase_status_valid "$CAMPAIGN/runs/$b_run" false; then
     valid=true
   fi
-  VALIDITIES+=("$valid")
-  PAIR_DIRS+=("$pair_dir")
-  PRODUCT_TOOK+=("$(record_ratio "$summary" random bool took p95)") || die "ratio absent: $summary random/bool/took/p95"
-  PRODUCT_CLIENT+=("$(record_ratio "$summary" random bool client p95)") || die "ratio absent: $summary random/bool/client/p95"
-  CORE_TOOK95+=("$(record_ratio "$summary" no_source bool took p95)") || die "ratio absent: $summary no_source/bool/took/p95"
-  CORE_TOOK99+=("$(record_ratio "$summary" no_source bool took p99)") || die "ratio absent: $summary no_source/bool/took/p99"
-  FIXED_MATCH+=("$(record_ratio "$summary" fixed match took p95)") || die "ratio absent: $summary fixed/match/took/p95"
-  RANDOM_MATCH+=("$(record_ratio "$summary" random match took p95)") || die "ratio absent: $summary random/match/took/p95"
-  PROBE_DELTA+=("$(record_probe_delta "$summary")") || die "sonde absente: $summary"
-  BOOTSTRAP_UPPER+=("$(jq -er '.primary_bootstrap.ci95_high | tonumber' "$summary")") || die "IC95 absent: $summary"
+  BASELINE_VALIDITIES+=("$valid")
+  BASELINE_PAIR_DIRS+=("$pair_dir")
   b_status=$(jq -er '.p2.phase_status_jsonl | strings' "$CAMPAIGN/runs/$b_run/surch.json") || die "statut P2 B absent: $b_run"
   [ -f "$b_status" ] || die "statut P2 B illisible: $b_status"
   while IFS= read -r diagnostic; do
@@ -138,14 +141,63 @@ for summary in "${PAIR_SUMMARIES[@]}"; do
     select(.variant == "B" and .bool_requests > 0 and (.phase == "warm" or .phase == "random" or .phase == "no_source"))
     | {pair:$pair,run:$run,phase:$phase,ratio:.blocks_read_over_total,target:.blocks_ratio_target,pass:.blocks_ratio_target_pass,verdict:.blocks_ratio_verdict}
   ' "$b_status")
+done
+
+for summary in "${PAIR_SUMMARIES[@]}"; do
+  pair_dir=${summary%/pair-summary.json}
+  parity="$pair_dir/parity.json"
+  [ -f "$parity" ] || die "artefact C/A illisible: $parity"
+  a_run=$(jq -er '.a_run | strings' "$parity") || die "artefact C/A illisible: $parity"
+  c_run=$(jq -er '.b_run | strings' "$parity") || die "artefact C/A illisible: $parity"
+  pair=$(jq -er '.pair | strings' "$parity") || die "artefact C/A illisible: $parity"
+  c_requires_p3=false
+  [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ] && c_requires_p3=true
+  valid=false
+  if jq -e '.parity == true and .a_manifest_sha256 == .b_manifest_sha256' "$parity" >/dev/null 2>&1 \
+     && phase_status_valid "$CAMPAIGN/runs/$a_run" false \
+     && phase_status_valid "$CAMPAIGN/runs/$c_run" "$c_requires_p3"; then
+    valid=true
+  fi
+  VALIDITIES+=("$valid")
+  PAIR_DIRS+=("$pair_dir")
+  PRODUCT_TOOK+=("$(record_ratio "$summary" random bool took p95)") || die "ratio C/A absent: $summary random/bool/took/p95"
+  PRODUCT_CLIENT+=("$(record_ratio "$summary" random bool client p95)") || die "ratio C/A absent: $summary random/bool/client/p95"
+  CORE_TOOK95+=("$(record_ratio "$summary" no_source bool took p95)") || die "ratio C/A absent: $summary no_source/bool/took/p95"
+  CORE_TOOK99+=("$(record_ratio "$summary" no_source bool took p99)") || die "ratio C/A absent: $summary no_source/bool/took/p99"
+  FIXED_MATCH+=("$(record_ratio "$summary" fixed match took p95)") || die "ratio C/A absent: $summary fixed/match/took/p95"
+  RANDOM_MATCH+=("$(record_ratio "$summary" random match took p95)") || die "ratio C/A absent: $summary random/match/took/p95"
+  PROBE_DELTA+=("$(record_probe_delta "$summary")") || die "sonde C/A absente: $summary"
+  BOOTSTRAP_UPPER+=("$(jq -er '.primary_bootstrap.ci95_high | tonumber' "$summary")") || die "IC95 C/A absent: $summary"
   if [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+    c_status=$(jq -er '.p2.phase_status_jsonl | strings' "$CAMPAIGN/runs/$c_run/surch.json") || die "statut P3 C absent: $c_run"
+    [ -f "$c_status" ] || die "statut P3 C illisible: $c_status"
     while IFS= read -r diagnostic; do
       [ -n "$diagnostic" ] && P3_INTEGRITY_DIAGNOSTICS+=("$diagnostic")
-    done < <(jq -c --arg pair "$pair" --arg run "$b_run" '
-      select(.variant == "B" and (.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source"))
+    done < <(jq -c --arg pair "$pair" --arg run "$c_run" '
+      select(.variant == "C" and (.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source"))
       | {pair:$pair,run:$run,phase:$phase,bytes:.integrity.bytes.after,hash_failures:.integrity.hash_failures.after,fallback_fields:.integrity.fallback_fields.after,verified_bytes:.integrity.verified_bytes.after}
-    ' "$b_status")
+    ' "$c_status")
   fi
+done
+
+for summary in "${COST_PAIR_SUMMARIES[@]}"; do
+  pair_dir=${summary%/pair-summary.json}
+  parity="$pair_dir/parity.json"
+  [ -f "$parity" ] || die "artefact C/B illisible: $parity"
+  b_run=$(jq -er '.a_run | strings' "$parity") || die "artefact C/B illisible: $parity"
+  c_run=$(jq -er '.b_run | strings' "$parity") || die "artefact C/B illisible: $parity"
+  pair=$(jq -er '.pair | strings' "$parity") || die "artefact C/B illisible: $parity"
+  c_requires_p3=false
+  [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ] && c_requires_p3=true
+  valid=false
+  if jq -e '.parity == true and .a_manifest_sha256 == .b_manifest_sha256' "$parity" >/dev/null 2>&1 \
+     && phase_status_valid "$CAMPAIGN/runs/$b_run" false \
+     && phase_status_valid "$CAMPAIGN/runs/$c_run" "$c_requires_p3"; then
+    valid=true
+  fi
+  COST_VALIDITIES+=("$valid")
+  COST_PAIR_DIRS+=("$pair_dir")
+  P3_COST_TOOK+=("$(record_ratio "$summary" random bool took p95)") || die "ratio C/B absent: $summary random/bool/took/p95"
 done
 
 MEDIAN_CORE95=$(median_three "${CORE_TOOK95[@]}")
@@ -153,8 +205,11 @@ MEDIAN_CORE99=$(median_three "${CORE_TOOK99[@]}")
 MEDIAN_PRODUCT_TOOK=$(median_three "${PRODUCT_TOOK[@]}")
 MEDIAN_PRODUCT_CLIENT=$(median_three "${PRODUCT_CLIENT[@]}")
 VALIDITIES_JSON=$(printf '%s\n' "${VALIDITIES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) == "true")')
+BASELINE_VALIDITIES_JSON=$(printf '%s\n' "${BASELINE_VALIDITIES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) == "true")')
+COST_VALIDITIES_JSON=$(printf '%s\n' "${COST_VALIDITIES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) == "true")')
 BLOCK_RATIO_JSON=$(printf '%s\n' "${BLOCK_RATIO_DIAGNOSTICS[@]}" | jq -sc '.')
 P3_INTEGRITY_JSON=$(printf '%s\n' "${P3_INTEGRITY_DIAGNOSTICS[@]}" | jq -sc '.')
+P3_COST_TOOK_JSON=$(numbers_json "${P3_COST_TOOK[@]}")
 CHECKS_JSONL=$(mktemp "${TMPDIR:-/tmp}/surch-p2-gate.XXXXXX") || die 'mktemp impossible'
 trap 'rm -f -- "$CHECKS_JSONL"' EXIT
 ALL_PASSED=true
@@ -167,7 +222,13 @@ add_check(){
 
 all_valid=true
 for valid in "${VALIDITIES[@]}"; do [ "$valid" = true ] || all_valid=false; done
-add_check 'validité route/parité/count/segments' "$all_valid" "paires valides: $VALIDITIES_JSON"
+add_check 'validité C/A route/parité/count/segments' "$all_valid" "paires valides: $VALIDITIES_JSON"
+baseline_valid=true
+for valid in "${BASELINE_VALIDITIES[@]}"; do [ "$valid" = true ] || baseline_valid=false; done
+add_check 'validité A/B route/parité/count/segments' "$baseline_valid" "paires valides: $BASELINE_VALIDITIES_JSON"
+cost_valid=true
+for valid in "${COST_VALIDITIES[@]}"; do [ "$valid" = true ] || cost_valid=false; done
+add_check 'validité C/B route/parité/count/segments' "$cost_valid" "paires valides: $COST_VALIDITIES_JSON"
 number_le "$MEDIAN_CORE95" 0.50 && pass=true || pass=false
 add_check 'noyau size:0 bool p95' "$pass" "médiane=$(printf '%.4f' "$MEDIAN_CORE95"), cible <= 0.50"
 number_le "$MEDIAN_CORE99" 0.70 && pass=true || pass=false
@@ -195,6 +256,8 @@ add_check 'écart sonde p95' "$pass" "écarts ms=$(numbers_json "${PROBE_DELTA[@
 # produit un ÉCHEC P2 lisible, jamais une campagne techniquement invalide.
 [ "${#BLOCK_RATIO_DIAGNOSTICS[@]}" -eq 9 ] && jq -e 'all(.[]; .pass == true)' <<< "$BLOCK_RATIO_JSON" >/dev/null && pass=true || pass=false
 add_check 'ratio de blocs P2 (résultat)' "$pass" "observations=$BLOCK_RATIO_JSON, cible <= 0.25"
+numbers_all_le 1.05 "${P3_COST_TOOK[@]}" && pass=true || pass=false
+add_check 'coût P3 C/B bool size:10 p95 took' "$pass" "ratios=$P3_COST_TOOK_JSON, cible <= 1.05"
 if [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
   [ "${#P3_INTEGRITY_DIAGNOSTICS[@]}" -eq 12 ] \
     && jq -e 'all(.[]; (.bytes | type) == "number" and (.hash_failures | type) == "number" and (.fallback_fields | type) == "number" and (.bytes <= 33554432) and (.hash_failures == 0) and (.fallback_fields == 0))' <<< "$P3_INTEGRITY_JSON" >/dev/null \
@@ -202,9 +265,11 @@ if [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
   add_check 'intégrité P3 agrégée (résultat)' "$pass" "observations=$P3_INTEGRITY_JSON, plafond <= 33554432, hash/fallback = 0"
 fi
 
+all_measurements_valid=true
+[ "$all_valid" = true ] && [ "$baseline_valid" = true ] && [ "$cost_valid" = true ] || all_measurements_valid=false
 if [ "$ALL_PASSED" = true ]; then
   VERDICT='PASS P2'
-elif [ "$all_valid" = true ]; then
+elif [ "$all_measurements_valid" = true ]; then
   VERDICT='ÉCHEC P2'
 else
   VERDICT='INVALIDE P2'
@@ -218,8 +283,8 @@ jq -n \
   --argjson fixed_match "$(numbers_json "${FIXED_MATCH[@]}")" --argjson random_match "$(numbers_json "${RANDOM_MATCH[@]}")" \
   --argjson probe_delta "$(numbers_json "${PROBE_DELTA[@]}")" --argjson bootstrap_upper "$(numbers_json "${BOOTSTRAP_UPPER[@]}")" \
   --argjson median_product_took "$MEDIAN_PRODUCT_TOOK" --argjson median_product_client "$MEDIAN_PRODUCT_CLIENT" \
-  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" --argjson p3_integrity_diagnostics "$P3_INTEGRITY_JSON" --argjson p3_integrity_required "$P2_REQUIRE_P3_INTEGRITY" \
-  '{schema:"surch.bench.p2.campaign.v1", verdict:$verdict, pair_directories:$pair_directories, ratios:{product_random_bool_took_p95:$product_took, product_random_bool_client_p95:$product_client, core_no_source_bool_took_p95:$core95, core_no_source_bool_took_p99:$core99, fixed_match_took_p95:$fixed_match, random_match_took_p95:$random_match, probe_p95_delta_ms:$probe_delta, bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper}, medians:{product_random_bool_took_p95:$median_product_took, product_random_bool_client_p95:$median_product_client, core_no_source_bool_took_p95:$median_core95, core_no_source_bool_took_p99:$median_core99}, blocks_ratio:{target:0.25,observations:$blocks_ratio_diagnostics}, p3_integrity:{required:($p3_integrity_required == 1),observations:$p3_integrity_diagnostics}, checks:$checks}' \
+  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" --argjson p3_integrity_diagnostics "$P3_INTEGRITY_JSON" --argjson p3_integrity_required "$P2_REQUIRE_P3_INTEGRITY" --argjson baseline_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${BASELINE_PAIR_DIRS[@]}")" --argjson p3_cost_took "$P3_COST_TOOK_JSON" --argjson p3_cost_pair_directories "$(jq -Rn --args '$ARGS.positional' -- "${COST_PAIR_DIRS[@]}")" \
+  '{schema:"surch.bench.p2.campaign.v1", verdict:$verdict, pair_directories:$pair_directories, baseline_pair_directories:$baseline_pair_directories, ratios:{product_random_bool_took_p95:$product_took, product_random_bool_client_p95:$product_client, core_no_source_bool_took_p95:$core95, core_no_source_bool_took_p99:$core99, fixed_match_took_p95:$fixed_match, random_match_took_p95:$random_match, probe_p95_delta_ms:$probe_delta, bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper}, medians:{product_random_bool_took_p95:$median_product_took, product_random_bool_client_p95:$median_product_client, core_no_source_bool_took_p95:$median_core95, core_no_source_bool_took_p99:$median_core99}, blocks_ratio:{target:0.25,observations:$blocks_ratio_diagnostics}, p3_integrity:{required:($p3_integrity_required == 1),observations:$p3_integrity_diagnostics,c_over_b_random_bool_took_p95:$p3_cost_took,pair_directories:$p3_cost_pair_directories}, checks:$checks}' \
   > "$CAMPAIGN/campaign-summary.json" || die 'écriture impossible de campaign-summary.json'
 
 {
@@ -227,10 +292,10 @@ jq -n \
   printf 'Verdict: **%s**.\n\n' "$VERDICT"
   printf '%s\n%s\n' '| Gate | Verdict | Détail |' '|---|---|---|'
   jq -r '"| \(.name) | \(if .pass then "pass" else "fail" end) | \(.detail) |"' "$CHECKS_JSONL"
-  printf '\n%s\n' 'Les nombres par paire et les IC bootstrap sont conservés sous `pairs/*/pair-summary.json`.'
+  printf '\n%s\n' 'Les nombres A/B, C/A et les coûts C/B sont conservés sous `pairs/*/`, `p3-primary-pairs/*/` et `p3-cost-pairs/*/`.'
 } > "$CAMPAIGN/README.md" || die 'écriture impossible de README.md'
 
 # Une campagne causalement valide doit être livrée même si P2 échoue son
 # objectif : son verdict et tous les ratios guident alors le prochain lot.
 # Seule une invalidité de mesure conserve un code non nul pour le pilote.
-[ "$all_valid" = true ]
+[ "$all_measurements_valid" = true ]

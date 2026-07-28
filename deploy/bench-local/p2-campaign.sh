@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# p2-campaign.sh — pilote fermé de la campagne A/B P2 sur la VM OVH dédiée.
+# p2-campaign.sh — pilote fermé de la campagne A/B/C P2/P3 sur la VM dédiée.
 #
-# Le même fair-ab.sh (celui de 6ce390e enrichi par ce lot) pilote les deux
-# images. Les images sont reconstruites depuis les deux SHA dans cette même
+# Le même fair-ab.sh pilote les trois images : A avant P2, B P2, C P3.
+# Les images sont reconstruites depuis les trois SHA dans cette même
 # session Docker ; les corps P2 vivent dans un répertoire partagé, gelé par
 # SHA-256 dès la première exécution.
 set -uo pipefail
@@ -14,6 +14,10 @@ PAIR_REPORT="${PAIR_REPORT:-$ROOT_DIR/deploy/bench-local/p2-report.sh}"
 GATE_REPORT="${GATE_REPORT:-$ROOT_DIR/deploy/bench-local/p2-gate.sh}"
 P2_A_SHA="${P2_A_SHA:-961ade10ffb74d78156aee8148f1e5c6bbbe6ba2}"
 P2_B_SHA="${P2_B_SHA:-6ce390e55da3593242ec11e2b09d4dee1057726d}"
+# C suit par défaut le commit local livré : le coût C/B mesure alors P3 avec
+# toutes les corrections de revue présentes, et reste surchargeable pour un
+# replay historique.
+P2_C_SHA="${P2_C_SHA:-$(git -C "$ROOT_DIR" rev-parse HEAD)}"
 P2_MODE="${P2_MODE:-full}"             # full ou smoke
 P2_CAMPAIGN_DIR="${P2_CAMPAIGN_DIR:-$HOME/p2-campaign-$(date -u +%Y%m%dT%H%M%SZ)}"
 P2_SMOKE_DIR="${P2_SMOKE_DIR:-}"       # obligatoire avant le full
@@ -50,6 +54,7 @@ if [ "$P2_MODE" = "full" ]; then
     && grep -q '^SMOKE P2 valide' "$P2_SMOKE_DIR/README.md" \
     && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-A/surch.json" >/dev/null \
     && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-B/surch.json" >/dev/null \
+    && jq -e '.measurement_valid == true and ((.p2.hot_phase_records == 4) or (.p2.phase_records == 5)) and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$P2_SMOKE_DIR/runs/smoke-C/surch.json" >/dev/null \
     || die "smoke P2 absent ou invalide: $P2_SMOKE_DIR"
 fi
 
@@ -125,6 +130,7 @@ build_image(){
 
 build_image A "$P2_A_SHA"; IMAGE_A="$BUILT_IMAGE"
 build_image B "$P2_B_SHA"; IMAGE_B="$BUILT_IMAGE"
+build_image C "$P2_C_SHA"; IMAGE_C="$BUILT_IMAGE"
 
 # Le baseline est pris après les builds : leurs couches et cache vivent sous
 # Docker, ne sont pas des artefacts de campagne et ne doivent pas être pris
@@ -143,7 +149,9 @@ if [ "$P2_MODE" = "full" ]; then
   SEGMENT_GATE=exact
   FLUSH_BUDGET=268435456
   MERGE_FANIN=8
-  SCHEDULE=("A1-B1:A:B" "B2-A2:B:A" "A3-B3:A:B")
+  # Chaque triplet conserve une paire A/B et une paire B/C. Les ordres
+  # tournent pour que ni P2 ni P3 ne bénéficie systématiquement du cache.
+  SCHEDULE=("A1,B1,C1:A:B:C" "A2,B2,C2:B:C:A" "A3,B3,C3:C:A:B")
 else
   PAIR_COUNT=100
   PROBE_REQUESTS=200
@@ -152,7 +160,7 @@ else
   SEGMENT_GATE=minimum
   FLUSH_BUDGET=33554432
   MERGE_FANIN=64
-  SCHEDULE=("smoke:A:B")
+  SCHEDULE=("smoke-A,smoke-B,smoke-C:A:B:C")
 fi
 [ "$EXPECTED_DOCS" -gt 0 ] || die "corpus smoke vide ou NDJSON invalide"
 
@@ -175,7 +183,8 @@ assert_scorecard(){
 }
 
 run_variant(){
-  local name="$1" variant="$2" image="$3" out="$P2_CAMPAIGN_DIR/runs/$name"
+  local name="$1" variant="$2" image="$3" require_p3=0 out="$P2_CAMPAIGN_DIR/runs/$name"
+  [ "$variant" = "C" ] && require_p3=1
   mkdir -p "$out" || die "création run impossible: $out"
   log "run $name ($variant, image=$image)"
   if ! env \
@@ -187,7 +196,7 @@ run_variant(){
     "SURCH_DENSIFY_BUDGET_DOCS=1000000" "SURCH_MERGE_MAX_DOCS=7000000" \
     "SURCH_SOURCE_FETCH_PROFILE=0" "PREFLIGHT_FORCE=0" \
     "PROBE_REQUESTS=$PROBE_REQUESTS" "COLD_PROBE_REQUESTS=50" "COLD_PROBE=1" \
-    "P2_MEASURE=1" "P2_VARIANT=$variant" "P2_PAIR_COUNT=$PAIR_COUNT" \
+    "P2_MEASURE=1" "P2_VARIANT=$variant" "P2_REQUIRE_P3_INTEGRITY=$require_p3" "P2_PAIR_COUNT=$PAIR_COUNT" \
     "P2_EXPECTED_DOCS=$EXPECTED_DOCS" "P2_REQUIRED_SEGMENTS=$REQUIRED_SEGMENTS" "P2_SEGMENT_GATE=$SEGMENT_GATE" \
     "P2_INPUT_DIR=$P2_INPUT_DIR" "SURCH_IMAGE=$image" "ENGINES=surch" "OUT_DIR=$out" \
     "$FAIR_AB" > "$out/fair-ab.log" 2>&1; then
@@ -197,7 +206,7 @@ run_variant(){
 }
 
 compare_parity(){
-  local pair="$1" a_name="$2" b_name="$3" report="$P2_CAMPAIGN_DIR/pairs/$pair"
+  local pair="$1" a_name="$2" b_name="$3" report_group="$4" report="$P2_CAMPAIGN_DIR/$report_group/$pair"
   local phase a_file b_file
   mkdir -p "$report" || die "création rapport impossible: $report"
   for phase in warm fixed random no_source; do
@@ -205,7 +214,7 @@ compare_parity(){
     b_file="$P2_CAMPAIGN_DIR/runs/$b_name/surch.p2.responses.${phase}.canonical.ndjson"
     if ! cmp -s "$a_file" "$b_file"; then
       diff -u "$a_file" "$b_file" > "$report/parity-${phase}.diff" || true
-      die "parité A/B divergente pour $pair/$phase (diff: $report/parity-${phase}.diff)"
+      die "parité divergente pour $pair/$phase (diff: $report/parity-${phase}.diff)"
     fi
   done
   jq -n \
@@ -277,22 +286,22 @@ recover_host(){
 }
 
 for scheduled in "${SCHEDULE[@]}"; do
-  IFS=: read -r pair first second <<< "$scheduled"
-  if [ "$first" = "A" ]; then
-    a_name="${pair%%-*}"; [ "$a_name" = "$pair" ] && a_name="$pair-A"
-    b_name="${pair##*-}"; [ "$b_name" = "$pair" ] && b_name="$pair-B"
-    run_variant "$a_name" A "$IMAGE_A"
-    recover_host "$a_name"
-    run_variant "$b_name" B "$IMAGE_B"
-  else
-    b_name="${pair%%-*}"; [ "$b_name" = "$pair" ] && b_name="$pair-B"
-    a_name="${pair##*-}"; [ "$a_name" = "$pair" ] && a_name="$pair-A"
-    run_variant "$b_name" B "$IMAGE_B"
-    recover_host "$b_name"
-    run_variant "$a_name" A "$IMAGE_A"
-  fi
-  compare_parity "$pair" "$a_name" "$b_name"
-  recover_host "$pair"
+  IFS=: read -r names first second third <<< "$scheduled"
+  IFS=, read -r a_name b_name c_name <<< "$names"
+  for variant in "$first" "$second" "$third"; do
+    case "$variant" in
+      A) run_name="$a_name"; image="$IMAGE_A" ;;
+      B) run_name="$b_name"; image="$IMAGE_B" ;;
+      C) run_name="$c_name"; image="$IMAGE_C" ;;
+      *) die "variante planifiée inconnue: $variant" ;;
+    esac
+    run_variant "$run_name" "$variant" "$image"
+    [ "$variant" = "$third" ] || recover_host "$run_name"
+  done
+  compare_parity "$a_name-$b_name" "$a_name" "$b_name" pairs
+  compare_parity "$b_name-$c_name" "$b_name" "$c_name" p3-cost-pairs
+  compare_parity "$a_name-$c_name" "$a_name" "$c_name" p3-primary-pairs
+  recover_host "$a_name-$b_name-$c_name"
 done
 
 if [ "$P2_MODE" = "full" ]; then

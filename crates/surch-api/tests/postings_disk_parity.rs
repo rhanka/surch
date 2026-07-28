@@ -44,7 +44,7 @@ fn corpus_ndjson() -> String {
             1 => "beta widget",
             _ => "gamma gadget",
         };
-        let category = if i % 2 == 0 { "tools" } else { "toys" };
+        let category = if i.is_multiple_of(2) { "tools" } else { "toys" };
         let body = if i.is_multiple_of(6) {
             "common common lorem ipsum"
         } else {

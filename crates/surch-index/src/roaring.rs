@@ -221,10 +221,10 @@ mod tests {
 
         // chunk 0 dense: a = multiples of 2, b = multiples of 3 (both > 4096 entries)
         for d in 0..CHUNK_SIZE {
-            if d % 2 == 0 {
+            if d.is_multiple_of(2) {
                 a.push(d);
             }
-            if d % 3 == 0 {
+            if d.is_multiple_of(3) {
                 b.push(d);
             }
         }

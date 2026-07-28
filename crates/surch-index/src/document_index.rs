@@ -378,6 +378,8 @@ pub struct DocumentIndex {
     /// tiered-merge doc-count cap, same rationale/pattern as
     /// `merge_fanin_override` — see [`MergeMaxDocsOverride`].
     merge_max_docs_override: MergeMaxDocsOverride,
+    #[cfg(test)]
+    p2_integrity_max_bytes_override: Option<u64>,
 }
 
 /// Avance commune aux curseurs RAM et disque d'un segment. Le chemin P2 doit
@@ -640,6 +642,8 @@ impl Default for DocumentIndex {
             flush_budget_override: FlushBudgetOverride::UseEnv,
             merge_fanin_override: MergeFaninOverride::UseEnv,
             merge_max_docs_override: MergeMaxDocsOverride::UseEnv,
+            #[cfg(test)]
+            p2_integrity_max_bytes_override: None,
         }
     }
 }
@@ -1477,6 +1481,33 @@ impl AggregatedFieldStats {
 }
 
 impl DocumentIndex {
+    fn p2_integrity_max_bytes(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(max_bytes) = self.p2_integrity_max_bytes_override {
+            return max_bytes;
+        }
+        P2_INTEGRITY_MAX_BYTES
+    }
+
+    /// Réserve au segment reconstruit la part encore libre du plafond P3
+    /// global. Les segments remplacés sont exclus : leurs digests tombent au
+    /// moment où le nouveau dictionnaire atomique prend leur place.
+    fn p2_integrity_budget_excluding(&self, excluded: std::ops::Range<usize>) -> u64 {
+        let used = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !excluded.contains(index))
+            .map(|(_, segment)| segment.terms.p2_integrity_metrics().integrity_bytes)
+            .fold(0u64, u64::saturating_add);
+        self.p2_integrity_max_bytes().saturating_sub(used)
+    }
+
+    #[cfg(test)]
+    fn set_p2_integrity_max_bytes_for_test(&mut self, max_bytes: u64) {
+        self.p2_integrity_max_bytes_override = Some(max_bytes);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1603,8 +1634,11 @@ impl DocumentIndex {
         // which `if` branch below actually rebuilds `terms`.
         let disk_enabled = self.resolved_postings_disk_enabled();
         if self.terms_dirty {
+            let active = self.segments.len() - 1;
+            let p2_integrity_budget = self.p2_integrity_budget_excluding(active..active + 1);
             let builder = std::mem::replace(&mut self.postings_builder, PostingsBuilder::new());
-            let new_terms = builder.build_with_disk_flag(disk_enabled);
+            let new_terms = builder
+                .build_with_disk_flag_and_p2_integrity_limit(disk_enabled, p2_integrity_budget);
             self.segment_mut().terms = new_terms;
             self.terms_dirty = false;
             self.terms_build_count.fetch_add(1, Ordering::Relaxed);
@@ -1767,6 +1801,7 @@ impl DocumentIndex {
     /// `doc_count` of the run's earlier segments.
     fn merge_segments_run(&mut self, start: usize, end: usize) {
         let merge_started_at = std::time::Instant::now();
+        let p2_integrity_budget = self.p2_integrity_budget_excluding(start..end);
         let run = &self.segments[start..end];
         let merged_doc_base = run[0].doc_base;
         let merged_doc_count: u32 = run.iter().map(|segment| segment.doc_count).sum();
@@ -1779,7 +1814,7 @@ impl DocumentIndex {
              for its whole process lifetime (see `postings_disk_enabled`'s doc comment)"
         );
         let term_dicts: Vec<&TermDictionary> = run.iter().map(|segment| &segment.terms).collect();
-        let terms = merge_term_dictionaries(&term_dicts, disk_enabled);
+        let terms = merge_term_dictionaries(&term_dicts, disk_enabled, p2_integrity_budget);
         let field_stats = merge_field_stats(run);
         // Plan segments S3b (design doc §S3b, "spill incrémental des
         // colonnes fusionnées pendant le merge"): unlike the S5c
@@ -1991,10 +2026,12 @@ impl DocumentIndex {
             // (single-doc paths and unit tests) can read `terms` /
             // `postings` without an explicit `materialize_terms()`.
             let disk_enabled = self.resolved_postings_disk_enabled();
+            let active = self.segments.len() - 1;
+            let p2_integrity_budget = self.p2_integrity_budget_excluding(active..active + 1);
             let new_terms = self
                 .postings_builder
                 .clone()
-                .build_with_disk_flag(disk_enabled);
+                .build_with_disk_flag_and_p2_integrity_limit(disk_enabled, p2_integrity_budget);
             self.segment_mut().terms = new_terms;
             self.terms_dirty = false;
             self.terms_build_count.fetch_add(1, Ordering::Relaxed);
@@ -2021,10 +2058,12 @@ impl DocumentIndex {
             return;
         }
         let disk_enabled = self.resolved_postings_disk_enabled();
+        let active = self.segments.len() - 1;
+        let p2_integrity_budget = self.p2_integrity_budget_excluding(active..active + 1);
         let new_terms = self
             .postings_builder
             .clone()
-            .build_with_disk_flag(disk_enabled);
+            .build_with_disk_flag_and_p2_integrity_limit(disk_enabled, p2_integrity_budget);
         self.segment_mut().terms = new_terms;
         self.terms_dirty = false;
         self.terms_build_count.fetch_add(1, Ordering::Relaxed);
@@ -3973,6 +4012,42 @@ mod tests {
             .expect("docs 2-3");
         index.materialize_terms_and_finalize_postings();
         (index, mapping)
+    }
+
+    #[test]
+    fn p2_integrity_budget_is_global_across_sealed_segments() {
+        let mapping = IndexMapping::default();
+        let mut index = DocumentIndex::new();
+        index.set_postings_disk_enabled(true);
+        index.set_flush_budget_bytes_override(Some(1));
+        index.set_merge_fanin_override(0);
+        // Une région d'entrées et une de répertoire pour un champ minuscule
+        // tiennent dans ce budget. Le second segment doit donc décliner P2
+        // plutôt que publier une seconde table de la même taille.
+        index.set_p2_integrity_max_bytes_for_test(128);
+
+        index
+            .add_documents_with_mapping_deferred([(0, [("body", "commun")])], &mapping)
+            .expect("premier segment");
+        index.maybe_flush_by_budget();
+        index
+            .add_documents_with_mapping_deferred([(1, [("body", "commun")])], &mapping)
+            .expect("second segment");
+        index.materialize_terms_and_finalize_postings();
+
+        let metrics = index.postings_p2_integrity_metrics();
+        assert!(
+            metrics.integrity_bytes <= 128,
+            "le total indexé doit rester dans le budget global"
+        );
+        assert!(
+            metrics.fallback_fields > 0,
+            "le segment sans budget doit rendre le déclin P2 observable"
+        );
+        assert!(
+            index.segmented_postings_checked("body", "commun").is_err(),
+            "une preuve incomplète doit décliner avant tout curseur P2"
+        );
     }
 
     fn collect_segmented_doc_ids(postings: &mut SegmentedPostings<'_>) -> Vec<u32> {

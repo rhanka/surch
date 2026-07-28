@@ -107,7 +107,9 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
   canoniques P2, sans copies résidentes des scalaires ni du répertoire.
   - [x] Le producteur unique seal/merge publie atomiquement deux descripteurs
     de région et une table de digests partagée, ou garde le fallback résident
-    compté ; le plafond de 32 Mio refuse toute dérive silencieuse.
+    compté ; chaque reconstruction reçoit le budget restant de l'index, donc
+    le total multi-segment ne dépasse jamais 32 Mio et P2 décline explicitement
+    si une preuve complète ne tient pas.
   - [x] Le lecteur authentifie la page de `TermEntry`, borne le payload,
     déduit exactement `ceil(df/128)`, puis authentifie le répertoire avant
     tout saut ; il décline intégralement sur incohérence.
@@ -123,6 +125,10 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     résident rend la campagne invalide avant le verdict de latence. Le
     lecteur P2 décline aussi intégralement avant d'ouvrir un curseur si ce
     plafond global ou cette absence de preuve est constaté.
+  - [x] Le pilote conserve A=pré-P2 et B=P2, ajoute C=P3, vérifie la parité
+    des trois paires A/B, B/C et A/C, applique les SLO principaux à C/A,
+    puis refuse un coût moteur p95 C/B supérieur à `1,05`; l'intégrité P3
+    n'est exigée que pour C.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.
@@ -132,12 +138,14 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
   dans cette mission.
 - [ ] Gate externe — vérifier les goldens forcé-générique/P2, les compteurs
   de couverture et la parité avant toute conclusion de performance.
-- [ ] Gate externe — comparer `961ade1` et P2 sur 28 917 511 documents,
-  6 Gio, douze segments et trois paires contrebalancées.
-- [ ] Gate externe — valider p95 `took` P2/baseline <= 0,50, p99 <= 0,70,
-  couverture compteur +500, contrôle `match` <= 1,05x et parité verte ;
-  rapporter séparément le ratio `blocks_read / blocks_total` (cible <= 25 %)
-  comme résultat P2, sans invalider la mesure.
+- [ ] Gate externe — comparer A=`961ade1`, B=`6ce390e` et C=commit P3 livré
+  sur 28 917 511 documents, 6 Gio, douze segments et trois triplets
+  contrebalancés.
+- [ ] Gate externe — valider p95 `took` C/A <= 0,50, p99 C/A <= 0,70,
+  coût p95 moteur C/B <= 1,05, couverture compteur +500, contrôle `match`
+  <= 1,05x et parité A/B + B/C verte ; rapporter séparément le ratio
+  `blocks_read / blocks_total` (cible <= 25 %) comme résultat P2, sans
+  invalider la mesure.
 - [ ] Décision de poursuite — abandonner P2 après trois paires valides si le
   saut est prouvé mais que le p95 gagne moins de 30 % ; autoriser une seule
   itération de profilage entre 30 et 50 % de gain.
@@ -150,8 +158,10 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
 - Preuves externes attendues : CI, goldens de parité, compteurs de routage et
   rapport chiffré conservant `took`, p95/p99, ratio de blocs, contrôle
   négatif et le coût C/B de l'authentification par curseur. La formule P3
-  estime uniquement digests et descripteurs ; la mesure corpus reste
-  obligatoire pour inclure les allocations et l'allocateur.
+  `32 × Σf(ceil(28Tf / 4096) + ceil(10Bf / 4096)) + 64F` estime uniquement
+  les digests et descripteurs ; ses bornes corpus déduites restent 12–17 Mio,
+  et la mesure corpus reste obligatoire pour inclure allocations, tables,
+  compteurs et allocateur.
 - Risque principal : utiliser le `df` local pour l'IDF et modifier score,
   `max_score`, ordre ou `min_score` malgré des ids exacts.
 
