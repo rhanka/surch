@@ -72,7 +72,12 @@ jobs:
     name: harnais P3 synthétique
     runs-on: ubuntu-22.04
     steps:
+      # Le vrai pilote archive trois commits P3 épinglés. Le checkout par
+      # défaut est superficiel et ne contient que HEAD, donc il ne peut pas
+      # vérifier ni construire les variantes A/B/C.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Exécuter la matrice normale du gate P3
         run: bash deploy/bench-local/test-p3-harness.sh
       - name: Exécuter la matrice exhaustive du gate P3

@@ -4,7 +4,7 @@
 # Le vrai p2-campaign.sh est exécuté sous set -euo pipefail. Docker,
 # fair-ab, le rapport et le gate sont remplacés aux frontières par des
 # doubles déterministes injectés par PATH et variables d'environnement.
-set -euo pipefail
+set -Eeuo pipefail
 export LC_ALL=C
 
 die(){ printf 'test-p3-campaign: %s\n' "$*" >&2; exit 1; }
@@ -166,6 +166,107 @@ run_as_fake(){
 }
 if run_as_fake "$@"; then exit 0; fi
 
+# Une erreur du pilote est normalement capturée dans *.out afin que les
+# assertions puissent l'inspecter. Sans ce piège, un échec avant assertion
+# rendait le job CI muet. Les valeurs sont initialisées avant tout prérequis
+# pour que même un échec de préparation garde son contexte.
+CURRENT_STEP='initialisation du test'
+CURRENT_ASSERTION='aucune'
+FAILED_COMMAND='aucune'
+FAILED_LINE='inconnue'
+CAPTURED_OUTPUT=''
+CAPTURED_DRIVER_LOG=''
+EXPECTED_ARTIFACTS=''
+TMP_DIR=''
+
+tool_version(){
+  local tool="$1"
+  local output=''
+  local status=0
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'absent'
+    return
+  fi
+  case "$tool" in
+    awk) output=$(awk -W version 2>&1) || status=$? ;;
+    *) output=$("$tool" --version 2>&1) || status=$? ;;
+  esac
+  output=${output%%$'\n'*}
+  if [ "$status" -eq 0 ]; then
+    printf '%s' "$output"
+  else
+    printf 'échec(code=%s): %s' "$status" "$output"
+  fi
+}
+
+print_versions(){
+  printf 'test-p3-campaign: versions bash=%s jq=%s awk=%s git=%s\n' \
+    "$BASH_VERSION" "$(tool_version jq)" "$(tool_version awk)" "$(tool_version git)" >&2
+}
+
+set_step(){
+  CURRENT_STEP="$1"
+  CURRENT_ASSERTION="$2"
+  CAPTURED_OUTPUT="${3:-}"
+  CAPTURED_DRIVER_LOG="${4:-}"
+  EXPECTED_ARTIFACTS="${5:-}"
+}
+
+remember_error(){
+  local status="$1"
+  FAILED_COMMAND="$2"
+  FAILED_LINE="$3"
+  return "$status"
+}
+
+print_excerpt(){
+  local label="$1"
+  local path="$2"
+  printf 'test-p3-campaign: %s: %s\n' "$label" "$path" >&2
+  if [ -s "$path" ]; then
+    tail -n 120 "$path" >&2
+  elif [ -e "$path" ]; then
+    printf 'test-p3-campaign: %s est vide\n' "$path" >&2
+  else
+    printf 'test-p3-campaign: %s est absent\n' "$path" >&2
+  fi
+}
+
+cleanup_and_report(){
+  local status=$?
+  local artifact
+  trap - EXIT
+  set +e
+  if [ "$status" -ne 0 ]; then
+    printf 'test-p3-campaign: ECHEC (code de sortie %s)\n' "$status" >&2
+    printf 'test-p3-campaign: étape: %s\n' "$CURRENT_STEP" >&2
+    printf 'test-p3-campaign: assertion/commande: %s\n' "$CURRENT_ASSERTION" >&2
+    printf 'test-p3-campaign: commande observée (ligne %s): %s\n' \
+      "$FAILED_LINE" "$FAILED_COMMAND" >&2
+    for artifact in $EXPECTED_ARTIFACTS; do
+      if [ -s "$artifact" ]; then
+        printf 'test-p3-campaign: artefact attendu présent: %s\n' "$artifact" >&2
+        head -c 4096 "$artifact" >&2
+        printf '\n' >&2
+      else
+        printf 'test-p3-campaign: artefact attendu absent ou vide: %s\n' "$artifact" >&2
+      fi
+    done
+    [ -z "$CAPTURED_OUTPUT" ] || print_excerpt 'extrait du pilote capturé' "$CAPTURED_OUTPUT"
+    [ -z "$CAPTURED_DRIVER_LOG" ] || print_excerpt 'extrait du journal faux pilote' "$CAPTURED_DRIVER_LOG"
+  fi
+  if [ -n "$TMP_DIR" ] && [ "${P3_CAMPAIGN_KEEP_TMP:-0}" != 1 ]; then
+    rm -rf -- "$TMP_DIR"
+  elif [ -n "$TMP_DIR" ] && [ "$status" -ne 0 ]; then
+    printf 'test-p3-campaign: temporaires conservés dans %s\n' "$TMP_DIR" >&2
+  fi
+  exit "$status"
+}
+
+trap 'remember_error "$?" "$BASH_COMMAND" "$LINENO"' ERR
+trap cleanup_and_report EXIT
+print_versions
+
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 CAMPAIGN="$ROOT_DIR/deploy/bench-local/p2-campaign.sh"
 
@@ -197,6 +298,7 @@ assert_no_grouped_declarations(){
     ' "$script" || exit 1
   done
 }
+set_step 'garde des déclarations locales' 'aucune déclaration locale groupée ne doit subsister'
 assert_no_grouped_declarations
 
 assert_bash43_empty_array_guard(){
@@ -209,17 +311,13 @@ assert_bash43_empty_array_guard(){
   ' "$ROOT_DIR/deploy/bench-local/fair-ab.sh" \
     || die 'les entrées awk doivent rester non vides sous Bash 4.3 et set -u'
 }
+set_step 'garde Bash 4.3 des entrées AWK' 'le tableau AWK optionnel doit rester non vide sous set -u'
 assert_bash43_empty_array_guard
 
+set_step 'création des fixtures' 'mktemp doit créer le répertoire temporaire'
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/surch-p3-campaign.XXXXXX")
 FAKE_BIN="$TMP_DIR/bin"
 mkdir -p "$FAKE_BIN" "$TMP_DIR/docker-root"
-cleanup(){
-  local status=$?
-  [ "${P3_CAMPAIGN_KEEP_TMP:-0}" = 1 ] || rm -rf -- "$TMP_DIR"
-  exit "$status"
-}
-trap cleanup EXIT
 SELF=$(readlink -f -- "$0")
 for fake in docker findmnt sync sleep sudo fake-fair-ab fake-pair-report fake-gate; do
   ln -s "$SELF" "$FAKE_BIN/$fake"
@@ -254,14 +352,15 @@ printf '{"query":{"match":{"NOM":"MARTIN"}},"size":10}\n' > "$TMP_DIR/control10.
 printf '{"query":{"match":{"NOM":"DURAND"}},"size":10}\n{"query":{"bool":{"must":[{"match":{"NOM":"DURAND"}},{"match":{"PRENOMS":"BOB"}}]}},"size":10}\n' > "$TMP_DIR/warm.ndjson"
 printf '{"query":{"match":{"NOM":"MARTIN"}},"size":10}\n' > "$TMP_DIR/fixed.ndjson"
 : > "$TMP_DIR/replay.ndjson"
+set_step 'validation des corps P3 synthétiques' 'les corps générés doivent rester canoniques'
 p2_validate_body_files \
   "$TMP_DIR/bool-pairs.tsv" "$TMP_DIR/control-names.tsv" "$TMP_DIR/warm-pairs.tsv" \
   "$TMP_DIR/bool10.ndjson" "$TMP_DIR/bool0.ndjson" "$TMP_DIR/control10.ndjson" \
   "$TMP_DIR/warm.ndjson" "$TMP_DIR/fixed.ndjson" "$TMP_DIR/replay.ndjson" \
   || die 'validation fair-ab avec replay optionnel refusée'
 
-fail(){ die "$*"; }
-assert_file(){ [ -s "$1" ] || fail "artefact absent ou vide: $1"; }
+fail(){ CURRENT_ASSERTION="$*"; die "$*"; }
+assert_file(){ EXPECTED_ARTIFACTS="$1"; [ -s "$1" ] || fail "artefact absent ou vide: $1"; }
 assert_log(){
   local log="$1"
   local expected="$2"
@@ -289,6 +388,10 @@ campaign_env(){
 
 SMOKE_DIR="$TMP_DIR/smoke"
 SMOKE_LOG="$TMP_DIR/smoke.log"
+set_step 'smoke du pilote P3' \
+  'campaign_env smoke doit construire et vérifier les variantes A/B/C' \
+  "$TMP_DIR/smoke.out" "$SMOKE_LOG" \
+  "$SMOKE_DIR/campaign-provenance.json $SMOKE_DIR/smoke-proof.json $SMOKE_DIR/README.md"
 campaign_env smoke "$SMOKE_DIR" '' "$SMOKE_LOG" > "$TMP_DIR/smoke.out" 2>&1
 for artifact in campaign-provenance.json smoke-proof.json smoke-formulas.json README.md; do
   assert_file "$SMOKE_DIR/$artifact"
@@ -303,6 +406,10 @@ assert_log "$SMOKE_LOG" $'build:surch-p2-a:961ade10ffb7\nbuild:surch-p2-b:6ce390
 
 FULL_DIR="$TMP_DIR/full"
 FULL_LOG="$TMP_DIR/full.log"
+set_step 'campagne complète synthétique' \
+  'campaign_env full doit produire les neuf runs et le verdict' \
+  "$TMP_DIR/full.out" "$FULL_LOG" \
+  "$FULL_DIR/preselection-c1.json $FULL_DIR/preselection-triplet-1.json $FULL_DIR/README.md"
 campaign_env full "$FULL_DIR" "$SMOKE_DIR" "$FULL_LOG" > "$TMP_DIR/full.out" 2>&1
 assert_file "$FULL_DIR/preselection-c1.json"
 assert_file "$FULL_DIR/preselection-triplet-1.json"
@@ -315,6 +422,9 @@ assert_log "$FULL_LOG" $'build:surch-p2-a:961ade10ffb7\nbuild:surch-p2-b:6ce390e
 
 FAIL_DIR="$TMP_DIR/fair-ab-echec"
 FAIL_LOG="$TMP_DIR/fair-ab-echec.log"
+set_step 'propagation de l échec fair-ab' \
+  'un fair-ab rouge doit arrêter le pilote avant la variante C' \
+  "$TMP_DIR/fair-ab-echec.out" "$FAIL_LOG" "$FAIL_DIR/smoke-proof.json"
 if P3_FAKE_FAIL_VARIANT=B campaign_env smoke "$FAIL_DIR" '' "$FAIL_LOG" > "$TMP_DIR/fair-ab-echec.out" 2>&1; then
   fail 'un échec de fair-ab doit arrêter le pilote'
 fi
@@ -326,6 +436,9 @@ fi
 
 PAIR_FAIL_DIR="$TMP_DIR/pair-report-echec"
 PAIR_FAIL_LOG="$TMP_DIR/pair-report-echec.log"
+set_step 'propagation de l échec p2-report' \
+  'un rapport statistique rouge doit arrêter le smoke' \
+  "$TMP_DIR/pair-report-echec.out" "$PAIR_FAIL_LOG" "$PAIR_FAIL_DIR/smoke-proof.json"
 if P3_FAKE_PAIR_FAIL=1 campaign_env smoke "$PAIR_FAIL_DIR" '' "$PAIR_FAIL_LOG" > "$TMP_DIR/pair-report-echec.out" 2>&1; then
   fail 'un échec de p2-report doit arrêter le pilote'
 fi
@@ -337,6 +450,9 @@ fi
 
 STOP_DIR="$TMP_DIR/hard-stop-echec"
 STOP_LOG="$TMP_DIR/hard-stop-echec.log"
+set_step 'hard-stop du premier triplet' \
+  'un hard-stop rouge doit empêcher A2' \
+  "$TMP_DIR/hard-stop-echec.out" "$STOP_LOG" "$STOP_DIR/preselection-triplet-1.json"
 if P3_FAKE_HARD_STOP_FAIL=1 campaign_env full "$STOP_DIR" "$SMOKE_DIR" "$STOP_LOG" > "$TMP_DIR/hard-stop-echec.out" 2>&1; then
   fail 'un hard-stop rouge doit arrêter le pilote'
 fi
@@ -348,6 +464,9 @@ fi
 
 C1_STOP_DIR="$TMP_DIR/c1-hard-stop-echec"
 C1_STOP_LOG="$TMP_DIR/c1-hard-stop-echec.log"
+set_step 'hard-stop C1' \
+  'un hard-stop C1 rouge doit empêcher A1 et B1' \
+  "$TMP_DIR/c1-hard-stop-echec.out" "$C1_STOP_LOG" "$C1_STOP_DIR/preselection-c1.json"
 if P3_FAKE_C1_INVALID=1 campaign_env full "$C1_STOP_DIR" "$SMOKE_DIR" "$C1_STOP_LOG" > "$TMP_DIR/c1-hard-stop-echec.out" 2>&1; then
   fail 'un hard-stop C1 rouge doit arrêter le pilote'
 fi
@@ -359,6 +478,9 @@ fi
 
 GATE_FAIL_DIR="$TMP_DIR/gate-echec"
 GATE_FAIL_LOG="$TMP_DIR/gate-echec.log"
+set_step 'propagation de l échec final du gate' \
+  'un gate rouge doit empêcher README.md' \
+  "$TMP_DIR/gate-echec.out" "$GATE_FAIL_LOG" "$GATE_FAIL_DIR/README.md"
 if P3_FAKE_GATE_FAIL=1 campaign_env full "$GATE_FAIL_DIR" "$SMOKE_DIR" "$GATE_FAIL_LOG" > "$TMP_DIR/gate-echec.out" 2>&1; then
   fail 'un échec de gate doit arrêter le pilote'
 fi
