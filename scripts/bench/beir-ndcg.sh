@@ -10,7 +10,8 @@
 # scifact) qrels alike.
 #
 # In K8s the corpus is pre-hydrated read-only on $BEIR_DIR by 00-init-corpora
-# / 00b-init-beir-extra; the download branch is a local-dev fallback.
+# / 00b-init-beir-extra.  Set BEIR_REQUIRE_LOCAL_DATA=1 for a quality gate:
+# a missing or partial corpus then fails instead of falling back to a download.
 set -euo pipefail
 DATASET="${1:?dataset (e.g. nfcorpus, fiqa, trec-covid, scifact)}"
 LABEL="${2:?label}"
@@ -51,8 +52,32 @@ http_request() {
   cat "$response_file"
 }
 
+require_expected_count() {
+  local label="${1:?label}"
+  local actual="${2:?actual}"
+  local expected="${3:-}"
+  if [ -z "$expected" ]; then
+    return 0
+  fi
+  case "$expected" in
+    *[!0-9]*|'')
+      echo "[$SCRIPT_NAME] invalid expected $label count: $expected" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$actual" -ne "$expected" ]; then
+    echo "[$SCRIPT_NAME] $label count=$actual, expected=$expected" >&2
+    exit 1
+  fi
+}
+
 # -- Step 1: ensure dataset present (auto-download for local dev only) --
 if [ ! -s "$DATA/corpus.jsonl" ] || [ ! -s "$DATA/queries.jsonl" ] || [ ! -s "$DATA/qrels/test.tsv" ]; then
+  if [ "${BEIR_REQUIRE_LOCAL_DATA:-0}" = "1" ]; then
+    echo "[$SCRIPT_NAME] required BEIR dataset is incomplete: $DATA" >&2
+    echo "[$SCRIPT_NAME] expected non-empty corpus.jsonl, queries.jsonl and qrels/test.tsv" >&2
+    exit 1
+  fi
   mkdir -p "$BEIR_ROOT"
   if [ ! -s "$ARCHIVE" ]; then
     echo "[beir:$DATASET] downloading $ARCHIVE_URL ..." >&2
@@ -61,6 +86,13 @@ if [ ! -s "$DATA/corpus.jsonl" ] || [ ! -s "$DATA/queries.jsonl" ] || [ ! -s "$D
   echo "[beir:$DATASET] extracting to $BEIR_ROOT ..." >&2
   ( cd "$BEIR_ROOT" && unzip -oq "$ARCHIVE" )
 fi
+
+corpus_docs=$(awk 'NF { count++ } END { print count + 0 }' "$DATA/corpus.jsonl")
+if [ "$corpus_docs" -eq 0 ]; then
+  echo "[$SCRIPT_NAME] $DATA/corpus.jsonl has no document" >&2
+  exit 1
+fi
+require_expected_count "corpus document" "$corpus_docs" "${BEIR_EXPECTED_DOCS:-}"
 
 # -- Step 2: convert corpus.jsonl -> bulk NDJSON ---------------------------
 if [ -s "$DATA/corpus.ndjson" ]; then
@@ -111,16 +143,34 @@ for chunk in "$TMP"/bulk.*; do
     echo "[$SCRIPT_NAME] $(basename "$chunk") has $chunk_lines lines (odd) — refusing to POST" >&2
     exit 22
   fi
-  http_request "bulk ingest $INDEX chunk $(basename "$chunk")" POST "$URL/_bulk" -H 'Content-Type: application/x-ndjson' \
-    --data-binary "@$chunk" >/dev/null
+  bulk_response=$(http_request "bulk ingest $INDEX chunk $(basename "$chunk")" POST "$URL/_bulk" -H 'Content-Type: application/x-ndjson' \
+    --data-binary "@$chunk")
+  if ! jq -e '.errors == false' >/dev/null <<<"$bulk_response"; then
+    echo "[$SCRIPT_NAME] bulk ingest $INDEX chunk $(basename "$chunk") reported item errors" >&2
+    exit 1
+  fi
 done
 t1=$(date +%s.%N)
 bulk_ms=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", (b-a)*1000 }')
 http_request "refresh $INDEX" POST "$URL/$INDEX/_refresh" >/dev/null
+count_response=$(http_request "count $INDEX" GET "$URL/$INDEX/_count")
+indexed_docs=$(jq -er '.count | if type == "number" and . >= 0 and floor == . then . else error("invalid count") end' <<<"$count_response") || {
+  echo "[$SCRIPT_NAME] malformed count response for $INDEX" >&2
+  exit 1
+}
+if [ "$indexed_docs" -ne "$corpus_docs" ]; then
+  echo "[$SCRIPT_NAME] indexed $indexed_docs documents in $INDEX, expected $corpus_docs" >&2
+  exit 1
+fi
 
 # -- Step 4: qrels + queries -----------------------------------------------
 awk -F'\t' 'NR>1 && $3>0 { print $1 }' "$DATA/qrels/test.tsv" | sort -u > "$TMP/test_qids.txt"
 total_queries=$(wc -l < "$TMP/test_qids.txt")
+if [ "$total_queries" -eq 0 ]; then
+  echo "[$SCRIPT_NAME] $DATA/qrels/test.tsv has no positive test qrel" >&2
+  exit 1
+fi
+require_expected_count "positive-qrel test query" "$total_queries" "${BEIR_EXPECTED_TEST_QIDS:-}"
 awk -F'\t' 'NR>1 && $3>0 { print $1"\t"$2"\t"$3 }' "$DATA/qrels/test.tsv" | sort -k1,1 > "$TMP/qrels.tsv"
 jq -r '"\(._id)\t\(.text)"' "$DATA/queries.jsonl" > "$TMP/queries.tsv"
 
@@ -129,10 +179,17 @@ cum_recall=0
 processed=0
 while read -r qid; do
   qtext=$(awk -F'\t' -v q="$qid" '$1==q{print $2; exit}' "$TMP/queries.tsv")
-  [ -z "$qtext" ] && continue
+  if [ -z "$qtext" ]; then
+    echo "[$SCRIPT_NAME] missing or empty query text for positive-qrel qid=$qid in $DATA" >&2
+    exit 1
+  fi
   qjson=$(printf '%s' "$qtext" | jq -Rsa . | sed 's/^"//;s/"$//')
   body=$(printf '{"query":{"multi_match":{"query":"%s","fields":["title","text"]}},"size":10,"track_total_hits":true}' "$qjson")
   resp=$(http_request "search $INDEX qid=$qid" POST "$URL/$INDEX/_search" -H 'Content-Type: application/json' --data "$body")
+  if ! jq -e '.hits.hits | type == "array"' >/dev/null <<<"$resp"; then
+    echo "[$SCRIPT_NAME] malformed search response for qid=$qid" >&2
+    exit 1
+  fi
   top10=$(jq -r '.hits.hits[]._id' <<<"$resp")
   if [ -z "$top10" ]; then
     processed=$((processed+1))
@@ -187,6 +244,11 @@ while read -r qid; do
   cum_recall=$(awk -v a="$cum_recall" -v b="$recall" 'BEGIN { printf "%.6f", a+b }')
   processed=$((processed+1))
 done < "$TMP/test_qids.txt"
+
+if [ "$processed" -ne "$total_queries" ]; then
+  echo "[$SCRIPT_NAME] processed $processed queries but expected $total_queries" >&2
+  exit 1
+fi
 
 avg_ndcg=$(awk -v c="$cum_ndcg" -v n="$processed" 'BEGIN { if (n>0) printf "%.4f", c/n; else print "n/a" }')
 avg_recall=$(awk -v c="$cum_recall" -v n="$processed" 'BEGIN { if (n>0) printf "%.4f", c/n; else print "n/a" }')

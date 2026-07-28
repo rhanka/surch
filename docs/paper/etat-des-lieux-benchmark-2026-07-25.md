@@ -127,11 +127,15 @@ BEIR NDCG@10 (surch / OpenSearch), dernier relevé de juin :
 | FiQA | 0,2294 | 0,2389 | −0,0095 🟡 |
 | TREC-COVID | 0,4777 | 0,4902 | −0,0125 🟡 |
 
-**Le dernier gate CI k8s vert date du 2026-07-04.** Depuis, 8 commits de code sont passés
-(segments S3b, compression zstd, packing side-table, fetchs parallèles, profil L2) **sans aucune
-validation de la qualité de recherche**. Les chiffres ci-dessus ne sont donc **pas** l'état actuel
-du moteur : ils décrivent le moteur d'il y a trois semaines. C'est le principal trou du tableau de
-bord — d'autant que ces mêmes commits ont profondément touché le stockage et le read-path.
+**Correction d'audit :** le vert CI k8s du 2026-07-04 est
+`b1-oracle-gate` (`28689787902`), pas un gate BEIR. Le dernier artefact K8s
+NFCorpus/FiQA est le run `26476471207` du 2026-05-26, sous
+`docs/ops/bench-reports/2026-05-26-F4-beir-nfcorpus-fiqa-K8s/`. Depuis, les
+commits segments S3b, compression zstd, packing side-table, fetchs
+parallèles, profil L2, lot S, P1a, P2 et P3 sont passés **sans nouvelle
+validation BEIR**. Les chiffres ci-dessus ne sont donc **pas** l'état actuel
+du moteur. Le plan de remise en état et les seuils explicites sont dans
+`docs/ops/beir-extra-ndcg-gate.md`.
 
 ## 5. Ce qui est solidement établi, et ce qui ne l'est pas
 

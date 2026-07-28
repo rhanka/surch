@@ -5,7 +5,8 @@
 # the quality-generality claim (Objective F) can be measured beyond
 # SciFact/TREC-COVID. Pure shell (busybox `wget` + `unzip` from the Alpine
 # base image) — no Python, runs as the non-root CI user, no `apk` needed.
-# Idempotent: skips a dataset whose `queries.jsonl` already exists.
+# Idempotent: skips only a complete, non-empty dataset. A partial PVC is
+# re-hydrated and any missing corpus, query or positive qrel is fatal.
 #
 # Datasets (BEIR, public UKP mirror):
 #   nfcorpus (~10 MiB) — medical IR, graded qrels
@@ -61,10 +62,25 @@ spec:
             - |
               set -eu
               mkdir -p "$BEIR_DIR"
+              dataset_complete() {
+                name="$1"
+                expected_docs="$2"
+                expected_test_qids="$3"
+                for f in corpus.jsonl queries.jsonl qrels/test.tsv; do
+                  if [ ! -s "$BEIR_DIR/$name/$f" ]; then
+                    return 1
+                  fi
+                done
+                docs="$(awk 'NF { count++ } END { print count + 0 }' "$BEIR_DIR/$name/corpus.jsonl")"
+                test_qids="$(awk -F '\t' 'NR > 1 && $3 > 0 { print $1 }' "$BEIR_DIR/$name/qrels/test.tsv" | sort -u | wc -l)"
+                [ "$docs" -eq "$expected_docs" ] && [ "$test_qids" -eq "$expected_test_qids" ]
+              }
               fetch_dataset() {
                 name="$1"
-                if [ -f "$BEIR_DIR/$name/queries.jsonl" ]; then
-                  echo "== $name already present, skipping =="
+                expected_docs="$2"
+                expected_test_qids="$3"
+                if dataset_complete "$name" "$expected_docs" "$expected_test_qids"; then
+                  echo "== $name already complete, skipping =="
                   return 0
                 fi
                 echo "== BEIR $name: download + extract =="
@@ -73,16 +89,12 @@ spec:
                 unzip -q -o "$zip" -d "$BEIR_DIR"
                 rm -f "$zip"
                 # Sanity: the standard BEIR layout must be present.
-                for f in corpus.jsonl queries.jsonl qrels/test.tsv; do
-                  if [ ! -f "$BEIR_DIR/$name/$f" ]; then
-                    echo "ERROR: $name missing $f after extract" >&2
-                    exit 1
-                  fi
-                done
-                docs="$(wc -l < "$BEIR_DIR/$name/corpus.jsonl")"
-                queries="$(wc -l < "$BEIR_DIR/$name/queries.jsonl")"
-                echo "  $name: $docs docs, $queries queries"
+                if ! dataset_complete "$name" "$expected_docs" "$expected_test_qids"; then
+                  echo "ERROR: $name has unexpected corpus or positive-qrel query cardinality after extract" >&2
+                  exit 1
+                fi
+                echo "  $name: $expected_docs docs, $expected_test_qids positive-qrel test queries"
               }
-              fetch_dataset nfcorpus
-              fetch_dataset fiqa
+              fetch_dataset nfcorpus 3633 323
+              fetch_dataset fiqa 57638 648
               echo "init-beir-extra complete."
