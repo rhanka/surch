@@ -175,7 +175,7 @@ async fn export_then_import_preserves_hits_total() {
     // are tagged `science`, half `fiction`; every document mentions
     // "alpha" so the post-restore match query has a non-trivial hit
     // count.
-    let docs: Vec<(String, Value)> = (0..100)
+    let docs: Vec<(String, Value)> = (0_u32..100_u32)
         .map(|n| {
             let category = if n.is_multiple_of(2) {
                 "science"

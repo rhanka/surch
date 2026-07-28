@@ -220,7 +220,7 @@ async fn snapshot_take_and_get_reports_success() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let docs: Vec<(String, Value)> = (0..100)
+    let docs: Vec<(String, Value)> = (0_u32..100_u32)
         .map(|n| {
             let category = if n.is_multiple_of(2) {
                 "science"
@@ -379,7 +379,7 @@ async fn snapshot_restore_round_trip_brings_docs_back() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let docs: Vec<(String, Value)> = (0..100)
+    let docs: Vec<(String, Value)> = (0_u32..100_u32)
         .map(|n| {
             let category = if n.is_multiple_of(2) {
                 "science"
