@@ -64,6 +64,16 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     refresh_jemalloc_gauges();
 }
 
+/// Rafraîchit les jauges mémoire propres au processus sans relire un index.
+///
+/// Le scrape Prometheus doit observer l'état présent entre deux requêtes de
+/// recherche : attendre une écriture ou `/_refresh` laisserait les statistiques
+/// jemalloc cachées à l'epoch précédente et fausserait les dérivés P3.
+pub(crate) fn refresh_runtime_memory_gauges() {
+    refresh_process_memory_gauges();
+    refresh_jemalloc_gauges();
+}
+
 /// Jauges P3 mises à jour à l'indexation et après chaque tentative P2. Les
 /// tailles sont instantanées ; les compteurs de vérification et de déclin sont
 /// cumulatifs pour la génération de segments courante.

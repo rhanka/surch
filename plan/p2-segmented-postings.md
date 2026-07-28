@@ -135,6 +135,12 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     snapshots JSONL couvrent P3, mémoire processus/jemalloc et cgroup à
     `index_ready` puis autour de chaque phase ; une métrique absente invalide
     le run. Le mix 50/50 historique ne subsiste que comme replay opt-in.
+  - [x] Correctifs de revue P3 B1-B9 et M1-M7 intégrés localement : JSON
+    cgroup validé par `jq`, identité des `NOM` sur le terme ASCII analysé,
+    SHA A/B/C gelés, ordre latin et hard-stops restaurés, provenance/image et
+    JSONL relus par le gate, dérivés mémoire/compaction et seuils P3 complets,
+    verdict non-PASS non nul. Preuves légères :
+    `deploy/bench-local/test-p3-harness.sh` et fixture synthétique du gate.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.

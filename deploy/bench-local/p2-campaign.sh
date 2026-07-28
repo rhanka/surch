@@ -12,12 +12,15 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 FAIR_AB="${FAIR_AB:-$ROOT_DIR/deploy/bench-local/fair-ab.sh}"
 PAIR_REPORT="${PAIR_REPORT:-$ROOT_DIR/deploy/bench-local/p2-report.sh}"
 GATE_REPORT="${GATE_REPORT:-$ROOT_DIR/deploy/bench-local/p2-gate.sh}"
-P2_A_SHA="${P2_A_SHA:-961ade10ffb74d78156aee8148f1e5c6bbbe6ba2}"
-P2_B_SHA="${P2_B_SHA:-6ce390e55da3593242ec11e2b09d4dee1057726d}"
-# C suit par défaut le commit local livré : le coût C/B mesure alors P3 avec
-# toutes les corrections de revue présentes, et reste surchargeable pour un
-# replay historique.
-P2_C_SHA="${P2_C_SHA:-$(git -C "$ROOT_DIR" rev-parse HEAD)}"
+P3_A_SHA="961ade10ffb74d78156aee8148f1e5c6bbbe6ba2"
+P3_B_SHA="6ce390e55da3593242ec11e2b09d4dee1057726d"
+P3_C_SHA="d0accd6e4809bc7340a6cd55cef0a94fcb6c062d"
+# Les trois variantes sont celles du protocole pré-engagé. Une surcharge qui
+# change un SHA est un autre protocole, donc un refus plutôt qu'un replay
+# silencieusement différent.
+P2_A_SHA="${P2_A_SHA:-$P3_A_SHA}"
+P2_B_SHA="${P2_B_SHA:-$P3_B_SHA}"
+P2_C_SHA="${P2_C_SHA:-$P3_C_SHA}"
 P2_MODE="${P2_MODE:-full}"             # full ou smoke
 P2_CAMPAIGN_DIR="${P2_CAMPAIGN_DIR:-$HOME/p2-campaign-$(date -u +%Y%m%dT%H%M%SZ)}"
 P2_SMOKE_DIR="${P2_SMOKE_DIR:-}"       # obligatoire avant le full
@@ -48,6 +51,9 @@ case "$P2_REST_SECONDS:$P2_RECOVERY_MEM_TOLERANCE_MIB:$P2_RECOVERY_DISK_TOLERANC
   *[!0-9:]*|:*|*::*) die "paramètres P2 de récupération invalides";;
 esac
 case "$P2_REPLAY_MIX_5050" in 0|1) ;; *) die "P2_REPLAY_MIX_5050 doit valoir 0 ou 1";; esac
+[ "$P2_A_SHA" = "$P3_A_SHA" ] || die "P2_A_SHA diffère du SHA pré-engagé P3"
+[ "$P2_B_SHA" = "$P3_B_SHA" ] || die "P2_B_SHA diffère du SHA pré-engagé P3"
+[ "$P2_C_SHA" = "$P3_C_SHA" ] || die "P2_C_SHA diffère du SHA pré-engagé P3"
 [ "$P2_REST_SECONDS" -eq 300 ] || die "P2_REST_SECONDS doit rester 300 secondes"
 [ -n "$P2_DOCKER_CLASSIC_SOURCE" ] || die "P2_DOCKER_CLASSIC_SOURCE est obligatoire (ex. /dev/sdb du volume classic)"
 if [ "$P2_MODE" = "full" ]; then
@@ -116,7 +122,8 @@ image_metadata(){
   image_id=$(docker image inspect -f '{{.Id}}' "$image") || return 1
   digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$image" 2>/dev/null || true)
   [ -n "$digest" ] || digest="$image_id"
-  jq -n --arg commit "$sha" --arg image "$image" --arg image_id "$image_id" --arg digest "$digest" > "$out"
+  jq -n --arg commit "$sha" --arg image "$image" --arg image_id "$image_id" --arg digest "$digest" \
+    '{commit:$commit,image:$image,image_id:$image_id,digest:$digest}' > "$out"
 }
 
 build_image(){
@@ -133,6 +140,19 @@ build_image(){
 build_image A "$P2_A_SHA"; IMAGE_A="$BUILT_IMAGE"
 build_image B "$P2_B_SHA"; IMAGE_B="$BUILT_IMAGE"
 build_image C "$P2_C_SHA"; IMAGE_C="$BUILT_IMAGE"
+jq -n \
+  --arg protocol 'p3-campagne-plan-v1' \
+  --slurpfile image_a "$P2_CAMPAIGN_DIR/image-A.json" \
+  --slurpfile image_b "$P2_CAMPAIGN_DIR/image-B.json" \
+  --slurpfile image_c "$P2_CAMPAIGN_DIR/image-C.json" \
+  '{schema:"surch.bench.p3.provenance.v1",protocol:$protocol,variants:{A:$image_a[0],B:$image_b[0],C:$image_c[0]}}' \
+  > "$P2_CAMPAIGN_DIR/campaign-provenance.json" \
+  || die 'écriture impossible de la provenance de campagne'
+jq -e --arg a "$P3_A_SHA" --arg b "$P3_B_SHA" --arg c "$P3_C_SHA" '
+  .variants.A.commit == $a and .variants.B.commit == $b and .variants.C.commit == $c
+  and ([.variants[] | .image, .image_id, .digest] | all(type == "string" and length > 0))
+' "$P2_CAMPAIGN_DIR/campaign-provenance.json" >/dev/null \
+  || die 'provenance image incomplète ou SHA non pré-engagé'
 
 # Le baseline est pris après les builds : leurs couches et cache vivent sous
 # Docker, ne sont pas des artefacts de campagne et ne doivent pas être pris
@@ -151,9 +171,9 @@ if [ "$P2_MODE" = "full" ]; then
   SEGMENT_GATE=exact
   FLUSH_BUDGET=268435456
   MERGE_FANIN=8
-  # Chaque triplet conserve une paire A/B et une paire B/C. Les ordres
-  # tournent pour que ni P2 ni P3 ne bénéficie systématiquement du cache.
-  SCHEDULE=("A1,B1,C1:A:B:C" "A2,B2,C2:B:C:A" "A3,B3,C3:C:A:B")
+  # Ordre latin pré-engagé : C commence le premier triplet afin qu'un échec
+  # mémoire P3 coupe la dépense avant A1/B1.
+  SCHEDULE=("A1,B1,C1:C:A:B" "A2,B2,C2:A:B:C" "A3,B3,C3:B:C:A")
 else
   PAIR_COUNT=100
   PROBE_REQUESTS=200
@@ -167,7 +187,7 @@ fi
 [ "$EXPECTED_DOCS" -gt 0 ] || die "corpus smoke vide ou NDJSON invalide"
 
 assert_scorecard(){
-  local out="$1" variant="$2" score="$out/surch.json"
+  local out="$1" variant="$2" image_metadata_file="$3" score="$out/surch.json"
   [ -s "$score" ] || die "scorecard absente: $score"
   jq -e \
     --arg variant "$variant" \
@@ -181,11 +201,20 @@ assert_scorecard(){
       and (.p2.observed_cpu_configuration.nproc == .probe_cpu_count)
       and (.p2.observed_cpu_configuration.engine_cpuset == .cpuset)
       and (.p2.observed_cpu_configuration.probe_cpuset == .probe_cpuset)
+      and (.p2.image | strings | length > 0)
+      and (.p2.image_id | strings | length > 0)
+      and (.p2.image_digest | strings | length > 0)
     ' "$score" >/dev/null || die "scorecard P2 invalide: $score"
+  jq -e --slurpfile metadata "$image_metadata_file" '
+    ($metadata | length) == 1
+    and .p2.image == $metadata[0].image
+    and .p2.image_id == $metadata[0].image_id
+    and .p2.image_digest == $metadata[0].digest
+  ' "$score" >/dev/null || die "provenance image incohérente: $score"
 }
 
 run_variant(){
-  local name="$1" variant="$2" image="$3" require_p3=0 out="$P2_CAMPAIGN_DIR/runs/$name"
+  local name="$1" variant="$2" image="$3" metadata="$4" require_p3=0 out="$P2_CAMPAIGN_DIR/runs/$name"
   [ "$variant" = "C" ] && require_p3=1
   mkdir -p "$out" || die "création run impossible: $out"
   log "run $name ($variant, image=$image)"
@@ -204,7 +233,7 @@ run_variant(){
     "$FAIR_AB" > "$out/fair-ab.log" 2>&1; then
     die "run $name invalide, voir $out/fair-ab.log"
   fi
-  assert_scorecard "$out" "$variant"
+  assert_scorecard "$out" "$variant" "$metadata"
 }
 
 compare_parity(){
@@ -257,9 +286,15 @@ compare_parity(){
 }
 
 recover_host(){
-  local name="$1" state="$P2_CAMPAIGN_DIR/recovery-$name.json" mem disk disk_effective artifacts load
-  docker ps -a --format '{{.Names}}' | grep -qx 'fairab-surch' && die "teardown incomplet: fairab-surch existe"
-  docker volume inspect fairab-vol-surch >/dev/null 2>&1 && die "teardown incomplet: fairab-vol-surch existe"
+  local name="$1" state="$P2_CAMPAIGN_DIR/recovery-$name.json" mem disk disk_effective artifacts load containers volumes
+  containers=$(docker ps -a --format '{{.Names}}') || die 'docker ps impossible pendant la récupération'
+  if grep -qx 'fairab-surch' <<< "$containers"; then
+    die 'teardown incomplet: fairab-surch existe'
+  fi
+  volumes=$(docker volume ls --format '{{.Name}}') || die 'docker volume ls impossible pendant la récupération'
+  if grep -qx 'fairab-vol-surch' <<< "$volumes"; then
+    die 'teardown incomplet: fairab-vol-surch existe'
+  fi
   sync
   if [ -w /proc/sys/vm/drop_caches ]; then
     printf '3\n' > /proc/sys/vm/drop_caches
@@ -288,23 +323,126 @@ recover_host(){
     || die "charge non revenue: $load vs baseline $baseline_load"
 }
 
+p3_ratio(){
+  local summary="$1" phase="$2" metric="$3" quantile="$4"
+  jq -er --arg phase "$phase" --arg metric "$metric" --arg quantile "$quantile" '
+    first(.records[] | select(.phase == $phase and .kind == "bool" and .metric == $metric) | .b_over_a[$quantile])
+    | if type == "number" then . else error("ratio P3 absent") end
+  ' "$summary"
+}
+
+p3_match_ratio(){
+  local summary="$1"
+  jq -er '
+    first(.records[] | select(.phase == "match_control" and .kind == "match" and .metric == "took") | .b_over_a.p95)
+    | if type == "number" then . else error("ratio témoin P3 absent") end
+  ' "$summary"
+}
+
+p3_index_telemetry_value(){
+  local score="$1" filter="$2" telemetry
+  telemetry=$(jq -er '.p2.telemetry_jsonl | strings' "$score") || return 1
+  [ -r "$telemetry" ] || return 1
+  jq -ser --arg filter "$filter" '
+    first(.[] | select(.phase == "index_ready" and .boundary == "snapshot") | getpath($filter | split(".") | map(if test("^[0-9]+$") then tonumber else . end)))
+    | if type == "number" then . else error("télémétrie index_ready absente") end
+  ' "$telemetry"
+}
+
+p3_recovery_ratio(){
+  local a="$1" b="$2" c="$3" mode="$4"
+  awk -v a="$a" -v b="$b" -v c="$c" -v mode="$mode" '
+    BEGIN {
+      if (mode == "rss") denominator = b - a
+      else if (mode == "file") denominator = a - b
+      else exit 1
+      if (denominator <= 0) exit 1
+      if (mode == "rss") numerator = b - c
+      else numerator = c - b
+      printf "%.12g", numerator / denominator
+    }
+  '
+}
+
+p3_c1_hard_stop(){
+  local score="$P2_CAMPAIGN_DIR/runs/C1/surch.json" status
+  [ -s "$score" ] || die 'C1: scorecard introuvable'
+  status=$(jq -er '.p2.phase_status_jsonl | strings' "$score") || die 'C1: statut de phases absent'
+  [ -r "$status" ] || die 'C1: statut de phases illisible'
+  jq -se --argjson target 17825792 '
+    ([.[] | select(.phase == "warm_match" or .phase == "match_control" or .phase == "warm_bool" or .phase == "bool_size10" or .phase == "bool_size0" or .phase == "fixed_martin")]) as $phases
+    | ($phases | length == 6)
+    and all($phases[];
+      .variant == "C" and .valid == true and .integrity.required == true
+      and (.integrity.bytes.before | type) == "number" and (.integrity.bytes.after | type) == "number"
+      and .integrity.bytes.before > 0 and .integrity.bytes.after > 0
+      and .integrity.bytes.before <= $target and .integrity.bytes.after <= $target
+      and .integrity.hash_failures.before == 0 and .integrity.hash_failures.after == 0
+      and .integrity.fallbacks.before == 0 and .integrity.fallbacks.after == 0
+      and .integrity.fallback_fields.before == 0 and .integrity.fallback_fields.after == 0
+    )
+  ' "$status" | grep -qx true \
+    || die 'hard-stop C1: intégrité P3, count/segments ou validité interne hors contrat (cible <= 17 Mio)'
+  jq -n --arg run C1 --arg status "$status" --argjson target 17825792 \
+    '{run:$run,hard_stop:"passed",integrity_target_bytes:$target,phase_status_jsonl:$status}' \
+    > "$P2_CAMPAIGN_DIR/preselection-c1.json" || die 'écriture impossible du hard-stop C1'
+}
+
+p3_first_triplet_hard_stop(){
+  local a="$1" b="$2" c="$3" primary cost c_a c_b_10 c_b_0 match a_rss b_rss c_rss a_anon b_anon c_anon a_file b_file c_file rss_recovery anon_recovery file_recovery
+  primary="$P2_CAMPAIGN_DIR/p3-primary-pairs/$a-$c/pair-summary.json"
+  cost="$P2_CAMPAIGN_DIR/p3-cost-pairs/$b-$c/pair-summary.json"
+  [ -r "$primary" ] && [ -r "$cost" ] || die 'hard-stop premier triplet: rapports de paires absents'
+  c_a=$(p3_ratio "$primary" bool_size10 took p95) || die 'hard-stop premier triplet: C/A produit absent'
+  c_b_10=$(p3_ratio "$cost" bool_size10 took p95) || die 'hard-stop premier triplet: C/B size:10 absent'
+  c_b_0=$(p3_ratio "$cost" bool_size0 took p95) || die 'hard-stop premier triplet: C/B size:0 absent'
+  match=$(p3_match_ratio "$primary") || die 'hard-stop premier triplet: témoin C/A absent'
+  a_rss=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$a/surch.json" process.rss_bytes) || die 'hard-stop premier triplet: RSS A absent'
+  b_rss=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$b/surch.json" process.rss_bytes) || die 'hard-stop premier triplet: RSS B absent'
+  c_rss=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$c/surch.json" process.rss_bytes) || die 'hard-stop premier triplet: RSS C absent'
+  a_anon=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$a/surch.json" process.rss_anon_bytes) || die 'hard-stop premier triplet: RssAnon A absent'
+  b_anon=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$b/surch.json" process.rss_anon_bytes) || die 'hard-stop premier triplet: RssAnon B absent'
+  c_anon=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$c/surch.json" process.rss_anon_bytes) || die 'hard-stop premier triplet: RssAnon C absent'
+  a_file=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$a/surch.json" cgroup.memory_stat.file) || die 'hard-stop premier triplet: cache fichier A absent'
+  b_file=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$b/surch.json" cgroup.memory_stat.file) || die 'hard-stop premier triplet: cache fichier B absent'
+  c_file=$(p3_index_telemetry_value "$P2_CAMPAIGN_DIR/runs/$c/surch.json" cgroup.memory_stat.file) || die 'hard-stop premier triplet: cache fichier C absent'
+  rss_recovery=$(p3_recovery_ratio "$a_rss" "$b_rss" "$c_rss" rss) || die 'hard-stop premier triplet: formule RSS indéfinie'
+  anon_recovery=$(p3_recovery_ratio "$a_anon" "$b_anon" "$c_anon" rss) || die 'hard-stop premier triplet: formule RssAnon indéfinie'
+  file_recovery=$(p3_recovery_ratio "$a_file" "$b_file" "$c_file" file) || die 'hard-stop premier triplet: formule cache fichier indéfinie'
+  jq -n --argjson c_a "$c_a" --argjson c_b_size10 "$c_b_10" --argjson c_b_size0 "$c_b_0" --argjson match "$match" \
+    --argjson rss_recovery "$rss_recovery" --argjson rss_anon_recovery "$anon_recovery" --argjson file_recovery "$file_recovery" \
+    '{c_over_a_bool_size10_took_p95:$c_a,c_over_b_bool_size10_took_p95:$c_b_size10,c_over_b_bool_size0_took_p95:$c_b_size0,match_control_c_over_a_took_p95:$match,recovery:{rss:$rss_recovery,rss_anon:$rss_anon_recovery,file:$file_recovery}}' \
+    > "$P2_CAMPAIGN_DIR/preselection-triplet-1.json" || die 'écriture impossible du hard-stop premier triplet'
+  awk -v c_a="$c_a" -v c_b_10="$c_b_10" -v c_b_0="$c_b_0" -v match="$match" -v rss="$rss_recovery" -v anon="$anon_recovery" -v file="$file_recovery" '
+    BEGIN { exit !(c_a <= .80 && c_b_10 <= 1.10 && c_b_0 <= 1.10 && match <= 1.10 && rss >= .80 && anon >= .80 && file >= .80) }
+  ' || die 'hard-stop premier triplet: présélection P3 rouge; campagne arrêtée avant les six runs restants'
+}
+
+triplet_number=0
 for scheduled in "${SCHEDULE[@]}"; do
+  triplet_number=$(( triplet_number + 1 ))
   IFS=: read -r names first second third <<< "$scheduled"
   IFS=, read -r a_name b_name c_name <<< "$names"
   for variant in "$first" "$second" "$third"; do
     case "$variant" in
-      A) run_name="$a_name"; image="$IMAGE_A" ;;
-      B) run_name="$b_name"; image="$IMAGE_B" ;;
-      C) run_name="$c_name"; image="$IMAGE_C" ;;
+      A) run_name="$a_name"; image="$IMAGE_A"; metadata="$P2_CAMPAIGN_DIR/image-A.json" ;;
+      B) run_name="$b_name"; image="$IMAGE_B"; metadata="$P2_CAMPAIGN_DIR/image-B.json" ;;
+      C) run_name="$c_name"; image="$IMAGE_C"; metadata="$P2_CAMPAIGN_DIR/image-C.json" ;;
       *) die "variante planifiée inconnue: $variant" ;;
     esac
-    run_variant "$run_name" "$variant" "$image"
+    run_variant "$run_name" "$variant" "$image" "$metadata"
+    if [ "$P2_MODE" = full ] && [ "$run_name" = C1 ]; then
+      p3_c1_hard_stop
+    fi
     [ "$variant" = "$third" ] || recover_host "$run_name"
   done
   compare_parity "$a_name-$b_name" "$a_name" "$b_name" pairs
   compare_parity "$b_name-$c_name" "$b_name" "$c_name" p3-cost-pairs
   compare_parity "$a_name-$c_name" "$a_name" "$c_name" p3-primary-pairs
   recover_host "$a_name-$b_name-$c_name"
+  if [ "$P2_MODE" = full ] && [ "$triplet_number" -eq 1 ]; then
+    p3_first_triplet_hard_stop "$a_name" "$b_name" "$c_name"
+  fi
 done
 
 if [ "$P2_MODE" = "full" ]; then
