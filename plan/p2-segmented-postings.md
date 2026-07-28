@@ -113,6 +113,16 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
     tout saut ; il décline intégralement sur incohérence.
   - [x] Les jauges P3 exposent digests, pages, octets vérifiés, échecs de
     hash, déclins, champs fallback et les composantes Lot 0 `T/B/F`.
+  - [x] La portée est explicite : l'attestation BLAKE3 protège seulement
+    `disk_cursor_p2_checked`, le chemin P2 à sauts. Le repli générique
+    historique (`term_entry` / `decode_from_segment` / merge), antérieur à
+    P2 et inchangé par P3, repart de zéro sans revendiquer cette garantie.
+  - [x] Le gate P3 lit les métriques agrégées de l'index :
+    `p2_integrity_bytes <= 32 Mio`, `p2_fallback_fields == 0` et
+    `p2_hash_failures == 0`; un dépassement multi-segment ou un fallback
+    résident rend la campagne invalide avant le verdict de latence. Le
+    lecteur P2 décline aussi intégralement avant d'ouvrir un curseur si ce
+    plafond global ou cette absence de preuve est constaté.
   - [x] Les unités couvrent la parité de lecture, les scalaires `TermEntry`,
     les pages de répertoire, permutation/troncature, maximum abaissé/haussé,
     digest altéré et l'absence de `pread` variable avant l'échec scalaire.
@@ -138,8 +148,10 @@ d'erreur et sans modifier la réponse compatible OpenSearch.
   et `git diff --check` vérifiés ; les tests P2 restent non exécutés par
   contrainte de mission.
 - Preuves externes attendues : CI, goldens de parité, compteurs de routage et
-  rapport chiffré conservant `took`, p95/p99, ratio de blocs et contrôle
-  négatif.
+  rapport chiffré conservant `took`, p95/p99, ratio de blocs, contrôle
+  négatif et le coût C/B de l'authentification par curseur. La formule P3
+  estime uniquement digests et descripteurs ; la mesure corpus reste
+  obligatoire pour inclure les allocations et l'allocateur.
 - Risque principal : utiliser le `df` local pour l'IDF et modifier score,
   `max_score`, ordre ou `min_score` malgré des ids exacts.
 

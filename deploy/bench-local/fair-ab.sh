@@ -86,6 +86,8 @@ P2_EXPECTED_DOCS="${P2_EXPECTED_DOCS:-28917511}"
 P2_REQUIRED_SEGMENTS="${P2_REQUIRED_SEGMENTS:-12}"
 P2_SEGMENT_GATE="${P2_SEGMENT_GATE:-exact}" # exact (full) ou minimum (smoke)
 P2_CPU_STEAL_MAX_PERCENT="${P2_CPU_STEAL_MAX_PERCENT:-1}"
+P2_REQUIRE_P3_INTEGRITY="${P2_REQUIRE_P3_INTEGRITY:-1}"
+P2_INTEGRITY_MAX_BYTES=$((32 * 1024 * 1024))
 P2_PROTOCOL_VERSION="p2-segmented-postings-v2"
 # Déclaré ici aussi parce que P2 refuse explicitement un bypass avant le
 # bloc historique de préflight qui consomme cette variable.
@@ -105,6 +107,7 @@ if [ "$P2_MEASURE" = "1" ]; then
   [ "$P2_VARIANT" = "A" ] || [ "$P2_VARIANT" = "B" ] || {
     err "P2_VARIANT doit valoir A ou B quand P2_MEASURE=1"; exit 1;
   }
+  case "$P2_REQUIRE_P3_INTEGRITY" in 0|1) ;; *) err "P2_REQUIRE_P3_INTEGRITY doit valoir 0 ou 1"; exit 1;; esac
   case "$P2_PAIR_COUNT:$P2_WARM_PAIR_COUNT" in *[!0-9:]*|:*|*::*) err "P2_PAIR_COUNT/P2_WARM_PAIR_COUNT invalides"; exit 1;; esac
   [ "$P2_WARM_PAIR_COUNT" -eq 100 ] || {
     err "protocole P2 invalide : P2_WARM_PAIR_COUNT doit rester 100"; exit 1;
@@ -950,6 +953,15 @@ probe_quantiles(){
 p2_index_ready_metric_names=(
   surch_index_segment_count
 )
+if [ "$P2_MEASURE" = "1" ] && [ "$P2_VARIANT" = "B" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+  # Ces trois jauges sont agrégées par index : elles rendent le plafond P3
+  # global aux segments et tout fallback résident bloquants avant les sondes.
+  p2_index_ready_metric_names+=(
+    surch_postings_p2_integrity_bytes
+    surch_postings_p2_hash_failures
+    surch_postings_p2_fallback_fields
+  )
+fi
 
 p2_cpu_stat(){
   awk '/^cpu / { total = 0; for (i = 2; i <= NF; i++) total += $i; print total, $9; exit }' /proc/stat
@@ -1032,9 +1044,11 @@ p2_write_phase_status(){
   local cpu_steal_percent="$6" cpu_steal_within_limit="$7" cpu_steal_reason="$8"
   local direct_before generic_before read_before total_before segments_before
   local direct_after generic_after read_after total_after segments_after
+  local integrity_bytes_before integrity_hash_failures_before integrity_fallback_fields_before integrity_verified_bytes_before
+  local integrity_bytes_after integrity_hash_failures_after integrity_fallback_fields_after integrity_verified_bytes_after
   local direct_delta generic_delta read_delta total_delta segment_delta ratio="null" blocks_metrics_emitted=false
   local blocks_ratio_target_pass="null" blocks_ratio_verdict="not_applicable"
-  local valid=true reason=""
+  local integrity_required=false valid=true reason=""
   direct_before=$(p2_counter_value surch_bool_direct_must_fused_total "$before") || valid=false
   generic_before=$(p2_counter_value surch_dbg_generic_total "$before") || valid=false
   read_before=$(p2_counter_value surch_postings_disk_blocks_read_total "$before") || valid=false
@@ -1045,6 +1059,17 @@ p2_write_phase_status(){
   read_after=$(p2_counter_value surch_postings_disk_blocks_read_total "$after") || valid=false
   total_after=$(p2_counter_value surch_postings_disk_blocks_total "$after") || valid=false
   segments_after=$(p2_metric_value surch_index_segment_count "$after") || valid=false
+  if [ "$P2_VARIANT" = "B" ] && [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+    integrity_required=true
+    integrity_bytes_before=$(p2_metric_value surch_postings_p2_integrity_bytes "$before") || valid=false
+    integrity_hash_failures_before=$(p2_metric_value surch_postings_p2_hash_failures "$before") || valid=false
+    integrity_fallback_fields_before=$(p2_metric_value surch_postings_p2_fallback_fields "$before") || valid=false
+    integrity_verified_bytes_before=$(p2_metric_value surch_postings_p2_verified_bytes "$before") || valid=false
+    integrity_bytes_after=$(p2_metric_value surch_postings_p2_integrity_bytes "$after") || valid=false
+    integrity_hash_failures_after=$(p2_metric_value surch_postings_p2_hash_failures "$after") || valid=false
+    integrity_fallback_fields_after=$(p2_metric_value surch_postings_p2_fallback_fields "$after") || valid=false
+    integrity_verified_bytes_after=$(p2_metric_value surch_postings_p2_verified_bytes "$after") || valid=false
+  fi
   if [ "$valid" != true ]; then
     reason="metric_value_unreadable"
   else
@@ -1059,6 +1084,12 @@ p2_write_phase_status(){
     segment_delta=$(awk -v a="$segments_after" -v b="$segments_before" 'BEGIN { printf "%.17g", a - b }')
     if ! p2_segment_value_valid "$segments_before" || ! p2_segment_value_valid "$segments_after"; then
       valid=false; reason="segment_count_${segments_before}_to_${segments_after}_invalid"
+    elif [ "$integrity_required" = true ] && { ! p2_number_le "$integrity_bytes_before" "$P2_INTEGRITY_MAX_BYTES" || ! p2_number_le "$integrity_bytes_after" "$P2_INTEGRITY_MAX_BYTES"; }; then
+      valid=false; reason="p3_integrity_bytes_above_${P2_INTEGRITY_MAX_BYTES}"
+    elif [ "$integrity_required" = true ] && { ! p2_number_equal "$integrity_hash_failures_before" 0 || ! p2_number_equal "$integrity_hash_failures_after" 0; }; then
+      valid=false; reason="p3_hash_failures_nonzero"
+    elif [ "$integrity_required" = true ] && { ! p2_number_equal "$integrity_fallback_fields_before" 0 || ! p2_number_equal "$integrity_fallback_fields_after" 0; }; then
+      valid=false; reason="p3_fallback_fields_nonzero"
     elif [ "$P2_VARIANT" = "A" ]; then
       if ! p2_number_equal "$direct_delta" 0 || ! p2_number_equal "$generic_delta" "$bool_requests"; then
         valid=false; reason="route_A_direct_${direct_delta}_generic_${generic_delta}_expected_0_${bool_requests}"
@@ -1086,6 +1117,9 @@ p2_write_phase_status(){
       elif [ "$bool_requests" -gt 0 ] && { ! p2_number_le 1 "$total_delta" || ! p2_number_le 0 "$read_delta"; }; then
         valid=false; reason="blocks_B_non_positive_read_${read_delta}_total_${total_delta}"
       elif [ "$bool_requests" -gt 0 ]; then
+        if [ "$integrity_required" = true ] && ! awk -v before="$integrity_verified_bytes_before" -v after="$integrity_verified_bytes_after" 'BEGIN { exit !((after + 0) > (before + 0)) }'; then
+          valid=false; reason="p3_verified_bytes_not_increasing"
+        fi
         ratio=$(awk -v read="$read_delta" -v total="$total_delta" 'BEGIN { printf "%.9f", read / total }')
         if ! p2_number_le "$ratio" 0.25; then
           blocks_ratio_target_pass=false; blocks_ratio_verdict="fail"
@@ -1101,7 +1135,7 @@ p2_write_phase_status(){
   # mesure : routage, corps, segments et réponses restent déjà fail-closed.
   # Un ratio hors cible est donc enregistré comme ÉCHEC P2 exploitable plutôt
   # que de transformer la phase A/B correcte en mesure invalide.
-  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}}}\n' \
+  printf '{"phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}},"integrity":{"required":%s,"bytes":{"before":%s,"after":%s},"hash_failures":{"before":%s,"after":%s},"fallback_fields":{"before":%s,"after":%s},"verified_bytes":{"before":%s,"after":%s}}}\n' \
     "$phase" "$P2_VARIANT" "$bool_requests" "$match_requests" "$valid" \
     "$( [ -n "$reason" ] && printf '\"%s\"' "$reason" || printf 'null' )" \
     "$cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT" "$cpu_steal_within_limit" \
@@ -1112,6 +1146,11 @@ p2_write_phase_status(){
     "${read_before:-null}" "${read_after:-null}" "${read_delta:-null}" \
     "${total_before:-null}" "${total_after:-null}" "${total_delta:-null}" \
     "${segments_before:-null}" "${segments_after:-null}" "${segment_delta:-null}" \
+    "$integrity_required" \
+    "${integrity_bytes_before:-null}" "${integrity_bytes_after:-null}" \
+    "${integrity_hash_failures_before:-null}" "${integrity_hash_failures_after:-null}" \
+    "${integrity_fallback_fields_before:-null}" "${integrity_fallback_fields_after:-null}" \
+    "${integrity_verified_bytes_before:-null}" "${integrity_verified_bytes_after:-null}" \
     >> "$P2_PHASE_STATUS"
   [ "$valid" = true ]
 }

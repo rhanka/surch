@@ -1029,12 +1029,12 @@ impl P2DiskBlockMetrics {
         self.blocks_total = self.blocks_total.saturating_add(total);
     }
 
-    fn publish(&self, index: &DocumentIndex) {
+    fn publish(&self, index_name: &str, index: &DocumentIndex) {
         if self.blocks_total > 0 {
             metrics::counter!("surch_postings_disk_blocks_read_total").increment(self.blocks_read);
             metrics::counter!("surch_postings_disk_blocks_total").increment(self.blocks_total);
         }
-        set_p2_integrity_gauges(index.postings_p2_integrity_metrics());
+        set_p2_integrity_gauges(index_name, index.postings_p2_integrity_metrics());
     }
 }
 
@@ -2993,7 +2993,7 @@ impl InMemoryIndex {
     /// `terms` is the FULL conjunction — every `(field, term)` must match.
     /// Returns matched internal doc-ids in ascending order — byte-identical to
     /// the `BTreeSet` intersection of the same lists (parity-safe).
-    fn conjunction_hits_internal(&self, terms: &[(String, String)]) -> Vec<u32> {
+    fn conjunction_hits_internal(&self, index_name: &str, terms: &[(String, String)]) -> Vec<u32> {
         if terms.is_empty() {
             return Vec::new();
         }
@@ -3002,7 +3002,7 @@ impl InMemoryIndex {
         // reintroduce the exact regression this design avoids on the
         // deces bool/full common-term tail). See `Self::conjunction_hits_disk`.
         if self.index.postings_disk_backed() {
-            return Self::conjunction_hits_disk(&self.index, terms);
+            return Self::conjunction_hits_disk(index_name, &self.index, terms);
         }
         // Resolve every required term's posting list; a missing/empty term
         // makes the whole AND empty.
@@ -3067,7 +3067,11 @@ impl InMemoryIndex {
     /// disjoints et ordonnés par doc id, donc leurs résultats s'ajoutent sans
     /// k-way merge. Une erreur détruit l'accumulateur temporaire et revient au
     /// chemin générique ; l'absence réelle d'un terme ne saute que le segment.
-    fn conjunction_hits_disk(index: &DocumentIndex, terms: &[(String, String)]) -> Vec<u32> {
+    fn conjunction_hits_disk(
+        index_name: &str,
+        index: &DocumentIndex,
+        terms: &[(String, String)],
+    ) -> Vec<u32> {
         let mut segmented_terms = Vec::with_capacity(terms.len());
         let mut block_metrics = P2DiskBlockMetrics::default();
         for (field, term) in terms {
@@ -3076,14 +3080,14 @@ impl InMemoryIndex {
                 // Terme absent de tous les segments : l'AND entier est vide.
                 Ok(None) => {
                     block_metrics.observe_segmented(&segmented_terms);
-                    block_metrics.publish(index);
+                    block_metrics.publish(index_name, index);
                     return Vec::new();
                 }
                 // Ne jamais publier le préfixe des segments déjà lus.
                 Err(error) => {
                     block_metrics.observe_segmented(&segmented_terms);
                     block_metrics.observe_construction_error(&error);
-                    block_metrics.publish(index);
+                    block_metrics.publish(index_name, index);
                     return Self::conjunction_hits_merged(index, terms);
                 }
             }
@@ -3114,13 +3118,13 @@ impl InMemoryIndex {
                 }
                 Err(()) => {
                     block_metrics.observe_segmented(&segmented_terms);
-                    block_metrics.publish(index);
+                    block_metrics.publish(index_name, index);
                     return Self::conjunction_hits_merged(index, terms);
                 }
             }
         }
         block_metrics.observe_segmented(&segmented_terms);
-        block_metrics.publish(index);
+        block_metrics.publish(index_name, index);
         out
     }
 
@@ -4687,7 +4691,7 @@ impl AppState {
             }
             terms.push((field.to_string(), toks.remove(0)));
         }
-        Some(data.conjunction_hits_internal(&terms))
+        Some(data.conjunction_hits_internal(index, &terms))
     }
 
     /// Fused single-token conjunction scoring — the deces `bool`/`full` tail
@@ -4754,7 +4758,7 @@ impl AppState {
         // checked : un `bool.must` direct peut donc emprunter ce chemin sans
         // confondre l'absence locale d'un terme avec une erreur de lecture.
         if data.index.postings_disk_backed() {
-            return Self::fused_conjunction_scores_disk(data, clauses, mode);
+            return Self::fused_conjunction_scores_disk(index, data, clauses, mode);
         }
 
         // Per-term: field stats + the SoA doc_ids/freqs channels (Lot C Phase 1
@@ -4913,6 +4917,7 @@ impl AppState {
     /// segment ; seul le choix du driver utilise le `df` local. Une erreur de
     /// lecture abandonne les scores temporaires et décline vers la référence.
     fn fused_conjunction_scores_disk(
+        index_name: &str,
         data: &InMemoryIndex,
         clauses: &[(&str, &str)],
         mode: FusedConjunctionScoreMode,
@@ -4924,7 +4929,7 @@ impl AppState {
             let recall = normalized_terms_for_field(value, field, &data.mapping);
             if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
                 block_metrics.observe_segmented(&segmented_terms);
-                block_metrics.publish(&data.index);
+                block_metrics.publish(index_name, &data.index);
                 return None;
             }
             let token = recall.into_iter().next().expect("len checked == 1");
@@ -4933,7 +4938,7 @@ impl AppState {
                 // Le terme est absent de tous les segments : l'AND est vide.
                 Ok(None) => {
                     block_metrics.observe_segmented(&segmented_terms);
-                    block_metrics.publish(&data.index);
+                    block_metrics.publish(index_name, &data.index);
                     return Some(Vec::new());
                 }
                 // Une erreur checked doit décliner AVANT compteur et
@@ -4942,7 +4947,7 @@ impl AppState {
                 Err(error) => {
                     block_metrics.observe_segmented(&segmented_terms);
                     block_metrics.observe_construction_error(&error);
-                    block_metrics.publish(&data.index);
+                    block_metrics.publish(index_name, &data.index);
                     return None;
                 }
             };
@@ -4950,7 +4955,7 @@ impl AppState {
                 // Même une construction de statistiques incomplète doit
                 // conserver le coût des termes déjà ouverts avant le déclin.
                 block_metrics.observe_segmented(&segmented_terms);
-                block_metrics.publish(&data.index);
+                block_metrics.publish(index_name, &data.index);
                 return None;
             };
             scoring_terms.push((field_stats, postings.global_df()));
@@ -5054,12 +5059,12 @@ impl AppState {
             drop(cursors);
             if segment_result.is_err() {
                 block_metrics.observe_segmented(&segmented_terms);
-                block_metrics.publish(&data.index);
+                block_metrics.publish(index_name, &data.index);
                 return None;
             }
         }
         block_metrics.observe_segmented(&segmented_terms);
-        block_metrics.publish(&data.index);
+        block_metrics.publish(index_name, &data.index);
         Some(scored)
     }
 

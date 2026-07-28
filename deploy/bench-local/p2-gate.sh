@@ -6,6 +6,7 @@ set -euo pipefail
 export LC_ALL=C
 
 CAMPAIGN=""
+P2_REQUIRE_P3_INTEGRITY="${P2_REQUIRE_P3_INTEGRITY:-1}"
 
 usage(){ printf 'usage: p2-gate.sh --campaign RÉPERTOIRE\n' >&2; }
 die(){ printf '[p2-gate] %s\n' "$*" >&2; exit 1; }
@@ -20,9 +21,10 @@ done
 [ -n "$CAMPAIGN" ] || { usage; die '--campaign est obligatoire'; }
 [ -d "$CAMPAIGN" ] || die "campagne introuvable: $CAMPAIGN"
 command -v jq >/dev/null 2>&1 || die 'commande requise absente: jq'
+case "$P2_REQUIRE_P3_INTEGRITY" in 0|1) ;; *) die 'P2_REQUIRE_P3_INTEGRITY doit valoir 0 ou 1';; esac
 
 phase_status_valid(){
-  local run_dir="$1" score status
+  local run_dir="$1" require_p3="$2" score status
   score="$run_dir/surch.json"
   jq -e '.measurement_valid == true and .p2.hot_phase_records == 4 and (.p2.phase_records >= 4 and .p2.phase_records <= 5)' "$score" >/dev/null 2>&1 || return 1
   status=$(jq -er '.p2.phase_status_jsonl | strings' "$score" 2>/dev/null) || return 1
@@ -30,11 +32,28 @@ phase_status_valid(){
   # Les quatre phases chaudes portent la preuve A/B. Cold reste disponible
   # dans les scorecards, mais ses droits de reclaim ne peuvent pas invalider
   # le routage, les corps ou la parité déjà vérifiés sur ces quatre phases.
-  jq -se '
+  jq -se --argjson require_p3 "$require_p3" '
     ([.[] | select(.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source")]) as $hot
     | ($hot | length == 4)
     and ([ $hot[] | .phase ] | sort == ["fixed", "no_source", "random", "warm"])
     and all($hot[]; .valid == true and .cpu_steal_within_limit == true)
+    and (if $require_p3 then
+      all($hot[];
+        .integrity.required == true
+        and (.integrity.bytes.before | type) == "number"
+        and (.integrity.bytes.after | type) == "number"
+        and (.integrity.hash_failures.before | type) == "number"
+        and (.integrity.hash_failures.after | type) == "number"
+        and (.integrity.fallback_fields.before | type) == "number"
+        and (.integrity.fallback_fields.after | type) == "number"
+        and .integrity.bytes.before <= 33554432
+        and .integrity.bytes.after <= 33554432
+        and .integrity.hash_failures.before == 0
+        and .integrity.hash_failures.after == 0
+        and .integrity.fallback_fields.before == 0
+        and .integrity.fallback_fields.after == 0
+      )
+    else true end)
   ' "$status" 2>/dev/null | grep -qx true
 }
 
@@ -86,6 +105,7 @@ PROBE_DELTA=()
 BOOTSTRAP_UPPER=()
 PAIR_DIRS=()
 BLOCK_RATIO_DIAGNOSTICS=()
+P3_INTEGRITY_DIAGNOSTICS=()
 
 for summary in "${PAIR_SUMMARIES[@]}"; do
   pair_dir=${summary%/pair-summary.json}
@@ -96,7 +116,8 @@ for summary in "${PAIR_SUMMARIES[@]}"; do
   pair=$(jq -er '.pair | strings' "$parity") || die "artefact illisible: $parity"
   valid=false
   if jq -e '.parity == true and .a_manifest_sha256 == .b_manifest_sha256' "$parity" >/dev/null 2>&1 \
-     && phase_status_valid "$CAMPAIGN/runs/$a_run" && phase_status_valid "$CAMPAIGN/runs/$b_run"; then
+     && phase_status_valid "$CAMPAIGN/runs/$a_run" 0 \
+     && phase_status_valid "$CAMPAIGN/runs/$b_run" "$P2_REQUIRE_P3_INTEGRITY"; then
     valid=true
   fi
   VALIDITIES+=("$valid")
@@ -117,6 +138,14 @@ for summary in "${PAIR_SUMMARIES[@]}"; do
     select(.variant == "B" and .bool_requests > 0 and (.phase == "warm" or .phase == "random" or .phase == "no_source"))
     | {pair:$pair,run:$run,phase:$phase,ratio:.blocks_read_over_total,target:.blocks_ratio_target,pass:.blocks_ratio_target_pass,verdict:.blocks_ratio_verdict}
   ' "$b_status")
+  if [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+    while IFS= read -r diagnostic; do
+      [ -n "$diagnostic" ] && P3_INTEGRITY_DIAGNOSTICS+=("$diagnostic")
+    done < <(jq -c --arg pair "$pair" --arg run "$b_run" '
+      select(.variant == "B" and (.phase == "warm" or .phase == "fixed" or .phase == "random" or .phase == "no_source"))
+      | {pair:$pair,run:$run,phase:$phase,bytes:.integrity.bytes.after,hash_failures:.integrity.hash_failures.after,fallback_fields:.integrity.fallback_fields.after,verified_bytes:.integrity.verified_bytes.after}
+    ' "$b_status")
+  fi
 done
 
 MEDIAN_CORE95=$(median_three "${CORE_TOOK95[@]}")
@@ -125,6 +154,7 @@ MEDIAN_PRODUCT_TOOK=$(median_three "${PRODUCT_TOOK[@]}")
 MEDIAN_PRODUCT_CLIENT=$(median_three "${PRODUCT_CLIENT[@]}")
 VALIDITIES_JSON=$(printf '%s\n' "${VALIDITIES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0) == "true")')
 BLOCK_RATIO_JSON=$(printf '%s\n' "${BLOCK_RATIO_DIAGNOSTICS[@]}" | jq -sc '.')
+P3_INTEGRITY_JSON=$(printf '%s\n' "${P3_INTEGRITY_DIAGNOSTICS[@]}" | jq -sc '.')
 CHECKS_JSONL=$(mktemp "${TMPDIR:-/tmp}/surch-p2-gate.XXXXXX") || die 'mktemp impossible'
 trap 'rm -f -- "$CHECKS_JSONL"' EXIT
 ALL_PASSED=true
@@ -165,6 +195,12 @@ add_check 'écart sonde p95' "$pass" "écarts ms=$(numbers_json "${PROBE_DELTA[@
 # produit un ÉCHEC P2 lisible, jamais une campagne techniquement invalide.
 [ "${#BLOCK_RATIO_DIAGNOSTICS[@]}" -eq 9 ] && jq -e 'all(.[]; .pass == true)' <<< "$BLOCK_RATIO_JSON" >/dev/null && pass=true || pass=false
 add_check 'ratio de blocs P2 (résultat)' "$pass" "observations=$BLOCK_RATIO_JSON, cible <= 0.25"
+if [ "$P2_REQUIRE_P3_INTEGRITY" = "1" ]; then
+  [ "${#P3_INTEGRITY_DIAGNOSTICS[@]}" -eq 12 ] \
+    && jq -e 'all(.[]; (.bytes | type) == "number" and (.hash_failures | type) == "number" and (.fallback_fields | type) == "number" and (.bytes <= 33554432) and (.hash_failures == 0) and (.fallback_fields == 0))' <<< "$P3_INTEGRITY_JSON" >/dev/null \
+    && pass=true || pass=false
+  add_check 'intégrité P3 agrégée (résultat)' "$pass" "observations=$P3_INTEGRITY_JSON, plafond <= 33554432, hash/fallback = 0"
+fi
 
 if [ "$ALL_PASSED" = true ]; then
   VERDICT='PASS P2'
@@ -182,8 +218,8 @@ jq -n \
   --argjson fixed_match "$(numbers_json "${FIXED_MATCH[@]}")" --argjson random_match "$(numbers_json "${RANDOM_MATCH[@]}")" \
   --argjson probe_delta "$(numbers_json "${PROBE_DELTA[@]}")" --argjson bootstrap_upper "$(numbers_json "${BOOTSTRAP_UPPER[@]}")" \
   --argjson median_product_took "$MEDIAN_PRODUCT_TOOK" --argjson median_product_client "$MEDIAN_PRODUCT_CLIENT" \
-  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" \
-  '{schema:"surch.bench.p2.campaign.v1", verdict:$verdict, pair_directories:$pair_directories, ratios:{product_random_bool_took_p95:$product_took, product_random_bool_client_p95:$product_client, core_no_source_bool_took_p95:$core95, core_no_source_bool_took_p99:$core99, fixed_match_took_p95:$fixed_match, random_match_took_p95:$random_match, probe_p95_delta_ms:$probe_delta, bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper}, medians:{product_random_bool_took_p95:$median_product_took, product_random_bool_client_p95:$median_product_client, core_no_source_bool_took_p95:$median_core95, core_no_source_bool_took_p99:$median_core99}, blocks_ratio:{target:0.25,observations:$blocks_ratio_diagnostics}, checks:$checks}' \
+  --argjson median_core95 "$MEDIAN_CORE95" --argjson median_core99 "$MEDIAN_CORE99" --argjson checks "$CHECKS_JSON" --argjson blocks_ratio_diagnostics "$BLOCK_RATIO_JSON" --argjson p3_integrity_diagnostics "$P3_INTEGRITY_JSON" --argjson p3_integrity_required "$P2_REQUIRE_P3_INTEGRITY" \
+  '{schema:"surch.bench.p2.campaign.v1", verdict:$verdict, pair_directories:$pair_directories, ratios:{product_random_bool_took_p95:$product_took, product_random_bool_client_p95:$product_client, core_no_source_bool_took_p95:$core95, core_no_source_bool_took_p99:$core99, fixed_match_took_p95:$fixed_match, random_match_took_p95:$random_match, probe_p95_delta_ms:$probe_delta, bootstrap_primary_p95_took_ci95_upper:$bootstrap_upper}, medians:{product_random_bool_took_p95:$median_product_took, product_random_bool_client_p95:$median_product_client, core_no_source_bool_took_p95:$median_core95, core_no_source_bool_took_p99:$median_core99}, blocks_ratio:{target:0.25,observations:$blocks_ratio_diagnostics}, p3_integrity:{required:($p3_integrity_required == 1),observations:$p3_integrity_diagnostics}, checks:$checks}' \
   > "$CAMPAIGN/campaign-summary.json" || die 'écriture impossible de campaign-summary.json'
 
 {
