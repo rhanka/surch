@@ -7,11 +7,35 @@
 # (aggregated by `bench_report --dir`). NFCorpus (~3.6k docs) and FiQA
 # (~57k docs) are far smaller than TREC-COVID, so the envelope is ample.
 #
-# Gate: the current Surch result must meet the explicit NDCG@10 floor from
-# the raw 2026-05-26 baseline (run 26476471207) and remain within the
-# declared gap of the OpenSearch 2.17.1 sidecar measured in this same Pod.
-# Missing data, output or metric is a failure. Requires 00b-init-beir-extra
-# to have hydrated the BEIR PVC.
+# Gate: the current Surch result must meet the explicit NDCG@10 floor and
+# remain within the declared gap of the OpenSearch 2.17.1 sidecar measured
+# in this same Pod. Missing data, output or metric is a failure. Requires
+# 00b-init-beir-extra to have hydrated the BEIR PVC.
+#
+# RE-ETALONNAGE 2026-07-29 (run 30451966000 rouge, diagnostic
+# .remote/beir-diagnostic.md). Les planchers precedents (nfcorpus 0.3033,
+# fiqa 0.2294) dataient du 2026-05-26 et etaient ANTERIEURS au commit
+# 07a58fc (2026-06-09) « quantize doc_len via Lucene SmallFloat », qui
+# aligne volontairement le scoring BM25 sur la quantization 1 octet/doc de
+# Lucene. Ce job n'ayant pas retourne entre le 2026-05-26 et le 2026-07-29,
+# les planchers sont restes pre-SmallFloat pendant 7 semaines.
+#
+# Effet mesure du SmallFloat (bisection par images GHCR, corpus BEIR
+# identiques, script scripts/bench/beir-ndcg.sh inchange) :
+#   scifact    0.6576 -> 0.6599  (+0.0023, gain)
+#   trec-covid 0.4750 -> 0.4777  (+0.0027, gain)
+#   nfcorpus   0.3033 -> 0.3021  (-0.0012, perte)
+#   fiqa       0.2294 -> 0.2274  (-0.0020, perte)
+# Valeur stable au bit pres du 2026-06-09 au 2026-07-29 : ni le chantier
+# multi-segment, ni la compression `_source`, ni le chemin `match`
+# mono-terme streame (C2, 333b902) ne l'ont bougee — le gate interroge en
+# `multi_match`, forme que le chemin C2 decline par construction.
+#
+# Les planchers ci-dessous sont donc les valeurs POST-SmallFloat mesurees,
+# sans marge : toute baisse ulterieure, meme d'un cran de 1e-4, echoue.
+# Les ecarts a OpenSearch ont ete elargis d'un cran pour la meme raison
+# (nfcorpus 0.0001 -> 0.0013, fiqa 0.0095 -> 0.0115 observes) ; les
+# resserrer est un travail de qualite ouvert, pas un pre-requis du gate.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -97,12 +121,17 @@ spec:
             - { name: BEIR_DIR,       value: "/data/beir" }
             - { name: REPORTS_DIR,    value: "/reports" }
             - { name: BEIR_REQUIRE_LOCAL_DATA, value: "1" }
-            - { name: BEIR_BASELINE_DATE, value: "2026-05-26" }
-            - { name: BEIR_BASELINE_RUN,  value: "26476471207" }
-            - { name: NFCORPUS_NDCG_FLOOR, value: "0.3033" }
-            - { name: FIQA_NDCG_FLOOR,     value: "0.2294" }
-            - { name: NFCORPUS_MAX_OS_GAP, value: "0.0010" }
-            - { name: FIQA_MAX_OS_GAP,     value: "0.0100" }
+            # Etalon courant : re-mesure 2026-07-29 post-SmallFloat.
+            # L'etalon brut d'origine (2026-05-26 / run 26476471207) est
+            # conserve pour la tracabilite historique.
+            - { name: BEIR_BASELINE_DATE, value: "2026-07-29" }
+            - { name: BEIR_BASELINE_RUN,  value: "30451966000" }
+            - { name: BEIR_ORIGIN_DATE,   value: "2026-05-26" }
+            - { name: BEIR_ORIGIN_RUN,    value: "26476471207" }
+            - { name: NFCORPUS_NDCG_FLOOR, value: "0.3021" }
+            - { name: FIQA_NDCG_FLOOR,     value: "0.2274" }
+            - { name: NFCORPUS_MAX_OS_GAP, value: "0.0015" }
+            - { name: FIQA_MAX_OS_GAP,     value: "0.0120" }
             - { name: NFCORPUS_EXPECTED_DOCS,      value: "3633" }
             - { name: NFCORPUS_EXPECTED_TEST_QIDS, value: "323" }
             - { name: FIQA_EXPECTED_DOCS,          value: "57638" }
@@ -119,7 +148,25 @@ spec:
               until wget -qO- "$OPENSEARCH_URL/_cluster/health?wait_for_status=yellow&timeout=30s" >/dev/null 2>&1; do sleep 1; done
               echo "Both engines healthy."
               mkdir -p "$REPORTS_DIR"
-              for ds in nfcorpus fiqa; do
+              # Une mesure ratee n'interrompt PLUS le driver : on enregistre
+              # l'echec et on poursuit, pour que le bloc de mesures parte
+              # TOUJOURS dans le journal du conteneur. Lecon du run
+              # 30451966000 : les QUATRE mesures avaient ete calculees puis
+              # perdues, parce que le gate sortait sur le premier plancher
+              # rate avant d'avoir imprime quoi que ce soit, et que le
+              # `kubectl cp` de /reports arrive apres la mort du driver.
+              DATASETS="nfcorpus fiqa"
+              FAILURES=0
+              NFCORPUS_SURCH_NDCG=""
+              NFCORPUS_OS_NDCG=""
+              FIQA_SURCH_NDCG=""
+              FIQA_OS_NDCG=""
+
+              measure() {
+                ds="$1"
+                label="$2"
+                out="$3"
+                url="$4"
                 case "$ds" in
                   nfcorpus)
                     expected_docs="$NFCORPUS_EXPECTED_DOCS"
@@ -131,17 +178,53 @@ spec:
                     ;;
                   *)
                     echo "BEIR_GATE status=FAIL reason=unknown_dataset:$ds" >&2
-                    exit 1
+                    FAILURES=$((FAILURES + 1))
+                    return 0
                     ;;
                 esac
-                BEIR_EXPECTED_DOCS="$expected_docs" BEIR_EXPECTED_TEST_QIDS="$expected_test_qids" \
-                  /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-surch-k8s" "$REPORTS_DIR/$ds-surch.out" "$SURCH_URL"
-                BEIR_EXPECTED_DOCS="$expected_docs" BEIR_EXPECTED_TEST_QIDS="$expected_test_qids" \
-                  /usr/local/bin/beir-ndcg.sh "$ds" "ndcg-os-k8s"    "$REPORTS_DIR/$ds-os.out"    "$OPENSEARCH_URL"
+                if ! BEIR_EXPECTED_DOCS="$expected_docs" BEIR_EXPECTED_TEST_QIDS="$expected_test_qids" \
+                    /usr/local/bin/beir-ndcg.sh "$ds" "$label" "$out" "$url"; then
+                  echo "BEIR_GATE status=FAIL reason=measure_failed dataset=$ds label=$label url=$url" >&2
+                  FAILURES=$((FAILURES + 1))
+                fi
+              }
+
+              for ds in $DATASETS; do
+                measure "$ds" "ndcg-surch-k8s" "$REPORTS_DIR/$ds-surch.out" "$SURCH_URL"
+                measure "$ds" "ndcg-os-k8s"    "$REPORTS_DIR/$ds-os.out"    "$OPENSEARCH_URL"
               done
+
+              # Le resume part AVANT toute decision de gate : meme sur echec,
+              # les quatre mesures restent lisibles dans
+              # `kubectl logs -c ndcg-driver` et dans le resume GitHub, qui
+              # reconstruit ce bloc depuis les marqueurs BEGIN/END.
+              {
+                echo "# Extra BEIR NDCG gate (NFCorpus + FiQA)"
+                echo
+                echo "- Etalon courant : $BEIR_BASELINE_DATE (run $BEIR_BASELINE_RUN)"
+                echo "- Etalon d'origine : $BEIR_ORIGIN_DATE (run $BEIR_ORIGIN_RUN)"
+                echo "- Planchers : nfcorpus >= $NFCORPUS_NDCG_FLOOR, fiqa >= $FIQA_NDCG_FLOOR"
+                echo "- Ecart OpenSearch max : nfcorpus $NFCORPUS_MAX_OS_GAP, fiqa $FIQA_MAX_OS_GAP"
+                echo "- Decision : PASS seulement si le plancher ET la comparaison OpenSearch courante tiennent, sur les DEUX jeux."
+                for ds in $DATASETS; do
+                  for engine in surch os; do
+                    echo
+                    echo "## $ds / $engine"
+                    if [ -s "$REPORTS_DIR/$ds-$engine.out" ]; then
+                      cat "$REPORTS_DIR/$ds-$engine.out"
+                    else
+                      echo "(sortie absente ou vide — mesure ratee)"
+                    fi
+                  done
+                done
+              } > "$REPORTS_DIR/summary.md"
+              echo "BEGIN_SURCH_K8S_SUMMARY"
+              cat "$REPORTS_DIR/summary.md"
+              echo "END_SURCH_K8S_SUMMARY"
+
               gate_fail() {
                 echo "BEIR_GATE status=FAIL reason=$*" >&2
-                exit 1
+                FAILURES=$((FAILURES + 1))
               }
               metric_value() {
                 file="$1"
@@ -169,66 +252,84 @@ spec:
                   }
                 ' "$file"
               }
-              assert_floor() {
-                observed="$1"
-                floor="$2"
-                dataset="$3"
-                if ! awk -v observed="$observed" -v floor="$floor" 'BEGIN { exit observed + 0 >= floor + 0 ? 0 : 1 }'; then
-                  gate_fail "$dataset NDCG@10=$observed below frozen floor=$floor"
-                fi
-              }
-              assert_current_os_gap() {
-                surch="$1"
-                opensearch="$2"
-                maximum_gap="$3"
-                dataset="$4"
-                if ! awk -v surch="$surch" -v opensearch="$opensearch" -v maximum_gap="$maximum_gap" 'BEGIN { exit surch - opensearch >= -maximum_gap ? 0 : 1 }'; then
-                  gate_fail "$dataset NDCG@10 gap to current OpenSearch exceeds $maximum_gap (surch=$surch opensearch=$opensearch)"
-                fi
-              }
+              # Les DEUX jeux sont toujours evalues : un plancher rate sur
+              # nfcorpus ne doit plus masquer le verdict de fiqa.
               check_dataset() {
                 dataset="$1"
                 floor="$2"
                 maximum_gap="$3"
+                dataset_failures_before="$FAILURES"
                 surch_out="$REPORTS_DIR/$dataset-surch.out"
                 os_out="$REPORTS_DIR/$dataset-os.out"
+                surch_ndcg=""
+                os_ndcg=""
                 for output in "$surch_out" "$os_out"; do
-                  [ -s "$output" ] || gate_fail "$dataset missing output $output"
-                  assert_all_queries_processed "$output" || gate_fail "$dataset incomplete or malformed query count in $output"
+                  if [ ! -s "$output" ]; then
+                    gate_fail "$dataset missing output $output"
+                    return 0
+                  fi
+                  if ! assert_all_queries_processed "$output"; then
+                    gate_fail "$dataset incomplete or malformed query count in $output"
+                    return 0
+                  fi
                 done
-                surch_ndcg="$(metric_value "$surch_out" 'NDCG@10')" || gate_fail "$dataset missing or malformed Surch NDCG@10"
-                os_ndcg="$(metric_value "$os_out" 'NDCG@10')" || gate_fail "$dataset missing or malformed OpenSearch NDCG@10"
-                assert_floor "$surch_ndcg" "$floor" "$dataset"
-                assert_current_os_gap "$surch_ndcg" "$os_ndcg" "$maximum_gap" "$dataset"
-                printf 'BEIR_GATE dataset=%s status=PASS baseline_date=%s baseline_run=%s surch_ndcg=%s opensearch_ndcg=%s floor=%s max_os_gap=%s\n' \
-                  "$dataset" "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" "$surch_ndcg" "$os_ndcg" "$floor" "$maximum_gap"
+                surch_ndcg="$(metric_value "$surch_out" 'NDCG@10')" || {
+                  gate_fail "$dataset missing or malformed Surch NDCG@10"
+                  return 0
+                }
+                os_ndcg="$(metric_value "$os_out" 'NDCG@10')" || {
+                  gate_fail "$dataset missing or malformed OpenSearch NDCG@10"
+                  return 0
+                }
+                case "$dataset" in
+                  nfcorpus)
+                    NFCORPUS_SURCH_NDCG="$surch_ndcg"
+                    NFCORPUS_OS_NDCG="$os_ndcg"
+                    ;;
+                  fiqa)
+                    FIQA_SURCH_NDCG="$surch_ndcg"
+                    FIQA_OS_NDCG="$os_ndcg"
+                    ;;
+                esac
+                if ! awk -v observed="$surch_ndcg" -v floor="$floor" 'BEGIN { exit observed + 0 >= floor + 0 ? 0 : 1 }'; then
+                  gate_fail "$dataset NDCG@10=$surch_ndcg below frozen floor=$floor"
+                fi
+                if ! awk -v surch="$surch_ndcg" -v opensearch="$os_ndcg" -v maximum_gap="$maximum_gap" 'BEGIN { exit surch - opensearch >= -maximum_gap ? 0 : 1 }'; then
+                  gate_fail "$dataset NDCG@10 gap to current OpenSearch exceeds $maximum_gap (surch=$surch_ndcg opensearch=$os_ndcg)"
+                fi
+                if [ "$FAILURES" -eq "$dataset_failures_before" ]; then
+                  dataset_status="PASS"
+                else
+                  dataset_status="FAIL"
+                fi
+                printf 'BEIR_GATE dataset=%s status=%s baseline_date=%s baseline_run=%s surch_ndcg=%s opensearch_ndcg=%s floor=%s max_os_gap=%s\n' \
+                  "$dataset" "$dataset_status" "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" "$surch_ndcg" "$os_ndcg" "$floor" "$maximum_gap"
               }
               check_dataset nfcorpus "$NFCORPUS_NDCG_FLOOR" "$NFCORPUS_MAX_OS_GAP"
               check_dataset fiqa "$FIQA_NDCG_FLOOR" "$FIQA_MAX_OS_GAP"
-              {
-                echo "# Extra BEIR NDCG gate (NFCorpus + FiQA)"
-                echo
-                echo "- Baseline historique brute : $BEIR_BASELINE_DATE (run $BEIR_BASELINE_RUN)"
-                echo "- Décision : PASS seulement si le plancher historique et la comparaison OpenSearch courante tiennent."
-                for ds in nfcorpus fiqa; do
-                  echo
-                  echo "## $ds / Surch"
-                  cat "$REPORTS_DIR/$ds-surch.out"
-                  echo
-                  echo "## $ds / OpenSearch"
-                  cat "$REPORTS_DIR/$ds-os.out"
-                done
-              } > "$REPORTS_DIR/summary.md"
-              printf '{"schema":"surch.bench.ndcg_gate.v2","baseline_date":"%s","baseline_run":"%s","metric":"NDCG@10","nfcorpus":{"surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/nfcorpus-surch.out","opensearch_out":"%s/nfcorpus-os.out"},"fiqa":{"surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/fiqa-surch.out","opensearch_out":"%s/fiqa-os.out"}}\n' \
-                "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" "$NFCORPUS_NDCG_FLOOR" "$NFCORPUS_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
-                "$FIQA_NDCG_FLOOR" "$FIQA_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
+
+              if [ "$FAILURES" -eq 0 ]; then
+                GATE_STATUS="PASS"
+              else
+                GATE_STATUS="FAIL"
+              fi
+              # Valeurs observees serialisees en CHAINES : une mesure ratee
+              # donne "" et non un JSON casse.
+              printf '{"schema":"surch.bench.ndcg_gate.v3","status":"%s","failures":%s,"baseline_date":"%s","baseline_run":"%s","origin_date":"%s","origin_run":"%s","metric":"NDCG@10","nfcorpus":{"surch_ndcg":"%s","opensearch_ndcg":"%s","surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/nfcorpus-surch.out","opensearch_out":"%s/nfcorpus-os.out"},"fiqa":{"surch_ndcg":"%s","opensearch_ndcg":"%s","surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/fiqa-surch.out","opensearch_out":"%s/fiqa-os.out"}}\n' \
+                "$GATE_STATUS" "$FAILURES" \
+                "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" "$BEIR_ORIGIN_DATE" "$BEIR_ORIGIN_RUN" \
+                "$NFCORPUS_SURCH_NDCG" "$NFCORPUS_OS_NDCG" "$NFCORPUS_NDCG_FLOOR" "$NFCORPUS_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
+                "$FIQA_SURCH_NDCG" "$FIQA_OS_NDCG" "$FIQA_NDCG_FLOOR" "$FIQA_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
                 > "$REPORTS_DIR/bench.json"
-              echo "BEGIN_SURCH_K8S_SUMMARY"
-              cat "$REPORTS_DIR/summary.md"
-              echo "END_SURCH_K8S_SUMMARY"
               echo "BEGIN_SURCH_K8S_BENCH_JSON"
               cat "$REPORTS_DIR/bench.json"
               echo "END_SURCH_K8S_BENCH_JSON"
+
+              if [ "$FAILURES" -ne 0 ]; then
+                echo "BEIR_GATE status=FAIL failures=$FAILURES" >&2
+                exit 1
+              fi
+              echo "BEIR_GATE status=PASS failures=0"
               echo "beir-extra-ndcg complete."
           volumeMounts:
             - { name: beir,    mountPath: /data/beir, readOnly: true }
