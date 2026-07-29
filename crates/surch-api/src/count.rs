@@ -114,14 +114,17 @@ pub async fn count_handler(
 
     match parse_count_request(&body) {
         Ok(request) => {
+            let plafond = plafond_de_comptage(request.track_total_hits.as_ref());
+            // Plafonner CHAQUE index à `limit` conserve la valeur rapportée :
+            // en notant `S = Σ c_i` et `S' = Σ min(c_i, limit)`, on a
+            // `min(S', limit) == min(S, limit)` — si `S <= limit` aucun
+            // plafond ne se déclenche et `S' == S`, sinon `S' >= limit` donc
+            // les deux minimums valent `limit`.
             let count: u64 = indices
                 .iter()
-                .map(|index| count_matches(&state, index, &request))
+                .map(|index| count_matches(&state, index, &request, plafond))
                 .sum();
-            let count = match request.track_total_hits {
-                Some(TrackTotalHits::UpTo(limit)) => count.min(limit),
-                Some(TrackTotalHits::Disabled) | Some(TrackTotalHits::Exact) | None => count,
-            };
+            let count = valeur_rapportee(count, request.track_total_hits.as_ref());
 
             (StatusCode::OK, Json(build_count_response(count))).into_response()
         }
@@ -129,16 +132,68 @@ pub async fn count_handler(
     }
 }
 
-fn count_matches(state: &AppState, index: &str, request: &CountRequest) -> u64 {
-    match request.query.as_ref() {
-        None => state.count(index),
-        Some(query) => count_query_matches(state, index, query),
+/// Chantier C1 — plafond de comptage AUTORISÉ par un mode `track_total_hits`.
+///
+/// `None` = comptage EXHAUSTIF obligatoire. C'est le cas de `Exact`
+/// (`track_total_hits: true`), où toute terminaison anticipée du comptage est
+/// interdite, mais AUSSI du mode par défaut et de `Disabled` : contrairement
+/// à `_search`, qui plafonne à 10 000 par défaut, `_count` rend un total
+/// exact dans ces deux modes. S'y arrêter tôt changerait la réponse.
+///
+/// Seul `UpTo(limit)` plafonne la valeur rapportée
+/// ([`valeur_rapportee`]) — c'est donc le seul mode où cesser de compter est
+/// invisible du client.
+fn plafond_de_comptage(mode: Option<&TrackTotalHits>) -> Option<u64> {
+    match mode {
+        Some(TrackTotalHits::UpTo(limit)) => Some(*limit),
+        Some(TrackTotalHits::Disabled) | Some(TrackTotalHits::Exact) | None => None,
     }
 }
 
-fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64 {
+/// Valeur `count` rapportée par `_count` à partir du compte accumulé.
+/// Inchangée par C1 : c'est le contrat observable.
+fn valeur_rapportee(count: u64, mode: Option<&TrackTotalHits>) -> u64 {
+    match mode {
+        Some(TrackTotalHits::UpTo(limit)) => count.min(*limit),
+        Some(TrackTotalHits::Disabled) | Some(TrackTotalHits::Exact) | None => count,
+    }
+}
+
+/// Compte les éléments d'un itérateur, en cessant de le tirer dès le plafond
+/// atteint. `None` = comptage exhaustif, le seul comportement autorisé quand
+/// la valeur rapportée n'est pas plafonnée.
+fn compter_avec_plafond<I: Iterator>(iterateur: I, plafond: Option<u64>) -> u64 {
+    match plafond {
+        None => iterateur.count() as u64,
+        Some(plafond) => {
+            let plafond = usize::try_from(plafond).unwrap_or(usize::MAX);
+            iterateur.take(plafond).count() as u64
+        }
+    }
+}
+
+fn count_matches(
+    state: &AppState,
+    index: &str,
+    request: &CountRequest,
+    plafond: Option<u64>,
+) -> u64 {
+    match request.query.as_ref() {
+        None => state.count(index),
+        Some(query) => count_query_matches(state, index, query, plafond),
+    }
+}
+
+fn count_query_matches(
+    state: &AppState,
+    index: &str,
+    query: &CountQuery,
+    plafond: Option<u64>,
+) -> u64 {
     let mapping = state.index_mapping(index).unwrap_or_default();
     match query {
+        // Ces deux formes lisent un compteur déjà tenu : il n'y a aucun
+        // parcours à interrompre, le plafond n'aurait rien à économiser.
         CountQuery::MatchAll => state.count(index),
         CountQuery::Term { field, value } => state.term_matches_count(index, field, value) as u64,
         CountQuery::BoolMust(clauses) => {
@@ -146,10 +201,12 @@ fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64
                 documents.len() as u64
             } else {
                 let documents = state.documents(index);
-                documents
-                    .into_iter()
-                    .filter(|document| query_matches(query, &document.source, &mapping))
-                    .count() as u64
+                compter_avec_plafond(
+                    documents
+                        .into_iter()
+                        .filter(|document| query_matches(query, &document.source, &mapping)),
+                    plafond,
+                )
             }
         }
         CountQuery::Range { .. }
@@ -157,11 +214,13 @@ fn count_query_matches(state: &AppState, index: &str, query: &CountQuery) -> u64
         | CountQuery::Terms { .. }
         | CountQuery::Prefix { .. }
         | CountQuery::Wildcard { .. }
-        | CountQuery::MultiMatch { .. } => state
-            .documents(index)
-            .into_iter()
-            .filter(|document| query_matches(query, &document.source, &mapping))
-            .count() as u64,
+        | CountQuery::MultiMatch { .. } => compter_avec_plafond(
+            state
+                .documents(index)
+                .into_iter()
+                .filter(|document| query_matches(query, &document.source, &mapping)),
+            plafond,
+        ),
     }
 }
 
@@ -470,5 +529,147 @@ fn fold_search_char(character: char) -> char {
         '\u{00fd}' | '\u{00ff}' => 'y',
         character if character.is_alphanumeric() => character,
         _ => ' ',
+    }
+}
+
+/// Chantier C1 — terminaison anticipée du COMPTAGE de `_count`.
+///
+/// Deux invariants, verrouillés contre le comptage exhaustif comme oracle :
+///
+/// 1. la valeur RAPPORTÉE est identique avec et sans plafond, dans tous les
+///    modes de `track_total_hits` ;
+/// 2. le mode `Exact` — comme le mode par défaut et `Disabled`, qui rendent
+///    eux aussi un total exact sur `_count` — n'obtient JAMAIS de plafond,
+///    donc compte toujours exhaustivement.
+#[cfg(test)]
+mod c1_comptage_tests {
+    use serde_json::json;
+
+    use super::{count_query_matches, plafond_de_comptage, valeur_rapportee, CountQuery};
+    use crate::search::TrackTotalHits;
+    use crate::state::{AppState, DocumentWriteOperation};
+
+    fn etat(index: &str, docs: usize) -> AppState {
+        let state = AppState::default();
+        state.create_index(index, None, json!({}), Default::default());
+        let operations = (0..docs)
+            .map(|doc_id| DocumentWriteOperation::Index {
+                index: index.to_owned(),
+                id: doc_id.to_string(),
+                source: json!({ "nom": "martin", "rang": doc_id.to_string() }),
+                status: 201,
+            })
+            .collect();
+        state.apply_document_writes(operations);
+        state.refresh_index(index);
+        state
+    }
+
+    fn modes(total: u64) -> Vec<Option<TrackTotalHits>> {
+        vec![
+            None,
+            Some(TrackTotalHits::Exact),
+            Some(TrackTotalHits::Disabled),
+            Some(TrackTotalHits::UpTo(0)),
+            Some(TrackTotalHits::UpTo(1)),
+            Some(TrackTotalHits::UpTo(total.saturating_sub(1))),
+            Some(TrackTotalHits::UpTo(total)),
+            Some(TrackTotalHits::UpTo(total + 1)),
+            Some(TrackTotalHits::UpTo(total * 10)),
+        ]
+    }
+
+    /// `exists` passe par le balayage plafonnable ; `term` et `match_all`
+    /// lisent un compteur déjà tenu et ne sont jamais plafonnés.
+    fn requetes() -> Vec<CountQuery> {
+        vec![
+            CountQuery::MatchAll,
+            CountQuery::Term {
+                field: "nom".to_owned(),
+                value: "martin".to_owned(),
+            },
+            CountQuery::Exists {
+                field: "nom".to_owned(),
+            },
+            CountQuery::Prefix {
+                field: "nom".to_owned(),
+                value: "mar".to_owned(),
+            },
+        ]
+    }
+
+    #[test]
+    fn la_valeur_rapportee_est_identique_avec_et_sans_plafond() {
+        let index = "c1-count";
+        let total = 250u64;
+        let state = etat(index, total as usize);
+        for query in requetes() {
+            // Oracle : le comptage exhaustif, celui d'avant C1.
+            let exhaustif = count_query_matches(&state, index, &query, None);
+            assert!(exhaustif > 0, "oracle exhaustif vide pour {query:?}");
+            for mode in modes(total) {
+                let plafond = plafond_de_comptage(mode.as_ref());
+                let plafonne = count_query_matches(&state, index, &query, plafond);
+                assert_eq!(
+                    valeur_rapportee(plafonne, mode.as_ref()),
+                    valeur_rapportee(exhaustif, mode.as_ref()),
+                    "valeur rapportée modifiée par le plafond ({mode:?}, {query:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn les_modes_exhaustifs_n_obtiennent_jamais_de_plafond() {
+        for mode in [
+            None,
+            Some(TrackTotalHits::Exact),
+            Some(TrackTotalHits::Disabled),
+        ] {
+            assert_eq!(
+                plafond_de_comptage(mode.as_ref()),
+                None,
+                "aucun plafond n'est licite dans ce mode : {mode:?}"
+            );
+        }
+        // Seul `UpTo` autorise l'arrêt.
+        assert_eq!(
+            plafond_de_comptage(Some(&TrackTotalHits::UpTo(42))),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn le_mode_exact_compte_exhaustivement() {
+        let index = "c1-count-exact";
+        let total = 250u64;
+        let state = etat(index, total as usize);
+        let query = CountQuery::Exists {
+            field: "nom".to_owned(),
+        };
+        let plafond = plafond_de_comptage(Some(&TrackTotalHits::Exact));
+        let compte = count_query_matches(&state, index, &query, plafond);
+        assert_eq!(compte, total, "le mode Exact ne doit jamais s'arrêter tôt");
+        assert_eq!(
+            valeur_rapportee(compte, Some(&TrackTotalHits::Exact)),
+            total
+        );
+    }
+
+    /// Le plafond doit RÉELLEMENT interrompre le balayage, sinon la
+    /// terminaison anticipée est prouvée à vide.
+    #[test]
+    fn le_plafond_interrompt_reellement_le_balayage() {
+        let index = "c1-count-plafond";
+        let total = 250u64;
+        let state = etat(index, total as usize);
+        let query = CountQuery::Exists {
+            field: "nom".to_owned(),
+        };
+        let compte = count_query_matches(&state, index, &query, Some(10));
+        assert_eq!(
+            compte, 10,
+            "le balayage doit cesser au plafond, pas compter les {total} documents"
+        );
     }
 }

@@ -1435,6 +1435,7 @@ fn merge_forward_fst(
 }
 
 use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
+use surch_search::topk::MinCompetitiveScore;
 
 use crate::scroll::ScrollTable;
 use crate::stats::{
@@ -1479,6 +1480,35 @@ pub(crate) fn injecter_erreur_p2_tardive_pour_test() {
 #[cfg(test)]
 fn consommer_erreur_p2_tardive_injectee() -> bool {
     P2_ERREUR_TARDIVE_INJECTEE.with(|injection| injection.replace(false))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Miroir local des deux compteurs C1 publiés en métriques
+    /// (`surch_dbg_c1_stream_docs_scored_total` /
+    /// `surch_dbg_c1_stream_docs_pruned_total`). Les métriques `metrics` sont
+    /// globales au processus et les tests tournent en parallèle : un miroir
+    /// par thread est le seul moyen d'affirmer, sans flakiness, que la
+    /// terminaison anticipée s'est RÉELLEMENT engagée sur CETTE requête.
+    static C1_ELAGAGE_OBSERVE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn observer_elagage_c1_pour_test(docs_scored: u64, docs_elagues: u64) {
+    C1_ELAGAGE_OBSERVE.with(|observe| {
+        let (scores, elagues) = observe.get();
+        observe.set((
+            scores.saturating_add(docs_scored),
+            elagues.saturating_add(docs_elagues),
+        ));
+    });
+}
+
+/// Remet à zéro et renvoie `(documents scorés, documents élagués)` accumulés
+/// par le chemin streamé mono-terme depuis le dernier appel.
+#[cfg(test)]
+pub(crate) fn prendre_elagage_c1_pour_test() -> (u64, u64) {
+    C1_ELAGAGE_OBSERVE.with(|observe| observe.replace((0, 0)))
 }
 
 impl P2DiskBlockMetrics {
@@ -5912,16 +5942,26 @@ impl AppState {
     /// directement dans le TopN borné à `limit`. Aucune allocation en O(df) :
     /// seuls le répertoire de blocs (`df/128`) et le TopN (`limit`) vivent.
     ///
-    /// **Équivalence.** Pour un token unique, la boucle MaxScore de référence
-    /// dégénère : `threshold` reste à `-inf`, donc `allow_new_docs` est
-    /// toujours vrai, aucun bloc n'est jamais sauté et `block_max_contribs` /
-    /// `max_term_freq` n'influencent aucune décision. Le résultat est donc
-    /// exactement « pour chaque posting de `df`, dans l'ordre croissant de
-    /// `doc_id` : ignorer `freq == 0`, ignorer une `doc_len` absente ou
-    /// nulle, sinon `bm25(freq, doc_len) * boost` », avec `boost == 1` puisque
-    /// la garde ci-dessous impose un token unique. `total` reste le `df` du
-    /// terme, comme `candidates.len()` du rappel : le contrat `total` et
-    /// `track_total_hits` n'est pas touché (périmètre C1, non engagé).
+    /// **Équivalence.** La sémantique de référence d'un token unique est
+    /// « pour chaque posting de `df`, dans l'ordre croissant de `doc_id` :
+    /// ignorer `freq == 0`, ignorer une `doc_len` absente ou nulle, sinon
+    /// `bm25(freq, doc_len) * boost` », avec `boost == 1` puisque la garde
+    /// ci-dessous impose un token unique, puis top-K par
+    /// `crate::search::scored_pair_ordering`.
+    ///
+    /// **Chantier C1 — terminaison anticipée.** Le seuil compétitif VIT
+    /// désormais dans cette boucle : dès que le TopN est plein, un document
+    /// n'est traité que si son score MAJORÉ (`bm25(freq, min_doc_len)`)
+    /// dépasse STRICTEMENT le K-ième meilleur. La strictesse est licite parce
+    /// que les `doc_id` sortent en ordre croissant et que le départage se
+    /// fait sur `doc_id` croissant : un ex æquo ultérieur perd. Les documents
+    /// ainsi écartés sont exactement ceux que `TopN::push` aurait rejetés, la
+    /// fenêtre rendue est donc INCHANGÉE au bit près.
+    ///
+    /// `total` reste le `df` du terme, obtenu de l'entrée de terme SANS
+    /// décoder un posting : la terminaison anticipée du scoring ne peut donc
+    /// pas dégrader `hits.total`, dans AUCUN mode de `track_total_hits` — y
+    /// compris `Exact`, où le comptage doit rester exhaustif.
     ///
     /// Retourne `None` pour DÉCLINER — le chemin de référence reprend alors
     /// la requête intégralement. Le déclin est la seule réponse à toute
@@ -5981,12 +6021,36 @@ impl AppState {
         )
         .ok()?;
         let norms_enabled = field_stats.norms_enabled;
+        // Chantier C1 — minorant PROUVÉ de `doc_len` sur ce champ. BM25 est
+        // décroissant en `doc_len` (le terme `b * doc_len / avg_doc_len` ne
+        // fait que grossir le dénominateur, et chaque opération IEEE est
+        // monotone en chacun de ses arguments), donc
+        // `score(tf, min_doc_len) >= score(tf, doc_len)` pour tout
+        // `doc_len >= min_doc_len`. `FieldLengthStats::min_doc_len` est
+        // maintenu comme un MINIMUM des longueurs reconstruites et n'est
+        // agrégé qu'en min-des-min entre segments : une suppression ne peut
+        // que le laisser en dessous du vrai minimum, jamais au-dessus. Sans
+        // normes, `doc_len` vaut 1 partout et le majorant est le score exact.
+        let min_doc_len_bound: u64 = if norms_enabled {
+            field_stats.min_doc_len().unwrap_or(1)
+        } else {
+            1
+        };
 
         // Le comparateur est LE comparateur du top-K scoré, importé et non
         // recopié : score décroissant puis `doc_id` croissant. Sur ce corpus
         // presque tous les scores sont égaux, le départage par `doc_id` est
         // donc la règle nominale, pas un cas limite.
         let mut topn = TopN::new(limit, crate::search::scored_pair_ordering);
+        // Chantier C1 — seuil compétitif VIVANT. Il est relevé à chaque
+        // remplacement dans le TopN, pas entre tokens (il n'y en a qu'un), et
+        // sa comparaison est STRICTE : les `doc_id` sortent en ordre
+        // croissant, donc un document ultérieur ex æquo avec le K-ième perd
+        // son départage et ne peut pas entrer. Cf.
+        // `surch_search::topk::MinCompetitiveScore`, qui porte la preuve.
+        let mut min_competitive = MinCompetitiveScore::unset();
+        let mut docs_scored = 0u64;
+        let mut docs_elagues = 0u64;
         for segment_idx in 0..data.index.segment_count() {
             let Some(cursor) = postings.cursor_at_mut(segment_idx) else {
                 continue;
@@ -6009,6 +6073,24 @@ impl AppState {
                 if freq == 0 {
                     continue;
                 }
+                let term_freq = u64::from(freq);
+                // Chantier C1 — élagage AVANT la lecture aléatoire de
+                // `doc_len`, qui est le poste dominant restant de cette
+                // boucle (un défaut de cache par document dans un tableau
+                // dense de 28,9 Mo). `score(tf, min_doc_len)` majore le score
+                // réel de CE document ; si ce majorant n'est pas strictement
+                // au-dessus du K-ième meilleur, `TopN::push` le rejetterait
+                // de toute façon — on saute donc la lecture et le calcul,
+                // sans changer d'un bit la fenêtre rendue.
+                //
+                // `is_armed()` court-circuite : tant que le TopN n'est pas
+                // plein, le majorant serait calculé pour rien.
+                if min_competitive.is_armed()
+                    && !min_competitive.admits(scorer.score(term_freq, min_doc_len_bound))
+                {
+                    docs_elagues += 1;
+                    continue;
+                }
                 let doc_len = if norms_enabled {
                     match field_stats.doc_len(doc_id) {
                         Some(len) if len > 0 => len,
@@ -6020,9 +6102,22 @@ impl AppState {
                 // `* boost` est omis : la garde impose `boost == 1.0`, et
                 // `x * 1.0 == x` bit-à-bit pour tout `f64` non-NaN (le
                 // scorer, validé fini, n'en produit pas).
-                topn.push((scorer.score(u64::from(freq), doc_len), doc_id));
+                docs_scored += 1;
+                topn.push((scorer.score(term_freq, doc_len), doc_id));
+                if let Some(&(kieme_meilleur, _)) = topn.worst_when_full() {
+                    min_competitive.observe_kth_best(kieme_meilleur);
+                }
             }
         }
+        // Publication UNE FOIS par requête (jamais par document : un
+        // `metrics::counter!` par posting coûterait plus cher que ce qu'il
+        // mesure). `surch_dbg_c1_stream_docs_pruned_total` est la preuve
+        // exploitable que la terminaison anticipée est engagée : sans lui, un
+        // gain non réalisé passerait inaperçu.
+        metrics::counter!("surch_dbg_c1_stream_docs_scored_total").increment(docs_scored);
+        metrics::counter!("surch_dbg_c1_stream_docs_pruned_total").increment(docs_elagues);
+        #[cfg(test)]
+        observer_elagage_c1_pour_test(docs_scored, docs_elagues);
         Some((topn.into_sorted_vec(), total))
     }
 

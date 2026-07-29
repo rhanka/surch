@@ -77,6 +77,21 @@ where
         self.data.truncate(self.capacity);
     }
 
+    /// Le PIRE élément retenu, et seulement quand le collecteur est PLEIN —
+    /// c'est-à-dire le K-ième meilleur.
+    ///
+    /// Chantier C1 : c'est l'unique source du seuil compétitif vivant. Tant
+    /// que le collecteur n'est pas plein il renvoie `None`, parce qu'un
+    /// candidat est alors admis quel que soit son score (il reste de la
+    /// place) — renvoyer le pire d'un tampon incomplet armerait un seuil
+    /// FAUX et ferait perdre des documents.
+    pub(crate) fn worst_when_full(&self) -> Option<&T> {
+        if self.capacity == 0 || self.data.len() < self.capacity {
+            return None;
+        }
+        self.data.last()
+    }
+
     /// Consume the collector and return the retained items in sorted
     /// order (best first).
     pub(crate) fn into_sorted_vec(self) -> Vec<T> {
@@ -170,6 +185,32 @@ mod tests {
         }
         let got = top.into_sorted_vec();
         assert_eq!(got, vec![(0.5, 1), (0.5, 2), (0.5, 3), (0.5, 4), (0.5, 5)]);
+    }
+
+    #[test]
+    fn worst_when_full_n_arme_le_seuil_qu_a_capacite() {
+        let mut top = TopN::new(3, desc_then_id);
+        assert!(top.worst_when_full().is_none(), "vide");
+        top.push((0.9, 1));
+        assert!(top.worst_when_full().is_none(), "1/3");
+        top.push((0.5, 2));
+        assert!(top.worst_when_full().is_none(), "2/3");
+        top.push((0.7, 3));
+        // Plein : le pire retenu est le 3e meilleur.
+        assert_eq!(top.worst_when_full(), Some(&(0.5, 2)));
+        // Un meilleur candidat RELÈVE le seuil.
+        top.push((0.8, 4));
+        assert_eq!(top.worst_when_full(), Some(&(0.7, 3)));
+        // Un ex æquo avec le pire retenu ne le déplace pas.
+        top.push((0.7, 5));
+        assert_eq!(top.worst_when_full(), Some(&(0.7, 3)));
+    }
+
+    #[test]
+    fn worst_when_full_est_none_a_capacite_zero() {
+        let mut top = TopN::new(0, desc_then_id);
+        top.push((1.0, 0));
+        assert!(top.worst_when_full().is_none());
     }
 
     #[test]

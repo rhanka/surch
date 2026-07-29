@@ -8,6 +8,7 @@ pub mod maxscore;
 pub mod query;
 pub mod scoring;
 pub mod small_float;
+pub mod topk;
 
 /// Short crate purpose used by workspace smoke tests.
 pub const CRATE_PURPOSE: &str = "Lucene-compatible search";

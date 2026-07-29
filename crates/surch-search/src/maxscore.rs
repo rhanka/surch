@@ -29,7 +29,33 @@
 //! performance optimisation. A perf counter ([`MaxScoreOutcome::blocks_skipped`])
 //! exposes how many 128-blocks the cursor leapfrogged so tests can assert
 //! the skip list is doing work.
+//!
+//! # Chantier C1 — le seuil compétitif VIT
+//!
+//! Le seuil n'était rafraîchi qu'ENTRE tokens. Sur un token unique il
+//! restait donc à `-inf` pour toute la requête : `allow_new_docs` était
+//! toujours vrai, `skippable` toujours faux, et les `df` postings étaient
+//! tous scorés — la dégénérescence que documentait la version précédente de
+//! [`MaxScoreOutcome::blocks_skipped`] (« Zero when no token triggered a
+//! block skip (e.g. a single token…) »).
+//!
+//! Deux corrections, toutes deux à résultat observable INCHANGÉ :
+//!
+//! 1. **mono-token** : la porte est réévaluée à chaque bloc contre un seuil
+//!    vivant (`SingleTokenGate`), et le parcours S'ARRÊTE dès que `limit`
+//!    documents ont atteint le majorant du terme. Licite parce qu'un score
+//!    inséré est alors définitif, que le parcours est ascendant en `doc_id`
+//!    et que le départage du top-K est `doc_id` croissant : un document
+//!    ultérieur ex æquo avec le K-ième PERD (cf.
+//!    [`crate::topk::MinCompetitiveScore`], qui porte la démonstration) ;
+//! 2. **multi-token** : la sémantique de porte est laissée telle quelle —
+//!    les valeurs de `scored` y sont des sommes PARTIELLES et un document
+//!    peut encore grossir. Seul le test de borne du saut de bloc passe de
+//!    `<` à `<=`, ce qui ne peut rien changer puisque, sous
+//!    `!allow_new_docs` et sans document déjà scoré dans la plage du bloc,
+//!    le bloc ne produit ni ne met à jour quoi que ce soit.
 
+use crate::topk::MinCompetitiveScore;
 use std::collections::BTreeMap;
 use surch_codec::postings_block::{BlockSkipEntry, BlockSkipList, PostingsBlockError};
 
@@ -100,10 +126,88 @@ pub struct MaxScoreOutcome {
     /// Final scored docs, keyed by doc id (ascending). Identical to the
     /// linear-walk Lot 1 path for the same inputs.
     pub scored: BTreeMap<u32, f64>,
-    /// Number of 128-blocks the skip-list cursor leapfrogged over,
-    /// summed across tokens. Zero when no token triggered a block skip
-    /// (e.g. a single token, or a threshold that never gates anything).
+    /// Number of 128-blocks whose postings were never examined, summed
+    /// across tokens: those the skip-list cursor leapfrogged over, plus
+    /// (chantier C1) those left unread when a mono-token run terminated
+    /// early. Zero when no token triggered a skip and no run stopped
+    /// early — e.g. a `limit` larger than the whole posting list.
     pub blocks_skipped: usize,
+    /// Chantier C1 : au moins un token a cessé son parcours avant la fin
+    /// de ses postings parce que le seuil compétitif vivant prouvait
+    /// qu'aucun document ultérieur ne pouvait entrer dans le top-K.
+    /// Faux quand le parcours est allé au bout, ce qui reste le cas de
+    /// toute exécution multi-token (cf. [`MaxScoreExecutor::run`]).
+    pub early_terminated: bool,
+}
+
+/// Porte compétitive VIVANTE du mode MONO-TOKEN, en O(1) mémoire.
+///
+/// N'est armée qu'avec un token unique (cf. [`MaxScoreExecutor::run`]), le
+/// seul régime dans lequel un score inséré dans `scored` est DÉFINITIF : sans
+/// token ultérieur il ne peut plus être augmenté, donc le K-ième meilleur
+/// courant est bien le K-ième meilleur score FINAL parmi les documents déjà
+/// collectés. En multi-token les valeurs de `scored` sont des sommes
+/// PARTIELLES ; le rafraîchissement entre tokens y reste l'unique mécanisme,
+/// strictement inchangé.
+///
+/// # Pourquoi un simple compteur suffit
+///
+/// Ce qu'on veut savoir est : « le K-ième meilleur a-t-il rejoint la borne
+/// `bound` du terme ? », car c'est la seule condition qui puisse fermer la
+/// porte — `bound` majorant tout score, `admits(bound)` ne devient faux que
+/// si le K-ième meilleur ATTEINT `bound`. Or le K-ième meilleur atteint
+/// `bound` si et seulement si au moins `limit` documents collectés ont un
+/// score `>= bound`. Suivre les `limit` meilleurs scores dans un tampon
+/// trié donnerait exactement la même réponse en payant `8 × limit` octets et
+/// une insertion triée par document : un compteur est équivalent, et gratuit.
+#[derive(Debug)]
+struct SingleTokenGate {
+    limit: usize,
+    /// `token.max_contrib` : majorant PROUVÉ (contrat du champ) du score de
+    /// tout document de ce token.
+    bound: f64,
+    /// Nombre de documents collectés dont le score atteint `bound`.
+    at_bound: usize,
+    /// Le seuil compétitif partagé — c'est LUI qui porte la règle stricte,
+    /// pas ce type.
+    min_competitive: MinCompetitiveScore,
+}
+
+impl SingleTokenGate {
+    fn new(limit: usize, bound: f64) -> Self {
+        Self {
+            limit,
+            bound,
+            at_bound: 0,
+            min_competitive: MinCompetitiveScore::unset(),
+        }
+    }
+
+    /// Enregistre le score FINAL d'un document nouvellement collecté.
+    fn observe(&mut self, score: f64) {
+        if self.limit == 0 || score < self.bound {
+            return;
+        }
+        self.at_bound += 1;
+        if self.at_bound >= self.limit {
+            // Le K-ième meilleur vaut désormais `bound`.
+            self.min_competitive.observe_kth_best(self.bound);
+        }
+    }
+
+    /// `true` si un document dont le score est majoré par `upper_bound` peut
+    /// encore entrer dans le top-K. Comparaison STRICTE : cf.
+    /// [`MinCompetitiveScore`].
+    fn admits(&self, upper_bound: f64) -> bool {
+        self.min_competitive.admits(upper_bound)
+    }
+}
+
+/// Résultat du parcours d'un token : blocs non examinés, et arrêt anticipé.
+#[derive(Debug)]
+struct TokenWalk {
+    blocks_skipped: usize,
+    early_terminated: bool,
 }
 
 /// MaxScore OR-match executor with skip-list block leapfrogging.
@@ -113,12 +217,30 @@ pub struct MaxScoreOutcome {
 #[derive(Debug)]
 pub struct MaxScoreExecutor {
     limit: usize,
+    early_termination: bool,
 }
 
 impl MaxScoreExecutor {
     /// Build an executor for a top-`limit` OR-match.
     pub fn new(limit: usize) -> Self {
-        Self { limit }
+        Self {
+            limit,
+            early_termination: true,
+        }
+    }
+
+    /// Chantier C1 — désactive la terminaison anticipée mono-token, et donc
+    /// tout écart avec la sémantique d'avant C1.
+    ///
+    /// À utiliser dès que la sortie n'est PAS directement le top-K rendu au
+    /// client. C'est le cas du `multi_match`, qui exécute un run PAR CHAMP
+    /// puis COMBINE les résultats (`max` par document) : la fenêtre finale y
+    /// est celle de la combinaison, pas celle d'un run, et le raisonnement
+    /// d'exactitude devrait alors porter sur la combinaison. On préfère ne
+    /// pas en dépendre.
+    pub fn without_early_termination(mut self) -> Self {
+        self.early_termination = false;
+        self
     }
 
     /// Run the MaxScore loop over `tokens` (which the caller has NOT
@@ -169,20 +291,43 @@ impl MaxScoreExecutor {
         let mut scored: BTreeMap<u32, f64> = BTreeMap::new();
         let mut threshold = f64::NEG_INFINITY;
         let mut blocks_skipped = 0usize;
+        let mut early_terminated = false;
+
+        // Chantier C1 — le seuil compétitif VIT, mais seulement là où c'est
+        // DÉMONTRABLE. Avec un token unique, le score qu'un document reçoit
+        // est définitif dès son insertion : le K-ième meilleur courant est
+        // donc le vrai K-ième meilleur parmi les documents déjà collectés,
+        // et `token.max_contrib` (contrat du champ : majorant de la
+        // contribution de CE token, boost compris) majore le score de tout
+        // document restant. Avec plusieurs tokens, `scored` ne porte que des
+        // sommes partielles et un document vu ici peut encore grossir sur un
+        // token suivant : la sémantique de porte reste alors STRICTEMENT
+        // celle d'avant ce chantier (rafraîchissement entre tokens), pour ne
+        // rien changer au résultat observable.
+        let mut live = if self.early_termination && tokens.len() == 1 {
+            tokens
+                .first()
+                .map(|token| SingleTokenGate::new(self.limit, token.max_contrib))
+        } else {
+            None
+        };
 
         for (token_idx, token) in ordered {
             let allow_new_docs = token.max_contrib >= threshold;
             let skip_list = skip_lists[token_idx].as_ref();
 
-            blocks_skipped += self.run_token(
+            let walk = self.run_token(
                 token_idx,
                 token,
                 skip_list,
                 allow_new_docs,
                 threshold,
+                live.as_mut(),
                 &mut scored,
                 &mut score_doc,
             )?;
+            blocks_skipped += walk.blocks_skipped;
+            early_terminated |= walk.early_terminated;
 
             // Refresh the threshold to the K-th best score so the next
             // (cheaper) token is gated against the tightest bound.
@@ -199,23 +344,26 @@ impl MaxScoreExecutor {
         Ok(MaxScoreOutcome {
             scored,
             blocks_skipped,
+            early_terminated,
         })
     }
 
     /// Walk a single token's postings, leapfrogging skippable blocks via
-    /// the skip-list cursor. Returns the number of blocks the cursor
-    /// jumped over.
+    /// the skip-list cursor. Renvoie les blocs dont les postings n'ont pas
+    /// été examinés et si le parcours s'est arrêté avant la fin (chantier
+    /// C1). `live` n'est `Some` qu'en mode mono-token.
     #[allow(clippy::too_many_arguments)]
     fn run_token<F>(
         &self,
         token_idx: usize,
         token: &MaxScoreToken<'_>,
         skip_list: Option<&BlockSkipList>,
-        allow_new_docs: bool,
+        allow_new_docs_between_tokens: bool,
         threshold: f64,
+        mut live: Option<&mut SingleTokenGate>,
         scored: &mut BTreeMap<u32, f64>,
         score_doc: &mut F,
-    ) -> Result<usize, MaxScoreError>
+    ) -> Result<TokenWalk, MaxScoreError>
     where
         F: FnMut(usize, u32, u64) -> Option<f64>,
     {
@@ -223,9 +371,30 @@ impl MaxScoreExecutor {
         let freqs = token.freqs;
         let num_blocks = token.block_max_contribs.len();
         let mut blocks_skipped = 0usize;
+        let mut early_terminated = false;
         let mut block_idx = 0usize;
 
         while block_idx < num_blocks {
+            // Chantier C1 — mode mono-token : la porte est rouverte à
+            // CHAQUE bloc contre le seuil vivant, au lieu d'être figée pour
+            // tout le token. La comparaison est STRICTE
+            // ([`MinCompetitiveScore`]) : un document ex æquo avec le
+            // K-ième perd son départage `doc_id` puisque le parcours est
+            // ascendant. Sur le corpus deces, où presque tous les scores
+            // d'un terme sont égaux, c'est exactement ce qui élague.
+            let allow_new_docs = match live.as_deref() {
+                Some(live) => live.admits(token.max_contrib),
+                None => allow_new_docs_between_tokens,
+            };
+            if live.is_some() && !allow_new_docs {
+                // Mono-token : aucun document restant ne peut plus entrer
+                // (leur score est majoré par `max_contrib`) et aucun
+                // document déjà collecté ne peut plus être amélioré (il n'y
+                // a pas de token suivant). Le reste du terme est mort.
+                blocks_skipped += num_blocks - block_idx;
+                early_terminated = true;
+                break;
+            }
             let block_start = block_idx * BLOCK_SIZE;
             let block_end = ((block_idx + 1) * BLOCK_SIZE).min(doc_ids.len());
             let block_doc_ids = &doc_ids[block_start..block_end];
@@ -238,13 +407,17 @@ impl MaxScoreExecutor {
             let block_first = block_doc_ids[0];
             let block_last = block_doc_ids[block_doc_ids.len() - 1];
 
-            // Block-level skip decision — identical to the Lot 1 linear
-            // path: if new docs are gated off AND this block's tightest
-            // upper bound is below the running threshold AND no
-            // already-scored doc falls inside the block's doc-id range,
-            // the block contributes nothing.
+            // Block-level skip decision. Exactitude : sous
+            // `!allow_new_docs`, la boucle de scoring ci-dessous ignore
+            // tout document absent de `scored` ; si en plus AUCUN document
+            // de `scored` ne tombe dans `[block_first, block_last]`, le bloc
+            // ne peut rien produire ni rien mettre à jour. Le test de borne
+            // est donc du pur zèle, et le passer de `<` à `<=` (chantier
+            // C1 : un bloc dont le majorant ÉGALE le seuil ne contient que
+            // des ex æquo, qui perdent leur départage `doc_id`) ne peut pas
+            // changer le résultat — seulement élargir l'élagage.
             let skippable = !allow_new_docs
-                && block_max < threshold
+                && block_max <= threshold
                 && scored.range(block_first..=block_last).next().is_none();
 
             if skippable {
@@ -295,12 +468,22 @@ impl MaxScoreExecutor {
                 };
                 let entry = scored.entry(doc_id).or_insert(0.0);
                 *entry += contrib;
+                // Chantier C1 — le seuil est relevé DANS le token, document
+                // par document. En mono-token `*entry` est le score final du
+                // document (aucun token ne le complétera).
+                if let Some(live) = live.as_deref_mut() {
+                    let final_score = *entry;
+                    live.observe(final_score);
+                }
             }
 
             block_idx += 1;
         }
 
-        Ok(blocks_skipped)
+        Ok(TokenWalk {
+            blocks_skipped,
+            early_terminated,
+        })
     }
 }
 
@@ -428,19 +611,129 @@ mod tests {
         move |token_idx, _doc_id, _tf| Some(weight_by_token[token_idx])
     }
 
+    /// Fenêtre top-K d'une carte de scores, avec LE comparateur partagé du
+    /// dépôt (`surch_search::topk::scored_pair_ordering`) — la même règle que
+    /// le collecteur borné de `surch-api`.
+    fn fenetre_topk(scored: &BTreeMap<u32, f64>, limit: usize) -> Vec<(u32, u64)> {
+        let mut paires: Vec<(f64, u32)> = scored.iter().map(|(&id, &s)| (s, id)).collect();
+        paires.sort_by(crate::topk::scored_pair_ordering);
+        paires
+            .into_iter()
+            .take(limit)
+            .map(|(score, id)| (id, score.to_bits()))
+            .collect()
+    }
+
+    /// Chantier C1 — cas NOMINAL du corpus deces : un token unique et des
+    /// scores TOUS ÉGAUX. Avant C1 le seuil restait à `-inf` pour un token
+    /// unique, `allow_new_docs` était toujours vrai, aucun bloc n'était
+    /// jamais sauté et les `df` postings étaient tous scorés. Le seuil vit
+    /// désormais À L'INTÉRIEUR du token : dès que K ex æquo sont collectés,
+    /// aucun document ultérieur ne peut battre le K-ième (il perdrait son
+    /// départage `doc_id`), et le parcours s'arrête — SANS changer d'un bit
+    /// la fenêtre top-K.
     #[test]
-    fn single_token_no_skip() {
+    fn single_token_termine_tot_sur_des_ex_aequo() {
         let doc_ids: Vec<u32> = (0..300).collect();
         let freqs: Vec<u32> = vec![1; doc_ids.len()];
         let mut bm = Vec::new();
         let token = make_token(&doc_ids, &freqs, &mut bm, 2.0);
         let weights = [2.0];
-        let outcome = MaxScoreExecutor::new(10)
+        let limit = 10usize;
+        let outcome = MaxScoreExecutor::new(limit)
             .run(&[token], score_const(&weights))
             .expect("run");
-        // Single token => every doc scored, no skip.
+
+        let mut bm_ref = Vec::new();
+        let token_ref = make_token(&doc_ids, &freqs, &mut bm_ref, 2.0);
+        let reference = linear_reference(&[token_ref], limit, score_const(&weights));
+
+        assert_eq!(
+            fenetre_topk(&outcome.scored, limit),
+            fenetre_topk(&reference, limit),
+            "la terminaison anticipée ne doit changer NI les documents, NI \
+             leur ordre, NI leurs scores"
+        );
+        assert!(
+            outcome.early_terminated,
+            "le parcours mono-token doit s'arrêter tôt sur des ex æquo"
+        );
+        assert!(
+            outcome.blocks_skipped > 0,
+            "des blocs doivent rester non lus, got {}",
+            outcome.blocks_skipped
+        );
+        assert!(
+            outcome.scored.len() < doc_ids.len(),
+            "moins de `df` documents doivent être scorés, got {}",
+            outcome.scored.len()
+        );
+    }
+
+    /// Le pendant du test précédent : quand `limit` dépasse le `df`, le
+    /// seuil ne s'arme jamais et le parcours doit rester INTÉGRAL.
+    #[test]
+    fn single_token_sans_seuil_arme_parcourt_tout() {
+        let doc_ids: Vec<u32> = (0..300).collect();
+        let freqs: Vec<u32> = vec![1; doc_ids.len()];
+        let mut bm = Vec::new();
+        let token = make_token(&doc_ids, &freqs, &mut bm, 2.0);
+        let weights = [2.0];
+        let outcome = MaxScoreExecutor::new(1_000)
+            .run(&[token], score_const(&weights))
+            .expect("run");
         assert_eq!(outcome.scored.len(), 300);
         assert_eq!(outcome.blocks_skipped, 0);
+        assert!(!outcome.early_terminated);
+    }
+
+    /// `limit == 0` ne doit JAMAIS armer le seuil (sinon tout serait
+    /// élagué dès le premier document).
+    #[test]
+    fn single_token_limit_zero_ne_prune_rien() {
+        let doc_ids: Vec<u32> = (0..300).collect();
+        let freqs: Vec<u32> = vec![1; doc_ids.len()];
+        let mut bm = Vec::new();
+        let token = make_token(&doc_ids, &freqs, &mut bm, 2.0);
+        let weights = [2.0];
+        let outcome = MaxScoreExecutor::new(0)
+            .run(&[token], score_const(&weights))
+            .expect("run");
+        assert_eq!(outcome.scored.len(), 300);
+        assert!(!outcome.early_terminated);
+    }
+
+    /// Scores réellement DISTINCTS : la terminaison anticipée ne doit
+    /// s'engager qu'une fois le K-ième meilleur atteint, et la fenêtre
+    /// top-K doit rester identique à la référence linéaire.
+    #[test]
+    fn single_token_scores_distincts_conserve_la_fenetre() {
+        // Le score décroît avec le `doc_id` : les K meilleurs sont les K
+        // premiers, donc le seuil se stabilise vite mais `max_contrib`
+        // (majorant) reste au-dessus tant que des documents meilleurs sont
+        // possibles.
+        let doc_ids: Vec<u32> = (0..600).collect();
+        let freqs: Vec<u32> = doc_ids.iter().map(|&d| 1 + (d % 5)).collect();
+        let block_max: Vec<f64> = vec![5.0; doc_ids.len().div_ceil(BLOCK_SIZE)];
+        let token = MaxScoreToken {
+            doc_ids: &doc_ids,
+            freqs: &freqs,
+            block_max_contribs: &block_max,
+            max_contrib: 5.0,
+        };
+        let score_tf = |_token_idx: usize, _doc_id: u32, tf: u64| Some(tf as f64);
+
+        for limit in [1usize, 2, 10, 128, 129, 600, 900] {
+            let outcome = MaxScoreExecutor::new(limit)
+                .run(std::slice::from_ref(&token), score_tf)
+                .expect("run");
+            let reference = linear_reference(std::slice::from_ref(&token), limit, score_tf);
+            assert_eq!(
+                fenetre_topk(&outcome.scored, limit),
+                fenetre_topk(&reference, limit),
+                "fenêtre top-K divergente à limit={limit}"
+            );
+        }
     }
 
     #[test]
