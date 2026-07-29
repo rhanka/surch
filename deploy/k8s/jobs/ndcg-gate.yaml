@@ -21,6 +21,57 @@
 #
 # `${SURCH_SHA}` is substituted by the GHA workflow via envsubst and
 # rendered into the docker-build.yml tag format: `sha-<full commit SHA>`.
+#
+# PREMIER ETALONNAGE 2026-07-29 (diagnostic .remote/beir-diagnostic.md,
+# section 7 point 2 : « ndcg-gate (scifact + trec-covid) n'a aucun
+# plancher »). Jusqu'a ce commit ce Job ne faisait QUE mesurer et publier
+# scifact/trec-covid : aucune comparaison a un seuil, `exit 0` implicite en
+# toute circonstance (le dernier `cat > bench.json <<EOF` reussissait
+# toujours). Une regression de pertinence sur ces deux jeux — les plus
+# suivis du projet — serait donc passee totalement inapercue, exactement
+# comme cela vient de se produire 64 jours durant sur le gate voisin
+# `beir-extra-ndcg` (plancher perime, pas un defaut du chantier de
+# recherche lui-meme — cf. diagnostic).
+#
+# Valeurs de reference posees ci-dessous, mesurees sur l'image
+# sha-188906f414e1ff6ecde3a566d61742e190fc32b0 (2026-07-29, run 30451966000
+# du diagnostic) :
+#   - SciFact    : Surch 0.6599 vs OpenSearch 2.17.1 0.6537 -> Surch GAGNE
+#     de +0.0062. Stable au bit pres sur trois mesures en pod, datees
+#     2026-06-15, 2026-06-30 et 2026-07-03 (beir-diagnostic.md §2, table de
+#     fidelite locale<->cluster : 3/3 correspondances exactes).
+#   - TREC-COVID : Surch 0.4777 vs OpenSearch 2.17.1 0.4902 -> Surch PERD de
+#     0.0125. Valeur mesuree en pod (run 30451966000) et corroboree par
+#     bisection locale (meme corpus, meme script `scifact/trec-covid-ndcg.sh`,
+#     memes images) ; UNE seule mesure en pod documentee a ce jour pour ce
+#     jeu (contrairement a SciFact, mesure trois fois) — le plancher
+#     ci-dessous verrouille la NON-REGRESSION de Surch, ce n'est PAS une
+#     cible de parite OpenSearch atteinte. Root-cause de cet ecart :
+#     `docs/paper/ndcg-trec-covid-rootcause-22.md` (#22 — quantization
+#     Lucene SmallFloat du doc_len, arbitrage delibere qui gagne sur
+#     scifact/trec-covid et coute sur nfcorpus/fiqa, cf. le meme
+#     diagnostic).
+#
+# Planchers SANS MARGE : chaque SURCH_*_NDCG_FLOOR est fixe A LA VALEUR
+# OBSERVEE EXACTE ci-dessus (memes chiffres `%.4f` que produit le script de
+# mesure) — toute baisse, meme d'un cran de 1e-4, fait echouer le gate.
+#
+# Ecarts a OpenSearch (MAX_OS_GAP) :
+#   - SciFact 0 : Surch doit rester >= OpenSearch. Marge confortable
+#     aujourd'hui (+0.0062), tres loin du bruit de representation double —
+#     aucune raison de retenir une valeur non nulle ici.
+#   - TREC-COVID 0.0130 : l'ecart brut observe est 0.0125, mais en double
+#     IEEE754 `0.4777 - 0.4902` vaut EXACTEMENT
+#     `-0.01250000000000001110` (verifie via `awk 'BEGIN{printf "%.20f",
+#     0.4777-0.4902}'`) — un plafond fixe A EXACTEMENT 0.0125 echouerait
+#     donc sur le bruit de representation, le meme piege deja rencontre sur
+#     nfcorpus/fiqa dans `beir-extra-ndcg.yaml` (`0.3021-0.3034` vaut
+#     `-0.0013000000000000123`, cf. beir-diagnostic.md). Le plafond est
+#     donc porte a 0.0130 (un cran de 0.0005 au-dela de l'observe), pour
+#     une raison PUREMENT NUMERIQUE : cela ne relache PAS l'exigence de
+#     qualite, qui reste verrouillee par le plancher absolu de Surch
+#     (0.4777, sans marge). L'ecart a OpenSearch sur TREC-COVID reste un
+#     CONSTAT documente (root-cause #22 ci-dessus), pas une cible.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -100,7 +151,7 @@ spec:
           volumeMounts:
             - { name: scratch, mountPath: /usr/share/opensearch/data, subPath: opensearch-data }
       containers:
-        # --- Driver: scifact-ndcg.sh against both engines -------------
+        # --- Driver: scifact-ndcg.sh + trec-covid-ndcg.sh against both engines
         - name: ndcg-driver
           image: ghcr.io/rhanka/surch:bench-sha-${SURCH_SHA}
           imagePullPolicy: IfNotPresent
@@ -110,13 +161,23 @@ spec:
             - { name: BEIR_DIR,       value: "/data/beir" }
             - { name: REPORTS_DIR,    value: "/reports" }
             - { name: RSS_SAMPLE_SECONDS, value: "1200" }
+            # Etalon courant : premier etalonnage 2026-07-29, diagnostic
+            # .remote/beir-diagnostic.md. Provenance complete en en-tete
+            # du manifeste (au-dessus de `apiVersion`).
+            - { name: BEIR_BASELINE_DATE, value: "2026-07-29" }
+            - { name: BEIR_BASELINE_RUN,  value: "30451966000" }
+            - { name: SCIFACT_NDCG_FLOOR,     value: "0.6599" }
+            - { name: TREC_COVID_NDCG_FLOOR,  value: "0.4777" }
+            - { name: SCIFACT_MAX_OS_GAP,     value: "0" }
+            - { name: TREC_COVID_MAX_OS_GAP,  value: "0.0130" }
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 1Gi }
           command: ["/bin/sh", "-c"]
           # The bench driver image bundles scripts/bench/{scifact,trec-covid}-ndcg.sh;
           # this driver waits for both engines, runs both BEIR gates against
-          # Surch and OpenSearch, and exits with the last script's status.
+          # Surch and OpenSearch, evaluates a floor + an OpenSearch-gap
+          # criterion on EACH dataset, and exits non-zero if either fails.
           # CI reads /reports/summary.md and /reports/bench.json; the
           # `*-ndcg.out` files are aggregated by `bench_report --dir`.
           args:
@@ -176,28 +237,72 @@ spec:
               }
               start_rss_sample "surch"      "surch-api" ""                         "$REPORTS_DIR/rss-ndcg-surch.json" "$REPORTS_DIR/.rss-surch.pid"
               start_rss_sample "opensearch" "java"      "org.opensearch.bootstrap" "$REPORTS_DIR/rss-ndcg-os.json"    "$REPORTS_DIR/.rss-os.pid"
-              /usr/local/bin/scifact-ndcg.sh   "ndcg-surch-k8s" "$REPORTS_DIR/scifact-surch.out"    "$SURCH_URL"
-              /usr/local/bin/scifact-ndcg.sh   "ndcg-os-k8s"    "$REPORTS_DIR/scifact-os.out"       "$OPENSEARCH_URL"
-              /usr/local/bin/trec-covid-ndcg.sh "ndcg-surch-k8s" "$REPORTS_DIR/trec-covid-surch.out" "$SURCH_URL"
-              /usr/local/bin/trec-covid-ndcg.sh "ndcg-os-k8s"    "$REPORTS_DIR/trec-covid-os.out"    "$OPENSEARCH_URL"
+
+              # Une mesure ratee n'interrompt PLUS le driver : on enregistre
+              # l'echec et on poursuit, pour que le bloc de mesures parte
+              # TOUJOURS dans le journal du conteneur. Meme lecon que
+              # beir-extra-ndcg (run 30451966000) : un gate qui sort au
+              # premier plancher rate perd le verdict du second jeu.
+              DATASETS="scifact trec-covid"
+              FAILURES=0
+              SCIFACT_SURCH_NDCG=""
+              SCIFACT_OS_NDCG=""
+              TREC_COVID_SURCH_NDCG=""
+              TREC_COVID_OS_NDCG=""
+
+              measure() {
+                ds="$1"
+                label="$2"
+                out="$3"
+                url="$4"
+                case "$ds" in
+                  scifact)     script="/usr/local/bin/scifact-ndcg.sh" ;;
+                  trec-covid)  script="/usr/local/bin/trec-covid-ndcg.sh" ;;
+                  *)
+                    echo "BEIR_GATE status=FAIL reason=unknown_dataset:$ds" >&2
+                    FAILURES=$((FAILURES + 1))
+                    return 0
+                    ;;
+                esac
+                if ! "$script" "$label" "$out" "$url"; then
+                  echo "BEIR_GATE status=FAIL reason=measure_failed dataset=$ds label=$label url=$url" >&2
+                  FAILURES=$((FAILURES + 1))
+                fi
+              }
+
+              for ds in $DATASETS; do
+                measure "$ds" "ndcg-surch-k8s" "$REPORTS_DIR/$ds-surch.out" "$SURCH_URL"
+                measure "$ds" "ndcg-os-k8s"    "$REPORTS_DIR/$ds-os.out"    "$OPENSEARCH_URL"
+              done
+
+              # Le resume part AVANT toute decision de gate : meme sur echec,
+              # les quatre mesures restent lisibles dans
+              # `kubectl logs -c ndcg-driver` et dans le resume GitHub, qui
+              # reconstruit ce bloc depuis les marqueurs BEGIN/END.
               {
-                echo "# BEIR NDCG gate"
+                echo "# NDCG gate (SciFact + TREC-COVID)"
                 echo
-                echo "## SciFact / Surch"
-                cat "$REPORTS_DIR/scifact-surch.out"
-                echo
-                echo "## SciFact / OpenSearch"
-                cat "$REPORTS_DIR/scifact-os.out"
-                echo
-                echo "## TREC-COVID / Surch"
-                cat "$REPORTS_DIR/trec-covid-surch.out"
-                echo
-                echo "## TREC-COVID / OpenSearch"
-                cat "$REPORTS_DIR/trec-covid-os.out"
+                echo "- Etalon courant : $BEIR_BASELINE_DATE (run $BEIR_BASELINE_RUN)"
+                echo "- Planchers : scifact >= $SCIFACT_NDCG_FLOOR, trec-covid >= $TREC_COVID_NDCG_FLOOR"
+                echo "- Ecart OpenSearch max : scifact $SCIFACT_MAX_OS_GAP, trec-covid $TREC_COVID_MAX_OS_GAP"
+                echo "- TREC-COVID : l'ecart a OpenSearch est un CONSTAT documente (root-cause docs/paper/ndcg-trec-covid-rootcause-22.md, #22), pas une cible de parite atteinte."
+                echo "- Decision : PASS seulement si le plancher ET la comparaison OpenSearch courante tiennent, sur les DEUX jeux."
+                for ds in $DATASETS; do
+                  for engine in surch os; do
+                    echo
+                    echo "## $ds / $engine"
+                    if [ -s "$REPORTS_DIR/$ds-$engine.out" ]; then
+                      cat "$REPORTS_DIR/$ds-$engine.out"
+                    else
+                      echo "(sortie absente ou vide — mesure ratee)"
+                    fi
+                  done
+                done
               } > "$REPORTS_DIR/summary.md"
-              cat > "$REPORTS_DIR/bench.json" <<EOF
-              {"schema":"surch.bench.ndcg_gate.v1","scifact_surch_out":"$REPORTS_DIR/scifact-surch.out","scifact_opensearch_out":"$REPORTS_DIR/scifact-os.out","trec_covid_surch_out":"$REPORTS_DIR/trec-covid-surch.out","trec_covid_opensearch_out":"$REPORTS_DIR/trec-covid-os.out"}
-              EOF
+              echo "BEGIN_SURCH_K8S_SUMMARY"
+              cat "$REPORTS_DIR/summary.md"
+              echo "END_SURCH_K8S_SUMMARY"
+
               wait_rss_sample "$REPORTS_DIR/.rss-surch.pid"
               wait_rss_sample "$REPORTS_DIR/.rss-os.pid"
               # Surface each rss-*.json envelope between markers so the
@@ -211,12 +316,118 @@ spec:
                 echo
                 echo "END_SURCH_K8S_RSS_FILE:$fname"
               done
-              echo "BEGIN_SURCH_K8S_SUMMARY"
-              cat "$REPORTS_DIR/summary.md"
-              echo "END_SURCH_K8S_SUMMARY"
+
+              gate_fail() {
+                echo "BEIR_GATE status=FAIL reason=$*" >&2
+                FAILURES=$((FAILURES + 1))
+              }
+              metric_value() {
+                file="$1"
+                metric="$2"
+                awk -v metric="$metric" '
+                  $1 == metric && $2 == "=" { seen++; value = $3 }
+                  END {
+                    if (seen != 1 || value !~ /^[0-9]+([.][0-9]+)?$/) exit 1
+                    print value
+                  }
+                ' "$file"
+              }
+              assert_all_queries_processed() {
+                file="$1"
+                awk '
+                  /^queries_processed=/ {
+                    seen++
+                    split($1, field, "=")
+                    processed = field[2]
+                    total = $4
+                    if ($2 != "(out" || $3 != "of" || $5 != "unique" || $6 != "test" || $7 != "qids)" || processed !~ /^[0-9]+$/ || total !~ /^[0-9]+$/) invalid = 1
+                  }
+                  END {
+                    if (seen != 1 || invalid || processed + 0 <= 0 || processed + 0 != total + 0) exit 1
+                  }
+                ' "$file"
+              }
+              # Les DEUX jeux sont toujours evalues : un plancher rate sur
+              # scifact ne doit plus masquer le verdict de trec-covid.
+              check_dataset() {
+                dataset="$1"
+                floor="$2"
+                maximum_gap="$3"
+                dataset_failures_before="$FAILURES"
+                surch_out="$REPORTS_DIR/$dataset-surch.out"
+                os_out="$REPORTS_DIR/$dataset-os.out"
+                surch_ndcg=""
+                os_ndcg=""
+                for output in "$surch_out" "$os_out"; do
+                  if [ ! -s "$output" ]; then
+                    gate_fail "$dataset missing output $output"
+                    return 0
+                  fi
+                  if ! assert_all_queries_processed "$output"; then
+                    gate_fail "$dataset incomplete or malformed query count in $output"
+                    return 0
+                  fi
+                done
+                surch_ndcg="$(metric_value "$surch_out" 'NDCG@10')" || {
+                  gate_fail "$dataset missing or malformed Surch NDCG@10"
+                  return 0
+                }
+                os_ndcg="$(metric_value "$os_out" 'NDCG@10')" || {
+                  gate_fail "$dataset missing or malformed OpenSearch NDCG@10"
+                  return 0
+                }
+                case "$dataset" in
+                  scifact)
+                    SCIFACT_SURCH_NDCG="$surch_ndcg"
+                    SCIFACT_OS_NDCG="$os_ndcg"
+                    ;;
+                  trec-covid)
+                    TREC_COVID_SURCH_NDCG="$surch_ndcg"
+                    TREC_COVID_OS_NDCG="$os_ndcg"
+                    ;;
+                esac
+                if ! awk -v observed="$surch_ndcg" -v floor="$floor" 'BEGIN { exit observed + 0 >= floor + 0 ? 0 : 1 }'; then
+                  gate_fail "$dataset NDCG@10=$surch_ndcg below frozen floor=$floor"
+                fi
+                if ! awk -v surch="$surch_ndcg" -v opensearch="$os_ndcg" -v maximum_gap="$maximum_gap" 'BEGIN { exit surch - opensearch >= -maximum_gap ? 0 : 1 }'; then
+                  gate_fail "$dataset NDCG@10 gap to current OpenSearch exceeds $maximum_gap (surch=$surch_ndcg opensearch=$os_ndcg)"
+                fi
+                if [ "$FAILURES" -eq "$dataset_failures_before" ]; then
+                  dataset_status="PASS"
+                else
+                  dataset_status="FAIL"
+                fi
+                printf 'BEIR_GATE dataset=%s status=%s baseline_date=%s baseline_run=%s surch_ndcg=%s opensearch_ndcg=%s floor=%s max_os_gap=%s\n' \
+                  "$dataset" "$dataset_status" "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" "$surch_ndcg" "$os_ndcg" "$floor" "$maximum_gap"
+              }
+              check_dataset scifact "$SCIFACT_NDCG_FLOOR" "$SCIFACT_MAX_OS_GAP"
+              check_dataset trec-covid "$TREC_COVID_NDCG_FLOOR" "$TREC_COVID_MAX_OS_GAP"
+
+              if [ "$FAILURES" -eq 0 ]; then
+                GATE_STATUS="PASS"
+              else
+                GATE_STATUS="FAIL"
+              fi
+              # Valeurs observees serialisees en CHAINES : une mesure ratee
+              # donne "" et non un JSON casse. Le champ
+              # `opensearch_gap_is_constat_not_cible` sur trec_covid encode
+              # en machine-lisible le point 4 du traitement honnete : cet
+              # ecart est un constat documente, jamais une cible atteinte.
+              printf '{"schema":"surch.bench.ndcg_gate.v2","status":"%s","failures":%s,"baseline_date":"%s","baseline_run":"%s","metric":"NDCG@10","scifact":{"surch_ndcg":"%s","opensearch_ndcg":"%s","surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/scifact-surch.out","opensearch_out":"%s/scifact-os.out"},"trec_covid":{"surch_ndcg":"%s","opensearch_ndcg":"%s","surch_floor":%s,"max_opensearch_gap":%s,"surch_out":"%s/trec-covid-surch.out","opensearch_out":"%s/trec-covid-os.out","opensearch_gap_is_constat_not_cible":true,"rootcause_doc":"docs/paper/ndcg-trec-covid-rootcause-22.md"}}\n' \
+                "$GATE_STATUS" "$FAILURES" \
+                "$BEIR_BASELINE_DATE" "$BEIR_BASELINE_RUN" \
+                "$SCIFACT_SURCH_NDCG" "$SCIFACT_OS_NDCG" "$SCIFACT_NDCG_FLOOR" "$SCIFACT_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
+                "$TREC_COVID_SURCH_NDCG" "$TREC_COVID_OS_NDCG" "$TREC_COVID_NDCG_FLOOR" "$TREC_COVID_MAX_OS_GAP" "$REPORTS_DIR" "$REPORTS_DIR" \
+                > "$REPORTS_DIR/bench.json"
               echo "BEGIN_SURCH_K8S_BENCH_JSON"
               cat "$REPORTS_DIR/bench.json"
               echo "END_SURCH_K8S_BENCH_JSON"
+
+              if [ "$FAILURES" -ne 0 ]; then
+                echo "BEIR_GATE status=FAIL failures=$FAILURES" >&2
+                exit 1
+              fi
+              echo "BEIR_GATE status=PASS failures=0"
               echo "ndcg-gate complete."
           volumeMounts:
             - { name: beir,    mountPath: /data/beir, readOnly: true }
