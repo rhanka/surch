@@ -62,6 +62,36 @@ COLD_PROBE_REQUESTS="${COLD_PROBE_REQUESTS:-50}" # protocole L2 : reclaim avant 
 # Seuil fixe du protocole L2 : le cache file résiduel doit être <= 4 MiB ou
 # <= 20 % de la valeur avant reclaim, selon la borne la moins stricte.
 COLD_FILE_CACHE_FLOOR_BYTES=4194304
+# ---- sonde froide RÉALISABLE : ce qu'on demande, ce qu'on mesure, ce qu'on exige ----
+# Un hôte SANS SWAP est le cas NOMINAL d'un banc de bases de données, pas une
+# exception. Sans swap, tout l'anonyme est IRRÉCUPÉRABLE : le cgroup ES porte
+# ~3,7 Gio de tas JVM que le noyau ne peut pas évincer. Écrire dans
+# `memory.reclaim` une cible calculée sur `memory.current` revenait donc à
+# demander une quantité physiquement inatteignable ; et même en visant `file`,
+# demander 100 % du cache est la limite EXACTE du réalisable (une part est à tout
+# instant sale, en écriture différée ou mappée active) : le noyau rend EAGAIN.
+# Mesuré sur VM (noyau 6.8.0-136) : ES échouait au 11e reclaim sur 50, surch au
+# 28e dans le run témoin.
+#
+# COLD_RECLAIM_REQUEST_PERCENT : part du cache `file` réellement DEMANDÉE au
+#   noyau à chaque tentative. 90 % laisse au noyau une marge de 10 points de
+#   pages non évinçables à cet instant, au lieu de le placer sur sa borne.
+# COLD_RECLAIM_MIN_EVICTED_PERCENT : seuil PRÉ-ENGAGÉ d'acceptation, mesuré
+#   AVANT/APRÈS sur `memory.stat file`. C'est exactement le critère de résidu
+#   historique du harnais (`file_after <= file_before / 5`), inchangé : ce qui
+#   change est qu'un EAGAIN n'est plus fatal EN SOI — seule compte la fraction
+#   RÉELLEMENT évincée. Un reclaim qui rend EAGAIN après avoir évincé 95 % du
+#   cache décrit une sonde froide, pas un échec.
+# Les deux valeurs sont IDENTIQUES pour les deux moteurs (globales du run),
+# publiées dans les deux scorecards, et journalisées tentative par tentative.
+COLD_RECLAIM_REQUEST_PERCENT="${COLD_RECLAIM_REQUEST_PERCENT:-90}"
+COLD_RECLAIM_MIN_EVICTED_PERCENT="${COLD_RECLAIM_MIN_EVICTED_PERCENT:-80}"
+# 1 = un axe froid invalide fait aussi tomber le run entier (comportement
+# historique). 0 (défaut) = l'axe froid est invalidé SEUL, nommément, dans
+# `<moteur>.json` et `cold-axis.json` ; les axes latence chaude, indexation et
+# disque restent jugés sur leurs propres preuves. Un noyau sans
+# `memory.reclaim` (< 5.19) ne doit pas détruire trois axes mesurés.
+COLD_AXIS_REQUIRED="${COLD_AXIS_REQUIRED:-0}"
 # Profil L2 benchmark-only : OFF par défaut. A 1, le runner passe un chemin
 # explicite dans le volume Surch pour un JSONL borné, exporté par phase.
 SURCH_SOURCE_FETCH_PROFILE="${SURCH_SOURCE_FETCH_PROFILE:-0}"
@@ -86,6 +116,31 @@ SURCH_SOURCE_COMPRESS_MODE="${SURCH_SOURCE_COMPRESS_MODE:-}"
 #   `off`       : aucun scrape ni gate (interdit quand P2_MEASURE=1).
 SURCH_C2_STREAM_EXPECT="${SURCH_C2_STREAM_EXPECT:-off}"
 SURCH_C2_STREAM_METRIC="surch_dbg_c2_single_term_stream_total"
+# ---- C1 : élagage du flux et terminaison anticipée maxscore ----
+# NOMS RÉELS DU MOTEUR. Deux des quatre noms employés dans les briefs de
+# campagne n'existent sous aucune forme dans le code :
+#   surch_dbg_c1_scored_total      -> surch_dbg_c1_stream_docs_scored_total
+#                                     (crates/surch-api/src/state.rs:6117)
+#   surch_dbg_c1_early_stop_total  -> surch_dbg_c1_maxscore_early_stop_total
+#                                     (crates/surch-api/src/search.rs:2822)
+# Les deux autres sont surch_dbg_c1_stream_docs_pruned_total (state.rs:6118) et
+# surch_dbg_c1_maxscore_blocks_skipped_total (search.rs:2824).
+# `metrics::counter!` ne crée la série qu'au PREMIER incrément : un compteur
+# jamais déclenché — ou un nom faux — est ABSENT de l'export, et `p2_counter_value`
+# rendrait « 0 ». Ce zéro-là est indiscernable d'un zéro mesuré : c'est le faux
+# vert que ce lot ferme. Ici, `absent` n'est JAMAIS `0` — la valeur publiée est
+# `null` et le statut est `absent`.
+#   off     : aucun scrape C1 (défaut, comportement historique) ;
+#   observe : scrape et publication par phase, aucune invalidation ;
+#   require : un compteur REQUIS absent ou illisible en fin de phase invalide la
+#             mesure, nommément.
+SURCH_C1_EXPECT="${SURCH_C1_EXPECT:-off}"
+SURCH_C1_METRICS_REQUIRED="${SURCH_C1_METRICS_REQUIRED:-surch_dbg_c1_stream_docs_scored_total surch_dbg_c1_stream_docs_pruned_total}"
+# Optionnels ASSUMÉS : sur 3 000 requêtes du smoke 1,36 M, blocks_skipped n'a
+# bougé que 331 fois et early_stop n'est apparu dans AUCUN scrape. Les exiger
+# rendrait tout run rouge ; les taire les rendrait indiscernables de zéro. Ils
+# sont donc scrapés, publiés avec le statut `absent`, et jamais fatals.
+SURCH_C1_METRICS_OPTIONAL="${SURCH_C1_METRICS_OPTIONAL:-surch_dbg_c1_maxscore_blocks_skipped_total surch_dbg_c1_maxscore_early_stop_total}"
 # Réconciliation de la ventilation disque par composant (besoin 4) : la somme des
 # composants doit retrouver le `du` du volume, à la tolérance de bloc/arrondi près.
 DISK_VENTILATION_TOLERANCE_MIB="${DISK_VENTILATION_TOLERANCE_MIB:-16}"
@@ -215,7 +270,44 @@ if [ "$P2_MEASURE" = "1" ]; then
   [ -n "$SURCH_SOURCE_COMPRESS_MODE" ] || {
     err "protocole P2 invalide : SURCH_SOURCE_COMPRESS_MODE doit être déclaré (doc = témoin D1 par-document, block = D1 par blocs)"; exit 1;
   }
+  # Le seuil froid est PRÉ-ENGAGÉ : sous protocole fermé il ne se négocie pas en
+  # cours de campagne, sinon « le froid a réussi » ne voudrait plus rien dire.
+  [ "$COLD_RECLAIM_REQUEST_PERCENT" = "90" ] && [ "$COLD_RECLAIM_MIN_EVICTED_PERCENT" = "80" ] || {
+    err "protocole P2 invalide : le seuil froid pré-engagé est COLD_RECLAIM_REQUEST_PERCENT=90 / COLD_RECLAIM_MIN_EVICTED_PERCENT=80 (reçu $COLD_RECLAIM_REQUEST_PERCENT / $COLD_RECLAIM_MIN_EVICTED_PERCENT)"; exit 1;
+  }
+  # Le scrape C1 ajoute des requêtes Prometheus hors fenêtre chronométrée ; le
+  # protocole P2 a ses propres bornes de phase et ne les accueille pas.
+  [ "$SURCH_C1_EXPECT" = "off" ] || {
+    err "protocole P2 invalide : SURCH_C1_EXPECT doit rester off sous P2_MEASURE=1 (reçu $SURCH_C1_EXPECT)"; exit 1;
+  }
 fi
+case "$SURCH_C1_EXPECT" in
+  off|observe|require) ;;
+  *) err "SURCH_C1_EXPECT doit valoir off, observe ou require (reçu $SURCH_C1_EXPECT)"; exit 1;;
+esac
+if [ "$SURCH_C1_EXPECT" != "off" ]; then
+  for _c1_metric in $SURCH_C1_METRICS_REQUIRED $SURCH_C1_METRICS_OPTIONAL; do
+    case "$_c1_metric" in
+      [a-zA-Z_]*) ;;
+      *) err "nom de compteur C1 invalide : $_c1_metric"; exit 1;;
+    esac
+    case "$_c1_metric" in
+      *[!a-zA-Z0-9_]*) err "nom de compteur C1 invalide : $_c1_metric"; exit 1;;
+    esac
+  done
+  [ -n "$SURCH_C1_METRICS_REQUIRED" ] || {
+    err "SURCH_C1_EXPECT=$SURCH_C1_EXPECT sans SURCH_C1_METRICS_REQUIRED : une attente vide serait un vert gratuit"; exit 1;
+  }
+fi
+case "$COLD_RECLAIM_REQUEST_PERCENT" in ''|*[!0-9]*) err "COLD_RECLAIM_REQUEST_PERCENT doit être un entier"; exit 1;; esac
+case "$COLD_RECLAIM_MIN_EVICTED_PERCENT" in ''|*[!0-9]*) err "COLD_RECLAIM_MIN_EVICTED_PERCENT doit être un entier"; exit 1;; esac
+if [ "$COLD_RECLAIM_REQUEST_PERCENT" -lt 1 ] || [ "$COLD_RECLAIM_REQUEST_PERCENT" -gt 100 ]; then
+  err "COLD_RECLAIM_REQUEST_PERCENT doit être dans [1;100] (reçu $COLD_RECLAIM_REQUEST_PERCENT)"; exit 1
+fi
+if [ "$COLD_RECLAIM_MIN_EVICTED_PERCENT" -lt 1 ] || [ "$COLD_RECLAIM_MIN_EVICTED_PERCENT" -gt 100 ]; then
+  err "COLD_RECLAIM_MIN_EVICTED_PERCENT doit être dans [1;100] (reçu $COLD_RECLAIM_MIN_EVICTED_PERCENT)"; exit 1
+fi
+case "$COLD_AXIS_REQUIRED" in 0|1) ;; *) err "COLD_AXIS_REQUIRED doit valoir 0 ou 1"; exit 1;; esac
 if [ "$SURCH_SOURCE_FETCH_PROFILE" = "1" ] && [ "$PROBE_REQUESTS" -ne 1000 ]; then
   err "protocole L2 profilé invalide : PROBE_REQUESTS doit rester 1000 (reçu $PROBE_REQUESTS)"
   exit 1
@@ -1393,6 +1485,114 @@ probe_publish_form_stats(){
 # métrique, même effectif) : un ratio ne peut pas être calculé entre deux
 # populations différentes.
 # Contrat de sortie : raison dans BY_FORM_RATIOS_REASON, pas de $(...).
+# APPARIEMENT des deux ventilations, NOMMÉ et DIAGNOSTICABLE.
+#
+# Défaut fermé ici : jusqu'à ce lot, un effectif divergent — typiquement un
+# moteur qui obtient sa série froide et pas l'autre — faisait lever `error(...)`
+# au filtre de ratios, et l'unique trace était un `by-form-ratios.jsonl` de
+# 0 OCTET. Le livrable central (les ratios par forme contre ES) disparaissait
+# donc en silence, sans dire QUELLES clés divergeaient.
+#
+# Cette fonction compare les populations AVANT tout calcul et écrit un rapport
+# listant les clés en défaut : présentes d'un seul côté, ou appariées mais
+# d'effectif `n` différent, ou dupliquées à l'intérieur d'un même fichier.
+# Contrat de sortie : BY_FORM_PAIRING_REASON / BY_FORM_PAIRING_REPORT, jamais
+# sous $(...).
+by_form_pairing_report(){
+  local es_jsonl="$1"
+  local surch_jsonl="$2"
+  local out="$3"
+  BY_FORM_PAIRING_REASON=""
+  BY_FORM_PAIRING_REPORT="$out"
+  if ! jq -n --slurpfile es "$es_jsonl" --slurpfile surch "$surch_jsonl" '
+    def key: [.phase, .form, .metric] | @json;
+    ($es | map({(key): .n}) | add // {}) as $ei
+    | ($surch | map({(key): .n}) | add // {}) as $si
+    | {es_records: ($es | length), es_keys: ($ei | keys | length),
+       surch_records: ($surch | length), surch_keys: ($si | keys | length),
+       only_es: [ $ei | keys[] as $k | select(($si | has($k)) | not) | $k ],
+       only_surch: [ $si | keys[] as $k | select(($ei | has($k)) | not) | $k ],
+       n_mismatch: [ $ei | keys[] as $k
+                     | select($si | has($k))
+                     | ($ei | .[$k]) as $en
+                     | ($si | .[$k]) as $sn
+                     | select($en != $sn)
+                     | {key: $k, es_n: $en, surch_n: $sn} ]}
+  ' > "$out" 2>/dev/null; then
+    BY_FORM_PAIRING_REASON="by_form_pairing_report_jq_error"
+    return 1
+  fi
+  if jq -e '
+    (.only_es | length) == 0 and (.only_surch | length) == 0 and (.n_mismatch | length) == 0
+    and .es_records == .es_keys and .surch_records == .surch_keys
+    and .es_records == .surch_records and .es_records > 0
+  ' "$out" > /dev/null 2>&1; then
+    rm -f "$out"
+    return 0
+  fi
+  BY_FORM_PAIRING_REASON=$(jq -r '
+    "by_form_population_mismatch"
+    + "_only_es_" + ((.only_es | length) | tostring)
+    + "_only_surch_" + ((.only_surch | length) | tostring)
+    + "_n_mismatch_" + ((.n_mismatch | length) | tostring)
+    + "_dup_es_" + ((.es_records - .es_keys) | tostring)
+    + "_dup_surch_" + ((.surch_records - .surch_keys) | tostring)
+  ' "$out" 2>/dev/null)
+  [ -n "$BY_FORM_PAIRING_REASON" ] || BY_FORM_PAIRING_REASON="by_form_population_mismatch"
+  return 1
+}
+
+# Phases dont la population (forme, métrique, effectif) est IDENTIQUE des deux
+# côtés. Sert le repli explicite : quand l'axe froid est asymétrique, les ratios
+# CHAUDS restent calculables sur des populations strictement appariées, et les
+# phases écartées sont NOMMÉES — jamais retirées en silence.
+# Contrat de sortie : BY_FORM_COMMON_PHASES / BY_FORM_EXCLUDED_PHASES.
+by_form_common_phases(){
+  local es_jsonl="$1"
+  local surch_jsonl="$2"
+  local common
+  local all
+  local phase
+  local common_phase
+  local kept
+  BY_FORM_COMMON_PHASES=""
+  BY_FORM_EXCLUDED_PHASES=""
+  common=$(jq -rn --slurpfile es "$es_jsonl" --slurpfile surch "$surch_jsonl" '
+    def key: [.form, .metric, .n] | @json;
+    (($es + $surch) | map(.phase) | unique)
+    | .[] as $p
+    | ($es | map(select(.phase == $p) | key) | sort) as $ek
+    | ($surch | map(select(.phase == $p) | key) | sort) as $sk
+    | select(($ek | length) > 0 and $ek == $sk)
+    | $p') || return 1
+  all=$(jq -rn --slurpfile es "$es_jsonl" --slurpfile surch "$surch_jsonl" '
+    (($es + $surch) | map(.phase) | unique) | .[]') || return 1
+  BY_FORM_COMMON_PHASES=$(printf '%s' "$common" | tr '\n' ' ')
+  for phase in $all; do
+    kept=0
+    # shellcheck disable=SC2086
+    for common_phase in $common; do
+      [ "$common_phase" = "$phase" ] && kept=1
+    done
+    [ "$kept" = 1 ] || BY_FORM_EXCLUDED_PHASES="$BY_FORM_EXCLUDED_PHASES$phase "
+  done
+}
+
+# Filtre une ventilation sur une liste de phases (séparées par des espaces).
+by_form_filter_phases(){
+  local src="$1"
+  local phases="$2"
+  local out="$3"
+  local phases_json
+  # Découpage voulu sur les espaces : `$phases` est une liste, pas un mot.
+  # shellcheck disable=SC2086
+  phases_json=$(printf '%s\n' $phases | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
+  # `index` rend 0 pour un premier élément trouvé, et 0 est VRAI en jq : la
+  # comparaison explicite à `null` évite de dépendre de ce piège.
+  jq -c --argjson phases "$phases_json" 'select((.phase as $p | $phases | index($p)) != null)' "$src" > "$out" || return 1
+  [ -s "$out" ]
+}
+
 by_form_ratios(){
   local es_jsonl="$1"
   local surch_jsonl="$2"
@@ -1401,6 +1601,15 @@ by_form_ratios(){
   BY_FORM_RATIOS_REASON=""
   if [ ! -s "$es_jsonl" ] || [ ! -s "$surch_jsonl" ]; then
     BY_FORM_RATIOS_REASON="by_form_jsonl_missing"
+    rm -f "$out"
+    return 1
+  fi
+  # Appariement d'abord : une divergence de population donne une invalidité
+  # NOMMÉE et un rapport de clés, plus jamais un fichier de ratios de 0 octet.
+  if ! by_form_pairing_report "$es_jsonl" "$surch_jsonl" "$out.pairing.json"; then
+    BY_FORM_RATIOS_REASON="$BY_FORM_PAIRING_REASON"
+    err "by_form_ratios : populations non appariées ($BY_FORM_RATIOS_REASON) — détail : $out.pairing.json"
+    rm -f "$out"
     return 1
   fi
   jq_err_file="$OUT_DIR/.by_form_ratios_jq_stderr.$$"
@@ -1429,12 +1638,239 @@ by_form_ratios(){
     err "by_form_ratios : jq a échoué : $(cat "$jq_err_file" 2>/dev/null)"
     rm -f "$jq_err_file"
     BY_FORM_RATIOS_REASON="by_form_ratios_jq_error"
+    # Un fichier de ratios VIDE est le pire des artefacts : il ressemble à un
+    # résultat. Il est détruit, la raison porte seule le diagnostic.
+    rm -f "$out"
     return 1
   fi
   rm -f "$jq_err_file"
-  [ -s "$out" ] || { BY_FORM_RATIOS_REASON="by_form_ratios_empty"; return 1; }
+  [ -s "$out" ] || { BY_FORM_RATIOS_REASON="by_form_ratios_empty"; rm -f "$out"; return 1; }
+}
+
+# État de publication des ratios, TOUJOURS écrit — succès comme échec. C'est lui
+# qui interdit le « fichier de 0 octet passé sous silence » : même quand aucun
+# ratio n'est produit, un artefact dit lequel, pourquoi, et sur quelles phases.
+by_form_ratios_status(){
+  local status_out="$1"
+  local ratios="$2"
+  local records=0
+  if [ -s "$ratios" ]; then
+    records=$(wc -l < "$ratios" 2>/dev/null)
+    records=${records:-0}
+  fi
+  printf '{"scope":"%s","valid":%s,"reason":%s,"included_phases":"%s","excluded_phases":"%s","ratio_records":%s,"ratios_file":%s}\n' \
+    "$BY_FORM_PUBLISH_SCOPE" "$BY_FORM_PUBLISH_VALID" \
+    "$( [ -n "$BY_FORM_PUBLISH_REASON" ] && printf '"%s"' "$BY_FORM_PUBLISH_REASON" || printf 'null' )" \
+    "$BY_FORM_PUBLISH_INCLUDED" "$BY_FORM_PUBLISH_EXCLUDED" "$records" \
+    "$( [ -s "$ratios" ] && printf '"%s"' "$ratios" || printf 'null' )" \
+    > "$status_out"
+}
+
+# Publication des ratios par forme, avec repli NOMMÉ sur les phases communes.
+#
+# Règle non négociable : jamais un ratio entre deux populations différentes. Le
+# repli ne relâche donc PAS l'appariement — il restreint le périmètre à des
+# phases strictement appariées des deux côtés, et NOMME celles qu'il écarte.
+# Il n'est toléré que pour la phase `cold` (asymétrie froide connue et déjà
+# rapportée par `cold-axis.json`) : toute autre divergence est un défaut du
+# harnais ou de la sonde, et fait échouer le run.
+# Contrat de sortie : globales BY_FORM_PUBLISH_*, ne pas appeler sous $(...).
+by_form_ratios_publish(){
+  local es_jsonl="$1"
+  local surch_jsonl="$2"
+  local out="$3"
+  local status_out="$4"
+  local excluded
+  local phase
+  local es_subset
+  local surch_subset
+  BY_FORM_PUBLISH_SCOPE="all_phases"
+  BY_FORM_PUBLISH_VALID=false
+  BY_FORM_PUBLISH_REASON=""
+  BY_FORM_PUBLISH_INCLUDED="all"
+  BY_FORM_PUBLISH_EXCLUDED=""
+  BY_FORM_COMMON_PHASES=""
+  BY_FORM_EXCLUDED_PHASES=""
+  if by_form_ratios "$es_jsonl" "$surch_jsonl" "$out"; then
+    BY_FORM_PUBLISH_VALID=true
+    by_form_ratios_status "$status_out" "$out"
+    return 0
+  fi
+  BY_FORM_PUBLISH_REASON="$BY_FORM_RATIOS_REASON"
+  case "$BY_FORM_RATIOS_REASON" in
+    by_form_population_mismatch*) ;;
+    *) by_form_ratios_status "$status_out" "$out"; return 1;;
+  esac
+  if ! by_form_common_phases "$es_jsonl" "$surch_jsonl"; then
+    BY_FORM_PUBLISH_REASON="by_form_common_phases_failed"
+    by_form_ratios_status "$status_out" "$out"
+    return 1
+  fi
+  excluded="$BY_FORM_EXCLUDED_PHASES"
+  BY_FORM_PUBLISH_EXCLUDED="$excluded"
+  BY_FORM_PUBLISH_INCLUDED="$BY_FORM_COMMON_PHASES"
+  # Découpage voulu sur les espaces : la liste de phases n'est pas un mot.
+  # shellcheck disable=SC2086
+  for phase in $excluded; do
+    if [ "$phase" != "cold" ]; then
+      BY_FORM_PUBLISH_REASON="by_form_population_mismatch_outside_cold_phase_$phase"
+      by_form_ratios_status "$status_out" "$out"
+      return 1
+    fi
+  done
+  if [ -z "$BY_FORM_COMMON_PHASES" ]; then
+    BY_FORM_PUBLISH_REASON="by_form_no_common_phase"
+    by_form_ratios_status "$status_out" "$out"
+    return 1
+  fi
+  es_subset="$es_jsonl.common"
+  surch_subset="$surch_jsonl.common"
+  if ! by_form_filter_phases "$es_jsonl" "$BY_FORM_COMMON_PHASES" "$es_subset" \
+     || ! by_form_filter_phases "$surch_jsonl" "$BY_FORM_COMMON_PHASES" "$surch_subset"; then
+    BY_FORM_PUBLISH_REASON="by_form_common_subset_filter_failed"
+    by_form_ratios_status "$status_out" "$out"
+    return 1
+  fi
+  if ! by_form_ratios "$es_subset" "$surch_subset" "$out"; then
+    BY_FORM_PUBLISH_REASON="${BY_FORM_RATIOS_REASON:-by_form_common_subset_ratio_failed}"
+    by_form_ratios_status "$status_out" "$out"
+    return 1
+  fi
+  BY_FORM_PUBLISH_SCOPE="common_phases"
+  BY_FORM_PUBLISH_VALID=true
+  BY_FORM_PUBLISH_REASON="cold_phase_excluded_from_ratios"
+  err "ratios par forme : phase(s) écartée(s) faute d'appariement entre moteurs — [ $excluded]. Les ratios publiés portent UNIQUEMENT sur [ $BY_FORM_COMMON_PHASES] ; l'axe froid est INVALIDE et n'est comparé nulle part."
+  by_form_ratios_status "$status_out" "$out"
 }
 # ============================ fin ventilation par forme ========================
+
+# =================== sonde froide : évaluation d'une tentative ================
+# Une tentative de reclaim n'est plus jugée sur le code de retour de l'écriture
+# dans `memory.reclaim` (EAGAIN dès que la cible intégrale n'est pas atteinte)
+# mais sur la FRACTION DE CACHE RÉELLEMENT ÉVINCÉE, mesurée avant/après dans
+# `memory.stat file`. Le seuil est PRÉ-ENGAGÉ, identique aux deux moteurs.
+#
+# La division entière tronque : 79,9 % est lu 79 %, donc REFUSÉ à seuil 80. Le
+# biais est conservateur — il ne peut pas rendre une série plus chaude que ce
+# qu'elle est.
+#
+# Contrat de sortie : globales COLD_RECLAIM_*, ne pas appeler sous $(...).
+cold_reclaim_evaluate(){
+  local before="$1"
+  local after="$2"
+  COLD_RECLAIM_EVICTED_BYTES=0
+  COLD_RECLAIM_EVICTED_PERCENT=0
+  COLD_RECLAIM_RESIDUAL_BYTES="$after"
+  COLD_RECLAIM_GAP_PERCENT=0
+  COLD_RECLAIM_VERDICT=""
+  case "$before" in ''|*[!0-9]*) COLD_RECLAIM_VERDICT="file_before_invalid"; return 1;; esac
+  case "$after" in ''|*[!0-9]*) COLD_RECLAIM_VERDICT="file_after_invalid"; return 1;; esac
+  if [ "$after" -lt "$before" ]; then
+    COLD_RECLAIM_EVICTED_BYTES=$(( before - after ))
+  fi
+  if [ "$before" -le 0 ]; then
+    # Pas de cache avant la requête : rien à évincer, la lecture est froide.
+    COLD_RECLAIM_EVICTED_PERCENT=100
+  else
+    COLD_RECLAIM_EVICTED_PERCENT=$(( COLD_RECLAIM_EVICTED_BYTES * 100 / before ))
+  fi
+  # Plancher absolu : quelques Mio de cache résiduel ne réchauffent pas un index
+  # de plusieurs Gio, quelle que soit la fraction relative.
+  if [ "$after" -le "$COLD_FILE_CACHE_FLOOR_BYTES" ]; then
+    COLD_RECLAIM_VERDICT="ok_residual_under_floor"
+    return 0
+  fi
+  if [ "$COLD_RECLAIM_EVICTED_PERCENT" -ge "$COLD_RECLAIM_MIN_EVICTED_PERCENT" ]; then
+    COLD_RECLAIM_VERDICT="ok"
+    return 0
+  fi
+  COLD_RECLAIM_GAP_PERCENT=$(( COLD_RECLAIM_MIN_EVICTED_PERCENT - COLD_RECLAIM_EVICTED_PERCENT ))
+  COLD_RECLAIM_VERDICT="below_floor"
+  return 1
+}
+
+# Synthèse de l'audit TSV : c'est elle qui rend la sonde INTERPRÉTABLE. Une
+# sonde froide dont on ignore le degré de froideur ne vaut rien.
+# Colonnes attendues (cf. capture_cold_samples) :
+#   1 request_no  2 file_before  3 file_after  4 file_after_max  5 memory_current
+#   6 reclaim_target  7 write_rc  8 evicted_bytes  9 evicted_percent
+#   10 min_evicted_percent  11 verdict
+# Contrat de sortie : globales COLD_AUDIT_*, ne pas appeler sous $(...).
+cold_reclaim_audit_summary(){
+  local audit="$1"
+  local summary
+  COLD_AUDIT_RECORDS=0
+  COLD_AUDIT_EVICTED_MIN_PERCENT="null"
+  COLD_AUDIT_EVICTED_P50_PERCENT="null"
+  COLD_AUDIT_EVICTED_MAX_PERCENT="null"
+  COLD_AUDIT_BELOW_FLOOR=0
+  [ -s "$audit" ] || return 1
+  summary=$(awk -F'\t' '
+    NF >= 11 && $9 ~ /^[0-9]+$/ {
+      v[++n] = $9 + 0
+      if ($11 != "ok" && $11 != "ok_residual_under_floor") below++
+    }
+    END {
+      if (n == 0) exit 1
+      for (i = 1; i < n; i++)
+        for (j = i + 1; j <= n; j++)
+          if (v[j] < v[i]) { t = v[i]; v[i] = v[j]; v[j] = t }
+      # Même convention de rang que `probe_quantiles` : rang le plus proche par
+      # excès, pour que les quantiles du harnais se lisent tous pareil.
+      raw = n * 0.5
+      rank = int(raw); if (rank < raw) rank++
+      if (rank < 1) rank = 1
+      printf "%d %d %d %d %d", n, v[1], v[rank], v[n], below + 0
+    }' "$audit") || return 1
+  read -r COLD_AUDIT_RECORDS COLD_AUDIT_EVICTED_MIN_PERCENT COLD_AUDIT_EVICTED_P50_PERCENT \
+    COLD_AUDIT_EVICTED_MAX_PERCENT COLD_AUDIT_BELOW_FLOOR <<< "$summary"
+  [ -n "$COLD_AUDIT_BELOW_FLOOR" ]
+}
+
+# SYMÉTRIE entre moteurs — exigence non négociable de l'axe froid.
+# La comparaison n'est valide que si les DEUX moteurs ont subi le même
+# traitement froid. Un moteur qui obtient sa série et l'autre non ne produit pas
+# un « ratio partiel » : il produit une INVALIDITÉ NOMMÉE.
+# Contrat de sortie : globales COLD_SYMMETRY_*, ne pas appeler sous $(...).
+cold_axis_symmetry(){
+  local es_json="$1"
+  local surch_json="$2"
+  local out="$3"
+  local reason_json
+  COLD_SYMMETRY_ES="missing"
+  COLD_SYMMETRY_SURCH="missing"
+  COLD_SYMMETRY_STATUS=""
+  COLD_SYMMETRY_REASON=""
+  if [ -s "$es_json" ]; then
+    COLD_SYMMETRY_ES=$(jq -r 'if .cold_axis_valid == true then "valid" else "invalid" end' "$es_json" 2>/dev/null) \
+      || COLD_SYMMETRY_ES="unreadable"
+  fi
+  if [ -s "$surch_json" ]; then
+    COLD_SYMMETRY_SURCH=$(jq -r 'if .cold_axis_valid == true then "valid" else "invalid" end' "$surch_json" 2>/dev/null) \
+      || COLD_SYMMETRY_SURCH="unreadable"
+  fi
+  [ -n "$COLD_SYMMETRY_ES" ] || COLD_SYMMETRY_ES="unreadable"
+  [ -n "$COLD_SYMMETRY_SURCH" ] || COLD_SYMMETRY_SURCH="unreadable"
+  case "$COLD_SYMMETRY_ES:$COLD_SYMMETRY_SURCH" in
+    valid:valid)
+      COLD_SYMMETRY_STATUS="symmetric_valid" ;;
+    invalid:invalid|missing:missing|unreadable:unreadable)
+      COLD_SYMMETRY_STATUS="symmetric_absent"
+      COLD_SYMMETRY_REASON="cold_axis_unmeasured_on_both_engines_es_${COLD_SYMMETRY_ES}_surch_${COLD_SYMMETRY_SURCH}" ;;
+    *)
+      COLD_SYMMETRY_STATUS="asymmetric"
+      COLD_SYMMETRY_REASON="cold_asymmetry_es_${COLD_SYMMETRY_ES}_surch_${COLD_SYMMETRY_SURCH}" ;;
+  esac
+  reason_json="null"
+  [ -n "$COLD_SYMMETRY_REASON" ] && reason_json="\"$COLD_SYMMETRY_REASON\""
+  printf '{"cold_axis_es":"%s","cold_axis_surch":"%s","status":"%s","reason":%s,"request_percent_engaged":%s,"min_evicted_percent_engaged":%s,"cold_axis_valid":%s}\n' \
+    "$COLD_SYMMETRY_ES" "$COLD_SYMMETRY_SURCH" "$COLD_SYMMETRY_STATUS" "$reason_json" \
+    "$COLD_RECLAIM_REQUEST_PERCENT" "$COLD_RECLAIM_MIN_EVICTED_PERCENT" \
+    "$( [ "$COLD_SYMMETRY_STATUS" = "symmetric_valid" ] && printf 'true' || printf 'false' )" \
+    > "$out" || return 1
+  [ "$COLD_SYMMETRY_STATUS" = "symmetric_valid" ]
+}
+# ======================= fin sonde froide : évaluation =========================
 
 # ============ ventilation DISQUE par composant (besoin 4) =====================
 # L'axe disque doit être lu PAR COMPOSANT : D1 agit sur `_source`, D2/C5 sur les
@@ -2069,6 +2505,111 @@ c2_stream_phase_verdict_bounded(){
 }
 # =========================== fin preuve C2 ====================================
 
+# ============== C1 : élagage et terminaison anticipée (compteurs réels) ========
+# Un compteur ATTENDU mais ABSENT doit produire une invalidité NOMMÉE, jamais un
+# zéro. Le harnais n'a jamais scrapé C1 : les quatre noms circulaient dans les
+# briefs de campagne, dont deux inexistants dans le moteur, et la lecture était
+# manuelle sur les fichiers `.prom`. Un nom faux lu par `p2_counter_value`
+# aurait rendu « 0 » — un vert gratuit. Ici, `absent` est un statut, la valeur
+# publiée est `null`, et jamais 0.
+#
+# Contrat de sortie : globales C1_METRIC_*, ne pas appeler sous $(...).
+c1_metric_status(){
+  local metric="$1"
+  local before="$2"
+  local after="$3"
+  local value
+  local base
+  C1_METRIC_NAME="$metric"
+  C1_METRIC_PRESENT_BEFORE=false
+  C1_METRIC_PRESENT_AFTER=false
+  C1_METRIC_VALUE_BEFORE="null"
+  C1_METRIC_VALUE_AFTER="null"
+  C1_METRIC_DELTA="null"
+  C1_METRIC_STATUS="absent"
+  C1_METRIC_REASON=""
+  if p2_metric_present "$metric" "$before"; then
+    value=$(p2_metric_value "$metric" "$before") || {
+      C1_METRIC_STATUS="unreadable"
+      C1_METRIC_REASON="c1_metric_unreadable_before_$metric"
+      return 1
+    }
+    C1_METRIC_PRESENT_BEFORE=true
+    C1_METRIC_VALUE_BEFORE="$value"
+  fi
+  if ! p2_metric_present "$metric" "$after"; then
+    # Série jamais créée côté moteur : compteur jamais incrémenté OU nom faux.
+    # Les deux cas sont des ABSENCES, pas des zéros mesurés.
+    C1_METRIC_STATUS="absent"
+    C1_METRIC_REASON="c1_metric_absent_after_$metric"
+    return 1
+  fi
+  value=$(p2_metric_value "$metric" "$after") || {
+    C1_METRIC_STATUS="unreadable"
+    C1_METRIC_REASON="c1_metric_unreadable_after_$metric"
+    return 1
+  }
+  C1_METRIC_PRESENT_AFTER=true
+  C1_METRIC_VALUE_AFTER="$value"
+  base=0
+  [ "$C1_METRIC_PRESENT_BEFORE" = true ] && base="$C1_METRIC_VALUE_BEFORE"
+  C1_METRIC_DELTA=$(awk -v a="$C1_METRIC_VALUE_AFTER" -v b="$base" 'BEGIN { printf "%.17g", a - b }')
+  if p2_number_equal "$C1_METRIC_DELTA" 0; then
+    # Compteur présent mais immobile : c'est une OBSERVATION (le smoke 1,36 M en
+    # a produit une entre `random` et `no_source`), pas une erreur de harnais.
+    C1_METRIC_STATUS="flat"
+    return 0
+  fi
+  if p2_number_le "$C1_METRIC_DELTA" 0; then
+    C1_METRIC_STATUS="decreased"
+    C1_METRIC_REASON="c1_metric_decreased_$metric"
+    return 1
+  fi
+  C1_METRIC_STATUS="increased"
+}
+
+# Publie une ligne JSONL par compteur et par phase, et n'invalide QUE sous
+# SURCH_C1_EXPECT=require, sur les compteurs déclarés requis.
+# Contrat de sortie : globales C1_ACTIVATION_RUN_*, ne pas appeler sous $(...).
+c1_phase_record(){
+  local phase="$1"
+  local before="$2"
+  local after="$3"
+  local class
+  local list
+  local metric
+  local valid=true
+  for class in required optional; do
+    case "$class" in
+      required) list="$SURCH_C1_METRICS_REQUIRED" ;;
+      *) list="$SURCH_C1_METRICS_OPTIONAL" ;;
+    esac
+    # Découpage voulu sur les espaces : la liste de compteurs n'est pas un mot.
+    # shellcheck disable=SC2086
+    for metric in $list; do
+      c1_metric_status "$metric" "$before" "$after" || true
+      printf '{"engine":"%s","phase":"%s","expect":"%s","class":"%s","metric":"%s","present_before":%s,"present_after":%s,"value_before":%s,"value_after":%s,"delta":%s,"status":"%s","reason":%s}\n' \
+        "$ENGINE" "$phase" "$SURCH_C1_EXPECT" "$class" "$metric" \
+        "$C1_METRIC_PRESENT_BEFORE" "$C1_METRIC_PRESENT_AFTER" \
+        "$C1_METRIC_VALUE_BEFORE" "$C1_METRIC_VALUE_AFTER" "$C1_METRIC_DELTA" \
+        "$C1_METRIC_STATUS" \
+        "$( [ -n "$C1_METRIC_REASON" ] && printf '"%s"' "$C1_METRIC_REASON" || printf 'null' )" \
+        >> "$C1_ACTIVATION_JSONL"
+      if [ "$class" = "required" ] && [ "$SURCH_C1_EXPECT" = "require" ]; then
+        case "$C1_METRIC_STATUS" in
+          absent|unreadable|decreased)
+            valid=false
+            C1_ACTIVATION_RUN_VALID=false
+            C1_ACTIVATION_RUN_REASON="${C1_METRIC_REASON:-c1_metric_invalid_$metric}_phase_$phase"
+            ;;
+        esac
+      fi
+    done
+  done
+  [ "$valid" = true ]
+}
+# =========================== fin preuve C1 ====================================
+
 p2_segment_value_valid(){
   local value="$1"
   case "$P2_SEGMENT_GATE" in
@@ -2482,6 +3023,49 @@ c2_phase_end(){
   fi
 }
 
+# ---- C1 hors protocole P2 : scrape des compteurs d'élagage autour des phases --
+# `c2_snapshot_metrics` récupère l'export Prometheus COMPLET malgré son nom
+# historique : quand la preuve C2 est active, ses instantanés portent déjà les
+# compteurs C1 et sont réutilisés tels quels — aucune requête supplémentaire.
+c1_phase_begin(){
+  local base="$1"
+  local phase="$2"
+  [ "$C1_ACTIVATION_ENABLED" = true ] || return 0
+  if [ "$C2_STREAM_ENABLED" = true ] && [ -s "$OUT_DIR/$ENGINE.c2.$phase.before.prom" ]; then
+    C1_PHASE_BEFORE="$OUT_DIR/$ENGINE.c2.$phase.before.prom"
+    return 0
+  fi
+  C1_PHASE_BEFORE="$OUT_DIR/$ENGINE.c1.$phase.before.prom"
+  if ! c2_snapshot_metrics "$base" "$C1_PHASE_BEFORE" "$phase"; then
+    C1_ACTIVATION_RUN_VALID=false
+    C1_ACTIVATION_RUN_REASON="${C2_SNAPSHOT_REASON:-${phase}_c1_before_scrape_failed}"
+    return 1
+  fi
+}
+
+c1_phase_end(){
+  local base="$1"
+  local phase="$2"
+  local after
+  [ "$C1_ACTIVATION_ENABLED" = true ] || return 0
+  if [ -z "$C1_PHASE_BEFORE" ] || [ ! -s "$C1_PHASE_BEFORE" ]; then
+    C1_ACTIVATION_RUN_VALID=false
+    C1_ACTIVATION_RUN_REASON="${phase}_c1_before_snapshot_missing"
+    return 1
+  fi
+  if [ "$C2_STREAM_ENABLED" = true ] && [ -s "$OUT_DIR/$ENGINE.c2.$phase.after.prom" ]; then
+    after="$OUT_DIR/$ENGINE.c2.$phase.after.prom"
+  else
+    after="$OUT_DIR/$ENGINE.c1.$phase.after.prom"
+    if ! c2_snapshot_metrics "$base" "$after" "$phase"; then
+      C1_ACTIVATION_RUN_VALID=false
+      C1_ACTIVATION_RUN_REASON="${C2_SNAPSHOT_REASON:-${phase}_c1_after_scrape_failed}"
+      return 1
+    fi
+  fi
+  c1_phase_record "$phase" "$C1_PHASE_BEFORE" "$after"
+}
+
 # Snapshot Prometheus brut par phase. Les compteurs restent bornés côté
 # serveur; les distributions exactes sont dans le JSONL, jamais dans des
 # summaries Prometheus.
@@ -2629,9 +3213,34 @@ source_fetch_no_source_delta_is_zero(){
   ' "$1"
 }
 
-# Sonde froide L2 : chaque requête est précédée d'un reclaim cgroup v2. La
-# quantité demandée vise le cache `file` réellement observé. Chaque couple
-# before/after est conservé : aucune éviction partielle ambigüe n'est admise.
+# Sonde froide L2 : chaque requête est précédée d'un reclaim cgroup v2.
+#
+# CE QUI A CHANGÉ, ET POURQUOI. La version précédente écrivait dans
+# `memory.reclaim` la cible `min(file_before, memory.current)`, c'est-à-dire la
+# TOTALITÉ du cache de pages en une seule écriture, cinquante fois de suite, et
+# traitait tout EAGAIN comme un échec dur. Sur un hôte sans swap — le cas
+# NOMINAL d'un banc de bases de données — l'anonyme est irrécupérable : ES échoue
+# au 11e reclaim sur 50, surch au 28e dans le run témoin. Le 50/50 obtenu une
+# fois n'était pas une propriété, c'était de la chance. Le gate exigeait donc
+# quelque chose de physiquement inatteignable, et détruisait au passage le
+# livrable central (ratios par forme non calculables sur des effectifs
+# divergents).
+#
+# Le protocole retenu, à seuil PRÉ-ENGAGÉ et identique aux deux moteurs :
+#   1. la cible demandée ne porte QUE sur le cache de pages `file`, jamais sur
+#      `memory.current` qui agrège de l'anonyme non réclamable, et n'en demande
+#      que COLD_RECLAIM_REQUEST_PERCENT % : le noyau garde une marge au lieu
+#      d'être placé sur sa borne exacte ;
+#   2. la fraction RÉELLEMENT évincée est mesurée avant/après à CHAQUE tentative
+#      et journalisée — c'est elle, et non le code de retour de l'écriture, qui
+#      dit si la lecture qui suit est froide ;
+#   3. la tentative n'échoue QUE sous COLD_RECLAIM_MIN_EVICTED_PERCENT, et
+#      l'écart exact au seuil est alors journalisé dans la raison.
+#
+# Colonnes de l'audit TSV — une ligne par TENTATIVE, y compris celle qui échoue :
+#   1 request_no  2 file_before  3 file_after  4 file_after_max  5 memory_current
+#   6 reclaim_target  7 write_rc  8 evicted_bytes  9 evicted_percent
+#   10 min_evicted_percent  11 verdict
 capture_cold_samples(){
   local base="$1"
   local bodies="$2"
@@ -2658,6 +3267,7 @@ capture_cold_samples(){
   local one_took
   local one_overhead
   local one_responses
+  local write_rc
   COLD_CAPTURE_REASON=""
   COLD_CAPTURE_COMPLETED=0
   : > "$client_raw"; : > "$took_raw"; : > "$overhead_raw"
@@ -2688,21 +3298,18 @@ capture_cold_samples(){
     if [ "$file_after_max" -lt "$COLD_FILE_CACHE_FLOOR_BYTES" ]; then
       file_after_max="$COLD_FILE_CACHE_FLOOR_BYTES"
     fi
-    reclaim_target="$file_before"
-    if [ "$reclaim_target" -gt "$memory_current" ]; then
-      reclaim_target="$memory_current"
-    fi
+    # La cible ne dérive QUE du cache de pages : `memory.current` agrège
+    # l'anonyme, irrécupérable sans swap, et le demander garantissait l'EAGAIN.
+    reclaim_target=$(( file_before * COLD_RECLAIM_REQUEST_PERCENT / 100 ))
 
-    if [ "$writer" = "sudo" ]; then
-      if ! sudo -n sh -c 'printf "%s\\n" "$1" > "$2"' sh "$reclaim_target" "$reclaim_path" >/dev/null 2>&1; then
-        COLD_CAPTURE_REASON="memory_reclaim_write_failed_before_request_$request_no"
-        COLD_CAPTURE_COMPLETED="$completed"
-        return 1
+    write_rc=0
+    if [ "$reclaim_target" -ge 1 ]; then
+      if [ "$writer" = "sudo" ]; then
+        sudo -n sh -c 'printf "%s\\n" "$1" > "$2"' sh "$reclaim_target" "$reclaim_path" >/dev/null 2>&1 \
+          || write_rc=$?
+      else
+        { printf '%s\n' "$reclaim_target" > "$reclaim_path"; } 2>/dev/null || write_rc=$?
       fi
-    elif ! printf '%s\n' "$reclaim_target" > "$reclaim_path"; then
-      COLD_CAPTURE_REASON="memory_reclaim_write_failed_before_request_$request_no"
-      COLD_CAPTURE_COMPLETED="$completed"
-      return 1
     fi
     file_after=$(awk '/^file /{print $2; exit}' "$stat_path" 2>/dev/null)
     case "$file_after" in ''|*[!0-9]*)
@@ -2710,12 +3317,22 @@ capture_cold_samples(){
       COLD_CAPTURE_COMPLETED="$completed"
       return 1;;
     esac
-    if [ "$file_after" -gt "$file_after_max" ]; then
-      COLD_CAPTURE_REASON="memory_reclaim_target_missed_before_request_${request_no}_after_${file_after}_max_${file_after_max}"
-      COLD_CAPTURE_COMPLETED="$completed"
-      return 1
-    fi
-    printf '%s\t%s\t%s\t%s\n' "$request_no" "$file_before" "$file_after" "$file_after_max" >> "$audit"
+    # Le verdict porte sur la fraction MESURÉE, pas sur `write_rc` : un EAGAIN
+    # qui a tout de même évincé la quasi-totalité du cache décrit une lecture
+    # froide. `write_rc` reste journalisé pour l'analyse.
+    cold_reclaim_evaluate "$file_before" "$file_after"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$request_no" "$file_before" "$file_after" "$file_after_max" "$memory_current" \
+      "$reclaim_target" "$write_rc" "$COLD_RECLAIM_EVICTED_BYTES" "$COLD_RECLAIM_EVICTED_PERCENT" \
+      "$COLD_RECLAIM_MIN_EVICTED_PERCENT" "$COLD_RECLAIM_VERDICT" >> "$audit"
+    case "$COLD_RECLAIM_VERDICT" in
+      ok|ok_residual_under_floor) ;;
+      *)
+        COLD_CAPTURE_REASON="cold_reclaim_evicted_${COLD_RECLAIM_EVICTED_PERCENT}_percent_below_${COLD_RECLAIM_MIN_EVICTED_PERCENT}_gap_${COLD_RECLAIM_GAP_PERCENT}_before_request_${request_no}_residual_${file_after}_of_${file_before}_target_${reclaim_target}_write_rc_${write_rc}"
+        err "sonde froide : tentative $request_no rejetée — évincé ${COLD_RECLAIM_EVICTED_PERCENT}% du cache de pages (${COLD_RECLAIM_EVICTED_BYTES} o sur ${file_before} o), seuil pré-engagé ${COLD_RECLAIM_MIN_EVICTED_PERCENT}%, écart ${COLD_RECLAIM_GAP_PERCENT} points, cible demandée ${reclaim_target} o, write_rc=${write_rc}, verdict=${COLD_RECLAIM_VERDICT}"
+        COLD_CAPTURE_COMPLETED="$completed"
+        return 1;;
+    esac
 
     printf '%s\n' "$body" > "$one_body"
     # Le reclaim doit précéder chaque transfert cold : cette phase garde donc
@@ -2803,6 +3420,18 @@ run_engine(){
     C2_STREAM_ENABLED=true
   else
     C2_STREAM_ENABLED=false
+  fi
+  # C1 : compteurs d'élagage / terminaison anticipée. Même règle que C2 — jamais
+  # sous protocole P2, jamais pour ES (compteurs propres à surch).
+  C1_ACTIVATION_JSONL="$OUT_DIR/$ENGINE.c1-activation.jsonl"
+  C1_ACTIVATION_RUN_VALID=true
+  C1_ACTIVATION_RUN_REASON=""
+  C1_PHASE_BEFORE=""
+  : > "$C1_ACTIVATION_JSONL"
+  if [ "$ENGINE" = "surch" ] && [ "$SURCH_C1_EXPECT" != "off" ] && [ "$P2_MEASURE" != "1" ]; then
+    C1_ACTIVATION_ENABLED=true
+  else
+    C1_ACTIVATION_ENABLED=false
   fi
   if [ "$P2_MEASURE" = "1" ]; then
     [ "$ENGINE" = "surch" ] || { err "P2 ne mesure que Surch (ENGINE=$ENGINE refusé)"; return 1; }
@@ -3181,6 +3810,7 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   }
+  c1_phase_begin "$BASE" fixed || err "$ENGINE : scrape C1 indisponible avant la sonde fixe : $C1_ACTIVATION_RUN_REASON"
   if [ "$P2_MEASURE" = "1" ]; then
     if ! p2_extract_warm_bodies "$P2_WARM_BODIES" "$warm_bool_bodies" "$(( P2_WARM_TERM_COUNT + 1 ))" "$P2_WARM_TERM_COUNT"; then
       PROBE_CAPTURE_REASON="warm_bool_bodies_extract_failed"
@@ -3206,6 +3836,7 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   }
+  c1_phase_end "$BASE" fixed || err "$ENGINE : preuve C1 invalide sur la sonde fixe : $C1_ACTIVATION_RUN_REASON"
   if [ "$P2_MEASURE" != "1" ] \
      && ! probe_publish_form_stats fixed "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS"; then
     PROBE_FORM_STATS_RUN_VALID=false
@@ -3248,6 +3879,7 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   }
+  c1_phase_begin "$BASE" random || err "$ENGINE : scrape C1 indisponible avant la sonde aléatoire : $C1_ACTIVATION_RUN_REASON"
   if [ "$P2_MEASURE" = "1" ]; then
     p2_capture_phase "$BASE" bool_size10 "$P2_BOOL_SIZE10_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" 0
   else
@@ -3263,6 +3895,7 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   }
+  c1_phase_end "$BASE" random || err "$ENGINE : preuve C1 invalide sur la sonde aléatoire : $C1_ACTIVATION_RUN_REASON"
   if [ "$P2_MEASURE" != "1" ] \
      && ! probe_publish_form_stats random "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS"; then
     PROBE_FORM_STATS_RUN_VALID=false
@@ -3314,6 +3947,7 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   }
+  c1_phase_begin "$BASE" no_source || err "$ENGINE : scrape C1 indisponible avant le témoin size:0 : $C1_ACTIVATION_RUN_REASON"
   if [ "$P2_MEASURE" = "1" ]; then
     p2_capture_phase "$BASE" bool_size0 "$P2_BOOL_SIZE0_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" 0
   else
@@ -3332,6 +3966,7 @@ run_engine(){
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
   }
+  c1_phase_end "$BASE" no_source || err "$ENGINE : preuve C1 invalide sur le témoin size:0 : $C1_ACTIVATION_RUN_REASON"
   if [ "$P2_MEASURE" != "1" ] \
      && ! probe_publish_form_stats no_source "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS"; then
     PROBE_FORM_STATS_RUN_VALID=false
@@ -3474,6 +4109,12 @@ run_engine(){
     cold_skip_reason="cold_probe_disabled"
   elif [ ! -r "$stat_path" ] || [ ! -r "$current_path" ]; then
     cold_skip_reason="cgroup_memory_stat_unreadable"
+  elif [ ! -e "$reclaim_path" ]; then
+    # `memory.reclaim` n'existe qu'à partir de Linux 5.19 (la VM tournait sous
+    # 5.15 : le fichier était purement ABSENT, pas interdit). Ce n'est ni un
+    # défaut de droits ni un défaut du moteur : le RÉGIME FROID N'EST PAS
+    # MESURABLE sur cet hôte. Cela invalide l'axe froid, et lui seul.
+    cold_skip_reason="cgroup_memory_reclaim_absent_kernel_lt_5_19"
   elif [ -w "$reclaim_path" ]; then
     reclaim_writer="direct"
   elif sudo -n test -w "$reclaim_path" >/dev/null 2>&1; then
@@ -3488,6 +4129,7 @@ run_engine(){
       record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
     }
+    c1_phase_begin "$BASE" cold || err "$ENGINE : scrape C1 indisponible avant la sonde froide : $C1_ACTIVATION_RUN_REASON"
     if [ "$P2_MEASURE" = "1" ]; then
       p2_cold_cpu_before=$(p2_cpu_stat 2>/dev/null || true)
       if ! p2_snapshot_metrics "$BASE" "$p2_cold_before" cold_before; then
@@ -3529,6 +4171,7 @@ run_engine(){
           record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
           docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
         }
+        c1_phase_end "$BASE" cold || err "$ENGINE : preuve C1 invalide sur la sonde froide : $C1_ACTIVATION_RUN_REASON"
         if [ "$P2_MEASURE" != "1" ] \
            && ! probe_publish_form_stats cold "$cold_bodies" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$COLD_PROBE_REQUESTS"; then
           PROBE_FORM_STATS_RUN_VALID=false
@@ -3550,10 +4193,24 @@ run_engine(){
       cold_ok=false
       cold_skip_reason="reclaim_count_${cold_reclaimed_requests}_of_${COLD_PROBE_REQUESTS}"
     fi
-    if [ "$cold_reclaim_audit_records" -ne 50 ]; then
+    # `50` n'est plus codé en dur : l'effectif exigé est celui du protocole
+    # déclaré, sinon COLD_PROBE_REQUESTS ne veut rien dire.
+    if [ "$cold_reclaim_audit_records" -ne "$COLD_PROBE_REQUESTS" ]; then
       cold_ok=false
-      cold_skip_reason="reclaim_audit_count_${cold_reclaim_audit_records}_of_50"
+      cold_skip_reason="reclaim_audit_count_${cold_reclaim_audit_records}_of_${COLD_PROBE_REQUESTS}"
     fi
+  fi
+  # Degré de froideur RÉELLEMENT obtenu, tentative par tentative. Une sonde
+  # froide dont on ignore la fraction évincée ne vaut rien : elle est publiée
+  # dans la scorecard, valide ou pas.
+  cold_reclaim_audit_summary "$cold_reclaim_audit" || true
+  local cold_axis_valid=false
+  local cold_axis_reason="null"
+  if [ "$cold_ok" = true ]; then
+    cold_axis_valid=true
+  else
+    cold_axis_reason="\"${cold_skip_reason:-cold_capture_failed}\""
+    err "$ENGINE : AXE FROID INVALIDE — ${cold_skip_reason:-cold_capture_failed} (reclaims ${cold_reclaimed_requests}/${COLD_PROBE_REQUESTS}, audit ${cold_reclaim_audit_records} lignes, éviction min/p50/max ${COLD_AUDIT_EVICTED_MIN_PERCENT}/${COLD_AUDIT_EVICTED_P50_PERCENT}/${COLD_AUDIT_EVICTED_MAX_PERCENT} %, seuil pré-engagé ${COLD_RECLAIM_MIN_EVICTED_PERCENT} %). Les axes latence chaude, indexation et disque ne sont PAS affectés."
   fi
   if [ -r "$stat_path" ]; then
     local v2
@@ -3625,10 +4282,22 @@ run_engine(){
 
   local measurement_valid=true
   local measurement_invalid_reason="null"
-  if [ "$P2_MEASURE" != "1" ] \
-     && { [ "$cold_reclaimed_requests" -ne 50 ] || [ "$cold_reclaim_audit_records" -ne 50 ] || [ "$cold_ok" != true ]; }; then
+  # L'axe froid ne peut plus faire tomber les trois autres. Le gate historique
+  # exigeait ici, `50` codé en dur et sans échappatoire (COLD_PROBE=0 échouait le
+  # même test), une éviction intégrale du cache de pages qu'un hôte sans swap ne
+  # peut pas garantir. Son invalidité est désormais portée NOMMÉMENT par
+  # `cold_axis_valid` / `cold_axis_invalid_reason` et par `cold-axis.json` ;
+  # COLD_AXIS_REQUIRED=1 restitue le comportement bloquant pour qui le veut.
+  if [ "$COLD_AXIS_REQUIRED" = "1" ] && [ "$cold_axis_valid" != true ]; then
     measurement_valid=false
-    measurement_invalid_reason="\"${cold_skip_reason:-cold_capture_failed}\""
+    measurement_invalid_reason="$cold_axis_reason"
+  fi
+  # Besoin C1 : un compteur d'activation ATTENDU mais absent est une invalidité
+  # nommée, jamais un zéro silencieux.
+  if [ "$C1_ACTIVATION_ENABLED" = true ] && [ "$SURCH_C1_EXPECT" = "require" ] \
+     && [ "$C1_ACTIVATION_RUN_VALID" != true ]; then
+    measurement_valid=false
+    measurement_invalid_reason="\"${C1_ACTIVATION_RUN_REASON:-c1_activation_invalid}\""
   fi
   if [ "$source_fetch_profile_enabled" = true ] && [ "$source_fetch_profile_valid" != true ]; then
     measurement_valid=false
@@ -3744,8 +4413,8 @@ run_engine(){
   [ "$cold_ok" = true ] && source_fetch_prometheus_json="$source_fetch_cold_json"
   local source_fetch_metrics_json="$source_fetch_prometheus_json,\"measurement_valid\":$measurement_valid,\"measurement_invalid_reason\":$measurement_invalid_reason,\"source_fetch_profile_valid\":$source_fetch_profile_valid,\"source_fetch_profile_invalid_reason\":$source_fetch_profile_reason_json,\"source_fetch_random_worker_participations\":$source_fetch_random_worker_participations,\"source_fetch_random_hydrated_8plus_requests\":$source_fetch_random_hydrated_8plus_requests,\"source_fetch_random_hydrated_8plus_gate\":$source_fetch_random_gate_json,\"source_fetch_jsonl\":{\"fixed\":$source_fetch_fixed_jsonl_json,\"random\":$source_fetch_random_jsonl_json,\"no_source\":$source_fetch_no_source_jsonl_json,\"cold\":$source_fetch_cold_jsonl_json},\"source_fetch_snapshots\":{\"before_fixed\":$source_fetch_before_json,\"after_fixed\":$source_fetch_fixed_json,\"after_random\":$source_fetch_random_json,\"after_no_source\":$source_fetch_no_source_json,\"after_cold\":$source_fetch_cold_json},\"source_fetch_deltas\":{\"fixed\":$source_fetch_fixed_delta_json,\"random\":$source_fetch_random_delta_json,\"no_source\":$source_fetch_no_source_delta_json,\"cold\":$source_fetch_cold_delta_json}"
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\",\"probe_cpu_count\":$HOST_CPU_COUNT,\"probe_connection_reuse\":{\"fixed\":\"single_curl_next\",\"random\":\"single_curl_next\",\"no_source\":\"single_curl_next\",\"cold\":\"one_curl_per_reclaim\"},\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_fixed_client_s_file\":\"$fixed_raw\",\"lat_fixed_took_ms_file\":\"$fixed_took_raw\",\"lat_fixed_probe_overhead_ms_file\":\"$fixed_overhead_raw\",\"lat_fixed_client_p50_ms\":$lat50,\"lat_fixed_client_p95_ms\":$lat95,\"lat_fixed_client_p99_ms\":$lat99,\"lat_fixed_took_p50_ms\":$lat_fixed_took50,\"lat_fixed_took_p95_ms\":$lat_fixed_took95,\"lat_fixed_took_p99_ms\":$lat_fixed_took99,\"lat_fixed_probe_overhead_p50_ms\":$lat_fixed_probe50,\"lat_fixed_probe_overhead_p95_ms\":$lat_fixed_probe95,\"lat_fixed_probe_overhead_p99_ms\":$lat_fixed_probe99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_rand_client_s_file\":\"$random_raw\",\"lat_rand_took_ms_file\":\"$random_took_raw\",\"lat_rand_probe_overhead_ms_file\":\"$random_overhead_raw\",\"lat_rand_client_p50_ms\":$latr50,\"lat_rand_client_p95_ms\":$latr95,\"lat_rand_client_p99_ms\":$latr99,\"lat_rand_took_p50_ms\":$lat_rand_took50,\"lat_rand_took_p95_ms\":$lat_rand_took95,\"lat_rand_took_p99_ms\":$lat_rand_took99,\"lat_rand_probe_overhead_p50_ms\":$lat_rand_probe50,\"lat_rand_probe_overhead_p95_ms\":$lat_rand_probe95,\"lat_rand_probe_overhead_p99_ms\":$lat_rand_probe99,\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"lat_no_source_client_s_file\":\"$no_source_raw\",\"lat_no_source_took_ms_file\":\"$no_source_took_raw\",\"lat_no_source_probe_overhead_ms_file\":\"$no_source_overhead_raw\",\"lat_no_source_client_p50_ms\":$latn50,\"lat_no_source_client_p95_ms\":$latn95,\"lat_no_source_client_p99_ms\":$latn99,\"lat_no_source_took_p50_ms\":$lat_no_source_took50,\"lat_no_source_took_p95_ms\":$lat_no_source_took95,\"lat_no_source_took_p99_ms\":$lat_no_source_took99,\"lat_no_source_probe_overhead_p50_ms\":$lat_no_source_probe50,\"lat_no_source_probe_overhead_p95_ms\":$lat_no_source_probe95,\"lat_no_source_probe_overhead_p99_ms\":$lat_no_source_probe99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"lat_cold_client_s_file\":\"$cold_raw\",\"lat_cold_took_ms_file\":\"$cold_took_raw\",\"lat_cold_probe_overhead_ms_file\":\"$cold_overhead_raw\",\"lat_cold_client_p50_ms\":$latc50,\"lat_cold_client_p95_ms\":$latc95,\"lat_cold_client_p99_ms\":$latc99,\"lat_cold_took_p50_ms\":$lat_cold_took50,\"lat_cold_took_p95_ms\":$lat_cold_took95,\"lat_cold_took_p99_ms\":$lat_cold_took99,\"lat_cold_probe_overhead_p50_ms\":$lat_cold_probe50,\"lat_cold_probe_overhead_p95_ms\":$lat_cold_probe95,\"lat_cold_probe_overhead_p99_ms\":$lat_cold_probe99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"source_compress\":\"${SURCH_SOURCE_COMPRESS:-0}\",\"source_compress_mode\":$source_compress_mode_json,\"source_write_mode\":\"$SURCH_SOURCE_WRITE_MODE\",\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"disk_bytes_total\":$disk_bytes_total,\"disk_files_total\":$disk_files_total,\"disk_ventilation_valid\":$disk_ventilation_valid,\"disk_ventilation_reason\":$disk_ventilation_reason,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"lat_rand_form_mix_not_conclusive\":true,\"lat_by_form_jsonl\":\"$PROBE_BY_FORM_JSONL\",\"lat_by_form_valid\":$PROBE_FORM_STATS_RUN_VALID,\"c2_stream_expect\":\"$SURCH_C2_STREAM_EXPECT\",\"c2_stream_metric\":\"$SURCH_C2_STREAM_METRIC\",\"c2_stream_checked\":$C2_STREAM_ENABLED,\"c2_stream_jsonl\":\"$C2_STREAM_JSONL\",\"c2_stream_valid\":$C2_STREAM_RUN_VALID,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json$p2_json}" > "$OUT_DIR/$ENGINE.json"
-  log "$ENGINE : mesure valide=$measurement_valid | ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe client ${lat50}/${lat95}/${lat99}, moteur ${lat_fixed_took50}/${lat_fixed_took95}/${lat_fixed_took99}, sonde ${lat_fixed_probe50}/${lat_fixed_probe95}/${lat_fixed_probe99} | rand client ${latr50}/${latr95}/${latr99}, moteur ${lat_rand_took50}/${lat_rand_took95}/${lat_rand_took99}, sonde ${lat_rand_probe50}/${lat_rand_probe95}/${lat_rand_probe99} | témoin client ${latn50}/${latn95}/${latn99}, moteur ${lat_no_source_took50}/${lat_no_source_took95}/${lat_no_source_took99}, sonde ${lat_no_source_probe50}/${lat_no_source_probe95}/${lat_no_source_probe99} | cold client ${latc50}/${latc95}/${latc99}, moteur ${lat_cold_took50}/${lat_cold_took95}/${lat_cold_took99}, sonde ${lat_cold_probe50}/${lat_cold_probe95}/${lat_cold_probe99} (reclaims=$cold_reclaimed_requests/50 audit=$cold_reclaim_audit_records/50 ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\",\"probe_cpu_count\":$HOST_CPU_COUNT,\"probe_connection_reuse\":{\"fixed\":\"single_curl_next\",\"random\":\"single_curl_next\",\"no_source\":\"single_curl_next\",\"cold\":\"one_curl_per_reclaim\"},\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_fixed_client_s_file\":\"$fixed_raw\",\"lat_fixed_took_ms_file\":\"$fixed_took_raw\",\"lat_fixed_probe_overhead_ms_file\":\"$fixed_overhead_raw\",\"lat_fixed_client_p50_ms\":$lat50,\"lat_fixed_client_p95_ms\":$lat95,\"lat_fixed_client_p99_ms\":$lat99,\"lat_fixed_took_p50_ms\":$lat_fixed_took50,\"lat_fixed_took_p95_ms\":$lat_fixed_took95,\"lat_fixed_took_p99_ms\":$lat_fixed_took99,\"lat_fixed_probe_overhead_p50_ms\":$lat_fixed_probe50,\"lat_fixed_probe_overhead_p95_ms\":$lat_fixed_probe95,\"lat_fixed_probe_overhead_p99_ms\":$lat_fixed_probe99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_rand_client_s_file\":\"$random_raw\",\"lat_rand_took_ms_file\":\"$random_took_raw\",\"lat_rand_probe_overhead_ms_file\":\"$random_overhead_raw\",\"lat_rand_client_p50_ms\":$latr50,\"lat_rand_client_p95_ms\":$latr95,\"lat_rand_client_p99_ms\":$latr99,\"lat_rand_took_p50_ms\":$lat_rand_took50,\"lat_rand_took_p95_ms\":$lat_rand_took95,\"lat_rand_took_p99_ms\":$lat_rand_took99,\"lat_rand_probe_overhead_p50_ms\":$lat_rand_probe50,\"lat_rand_probe_overhead_p95_ms\":$lat_rand_probe95,\"lat_rand_probe_overhead_p99_ms\":$lat_rand_probe99,\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"lat_no_source_client_s_file\":\"$no_source_raw\",\"lat_no_source_took_ms_file\":\"$no_source_took_raw\",\"lat_no_source_probe_overhead_ms_file\":\"$no_source_overhead_raw\",\"lat_no_source_client_p50_ms\":$latn50,\"lat_no_source_client_p95_ms\":$latn95,\"lat_no_source_client_p99_ms\":$latn99,\"lat_no_source_took_p50_ms\":$lat_no_source_took50,\"lat_no_source_took_p95_ms\":$lat_no_source_took95,\"lat_no_source_took_p99_ms\":$lat_no_source_took99,\"lat_no_source_probe_overhead_p50_ms\":$lat_no_source_probe50,\"lat_no_source_probe_overhead_p95_ms\":$lat_no_source_probe95,\"lat_no_source_probe_overhead_p99_ms\":$lat_no_source_probe99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"cold_axis_valid\":$cold_axis_valid,\"cold_axis_invalid_reason\":$cold_axis_reason,\"cold_axis_required\":$COLD_AXIS_REQUIRED,\"cold_reclaim_request_percent\":$COLD_RECLAIM_REQUEST_PERCENT,\"cold_reclaim_min_evicted_percent\":$COLD_RECLAIM_MIN_EVICTED_PERCENT,\"cold_reclaim_evicted_percent_min\":$COLD_AUDIT_EVICTED_MIN_PERCENT,\"cold_reclaim_evicted_percent_p50\":$COLD_AUDIT_EVICTED_P50_PERCENT,\"cold_reclaim_evicted_percent_max\":$COLD_AUDIT_EVICTED_MAX_PERCENT,\"cold_reclaim_attempts_below_floor\":$COLD_AUDIT_BELOW_FLOOR,\"cold_reclaim_audit_columns\":\"request_no,file_before,file_after,file_after_max,memory_current,reclaim_target,write_rc,evicted_bytes,evicted_percent,min_evicted_percent,verdict\",\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"lat_cold_client_s_file\":\"$cold_raw\",\"lat_cold_took_ms_file\":\"$cold_took_raw\",\"lat_cold_probe_overhead_ms_file\":\"$cold_overhead_raw\",\"lat_cold_client_p50_ms\":$latc50,\"lat_cold_client_p95_ms\":$latc95,\"lat_cold_client_p99_ms\":$latc99,\"lat_cold_took_p50_ms\":$lat_cold_took50,\"lat_cold_took_p95_ms\":$lat_cold_took95,\"lat_cold_took_p99_ms\":$lat_cold_took99,\"lat_cold_probe_overhead_p50_ms\":$lat_cold_probe50,\"lat_cold_probe_overhead_p95_ms\":$lat_cold_probe95,\"lat_cold_probe_overhead_p99_ms\":$lat_cold_probe99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"source_compress\":\"${SURCH_SOURCE_COMPRESS:-0}\",\"source_compress_mode\":$source_compress_mode_json,\"source_write_mode\":\"$SURCH_SOURCE_WRITE_MODE\",\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"disk_bytes_total\":$disk_bytes_total,\"disk_files_total\":$disk_files_total,\"disk_ventilation_valid\":$disk_ventilation_valid,\"disk_ventilation_reason\":$disk_ventilation_reason,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"lat_rand_form_mix_not_conclusive\":true,\"lat_by_form_jsonl\":\"$PROBE_BY_FORM_JSONL\",\"lat_by_form_valid\":$PROBE_FORM_STATS_RUN_VALID,\"c2_stream_expect\":\"$SURCH_C2_STREAM_EXPECT\",\"c2_stream_metric\":\"$SURCH_C2_STREAM_METRIC\",\"c2_stream_checked\":$C2_STREAM_ENABLED,\"c2_stream_jsonl\":\"$C2_STREAM_JSONL\",\"c2_stream_valid\":$C2_STREAM_RUN_VALID,\"c1_expect\":\"$SURCH_C1_EXPECT\",\"c1_activation_checked\":$C1_ACTIVATION_ENABLED,\"c1_activation_valid\":$C1_ACTIVATION_RUN_VALID,\"c1_activation_invalid_reason\":$( [ -n "$C1_ACTIVATION_RUN_REASON" ] && printf '"%s"' "$C1_ACTIVATION_RUN_REASON" || printf 'null' ),\"c1_activation_jsonl\":\"$C1_ACTIVATION_JSONL\",\"c1_metrics_required\":\"$SURCH_C1_METRICS_REQUIRED\",\"c1_metrics_optional\":\"$SURCH_C1_METRICS_OPTIONAL\",\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json$p2_json}" > "$OUT_DIR/$ENGINE.json"
+  log "$ENGINE : mesure valide=$measurement_valid | ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe client ${lat50}/${lat95}/${lat99}, moteur ${lat_fixed_took50}/${lat_fixed_took95}/${lat_fixed_took99}, sonde ${lat_fixed_probe50}/${lat_fixed_probe95}/${lat_fixed_probe99} | rand client ${latr50}/${latr95}/${latr99}, moteur ${lat_rand_took50}/${lat_rand_took95}/${lat_rand_took99}, sonde ${lat_rand_probe50}/${lat_rand_probe95}/${lat_rand_probe99} | témoin client ${latn50}/${latn95}/${latn99}, moteur ${lat_no_source_took50}/${lat_no_source_took95}/${lat_no_source_took99}, sonde ${lat_no_source_probe50}/${lat_no_source_probe95}/${lat_no_source_probe99} | cold client ${latc50}/${latc95}/${latc99}, moteur ${lat_cold_took50}/${lat_cold_took95}/${lat_cold_took99}, sonde ${lat_cold_probe50}/${lat_cold_probe95}/${lat_cold_probe99} (reclaims=$cold_reclaimed_requests/$COLD_PROBE_REQUESTS audit=$cold_reclaim_audit_records/$COLD_PROBE_REQUESTS ok=$cold_ok axe_froid=$cold_axis_valid éviction min/p50/max=${COLD_AUDIT_EVICTED_MIN_PERCENT}/${COLD_AUDIT_EVICTED_P50_PERCENT}/${COLD_AUDIT_EVICTED_MAX_PERCENT}% seuil=${COLD_RECLAIM_MIN_EVICTED_PERCENT}% skip=${cold_skip_reason:-none}) ms"
   [ "$HOLD_SECONDS" -gt 0 ] 2>/dev/null && { log "$ENGINE : HOLD_SECONDS=$HOLD_SECONDS avant teardown (brancher artillery-replay.sh sur $NET / $CID)"; sleep "$HOLD_SECONDS"; }
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
   [ "$measurement_valid" = true ]
@@ -3755,14 +4424,31 @@ ENGINES="${ENGINES:-es surch}"   # ex: ENGINES=surch pour rejouer un seul moteur
 run_failed=0
 for _e in $ENGINES; do run_engine "$_e" || run_failed=1; done
 
+# ---- SYMÉTRIE de l'axe froid entre moteurs ----
+# La comparaison n'a de sens que si les DEUX moteurs ont subi le même traitement
+# froid. Un moteur qui obtient sa série et l'autre non ne produit pas une
+# comparaison dégradée : il produit une invalidité NOMMÉE, écrite dans
+# `cold-axis.json`, et la phase froide est écartée des ratios.
+if [ "$P2_MEASURE" != "1" ] && [ -s "$OUT_DIR/es.json" ] && [ -s "$OUT_DIR/surch.json" ]; then
+  cold_axis_symmetry "$OUT_DIR/es.json" "$OUT_DIR/surch.json" "$OUT_DIR/cold-axis.json" || true
+  case "$COLD_SYMMETRY_STATUS" in
+    symmetric_valid)
+      log "axe froid : les deux moteurs ont obtenu leur série froide complète au seuil pré-engagé ${COLD_RECLAIM_MIN_EVICTED_PERCENT} % d'éviction du cache de pages ($OUT_DIR/cold-axis.json)" ;;
+    *)
+      err "AXE FROID INVALIDE : $COLD_SYMMETRY_REASON (voir $OUT_DIR/cold-axis.json). Les axes latence chaude, indexation (doc/s) et disque restent jugés sur leurs propres preuves."
+      if [ "$COLD_AXIS_REQUIRED" = "1" ]; then run_failed=1; fi ;;
+  esac
+fi
+
 # Ratios surch/ES PAR FORME dès que les deux moteurs ont tourné dans ce
 # OUT_DIR. Le fichier ne contient AUCUN agrégat : c'est la seule table de
 # ratios sur laquelle une conclusion latence est légitime.
 if [ "$P2_MEASURE" != "1" ] && [ -s "$OUT_DIR/es.by-form.jsonl" ] && [ -s "$OUT_DIR/surch.by-form.jsonl" ]; then
-  if by_form_ratios "$OUT_DIR/es.by-form.jsonl" "$OUT_DIR/surch.by-form.jsonl" "$OUT_DIR/by-form-ratios.jsonl"; then
-    log "ratios par forme : $OUT_DIR/by-form-ratios.jsonl (aucun agrégat — un ratio toutes formes confondues est ininterprétable)"
+  if by_form_ratios_publish "$OUT_DIR/es.by-form.jsonl" "$OUT_DIR/surch.by-form.jsonl" \
+       "$OUT_DIR/by-form-ratios.jsonl" "$OUT_DIR/by-form-ratios.status.json"; then
+    log "ratios par forme ($BY_FORM_PUBLISH_SCOPE) : $OUT_DIR/by-form-ratios.jsonl — état : $OUT_DIR/by-form-ratios.status.json (aucun agrégat — un ratio toutes formes confondues est ininterprétable)"
   else
-    err "ratios par forme impossibles : $BY_FORM_RATIOS_REASON"
+    err "ratios par forme impossibles : $BY_FORM_PUBLISH_REASON — état : $OUT_DIR/by-form-ratios.status.json"
     run_failed=1
   fi
 fi
