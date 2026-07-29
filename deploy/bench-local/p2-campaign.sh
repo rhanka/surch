@@ -32,6 +32,16 @@ P2_RECOVERY_MEM_TOLERANCE_MIB="${P2_RECOVERY_MEM_TOLERANCE_MIB:-512}"
 P2_RECOVERY_DISK_TOLERANCE_MIB="${P2_RECOVERY_DISK_TOLERANCE_MIB:-128}"
 P2_RECOVERY_LOAD_TOLERANCE="${P2_RECOVERY_LOAD_TOLERANCE:-0.25}"
 P2_REPLAY_MIX_5050="${P2_REPLAY_MIX_5050:-0}"
+# Les trois SHA pré-engagés sont ANTÉRIEURS aux chantiers C2 et D1 :
+#   - leur image n'expose pas `surch_dbg_c2_single_term_stream_total` et ne
+#     possède pas `single_term_match_topk_streamed` -> attente `reference` ;
+#   - elle ignore `SURCH_SOURCE_COMPRESS_MODE` et écrit donc du zstd PAR
+#     DOCUMENT -> déclaration `doc`, qui est un FAIT sur ces pins.
+# fair-ab.sh exige ces deux déclarations sous P2_MEASURE=1 ; les défauts ci-
+# dessous les rendent exactes pour la campagne A/B/C figée, et une campagne
+# ultérieure sur des images post-C2/D1 doit les surcharger EXPLICITEMENT.
+P2_C2_STREAM_EXPECT="${P2_C2_STREAM_EXPECT:-reference}"
+P2_SOURCE_COMPRESS_MODE="${P2_SOURCE_COMPRESS_MODE:-doc}"
 BULK_FILE="${BULK_FILE:-}"
 MAPPING_FILE="${MAPPING_FILE:-}"
 
@@ -108,6 +118,8 @@ case "$P2_REST_SECONDS:$P2_RECOVERY_MEM_TOLERANCE_MIB:$P2_RECOVERY_DISK_TOLERANC
   *[!0-9:]*|:*|*::*) die "paramètres P2 de récupération invalides";;
 esac
 case "$P2_REPLAY_MIX_5050" in 0|1) ;; *) die "P2_REPLAY_MIX_5050 doit valoir 0 ou 1";; esac
+case "$P2_C2_STREAM_EXPECT" in stream|reference) ;; *) die "P2_C2_STREAM_EXPECT doit valoir stream ou reference";; esac
+case "$P2_SOURCE_COMPRESS_MODE" in doc|block) ;; *) die "P2_SOURCE_COMPRESS_MODE doit valoir doc ou block";; esac
 [ "$P2_A_SHA" = "$P3_A_SHA" ] || die "P2_A_SHA diffère du SHA pré-engagé P3"
 [ "$P2_B_SHA" = "$P3_B_SHA" ] || die "P2_B_SHA diffère du SHA pré-engagé P3"
 [ "$P2_C_SHA" = "$P3_C_SHA" ] || die "P2_C_SHA diffère du SHA pré-engagé P3"
@@ -257,11 +269,15 @@ assert_scorecard(){
   [ -s "$score" ] || die "scorecard absente: $score"
   jq -e \
     --arg variant "$variant" \
+    --arg c2_expect "$P2_C2_STREAM_EXPECT" \
+    --arg source_mode "$P2_SOURCE_COMPRESS_MODE" \
     --argjson docs "$EXPECTED_DOCS" \
     --argjson segments "$REQUIRED_SEGMENTS" '
       .measurement_valid == true
       and .count == $docs and .indexed == $docs and .item_errors == 0
       and .p2.variant == $variant and .p2.expected_docs == $docs
+      and .p2.c2_stream_expect == $c2_expect
+      and .p2.source_compress_mode == $source_mode
       and .p2.required_segments == $segments and .p2.causal_phase_records == 5
       and ((.p2.replay_mix_5050 == 0 and .p2.phase_records == 6 and .p2.telemetry_records == 13) or (.p2.replay_mix_5050 == 1 and .p2.phase_records == 7 and .p2.telemetry_records == 15))
       and (.p2.observed_cpu_configuration.nproc == .probe_cpu_count)
@@ -312,6 +328,7 @@ run_variant(){
     "PROBE_FIELD_NOM=NOM" "PROBE_FIELD_PRENOMS=PRENOMS" "PROBE_FIXED_TERM=MARTIN" \
     "CPUSET=0-2" "MEM_LIMIT=6g" "HARNESS_MEM_MAX=3G" "PREFLIGHT_MARGIN_MIB=2048" "AUX_MEM=512m" \
     "POSTINGS_DISK=1" "SURCH_SOURCE_COMPRESS=1" \
+    "SURCH_SOURCE_COMPRESS_MODE=$P2_SOURCE_COMPRESS_MODE" "SURCH_C2_STREAM_EXPECT=$P2_C2_STREAM_EXPECT" \
     "SURCH_FLUSH_BUDGET_BYTES=$FLUSH_BUDGET" "SURCH_MERGE_FANIN=$MERGE_FANIN" \
     "SURCH_DENSIFY_BUDGET_DOCS=1000000" "SURCH_MERGE_MAX_DOCS=7000000" \
     "SURCH_SOURCE_FETCH_PROFILE=0" "PREFLIGHT_FORCE=0" \
