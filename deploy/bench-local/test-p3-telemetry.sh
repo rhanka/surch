@@ -91,7 +91,9 @@ awk '
   capture { print }
 ' "$HARNESS" > "$TMP_DIR/form-helpers.sh"
 for helper in probe_quantiles probe_form_vector probe_form_count probe_split_series_by_form \
-  probe_mono_token_match_count probe_publish_form_stats by_form_ratios disk_ventilation_classify; do
+  probe_mono_token_match_count probe_publish_form_stats by_form_ratios disk_ventilation_classify \
+  by_form_pairing_report by_form_common_phases by_form_filter_phases by_form_ratios_publish \
+  by_form_ratios_status cold_reclaim_evaluate cold_reclaim_audit_summary cold_axis_symmetry; do
   grep -q "^$helper(){" "$TMP_DIR/form-helpers.sh" \
     || fail "$helper non extrait : le bornage awk a dérivé"
 done
@@ -114,7 +116,8 @@ source "$TMP_DIR/validation-helpers.sh"
 source "$TMP_DIR/cpu-steal-helper.sh"
 source "$TMP_DIR/form-helpers.sh"
 source "$TMP_DIR/phase-status-helper.sh"
-for helper in c2_expected_stream_delta c2_stream_phase_verdict c2_stream_phase_verdict_bounded; do
+for helper in c2_expected_stream_delta c2_stream_phase_verdict c2_stream_phase_verdict_bounded \
+  c1_metric_status c1_phase_record; do
   grep -q "^$helper(){" "$TMP_DIR/validation-helpers.sh" \
     || fail "$helper non extrait : le bornage awk a dérivé"
 done
@@ -406,8 +409,12 @@ jq -c '.n = 400' "$SURCH_FORMS" > "$OUT_DIR/surch.by-form.desapparie.jsonl"
 if by_form_ratios "$ES_FORMS" "$OUT_DIR/surch.by-form.desapparie.jsonl" "$OUT_DIR/ratios-desapparies.jsonl" 2>/dev/null; then
   fail 'T12bis: des effectifs différents doivent refuser le ratio'
 fi
-[ "$BY_FORM_RATIOS_REASON" = by_form_ratios_jq_error ] \
-  || fail "T12bis: raison inattendue pour un appariement rompu : $BY_FORM_RATIOS_REASON"
+case "$BY_FORM_RATIOS_REASON" in
+  by_form_population_mismatch_only_es_0_only_surch_0_n_mismatch_2_*) ;;
+  *) fail "T12bis: raison inattendue pour un appariement rompu : $BY_FORM_RATIOS_REASON";;
+esac
+[ ! -e "$OUT_DIR/ratios-desapparies.jsonl" ] \
+  || fail 'T12bis: un appariement rompu ne doit laisser AUCUN fichier de ratios (même vide)'
 # Forme absente d'un côté : refus également.
 head -n 1 "$ES_FORMS" > "$OUT_DIR/es.by-form.partiel.jsonl"
 if by_form_ratios "$OUT_DIR/es.by-form.partiel.jsonl" "$SURCH_FORMS" "$OUT_DIR/ratios-partiels.jsonl" 2>/dev/null; then
@@ -578,5 +585,299 @@ p2_write_phase_status match_control 0 100 "$C2_BEFORE" "$C2_AFTER" 0 true '' \
 jq -se '.[0] | .c2_stream.checked == false and .c2_stream.expect == "off" and .c2_stream.delta == null' \
   "$P2_PHASE_STATUS" | grep -qx true \
   || { cat "$P2_PHASE_STATUS" >&2; fail 'T16: l absence de vérification C2 doit être explicite dans le statut'; }
+
+# ============================================================================
+# Lot « sonde froide réalisable » : le régime froid est le seul qui teste le
+# comportement disk-backed. Il n'est pas supprimé — il est rendu RÉALISABLE
+# (cible sur le cache de pages, fraction évincée mesurée) et HONNÊTE (seuil
+# pré-engagé, symétrie entre moteurs, invalidités nommées).
+# ============================================================================
+
+# ==== T17 : le verdict d'une tentative de reclaim porte sur la FRACTION
+#            RÉELLEMENT ÉVINCÉE, pas sur le code de retour de l'écriture.
+#            Le cas PARTIEL est celui qui bloquait la campagne 28 M. ====
+set_step 'T17 — reclaim partiel : accepté au-dessus du seuil, nommé en dessous'
+COLD_FILE_CACHE_FLOOR_BYTES=4194304
+COLD_RECLAIM_MIN_EVICTED_PERCENT=80
+COLD_RECLAIM_REQUEST_PERCENT=90
+
+# Éviction quasi totale : froid, évidemment.
+cold_reclaim_evaluate 1000000000 50000000 \
+  || fail "T17: 95 % d'éviction doit être accepté (verdict=$COLD_RECLAIM_VERDICT)"
+[ "$COLD_RECLAIM_EVICTED_PERCENT" = 95 ] || fail "T17: fraction évincée incorrecte ($COLD_RECLAIM_EVICTED_PERCENT)"
+[ "$COLD_RECLAIM_VERDICT" = ok ] || fail "T17: verdict incorrect ($COLD_RECLAIM_VERDICT)"
+
+# Reclaim PARTIEL exactement au seuil pré-engagé : accepté, et c'est tout le
+# point du lot — le noyau rend EAGAIN bien avant 100 % sur un hôte sans swap.
+cold_reclaim_evaluate 1000000000 200000000 \
+  || fail 'T17: une éviction exactement au seuil pré-engagé doit être acceptée'
+[ "$COLD_RECLAIM_EVICTED_PERCENT" = 80 ] || fail 'T17: fraction au seuil incorrecte'
+[ "$COLD_RECLAIM_GAP_PERCENT" = 0 ] || fail 'T17: écart au seuil non nul alors que le seuil est atteint'
+
+# Reclaim PARTIEL un point sous le seuil : REFUS nommé, avec l'écart exact.
+if cold_reclaim_evaluate 1000000000 201000000; then
+  fail 'T17: une éviction sous le seuil pré-engagé doit être refusée'
+fi
+[ "$COLD_RECLAIM_VERDICT" = below_floor ] || fail "T17: verdict de refus incorrect ($COLD_RECLAIM_VERDICT)"
+[ "$COLD_RECLAIM_EVICTED_PERCENT" = 79 ] || fail 'T17: la troncature entière doit rester conservatrice (79, pas 80)'
+[ "$COLD_RECLAIM_GAP_PERCENT" = 1 ] || fail "T17: l'écart exact au seuil doit être journalisé (reçu $COLD_RECLAIM_GAP_PERCENT)"
+
+# Reclaim franchement partiel : refus, écart de 20 points.
+if cold_reclaim_evaluate 1000000000 400000000; then
+  fail 'T17: 60 % d éviction doit être refusé à seuil 80'
+fi
+[ "$COLD_RECLAIM_GAP_PERCENT" = 20 ] || fail 'T17: écart au seuil incorrect pour 60 %'
+
+# Plancher absolu : quelques Mio résiduels sont froids quelle que soit la
+# fraction relative (sinon un cgroup déjà froid serait déclaré chaud).
+cold_reclaim_evaluate 3000000 3000000 \
+  || fail 'T17: un résidu sous le plancher absolu doit rester froid'
+[ "$COLD_RECLAIM_VERDICT" = ok_residual_under_floor ] || fail 'T17: verdict de plancher absolu incorrect'
+
+# Entrées non numériques : fail-closed, jamais une fraction inventée.
+if cold_reclaim_evaluate '' 10; then fail 'T17: un file_before illisible doit être invalide'; fi
+[ "$COLD_RECLAIM_VERDICT" = file_before_invalid ] || fail 'T17: motif file_before invalide incorrect'
+if cold_reclaim_evaluate 100 'x'; then fail 'T17: un file_after illisible doit être invalide'; fi
+[ "$COLD_RECLAIM_VERDICT" = file_after_invalid ] || fail 'T17: motif file_after invalide incorrect'
+
+# Le seuil est un PARAMÈTRE PRÉ-ENGAGÉ, pas une constante cachée : le desserrer
+# doit visiblement changer le verdict (et c'est pour cela qu'il est publié dans
+# la scorecard et figé sous protocole P2).
+COLD_RECLAIM_MIN_EVICTED_PERCENT=60
+cold_reclaim_evaluate 1000000000 400000000 \
+  || fail 'T17: à seuil 60, 60 % d éviction doit être accepté'
+COLD_RECLAIM_MIN_EVICTED_PERCENT=80
+
+# ==== T18 : le degré de froideur obtenu est MESURÉ et RÉCAPITULÉ. Une sonde
+#            froide dont on ignore la fraction évincée ne vaut rien. ====
+set_step 'T18 — synthèse de l audit de reclaim (min/p50/max, tentatives sous le seuil)'
+COLD_AUDIT="$OUT_DIR/cold_reclaim.tsv"
+{
+  printf '1\t1000000000\t50000000\t200000000\t4000000000\t900000000\t0\t950000000\t95\t80\tok\n'
+  printf '2\t1000000000\t200000000\t200000000\t4000000000\t900000000\t1\t800000000\t80\t80\tok\n'
+  printf '3\t1000000000\t400000000\t200000000\t4000000000\t900000000\t1\t600000000\t60\t80\tbelow_floor\n'
+} > "$COLD_AUDIT"
+cold_reclaim_audit_summary "$COLD_AUDIT" || fail 'T18: la synthèse de l audit doit aboutir'
+[ "$COLD_AUDIT_RECORDS" = 3 ] || fail "T18: effectif d audit incorrect ($COLD_AUDIT_RECORDS)"
+[ "$COLD_AUDIT_EVICTED_MIN_PERCENT" = 60 ] || fail 'T18: minimum d éviction incorrect'
+[ "$COLD_AUDIT_EVICTED_MAX_PERCENT" = 95 ] || fail 'T18: maximum d éviction incorrect'
+[ "$COLD_AUDIT_EVICTED_P50_PERCENT" = 80 ] || fail 'T18: médiane d éviction incorrecte'
+[ "$COLD_AUDIT_BELOW_FLOOR" = 1 ] || fail 'T18: le décompte des tentatives sous le seuil est faux'
+if cold_reclaim_audit_summary "$OUT_DIR/audit-absent.tsv"; then
+  fail 'T18: un audit absent ne doit pas produire de synthèse'
+fi
+[ "$COLD_AUDIT_EVICTED_MIN_PERCENT" = null ] \
+  || fail 'T18: sans audit, la fraction publiée doit être null — jamais 0'
+
+# ==== T19 : SYMÉTRIE entre moteurs. Un moteur qui obtient sa série froide et
+#            pas l'autre rend l'axe froid INVALIDE, nommément. ====
+set_step 'T19 — symétrie de l axe froid entre moteurs'
+COLD_RECLAIM_REQUEST_PERCENT=90
+printf '{"engine":"es","cold_axis_valid":true}\n' > "$OUT_DIR/es.json"
+printf '{"engine":"surch","cold_axis_valid":true}\n' > "$OUT_DIR/surch.json"
+cold_axis_symmetry "$OUT_DIR/es.json" "$OUT_DIR/surch.json" "$OUT_DIR/cold-axis.json" \
+  || fail "T19: deux séries froides complètes doivent être symétriques ($COLD_SYMMETRY_STATUS)"
+[ "$COLD_SYMMETRY_STATUS" = symmetric_valid ] || fail 'T19: statut de symétrie incorrect'
+jq -e '.cold_axis_valid == true and .status == "symmetric_valid" and .min_evicted_percent_engaged == 80' \
+  "$OUT_DIR/cold-axis.json" > /dev/null \
+  || { cat "$OUT_DIR/cold-axis.json" >&2; fail 'T19: le seuil pré-engagé doit être publié avec le verdict'; }
+
+printf '{"engine":"surch","cold_axis_valid":false,"cold_axis_invalid_reason":"reclaim_count_27_of_50"}\n' > "$OUT_DIR/surch.json"
+if cold_axis_symmetry "$OUT_DIR/es.json" "$OUT_DIR/surch.json" "$OUT_DIR/cold-axis.json"; then
+  fail 'T19: une série froide obtenue par un seul moteur ne peut pas être valide'
+fi
+[ "$COLD_SYMMETRY_STATUS" = asymmetric ] || fail "T19: statut asymétrique attendu ($COLD_SYMMETRY_STATUS)"
+[ "$COLD_SYMMETRY_REASON" = cold_asymmetry_es_valid_surch_invalid ] \
+  || fail "T19: motif d asymétrie non diagnosticable : $COLD_SYMMETRY_REASON"
+jq -e '.cold_axis_valid == false and .status == "asymmetric"' "$OUT_DIR/cold-axis.json" > /dev/null \
+  || fail 'T19: l artefact de symétrie ne porte pas l invalidité'
+
+# Absence des DEUX côtés : symétrique, donc pas un biais de comparaison — mais
+# l'axe froid reste invalide et le dit.
+printf '{"engine":"es","cold_axis_valid":false}\n' > "$OUT_DIR/es.json"
+if cold_axis_symmetry "$OUT_DIR/es.json" "$OUT_DIR/surch.json" "$OUT_DIR/cold-axis.json"; then
+  fail 'T19: un axe froid absent des deux côtés ne peut pas être déclaré valide'
+fi
+[ "$COLD_SYMMETRY_STATUS" = symmetric_absent ] || fail 'T19: statut d absence symétrique incorrect'
+case "$COLD_SYMMETRY_REASON" in
+  cold_axis_unmeasured_on_both_engines_*) ;;
+  *) fail "T19: motif d absence symétrique non nommé : $COLD_SYMMETRY_REASON";;
+esac
+
+# ==== T20 : effectifs par forme DIVERGENTS — le cas exact qui a produit un
+#            `by-form-ratios.jsonl` de 0 octet. Invalidité nommée, aucun
+#            fichier vide, et repli EXPLICITE sur les phases communes. ====
+set_step 'T20 — effectifs divergents : invalidité nommée, jamais un fichier de ratios vide'
+ES_COLD="$OUT_DIR/es.cold-asym.jsonl"
+SURCH_COLD="$OUT_DIR/surch.cold-asym.jsonl"
+{
+  printf '{"engine":"es","phase":"random","form":"match","metric":"took","unit":"ms","n":500,"raw_file":"/e/m","p50":10,"p95":50,"p99":100}\n'
+  printf '{"engine":"es","phase":"random","form":"bool","metric":"took","unit":"ms","n":500,"raw_file":"/e/b","p50":20,"p95":60,"p99":120}\n'
+} > "$ES_COLD"
+{
+  printf '{"engine":"surch","phase":"random","form":"match","metric":"took","unit":"ms","n":500,"raw_file":"/s/m","p50":25,"p95":200,"p99":300}\n'
+  printf '{"engine":"surch","phase":"random","form":"bool","metric":"took","unit":"ms","n":500,"raw_file":"/s/b","p50":10,"p95":30,"p99":60}\n'
+  printf '{"engine":"surch","phase":"cold","form":"match","metric":"took","unit":"ms","n":50,"raw_file":"/s/c","p50":90,"p95":120,"p99":150}\n'
+} > "$SURCH_COLD"
+RATIOS_ASYM="$OUT_DIR/ratios-cold-asym.jsonl"
+if by_form_ratios "$ES_COLD" "$SURCH_COLD" "$RATIOS_ASYM" 2>/dev/null; then
+  fail 'T20: des populations divergentes ne doivent JAMAIS produire de ratios'
+fi
+case "$BY_FORM_RATIOS_REASON" in
+  by_form_population_mismatch_only_es_0_only_surch_1_*) ;;
+  *) fail "T20: raison non diagnosticable pour une divergence d effectifs : $BY_FORM_RATIOS_REASON";;
+esac
+[ ! -e "$RATIOS_ASYM" ] || fail 'T20: aucun fichier de ratios ne doit subsister (0 octet compris)'
+[ -s "$RATIOS_ASYM.pairing.json" ] || fail 'T20: le rapport d appariement doit nommer les clés fautives'
+jq -e '.only_surch == ["[\"cold\",\"match\",\"took\"]"] and (.only_es | length) == 0' \
+  "$RATIOS_ASYM.pairing.json" > /dev/null \
+  || { cat "$RATIOS_ASYM.pairing.json" >&2; fail 'T20: le rapport d appariement ne désigne pas la clé fautive'; }
+
+# Repli : les ratios CHAUDS restent calculables sur les phases strictement
+# appariées, la phase froide est NOMMÉMENT écartée, et l'état est écrit.
+STATUS_ASYM="$OUT_DIR/ratios-cold-asym.status.json"
+by_form_ratios_publish "$ES_COLD" "$SURCH_COLD" "$RATIOS_ASYM" "$STATUS_ASYM" 2>/dev/null \
+  || fail "T20: le repli sur les phases communes doit aboutir ($BY_FORM_PUBLISH_REASON)"
+[ "$BY_FORM_PUBLISH_SCOPE" = common_phases ] || fail 'T20: le périmètre publié doit être explicitement restreint'
+jq -e '
+  .scope == "common_phases" and .valid == true
+  and .reason == "cold_phase_excluded_from_ratios"
+  and (.included_phases | test("random"))
+  and (.excluded_phases | test("cold"))
+  and .ratio_records == 2
+' "$STATUS_ASYM" > /dev/null \
+  || { cat "$STATUS_ASYM" >&2; fail 'T20: l état de publication ne nomme pas la phase écartée'; }
+jq -se 'length == 2 and all(.[]; .phase == "random")' "$RATIOS_ASYM" | grep -qx true \
+  || { cat "$RATIOS_ASYM" >&2; fail 'T20: les ratios publiés doivent porter uniquement sur les phases appariées'; }
+
+# Une divergence HORS phase froide n'est pas l'asymétrie connue : elle est un
+# défaut, et le repli doit la refuser.
+ES_BAD="$OUT_DIR/es.random-bad.jsonl"
+head -n 1 "$ES_COLD" > "$ES_BAD"
+head -n 2 "$SURCH_COLD" > "$OUT_DIR/surch.random-bad.jsonl"
+if by_form_ratios_publish "$ES_BAD" "$OUT_DIR/surch.random-bad.jsonl" \
+     "$OUT_DIR/ratios-bad.jsonl" "$OUT_DIR/ratios-bad.status.json" 2>/dev/null; then
+  fail 'T20: une divergence hors phase froide ne doit pas être repliée en silence'
+fi
+case "$BY_FORM_PUBLISH_REASON" in
+  by_form_no_common_phase|by_form_population_mismatch_outside_cold_phase_*) ;;
+  *) fail "T20: motif de refus hors phase froide incorrect : $BY_FORM_PUBLISH_REASON";;
+esac
+[ -s "$OUT_DIR/ratios-bad.status.json" ] \
+  || fail 'T20: même en échec, l état de publication doit exister — rien ne passe sous silence'
+jq -e '.valid == false and .ratio_records == 0 and .ratios_file == null' \
+  "$OUT_DIR/ratios-bad.status.json" > /dev/null \
+  || { cat "$OUT_DIR/ratios-bad.status.json" >&2; fail 'T20: l état d échec doit dire qu aucun ratio n existe'; }
+
+# ==== T21 : compteurs C1 — les NOMS doivent être ceux du moteur, et un
+#            compteur ATTENDU mais absent doit produire une invalidité nommée,
+#            jamais un zéro silencieux. ====
+set_step 'T21 — compteurs C1 : noms réels, absence != zéro'
+C1_REQUIRED_DEFAULT=$(awk -F'-' '
+  /^SURCH_C1_METRICS_REQUIRED=/ { sub(/^[^-]*-/, ""); sub(/}"$/, ""); print; exit }
+' "$HARNESS")
+C1_OPTIONAL_DEFAULT=$(awk -F'-' '
+  /^SURCH_C1_METRICS_OPTIONAL=/ { sub(/^[^-]*-/, ""); sub(/}"$/, ""); print; exit }
+' "$HARNESS")
+[ -n "$C1_REQUIRED_DEFAULT" ] && [ -n "$C1_OPTIONAL_DEFAULT" ] \
+  || fail 'T21: les listes de compteurs C1 par défaut sont introuvables dans fair-ab.sh'
+# Garde-fou mécanisé contre le bug d origine : deux des quatre noms cités dans
+# les briefs (`surch_dbg_c1_scored_total`, `surch_dbg_c1_early_stop_total`)
+# n existent pas dans le moteur. Un nom que le moteur n émet pas se scraperait à
+# vide et rendrait « 0 » — un faux vert.
+for metric in $C1_REQUIRED_DEFAULT $C1_OPTIONAL_DEFAULT "$SURCH_C2_STREAM_METRIC"; do
+  grep -rq "$metric" "$ROOT_DIR/crates/surch-api/src" \
+    || fail "T21: le compteur $metric scrapé par le harnais n existe pas dans le moteur"
+done
+for absent in surch_dbg_c1_scored_total surch_dbg_c1_early_stop_total; do
+  if grep -rq "$absent" "$ROOT_DIR/crates/surch-api/src"; then
+    fail "T21: $absent existe désormais dans le moteur — la table de correspondance des noms est à revoir"
+  fi
+done
+
+ENGINE=surch
+SURCH_C1_EXPECT=require
+SURCH_C1_METRICS_REQUIRED="$C1_REQUIRED_DEFAULT"
+SURCH_C1_METRICS_OPTIONAL="$C1_OPTIONAL_DEFAULT"
+C1_ACTIVATION_JSONL="$OUT_DIR/c1-activation.jsonl"
+C1_ACTIVATION_RUN_VALID=true
+C1_ACTIVATION_RUN_REASON=""
+: > "$C1_ACTIVATION_JSONL"
+C1_BEFORE="$OUT_DIR/c1.before.prom"
+C1_AFTER="$OUT_DIR/c1.after.prom"
+# Valeurs relevées au smoke 1,36 M (fin `fixed` -> fin `random`) : élagage
+# massif, saut de blocs rare, terminaison anticipée JAMAIS déclenchée.
+printf 'surch_dbg_c1_stream_docs_scored_total 17000\nsurch_dbg_c1_stream_docs_pruned_total 4811000\n' > "$C1_BEFORE"
+printf 'surch_dbg_c1_stream_docs_scored_total 20746\nsurch_dbg_c1_stream_docs_pruned_total 4876841\nsurch_dbg_c1_maxscore_blocks_skipped_total 227\n' > "$C1_AFTER"
+c1_phase_record random "$C1_BEFORE" "$C1_AFTER" \
+  || fail "T21: des compteurs requis présents et croissants doivent rester valides ($C1_ACTIVATION_RUN_REASON)"
+[ "$C1_ACTIVATION_RUN_VALID" = true ] || fail 'T21: la phase C1 nominale ne doit pas être invalidée'
+jq -se '
+  length == 4
+  and (first(.[] | select(.metric == "surch_dbg_c1_stream_docs_scored_total"))
+       | .status == "increased" and .delta == 3746 and .class == "required")
+  and (first(.[] | select(.metric == "surch_dbg_c1_maxscore_blocks_skipped_total"))
+       | .status == "increased" and .present_before == false and .value_before == null and .delta == 227)
+  and (first(.[] | select(.metric == "surch_dbg_c1_maxscore_early_stop_total"))
+       | .status == "absent" and .value_after == null and .delta == null and .class == "optional")
+' "$C1_ACTIVATION_JSONL" | grep -qx true \
+  || { cat "$C1_ACTIVATION_JSONL" >&2; fail 'T21: un compteur absent doit être publié `absent`/null, jamais 0'; }
+
+# Un compteur REQUIS absent (nom faux ou chemin jamais emprunté) : invalidité
+# nommée. C est exactement ce qu un scrape à vide rendait « 0 » auparavant.
+: > "$C1_ACTIVATION_JSONL"
+C1_ACTIVATION_RUN_VALID=true
+C1_ACTIVATION_RUN_REASON=""
+printf 'surch_dbg_c1_stream_docs_pruned_total 4876841\n' > "$C1_AFTER"
+if c1_phase_record random "$C1_BEFORE" "$C1_AFTER"; then
+  fail 'T21: un compteur REQUIS absent doit invalider la phase'
+fi
+[ "$C1_ACTIVATION_RUN_VALID" = false ] || fail 'T21: le run doit être marqué invalide'
+[ "$C1_ACTIVATION_RUN_REASON" = 'c1_metric_absent_after_surch_dbg_c1_stream_docs_scored_total_phase_random' ] \
+  || fail "T21: motif d absence non diagnosticable : $C1_ACTIVATION_RUN_REASON"
+jq -se 'first(.[] | select(.metric == "surch_dbg_c1_stream_docs_scored_total"))
+        | .status == "absent" and .value_after == null' \
+  "$C1_ACTIVATION_JSONL" | grep -qx true \
+  || { cat "$C1_ACTIVATION_JSONL" >&2; fail 'T21: un requis absent doit rester `absent`, jamais 0'; }
+
+# Sous `observe`, la même absence est publiée mais n invalide rien : l opérateur
+# choisit ce qu il exige, le harnais ne l invente pas.
+: > "$C1_ACTIVATION_JSONL"
+C1_ACTIVATION_RUN_VALID=true
+C1_ACTIVATION_RUN_REASON=""
+SURCH_C1_EXPECT=observe
+c1_phase_record random "$C1_BEFORE" "$C1_AFTER" \
+  || fail 'T21: sous observe, une absence ne doit pas faire échouer la phase'
+[ "$C1_ACTIVATION_RUN_VALID" = true ] || fail 'T21: observe ne doit pas invalider le run'
+jq -se 'first(.[] | select(.metric == "surch_dbg_c1_stream_docs_scored_total")) | .status == "absent"' \
+  "$C1_ACTIVATION_JSONL" | grep -qx true \
+  || fail 'T21: sous observe, l absence doit rester publiée'
+
+# Compteur présent mais immobile : `flat`, ni absent ni erreur — l anomalie
+# observée entre `random` et `no_source` au smoke doit rester descriptible.
+SURCH_C1_EXPECT=require
+: > "$C1_ACTIVATION_JSONL"
+C1_ACTIVATION_RUN_VALID=true
+C1_ACTIVATION_RUN_REASON=""
+printf 'surch_dbg_c1_stream_docs_scored_total 20746\nsurch_dbg_c1_stream_docs_pruned_total 4876841\n' > "$C1_BEFORE"
+cp "$C1_BEFORE" "$C1_AFTER"
+c1_phase_record no_source "$C1_BEFORE" "$C1_AFTER" \
+  || fail 'T21: un compteur présent mais immobile ne doit pas invalider la phase'
+jq -se 'all(.[] | select(.class == "required"); .status == "flat" and .delta == 0)' \
+  "$C1_ACTIVATION_JSONL" | grep -qx true \
+  || { cat "$C1_ACTIVATION_JSONL" >&2; fail 'T21: un compteur immobile doit être publié `flat`'; }
+
+# Compteur qui recule : impossible pour un compteur Prometheus, donc invalide.
+: > "$C1_ACTIVATION_JSONL"
+C1_ACTIVATION_RUN_VALID=true
+C1_ACTIVATION_RUN_REASON=""
+printf 'surch_dbg_c1_stream_docs_scored_total 10\nsurch_dbg_c1_stream_docs_pruned_total 4876841\n' > "$C1_AFTER"
+if c1_phase_record cold "$C1_BEFORE" "$C1_AFTER"; then
+  fail 'T21: un compteur en recul doit invalider la phase'
+fi
+case "$C1_ACTIVATION_RUN_REASON" in
+  c1_metric_decreased_surch_dbg_c1_stream_docs_scored_total_phase_cold) ;;
+  *) fail "T21: motif de recul incorrect : $C1_ACTIVATION_RUN_REASON";;
+esac
 
 printf '[test-p3-telemetry] OK — toutes les assertions sur le VRAI code fair-ab.sh sont passées\n' >&2
