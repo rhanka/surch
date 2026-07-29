@@ -18,7 +18,7 @@ use surch_index::{
     },
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
-    postings::{BlockMeta, PostingsBlockSkipIter, PostingsList},
+    postings::{BlockMeta, BlockedEncodeStats, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
 };
 use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor};
@@ -6659,6 +6659,22 @@ impl AppState {
             .indices
             .get(index)
             .map(|data| data.index.postings_segment_skipped_terms())
+    }
+
+    /// D2 : ventilation des octets écrits par le codec de postings. Elle
+    /// alimente les jauges `surch_index_postings_codec_*`, seule preuve
+    /// scrapable que l'omission des fréquences constantes et le
+    /// bit-packing des deltas sont réellement engagés sur le corpus servi.
+    pub fn index_postings_codec_stats(&self, index: &str) -> Option<BlockedEncodeStats> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .indices
+            .get(index)
+            .map(|data| data.index.postings_codec_stats())
     }
 
     /// Photo des preuves P3 après matérialisation des termes en attente. Elle

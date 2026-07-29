@@ -941,3 +941,160 @@ fn disk_cursor_with_spilled_directory_matches_ram_leapfrog() {
     assert_eq!(aa_cursor.freq(), 1);
     assert_eq!(aa_cursor.advance_to(4), None);
 }
+
+/// D2 (`.remote/d2-bitpacking-postings.md`) : le format de postings passe
+/// au bit-packing des deltas et à l'OMISSION du canal des fréquences quand
+/// elles sont constantes. Ce test verrouille la seule chose qui compte
+/// vraiment — les postings relus sont STRICTEMENT identiques — sur les cas
+/// que le corpus de production produit réellement :
+///
+/// * `tf = 1` partout (le cas nominal du champ `NOM` analysé en `norm`),
+/// * `tf` variable dans un même terme,
+/// * `df = 1`,
+/// * `df` très grand franchissant plusieurs blocs de 128 avec un bloc
+///   partiel en fin,
+/// * une liste GROUPÉE (runs denses séparés par des sauts énormes), qui est
+///   la forme des champs de code INSEE et qui met en défaut un
+///   frame-of-reference naïf,
+/// * plusieurs bases de `doc_id` disjointes, comme les 12 segments de
+///   production.
+///
+/// Il vérifie les deux chemins de lecture : le décodage intégral
+/// (`decode_from_segment`) et le curseur à sauts, celui qui `pread` bloc
+/// par bloc.
+#[test]
+fn d2_postings_bit_packes_relus_a_l_identique() {
+    let mut expected: Vec<(&str, &str, Vec<u32>, Vec<u32>)> = Vec::new();
+
+    // tf = 1 partout, df grand, 4 blocs dont un partiel.
+    let dense: Vec<u32> = (0..(BLOCK_SIZE as u32 * 3 + 17)).map(|i| i * 3).collect();
+    expected.push(("nom", "martin", dense.clone(), vec![1; dense.len()]));
+
+    // tf variable dans le même terme.
+    let varied: Vec<u32> = (0..300u32).map(|i| i * 7 + 1).collect();
+    let varied_freqs: Vec<u32> = varied.iter().map(|d| (d % 5) + 1).collect();
+    expected.push(("prenoms", "jean", varied, varied_freqs));
+
+    // df = 1.
+    expected.push(("uid", "1zwbewyuinli", vec![42], vec![1]));
+
+    // Liste groupée : 6 runs de 90 identifiants consécutifs séparés par des
+    // sauts de ~900 000 — le motif qui fait exploser un FoR sans exception.
+    let mut clustered: Vec<u32> = Vec::new();
+    let mut next = 5u32;
+    for run in 0..6u32 {
+        for _ in 0..90 {
+            clustered.push(next);
+            next += 1;
+        }
+        next += 900_000 + run;
+    }
+    expected.push((
+        "code_insee",
+        "01004",
+        clustered.clone(),
+        vec![1; clustered.len()],
+    ));
+
+    // Bases de doc_id disjointes et croissantes, à la manière des segments.
+    for (index, base) in [2_400_000u32, 4_800_000, 7_200_000].iter().enumerate() {
+        let ids: Vec<u32> = (0..200u32).map(|i| base + i * 13).collect();
+        let freqs: Vec<u32> = ids.iter().map(|d| (d % 2) + 1).collect();
+        let term: &'static str = match index {
+            0 => "seg0",
+            1 => "seg1",
+            _ => "seg2",
+        };
+        expected.push(("nom", term, ids, freqs));
+    }
+
+    let build = |disk_enabled: bool| {
+        let mut builder = PostingsBuilder::new();
+        for (field, term, doc_ids, freqs) in &expected {
+            for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+                let positions: Vec<u32> = (0..freq).collect();
+                builder
+                    .add(*field, *term, doc_id, positions)
+                    .unwrap_or_else(|error| panic!("{field}/{term}@{doc_id}: {error}"));
+            }
+        }
+        builder.build_with_disk_flag(disk_enabled)
+    };
+
+    for disk_enabled in [false, true] {
+        let dictionary = build(disk_enabled);
+
+        for (field, term, doc_ids, freqs) in &expected {
+            // Chemin 1 : décodage intégral du payload.
+            let (decoded_doc_ids, decoded_freqs) = dictionary
+                .decode_from_segment(field, term)
+                .unwrap_or_else(|| panic!("{field}/{term} décodage segment (disk={disk_enabled})"));
+            assert_eq!(
+                &decoded_doc_ids, doc_ids,
+                "{field}/{term} doc_ids (disk={disk_enabled})"
+            );
+            assert_eq!(
+                &decoded_freqs, freqs,
+                "{field}/{term} freqs (disk={disk_enabled})"
+            );
+
+            // Chemin 2 : curseur à sauts, un `pread` + un décodage par bloc
+            // réellement touché. Il doit rendre la MÊME suite, y compris
+            // les fréquences reconstruites depuis un canal omis.
+            let mut cursor = dictionary
+                .disk_cursor(field, term)
+                .unwrap_or_else(|| panic!("{field}/{term} curseur (disk={disk_enabled})"));
+            assert_eq!(cursor.doc_freq(), doc_ids.len());
+            let mut walked_doc_ids: Vec<u32> = Vec::with_capacity(doc_ids.len());
+            let mut walked_freqs: Vec<u32> = Vec::with_capacity(doc_ids.len());
+            let mut target = 0u32;
+            while let Some(doc_id) = cursor.advance_to(target) {
+                walked_doc_ids.push(doc_id);
+                walked_freqs.push(cursor.freq());
+                target = doc_id + 1;
+            }
+            assert_eq!(
+                &walked_doc_ids, doc_ids,
+                "{field}/{term} curseur doc_ids (disk={disk_enabled})"
+            );
+            assert_eq!(
+                &walked_freqs, freqs,
+                "{field}/{term} curseur freqs (disk={disk_enabled})"
+            );
+        }
+
+        // Le terme absent reste absent, et le champ absent aussi : le
+        // changement de format ne transforme aucune absence en erreur.
+        assert!(dictionary.decode_from_segment("nom", "inconnu").is_none());
+        assert!(dictionary
+            .decode_from_segment("inconnu", "martin")
+            .is_none());
+        assert_eq!(dictionary.postings_segment_skipped_terms(), 0);
+
+        // Compteurs : ils doivent PROUVER que l'omission est engagée,
+        // sinon un gain non réalisé passerait inaperçu.
+        let stats = dictionary.postings_codec_stats();
+        let expected_blocks: u64 = expected
+            .iter()
+            .map(|(_, _, doc_ids, _)| doc_ids.len().div_ceil(BLOCK_SIZE) as u64)
+            .sum();
+        assert_eq!(
+            stats.blocks, expected_blocks,
+            "un bloc par tranche de {BLOCK_SIZE} postings, bloc partiel compris"
+        );
+        assert!(
+            stats.freq_omitted_blocks > 0,
+            "les termes à tf = 1 doivent omettre leur canal freq"
+        );
+        assert!(
+            stats.freq_omitted_blocks < stats.blocks,
+            "les termes à tf variable doivent, eux, écrire un canal freq"
+        );
+        assert!(
+            stats.freq_bytes < stats.doc_id_bytes,
+            "le canal freq doit être devenu marginal : {} contre {}",
+            stats.freq_bytes,
+            stats.doc_id_bytes
+        );
+    }
+}

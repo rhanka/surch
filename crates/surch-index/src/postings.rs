@@ -6,9 +6,15 @@ use std::sync::{
 
 use fst::{IntoStreamer, Map, MapBuilder, Streamer};
 use surch_codec::postings_block::{
-    block_directory, decode_block, decode_postings_blocked, encode_postings_blocked, BlockDirEntry,
-    BlockSkipCursor, BlockSkipEntry, BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
+    block_directory, decode_block, decode_postings_blocked, encode_postings_blocked,
+    encode_postings_blocked_with_directory, BlockDirEntry, BlockSkipCursor, BlockSkipEntry,
+    BlockSkipList, PostingsBlockError, FOR_BLOCK_SIZE,
 };
+
+/// D2 : ré-exporté ici pour que les consommateurs de `surch-index`
+/// (`document_index`, puis les jauges de `surch-api`) nomment la
+/// ventilation du codec sans dépendre directement de `surch-codec`.
+pub use surch_codec::postings_block::BlockedEncodeStats;
 
 use crate::roaring::RoaringDocSet;
 use postings_segment::PostingsSegment;
@@ -1078,6 +1084,7 @@ impl PostingsBuilder {
         // truth, so it must never be able to crash indexation.
         let mut postings_segment = PostingsSegment::try_new();
         let mut postings_skipped_terms: u64 = 0;
+        let mut codec_stats = BlockedEncodeStats::default();
 
         let mut fields: BTreeMap<String, FieldPostings> = BTreeMap::new();
         let mut p2_integrity = P2IntegrityBuilder::with_max_bytes(p2_integrity_max_bytes);
@@ -1216,8 +1223,9 @@ impl PostingsBuilder {
 
                     offsets.push(offsets.last().copied().unwrap_or(0) + term_doc_ids.len() as u32);
 
-                    match encode_postings_blocked(&term_doc_ids, &term_freqs) {
-                        Ok(block_payload) => {
+                    match encode_postings_blocked_with_directory(&term_doc_ids, &term_freqs) {
+                        Ok(encoded) => {
+                            let block_payload = encoded.payload;
                             // SHADOW validation, disk-mode counterpart of the
                             // flag-off branch's post-loop
                             // `validate_field_segment_round_trip` (which
@@ -1242,11 +1250,13 @@ impl PostingsBuilder {
                             // query-time `disk_cursor` never re-preads +
                             // re-decodes the whole term payload just to find
                             // block boundaries (sous-pas 1's ad hoc fallback).
-                            if let Ok(directory) =
-                                block_directory(&block_payload, term_doc_ids.len())
-                            {
-                                block_directory_flat.extend(directory);
-                            }
+                            // D2 : le répertoire vient désormais de
+                            // l'encodeur lui-même, qui connaît déjà les
+                            // frontières de blocs et leur `max_doc_id` — le
+                            // décodage intégral que `block_directory`
+                            // imposait à CHAQUE terme disparaît.
+                            codec_stats.merge(encoded.stats);
+                            block_directory_flat.extend(encoded.directory);
                             field_payload.extend_from_slice(&block_payload);
                             segment_descriptors.push((payload_offset, block_payload.len() as u32));
                         }
@@ -1334,14 +1344,16 @@ impl PostingsBuilder {
                     // posting regardless of encode success, so nothing is
                     // lost, only the SHADOW segment's coverage of this one
                     // term.
-                    match encode_postings_blocked(
+                    match encode_postings_blocked_with_directory(
                         &doc_ids_flat[doc_ids_start..],
                         &freqs_flat[freqs_start..],
                     ) {
-                        Ok(block_payload) => {
+                        Ok(encoded) => {
                             let payload_offset = field_payload.len() as u64;
-                            field_payload.extend_from_slice(&block_payload);
-                            segment_descriptors.push((payload_offset, block_payload.len() as u32));
+                            codec_stats.merge(encoded.stats);
+                            field_payload.extend_from_slice(&encoded.payload);
+                            segment_descriptors
+                                .push((payload_offset, encoded.payload.len() as u32));
                         }
                         Err(_) => {
                             // Sentinel: no disk coverage for this term.
@@ -1488,6 +1500,7 @@ impl PostingsBuilder {
             disk_enabled,
             p2_integrity: Arc::new(p2_integrity.finish()),
             p2_runtime_metrics: Arc::default(),
+            postings_codec_stats: codec_stats,
         }
     }
 }
@@ -1907,6 +1920,10 @@ struct FieldMergeAccumulator {
     block_dir_offsets: Vec<u32>,
     postings_skipped_terms: u64,
     next_term_idx: u32,
+    /// D2 : mêmes compteurs de codec que sur le chemin de construction —
+    /// un segment issu d'un merge doit être observable de la même façon
+    /// qu'un segment fraîchement construit.
+    codec_stats: BlockedEncodeStats,
 }
 
 impl FieldMergeAccumulator {
@@ -1935,6 +1952,7 @@ impl FieldMergeAccumulator {
             block_dir_offsets,
             postings_skipped_terms: 0,
             next_term_idx: 0,
+            codec_stats: BlockedEncodeStats::default(),
         }
     }
 
@@ -2019,17 +2037,16 @@ impl FieldMergeAccumulator {
     /// encode step (persisted block directory only when `disk_enabled`,
     /// same sentinel-on-failure contract).
     fn encode_and_store(&mut self, doc_ids: &[u32], freqs: &[u32]) {
-        match encode_postings_blocked(doc_ids, freqs) {
-            Ok(block_payload) => {
+        match encode_postings_blocked_with_directory(doc_ids, freqs) {
+            Ok(encoded) => {
                 let payload_offset = self.field_payload.len() as u64;
+                self.codec_stats.merge(encoded.stats);
                 if self.disk_enabled {
-                    if let Ok(directory) = block_directory(&block_payload, doc_ids.len()) {
-                        self.block_directory_flat.extend(directory);
-                    }
+                    self.block_directory_flat.extend(encoded.directory);
                 }
-                self.field_payload.extend_from_slice(&block_payload);
+                self.field_payload.extend_from_slice(&encoded.payload);
                 self.segment_descriptors
-                    .push((payload_offset, block_payload.len() as u32));
+                    .push((payload_offset, encoded.payload.len() as u32));
             }
             Err(_) => {
                 self.segment_descriptors.push((0, 0));
@@ -2043,13 +2060,14 @@ impl FieldMergeAccumulator {
     /// batching contract as [`PostingsBuilder::build_with_disk_flag`]),
     /// rebase `segment_descriptors`, and assemble the final
     /// [`FieldPostings`]. Returns the skipped-terms count for the caller
-    /// to fold into [`TermDictionary::postings_skipped_terms`].
+    /// to fold into [`TermDictionary::postings_skipped_terms`], et la
+    /// ventilation D2 du codec pour [`TermDictionary::postings_codec_stats`].
     fn finish(
         mut self,
         postings_segment: &mut Option<PostingsSegment>,
         field_ordinal: Option<u32>,
         p2_integrity: &mut P2IntegrityBuilder,
-    ) -> (FieldPostings, u64) {
+    ) -> (FieldPostings, u64, BlockedEncodeStats) {
         self.roaring.shrink_to_fit();
         let field_base_offset = if self.field_payload.is_empty() {
             None
@@ -2131,6 +2149,7 @@ impl FieldMergeAccumulator {
                 p2_integrity: tables.p2_integrity,
             },
             self.postings_skipped_terms,
+            self.codec_stats,
         )
     }
 }
@@ -2189,6 +2208,7 @@ pub(crate) fn merge_term_dictionaries(
 
     let mut postings_segment = PostingsSegment::try_new();
     let mut postings_skipped_terms: u64 = 0;
+    let mut codec_stats = BlockedEncodeStats::default();
     let mut fields: BTreeMap<String, FieldPostings> = BTreeMap::new();
     let mut p2_integrity = P2IntegrityBuilder::with_max_bytes(p2_integrity_max_bytes);
 
@@ -2264,12 +2284,13 @@ pub(crate) fn merge_term_dictionaries(
             acc.push_term(term_bytes, &merged_doc_ids, &merged_freqs);
         }
 
-        let (field_postings, skipped) = acc.finish(
+        let (field_postings, skipped, field_codec_stats) = acc.finish(
             &mut postings_segment,
             u32::try_from(field_ordinal).ok(),
             &mut p2_integrity,
         );
         postings_skipped_terms += skipped;
+        codec_stats.merge(field_codec_stats);
         fields.insert(field.to_string(), field_postings);
     }
 
@@ -2280,6 +2301,7 @@ pub(crate) fn merge_term_dictionaries(
         disk_enabled,
         p2_integrity: Arc::new(p2_integrity.finish()),
         p2_runtime_metrics: Arc::default(),
+        postings_codec_stats: codec_stats,
     }
 }
 
@@ -3152,6 +3174,13 @@ pub struct TermDictionary {
     /// dictionnaire observe la même génération de segment, donc partage ces
     /// compteurs comme il partage déjà le fichier de postings.
     p2_runtime_metrics: Arc<P2RuntimeMetrics>,
+    /// D2 : ventilation des octets réellement écrits par le codec de
+    /// postings (canal doc_id, canal freq, blocs, blocs à canal freq omis).
+    /// C'est la SEULE preuve exploitable qu'un gain disque annoncé par le
+    /// changement de format est réalisé : sans elle, un canal `freq` qui ne
+    /// s'omettrait jamais (fréquences non constantes inattendues) ne se
+    /// verrait nulle part. Alimente `surch_index_postings_codec_*`.
+    postings_codec_stats: BlockedEncodeStats,
 }
 
 impl TermDictionary {
@@ -3477,6 +3506,14 @@ impl TermDictionary {
     /// and disabled it for the rest of the build).
     pub fn postings_segment_skipped_terms(&self) -> u64 {
         self.postings_skipped_terms
+    }
+
+    /// D2 : ventilation des octets écrits par le codec de postings de ce
+    /// segment (canal doc_id, canal freq, blocs, blocs à canal freq omis).
+    /// C'est l'attestation que le changement de format délivre réellement :
+    /// un canal `freq` qui ne s'omettrait jamais s'y verrait immédiatement.
+    pub fn postings_codec_stats(&self) -> BlockedEncodeStats {
+        self.postings_codec_stats
     }
 
     /// Métriques de l'attestation BLAKE3 P2. Les compteurs de lecture sont
@@ -5048,25 +5085,26 @@ mod tests {
             &encode_postings_blocked(&second_doc_ids, &second_freqs)
                 .expect("le second bloc localement valide doit s'encoder"),
         );
-        assert!(
-            corrupted_payload.len() <= canonical_payload.len(),
-            "la corruption doit rester dans la plage canonique lue"
+        // Le premier bloc est BYTE-IDENTIQUE au canonique (mêmes postings,
+        // mêmes fréquences), donc l'offset du second bloc lu dans le
+        // répertoire canonique désigne bien le second bloc corrompu. Seule
+        // la longueur TOTALE peut différer — le codec D2 choisit le mode de
+        // chaque bloc par coût, et un bloc corrompu n'a aucune raison de
+        // coûter exactement autant que le bloc licite qu'il remplace.
+        assert_eq!(
+            corrupted_payload[..directory[1].byte_offset_in_term_payload as usize],
+            canonical_payload[..directory[1].byte_offset_in_term_payload as usize],
+            "le premier bloc doit rester identique au canonique"
         );
 
         let mut segment = PostingsSegment::try_new().expect("segment temporaire disponible");
         let base = segment
             .append(&corrupted_payload)
             .expect("payload corrompu écrit pour la régression");
-        if corrupted_payload.len() < canonical_payload.len() {
-            let bourrage = vec![0; canonical_payload.len() - corrupted_payload.len()];
-            segment
-                .append(&bourrage)
-                .expect("bourrage trailing écrit pour la régression");
-        }
         let mut cursor = DiskPostingsCursor::open_with_directory(
             &segment,
             base,
-            canonical_payload.len() as u32,
+            corrupted_payload.len() as u32,
             directory,
             canonical_doc_ids.len(),
         );
