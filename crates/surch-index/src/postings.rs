@@ -2571,9 +2571,42 @@ struct TermEntry {
     block_dir_count: u32,
 }
 
+/// Densité MAXIMALE qu'un payload de postings canonique peut atteindre,
+/// en postings par octet. C'est la borne qui garde `postings_count`
+/// proportionnel à `postings_len` : sans elle, un compteur corrompu ferait
+/// réserver un `Vec` sans rapport avec les octets réellement adressés.
+///
+/// **Elle est dictée par le CODEC, et le codec a changé en D2.** Avant D2,
+/// chaque posting coûtait au moins deux octets (un varint de delta + un
+/// varint de fréquence), d'où la borne historique « au plus 0,5 posting par
+/// octet ». D2 supprime les deux planchers : le canal des fréquences
+/// DISPARAÎT quand elles valent toutes 1, et les deltas sont bit-packés.
+///
+/// Nouveau plancher, démontré sur le format D2
+/// (`surch_codec::postings_block`, disposition d'un bloc). Pour un bloc de
+/// `c <= 128` postings, l'encodeur écrit toujours 1 octet d'en-tête, puis le
+/// varint du premier `doc_id` (>= 1 octet), puis le canal doc_id — dont
+/// AUCUN des trois modes ne descend sous `ceil((c - 1) / 8)` octets
+/// (`varint` : `c - 1` octets ; `packed` : `1 + ceil((c - 1) * w / 8)` avec
+/// `w >= 1` ; `patched` : strictement davantage). Un bloc pèse donc au moins
+/// `2 + ceil((c - 1) / 8) >= ceil(c / 8)` octets, et en sommant sur les
+/// blocs `postings_len >= ceil(postings_count / 8)`.
+///
+/// Le pire cas réellement atteignable est ~6,7 postings/octet (un bloc plein
+/// de 128 postings à deltas d'un bit : 1 + 1 + 1 + 16 = 19 octets) : `8`
+/// borne le format sans jamais refuser un payload canonique.
+const MAX_POSTINGS_PER_PAYLOAD_BYTE: u64 = 8;
+
 impl TermEntry {
     /// Vérifie les invariants portés par l'entrée elle-même, avant toute
     /// allocation ou interprétation du payload qu'elle désigne.
+    ///
+    /// La borne de densité est celle du codec courant
+    /// ([`MAX_POSTINGS_PER_PAYLOAD_BYTE`]) : la resserrer sous le plancher
+    /// que le codec peut atteindre ne durcit rien, elle rend `Corrupt`
+    /// TOUTE lecture checked d'un segment sain — donc elle éteint
+    /// silencieusement les chemins qui déclinent sur erreur (conjonction P2,
+    /// `match` mono-terme streamé) sans changer un seul résultat.
     fn validate(&self) -> core::result::Result<(), PostingsReadError> {
         if self.postings_len == 0 {
             return if self.postings_offset == 0 {
@@ -2583,7 +2616,8 @@ impl TermEntry {
             };
         }
         if self.postings_count == 0
-            || u64::from(self.postings_count).saturating_mul(2) > u64::from(self.postings_len)
+            || u64::from(self.postings_count).div_ceil(MAX_POSTINGS_PER_PAYLOAD_BYTE)
+                > u64::from(self.postings_len)
         {
             return Err(PostingsReadError::Corrupt);
         }
@@ -4820,6 +4854,68 @@ mod tests {
             dictionary.disk_cursor_checked("body", "large"),
             Err(PostingsReadError::Corrupt)
         ));
+    }
+
+    /// D2 — régression de ROUTAGE, jamais visible dans un résultat. Le
+    /// codec bit-packé descend sous le plancher de deux octets par posting
+    /// que le format varint garantissait, et que [`TermEntry::validate`]
+    /// avait figé en invariant d'entrée. Tant qu'il y était, chaque terme
+    /// d'un segment disque SAIN rendait `Corrupt` sur les trois lectures
+    /// checked, `segmented_postings_checked` déclinait, et les chemins qui
+    /// déclinent sur erreur — conjonction P2, `match` mono-terme streamé de
+    /// C2, terminaison anticipée de C1 — cessaient de s'engager sans qu'un
+    /// seul document, score ou total ne bouge.
+    ///
+    /// Les deux assertions sont solidaires : la première interdit au test de
+    /// se vider (si le payload repassait au-dessus de l'ancien plancher, la
+    /// seconde ne prouverait plus rien).
+    #[test]
+    fn d2_payload_bit_packe_sous_deux_octets_par_posting_reste_lisible_checked() {
+        let total = BLOCK_SIZE as u32 * 4 + 7;
+        let mut builder = PostingsBuilder::new();
+        for doc_id in 0..total {
+            builder
+                .add("body", "dense", doc_id, vec![0])
+                .expect("les postings denses doivent être construits");
+        }
+        let dictionary = builder.build_with_disk_flag(true);
+        let segment = dictionary
+            .postings_segment
+            .as_deref()
+            .expect("le segment disque doit exister");
+        let field = dictionary.fields.get("body").expect("field present");
+        let idx = field.fst.get(b"dense").expect("term present") as usize;
+        let entry = field
+            .term_entry(idx, Some(segment))
+            .expect("entry persisted present");
+
+        assert!(
+            u64::from(entry.postings_count).saturating_mul(2) > u64::from(entry.postings_len),
+            "le cas de test doit franchir l'ancien plancher varint de 2 o/posting \
+             ({} postings, {} octets), sinon il ne prouve rien",
+            entry.postings_count,
+            entry.postings_len
+        );
+
+        let mut cursor = dictionary
+            .disk_cursor_p2_checked("body", "dense")
+            .expect("un payload D2 canonique ne doit pas être déclaré corrompu")
+            .expect("le terme doit exister");
+        let mut lus = Vec::with_capacity(total as usize);
+        let mut target = 0u32;
+        loop {
+            match cursor.advance_to_with_status(target) {
+                DiskPostingsAdvance::Found(doc_id) => {
+                    lus.push(doc_id);
+                    target = doc_id.saturating_add(1);
+                }
+                DiskPostingsAdvance::Exhausted => break,
+                DiskPostingsAdvance::Error => {
+                    panic!("un payload D2 sain ne doit jamais devenir une erreur de lecture")
+                }
+            }
+        }
+        assert_eq!(lus, (0..total).collect::<Vec<_>>());
     }
 
     #[test]
