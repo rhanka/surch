@@ -517,14 +517,14 @@ baisser que **modestement** (−14 % attendu). Une baisse spectaculaire y serait
    21 tests sont **ÉCRITS, PAS VERTS**. La CI est le seul juge
    (`cargo clippy --workspace --all-targets --locked -- -D warnings`, `.github/workflows/ci.yml:51`) :
    un lint Clippy suffit à tout casser.
-   Une **relecture statique indépendante** du diff a été passée (compilation simulée, lints
-   Clippy de niveau défaut, débordements de décalage, symétrie encodeur/décodeur) : elle n'a
-   trouvé **aucune erreur de compilation, aucun lint, aucun bug de logique**, et cinq remarques
-   mineures, toutes appliquées (doc de `finish` remise à jour, lien intra-doc ambigu supprimé,
+   **Aucune relecture indépendante n'a abouti.** Une avait été lancée en sous-agent ; elle
+   n'a jamais rendu de conclusion, et j'ai terminé la vérification moi-même. Les cinq
+   derniers ajustements du commit (doc de `finish` remise à jour, doc de
+   `postings_codec_stats` corrigée sur le périmètre des segments,
    `const _: () = assert!(FOR_BLOCK_SIZE <= 256)` pour figer l'invariant des positions
-   d'exception sur un octet, deux `clone()` inutiles retirés, doc de `postings_codec_stats`
-   corrigée sur le périmètre des segments). **Une relecture n'est pas une compilation** : cela
-   n'avance en rien la preuve, cela réduit seulement la probabilité d'un aller-retour CI.
+   d'exception sur un octet, deux `clone()` inutiles retirés) sont **les miens**, pas ceux
+   d'un relecteur. Aucun second regard n'atteste donc ce code : la relecture reste à faire,
+   et la CI reste le seul juge.
 2. **Aucun chiffre disque de ce rapport ne vient de surch qui tourne.** La ventilation du §2
    est produite par une **simulation en awk** de l'encodeur, sur le corpus réel mais **hors
    du moteur**. Elle est validée à 97,04 % contre la seule mesure moteur disponible
