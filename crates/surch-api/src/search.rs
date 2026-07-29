@@ -2134,12 +2134,10 @@ fn run_topk_exact_bool(
         let reader = reader?;
         let mut arena = ScoringArena::default();
         let scoring_context = SearchScoringContext::new(&reader, query, &mut arena);
-        let cmp = |a: &(f64, u32), b: &(f64, u32)| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        };
-        let mut topn = TopN::new(limit, cmp);
+        // Chantier C1 : cette closure recopiait mot pour mot
+        // `scored_pair_ordering`. Une seule définition de l'ordre dans tout
+        // le dépôt — une dérive silencieuse entre chemins était possible.
+        let mut topn = TopN::new(limit, scored_pair_ordering);
         let mut total: u64 = 0;
         let mut max_score = f64::NEG_INFINITY;
         for &id in &ids {
@@ -2310,12 +2308,9 @@ fn finalize_fused_topk(
     started_at: Instant,
 ) -> Option<SearchResponse> {
     let limit = requested_hit_window_limit(from, size);
-    let cmp = |a: &(f64, u32), b: &(f64, u32)| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.cmp(&b.1))
-    };
-    let mut topn = TopN::new(limit, cmp);
+    // Chantier C1 : troisième recopie mot pour mot du comparateur, remplacée
+    // par l'unique définition partagée.
+    let mut topn = TopN::new(limit, scored_pair_ordering);
     let mut total: u64 = 0;
     let mut max_score = f64::NEG_INFINITY;
     for (score, id) in scored {
@@ -2527,7 +2522,8 @@ fn topk_scored_documents_reference(
             value,
             operator,
         } if *operator != MatchOperator::And => {
-            if let Some(scored_pairs) = maxscore_match(field, value, limit, &scoring_context, total)
+            if let Some(scored_pairs) =
+                maxscore_match(field, value, limit, &scoring_context, total, true)
             {
                 return finalize_topk(reader, scored_pairs, total, limit);
             }
@@ -2561,17 +2557,17 @@ fn topk_scored_documents_reference(
 }
 
 /// LE comparateur du top-K scoré : score décroissant, puis `doc_id`
-/// croissant pour départager les ex æquo. Défini une seule fois et partagé
-/// avec le chemin streamé mono-terme (`state.rs`) : sur le corpus deces
-/// presque tous les documents d'un terme ont le MÊME score (`tf = 1`,
-/// `doc_len = 1`), le départage par `doc_id` est donc la règle nominale.
-/// Comme les `doc_id` sont uniques, cet ordre est TOTAL — le résultat d'un
-/// TopN ne dépend donc pas de l'ordre d'arrivée des candidats.
-pub(crate) fn scored_pair_ordering(a: &(f64, u32), b: &(f64, u32)) -> std::cmp::Ordering {
-    b.0.partial_cmp(&a.0)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.1.cmp(&b.1))
-}
+/// croissant pour départager les ex æquo. Sur le corpus deces presque tous
+/// les documents d'un terme ont le MÊME score (`tf = 1`, `doc_len = 1`), le
+/// départage par `doc_id` est donc la règle NOMINALE, pas un cas limite.
+///
+/// Chantier C1 : la définition a migré dans `surch_search::topk`, aux côtés
+/// de `MinCompetitiveScore` — le seuil compétitif n'est rien d'autre qu'un
+/// COROLLAIRE de cet ordre, et les deux doivent être impossibles à faire
+/// dériver l'un de l'autre. Ce `use` garde le chemin d'accès historique
+/// (`crate::search::scored_pair_ordering`) tout en ne laissant qu'UNE
+/// définition dans le dépôt.
+pub(crate) use surch_search::topk::scored_pair_ordering;
 
 fn finalize_topk(
     reader: &IndexReader<'_>,
@@ -2635,7 +2631,7 @@ fn maxscore_multi_match(
     let mut combined: BTreeMap<u32, f64> = BTreeMap::new();
     let mut any_field = false;
     for field in fields {
-        let Some(field_scores) = maxscore_match(field, value, limit, ctx, 0) else {
+        let Some(field_scores) = maxscore_match(field, value, limit, ctx, 0, false) else {
             continue;
         };
         any_field = true;
@@ -2666,12 +2662,16 @@ fn maxscore_multi_match(
 /// only update docs already scored from a rarer token. Returns the full
 /// list of scored (score, internal doc id) pairs, or `None` if the path
 /// cannot be used (no field stats, no scorable tokens, etc.).
+/// `terminaison_anticipee` : chantier C1. `true` uniquement quand la sortie
+/// de cet appel EST la fenêtre top-K rendue au client — donc pas pour le
+/// `multi_match`, qui combine un run par champ avant de couper la fenêtre.
 fn maxscore_match(
     field: &str,
     value: &str,
     limit: usize,
     ctx: &SearchScoringContext<'_>,
     total_hint: u64,
+    terminaison_anticipee: bool,
 ) -> Option<Vec<(f64, u32)>> {
     let field_stats = ctx.field_stats(field)?;
     if field_stats.doc_count == 0 {
@@ -2792,7 +2792,12 @@ fn maxscore_match(
         })
         .collect();
 
-    let outcome = MaxScoreExecutor::new(limit)
+    let executeur = if terminaison_anticipee {
+        MaxScoreExecutor::new(limit)
+    } else {
+        MaxScoreExecutor::new(limit).without_early_termination()
+    };
+    let outcome = executeur
         .run(&tokens, |token_idx, doc_id, tf| {
             let token = &token_infos[token_idx];
             let doc_len = if norms_enabled {
@@ -2806,6 +2811,18 @@ fn maxscore_match(
             Some(token.scorer.score(tf, doc_len) * token.boost)
         })
         .ok()?;
+
+    // Chantier C1 — preuve scrapable que le chemin de RÉFÉRENCE (celui que
+    // sert toute requête que le chemin streamé décline, et toute requête si
+    // le plafond d'intégrité P2 se referme) saute réellement des blocs.
+    // Volontairement distincts de `surch_postings_disk_blocks_read_total` /
+    // `_blocks_total`, qui attestent le routage P2 et dont il ne faut pas
+    // changer le sens.
+    if outcome.early_terminated {
+        metrics::counter!("surch_dbg_c1_maxscore_early_stop_total").increment(1);
+    }
+    metrics::counter!("surch_dbg_c1_maxscore_blocks_skipped_total")
+        .increment(u64::try_from(outcome.blocks_skipped).unwrap_or(u64::MAX));
 
     let _ = total_hint;
     Some(
@@ -7952,5 +7969,380 @@ mod c2_lecture_streamee_tests {
             index,
             &requete("nom", "", MatchOperator::Or)
         ));
+    }
+}
+
+/// Chantier C1 — terminaison anticipée. Ce module verrouille les DEUX
+/// invariants du chantier, en les prouvant contre un ORACLE indépendant des
+/// deux chemins modifiés :
+///
+/// 1. la fenêtre top-K (documents, ordre, scores au bit près) est
+///    inchangée alors que des documents ne sont plus traités ;
+/// 2. `hits.total` (valeur ET relation) est inchangé dans TOUS les modes de
+///    `track_total_hits`, et le mode `Exact` compte toujours exhaustivement.
+///
+/// L'oracle est le scoring par candidat (`score_for_query` sur le rappel
+/// matérialisé), c'est-à-dire le chemin générique de parité du dépôt : il ne
+/// passe NI par `maxscore_match` (modifié par C1) NI par le chemin streamé
+/// (modifié par C1). Sans lui, C1 se prouverait contre lui-même.
+#[cfg(test)]
+mod c1_terminaison_anticipee_tests {
+    use serde_json::{json, Value};
+
+    use super::{
+        resolve_total_hits, score_for_query, scored_pair_ordering, topk_scored_documents_inner,
+        topk_scored_documents_reference, MatchOperator, ScoredDocument, ScoringArena, SearchQuery,
+        SearchScoringContext, TrackTotalHits, DEFAULT_TRACK_TOTAL_HITS_CAP,
+    };
+    use crate::state::{
+        prendre_elagage_c1_pour_test, AppState, DocumentWriteOperation, IndexReader,
+    };
+
+    /// Fenêtres balayées : sous le `df`, aux frontières de blocs de 128, et
+    /// au-delà du `df` (`size` supérieur au nombre de résultats).
+    const FENETRES: [usize; 9] = [0, 1, 2, 10, 127, 128, 129, 1_000, 50_000];
+
+    /// Ce qu'un client observe d'un top-K : les `_id` DANS L'ORDRE, les
+    /// scores au bit près, et le total.
+    type Empreinte = Option<(Vec<(String, u64)>, u64)>;
+
+    fn empreinte(result: Option<(Vec<ScoredDocument>, u64)>) -> Empreinte {
+        result.map(|(documents, total)| {
+            (
+                documents
+                    .into_iter()
+                    .map(|scored| (scored.doc.id, scored.score.to_bits()))
+                    .collect(),
+                total,
+            )
+        })
+    }
+
+    fn requete(field: &str, value: &str) -> SearchQuery {
+        SearchQuery::Match {
+            field: field.to_owned(),
+            value: value.to_owned(),
+            operator: MatchOperator::Or,
+        }
+    }
+
+    /// ORACLE : rappel matérialisé + un `score_for_query` par candidat + tri
+    /// par LE comparateur partagé. Aucune terminaison anticipée, aucun
+    /// MaxScore, aucun curseur streamé — la définition brute du résultat
+    /// attendu.
+    fn oracle(reader: &IndexReader<'_>, query: &SearchQuery, limit: usize) -> Empreinte {
+        let SearchQuery::Match {
+            field,
+            value,
+            operator,
+        } = query
+        else {
+            panic!("l'oracle ne couvre que `match`");
+        };
+        let candidates = reader.match_hits_internal(field, value, *operator == MatchOperator::And);
+        let total = candidates.len() as u64;
+        if limit == 0 || candidates.is_empty() {
+            return Some((Vec::new(), total));
+        }
+        let mut arena = ScoringArena::default();
+        let contexte = SearchScoringContext::new(reader, query, &mut arena);
+        let mut scored: Vec<(f64, u32)> = candidates
+            .iter()
+            .map(|internal_id| {
+                (
+                    score_for_query(query, *internal_id, &contexte, None),
+                    *internal_id,
+                )
+            })
+            .collect();
+        scored.sort_by(scored_pair_ordering);
+        scored.truncate(limit);
+        let winner_ids: Vec<u32> = scored.iter().map(|(_, id)| *id).collect();
+        let hydrated = reader.documents_by_internal_ids(&winner_ids);
+        Some((
+            scored
+                .into_iter()
+                .zip(hydrated)
+                .map(|((score, _), doc)| (doc.id, score.to_bits()))
+                .collect(),
+            total,
+        ))
+    }
+
+    /// Compare les TROIS chemins sur la même requête et la même fenêtre, et
+    /// renvoie `(documents élagués par le chemin streamé, total)`.
+    fn comparer(state: &AppState, index: &str, query: &SearchQuery, limit: usize) -> (u64, u64) {
+        state.with_search_reader(index, |reader| {
+            let reader = reader.expect("l'index de test doit exister");
+            let attendu = oracle(&reader, query, limit);
+            let _ = prendre_elagage_c1_pour_test();
+            let streame = empreinte(topk_scored_documents_inner(&reader, query, limit));
+            let (_, elagues) = prendre_elagage_c1_pour_test();
+            let reference = empreinte(topk_scored_documents_reference(&reader, query, limit));
+            assert_eq!(
+                streame, attendu,
+                "chemin streamé ≠ oracle à limit={limit} pour {query:?}"
+            );
+            assert_eq!(
+                reference, attendu,
+                "chemin de référence (MaxScore) ≠ oracle à limit={limit} pour {query:?}"
+            );
+            let total = attendu.expect("l'oracle rend toujours un total").1;
+            (elagues, total)
+        })
+    }
+
+    /// Balaie toutes les fenêtres. Renvoie le nombre TOTAL de documents
+    /// élagués par le chemin streamé et le `total` (identique partout).
+    fn comparer_toutes_fenetres(state: &AppState, index: &str, query: &SearchQuery) -> (u64, u64) {
+        comparer_fenetres(state, index, query, &FENETRES)
+    }
+
+    fn comparer_fenetres(
+        state: &AppState,
+        index: &str,
+        query: &SearchQuery,
+        fenetres: &[usize],
+    ) -> (u64, u64) {
+        let mut elagues = 0u64;
+        let mut total = None;
+        for &limit in fenetres {
+            let (elagues_fenetre, total_fenetre) = comparer(state, index, query, limit);
+            elagues += elagues_fenetre;
+            match total {
+                None => total = Some(total_fenetre),
+                Some(precedent) => assert_eq!(
+                    precedent, total_fenetre,
+                    "`total` doit être indépendant de `size` (limit={limit})"
+                ),
+            }
+        }
+        (elagues, total.expect("FENETRES n'est jamais vide"))
+    }
+
+    /// Vérifie que le contrat `hits.total` observable est IDENTIQUE à ce
+    /// qu'il serait sans C1 — dans tous les modes, y compris aux frontières
+    /// du plafond par défaut de 10 000.
+    fn verifier_contrat_total(total: u64) {
+        let cap = DEFAULT_TRACK_TOTAL_HITS_CAP;
+
+        // Mode absent : exact sous le plafond, `gte 10000` au-dessus.
+        let defaut = resolve_total_hits(total, None).expect("le mode par défaut rend un total");
+        if total <= cap {
+            assert_eq!((defaut.value, defaut.relation), (total, "eq"));
+        } else {
+            assert_eq!((defaut.value, defaut.relation), (cap, "gte"));
+        }
+
+        // `track_total_hits: true` → EXACT, sans plafond. C'est le mode dans
+        // lequel toute terminaison anticipée du comptage est INTERDITE.
+        let exact = resolve_total_hits(total, Some(&TrackTotalHits::Exact))
+            .expect("le mode exact rend un total");
+        assert_eq!(
+            (exact.value, exact.relation),
+            (total, "eq"),
+            "le mode Exact doit rendre le total EXHAUSTIF, jamais un plafond"
+        );
+
+        // `track_total_hits: false` → aucun objet `total`.
+        assert!(resolve_total_hits(total, Some(&TrackTotalHits::Disabled)).is_none());
+
+        // Entier plus petit que le total → `gte n` ; plus grand → exact.
+        for n in [
+            0u64,
+            1,
+            total.saturating_sub(1),
+            total,
+            total + 1,
+            total * 2,
+        ] {
+            let borne = resolve_total_hits(total, Some(&TrackTotalHits::UpTo(n)))
+                .expect("le mode UpTo rend un total");
+            if total <= n {
+                assert_eq!((borne.value, borne.relation), (total, "eq"), "UpTo({n})");
+            } else {
+                assert_eq!((borne.value, borne.relation), (n, "gte"), "UpTo({n})");
+            }
+        }
+    }
+
+    fn indexer_par_lots(state: &AppState, index: &str, docs: &[(String, Value)], par_lot: usize) {
+        for lot in docs.chunks(par_lot) {
+            let operations = lot
+                .iter()
+                .map(|(id, source)| DocumentWriteOperation::Index {
+                    index: index.to_owned(),
+                    id: id.clone(),
+                    source: source.clone(),
+                    status: 201,
+                })
+                .collect();
+            state.apply_document_writes(operations);
+        }
+        state.refresh_index(index);
+    }
+
+    /// Corpus « deces » : `nom` porte un mot partagé par presque tous les
+    /// documents (`tf = 1`, `doc_len = 1` → scores TOUS ÉGAUX, le cas
+    /// nominal), `corps` porte des longueurs et des répétitions variables
+    /// (scores réellement distincts, donc un seuil qui monte vraiment).
+    fn corpus(docs: usize) -> Vec<(String, Value)> {
+        (0..docs)
+            .map(|doc_id| {
+                let nom = if doc_id.is_multiple_of(97) {
+                    "durand"
+                } else {
+                    "martin"
+                };
+                let repetitions = (doc_id % 5) + 1;
+                let mut corps = String::new();
+                for _ in 0..repetitions {
+                    corps.push_str("commun ");
+                }
+                for mot in 0..(doc_id % 7) {
+                    corps.push_str(&format!("mot{mot} "));
+                }
+                (
+                    doc_id.to_string(),
+                    json!({ "nom": nom, "corps": corps.trim_end() }),
+                )
+            })
+            .collect()
+    }
+
+    fn construire(index: &str, disque: bool, budget: Option<u64>, docs: usize) -> AppState {
+        let state = AppState::default();
+        state.create_index(index, None, json!({}), Default::default());
+        state.set_postings_disk_enabled(index, disque);
+        state.set_flush_budget_bytes_override(index, budget);
+        state.set_merge_fanin_override(index, 0);
+        indexer_par_lots(&state, index, &corpus(docs), 50);
+        state
+    }
+
+    #[test]
+    fn ex_aequo_massifs_le_seuil_elague_sans_changer_la_fenetre() {
+        for disque in [false, true] {
+            let index = "c1-ex-aequo";
+            let state = construire(index, disque, None, 600);
+            let (elagues, total) =
+                comparer_toutes_fenetres(&state, index, &requete("nom", "martin"));
+            assert!(
+                elagues > 0,
+                "le seuil compétitif doit réellement élaguer sur des ex æquo massifs \
+                 (disque={disque}) — sans élagage, l'équivalence est prouvée à vide"
+            );
+            verifier_contrat_total(total);
+        }
+    }
+
+    #[test]
+    fn scores_reellement_distincts_conservent_la_fenetre() {
+        for disque in [false, true] {
+            let index = "c1-scores-distincts";
+            let state = construire(index, disque, None, 600);
+            let (_, total) = comparer_toutes_fenetres(&state, index, &requete("corps", "commun"));
+            verifier_contrat_total(total);
+        }
+    }
+
+    #[test]
+    fn plusieurs_segments_conservent_la_fenetre() {
+        for disque in [false, true] {
+            let index = "c1-multi-segments";
+            // Budget d'un octet : chaque lot scelle un segment.
+            let state = construire(index, disque, Some(1), 600);
+            assert!(
+                state.index_segment_count(index) > 1,
+                "le cas multi-segment doit réellement produire plusieurs segments \
+                 (disque={disque})"
+            );
+            let (elagues, total) =
+                comparer_toutes_fenetres(&state, index, &requete("nom", "martin"));
+            assert!(elagues > 0, "élagage attendu même en multi-segment");
+            verifier_contrat_total(total);
+        }
+    }
+
+    #[test]
+    fn df_faible_et_df_nul() {
+        let index = "c1-df-faible";
+        let state = construire(index, true, None, 600);
+        // `durand` : 7 documents pour 600 — `size` dépasse largement le `df`.
+        let (_, total_rare) = comparer_toutes_fenetres(&state, index, &requete("nom", "durand"));
+        assert_eq!(total_rare, 7, "df du témoin rare");
+        verifier_contrat_total(total_rare);
+        // Terme absent : `df = 0`, aucun hit, aucun élagage possible.
+        let (elagues, total_absent) =
+            comparer_toutes_fenetres(&state, index, &requete("nom", "inexistant"));
+        assert_eq!(total_absent, 0);
+        assert_eq!(elagues, 0);
+        verifier_contrat_total(total_absent);
+    }
+
+    #[test]
+    fn multi_token_reste_sur_la_reference_et_garde_la_fenetre() {
+        // Deux tokens : le chemin streamé décline et `MaxScoreExecutor` reste
+        // en sémantique multi-token STRICTEMENT inchangée. La fenêtre doit
+        // quand même valoir l'oracle.
+        let index = "c1-multi-token";
+        let state = construire(index, true, None, 600);
+        let (elagues, total) =
+            comparer_toutes_fenetres(&state, index, &requete("corps", "commun mot0"));
+        assert_eq!(
+            elagues, 0,
+            "le chemin streamé doit décliner un `match` multi-token"
+        );
+        verifier_contrat_total(total);
+    }
+
+    /// `df` très grand ET total de part et d'autre du plafond par défaut de
+    /// 10 000 : le contrat `hits.total` doit rester identique dans tous les
+    /// modes, alors même que le scoring s'arrête tôt.
+    #[test]
+    fn df_tres_grand_de_part_et_d_autre_du_plafond_de_dix_mille() {
+        let index = "c1-plafond-10k";
+        // 10 200 documents : `martin` passe au-dessus du plafond de 10 000,
+        // `durand` (un document sur 97) reste largement en dessous. Fenêtres
+        // volontairement plus étroites : l'objet du test est le contrat
+        // `total` à grand `df`, pas un nouveau balayage de fenêtres.
+        let fenetres: [usize; 6] = [0, 1, 10, 128, 129, 1_000];
+        let state = construire(index, true, None, 10_200);
+        let (elagues, total_martin) =
+            comparer_fenetres(&state, index, &requete("nom", "martin"), &fenetres);
+        assert!(
+            total_martin > DEFAULT_TRACK_TOTAL_HITS_CAP,
+            "le témoin doit dépasser le plafond, got {total_martin}"
+        );
+        assert!(elagues > 0, "élagage attendu à `df` très grand");
+        verifier_contrat_total(total_martin);
+
+        let (_, total_durand) =
+            comparer_fenetres(&state, index, &requete("nom", "durand"), &fenetres);
+        assert!(
+            total_durand < DEFAULT_TRACK_TOTAL_HITS_CAP,
+            "le second témoin doit rester sous le plafond, got {total_durand}"
+        );
+        verifier_contrat_total(total_durand);
+
+        // Frontières exactes du plafond, indépendamment du corpus.
+        for total in [
+            DEFAULT_TRACK_TOTAL_HITS_CAP - 1,
+            DEFAULT_TRACK_TOTAL_HITS_CAP,
+            DEFAULT_TRACK_TOTAL_HITS_CAP + 1,
+        ] {
+            verifier_contrat_total(total);
+        }
+    }
+
+    /// Le mode `Exact` ne doit JAMAIS plafonner : c'est l'invariant qui
+    /// interdit toute terminaison anticipée du comptage dans ce mode.
+    #[test]
+    fn le_mode_exact_ne_plafonne_jamais() {
+        for total in [0u64, 1, 9_999, 10_000, 10_001, 28_917_511] {
+            let exact = resolve_total_hits(total, Some(&TrackTotalHits::Exact))
+                .expect("le mode exact rend toujours un total");
+            assert_eq!((exact.value, exact.relation), (total, "eq"));
+        }
     }
 }
