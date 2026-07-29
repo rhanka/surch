@@ -66,6 +66,30 @@ COLD_FILE_CACHE_FLOOR_BYTES=4194304
 # explicite dans le volume Surch pour un JSONL borné, exporté par phase.
 SURCH_SOURCE_FETCH_PROFILE="${SURCH_SOURCE_FETCH_PROFILE:-0}"
 SURCH_SOURCE_FETCH_PROFILE_FILE="${SURCH_SOURCE_FETCH_PROFILE_FILE:-/tmp/surch-source-fetch-profile.jsonl}"
+# ---- D1 : compression `_source` par blocs OU par document (témoin disque) ----
+# Le moteur lit DEUX drapeaux (crates/surch-api/src/state.rs) :
+#   - `SURCH_SOURCE_COMPRESS`      (`source_compress_enabled`, state.rs:695) — maître, absent/0 = brut ;
+#   - `SURCH_SOURCE_COMPRESS_MODE` (`source_block_mode_enabled`, state.rs:716) — `doc` = zstd PAR
+#     DOCUMENT (le TÉMOIN du chantier D1), toute autre valeur OU ABSENCE = blocs de 16 Kio (défaut D1).
+# Le harnais n'accepte que `doc` ou `block` : une faute de frappe (`bloc`, `docs`, `DOC ` avec espace)
+# serait lue « blocs » par le moteur et rendrait le témoin par-document silencieusement inatteignable
+# — exactement le mode d'échec que ce lot doit fermer.
+SURCH_SOURCE_COMPRESS_MODE="${SURCH_SOURCE_COMPRESS_MODE:-}"
+# ---- C2 : preuve d'activation du chemin `match` mono-terme streamé ----
+# `AppState::single_term_match_topk_streamed` est gardé par le plafond d'intégrité P2
+# (`document_index.rs`) : au-delà, il DÉCLINE SILENCIEUSEMENT et le chemin historique
+# `topk_scored_documents_reference` s'exécute — la mesure porterait alors sur l'ancien code.
+# Le compteur `surch_dbg_c2_single_term_stream_total` (crates/surch-api/src/search.rs:2470,
+# +1 par requête RÉELLEMENT servie par le chemin streamé, `size:0` compris) est la seule preuve.
+#   `stream`    : le chemin DOIT servir les `match` mono-terme de chaque phase ;
+#   `reference` : il ne doit en servir AUCUN (image antérieure à C2, ou témoin volontaire) ;
+#   `off`       : aucun scrape ni gate (interdit quand P2_MEASURE=1).
+SURCH_C2_STREAM_EXPECT="${SURCH_C2_STREAM_EXPECT:-off}"
+SURCH_C2_STREAM_METRIC="surch_dbg_c2_single_term_stream_total"
+# Réconciliation de la ventilation disque par composant (besoin 4) : la somme des
+# composants doit retrouver le `du` du volume, à la tolérance de bloc/arrondi près.
+DISK_VENTILATION_TOLERANCE_MIB="${DISK_VENTILATION_TOLERANCE_MIB:-16}"
+DISK_VENTILATION_TOLERANCE_PERCENT="${DISK_VENTILATION_TOLERANCE_PERCENT:-1}"
 HOLD_SECONDS="${HOLD_SECONDS:-0}"   # après mesures, tient le conteneur N s avant teardown (permet
                                      # à artillery-replay.sh de se brancher sur le réseau fair-ab, 1d)
 # BULK_FILE   : NDJSON pré-construit (lignes alternées action/doc) indexé TEL QUEL (bypass builder awk interne).
@@ -111,6 +135,37 @@ FEEDER_TMP_DIR=$(readlink -f "$FEEDER_TMP_DIR") || { err "résolution FEEDER_TMP
 case "$FEEDER_TMP_MARGIN_MIB" in ''|*[!0-9]*) err "FEEDER_TMP_MARGIN_MIB doit être un entier en Mio"; exit 1;; esac
 case "$PROBE_REQUESTS" in ''|*[!0-9]*) err "PROBE_REQUESTS doit être un entier positif"; exit 1;; esac
 [ "$PROBE_REQUESTS" -gt 0 ] || { err "PROBE_REQUESTS doit être > 0"; exit 1; }
+# ---- D1 : mode d'écriture `_source`, refusé dès qu'il serait ambigu ----
+case "$SURCH_SOURCE_COMPRESS_MODE" in
+  ''|doc|block) ;;
+  *) err "SURCH_SOURCE_COMPRESS_MODE doit valoir doc (témoin par-document) ou block (défaut D1) — reçu « $SURCH_SOURCE_COMPRESS_MODE » ; toute autre valeur serait lue « blocs » par le moteur"; exit 1;;
+esac
+if [ -n "$SURCH_SOURCE_COMPRESS_MODE" ] && [ "${SURCH_SOURCE_COMPRESS:-}" != "1" ]; then
+  err "SURCH_SOURCE_COMPRESS_MODE=$SURCH_SOURCE_COMPRESS_MODE sans SURCH_SOURCE_COMPRESS=1 : le moteur ignorerait le mode (source_block_mode_enabled n'a d'effet que si source_compress_enabled), l'A/B disque D1 serait un faux témoin"
+  exit 1
+fi
+# Mode réellement écrit par le moteur, reconstitué depuis les deux drapeaux comme
+# `source_write_mode()` (state.rs:727). Il est inscrit dans la scorecard : aucun
+# lecteur ne doit avoir à redéduire un défaut implicite.
+if [ "${SURCH_SOURCE_COMPRESS:-}" = "1" ]; then
+  SURCH_SOURCE_WRITE_MODE="${SURCH_SOURCE_COMPRESS_MODE:-block}"
+else
+  SURCH_SOURCE_WRITE_MODE="raw"
+fi
+case "$SURCH_C2_STREAM_EXPECT" in
+  off|stream|reference) ;;
+  *) err "SURCH_C2_STREAM_EXPECT doit valoir off, stream ou reference"; exit 1;;
+esac
+if [ "$SURCH_C2_STREAM_EXPECT" != "off" ]; then
+  [ -r "$P2_ASCIIFOLD_AWK" ] || {
+    err "preuve C2 : table asciifolding introuvable ($P2_ASCIIFOLD_AWK) — la borne basse de requêtes mono-token ne peut pas être calculée"; exit 1;
+  }
+  printf '%s' "$PROBE_FIXED_TERM" | awk '/^[A-Za-z0-9]+$/ { ok = 1 } END { exit !ok }' || {
+    err "preuve C2 : PROBE_FIXED_TERM doit être mono-token ASCII (la phase fixe est la seule dont l'attente C2 est EXACTE)"; exit 1;
+  }
+fi
+case "$DISK_VENTILATION_TOLERANCE_MIB" in ''|*[!0-9]*) err "DISK_VENTILATION_TOLERANCE_MIB doit être un entier en Mio"; exit 1;; esac
+case "$DISK_VENTILATION_TOLERANCE_PERCENT" in ''|*[!0-9]*) err "DISK_VENTILATION_TOLERANCE_PERCENT doit être un entier"; exit 1;; esac
 case "$P2_MEASURE" in 0|1) ;; *) err "P2_MEASURE doit valoir 0 ou 1"; exit 1;; esac
 if [ "$P2_MEASURE" = "1" ]; then
   [ "$P2_VARIANT" = "A" ] || [ "$P2_VARIANT" = "B" ] || [ "$P2_VARIANT" = "C" ] || {
@@ -149,6 +204,16 @@ if [ "$P2_MEASURE" = "1" ]; then
   }
   [ -n "$BULK_FILE" ] && [ -n "$MAPPING_FILE" ] || {
     err "protocole P2 : BULK_FILE et MAPPING_FILE explicites sont obligatoires"; exit 1;
+  }
+  # Aucun défaut implicite sous protocole fermé : l'opérateur DÉCLARE le chemin
+  # C2 attendu et le mode d'écriture `_source`. Un défaut silencieux rendrait
+  # possible exactement les deux faux négatifs que ce lot ferme (chemin C2
+  # décliné sans que rien n'échoue ; témoin D1 par-document inatteignable).
+  [ "$SURCH_C2_STREAM_EXPECT" = "stream" ] || [ "$SURCH_C2_STREAM_EXPECT" = "reference" ] || {
+    err "protocole P2 invalide : SURCH_C2_STREAM_EXPECT doit être déclaré à stream (le chemin C2 doit servir chaque match mono-terme) ou reference (image antérieure à C2)"; exit 1;
+  }
+  [ -n "$SURCH_SOURCE_COMPRESS_MODE" ] || {
+    err "protocole P2 invalide : SURCH_SOURCE_COMPRESS_MODE doit être déclaré (doc = témoin D1 par-document, block = D1 par blocs)"; exit 1;
   }
 fi
 if [ "$SURCH_SOURCE_FETCH_PROFILE" = "1" ] && [ "$PROBE_REQUESTS" -ne 1000 ]; then
@@ -1170,6 +1235,284 @@ probe_quantiles(){
     }'
 }
 
+# ================= ventilation par FORME de requête (besoin 1) =================
+# La sonde dite « aléatoire » est un MÉLANGE 50/50 de `match` mono-champ et de
+# `bool.must`. Les deux formes empruntent des chemins de code entièrement
+# différents (P2 n'a optimisé que le `bool.must` fusionné, C2 que le `match`
+# mono-terme streamé) : leurs quantiles agrégés produisent un ratio
+# ININTERPRÉTABLE — c'est la faute exacte du « 4,13× » cité pendant des semaines.
+# Les séries sont donc découpées par forme, et l'agrégat historique reste publié
+# UNIQUEMENT étiqueté comme non concluant.
+#
+# La forme est lue DANS LE CORPS de la requête, jamais déduite d'une parité de
+# ligne : une évolution du générateur ne peut donc pas réétiqueter silencieusement
+# les séries. Un corps qui n'est ni `match` ni `bool.must` fait échouer la
+# ventilation (fail-closed), il n'est jamais rangé dans un fourre-tout.
+probe_form_vector(){
+  local bodies="$1"
+  local out="$2"
+  local wanted="$3"
+  local got
+  # Classes explicites `[{]` / `[[]` plutôt que `\{` / `\[` : l'échappement
+  # d'une accolade est ambigu avec les intervalles ERE et gawk 5 (VM) ne le
+  # traite pas comme mawk (CI). Une classe est lue identiquement partout.
+  awk '
+    /^[{]"query":[{]"match":[{]/ { print "match"; next }
+    /^[{]"query":[{]"bool":[{]"must":[[]/ { print "bool"; next }
+    { exit 1 }
+  ' "$bodies" > "$out" || return 1
+  got=$(wc -l < "$out" 2>/dev/null); got=${got:-0}
+  [ "$got" -eq "$wanted" ] && [ "$wanted" -gt 0 ]
+}
+
+probe_form_count(){
+  local forms="$1"
+  local form="$2"
+  awk -v form="$form" '$1 == form { total++ } END { printf "%d", total + 0 }' "$forms"
+}
+
+# Découpe une série alignée ligne à ligne sur le vecteur de formes. Le garde
+# `[ -s "$forms" ]` n'est pas décoratif : avec un premier fichier VIDE, le
+# `NR == FNR` d'awk resterait vrai sur la première ligne du second fichier et
+# consommerait silencieusement un échantillon.
+probe_split_series_by_form(){
+  local src="$1"
+  local forms="$2"
+  local form="$3"
+  local out="$4"
+  local wanted="$5"
+  local got
+  [ -s "$forms" ] || return 1
+  [ -s "$src" ] || return 1
+  awk -v form="$form" '
+    NR == FNR { kind[FNR] = $1; next }
+    kind[FNR] == form { print }
+  ' "$forms" "$src" > "$out" || return 1
+  got=$(wc -l < "$out" 2>/dev/null); got=${got:-0}
+  [ "$got" -eq "$wanted" ]
+}
+
+# Nombre de corps `match` dont le NOM est mono-token ASCII après asciifolding +
+# lowercase, c'est-à-dire la BORNE BASSE des requêtes que le chemin C2 doit
+# servir. `NormAnalyzer` coupe sur `!char::is_alphanumeric()`
+# (crates/surch-analysis/src/lib.rs:98) : tout terme reconnu mono-token par cette
+# table l'est aussi pour le moteur, alors que l'inverse est faux (un caractère
+# alphanumérique Unicode absent de la table est compté « multi » ici et
+# « mono » par le moteur). L'inclusion ne va donc que dans un sens, et c'est
+# exactement ce qui rend cette valeur utilisable comme borne BASSE.
+probe_mono_token_match_count(){
+  local bodies="$1"
+  local field="$2"
+  awk -f "$P2_ASCIIFOLD_AWK" -f <(printf '%s\n' '
+    {
+      pattern = "\"query\":{\"match\":{\"" field "\":\""
+      start = index($0, pattern)
+      if (start == 0) next
+      rest = substr($0, start + length(pattern))
+      quote = index(rest, "\"")
+      if (quote == 0) next
+      value = substr(rest, 1, quote - 1)
+      if (p2_analysed_nom(value) ~ /^[a-z0-9]+$/) total++
+    }
+    END { printf "%d", total + 0 }
+  ') -v field="$field" "$bodies"
+}
+
+# Publie les quantiles SÉPARÉMENT par forme pour une phase, avec les séries
+# brutes correspondantes (matière première d'un bootstrap/IC95 par forme). Rien
+# n'est agrégé ici : l'agrégat historique reste publié ailleurs, explicitement
+# étiqueté `lat_rand_form_mix_not_conclusive`.
+# Renseigne PROBE_FORM_STATS_REASON et rend un statut non nul dès qu'une série
+# est incomplète — une ventilation partielle est une invalidité, pas un résultat.
+probe_publish_form_stats(){
+  local phase="$1"
+  local bodies="$2"
+  local client="$3"
+  local took="$4"
+  local overhead="$5"
+  local wanted="$6"
+  local forms="$OUT_DIR/$ENGINE.forms.$phase.txt"
+  local form
+  local count
+  local spec
+  local metric
+  local src
+  local scale
+  local suffix
+  local out
+  local q50
+  local q95
+  local q99
+  local published=0
+  PROBE_FORM_STATS_REASON=""
+  if ! probe_form_vector "$bodies" "$forms" "$wanted"; then
+    PROBE_FORM_STATS_REASON="${phase}_form_vector_invalid"
+    return 1
+  fi
+  for form in match bool; do
+    count=$(probe_form_count "$forms" "$form")
+    [ "$count" -gt 0 ] || continue
+    for spec in "client:$client:1000:_s" "took:$took:1:_ms" "probe:$overhead:1:_ms"; do
+      metric=${spec%%:*}; spec=${spec#*:}
+      src=${spec%%:*}; spec=${spec#*:}
+      scale=${spec%%:*}; suffix=${spec#*:}
+      out="$OUT_DIR/$ENGINE.by_form.$phase.$form.$metric$suffix"
+      if ! probe_split_series_by_form "$src" "$forms" "$form" "$out" "$count"; then
+        PROBE_FORM_STATS_REASON="${phase}_${form}_${metric}_split_invalid"
+        return 1
+      fi
+      # `probe_quantiles` n'émet PAS de saut de ligne final : `read` renseigne
+      # bien les trois variables puis retourne 1 à EOF. Tester son statut
+      # invaliderait donc une série pourtant complète (même piège que
+      # `p2_quantiles_with_max`). On valide les VALEURS, pas le statut.
+      q50=""; q95=""; q99=""
+      read -r q50 q95 q99 < <(probe_quantiles "$out" "$scale") || true
+      if ! printf '%s %s %s\n' "$q50" "$q95" "$q99" \
+        | awk 'NF != 3 { exit 1 } { for (i = 1; i <= 3; i++) if ($i !~ /^-?[0-9]+([.][0-9]+)?$/) exit 1 }'; then
+        PROBE_FORM_STATS_REASON="${phase}_${form}_${metric}_quantiles_invalid"
+        return 1
+      fi
+      printf '{"engine":"%s","phase":"%s","form":"%s","metric":"%s","unit":"ms","n":%s,"raw_file":"%s","p50":%s,"p95":%s,"p99":%s}\n' \
+        "$ENGINE" "$phase" "$form" "$metric" "$count" "$out" "$q50" "$q95" "$q99" >> "$PROBE_BY_FORM_JSONL" || {
+          PROBE_FORM_STATS_REASON="${phase}_${form}_${metric}_jsonl_write_failed"
+          return 1
+        }
+      published=$((published + 1))
+    done
+  done
+  if [ "$published" -eq 0 ]; then
+    PROBE_FORM_STATS_REASON="${phase}_no_form_published"
+    return 1
+  fi
+}
+# Ratios surch/ES PAR FORME. Aucun agrégat n'est produit ici, et c'est
+# volontaire : un ratio toutes formes confondues mélange une moitié optimisée
+# par P2 (`bool.must`) et une moitié optimisée par C2 (`match` mono-terme), donc
+# il ne veut rien dire — c'est exactement le défaut du « 4,13× ». L'appariement
+# est vérifié enregistrement par enregistrement (même phase, même forme, même
+# métrique, même effectif) : un ratio ne peut pas être calculé entre deux
+# populations différentes.
+# Contrat de sortie : raison dans BY_FORM_RATIOS_REASON, pas de $(...).
+by_form_ratios(){
+  local es_jsonl="$1"
+  local surch_jsonl="$2"
+  local out="$3"
+  local jq_err_file
+  BY_FORM_RATIOS_REASON=""
+  if [ ! -s "$es_jsonl" ] || [ ! -s "$surch_jsonl" ]; then
+    BY_FORM_RATIOS_REASON="by_form_jsonl_missing"
+    return 1
+  fi
+  jq_err_file="$OUT_DIR/.by_form_ratios_jq_stderr.$$"
+  # Filtre volontairement limité à jq 1.6 (version du runner CI) : pas
+  # d'interpolation `\(…)` dans `error`, pas d'indexation d'une variable par une
+  # pipeline (`$v[expr]`), seulement `.[$k]`, `map`, `add` et `+` sur chaînes.
+  if ! jq -c --slurpfile es "$es_jsonl" --slurpfile surch "$surch_jsonl" -n '
+    def key: [.phase, .form, .metric] | @json;
+    def ratio($a; $b): if ($a | type) != "number" or ($b | type) != "number" or $a == 0 then null else $b / $a end;
+    if ($es | length) == 0 or ($es | length) != ($surch | length)
+    then error("effectifs de ventilation par forme differents entre moteurs")
+    else . end
+    | ($es | map({(key): .}) | add) as $index
+    | $surch[]
+    | . as $s
+    | ($s | key) as $k
+    | ($index | .[$k]) as $e
+    | if $e == null then error("enregistrement par forme absent cote ES: " + $k) else . end
+    | if $e.n != $s.n then error("effectifs apparies differents: " + $k) else . end
+    | {phase: $s.phase, form: $s.form, metric: $s.metric, unit: $s.unit, n: $s.n,
+       aggregate: false,
+       es: {p50: $e.p50, p95: $e.p95, p99: $e.p99, raw_file: $e.raw_file},
+       surch: {p50: $s.p50, p95: $s.p95, p99: $s.p99, raw_file: $s.raw_file},
+       surch_over_es: {p50: ratio($e.p50; $s.p50), p95: ratio($e.p95; $s.p95), p99: ratio($e.p99; $s.p99)}}
+  ' > "$out" 2>"$jq_err_file"; then
+    err "by_form_ratios : jq a échoué : $(cat "$jq_err_file" 2>/dev/null)"
+    rm -f "$jq_err_file"
+    BY_FORM_RATIOS_REASON="by_form_ratios_jq_error"
+    return 1
+  fi
+  rm -f "$jq_err_file"
+  [ -s "$out" ] || { BY_FORM_RATIOS_REASON="by_form_ratios_empty"; return 1; }
+}
+# ============================ fin ventilation par forme ========================
+
+# ============ ventilation DISQUE par composant (besoin 4) =====================
+# L'axe disque doit être lu PAR COMPOSANT : D1 agit sur `_source`, D2/C5 sur les
+# postings, et un total masque quel levier a payé. La ventilation existait déjà
+# (elle a produit `_source` 7 248 Mio / postings 4 598 / subfields 1 047 / fst 0
+# dans docs/paper/verdict-28M-6g-2026-07-11.md) mais n'était pas VÉRIFIÉE : une
+# liste vide rendait cinq zéros indiscernables d'un index sans `_source`.
+#
+# Entrée : lignes « octets<espace>nom_de_fichier », exhaustives sur le volume.
+# Contrat de sortie : globales DISK_VENT_* ; ne pas appeler sous $(...).
+disk_ventilation_classify(){
+  local listing="$1"
+  local du_mib="$2"
+  local fsize
+  local fname
+  local total_mib
+  local tolerance_mib
+  local gap_mib
+  DISK_VENT_POSTINGS=0
+  DISK_VENT_SUBFIELDS=0
+  DISK_VENT_SOURCE=0
+  DISK_VENT_FST_MERGE=0
+  DISK_VENT_OTHER=0
+  DISK_VENT_TOTAL=0
+  DISK_VENT_FILES=0
+  DISK_VENT_POSTINGS_FILES=0
+  DISK_VENT_VALID=false
+  DISK_VENT_REASON=""
+  if [ -z "$listing" ]; then
+    DISK_VENT_REASON="disk_ventilation_listing_empty"
+    return 1
+  fi
+  while read -r fsize fname; do
+    [ -n "$fname" ] || continue
+    case "$fsize" in ''|*[!0-9]*)
+      DISK_VENT_REASON="disk_ventilation_size_non_numeric"
+      return 1;;
+    esac
+    DISK_VENT_FILES=$((DISK_VENT_FILES + 1))
+    case "$fname" in
+      surch-postings-*) DISK_VENT_POSTINGS=$((DISK_VENT_POSTINGS + fsize)); DISK_VENT_POSTINGS_FILES=$((DISK_VENT_POSTINGS_FILES + 1)) ;;
+      surch-subfields-*) DISK_VENT_SUBFIELDS=$((DISK_VENT_SUBFIELDS + fsize)) ;;
+      surch-source-*) DISK_VENT_SOURCE=$((DISK_VENT_SOURCE + fsize)) ;;
+      surch-fst-merge-*) DISK_VENT_FST_MERGE=$((DISK_VENT_FST_MERGE + fsize)) ;;
+      *) DISK_VENT_OTHER=$((DISK_VENT_OTHER + fsize)) ;;
+    esac
+  done <<< "$listing"
+  DISK_VENT_TOTAL=$((DISK_VENT_POSTINGS + DISK_VENT_SUBFIELDS + DISK_VENT_SOURCE + DISK_VENT_FST_MERGE + DISK_VENT_OTHER))
+  # Un composant à zéro est indiscernable d'une ventilation muette : sur un
+  # index qui contient des documents, postings et `_source` sont non vides par
+  # construction. Zéro = INVALIDE, jamais « rien à ventiler ».
+  if [ "$DISK_VENT_POSTINGS" -le 0 ] || [ "$DISK_VENT_POSTINGS_FILES" -le 0 ]; then
+    DISK_VENT_REASON="disk_ventilation_postings_zero"
+    return 1
+  fi
+  if [ "$DISK_VENT_SOURCE" -le 0 ]; then
+    DISK_VENT_REASON="disk_ventilation_source_zero"
+    return 1
+  fi
+  case "$du_mib" in ''|*[!0-9]*)
+    DISK_VENT_REASON="disk_ventilation_du_unreadable_${du_mib}"
+    return 1;;
+  esac
+  # Réconciliation avec `du -sm` du MÊME volume : si la somme des composants ne
+  # retrouve pas le total, une part du disque n'est attribuée à aucun levier et
+  # la comparaison par composant serait fausse.
+  total_mib=$(( DISK_VENT_TOTAL / 1024 / 1024 ))
+  tolerance_mib=$(( du_mib * DISK_VENTILATION_TOLERANCE_PERCENT / 100 ))
+  [ "$tolerance_mib" -ge "$DISK_VENTILATION_TOLERANCE_MIB" ] || tolerance_mib="$DISK_VENTILATION_TOLERANCE_MIB"
+  gap_mib=$(( total_mib - du_mib )); [ "$gap_mib" -ge 0 ] || gap_mib=$(( -gap_mib ))
+  if [ "$gap_mib" -gt "$tolerance_mib" ]; then
+    DISK_VENT_REASON="disk_ventilation_sum_${total_mib}_vs_du_${du_mib}_gap_${gap_mib}_tolerance_${tolerance_mib}"
+    return 1
+  fi
+  DISK_VENT_VALID=true
+}
+# ====================== fin ventilation disque par composant ==================
+
 # ---- P2 : preuve du routage et statistiques par corps ----
 # Cette jauge est publiée pendant l'indexation : elle doit donc être présente
 # dès le contrôle index_ready, avant toute sonde.
@@ -1612,6 +1955,120 @@ p2_counter_value(){
 p2_number_equal(){ awk -v left="$1" -v right="$2" 'BEGIN { exit !((left + 0) == (right + 0)) }'; }
 p2_number_le(){ awk -v left="$1" -v right="$2" 'BEGIN { exit !((left + 0) <= (right + 0)) }'; }
 
+# ============== C2 : preuve d'activation du chemin streamé (besoin 2) ==========
+# Rappel du piège maison : `p2_counter_value` rend « 0 » quand la SÉRIE est
+# absente (compteur Prometheus jamais incrémenté). Ce zéro est légitime AVANT la
+# première requête, mais après une phase qui devait streamer il est la signature
+# EXACTE du déclin silencieux. La présence de la série est donc exigée
+# SÉPARÉMENT, et une absence n'est jamais convertie en succès.
+#
+# Contrat de sortie : comme `p2_metric_bundle_json`, cette fonction publie ses
+# résultats dans des globales et NE DOIT PAS être appelée sous $(...) — un
+# sous-shell perdrait la raison d'échec et la rendrait indiscernable d'un
+# compteur réellement absent.
+c2_expected_stream_delta(){
+  local match_requests="$1"
+  case "$SURCH_C2_STREAM_EXPECT" in
+    stream) printf '%s' "$match_requests" ;;
+    reference) printf '0' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Attente EXACTE : `delta == match_requests` (mode stream) ou `delta == 0`
+# (mode reference). Réservée aux phases dont chaque corps `match` est prouvé
+# mono-token par le protocole (phases P2, sonde fixe).
+c2_stream_phase_verdict(){
+  local before="$1"
+  local after="$2"
+  local match_requests="$3"
+  local expected
+  C2_STREAM_BEFORE=""
+  C2_STREAM_AFTER=""
+  C2_STREAM_DELTA=""
+  C2_STREAM_EXPECTED=""
+  C2_STREAM_PRESENT_AFTER=false
+  C2_STREAM_REASON=""
+  if [ "$SURCH_C2_STREAM_EXPECT" = "off" ]; then
+    C2_STREAM_REASON="c2_stream_expectation_off"
+    return 1
+  fi
+  C2_STREAM_BEFORE=$(p2_counter_value "$SURCH_C2_STREAM_METRIC" "$before") || {
+    C2_STREAM_REASON="c2_stream_counter_before_unreadable"; return 1;
+  }
+  C2_STREAM_AFTER=$(p2_counter_value "$SURCH_C2_STREAM_METRIC" "$after") || {
+    C2_STREAM_REASON="c2_stream_counter_after_unreadable"; return 1;
+  }
+  if p2_metric_present "$SURCH_C2_STREAM_METRIC" "$after"; then
+    C2_STREAM_PRESENT_AFTER=true
+  fi
+  C2_STREAM_DELTA=$(awk -v a="$C2_STREAM_AFTER" -v b="$C2_STREAM_BEFORE" 'BEGIN { printf "%.17g", a - b }')
+  expected=$(c2_expected_stream_delta "$match_requests") || {
+    C2_STREAM_REASON="c2_stream_expectation_undeclared"; return 1;
+  }
+  C2_STREAM_EXPECTED="$expected"
+  if [ "$SURCH_C2_STREAM_EXPECT" = "stream" ] && [ "$match_requests" -gt 0 ] \
+     && [ "$C2_STREAM_PRESENT_AFTER" != true ]; then
+    C2_STREAM_REASON="c2_stream_metric_absent_after_${match_requests}_match_requests"
+    return 1
+  fi
+  if ! p2_number_equal "$C2_STREAM_DELTA" "$expected"; then
+    C2_STREAM_REASON="c2_stream_delta_${C2_STREAM_DELTA}_expected_${expected}"
+    return 1
+  fi
+}
+
+# Attente ENCADRÉE : `mono_lower_bound <= delta <= match_requests` (mode stream)
+# ou `delta == 0` (mode reference). Réservée aux phases dont les corps `match`
+# viennent du corpus brut, où la proportion réellement mono-token n'est pas
+# connue exactement (cf. `probe_mono_token_match_count`). L'encadrement reste
+# fail-closed : un déclin global donne delta = 0 < borne basse, donc INVALIDE.
+c2_stream_phase_verdict_bounded(){
+  local before="$1"
+  local after="$2"
+  local match_requests="$3"
+  local mono_lower_bound="$4"
+  C2_STREAM_BEFORE=""
+  C2_STREAM_AFTER=""
+  C2_STREAM_DELTA=""
+  C2_STREAM_EXPECTED=""
+  C2_STREAM_PRESENT_AFTER=false
+  C2_STREAM_REASON=""
+  if [ "$SURCH_C2_STREAM_EXPECT" = "off" ]; then
+    C2_STREAM_REASON="c2_stream_expectation_off"
+    return 1
+  fi
+  C2_STREAM_BEFORE=$(p2_counter_value "$SURCH_C2_STREAM_METRIC" "$before") || {
+    C2_STREAM_REASON="c2_stream_counter_before_unreadable"; return 1;
+  }
+  C2_STREAM_AFTER=$(p2_counter_value "$SURCH_C2_STREAM_METRIC" "$after") || {
+    C2_STREAM_REASON="c2_stream_counter_after_unreadable"; return 1;
+  }
+  if p2_metric_present "$SURCH_C2_STREAM_METRIC" "$after"; then
+    C2_STREAM_PRESENT_AFTER=true
+  fi
+  C2_STREAM_DELTA=$(awk -v a="$C2_STREAM_AFTER" -v b="$C2_STREAM_BEFORE" 'BEGIN { printf "%.17g", a - b }')
+  if [ "$SURCH_C2_STREAM_EXPECT" = "reference" ]; then
+    C2_STREAM_EXPECTED="0"
+    if p2_number_equal "$C2_STREAM_DELTA" 0; then
+      return 0
+    fi
+    C2_STREAM_REASON="c2_stream_delta_${C2_STREAM_DELTA}_expected_0"
+    return 1
+  fi
+  C2_STREAM_EXPECTED="[${mono_lower_bound};${match_requests}]"
+  if [ "$mono_lower_bound" -gt 0 ] && [ "$C2_STREAM_PRESENT_AFTER" != true ]; then
+    C2_STREAM_REASON="c2_stream_metric_absent_after_${mono_lower_bound}_mono_token_match_requests"
+    return 1
+  fi
+  if ! p2_number_le "$mono_lower_bound" "$C2_STREAM_DELTA" \
+     || ! p2_number_le "$C2_STREAM_DELTA" "$match_requests"; then
+    C2_STREAM_REASON="c2_stream_delta_${C2_STREAM_DELTA}_outside_${mono_lower_bound}_${match_requests}"
+    return 1
+  fi
+}
+# =========================== fin preuve C2 ====================================
+
 p2_segment_value_valid(){
   local value="$1"
   case "$P2_SEGMENT_GATE" in
@@ -1660,6 +2117,12 @@ p2_write_phase_status(){
   local blocks_ratio_target_pass="null"
   local blocks_ratio_verdict="not_applicable"
   local integrity_required=false
+  local c2_checked=false
+  local c2_before="null"
+  local c2_after="null"
+  local c2_delta="null"
+  local c2_expected="null"
+  local c2_present_after=false
   local valid=true
   local reason=""
   direct_before=$(p2_counter_value surch_bool_direct_must_fused_total "$before") || valid=false
@@ -1750,6 +2213,21 @@ p2_write_phase_status(){
         fi
       fi
     fi
+    # Preuve d'activation du chantier C2 (besoin 2). Chaque corps `match` du
+    # protocole P2 est prouvé mono-token ASCII par `p2_validate_*` : l'attente
+    # est donc EXACTE, et un déclin silencieux rend la phase INVALIDE — jamais
+    # performante. Une phase bool doit, symétriquement, ne rien streamer.
+    if [ "$valid" = true ] && [ "$SURCH_C2_STREAM_EXPECT" != "off" ]; then
+      c2_checked=true
+      if ! c2_stream_phase_verdict "$before" "$after" "$match_requests"; then
+        valid=false; reason="${C2_STREAM_REASON:-c2_stream_invalid}"
+      fi
+      c2_before="${C2_STREAM_BEFORE:-null}"
+      c2_after="${C2_STREAM_AFTER:-null}"
+      c2_delta="${C2_STREAM_DELTA:-null}"
+      c2_expected="${C2_STREAM_EXPECTED:-null}"
+      c2_present_after="${C2_STREAM_PRESENT_AFTER:-false}"
+    fi
   fi
   P2_PHASE_VALID="$valid"
   P2_PHASE_REASON="$reason"
@@ -1757,7 +2235,7 @@ p2_write_phase_status(){
   # mesure : routage, corps, segments et réponses restent déjà fail-closed.
   # Un ratio hors cible est donc enregistré comme ÉCHEC P2 exploitable plutôt
   # que de transformer la phase A/B correcte en mesure invalide.
-  printf '{"execution_id":"%s","phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"request_cache":false,"hits_total_positive":true,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}},"integrity":{"required":%s,"bytes":{"before":%s,"after":%s},"hash_failures":{"before":%s,"after":%s},"fallbacks":{"before":%s,"after":%s},"fallback_fields":{"before":%s,"after":%s},"verified_bytes":{"before":%s,"after":%s}}}\n' \
+  printf '{"execution_id":"%s","phase":"%s","variant":"%s","bool_requests":%s,"match_requests":%s,"request_cache":false,"hits_total_positive":true,"valid":%s,"reason":%s,"cpu_steal_percent":%s,"cpu_steal_limit_percent":%s,"cpu_steal_within_limit":%s,"cpu_steal_reason":%s,"blocks_metrics_emitted":%s,"blocks_read_over_total":%s,"blocks_ratio_target":0.25,"blocks_ratio_target_pass":%s,"blocks_ratio_verdict":"%s","metrics":{"direct":{"before":%s,"after":%s,"delta":%s},"generic":{"before":%s,"after":%s,"delta":%s},"blocks_read":{"before":%s,"after":%s,"delta":%s},"blocks_total":{"before":%s,"after":%s,"delta":%s},"segments":{"before":%s,"after":%s,"delta":%s}},"integrity":{"required":%s,"bytes":{"before":%s,"after":%s},"hash_failures":{"before":%s,"after":%s},"fallbacks":{"before":%s,"after":%s},"fallback_fields":{"before":%s,"after":%s},"verified_bytes":{"before":%s,"after":%s}},"c2_stream":{"expect":"%s","checked":%s,"metric":"%s","metric_present_after":%s,"before":%s,"after":%s,"delta":%s,"expected_delta":%s}}\n' \
     "$P2_EXECUTION_ID" "$phase" "$P2_VARIANT" "$bool_requests" "$match_requests" "$valid" \
     "$( [ -n "$reason" ] && printf '\"%s\"' "$reason" || printf 'null' )" \
     "$cpu_steal_percent" "$P2_CPU_STEAL_MAX_PERCENT" "$cpu_steal_within_limit" \
@@ -1774,6 +2252,8 @@ p2_write_phase_status(){
     "${integrity_fallbacks_before:-null}" "${integrity_fallbacks_after:-null}" \
     "${integrity_fallback_fields_before:-null}" "${integrity_fallback_fields_after:-null}" \
     "${integrity_verified_bytes_before:-null}" "${integrity_verified_bytes_after:-null}" \
+    "$SURCH_C2_STREAM_EXPECT" "$c2_checked" "$SURCH_C2_STREAM_METRIC" "$c2_present_after" \
+    "$c2_before" "$c2_after" "$c2_delta" "$c2_expected" \
     >> "$P2_PHASE_STATUS"
   [ "$valid" = true ]
 }
@@ -1932,6 +2412,74 @@ p2_split_and_stat_phase(){
       p2_write_stat "$phase" "$kind" "$metric" "$out" "$scale" "$wanted" || return 1
     done
   done
+}
+
+# ---- C2 hors protocole P2 : scrape du compteur autour de chaque phase ----
+# Le chemin ES/L2 est précisément celui qui a produit le ratio agrégé
+# historique : il doit porter la même preuve d'activation que le protocole
+# fermé. Le scrape a lieu HORS de la fenêtre chronométrée (les latences sont
+# des `time_total` par requête), il ne peut donc pas polluer les séries.
+c2_snapshot_metrics(){
+  local base="$1"
+  local out="$2"
+  local phase="$3"
+  C2_SNAPSHOT_REASON=""
+  : > "$out"
+  if ! docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 \
+    --fail-with-body --silent --show-error "$base/_prometheus_metrics" > "$out"; then
+    C2_SNAPSHOT_REASON="${phase}_c2_prometheus_curl_failed"
+    return 1
+  fi
+  [ -s "$out" ] || { C2_SNAPSHOT_REASON="${phase}_c2_prometheus_empty"; return 1; }
+}
+
+c2_phase_begin(){
+  local base="$1"
+  local phase="$2"
+  [ "$C2_STREAM_ENABLED" = true ] || return 0
+  C2_PHASE_BEFORE="$OUT_DIR/$ENGINE.c2.$phase.before.prom"
+  if ! c2_snapshot_metrics "$base" "$C2_PHASE_BEFORE" "$phase"; then
+    C2_STREAM_RUN_VALID=false
+    C2_STREAM_RUN_REASON="${C2_SNAPSHOT_REASON:-${phase}_c2_before_failed}"
+    return 1
+  fi
+}
+
+# `exact=true` : la phase ne contient que des `match` prouvés mono-token
+# (sonde fixe) — attente stricte. `exact=false` : les corps viennent du corpus
+# brut, l'attente est l'encadrement [mono_lower_bound ; match_requests].
+c2_phase_end(){
+  local base="$1"
+  local phase="$2"
+  local match_requests="$3"
+  local mono_lower_bound="$4"
+  local exact="$5"
+  local after
+  local phase_valid=true
+  [ "$C2_STREAM_ENABLED" = true ] || return 0
+  after="$OUT_DIR/$ENGINE.c2.$phase.after.prom"
+  if ! c2_snapshot_metrics "$base" "$after" "$phase"; then
+    C2_STREAM_RUN_VALID=false
+    C2_STREAM_RUN_REASON="${C2_SNAPSHOT_REASON:-${phase}_c2_after_failed}"
+    return 1
+  fi
+  if [ "$exact" = true ]; then
+    c2_stream_phase_verdict "$C2_PHASE_BEFORE" "$after" "$match_requests" || phase_valid=false
+  else
+    c2_stream_phase_verdict_bounded "$C2_PHASE_BEFORE" "$after" "$match_requests" "$mono_lower_bound" || phase_valid=false
+  fi
+  printf '{"engine":"%s","phase":"%s","expect":"%s","exact_expectation":%s,"metric":"%s","metric_present_after":%s,"match_requests":%s,"mono_token_lower_bound":%s,"before":%s,"after":%s,"delta":%s,"expected_delta":"%s","valid":%s,"reason":%s}\n' \
+    "$ENGINE" "$phase" "$SURCH_C2_STREAM_EXPECT" "$exact" "$SURCH_C2_STREAM_METRIC" \
+    "${C2_STREAM_PRESENT_AFTER:-false}" "$match_requests" "$mono_lower_bound" \
+    "${C2_STREAM_BEFORE:-null}" "${C2_STREAM_AFTER:-null}" "${C2_STREAM_DELTA:-null}" \
+    "${C2_STREAM_EXPECTED:-}" "$phase_valid" \
+    "$( [ -n "$C2_STREAM_REASON" ] && printf '"%s"' "$C2_STREAM_REASON" || printf 'null' )" \
+    >> "$C2_STREAM_JSONL"
+  if [ "$phase_valid" != true ]; then
+    C2_STREAM_RUN_VALID=false
+    C2_STREAM_RUN_REASON="${C2_STREAM_REASON:-${phase}_c2_stream_invalid}"
+    return 1
+  fi
 }
 
 # Snapshot Prometheus brut par phase. Les compteurs restent bornés côté
@@ -2235,6 +2783,27 @@ run_engine(){
   local HEAP
   local HALF
   prepare_feeder_tmp "$ENGINE" || return 1
+  # Artefacts par moteur des deux nouveaux garde-fous : preuve d'activation C2
+  # (besoin 2) et ventilation par forme (besoin 1). Ils sont remis à zéro ici,
+  # jamais réutilisés d'un moteur à l'autre.
+  C2_STREAM_JSONL="$OUT_DIR/$ENGINE.c2-stream.jsonl"
+  PROBE_BY_FORM_JSONL="$OUT_DIR/$ENGINE.by-form.jsonl"
+  C2_STREAM_RUN_VALID=true
+  C2_STREAM_RUN_REASON=""
+  C2_PHASE_BEFORE=""
+  PROBE_FORM_STATS_RUN_VALID=true
+  PROBE_FORM_STATS_RUN_REASON=""
+  : > "$C2_STREAM_JSONL"
+  : > "$PROBE_BY_FORM_JSONL"
+  # Sous P2_MEASURE=1, la preuve C2 est portée phase par phase par
+  # `p2_write_phase_status` (attente EXACTE, corps mono-token prouvés) : pas de
+  # scrape supplémentaire, donc aucune perturbation du protocole du témoin
+  # autonome. Hors P2, c'est ce scrape-ci qui porte la preuve.
+  if [ "$ENGINE" = "surch" ] && [ "$SURCH_C2_STREAM_EXPECT" != "off" ] && [ "$P2_MEASURE" != "1" ]; then
+    C2_STREAM_ENABLED=true
+  else
+    C2_STREAM_ENABLED=false
+  fi
   if [ "$P2_MEASURE" = "1" ]; then
     [ "$ENGINE" = "surch" ] || { err "P2 ne mesure que Surch (ENGINE=$ENGINE refusé)"; return 1; }
     P2_PHASE_STATUS="$OUT_DIR/$ENGINE.p2.phase-status.jsonl"
@@ -2272,6 +2841,7 @@ run_engine(){
       ${SURCH_MERGE_MAX_DOCS:+-e SURCH_MERGE_MAX_DOCS="$SURCH_MERGE_MAX_DOCS"} \
       ${SURCH_DENSIFY_BUDGET_DOCS:+-e SURCH_DENSIFY_BUDGET_DOCS="$SURCH_DENSIFY_BUDGET_DOCS"} \
       ${SURCH_SOURCE_COMPRESS:+-e SURCH_SOURCE_COMPRESS="$SURCH_SOURCE_COMPRESS"} \
+      ${SURCH_SOURCE_COMPRESS_MODE:+-e SURCH_SOURCE_COMPRESS_MODE="$SURCH_SOURCE_COMPRESS_MODE"} \
       ${SURCH_SOURCE_FETCH_PARALLEL:+-e SURCH_SOURCE_FETCH_PARALLEL="$SURCH_SOURCE_FETCH_PARALLEL"} \
       -e SURCH_SOURCE_FETCH_PROFILE="$SURCH_SOURCE_FETCH_PROFILE" \
       -e SURCH_SOURCE_FETCH_PROFILE_FILE="$SURCH_SOURCE_FETCH_PROFILE_FILE" \
@@ -2441,37 +3011,49 @@ run_engine(){
   local disk_bytes_source="null"
   local disk_bytes_fst_merge="null"
   local disk_bytes_other="null"
+  local disk_bytes_total="null"
+  local disk_files_total="null"
   local files_postings_count="null"
   local segment_count="null"
+  local disk_ventilation_valid="null"
+  local disk_ventilation_reason="null"
   if [ "$ENGINE" = "surch" ]; then
-    local bp=0
-    local bsub=0
-    local bsrc=0
-    local bfst=0
-    local both=0
-    local fpc=0
     local vent_listing
+    local vent_rc
+    # Le parcours est RÉCURSIF (`find -type f`) : la somme des composants est
+    # exhaustive par construction, donc réconciliable avec le `du -sm` du même
+    # volume. L'ancien `for f in *` ignorait tout sous-répertoire et pouvait
+    # rendre une ventilation muette sur une part du disque.
+    # `%b * 512` = octets réellement OCCUPÉS (pas la taille apparente : les
+    # stores sont préalloués/creux -> `stat %s` surestime, cf gate 1,36M :
+    # 1375 Mio apparents vs 1040 `du`).
     vent_listing=$(docker run --rm $AUXCAP -v "fairab-vol-$ENGINE:/d" alpine:3 sh -c '
-      cd /d 2>/dev/null || exit 0
-      for f in *; do
-        [ -f "$f" ] || continue
-        # %b*512 = octets réellement OCCUPÉS (pas la taille apparente : les stores sont
-        # préalloués/creux -> stat %s surestime, cf gate 1,36M : 1375 MiB apparents vs 1040 du)
-        blk=$(stat -c "%b" "$f" 2>/dev/null); blk=${blk:-0}
-        echo "$f $(( blk * 512 ))"
+      cd /d || exit 1
+      find . -type f | while IFS= read -r f; do
+        blk=$(stat -c "%b" "$f" 2>/dev/null) || blk=""
+        [ -n "$blk" ] || exit 1
+        printf "%s %s\n" "$(( blk * 512 ))" "${f##*/}"
       done' 2>/dev/null)
-    while IFS=' ' read -r fname fsize; do
-      [ -z "$fname" ] && continue
-      case "$fname" in
-        surch-postings-*) bp=$((bp+fsize)); fpc=$((fpc+1)) ;;
-        surch-subfields-*) bsub=$((bsub+fsize)) ;;
-        surch-source-*) bsrc=$((bsrc+fsize)) ;;
-        surch-fst-merge-*) bfst=$((bfst+fsize)) ;;
-        *) both=$((both+fsize)) ;;
-      esac
-    done <<< "$vent_listing"
-    disk_bytes_postings=$bp; disk_bytes_subfields=$bsub; disk_bytes_source=$bsrc
-    disk_bytes_fst_merge=$bfst; disk_bytes_other=$both; files_postings_count=$fpc
+    vent_rc=$?
+    if [ "$vent_rc" -ne 0 ]; then
+      DISK_VENT_VALID=false
+      DISK_VENT_REASON="disk_ventilation_listing_failed"
+      DISK_VENT_POSTINGS=0; DISK_VENT_SUBFIELDS=0; DISK_VENT_SOURCE=0
+      DISK_VENT_FST_MERGE=0; DISK_VENT_OTHER=0; DISK_VENT_TOTAL=0
+      DISK_VENT_FILES=0; DISK_VENT_POSTINGS_FILES=0
+    else
+      disk_ventilation_classify "$vent_listing" "$disk"
+    fi
+    disk_bytes_postings=$DISK_VENT_POSTINGS
+    disk_bytes_subfields=$DISK_VENT_SUBFIELDS
+    disk_bytes_source=$DISK_VENT_SOURCE
+    disk_bytes_fst_merge=$DISK_VENT_FST_MERGE
+    disk_bytes_other=$DISK_VENT_OTHER
+    disk_bytes_total=$DISK_VENT_TOTAL
+    disk_files_total=$DISK_VENT_FILES
+    files_postings_count=$DISK_VENT_POSTINGS_FILES
+    disk_ventilation_valid="$DISK_VENT_VALID"
+    [ -n "$DISK_VENT_REASON" ] && disk_ventilation_reason="\"$DISK_VENT_REASON\""
     segment_count=$(docker run --rm $AUXCAP --network "$NET" curlimages/curl:8.10.1 --fail-with-body --silent --show-error "$BASE/_prometheus_metrics" 2>/dev/null | awk '/^surch_index_segment_count\{/{print $NF; exit}')
     [ -z "$segment_count" ] && segment_count="null"
   fi
@@ -2515,6 +3097,19 @@ run_engine(){
   local match_control_overhead_raw="$OUT_DIR/$ENGINE.p2.match_control_probe_overhead_ms"
   local warm_match_bodies="$OUT_DIR/$ENGINE.p2.warm_match_bodies.ndjson"
   local warm_bool_bodies="$OUT_DIR/$ENGINE.p2.warm_bool_bodies.ndjson"
+  # Nombre de corps `match` de la sonde aléatoire, et BORNE BASSE des corps que
+  # le chemin C2 doit servir (NOM mono-token après asciifolding + lowercase).
+  # Hors protocole P2, les NOM viennent du corpus brut : « DE LA CROIX » ou
+  # « LE GALL » y sont multi-token et déclinent légitimement. L'attente C2 y est
+  # donc un ENCADREMENT, jamais une égalité inventée.
+  local probe_random_match_requests=0
+  local probe_random_mono_lower_bound=0
+  if [ "$P2_MEASURE" != "1" ] && [ "$C2_STREAM_ENABLED" = true ]; then
+    probe_random_match_requests=$(grep -c '"query":{"match"' "$PROBE_BODIES" 2>/dev/null || true)
+    probe_random_match_requests=${probe_random_match_requests:-0}
+    probe_random_mono_lower_bound=$(probe_mono_token_match_count "$PROBE_BODIES" "$PROBE_FIELD_NOM")
+    probe_random_mono_lower_bound=${probe_random_mono_lower_bound:-0}
+  fi
   local warm_match_raw="$OUT_DIR/$ENGINE.p2.warm_match_client_s"
   local warm_match_took_raw="$OUT_DIR/$ENGINE.p2.warm_match_took_ms"
   local warm_match_overhead_raw="$OUT_DIR/$ENGINE.p2.warm_match_probe_overhead_ms"
@@ -2581,6 +3176,11 @@ run_engine(){
       docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1;
     }
   fi
+  c2_phase_begin "$BASE" fixed || {
+    err "$ENGINE : preuve C2 impossible avant la sonde fixe : $C2_STREAM_RUN_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  }
   if [ "$P2_MEASURE" = "1" ]; then
     if ! p2_extract_warm_bodies "$P2_WARM_BODIES" "$warm_bool_bodies" "$(( P2_WARM_TERM_COUNT + 1 ))" "$P2_WARM_TERM_COUNT"; then
       PROBE_CAPTURE_REASON="warm_bool_bodies_extract_failed"
@@ -2596,6 +3196,20 @@ run_engine(){
     err "$ENGINE : chauffe bool invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  fi
+  # Sonde fixe : `PROBE_FIXED_TERM` est validé mono-token ASCII au préflight,
+  # l'attente C2 y est donc EXACTE. C'est la seule phase hors protocole P2 dans
+  # ce cas, et c'est elle qui tranche un déclin GLOBAL du chemin streamé — le
+  # plafond d'intégrité P2 est une propriété de l'index, pas du terme.
+  c2_phase_end "$BASE" fixed "$PROBE_REQUESTS" "$PROBE_REQUESTS" true || {
+    err "$ENGINE : preuve C2 invalide sur la sonde fixe : $C2_STREAM_RUN_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  }
+  if [ "$P2_MEASURE" != "1" ] \
+     && ! probe_publish_form_stats fixed "$PROBE_FIXED_BODIES" "$fixed_raw" "$fixed_took_raw" "$fixed_overhead_raw" "$PROBE_REQUESTS"; then
+    PROBE_FORM_STATS_RUN_VALID=false
+    PROBE_FORM_STATS_RUN_REASON="${PROBE_FORM_STATS_REASON:-fixed_form_stats_invalid}"
   fi
   local lat50
   local lat95
@@ -2629,6 +3243,11 @@ run_engine(){
       source_fetch_profile_previous=$((source_fetch_profile_previous + SOURCE_FETCH_ARTIFACT_RECORDS))
     fi
   fi
+  c2_phase_begin "$BASE" random || {
+    err "$ENGINE : preuve C2 impossible avant la sonde aléatoire : $C2_STREAM_RUN_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  }
   if [ "$P2_MEASURE" = "1" ]; then
     p2_capture_phase "$BASE" bool_size10 "$P2_BOOL_SIZE10_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" 0
   else
@@ -2638,6 +3257,16 @@ run_engine(){
     err "$ENGINE : bool.must size:10 invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  fi
+  c2_phase_end "$BASE" random "$probe_random_match_requests" "$probe_random_mono_lower_bound" false || {
+    err "$ENGINE : preuve C2 invalide sur la sonde aléatoire : $C2_STREAM_RUN_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  }
+  if [ "$P2_MEASURE" != "1" ] \
+     && ! probe_publish_form_stats random "$PROBE_BODIES" "$random_raw" "$random_took_raw" "$random_overhead_raw" "$PROBE_REQUESTS"; then
+    PROBE_FORM_STATS_RUN_VALID=false
+    PROBE_FORM_STATS_RUN_REASON="${PROBE_FORM_STATS_REASON:-random_form_stats_invalid}"
   fi
   local latr50
   local latr95
@@ -2680,6 +3309,11 @@ run_engine(){
       source_fetch_profile_reason="${source_fetch_profile_reason:-random_hydrated_8plus_absent}"
     fi
   fi
+  c2_phase_begin "$BASE" no_source || {
+    err "$ENGINE : preuve C2 impossible avant le témoin size:0 : $C2_STREAM_RUN_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  }
   if [ "$P2_MEASURE" = "1" ]; then
     p2_capture_phase "$BASE" bool_size0 "$P2_BOOL_SIZE0_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$P2_PAIR_COUNT" "$P2_PAIR_COUNT" 0
   else
@@ -2689,6 +3323,19 @@ run_engine(){
     err "$ENGINE : bool.must size:0 invalide : $PROBE_CAPTURE_REASON"
     record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$PROBE_CAPTURE_REASON"
     docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  fi
+  # `size:0` incrémente aussi le compteur C2 : `single_term_match_topk` rend
+  # `(vide, total)` AVANT toute lecture de bloc quand `limit == 0`, et le
+  # compteur est incrémenté sur ce retour (search.rs:2469-2471).
+  c2_phase_end "$BASE" no_source "$probe_random_match_requests" "$probe_random_mono_lower_bound" false || {
+    err "$ENGINE : preuve C2 invalide sur le témoin size:0 : $C2_STREAM_RUN_REASON"
+    record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+    docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+  }
+  if [ "$P2_MEASURE" != "1" ] \
+     && ! probe_publish_form_stats no_source "$PROBE_CONTROL_BODIES" "$no_source_raw" "$no_source_took_raw" "$no_source_overhead_raw" "$PROBE_REQUESTS"; then
+    PROBE_FORM_STATS_RUN_VALID=false
+    PROBE_FORM_STATS_RUN_REASON="${PROBE_FORM_STATS_REASON:-no_source_form_stats_invalid}"
   fi
   local latn50
   local latn95
@@ -2780,6 +3427,9 @@ run_engine(){
   local cold_took_raw="$OUT_DIR/$ENGINE.lat_cold_took_ms"
   local cold_overhead_raw="$OUT_DIR/$ENGINE.lat_cold_probe_overhead_ms"
   local cold_reclaimed_requests=0
+  local cold_bodies=""
+  local cold_match_requests=0
+  local cold_mono_lower_bound=0
   local cold_reclaim_audit="$OUT_DIR/$ENGINE.cold_reclaim.tsv"
   local cold_reclaim_audit_records=0
   local p2_cold_before=""
@@ -2833,6 +3483,11 @@ run_engine(){
   fi
   if [ -n "$reclaim_writer" ]; then
     cold_attempted=true
+    c2_phase_begin "$BASE" cold || {
+      err "$ENGINE : preuve C2 impossible avant la sonde froide : $C2_STREAM_RUN_REASON"
+      record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+      docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+    }
     if [ "$P2_MEASURE" = "1" ]; then
       p2_cold_cpu_before=$(p2_cpu_stat 2>/dev/null || true)
       if ! p2_snapshot_metrics "$BASE" "$p2_cold_before" cold_before; then
@@ -2855,6 +3510,34 @@ run_engine(){
     else
       cold_skip_reason="${COLD_CAPTURE_REASON:-cold_capture_failed}"
       cold_reclaimed_requests="$COLD_CAPTURE_COMPLETED"
+    fi
+    if [ "$cold_ok" = true ]; then
+      # La sonde froide rejoue les COLD_PROBE_REQUESTS PREMIERS corps de la
+      # sonde aléatoire : son vecteur de formes et ses bornes C2 sont donc ceux
+      # de ce préfixe, jamais ceux de la série complète.
+      cold_bodies="$OUT_DIR/$ENGINE.cold_bodies.ndjson"
+      if head -n "$COLD_PROBE_REQUESTS" "$PROBE_BODIES" > "$cold_bodies" \
+         && [ "$(wc -l < "$cold_bodies" 2>/dev/null || echo 0)" -eq "$COLD_PROBE_REQUESTS" ]; then
+        cold_match_requests=$(grep -c '"query":{"match"' "$cold_bodies" 2>/dev/null || true)
+        cold_match_requests=${cold_match_requests:-0}
+        if [ "$C2_STREAM_ENABLED" = true ]; then
+          cold_mono_lower_bound=$(probe_mono_token_match_count "$cold_bodies" "$PROBE_FIELD_NOM")
+          cold_mono_lower_bound=${cold_mono_lower_bound:-0}
+        fi
+        c2_phase_end "$BASE" cold "$cold_match_requests" "$cold_mono_lower_bound" false || {
+          err "$ENGINE : preuve C2 invalide sur la sonde froide : $C2_STREAM_RUN_REASON"
+          record_invalid_measurement "$ENGINE" "$cnt" "$indexed" "$item_err" "$C2_STREAM_RUN_REASON"
+          docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1; return 1
+        }
+        if [ "$P2_MEASURE" != "1" ] \
+           && ! probe_publish_form_stats cold "$cold_bodies" "$cold_raw" "$cold_took_raw" "$cold_overhead_raw" "$COLD_PROBE_REQUESTS"; then
+          PROBE_FORM_STATS_RUN_VALID=false
+          PROBE_FORM_STATS_RUN_REASON="${PROBE_FORM_STATS_REASON:-cold_form_stats_invalid}"
+        fi
+      else
+        PROBE_FORM_STATS_RUN_VALID=false
+        PROBE_FORM_STATS_RUN_REASON="${PROBE_FORM_STATS_RUN_REASON:-cold_bodies_prefix_invalid}"
+      fi
     fi
   fi
   [ -f "$cold_raw" ] || : > "$cold_raw"
@@ -2915,6 +3598,11 @@ run_engine(){
       cold_skip_reason="p2_cold_stats_invalid"
     fi
   fi
+  # Mode d'écriture `_source` déclaré, tel qu'il a été propagé au conteneur.
+  # `null` = variable absente, donc défaut moteur (blocs) si la compression est
+  # active ; `source_write_mode` porte le mode EFFECTIF, sans défaut implicite.
+  local source_compress_mode_json="null"
+  [ -n "$SURCH_SOURCE_COMPRESS_MODE" ] && source_compress_mode_json="\"$SURCH_SOURCE_COMPRESS_MODE\""
   local cold_skip_json="null"
   [ -n "$cold_skip_reason" ] && cold_skip_json="\"$cold_skip_reason\""
   local cold_method_json="null"
@@ -2945,6 +3633,25 @@ run_engine(){
   if [ "$source_fetch_profile_enabled" = true ] && [ "$source_fetch_profile_valid" != true ]; then
     measurement_valid=false
     measurement_invalid_reason="\"${source_fetch_profile_reason:-source_fetch_profile_invalid}\""
+  fi
+  # Besoin 4 : une ventilation disque muette ou qui ne boucle pas rend la
+  # comparaison par composant fausse. INVALIDE, pas « 0 Mio gagnés ».
+  if [ "$ENGINE" = "surch" ] && [ "$disk_ventilation_valid" != true ]; then
+    measurement_valid=false
+    measurement_invalid_reason="${disk_ventilation_reason:-\"disk_ventilation_invalid\"}"
+  fi
+  # Besoin 1 : une ventilation par forme incomplète ramène le lecteur à
+  # l'agrégat 50/50, c'est-à-dire à un ratio ininterprétable.
+  if [ "$PROBE_FORM_STATS_RUN_VALID" != true ]; then
+    measurement_valid=false
+    measurement_invalid_reason="\"${PROBE_FORM_STATS_RUN_REASON:-probe_form_stats_invalid}\""
+  fi
+  # Besoin 2 : le filet de sécurité de dernier recours. Les phases ont déjà
+  # échoué en dur ci-dessus ; ce test garantit qu'aucun chemin ne peut publier
+  # une mesure valide avec une preuve C2 rouge.
+  if [ "$C2_STREAM_RUN_VALID" != true ]; then
+    measurement_valid=false
+    measurement_invalid_reason="\"${C2_STREAM_RUN_REASON:-c2_stream_invalid}\""
   fi
   local p2_json=""
   if [ "$P2_MEASURE" = "1" ]; then
@@ -3001,7 +3708,7 @@ run_engine(){
     [ -n "$p2_image_digest" ] || p2_image_digest="$p2_image_id"
     p2_bulk_sha256=$(p2_manifest_value bulk_sha256 "$PROBE_MANIFEST")
     p2_mapping_sha256=$(p2_manifest_value mapping_sha256 "$PROBE_MANIFEST")
-    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"execution_id\":\"$P2_EXECUTION_ID\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"telemetry_jsonl\":\"$P2_TELEMETRY_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_causal_phase\",\"required_causal_phase_records\":5,\"causal_phase_records\":$p2_causal_phase_records,\"secondary_fixed_phase_records\":1,\"expected_phase_records\":$p2_expected_phase_records,\"expected_telemetry_records\":$p2_expected_telemetry_records,\"telemetry_records\":$p2_telemetry_records,\"replay_mix_5050\":$P2_REPLAY_MIX_5050,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
+    p2_json=",\"p2\":{\"protocol\":\"$P2_PROTOCOL_VERSION\",\"variant\":\"$P2_VARIANT\",\"execution_id\":\"$P2_EXECUTION_ID\",\"input_manifest\":\"$PROBE_MANIFEST\",\"input_manifest_sha256\":\"$P2_INPUT_MANIFEST_SHA256\",\"bulk_sha256\":\"$p2_bulk_sha256\",\"mapping_sha256\":\"$p2_mapping_sha256\",\"phase_status_jsonl\":\"$P2_PHASE_STATUS\",\"stats_jsonl\":\"$P2_STATS_JSONL\",\"telemetry_jsonl\":\"$P2_TELEMETRY_JSONL\",\"image\":\"$SURCH_IMAGE\",\"image_id\":\"$p2_image_id\",\"image_digest\":\"$p2_image_digest\",\"observed_cpu_configuration\":{\"nproc\":$HOST_CPU_COUNT,\"engine_cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\"},\"cpu_steal_percent\":$p2_cpu_steal_percent,\"cpu_steal_limit_percent\":$P2_CPU_STEAL_MAX_PERCENT,\"cpu_steal_scope\":\"max_causal_phase\",\"c2_stream_expect\":\"$SURCH_C2_STREAM_EXPECT\",\"c2_stream_metric\":\"$SURCH_C2_STREAM_METRIC\",\"source_compress_mode\":\"$SURCH_SOURCE_COMPRESS_MODE\",\"source_write_mode\":\"$SURCH_SOURCE_WRITE_MODE\",\"required_causal_phase_records\":5,\"causal_phase_records\":$p2_causal_phase_records,\"secondary_fixed_phase_records\":1,\"expected_phase_records\":$p2_expected_phase_records,\"expected_telemetry_records\":$p2_expected_telemetry_records,\"telemetry_records\":$p2_telemetry_records,\"replay_mix_5050\":$P2_REPLAY_MIX_5050,\"cold_phase_optional\":true,\"blocks_ratio_target\":0.25,\"segment_gate\":\"$P2_SEGMENT_GATE\",\"required_segments\":$P2_REQUIRED_SEGMENTS,\"expected_docs\":$P2_EXPECTED_DOCS,\"phase_records\":$p2_phase_records}"
   fi
   local source_fetch_profile_reason_json="null"
   local source_fetch_random_gate_json="null"
@@ -3037,7 +3744,7 @@ run_engine(){
   [ "$cold_ok" = true ] && source_fetch_prometheus_json="$source_fetch_cold_json"
   local source_fetch_metrics_json="$source_fetch_prometheus_json,\"measurement_valid\":$measurement_valid,\"measurement_invalid_reason\":$measurement_invalid_reason,\"source_fetch_profile_valid\":$source_fetch_profile_valid,\"source_fetch_profile_invalid_reason\":$source_fetch_profile_reason_json,\"source_fetch_random_worker_participations\":$source_fetch_random_worker_participations,\"source_fetch_random_hydrated_8plus_requests\":$source_fetch_random_hydrated_8plus_requests,\"source_fetch_random_hydrated_8plus_gate\":$source_fetch_random_gate_json,\"source_fetch_jsonl\":{\"fixed\":$source_fetch_fixed_jsonl_json,\"random\":$source_fetch_random_jsonl_json,\"no_source\":$source_fetch_no_source_jsonl_json,\"cold\":$source_fetch_cold_jsonl_json},\"source_fetch_snapshots\":{\"before_fixed\":$source_fetch_before_json,\"after_fixed\":$source_fetch_fixed_json,\"after_random\":$source_fetch_random_json,\"after_no_source\":$source_fetch_no_source_json,\"after_cold\":$source_fetch_cold_json},\"source_fetch_deltas\":{\"fixed\":$source_fetch_fixed_delta_json,\"random\":$source_fetch_random_delta_json,\"no_source\":$source_fetch_no_source_delta_json,\"cold\":$source_fetch_cold_delta_json}"
 
-  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\",\"probe_cpu_count\":$HOST_CPU_COUNT,\"probe_connection_reuse\":{\"fixed\":\"single_curl_next\",\"random\":\"single_curl_next\",\"no_source\":\"single_curl_next\",\"cold\":\"one_curl_per_reclaim\"},\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_fixed_client_s_file\":\"$fixed_raw\",\"lat_fixed_took_ms_file\":\"$fixed_took_raw\",\"lat_fixed_probe_overhead_ms_file\":\"$fixed_overhead_raw\",\"lat_fixed_client_p50_ms\":$lat50,\"lat_fixed_client_p95_ms\":$lat95,\"lat_fixed_client_p99_ms\":$lat99,\"lat_fixed_took_p50_ms\":$lat_fixed_took50,\"lat_fixed_took_p95_ms\":$lat_fixed_took95,\"lat_fixed_took_p99_ms\":$lat_fixed_took99,\"lat_fixed_probe_overhead_p50_ms\":$lat_fixed_probe50,\"lat_fixed_probe_overhead_p95_ms\":$lat_fixed_probe95,\"lat_fixed_probe_overhead_p99_ms\":$lat_fixed_probe99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_rand_client_s_file\":\"$random_raw\",\"lat_rand_took_ms_file\":\"$random_took_raw\",\"lat_rand_probe_overhead_ms_file\":\"$random_overhead_raw\",\"lat_rand_client_p50_ms\":$latr50,\"lat_rand_client_p95_ms\":$latr95,\"lat_rand_client_p99_ms\":$latr99,\"lat_rand_took_p50_ms\":$lat_rand_took50,\"lat_rand_took_p95_ms\":$lat_rand_took95,\"lat_rand_took_p99_ms\":$lat_rand_took99,\"lat_rand_probe_overhead_p50_ms\":$lat_rand_probe50,\"lat_rand_probe_overhead_p95_ms\":$lat_rand_probe95,\"lat_rand_probe_overhead_p99_ms\":$lat_rand_probe99,\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"lat_no_source_client_s_file\":\"$no_source_raw\",\"lat_no_source_took_ms_file\":\"$no_source_took_raw\",\"lat_no_source_probe_overhead_ms_file\":\"$no_source_overhead_raw\",\"lat_no_source_client_p50_ms\":$latn50,\"lat_no_source_client_p95_ms\":$latn95,\"lat_no_source_client_p99_ms\":$latn99,\"lat_no_source_took_p50_ms\":$lat_no_source_took50,\"lat_no_source_took_p95_ms\":$lat_no_source_took95,\"lat_no_source_took_p99_ms\":$lat_no_source_took99,\"lat_no_source_probe_overhead_p50_ms\":$lat_no_source_probe50,\"lat_no_source_probe_overhead_p95_ms\":$lat_no_source_probe95,\"lat_no_source_probe_overhead_p99_ms\":$lat_no_source_probe99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"lat_cold_client_s_file\":\"$cold_raw\",\"lat_cold_took_ms_file\":\"$cold_took_raw\",\"lat_cold_probe_overhead_ms_file\":\"$cold_overhead_raw\",\"lat_cold_client_p50_ms\":$latc50,\"lat_cold_client_p95_ms\":$latc95,\"lat_cold_client_p99_ms\":$latc99,\"lat_cold_took_p50_ms\":$lat_cold_took50,\"lat_cold_took_p95_ms\":$lat_cold_took95,\"lat_cold_took_p99_ms\":$lat_cold_took99,\"lat_cold_probe_overhead_p50_ms\":$lat_cold_probe50,\"lat_cold_probe_overhead_p95_ms\":$lat_cold_probe95,\"lat_cold_probe_overhead_p99_ms\":$lat_cold_probe99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json$p2_json}" > "$OUT_DIR/$ENGINE.json"
+  echo "{\"engine\":\"$ENGINE\",\"mem_limit\":\"$MEM_LIMIT\",\"cpuset\":\"$CPUSET\",\"probe_cpuset\":\"$PROBE_CPUSET\",\"probe_cpu_count\":$HOST_CPU_COUNT,\"probe_connection_reuse\":{\"fixed\":\"single_curl_next\",\"random\":\"single_curl_next\",\"no_source\":\"single_curl_next\",\"cold\":\"one_curl_per_reclaim\"},\"survived_boot\":true,\"survived_index\":true,\"count\":$cnt,\"expected\":$NDOCS,\"indexed\":$indexed,\"item_errors\":$item_err,\"index_doc_s\":$dps,\"rss_container\":\"$rss\",\"disk_mib\":\"$disk\",\"lat_p50_ms\":$lat50,\"lat_p95_ms\":$lat95,\"lat_p99_ms\":$lat99,\"lat_fixed_raw_s_file\":\"$fixed_raw\",\"lat_fixed_client_s_file\":\"$fixed_raw\",\"lat_fixed_took_ms_file\":\"$fixed_took_raw\",\"lat_fixed_probe_overhead_ms_file\":\"$fixed_overhead_raw\",\"lat_fixed_client_p50_ms\":$lat50,\"lat_fixed_client_p95_ms\":$lat95,\"lat_fixed_client_p99_ms\":$lat99,\"lat_fixed_took_p50_ms\":$lat_fixed_took50,\"lat_fixed_took_p95_ms\":$lat_fixed_took95,\"lat_fixed_took_p99_ms\":$lat_fixed_took99,\"lat_fixed_probe_overhead_p50_ms\":$lat_fixed_probe50,\"lat_fixed_probe_overhead_p95_ms\":$lat_fixed_probe95,\"lat_fixed_probe_overhead_p99_ms\":$lat_fixed_probe99,\"lat_rand_p50_ms\":$latr50,\"lat_rand_p95_ms\":$latr95,\"lat_rand_p99_ms\":$latr99,\"lat_rand_raw_s_file\":\"$random_raw\",\"lat_rand_client_s_file\":\"$random_raw\",\"lat_rand_took_ms_file\":\"$random_took_raw\",\"lat_rand_probe_overhead_ms_file\":\"$random_overhead_raw\",\"lat_rand_client_p50_ms\":$latr50,\"lat_rand_client_p95_ms\":$latr95,\"lat_rand_client_p99_ms\":$latr99,\"lat_rand_took_p50_ms\":$lat_rand_took50,\"lat_rand_took_p95_ms\":$lat_rand_took95,\"lat_rand_took_p99_ms\":$lat_rand_took99,\"lat_rand_probe_overhead_p50_ms\":$lat_rand_probe50,\"lat_rand_probe_overhead_p95_ms\":$lat_rand_probe95,\"lat_rand_probe_overhead_p99_ms\":$lat_rand_probe99,\"lat_no_source_p50_ms\":$latn50,\"lat_no_source_p95_ms\":$latn95,\"lat_no_source_p99_ms\":$latn99,\"lat_no_source_raw_s_file\":\"$no_source_raw\",\"lat_no_source_client_s_file\":\"$no_source_raw\",\"lat_no_source_took_ms_file\":\"$no_source_took_raw\",\"lat_no_source_probe_overhead_ms_file\":\"$no_source_overhead_raw\",\"lat_no_source_client_p50_ms\":$latn50,\"lat_no_source_client_p95_ms\":$latn95,\"lat_no_source_client_p99_ms\":$latn99,\"lat_no_source_took_p50_ms\":$lat_no_source_took50,\"lat_no_source_took_p95_ms\":$lat_no_source_took95,\"lat_no_source_took_p99_ms\":$lat_no_source_took99,\"lat_no_source_probe_overhead_p50_ms\":$lat_no_source_probe50,\"lat_no_source_probe_overhead_p95_ms\":$lat_no_source_probe95,\"lat_no_source_probe_overhead_p99_ms\":$lat_no_source_probe99,\"cold_probe_attempted\":$cold_attempted,\"cold_probe_ok\":$cold_ok,\"cold_probe_requests\":$COLD_PROBE_REQUESTS,\"cold_reclaimed_requests\":$cold_reclaimed_requests,\"cold_reclaim_audit_tsv\":\"$cold_reclaim_audit\",\"cold_reclaim_audit_records\":$cold_reclaim_audit_records,\"cold_skip_reason\":$cold_skip_json,\"cold_method\":$cold_method_json,\"lat_cold_p50_ms\":$latc50,\"lat_cold_p95_ms\":$latc95,\"lat_cold_p99_ms\":$latc99,\"lat_cold_raw_s_file\":\"$cold_raw\",\"lat_cold_client_s_file\":\"$cold_raw\",\"lat_cold_took_ms_file\":\"$cold_took_raw\",\"lat_cold_probe_overhead_ms_file\":\"$cold_overhead_raw\",\"lat_cold_client_p50_ms\":$latc50,\"lat_cold_client_p95_ms\":$latc95,\"lat_cold_client_p99_ms\":$latc99,\"lat_cold_took_p50_ms\":$lat_cold_took50,\"lat_cold_took_p95_ms\":$lat_cold_took95,\"lat_cold_took_p99_ms\":$lat_cold_took99,\"lat_cold_probe_overhead_p50_ms\":$lat_cold_probe50,\"lat_cold_probe_overhead_p95_ms\":$lat_cold_probe95,\"lat_cold_probe_overhead_p99_ms\":$lat_cold_probe99,\"mem_anon_bytes_warm\":$mem_anon_warm,\"mem_file_bytes_warm\":$mem_file_warm,\"mem_anon_bytes_cold\":$mem_anon_cold,\"mem_file_bytes_cold\":$mem_file_cold,\"source_compress\":\"${SURCH_SOURCE_COMPRESS:-0}\",\"source_compress_mode\":$source_compress_mode_json,\"source_write_mode\":\"$SURCH_SOURCE_WRITE_MODE\",\"disk_bytes_postings\":$disk_bytes_postings,\"disk_bytes_subfields\":$disk_bytes_subfields,\"disk_bytes_source\":$disk_bytes_source,\"disk_bytes_fst_merge\":$disk_bytes_fst_merge,\"disk_bytes_other\":$disk_bytes_other,\"disk_bytes_total\":$disk_bytes_total,\"disk_files_total\":$disk_files_total,\"disk_ventilation_valid\":$disk_ventilation_valid,\"disk_ventilation_reason\":$disk_ventilation_reason,\"files_postings_count\":$files_postings_count,\"segment_count\":$segment_count,\"lat_rand_form_mix_not_conclusive\":true,\"lat_by_form_jsonl\":\"$PROBE_BY_FORM_JSONL\",\"lat_by_form_valid\":$PROBE_FORM_STATS_RUN_VALID,\"c2_stream_expect\":\"$SURCH_C2_STREAM_EXPECT\",\"c2_stream_metric\":\"$SURCH_C2_STREAM_METRIC\",\"c2_stream_checked\":$C2_STREAM_ENABLED,\"c2_stream_jsonl\":\"$C2_STREAM_JSONL\",\"c2_stream_valid\":$C2_STREAM_RUN_VALID,\"source_fetch_profile_enabled\":$source_fetch_profile_enabled,\"source_fetch_prometheus_file\":$source_fetch_metrics_json$p2_json}" > "$OUT_DIR/$ENGINE.json"
   log "$ENGINE : mesure valide=$measurement_valid | ${dps} doc/s | RSS $rss | disk ${disk}MiB | fixe client ${lat50}/${lat95}/${lat99}, moteur ${lat_fixed_took50}/${lat_fixed_took95}/${lat_fixed_took99}, sonde ${lat_fixed_probe50}/${lat_fixed_probe95}/${lat_fixed_probe99} | rand client ${latr50}/${latr95}/${latr99}, moteur ${lat_rand_took50}/${lat_rand_took95}/${lat_rand_took99}, sonde ${lat_rand_probe50}/${lat_rand_probe95}/${lat_rand_probe99} | témoin client ${latn50}/${latn95}/${latn99}, moteur ${lat_no_source_took50}/${lat_no_source_took95}/${lat_no_source_took99}, sonde ${lat_no_source_probe50}/${lat_no_source_probe95}/${lat_no_source_probe99} | cold client ${latc50}/${latc95}/${latc99}, moteur ${lat_cold_took50}/${lat_cold_took95}/${lat_cold_took99}, sonde ${lat_cold_probe50}/${lat_cold_probe95}/${lat_cold_probe99} (reclaims=$cold_reclaimed_requests/50 audit=$cold_reclaim_audit_records/50 ok=$cold_ok skip=${cold_skip_reason:-none}) ms"
   [ "$HOLD_SECONDS" -gt 0 ] 2>/dev/null && { log "$ENGINE : HOLD_SECONDS=$HOLD_SECONDS avant teardown (brancher artillery-replay.sh sur $NET / $CID)"; sleep "$HOLD_SECONDS"; }
   docker rm -f "$CID" >/dev/null 2>&1; docker volume rm "fairab-vol-$ENGINE" >/dev/null 2>&1
@@ -3047,6 +3754,18 @@ run_engine(){
 ENGINES="${ENGINES:-es surch}"   # ex: ENGINES=surch pour rejouer un seul moteur
 run_failed=0
 for _e in $ENGINES; do run_engine "$_e" || run_failed=1; done
+
+# Ratios surch/ES PAR FORME dès que les deux moteurs ont tourné dans ce
+# OUT_DIR. Le fichier ne contient AUCUN agrégat : c'est la seule table de
+# ratios sur laquelle une conclusion latence est légitime.
+if [ "$P2_MEASURE" != "1" ] && [ -s "$OUT_DIR/es.by-form.jsonl" ] && [ -s "$OUT_DIR/surch.by-form.jsonl" ]; then
+  if by_form_ratios "$OUT_DIR/es.by-form.jsonl" "$OUT_DIR/surch.by-form.jsonl" "$OUT_DIR/by-form-ratios.jsonl"; then
+    log "ratios par forme : $OUT_DIR/by-form-ratios.jsonl (aucun agrégat — un ratio toutes formes confondues est ininterprétable)"
+  else
+    err "ratios par forme impossibles : $BY_FORM_RATIOS_REASON"
+    run_failed=1
+  fi
+fi
 
 log "=== SCORECARD ($MEM_LIMIT, $NDOCS docs, cpuset $CPUSET) ==="
 for e in es surch; do cat "$OUT_DIR/$e.json" 2>/dev/null; echo; done

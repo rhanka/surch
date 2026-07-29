@@ -67,6 +67,12 @@ fake_fair_ab(){
   local rss_anon
   local file_cache
   fake_log "run:$P2_VARIANT:${OUT_DIR##*/}"
+  # Les deux déclarations obligatoires du lot « harnais 4 axes » sont
+  # RÉELLEMENT reçues du pilote : le double les recopie dans la scorecard, et
+  # `assert_scorecard` du vrai p2-campaign.sh les revérifie. Sans propagation,
+  # elles seraient vides et l'assertion tomberait.
+  fake_log "c2_expect:${SURCH_C2_STREAM_EXPECT:-absent}"
+  fake_log "source_mode:${SURCH_SOURCE_COMPRESS_MODE:-absent}"
   if [ "${P3_FAKE_FAIL_VARIANT:-}" = "$P2_VARIANT" ]; then
     printf 'échec injecté de fair-ab pour %s\n' "$P2_VARIANT" >&2
     exit 42
@@ -105,8 +111,9 @@ fake_fair_ab(){
     --arg variant "$P2_VARIANT" --arg image "$SURCH_IMAGE" --arg image_id "$image_id" --arg digest "$digest" \
     --arg execution_id "$P2_EXECUTION_ID" --arg manifest "$manifest" --arg manifest_sha "$manifest_sha" \
     --arg telemetry "$telemetry" --arg phase_status "$phase_status" --argjson docs "$P2_EXPECTED_DOCS" \
+    --arg c2_expect "${SURCH_C2_STREAM_EXPECT:-}" --arg source_mode "${SURCH_SOURCE_COMPRESS_MODE:-}" \
     --argjson segments "$P2_REQUIRED_SEGMENTS" \
-    '{measurement_valid:true,count:$docs,indexed:$docs,item_errors:0,cold_probe_ok:false,probe_cpu_count:3,cpuset:"0-2",probe_cpuset:"0-2",p2:{variant:$variant,protocol:"p2-segmented-postings-v4-termes-analyses",expected_docs:$docs,required_segments:$segments,causal_phase_records:5,replay_mix_5050:0,phase_records:6,telemetry_records:13,observed_cpu_configuration:{nproc:3,engine_cpuset:"0-2",probe_cpuset:"0-2"},image:$image,image_id:$image_id,image_digest:$digest,execution_id:$execution_id,input_manifest:$manifest,input_manifest_sha256:$manifest_sha,telemetry_jsonl:$telemetry,phase_status_jsonl:$phase_status}}' \
+    '{measurement_valid:true,count:$docs,indexed:$docs,item_errors:0,cold_probe_ok:false,probe_cpu_count:3,cpuset:"0-2",probe_cpuset:"0-2",p2:{variant:$variant,protocol:"p2-segmented-postings-v4-termes-analyses",expected_docs:$docs,required_segments:$segments,causal_phase_records:5,replay_mix_5050:0,phase_records:6,telemetry_records:13,c2_stream_expect:$c2_expect,source_compress_mode:$source_mode,observed_cpu_configuration:{nproc:3,engine_cpuset:"0-2",probe_cpuset:"0-2"},image:$image,image_id:$image_id,image_digest:$digest,execution_id:$execution_id,input_manifest:$manifest,input_manifest_sha256:$manifest_sha,telemetry_jsonl:$telemetry,phase_status_jsonl:$phase_status}}' \
     > "$OUT_DIR/surch.json"
 }
 
@@ -403,6 +410,79 @@ done
 jq -e '.verdict == "PASS SMOKE P3" and (.variants | keys == ["A","B","C"])' "$SMOKE_DIR/smoke-proof.json" >/dev/null \
   || fail 'preuve smoke non rejouable'
 assert_log "$SMOKE_LOG" $'build:surch-p2-a:961ade10ffb7\nbuild:surch-p2-b:6ce390e55da3\nbuild:surch-p2-c:d0accd6e4809\nrun:A:smoke-A\nsleep:300\nrun:B:smoke-B\nsleep:300\nrun:C:smoke-C\npair:smoke-A:smoke-B\npair:smoke-B:smoke-C\npair:smoke-A:smoke-C\nsleep:300'
+
+# ---- lot « harnais 4 axes » : les deux déclarations obligatoires du pilote ----
+# fair-ab.sh refuse de démarrer sous P2_MEASURE=1 sans SURCH_C2_STREAM_EXPECT ni
+# SURCH_SOURCE_COMPRESS_MODE. Le pilote DOIT donc les propager, et les valeurs
+# par défaut doivent être celles qui sont VRAIES des trois SHA pré-engagés.
+set_step 'propagation C2/D1 par le pilote' \
+  'le pilote doit propager SURCH_C2_STREAM_EXPECT et SURCH_SOURCE_COMPRESS_MODE aux trois runs' \
+  "$TMP_DIR/smoke.out" "$SMOKE_LOG"
+[ "$(grep -cx 'c2_expect:reference' "$SMOKE_LOG")" -eq 3 ] \
+  || fail 'SURCH_C2_STREAM_EXPECT=reference non propagé aux trois runs A/B/C'
+[ "$(grep -cx 'source_mode:doc' "$SMOKE_LOG")" -eq 3 ] \
+  || fail 'SURCH_SOURCE_COMPRESS_MODE=doc non propagé aux trois runs A/B/C'
+for variant in A B C; do
+  jq -e '.p2.c2_stream_expect == "reference" and .p2.source_compress_mode == "doc"' \
+    "$SMOKE_DIR/runs/smoke-$variant/surch.json" >/dev/null \
+    || fail "déclarations C2/D1 absentes de la scorecard smoke-$variant"
+done
+
+# Surcharge explicite : une campagne sur des images post-C2/D1 doit pouvoir
+# déclarer l'autre bras, et le pilote doit revérifier ce qu'il a propagé.
+OVERRIDE_DIR="$TMP_DIR/smoke-override"
+OVERRIDE_LOG="$TMP_DIR/smoke-override.log"
+set_step 'surcharge C2/D1 du pilote' \
+  'P2_C2_STREAM_EXPECT=stream et P2_SOURCE_COMPRESS_MODE=block doivent être propagés tels quels' \
+  "$TMP_DIR/smoke-override.out" "$OVERRIDE_LOG"
+P2_C2_STREAM_EXPECT=stream P2_SOURCE_COMPRESS_MODE=block \
+  campaign_env smoke "$OVERRIDE_DIR" '' "$OVERRIDE_LOG" > "$TMP_DIR/smoke-override.out" 2>&1
+[ "$(grep -cx 'c2_expect:stream' "$OVERRIDE_LOG")" -eq 3 ] \
+  || fail 'surcharge SURCH_C2_STREAM_EXPECT=stream non propagée'
+[ "$(grep -cx 'source_mode:block' "$OVERRIDE_LOG")" -eq 3 ] \
+  || fail 'surcharge SURCH_SOURCE_COMPRESS_MODE=block non propagée'
+
+# Valeur hors domaine : refus fail-closed, jamais un repli silencieux.
+set_step 'refus des déclarations C2/D1 hors domaine' \
+  'une valeur inconnue doit arrêter le pilote' "$TMP_DIR/smoke-bad-decl.out"
+if P2_C2_STREAM_EXPECT=peutetre \
+   campaign_env smoke "$TMP_DIR/smoke-bad-c2" '' "$TMP_DIR/smoke-bad-c2.log" > "$TMP_DIR/smoke-bad-decl.out" 2>&1; then
+  fail 'P2_C2_STREAM_EXPECT invalide accepté par le pilote'
+fi
+grep -q 'P2_C2_STREAM_EXPECT doit valoir stream ou reference' "$TMP_DIR/smoke-bad-decl.out" \
+  || fail 'motif de refus P2_C2_STREAM_EXPECT absent'
+if P2_SOURCE_COMPRESS_MODE=bloc \
+   campaign_env smoke "$TMP_DIR/smoke-bad-mode" '' "$TMP_DIR/smoke-bad-mode.log" > "$TMP_DIR/smoke-bad-mode.out" 2>&1; then
+  fail 'P2_SOURCE_COMPRESS_MODE=bloc (faute de frappe) accepté par le pilote'
+fi
+grep -q 'P2_SOURCE_COMPRESS_MODE doit valoir doc ou block' "$TMP_DIR/smoke-bad-mode.out" \
+  || fail 'motif de refus P2_SOURCE_COMPRESS_MODE absent'
+
+# Mutation mécanisée d'une COPIE du pilote (jamais du fichier commité) : sans
+# la ligne de propagation, `assert_scorecard` doit tomber. Sans cette preuve,
+# le test ci-dessus ne prouverait que la cohérence du double avec lui-même.
+# La copie vit dans une arborescence miroir (`deploy/bench-local/` + `.git`
+# symbolique) parce que le pilote dérive ROOT_DIR de son propre emplacement et
+# archive les trois SHA depuis ce dépôt.
+MUTATED_ROOT="$TMP_DIR/pilote-mute"
+MUTATED_CAMPAIGN="$MUTATED_ROOT/deploy/bench-local/p2-campaign.sh"
+set_step 'mutation : propagation C2/D1 retirée du pilote' \
+  'un pilote qui ne propage plus les déclarations doit échouer' \
+  "$TMP_DIR/smoke-mutated.out" "$TMP_DIR/smoke-mutated.log"
+mkdir -p "$MUTATED_ROOT/deploy/bench-local"
+ln -s "$ROOT_DIR/.git" "$MUTATED_ROOT/.git"
+cp "$CAMPAIGN" "$MUTATED_CAMPAIGN"
+grep -q '"SURCH_SOURCE_COMPRESS_MODE=\$P2_SOURCE_COMPRESS_MODE" "SURCH_C2_STREAM_EXPECT=\$P2_C2_STREAM_EXPECT"' "$MUTATED_CAMPAIGN" \
+  || fail 'la ligne de propagation C2/D1 est absente du pilote — a-t-elle régressé ?'
+# La continuation de ligne est conservée : seule la propagation disparaît.
+sed -i 's|"SURCH_SOURCE_COMPRESS_MODE=\$P2_SOURCE_COMPRESS_MODE" "SURCH_C2_STREAM_EXPECT=\$P2_C2_STREAM_EXPECT"|"P3_MUTATION_SANS_PROPAGATION=1"|' "$MUTATED_CAMPAIGN"
+grep -q 'P3_MUTATION_SANS_PROPAGATION=1' "$MUTATED_CAMPAIGN" \
+  || fail 'la mutation sed n a pas pris : le test ne prouverait rien'
+if CAMPAIGN="$MUTATED_CAMPAIGN" campaign_env smoke "$TMP_DIR/smoke-mutated" '' "$TMP_DIR/smoke-mutated.log" > "$TMP_DIR/smoke-mutated.out" 2>&1; then
+  fail 'un pilote sans propagation C2/D1 aurait dû être refusé par assert_scorecard'
+fi
+grep -q 'scorecard P2 invalide' "$TMP_DIR/smoke-mutated.out" \
+  || fail 'la perte de propagation C2/D1 n est pas signalée comme scorecard invalide'
 
 FULL_DIR="$TMP_DIR/full"
 FULL_LOG="$TMP_DIR/full.log"
