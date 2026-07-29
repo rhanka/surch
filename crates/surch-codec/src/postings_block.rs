@@ -22,6 +22,14 @@ use thiserror::Error;
 /// exercised independently from `surch-index`.
 pub const FOR_BLOCK_SIZE: usize = 128;
 
+/// D2 : le mode patché écrit la position d'une exception sur UN octet, et
+/// le nombre d'exceptions d'un bloc sur un autre. Les deux ne tiennent que
+/// parce qu'un bloc porte au plus [`FOR_BLOCK_SIZE`] postings. L'invariant
+/// est implicite dans `encode_block_into` ; il est figé ici pour qu'un
+/// futur agrandissement de la taille de bloc échoue à la COMPILATION au
+/// lieu de tronquer silencieusement une position.
+const _: () = assert!(FOR_BLOCK_SIZE <= 256);
+
 /// Number of blocks summarised by one entry in the top-level skip layer
 /// of [`BlockSkipList`]. Tuned to keep the top layer dense enough to fit
 /// in a 32-byte L1 cache line for `~1024` blocks (i.e. up to ~131 k
@@ -53,6 +61,15 @@ pub enum PostingsBlockError {
     /// overflow when accumulating.
     #[error("postings block: doc ids are not strictly monotonic")]
     NotMonotonic,
+    /// Octets qu'un encodeur canonique n'aurait jamais pu produire : bit
+    /// réservé de l'en-tête posé, mode de canal inconnu, largeur de
+    /// bit-packing nulle ou supérieure à 32, liste d'exceptions
+    /// incohérente, ou constante de fréquence égale à 1 (elle aurait été
+    /// écrite dans le mode « toutes à 1 », sans octet). Distincte de
+    /// [`Self::NotMonotonic`] : ici c'est la FORME du bloc qui est
+    /// invalide, pas la suite d'identifiants qu'il reconstruirait.
+    #[error("postings block: malformed block header or channel")]
+    MalformedBlock,
 }
 
 /// Lightweight metadata describing one logical block inside the payload
@@ -251,80 +268,537 @@ pub fn decode_postings_doc_id_freq(
     Ok((doc_ids, freqs))
 }
 
-/// Encode `(doc_ids, freqs)` as a sequence of self-contained FoR blocks of
-/// up to [`FOR_BLOCK_SIZE`] postings each — the Lot C `C1a-batché` segment
-/// format (`docs/paper/c1b-disk-backed-design-2026-07-02.md`).
+/// Nombre maximal de bits d'une valeur bit-packée : les identifiants et
+/// les fréquences sont des `u32`.
+const MAX_PACKED_WIDTH: u32 = 32;
+
+/// Masque du mode du canal doc_id dans l'octet d'en-tête de bloc.
+const DOC_MODE_MASK: u8 = 0b0000_0011;
+/// Décalage du mode du canal freq dans l'octet d'en-tête de bloc.
+const FREQ_MODE_SHIFT: u32 = 2;
+/// Bits réservés de l'octet d'en-tête : ils DOIVENT valoir 0. Un bit posé
+/// est un octet non canonique, donc une corruption explicite.
+const HEADER_RESERVED_MASK: u8 = 0b1111_0000;
+
+/// Deltas écrits en LEB128, un varint par valeur (le format historique).
+const DOC_MODE_VARINT: u8 = 0;
+/// Deltas bit-packés à largeur fixe (frame of reference).
+const DOC_MODE_PACKED: u8 = 1;
+/// Deltas bit-packés + liste d'exceptions (patched frame of reference).
+const DOC_MODE_PATCHED: u8 = 2;
+
+/// Toutes les fréquences du bloc valent 1 : le canal est ABSENT du payload.
+const FREQ_MODE_ALL_ONES: u8 = 0;
+/// Toutes les fréquences du bloc sont égales à une constante != 1, écrite
+/// une seule fois en varint.
+const FREQ_MODE_CONSTANT: u8 = 1;
+/// Fréquences non constantes : bit-packées à largeur fixe.
+const FREQ_MODE_PACKED: u8 = 2;
+/// Fréquences non constantes écrites en varint, une par valeur — le mode
+/// historique, conservé comme REPLI. Il n'est retenu que lorsqu'il est
+/// strictement moins cher que le bit-packing (fréquences très dispersées
+/// dans un petit bloc) : c'est ce qui garantit que le canal `freq` n'est
+/// JAMAIS plus gros qu'avant D2.
+const FREQ_MODE_VARINT: u8 = 3;
+
+/// Nombre de bits utiles de `value` (`0` pour `0`).
+fn bit_width(value: u32) -> u32 {
+    u32::BITS - value.leading_zeros()
+}
+
+/// Taille, en octets, du varint LEB128 d'une valeur de `bits` bits utiles.
+fn varint_len_for_bits(bits: u32) -> usize {
+    match bits {
+        0..=7 => 1,
+        8..=14 => 2,
+        15..=21 => 3,
+        22..=28 => 4,
+        _ => 5,
+    }
+}
+
+/// Taille, en octets, de `count` valeurs bit-packées sur `width` bits.
+fn packed_len(count: usize, width: u32) -> usize {
+    (count as u64 * u64::from(width)).div_ceil(8) as usize
+}
+
+/// Écrit `values` bit-packées sur `width` bits, poids faibles d'abord.
+/// Les bits de bourrage du dernier octet sont laissés à `0` : c'est ce qui
+/// rend l'encodage CANONIQUE (une seule suite d'octets par entrée).
+fn pack_bits(out: &mut Vec<u8>, values: &[u32], width: u32) {
+    if width == 0 || values.is_empty() {
+        return;
+    }
+    let start = out.len();
+    out.resize(start + packed_len(values.len(), width), 0);
+    let mut bit_cursor: usize = 0;
+    for &value in values {
+        let mut remaining = width;
+        let mut rest = value;
+        while remaining > 0 {
+            let byte_index = start + bit_cursor / 8;
+            let bit_in_byte = (bit_cursor % 8) as u32;
+            let take = remaining.min(8 - bit_in_byte);
+            let chunk = (rest & ((1u32 << take) - 1)) as u8;
+            out[byte_index] |= chunk << bit_in_byte;
+            rest >>= take;
+            bit_cursor += take as usize;
+            remaining -= take;
+        }
+    }
+}
+
+/// Inverse de [`pack_bits`]. Avance `*position` du nombre exact d'octets
+/// consommés et refuse une entrée tronquée plutôt que de compléter par des
+/// zéros.
+fn unpack_bits(
+    bytes: &[u8],
+    position: &mut usize,
+    count: usize,
+    width: u32,
+    out: &mut Vec<u32>,
+) -> Result<(), PostingsBlockError> {
+    if count == 0 {
+        return Ok(());
+    }
+    let byte_len = packed_len(count, width);
+    let slice = bytes
+        .get(*position..*position + byte_len)
+        .ok_or(PostingsBlockError::UnexpectedEof)?;
+    let mut bit_cursor: usize = 0;
+    for _ in 0..count {
+        let mut value: u32 = 0;
+        let mut collected: u32 = 0;
+        while collected < width {
+            let byte = slice[bit_cursor / 8];
+            let bit_in_byte = (bit_cursor % 8) as u32;
+            let take = (width - collected).min(8 - bit_in_byte);
+            let mask = ((1u16 << take) - 1) as u8;
+            value |= u32::from((byte >> bit_in_byte) & mask) << collected;
+            bit_cursor += take as usize;
+            collected += take;
+        }
+        out.push(value);
+    }
+    *position += byte_len;
+    Ok(())
+}
+
+/// Compteurs d'écriture du codec, agrégés par
+/// [`encode_postings_blocked_with_directory`] et remontés jusqu'aux jauges
+/// `surch_index_postings_codec_*`. Sans eux, un gain disque non réalisé
+/// (par exemple un canal `freq` qui ne s'omettrait jamais) passerait
+/// inaperçu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockedEncodeStats {
+    /// Nombre de blocs écrits.
+    pub blocks: u64,
+    /// Octets du canal doc_id, en-tête de bloc et premier identifiant
+    /// absolu inclus.
+    pub doc_id_bytes: u64,
+    /// Octets du canal freq (0 pour un bloc à fréquences toutes égales à 1).
+    pub freq_bytes: u64,
+    /// Blocs dont le canal freq est totalement ABSENT du payload.
+    pub freq_omitted_blocks: u64,
+}
+
+impl BlockedEncodeStats {
+    /// Accumule `other`. Saturant : un compteur de diagnostic ne doit
+    /// jamais pouvoir paniquer une indexation.
+    pub fn merge(&mut self, other: Self) {
+        self.blocks = self.blocks.saturating_add(other.blocks);
+        self.doc_id_bytes = self.doc_id_bytes.saturating_add(other.doc_id_bytes);
+        self.freq_bytes = self.freq_bytes.saturating_add(other.freq_bytes);
+        self.freq_omitted_blocks = self
+            .freq_omitted_blocks
+            .saturating_add(other.freq_omitted_blocks);
+    }
+}
+
+/// Ce que [`encode_postings_blocked_with_directory`] produit en UNE passe :
+/// le payload, son répertoire de blocs et les compteurs d'écriture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedEncodeOutput {
+    pub payload: Vec<u8>,
+    pub directory: Vec<BlockDirEntry>,
+    pub stats: BlockedEncodeStats,
+}
+
+/// Choix du codage du canal doc_id d'un bloc, décidé par coût EXACT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocPlan {
+    Varint,
+    Packed { width: u32 },
+    Patched { width: u32, exceptions: usize },
+}
+
+/// Décide le codage du canal doc_id d'un bloc à partir de l'histogramme
+/// des largeurs de ses deltas.
 ///
-/// Unlike [`encode_postings_doc_id_freq`] (whose delta chain spans the
-/// whole term, so decoding block `j` requires re-walking blocks `0..j`
-/// first), every block here resets its delta base to `0` at the block
-/// boundary: the first doc_id of a block is written as an ABSOLUTE varint
-/// (delta from `0`), the remaining doc_ids of the block are deltas within
-/// that block, followed by the block's `freq` varints. A block is
-/// therefore decodable in isolation via [`decode_block`] given only its
-/// own bytes and its posting count — no predecessor block needs to be
-/// read first. That is the property the future pread-addressed read path
-/// (C1b) needs: a block's byte range, looked up from a directory, can be
-/// `pread`'d and decoded on its own.
+/// La règle est TOTALE et DÉTERMINISTE — c'est ce qui rend l'encodage
+/// canonique, donc ce qui permet à `decode_postings_payload_checked`
+/// (surch-index) de ré-encoder et de comparer octet pour octet :
+/// on parcourt les largeurs par ordre croissant et on ne retient qu'une
+/// amélioration STRICTE, en partant du varint. À coût égal, le mode le
+/// plus simple gagne donc toujours.
+fn plan_doc_channel(histogram: &[usize; 33], delta_count: usize, varint_cost: usize) -> DocPlan {
+    if delta_count == 0 {
+        return DocPlan::Varint;
+    }
+    let Some(width_max) = (1..=MAX_PACKED_WIDTH)
+        .rev()
+        .find(|&w| histogram[w as usize] > 0)
+    else {
+        // Impossible sur une entrée valide (les deltas intra-bloc sont
+        // >= 1 puisque les doc_ids croissent strictement), mais le codec
+        // ne doit jamais dépendre d'un invariant qu'il ne vérifie pas.
+        return DocPlan::Varint;
+    };
+
+    let mut best_plan = DocPlan::Varint;
+    let mut best_cost = varint_cost;
+
+    // Largeurs candidates AVEC exceptions, de la plus étroite à la plus
+    // large ; puis la largeur maximale, qui est la seule sans exception.
+    for width in 1..width_max {
+        let mut exceptions = 0usize;
+        let mut exception_bytes = 0usize;
+        for bits in (width + 1)..=width_max {
+            let count = histogram[bits as usize];
+            if count == 0 {
+                continue;
+            }
+            exceptions += count;
+            // 1 octet de position + le varint de la valeur complète.
+            exception_bytes += count * (1 + varint_len_for_bits(bits));
+        }
+        // `exceptions` tient dans un `u8` : un bloc porte au plus
+        // FOR_BLOCK_SIZE - 1 = 127 deltas.
+        let cost = 2 + packed_len(delta_count, width) + exception_bytes;
+        if cost < best_cost {
+            best_cost = cost;
+            best_plan = DocPlan::Patched { width, exceptions };
+        }
+    }
+
+    let packed_cost = 1 + packed_len(delta_count, width_max);
+    if packed_cost < best_cost {
+        best_plan = DocPlan::Packed { width: width_max };
+    }
+    best_plan
+}
+
+/// Encode UN bloc dans `out`. `scratch` est réutilisé d'un bloc à l'autre
+/// pour que l'encodage ne fasse pas une allocation par bloc — le piège
+/// « une écriture par token » a déjà coûté -40 % d'indexation sur ce
+/// dépôt, on ne le reproduit pas au niveau de l'allocateur.
+fn encode_block_into(
+    out: &mut Vec<u8>,
+    doc_chunk: &[u32],
+    freq_chunk: &[u32],
+    scratch: &mut Vec<u32>,
+    exceptions_scratch: &mut Vec<(u8, u32)>,
+) -> BlockedEncodeStats {
+    let doc_start = out.len();
+
+    scratch.clear();
+    let mut histogram = [0usize; 33];
+    let mut varint_cost = 0usize;
+    for pair in doc_chunk.windows(2) {
+        let delta = pair[1] - pair[0]; // strictement croissant : vérifié en amont
+        let bits = bit_width(delta);
+        histogram[bits as usize] += 1;
+        varint_cost += varint_len_for_bits(bits);
+        scratch.push(delta);
+    }
+    let plan = plan_doc_channel(&histogram, scratch.len(), varint_cost);
+
+    let freq_width = freq_chunk
+        .iter()
+        .map(|&freq| bit_width(freq))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let freq_mode = if freq_chunk.iter().all(|&freq| freq == 1) {
+        FREQ_MODE_ALL_ONES
+    } else if freq_chunk.windows(2).all(|pair| pair[0] == pair[1]) {
+        FREQ_MODE_CONSTANT
+    } else {
+        let freq_varint_cost: usize = freq_chunk
+            .iter()
+            .map(|&freq| varint_len_for_bits(bit_width(freq)))
+            .sum();
+        if freq_varint_cost < 1 + packed_len(freq_chunk.len(), freq_width) {
+            FREQ_MODE_VARINT
+        } else {
+            FREQ_MODE_PACKED
+        }
+    };
+
+    let doc_mode = match plan {
+        DocPlan::Varint => DOC_MODE_VARINT,
+        DocPlan::Packed { .. } => DOC_MODE_PACKED,
+        DocPlan::Patched { .. } => DOC_MODE_PATCHED,
+    };
+    out.push(doc_mode | (freq_mode << FREQ_MODE_SHIFT));
+    // Le premier identifiant reste ABSOLU : c'est ce qui rend un bloc
+    // décodable seul, propriété dont dépend le curseur à sauts (un `pread`
+    // du seul bloc visé, sans lire ses prédécesseurs).
+    write_varint_u32(out, doc_chunk[0]);
+
+    match plan {
+        DocPlan::Varint => {
+            for &delta in scratch.iter() {
+                write_varint_u32(out, delta);
+            }
+        }
+        DocPlan::Packed { width } => {
+            out.push(width as u8);
+            pack_bits(out, scratch, width);
+        }
+        DocPlan::Patched { width, exceptions } => {
+            out.push(width as u8);
+            out.push(exceptions as u8);
+            let threshold = 1u32 << width;
+            exceptions_scratch.clear();
+            for (index, delta) in scratch.iter_mut().enumerate() {
+                if *delta >= threshold {
+                    exceptions_scratch.push((index as u8, *delta));
+                    *delta = 0;
+                }
+            }
+            // Le planificateur compte les exceptions depuis l'histogramme,
+            // l'écriture les redécouvre par comparaison au seuil : les deux
+            // doivent voir exactement le même ensemble, sinon l'octet de
+            // décompte mentirait sur la liste qui le suit.
+            debug_assert_eq!(
+                exceptions_scratch.len(),
+                exceptions,
+                "décompte d'exceptions divergent entre le plan et l'écriture"
+            );
+            pack_bits(out, scratch, width);
+            for &(index, delta) in exceptions_scratch.iter() {
+                out.push(index);
+                write_varint_u32(out, delta);
+            }
+        }
+    }
+
+    let doc_id_bytes = (out.len() - doc_start) as u64;
+    let freq_start = out.len();
+    match freq_mode {
+        FREQ_MODE_CONSTANT => write_varint_u32(out, freq_chunk[0]),
+        FREQ_MODE_PACKED => {
+            out.push(freq_width as u8);
+            pack_bits(out, freq_chunk, freq_width);
+        }
+        FREQ_MODE_VARINT => {
+            for &freq in freq_chunk {
+                write_varint_u32(out, freq);
+            }
+        }
+        _ => {}
+    }
+
+    BlockedEncodeStats {
+        blocks: 1,
+        doc_id_bytes,
+        freq_bytes: (out.len() - freq_start) as u64,
+        freq_omitted_blocks: u64::from(freq_mode == FREQ_MODE_ALL_ONES),
+    }
+}
+
+/// Encode `(doc_ids, freqs)` en blocs auto-portants d'au plus
+/// [`FOR_BLOCK_SIZE`] postings — le format de segment de Lot C
+/// `C1a-batché`, révision D2 (bit-packing + omission des fréquences
+/// constantes).
 ///
-/// Layout — no overall length header, since callers already know
-/// `doc_ids.len()` (the CSR term range length) and derive the block
-/// count via `doc_ids.len().div_ceil(FOR_BLOCK_SIZE)`:
+/// Chaque bloc réinitialise sa base de delta : le premier `doc_id` du bloc
+/// est écrit en varint ABSOLU, les suivants en deltas intra-bloc. Un bloc
+/// reste donc décodable en isolation par [`decode_block`] à partir de ses
+/// seuls octets et de son nombre de postings — c'est la propriété dont
+/// dépend le chemin de lecture adressé par `pread` (C1b) : la plage
+/// d'octets d'un bloc, lue dans le répertoire, se `pread` et se décode
+/// seule.
+///
+/// Disposition — aucun en-tête global, l'appelant connaît déjà
+/// `doc_ids.len()` (la longueur de plage CSR du terme) et en déduit le
+/// nombre de blocs par `doc_ids.len().div_ceil(FOR_BLOCK_SIZE)` :
 ///
 /// ```text
-/// for each block of up to FOR_BLOCK_SIZE postings:
-///     block-local delta-varint doc ids (first one absolute, delta from 0)
-///     block-local varint freqs
+/// pour chaque bloc de n <= FOR_BLOCK_SIZE postings :
+///     1 octet  en-tête : [doc_mode:2][freq_mode:2][réservé:4 = 0]
+///     varint   doc_ids[0] ABSOLU
+///     canal doc_id, selon doc_mode :
+///       0 varint  : n-1 varints de delta
+///       1 packed  : 1 octet de largeur w, puis n-1 deltas sur w bits
+///       2 patched : 1 octet w, 1 octet e, n-1 deltas sur w bits (les
+///                   exceptions y valent 0), puis e couples
+///                   (1 octet de position, varint de la valeur complète)
+///     canal freq, selon freq_mode :
+///       0 all-ones : ABSENT — toutes les fréquences valent 1
+///       1 constant : varint de la constante (!= 1)
+///       2 packed   : 1 octet de largeur, puis n fréquences bit-packées
+///       3 varint   : n varints (repli, uniquement s'il est plus court)
 /// ```
 ///
-/// `doc_ids` and `freqs` must have the same length and `doc_ids` must be
-/// strictly increasing (same contract as [`encode_postings_doc_id_freq`]);
-/// violations return [`PostingsBlockError::NotMonotonic`] (the variant is
-/// reused rather than adding a breaking enum change, mirroring the
-/// existing length-mismatch handling on the sibling encoder).
+/// Le mode d'un bloc est choisi par coût EXACT, jamais par heuristique :
+/// le codage retenu n'est donc jamais plus gros que le varint historique,
+/// à l'octet d'en-tête près.
+///
+/// `doc_ids` et `freqs` doivent avoir la même longueur et `doc_ids` doit
+/// croître strictement ; une violation rend
+/// [`PostingsBlockError::NotMonotonic`] (variante réutilisée plutôt que
+/// d'introduire un changement d'énumération cassant, comme sur l'encodeur
+/// frère).
 pub fn encode_postings_blocked(
     doc_ids: &[u32],
     freqs: &[u32],
 ) -> Result<Vec<u8>, PostingsBlockError> {
+    encode_postings_blocked_with_directory(doc_ids, freqs).map(|output| output.payload)
+}
+
+/// Variante de [`encode_postings_blocked`] qui rend AUSSI le répertoire de
+/// blocs et les compteurs d'écriture, en UNE seule passe.
+///
+/// Le chemin d'indexation appelait jusqu'ici `encode_postings_blocked`
+/// puis [`block_directory`], qui RE-DÉCODAIT intégralement le payload que
+/// l'encodeur venait de produire, uniquement pour retrouver les frontières
+/// de blocs et leur `max_doc_id`. L'encodeur connaît les deux : cette
+/// fonction supprime ce second passage par terme.
+pub fn encode_postings_blocked_with_directory(
+    doc_ids: &[u32],
+    freqs: &[u32],
+) -> Result<BlockedEncodeOutput, PostingsBlockError> {
     if doc_ids.len() != freqs.len() {
         return Err(PostingsBlockError::NotMonotonic);
     }
     validate_strictly_increasing(doc_ids)?;
 
-    // Same ~1.5 B/delta + ~1 B/freq heuristic as `encode_postings_doc_id_freq`.
-    let mut out = Vec::with_capacity(doc_ids.len() * 3);
+    // ~1 octet par posting suffit désormais dans le cas nominal (freqs
+    // omises, deltas bit-packés) ; on garde une marge de 2 pour ne pas
+    // repayer une croissance géométrique sur les listes clairsemées.
+    let mut payload = Vec::with_capacity(doc_ids.len() * 2 + 8);
+    let mut directory = Vec::with_capacity(doc_ids.len().div_ceil(FOR_BLOCK_SIZE));
+    let mut stats = BlockedEncodeStats::default();
+    let mut scratch: Vec<u32> = Vec::with_capacity(FOR_BLOCK_SIZE);
+    let mut exceptions_scratch: Vec<(u8, u32)> = Vec::new();
+
     for (doc_chunk, freq_chunk) in doc_ids
         .chunks(FOR_BLOCK_SIZE)
         .zip(freqs.chunks(FOR_BLOCK_SIZE))
     {
-        let mut previous: u32 = 0;
-        for &value in doc_chunk {
-            let delta = value - previous; // safe: validate_* above guarantees value >= previous.
-            write_varint_u32(&mut out, delta);
-            previous = value;
-        }
-        for &freq in freq_chunk {
-            write_varint_u32(&mut out, freq);
-        }
+        let byte_offset = payload.len();
+        stats.merge(encode_block_into(
+            &mut payload,
+            doc_chunk,
+            freq_chunk,
+            &mut scratch,
+            &mut exceptions_scratch,
+        ));
+        directory.push(BlockDirEntry {
+            byte_offset_in_term_payload: byte_offset as u32,
+            count: doc_chunk.len() as u16,
+            max_doc_id: *doc_chunk
+                .last()
+                .expect("chunks() never yields an empty chunk"),
+        });
     }
-    Ok(out)
+
+    Ok(BlockedEncodeOutput {
+        payload,
+        directory,
+        stats,
+    })
 }
 
-/// Shared block-decoding core for [`decode_block`] and
-/// [`decode_postings_blocked`]: reads `count` delta-varint doc ids (the
-/// first one absolute, per the block-local reset [`encode_postings_blocked`]
-/// performs) followed by `count` varint freqs, starting at `*position`,
-/// advancing `*position` past whatever it consumed.
+/// Cœur de décodage partagé par [`decode_block`] et
+/// [`decode_postings_blocked`] : lit UN bloc de `count` postings à partir
+/// de `*position`, en avançant `*position` de ce qu'il a consommé.
+///
+/// Fail-closed : tout octet qu'un encodeur canonique n'aurait pas pu
+/// produire (bit réservé posé, mode inconnu, largeur nulle ou > 32,
+/// exception qui ne dépasse pas sa largeur, position d'exception hors
+/// bloc ou non croissante, constante de fréquence égale à 1) est une
+/// corruption explicite, jamais une omission silencieuse.
 fn decode_block_at(
     bytes: &[u8],
     position: &mut usize,
     count: usize,
 ) -> Result<(Vec<u32>, Vec<u32>), PostingsBlockError> {
+    if count == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let header = *bytes
+        .get(*position)
+        .ok_or(PostingsBlockError::UnexpectedEof)?;
+    *position += 1;
+    if header & HEADER_RESERVED_MASK != 0 {
+        return Err(PostingsBlockError::MalformedBlock);
+    }
+    let doc_mode = header & DOC_MODE_MASK;
+    let freq_mode = (header >> FREQ_MODE_SHIFT) & DOC_MODE_MASK;
+
+    let first = read_varint_u32(bytes, position)?;
+    let delta_count = count - 1;
+    let mut deltas: Vec<u32> = Vec::with_capacity(delta_count);
+    match doc_mode {
+        DOC_MODE_VARINT => {
+            for _ in 0..delta_count {
+                deltas.push(read_varint_u32(bytes, position)?);
+            }
+        }
+        DOC_MODE_PACKED => {
+            let width = read_width(bytes, position)?;
+            unpack_bits(bytes, position, delta_count, width, &mut deltas)?;
+        }
+        DOC_MODE_PATCHED => {
+            let width = read_width(bytes, position)?;
+            // Une exception vaut « >= 2^width » : la largeur maximale ne
+            // laisse aucune valeur au-dessus d'elle, donc l'encodeur ne
+            // l'emploie jamais en mode patché. La refuser ici évite en
+            // prime un décalage de 32 bits sur `u32`.
+            if width >= MAX_PACKED_WIDTH {
+                return Err(PostingsBlockError::MalformedBlock);
+            }
+            let exceptions = usize::from(
+                *bytes
+                    .get(*position)
+                    .ok_or(PostingsBlockError::UnexpectedEof)?,
+            );
+            *position += 1;
+            if exceptions == 0 || exceptions > delta_count {
+                return Err(PostingsBlockError::MalformedBlock);
+            }
+            unpack_bits(bytes, position, delta_count, width, &mut deltas)?;
+            let threshold = 1u32 << width;
+            let mut previous_index: Option<usize> = None;
+            for _ in 0..exceptions {
+                let index = usize::from(
+                    *bytes
+                        .get(*position)
+                        .ok_or(PostingsBlockError::UnexpectedEof)?,
+                );
+                *position += 1;
+                if index >= delta_count || previous_index.is_some_and(|prev| index <= prev) {
+                    return Err(PostingsBlockError::MalformedBlock);
+                }
+                let value = read_varint_u32(bytes, position)?;
+                if value < threshold || deltas[index] != 0 {
+                    return Err(PostingsBlockError::MalformedBlock);
+                }
+                deltas[index] = value;
+                previous_index = Some(index);
+            }
+        }
+        _ => return Err(PostingsBlockError::MalformedBlock),
+    }
+
     let mut doc_ids = Vec::with_capacity(count);
-    let mut previous: u32 = 0;
-    for i in 0..count {
-        let delta = read_varint_u32(bytes, position)?;
-        if i > 0 && delta == 0 {
+    doc_ids.push(first);
+    let mut previous = first;
+    for &delta in &deltas {
+        if delta == 0 {
             return Err(PostingsBlockError::NotMonotonic);
         }
         let value = previous
@@ -334,11 +808,52 @@ fn decode_block_at(
         previous = value;
     }
 
-    let mut freqs = Vec::with_capacity(count);
-    for _ in 0..count {
-        freqs.push(read_varint_u32(bytes, position)?);
-    }
+    let freqs = match freq_mode {
+        FREQ_MODE_ALL_ONES => vec![1u32; count],
+        FREQ_MODE_CONSTANT => {
+            let constant = read_varint_u32(bytes, position)?;
+            if constant == 1 {
+                return Err(PostingsBlockError::MalformedBlock);
+            }
+            vec![constant; count]
+        }
+        FREQ_MODE_PACKED => {
+            let width = read_width(bytes, position)?;
+            let mut freqs = Vec::with_capacity(count);
+            unpack_bits(bytes, position, count, width, &mut freqs)?;
+            freqs
+        }
+        FREQ_MODE_VARINT => {
+            let mut freqs = Vec::with_capacity(count);
+            for _ in 0..count {
+                freqs.push(read_varint_u32(bytes, position)?);
+            }
+            freqs
+        }
+        // Inatteignable : `freq_mode` est masqué sur 2 bits, donc couvert
+        // par les quatre bras ci-dessus. Le bras existe parce que le type
+        // porté est un `u8`, pas une énumération.
+        _ => return Err(PostingsBlockError::MalformedBlock),
+    };
+
     Ok((doc_ids, freqs))
+}
+
+/// Lit l'octet de largeur d'un canal bit-packé. `0` et toute valeur au-delà
+/// de 32 sont refusées : un encodeur canonique n'en produit jamais, et
+/// accepter une largeur nulle rendrait un bloc de deltas tous nuls, donc
+/// des identifiants non strictement croissants.
+fn read_width(bytes: &[u8], position: &mut usize) -> Result<u32, PostingsBlockError> {
+    let width = u32::from(
+        *bytes
+            .get(*position)
+            .ok_or(PostingsBlockError::UnexpectedEof)?,
+    );
+    *position += 1;
+    if width == 0 || width > MAX_PACKED_WIDTH {
+        return Err(PostingsBlockError::MalformedBlock);
+    }
+    Ok(width)
 }
 
 /// Decode a single self-contained block produced by
@@ -1229,6 +1744,413 @@ mod tests {
             decode_postings_blocked(&encoded, doc_ids.len()).unwrap();
         assert_eq!(decoded_doc_ids, doc_ids);
         assert_eq!(decoded_freqs, freqs);
+    }
+
+    // ---------------------------------------------------------------
+    // D2 — bit-packing des deltas et omission des fréquences constantes.
+    // ---------------------------------------------------------------
+
+    /// Taille qu'aurait le payload dans le format ANTÉRIEUR à D2 (un
+    /// varint par delta, un varint par fréquence, aucun en-tête de bloc).
+    /// Sert de témoin aux tests de non-régression de taille.
+    fn legacy_blocked_len(doc_ids: &[u32], freqs: &[u32]) -> usize {
+        let mut total = 0usize;
+        for (doc_chunk, freq_chunk) in doc_ids
+            .chunks(FOR_BLOCK_SIZE)
+            .zip(freqs.chunks(FOR_BLOCK_SIZE))
+        {
+            let mut scratch = Vec::new();
+            let mut previous = 0u32;
+            for &value in doc_chunk {
+                write_varint_u32(&mut scratch, value - previous);
+                previous = value;
+            }
+            for &freq in freq_chunk {
+                write_varint_u32(&mut scratch, freq);
+            }
+            total += scratch.len();
+        }
+        total
+    }
+
+    /// Aller-retour STRICT : les identifiants ET les fréquences relus sont
+    /// identiques, dans le même ordre, par le décodeur complet ET par le
+    /// décodage bloc par bloc (la propriété dont dépend le curseur disque).
+    fn assert_strict_round_trip(doc_ids: &[u32], freqs: &[u32]) -> Vec<u8> {
+        let output = encode_postings_blocked_with_directory(doc_ids, freqs).unwrap();
+        let (decoded_ids, decoded_freqs) =
+            decode_postings_blocked(&output.payload, doc_ids.len()).unwrap();
+        assert_eq!(decoded_ids, doc_ids, "doc_ids doivent être identiques");
+        assert_eq!(decoded_freqs, freqs, "freqs doivent être identiques");
+
+        // Canonicité : c'est elle que `decode_postings_payload_checked`
+        // (surch-index) utilise comme contrôle d'intégrité.
+        let reencoded = encode_postings_blocked(&decoded_ids, &decoded_freqs).unwrap();
+        assert_eq!(reencoded, output.payload, "l'encodage doit être canonique");
+
+        // Le répertoire rendu par l'encodeur doit être EXACTEMENT celui que
+        // le recalcul depuis le payload produit — le chemin de repli
+        // `DiskPostingsCursor::open` en dépend.
+        let recomputed = block_directory(&output.payload, doc_ids.len()).unwrap();
+        assert_eq!(recomputed, output.directory, "répertoires divergents");
+
+        // Chaque bloc est décodable SEUL depuis son offset.
+        for (entry, (doc_chunk, freq_chunk)) in output.directory.iter().zip(
+            doc_ids
+                .chunks(FOR_BLOCK_SIZE)
+                .zip(freqs.chunks(FOR_BLOCK_SIZE)),
+        ) {
+            assert_eq!(entry.count as usize, doc_chunk.len());
+            assert_eq!(entry.max_doc_id, *doc_chunk.last().unwrap());
+            let from_offset = &output.payload[entry.byte_offset_in_term_payload as usize..];
+            let (block_ids, block_freqs) = decode_block(from_offset, doc_chunk.len()).unwrap();
+            assert_eq!(block_ids, doc_chunk);
+            assert_eq!(block_freqs, freq_chunk);
+        }
+        output.payload
+    }
+
+    #[test]
+    fn d2_freqs_toutes_a_un_disparaissent_du_payload() {
+        // Le cas NOMINAL du corpus deces : `tf = 1` partout. Le canal des
+        // fréquences doit être totalement absent des octets écrits.
+        let doc_ids: Vec<u32> = (0..1000).map(|i| i * 3 + 7).collect();
+        let freqs: Vec<u32> = vec![1; 1000];
+        let output = encode_postings_blocked_with_directory(&doc_ids, &freqs).unwrap();
+        assert_eq!(output.stats.freq_bytes, 0, "aucun octet de fréquence");
+        assert_eq!(output.stats.freq_omitted_blocks, output.stats.blocks);
+        assert_eq!(
+            output.stats.blocks,
+            doc_ids.len().div_ceil(FOR_BLOCK_SIZE) as u64
+        );
+        assert_eq!(
+            output.stats.doc_id_bytes as usize,
+            output.payload.len(),
+            "tout le payload est du canal doc_id"
+        );
+        assert_strict_round_trip(&doc_ids, &freqs);
+    }
+
+    #[test]
+    fn d2_freq_constante_non_unitaire_tient_en_un_varint_par_bloc() {
+        let doc_ids: Vec<u32> = (0..300).map(|i| i * 5).collect();
+        let freqs: Vec<u32> = vec![9; 300];
+        let output = encode_postings_blocked_with_directory(&doc_ids, &freqs).unwrap();
+        // 3 blocs (128 + 128 + 44), un varint de la constante chacun.
+        assert_eq!(output.stats.blocks, 3);
+        assert_eq!(output.stats.freq_bytes, 3);
+        assert_eq!(output.stats.freq_omitted_blocks, 0);
+        assert_strict_round_trip(&doc_ids, &freqs);
+    }
+
+    #[test]
+    fn d2_freqs_variables_restent_exactes() {
+        let doc_ids: Vec<u32> = (0..500).map(|i| i * 2 + 1).collect();
+        let freqs: Vec<u32> = doc_ids.iter().map(|d| (d % 37) + 1).collect();
+        let output = encode_postings_blocked_with_directory(&doc_ids, &freqs).unwrap();
+        assert!(output.stats.freq_bytes > 0, "canal freq réellement écrit");
+        assert_eq!(output.stats.freq_omitted_blocks, 0);
+        assert_strict_round_trip(&doc_ids, &freqs);
+    }
+
+    #[test]
+    fn d2_freqs_mixtes_par_bloc() {
+        // Un bloc à fréquences toutes égales à 1, un bloc constant != 1, un
+        // bloc variable : les trois modes coexistent dans un même terme.
+        let total = FOR_BLOCK_SIZE * 3;
+        let doc_ids: Vec<u32> = (0..total as u32).map(|i| i * 4).collect();
+        let freqs: Vec<u32> = (0..total)
+            .map(|i| {
+                if i < FOR_BLOCK_SIZE {
+                    1
+                } else if i < FOR_BLOCK_SIZE * 2 {
+                    4
+                } else {
+                    (i % 11) as u32 + 1
+                }
+            })
+            .collect();
+        let output = encode_postings_blocked_with_directory(&doc_ids, &freqs).unwrap();
+        assert_eq!(output.stats.blocks, 3);
+        assert_eq!(output.stats.freq_omitted_blocks, 1);
+        assert_strict_round_trip(&doc_ids, &freqs);
+    }
+
+    #[test]
+    fn d2_df_de_un_et_df_de_deux() {
+        assert_strict_round_trip(&[0], &[1]);
+        assert_strict_round_trip(&[u32::MAX], &[1]);
+        assert_strict_round_trip(&[7], &[42]);
+        assert_strict_round_trip(&[0, u32::MAX], &[1, 1]);
+        assert_strict_round_trip(&[3, 4], &[2, 3]);
+    }
+
+    #[test]
+    fn d2_bloc_partiel_en_fin_de_terme() {
+        // Trois blocs pleins + un bloc partiel de 17 postings — la forme
+        // qu'un terme de queue de segment produit toujours.
+        let total = (FOR_BLOCK_SIZE * 3 + 17) as u32;
+        let doc_ids: Vec<u32> = (0..total).map(|i| i * 7 + (i % 5)).collect();
+        let freqs: Vec<u32> = (0..total).map(|i| (i % 16) + 1).collect();
+        let output = encode_postings_blocked_with_directory(&doc_ids, &freqs).unwrap();
+        assert_eq!(output.directory.len(), 4);
+        assert_eq!(output.directory[3].count, 17);
+        assert_strict_round_trip(&doc_ids, &freqs);
+    }
+
+    #[test]
+    fn d2_df_tres_grand_et_dense() {
+        // 100 000 postings très denses : le cas où le bit-packing gagne
+        // franchement contre le varint (deltas de 1 à 3 bits).
+        let doc_ids: Vec<u32> = (0..100_000).map(|i| i * 2).collect();
+        let freqs: Vec<u32> = vec![1; 100_000];
+        let payload = assert_strict_round_trip(&doc_ids, &freqs);
+        let legacy = legacy_blocked_len(&doc_ids, &freqs);
+        assert!(
+            payload.len() * 4 < legacy,
+            "attendu au moins 4x plus petit : {} contre {legacy}",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn d2_valeurs_aberrantes_ne_font_pas_exploser_le_bloc() {
+        // Le motif RÉEL du corpus deces sur un champ groupé (code INSEE de
+        // décès) : des runs très denses séparés par un saut énorme. Un
+        // frame-of-reference NAÏF prendrait la largeur du saut pour TOUTES
+        // les valeurs du bloc ; le mode à exceptions doit l'éviter.
+        let mut doc_ids: Vec<u32> = Vec::new();
+        let mut next = 0u32;
+        for run in 0..8u32 {
+            for _ in 0..100 {
+                doc_ids.push(next);
+                next += 1;
+            }
+            next += 900_000 + run; // frontière de grappe
+        }
+        let freqs: Vec<u32> = vec![1; doc_ids.len()];
+        let payload = assert_strict_round_trip(&doc_ids, &freqs);
+        let legacy = legacy_blocked_len(&doc_ids, &freqs);
+        assert!(
+            payload.len() < legacy,
+            "le mode à exceptions doit rester sous le varint : {} contre {legacy}",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn d2_jamais_significativement_plus_gros_que_le_varint() {
+        // Propriété structurante : le mode d'un bloc est choisi par coût
+        // EXACT, donc le seul surcoût possible face au format antérieur est
+        // l'octet d'en-tête par bloc.
+        let mut state: u32 = 0x0BAD_C0DE;
+        let mut next = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for spread in [10u32, 1_000, 100_000, 10_000_000] {
+            let mut doc_ids: Vec<u32> = (0..900).map(|_| next() % spread).collect();
+            doc_ids.sort_unstable();
+            doc_ids.dedup();
+            let freqs: Vec<u32> = doc_ids.iter().map(|d| (d % 3) + 1).collect();
+            let payload = assert_strict_round_trip(&doc_ids, &freqs);
+            let legacy = legacy_blocked_len(&doc_ids, &freqs);
+            let blocks = doc_ids.len().div_ceil(FOR_BLOCK_SIZE);
+            assert!(
+                payload.len() <= legacy + blocks,
+                "spread={spread} : {} > {legacy} + {blocks}",
+                payload.len()
+            );
+        }
+    }
+
+    #[test]
+    fn d2_corpus_seede_multi_segments() {
+        // Trois « segments » de bases de doc_id disjointes et croissantes,
+        // comme les 12 segments du corpus de production : chacun encode et
+        // relit ses propres postings sans interférence.
+        let mut state: u32 = 0x5EED_1234;
+        let mut next = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for segment in 0..3u32 {
+            let base = segment * 2_400_000;
+            let mut doc_ids: Vec<u32> = (0..1500).map(|_| base + next() % 2_400_000).collect();
+            doc_ids.sort_unstable();
+            doc_ids.dedup();
+            let freqs: Vec<u32> = doc_ids.iter().map(|d| (d % 4) + 1).collect();
+            assert_strict_round_trip(&doc_ids, &freqs);
+        }
+    }
+
+    #[test]
+    fn d2_bit_packing_round_trip_sur_toutes_les_largeurs() {
+        for width in 1..=MAX_PACKED_WIDTH {
+            let mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
+            let values: Vec<u32> = (0..133u32)
+                .map(|i| i.wrapping_mul(2_654_435_761) & mask)
+                .collect();
+            let mut packed = Vec::new();
+            pack_bits(&mut packed, &values, width);
+            assert_eq!(packed.len(), packed_len(values.len(), width));
+            let mut position = 0usize;
+            let mut decoded = Vec::new();
+            unpack_bits(&packed, &mut position, values.len(), width, &mut decoded).unwrap();
+            assert_eq!(decoded, values, "largeur {width}");
+            assert_eq!(position, packed.len());
+        }
+    }
+
+    #[test]
+    fn d2_bit_packing_refuse_une_entree_tronquee() {
+        let values: Vec<u32> = (0..64).collect();
+        let mut packed = Vec::new();
+        pack_bits(&mut packed, &values, 6);
+        packed.pop();
+        let mut position = 0usize;
+        let mut decoded = Vec::new();
+        let err = unpack_bits(&packed, &mut position, values.len(), 6, &mut decoded).unwrap_err();
+        assert_eq!(err, PostingsBlockError::UnexpectedEof);
+    }
+
+    #[test]
+    fn d2_en_tete_a_bit_reserve_est_une_corruption() {
+        let doc_ids: Vec<u32> = (0..200).map(|i| i * 3).collect();
+        let freqs: Vec<u32> = vec![1; 200];
+        let mut encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        encoded[0] |= 0b0001_0000;
+        let err = decode_postings_blocked(&encoded, doc_ids.len()).unwrap_err();
+        assert_eq!(err, PostingsBlockError::MalformedBlock);
+    }
+
+    #[test]
+    fn d2_mode_de_canal_inconnu_est_une_corruption() {
+        let doc_ids: Vec<u32> = (0..200).map(|i| i * 3).collect();
+        let freqs: Vec<u32> = vec![1; 200];
+        let mut encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        encoded[0] = (encoded[0] & !0b0000_0011) | 0b0000_0011;
+        assert_eq!(
+            decode_postings_blocked(&encoded, doc_ids.len()).unwrap_err(),
+            PostingsBlockError::MalformedBlock
+        );
+    }
+
+    #[test]
+    fn d2_freqs_tres_dispersees_retombent_sur_le_varint() {
+        // Repli explicite : sur un bloc minuscule à fréquences très
+        // écartées, le bit-packing coûterait plus cher que le varint. Le
+        // canal `freq` ne doit alors JAMAIS grossir par rapport au format
+        // antérieur — c'est ce que ce mode garantit.
+        let doc_ids = [4u32, 9];
+        let freqs = [1u32, 300];
+        let output = encode_postings_blocked_with_directory(&doc_ids, &freqs).unwrap();
+        assert_eq!((output.payload[0] >> FREQ_MODE_SHIFT) & DOC_MODE_MASK, 3);
+        assert_eq!(output.stats.freq_bytes, 3, "varint(1) + varint(300)");
+        assert_strict_round_trip(&doc_ids, &freqs);
+    }
+
+    #[test]
+    fn d2_largeur_de_bit_packing_invalide_est_une_corruption() {
+        // Corpus dense : le bloc est bit-packé, donc l'octet de largeur
+        // suit immédiatement le premier identifiant (ici un varint d'un
+        // octet, doc_id 0).
+        let doc_ids: Vec<u32> = (0..200).map(|i| i * 2).collect();
+        let freqs: Vec<u32> = vec![1; 200];
+        let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        assert_eq!(encoded[0] & 0b0000_0011, 1, "bloc attendu bit-packé");
+        assert_eq!(encoded[1], 0, "doc_id 0 sur un octet de varint");
+        for bogus in [0u8, 33, 255] {
+            let mut corrupted = encoded.clone();
+            corrupted[2] = bogus;
+            assert_eq!(
+                decode_postings_blocked(&corrupted, doc_ids.len()).unwrap_err(),
+                PostingsBlockError::MalformedBlock,
+                "largeur {bogus}"
+            );
+        }
+    }
+
+    #[test]
+    fn d2_freq_constante_egale_a_un_est_une_corruption() {
+        // Un encodeur canonique aurait employé le mode « toutes à 1 », qui
+        // n'écrit aucun octet : rencontrer la constante 1 prouve que les
+        // octets ne viennent pas de cet encodeur.
+        let doc_ids = [0u32, 5, 9];
+        let freqs = [3u32, 3, 3];
+        let mut encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        let last = encoded.len() - 1;
+        assert_eq!(encoded[last], 3, "constante de fréquence en queue de bloc");
+        encoded[last] = 1;
+        assert_eq!(
+            decode_postings_blocked(&encoded, doc_ids.len()).unwrap_err(),
+            PostingsBlockError::MalformedBlock
+        );
+    }
+
+    #[test]
+    fn d2_payload_tronque_est_un_eof() {
+        let doc_ids: Vec<u32> = (0..300).map(|i| i * 3).collect();
+        let freqs: Vec<u32> = (0..300).map(|i| (i % 5) + 1).collect();
+        let encoded = encode_postings_blocked(&doc_ids, &freqs).unwrap();
+        for cut in [1usize, 2, encoded.len() / 2, encoded.len() - 1] {
+            let err = decode_postings_blocked(&encoded[..cut], doc_ids.len()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    PostingsBlockError::UnexpectedEof | PostingsBlockError::MalformedBlock
+                ),
+                "coupe {cut} : {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn d2_repertoire_de_blocs_est_gratuit_et_exact() {
+        // L'encodeur rend le répertoire en UNE passe ; il doit être
+        // rigoureusement égal à celui que `block_directory` recalculait en
+        // re-décodant tout le payload (le passage supprimé du chemin
+        // d'indexation).
+        let total = (FOR_BLOCK_SIZE * 5 + 3) as u32;
+        let doc_ids: Vec<u32> = (0..total).map(|i| i * 11 + (i % 7)).collect();
+        let freqs: Vec<u32> = (0..total).map(|i| (i % 3) + 1).collect();
+        let output = encode_postings_blocked_with_directory(&doc_ids, &freqs).unwrap();
+        assert_eq!(
+            output.directory,
+            block_directory(&output.payload, doc_ids.len()).unwrap()
+        );
+        assert_eq!(output.directory.len(), 6);
+        assert_eq!(output.directory[0].byte_offset_in_term_payload, 0);
+        for pair in output.directory.windows(2) {
+            assert!(pair[0].byte_offset_in_term_payload < pair[1].byte_offset_in_term_payload);
+            assert!(pair[0].max_doc_id < pair[1].max_doc_id);
+        }
+    }
+
+    #[test]
+    fn d2_compteurs_se_cumulent_sans_deborder() {
+        let mut stats = BlockedEncodeStats {
+            blocks: u64::MAX,
+            doc_id_bytes: u64::MAX,
+            freq_bytes: u64::MAX,
+            freq_omitted_blocks: u64::MAX,
+        };
+        stats.merge(BlockedEncodeStats {
+            blocks: 1,
+            doc_id_bytes: 1,
+            freq_bytes: 1,
+            freq_omitted_blocks: 1,
+        });
+        assert_eq!(stats.blocks, u64::MAX);
+        assert_eq!(stats.doc_id_bytes, u64::MAX);
     }
 
     fn skip_entries(ranges: &[(usize, u32, u32)]) -> Vec<BlockSkipEntry> {

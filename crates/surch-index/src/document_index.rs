@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
 use crate::postings::{
-    merge_term_dictionaries, postings_disk_enabled, BlockMeta, CheckedPostings,
+    merge_term_dictionaries, postings_disk_enabled, BlockMeta, BlockedEncodeStats, CheckedPostings,
     DiskPostingsAdvance, DiskPostingsCursor, P2IntegrityMetrics, PostingsBlockSkipIter,
     PostingsBuilder, PostingsEnum, PostingsError, PostingsList, PostingsReadError, TermDictionary,
     TermsEnum, P2_INTEGRITY_MAX_BYTES,
@@ -2713,6 +2713,21 @@ impl DocumentIndex {
             .iter()
             .map(|s| s.terms.postings_segment_skipped_terms())
             .sum()
+    }
+
+    /// D2 : ventilation cumulée des octets écrits par le codec de postings
+    /// (canal doc_id, canal freq, blocs, blocs à canal freq omis), sommée
+    /// sur tous les segments portés par l'index — le segment actif compris
+    /// dès qu'il a été construit, comme [`Self::postings_segment_bytes`].
+    /// Alimente les jauges
+    /// `surch_index_postings_codec_*` — sans elles, un canal `freq` qui ne
+    /// s'omettrait jamais rendrait le gain disque annoncé invérifiable.
+    pub fn postings_codec_stats(&self) -> BlockedEncodeStats {
+        let mut total = BlockedEncodeStats::default();
+        for segment in &self.segments {
+            total.merge(segment.terms.postings_codec_stats());
+        }
+        total
     }
 
     /// Plan segments S5c: raw disk-footprint of the sub-field spill

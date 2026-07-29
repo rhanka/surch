@@ -312,6 +312,15 @@ async fn prometheus_exposes_memory_gauges_after_indexing() {
         // identified candidate for the ~295 MiB non-gaugé gap — see
         // `surch_index::memory::MemoryUsage::postings_directory_bytes`).
         "surch_index_postings_directory_bytes",
+        // D2 : ventilation des octets écrits par le codec de postings. Le
+        // harnais de mesure les scrape pour attester que l'omission des
+        // fréquences constantes et le bit-packing des deltas sont bien
+        // engagés — sans elles, un gain disque NON réalisé passerait
+        // inaperçu, ce qui est déjà arrivé sur ce dépôt.
+        "surch_index_postings_codec_blocks",
+        "surch_index_postings_codec_doc_id_bytes",
+        "surch_index_postings_codec_freq_bytes",
+        "surch_index_postings_codec_freq_omitted_blocks",
         "surch_postings_p2_integrity_bytes",
         "surch_postings_p2_fallback_fields",
     ] {

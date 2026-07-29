@@ -26,7 +26,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use surch_index::{memory::MemoryUsage, postings::P2IntegrityMetrics};
+use surch_index::{
+    memory::MemoryUsage,
+    postings::{BlockedEncodeStats, P2IntegrityMetrics},
+};
 
 use crate::state::AppState;
 
@@ -44,6 +47,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
     let disk_postings_bytes = state.index_disk_postings_bytes(index).unwrap_or(0);
     let disk_postings_skipped_terms = state.index_disk_postings_skipped_terms(index).unwrap_or(0);
     let disk_subfield_values_bytes = state.index_disk_subfield_values_bytes(index).unwrap_or(0);
+    let postings_codec_stats = state.index_postings_codec_stats(index).unwrap_or_default();
     let p2_integrity_metrics = state.index_p2_integrity_metrics(index).unwrap_or_default();
     let segment_count = state.index_segment_count(index);
     set_gauges(
@@ -57,6 +61,7 @@ pub fn refresh_memory_gauges(state: &AppState, index: &str) {
         disk_postings_bytes,
         disk_postings_skipped_terms,
         disk_subfield_values_bytes,
+        postings_codec_stats,
         segment_count,
     );
     set_p2_integrity_gauges(index, p2_integrity_metrics);
@@ -398,7 +403,20 @@ pub fn refresh_jemalloc_purge() {}
 /// Drop the gauges for `index`. Called when an index is deleted so the
 /// scrape body does not keep advertising stale totals.
 pub fn clear_memory_gauges(index: &str) {
-    set_gauges(index, 0, &MemoryUsage::default(), 0, 0, 0, 0, 0, 0, 0, 0);
+    set_gauges(
+        index,
+        0,
+        &MemoryUsage::default(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        BlockedEncodeStats::default(),
+        0,
+    );
     set_p2_integrity_gauges(index, P2IntegrityMetrics::default());
 }
 
@@ -419,6 +437,7 @@ fn set_gauges(
     disk_postings_bytes: u64,
     disk_postings_skipped_terms: u64,
     disk_subfield_values_bytes: u64,
+    postings_codec_stats: BlockedEncodeStats,
     segment_count: usize,
 ) {
     let label = [("index", index.to_owned())];
@@ -446,6 +465,23 @@ fn set_gauges(
     // `skipped_terms == 0` mais `disk_postings_bytes == 0` => IO/tmpfs.
     metrics::gauge!("surch_index_disk_postings_skipped_terms", &label)
         .set(disk_postings_skipped_terms as f64);
+    // D2 : ventilation des octets ECRITS par le codec de postings, seule
+    // attestation scrapable que le changement de format delivre. A lire
+    // ensemble, sinon un gain non realise passe inapercu :
+    //  - `..._freq_bytes` doit s'effondrer (freqs constantes omises) ;
+    //  - `..._freq_omitted_blocks / ..._blocks_total` doit tendre vers 1 ;
+    //  - `..._doc_id_bytes` porte l'en-tete de bloc (1 o/bloc) et le
+    //    premier identifiant absolu, donc il ne baisse que modestement.
+    // La somme des deux canaux + les tables de service reste mesuree par
+    // `surch_index_disk_postings_bytes` ci-dessus.
+    metrics::gauge!("surch_index_postings_codec_blocks", &label)
+        .set(postings_codec_stats.blocks as f64);
+    metrics::gauge!("surch_index_postings_codec_doc_id_bytes", &label)
+        .set(postings_codec_stats.doc_id_bytes as f64);
+    metrics::gauge!("surch_index_postings_codec_freq_bytes", &label)
+        .set(postings_codec_stats.freq_bytes as f64);
+    metrics::gauge!("surch_index_postings_codec_freq_omitted_blocks", &label)
+        .set(postings_codec_stats.freq_omitted_blocks as f64);
     metrics::gauge!("surch_index_postings_bytes", &label).set(usage.postings_bytes as f64);
     metrics::gauge!("surch_index_prefix_postings_bytes", &label)
         .set(usage.prefix_postings_bytes as f64);
