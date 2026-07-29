@@ -335,7 +335,10 @@ baseline.
 
 - `.github/workflows/ci-k8s.yml` — manual GHA workflow
 - `deploy/k8s/jobs/00-init-corpora.yaml` — one-shot PVC pre-warm
-- `deploy/k8s/jobs/ndcg-gate.yaml` — SciFact NDCG@10 parity gate
+- `deploy/k8s/jobs/ndcg-gate.yaml` — SciFact + TREC-COVID NDCG@10 parity
+  gate, with hard Surch floors and an OpenSearch-gap ceiling since
+  2026-07-29 (provenance in the manifest header; see
+  `.remote/ndcg-gate-plancher.md`)
 - `deploy/k8s/jobs/insee-bench.yaml` — paired bench Surch vs OS
 - `Makefile` target `bench-k8s` — wrapper around `gh workflow run`
   that prints the run id / URL before optional `gh run watch`
