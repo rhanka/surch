@@ -4312,6 +4312,25 @@ impl<'a> IndexReader<'a> {
     }
 }
 
+/// One action of a `POST /_aliases` batch, applied atomically by
+/// [`AppState::apply_alias_actions`].
+#[derive(Debug, Clone)]
+pub enum AliasActionOp {
+    Add {
+        index: String,
+        alias: String,
+        definition: Value,
+    },
+    /// `index` may be an index pattern (`*`, `deces-*`).
+    Remove {
+        index: String,
+        alias: String,
+    },
+    RemoveIndex {
+        index: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DocumentWriteOperation {
     Index {
@@ -5142,6 +5161,74 @@ impl AppState {
             .or_default()
             .insert(index.to_owned(), definition);
         true
+    }
+
+    /// Applies a `POST /_aliases` batch atomically: every action is
+    /// validated and applied under ONE write lock, so a concurrent search
+    /// never observes an intermediate state (alias missing between a
+    /// `remove` and an `add`, or pointing at two indices). On a validation
+    /// error nothing is applied. `Remove.index` may be an index pattern
+    /// (`*`, `deces-*`); `RemoveIndex` deletes a concrete index and drops
+    /// its aliases. Returns the deleted indices so the caller can run the
+    /// post-delete side effects (cache invalidation, gauges) outside the
+    /// lock.
+    pub fn apply_alias_actions(&self, actions: &[AliasActionOp]) -> Result<Vec<String>, String> {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        for action in actions {
+            match action {
+                AliasActionOp::Add { index, .. } | AliasActionOp::RemoveIndex { index } => {
+                    if !store.indices.contains_key(index) {
+                        return Err(index.clone());
+                    }
+                }
+                AliasActionOp::Remove { .. } => {}
+            }
+        }
+
+        let mut deleted = Vec::new();
+        for action in actions {
+            match action {
+                AliasActionOp::Add {
+                    index,
+                    alias,
+                    definition,
+                } => {
+                    if store.indices.contains_key(index) {
+                        store
+                            .aliases
+                            .entry(alias.clone())
+                            .or_default()
+                            .insert(index.clone(), definition.clone());
+                    }
+                }
+                AliasActionOp::Remove { index, alias } => {
+                    if let Some(entry) = store.aliases.get_mut(alias) {
+                        entry.retain(|target, _| !index_pattern_matches(index, target));
+                        if entry.is_empty() {
+                            store.aliases.remove(alias);
+                        }
+                    }
+                }
+                AliasActionOp::RemoveIndex { index } => {
+                    if store.indices.remove(index).is_some() {
+                        store.aliases.retain(|_, targets| {
+                            targets.remove(index);
+                            !targets.is_empty()
+                        });
+                        deleted.push(index.clone());
+                    }
+                }
+            }
+        }
+        drop(store);
+        for index in &deleted {
+            self.invalidate_search_cache(index);
+            clear_memory_gauges(index);
+        }
+        Ok(deleted)
     }
 
     pub fn remove_alias(&self, index: &str, alias: &str) -> bool {

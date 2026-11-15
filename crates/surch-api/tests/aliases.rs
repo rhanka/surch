@@ -789,3 +789,96 @@ async fn document_index_through_multi_target_alias_returns_400() {
         .expect("reason string")
         .contains("no write index is defined for alias"));
 }
+
+#[tokio::test]
+async fn aliases_monthly_reload_swap_with_wildcard_remove() {
+    // matchID prod reload: `remove {index:"*", alias}` + `add {new}` in one batch.
+    let router = app_router();
+    create_index(&router, "deces-old").await;
+    create_index(&router, "deces-new").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"deces-old","alias":"deces"}}]}"#,
+    )
+    .await;
+
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"remove":{"index":"*","alias":"deces"}},
+            {"add":{"index":"deces-new","alias":"deces"}}
+        ]}"#,
+    )
+    .await;
+
+    let (status, response) = get_json(&router, "/_alias/deces").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        response,
+        serde_json::json!({ "deces-new": {"aliases": {"deces": {}}} })
+    );
+}
+
+#[tokio::test]
+async fn aliases_remove_index_action_drops_index_and_its_aliases() {
+    let router = app_router();
+    create_index(&router, "deces").await;
+    create_index(&router, "deces-new").await;
+
+    // matchID prod reload when a concrete `deces` index exists.
+    post_aliases(
+        &router,
+        r#"{"actions":[
+            {"remove_index":{"index":"deces"}},
+            {"add":{"index":"deces-new","alias":"deces"}}
+        ]}"#,
+    )
+    .await;
+
+    let (status, response) = get_json(&router, "/_alias/deces").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        response,
+        serde_json::json!({ "deces-new": {"aliases": {"deces": {}}} })
+    );
+    let (status, _) = get_json(&router, "/deces-new/_alias").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn aliases_batch_is_all_or_nothing_on_missing_index() {
+    let router = app_router();
+    create_index(&router, "deces-old").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"deces-old","alias":"deces"}}]}"#,
+    )
+    .await;
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/_aliases")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"actions":[
+                        {"remove":{"index":"deces-old","alias":"deces"}},
+                        {"add":{"index":"missing","alias":"deces"}}
+                    ]}"#,
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // The earlier `remove` must not have been applied.
+    let (status, response) = get_json(&router, "/_alias/deces").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        response,
+        serde_json::json!({ "deces-old": {"aliases": {"deces": {}}} })
+    );
+}

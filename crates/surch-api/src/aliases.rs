@@ -8,22 +8,15 @@ use axum::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::{index::validate_index_name, state::AppState, OpenSearchError};
+use crate::{
+    index::validate_index_name,
+    state::{AliasActionOp as AliasAction, AppState},
+    OpenSearchError,
+};
 
-#[derive(Debug, Clone)]
-enum AliasAction {
-    Add {
-        index: String,
-        alias: String,
-        definition: Value,
-    },
-    Remove {
-        index: String,
-        alias: String,
-    },
-}
-
-/// Axum handler for `POST /_aliases` (atomic add/remove batch).
+/// Axum handler for `POST /_aliases`: the whole batch is validated and
+/// applied under one state lock (Elasticsearch semantics), so an alias
+/// swap `remove old + add new` is never observed half-applied.
 pub async fn aliases_state_handler(
     State(state): State<AppState>,
     body: String,
@@ -33,38 +26,15 @@ pub async fn aliases_state_handler(
         Err(error) => return error.into_response(),
     };
 
-    for action in &actions {
-        match action {
-            AliasAction::Add { index, .. } => {
-                if !state.index_exists(index) {
-                    return OpenSearchError::new(
-                        StatusCode::NOT_FOUND,
-                        "index_not_found_exception",
-                        format!("index [{index}] missing"),
-                    )
-                    .into_response();
-                }
-            }
-            AliasAction::Remove { .. } => {}
-        }
+    match state.apply_alias_actions(&actions) {
+        Ok(_) => (StatusCode::OK, Json(json!({ "acknowledged": true }))).into_response(),
+        Err(index) => OpenSearchError::new(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("index [{index}] missing"),
+        )
+        .into_response(),
     }
-
-    for action in actions {
-        match action {
-            AliasAction::Add {
-                index,
-                alias,
-                definition,
-            } => {
-                state.add_alias_with_definition(&index, &alias, definition);
-            }
-            AliasAction::Remove { index, alias } => {
-                state.remove_alias(&index, &alias);
-            }
-        }
-    }
-
-    (StatusCode::OK, Json(json!({ "acknowledged": true }))).into_response()
 }
 
 /// Axum handler for `GET /_alias`.
@@ -296,7 +266,17 @@ fn parse_alias_action(value: &Value) -> Result<AliasAction, OpenSearchError> {
             ));
         }
     };
-    validate_index_name(&index)?;
+    if op == "remove_index" {
+        validate_index_name(&index)?;
+        return Ok(AliasAction::RemoveIndex { index });
+    }
+    // `remove` accepts an index pattern (`*`, `deces-*`), as Elasticsearch
+    // does; `add` must name a concrete index.
+    if op == "remove" && index.contains(['*', '?']) {
+        validate_index_name(&index.replace(['*', '?'], "x"))?;
+    } else {
+        validate_index_name(&index)?;
+    }
     let alias = match inner.get("alias") {
         Some(Value::String(text)) if !text.is_empty() => text.clone(),
         Some(Value::String(_)) => {
