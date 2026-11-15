@@ -208,6 +208,10 @@ multi-fields), 20 `_bulk` chunks of 10 000, one `_refresh`. The restart
 follows a `kill -9` of the server (no graceful shutdown). Single run,
 no repetition: treat the build-time delta as indicative.
 
+Replay: `ROOT=<scratch dir> scripts/bench/l6-persistence-200k.sh
+<release surch-api binary> <mapping.json>` (bash + awk only; `ROOT` is
+wiped).
+
 | Metric | In-memory (no data dir) | `SURCH_DATA_DIR` |
 |---|---|---|
 | Build: 20 bulks + `_refresh` | 3 356 ms | 3 606 ms (+7 %, includes the commit) |
