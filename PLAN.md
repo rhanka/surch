@@ -82,7 +82,11 @@ caps, S3 restore time and artefact size measured.
 - [ ] L2 — `deces_v2` contract and ES 8.6.1 oracle gate.
 - [ ] L3 — 29.3 M campaign under the target caps, ES vs Surch.
 - [ ] L4 — Monthly reload path (build → S3 → restore rename → alias).
-- [ ] L5 — Double run with matchid.
+- [ ] L5 — Double run / multi-engine bench with matchid (owner order
+  2026-11-15: ES, Postgres, DuckDB, Surch; byte-identical responses).
+- [ ] L6 — Persistent index: Surch restarts empty today (blocker).
+- [ ] L7 — Lucene score parity (f32 BM25 without `(k1+1)`, fuzzy blended
+  rewrite, tie order) for the byte-identical bar.
 
 ## Track A - Perf / Optimisation
 

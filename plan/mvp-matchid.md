@@ -94,10 +94,10 @@ estimated by matchid (unverified until k8s measures allocatable):
     `~/.cache-tmp/h2a-lanes/surch-cond/dsl-gap-map.md`, to be promoted under
     `docs/wp-d-matchid/` with the contract). `missing` agg and nested
     sub-aggs are NOT used by deces-backend: dropped.
-  - [ ] Composite agg must emit `after_key` on every non-empty page
-    (deces-backend `/agg` loops forever otherwise).
-  - [ ] Empty `bool` (`bool{}`, `bool{should:[]}`) behaves as `match_all`
-    instead of HTTP 400 (breaks `/agg` without criteria and `_msearch` link
+  - [x] Composite agg emits `after_key` on every non-empty page
+    (deces-backend `/agg` looped forever otherwise): `ea2cd47`.
+  - [x] Empty `bool` (`bool{}`, `bool{should:[]}`) behaves as `match_all`
+    instead of HTTP 400 (`ea2cd47`) (breaks `/agg` without criteria and `_msearch` link
     chunks).
   - [ ] `GET /_cat/indices/{index}?h=creation.date.string` + stored creation
     date (`/version` endpoint).
@@ -120,15 +120,46 @@ estimated by matchid (unverified until k8s measures allocatable):
   - [ ] Memory breakdown (anon, file cache) and reduction if over budget.
   - [ ] Infra: ephemeral VM (owner decision), destroyed after each run.
 - [ ] L4 — Monthly reload path.
-  - [ ] `POST /_aliases` atomic across actions (single lock), `remove_index`
-    action, `index: "*"` wildcard in remove.
-  - [ ] Alias persistence across restart (unverified).
+  - [x] `POST /_aliases` atomic across actions (single lock), `remove_index`
+    action, `index: "*"` wildcard in remove: `4c1a83e`.
+  - [ ] Alias persistence across restart: NOT persisted (state is
+    in-memory, see L6).
   - [ ] `_restore` `rename_pattern` / `rename_replacement`.
   - [ ] S3 repo settings parity (`path_style_access`, `protocol`,
     `readonly`), credentials via env/secret.
   - [ ] `_cluster/health/<idx>?wait_for_status=green`, marker index write.
   - [ ] Offline build → S3 → restore → alias swap timed at 29.3 M.
-- [ ] L5 — Double run ES/Surch with matchid (matchid owns infra).
+- [ ] L5 — Double run ES/Surch with matchid (matchid owns infra). The owner
+  widened it on 2026-11-15 to a multi-engine bench (ES, Postgres, DuckDB,
+  Surch, others) on ephemeral OVH GRA b3-8 nodes created by k8s, replaying
+  real production search + bulk requests (bench servers in France, purged
+  afterwards), with byte-identical API responses (timing fields excluded) as
+  the parity bar. Design study owned by matchid.
+- [ ] L6 — Persistent index (blocker found 2026-11-15). Surch keeps no data
+  directory: `AppRouterState::default()` starts empty, postings / `_source` /
+  sub-field spills are `TMPDIR` tempfiles, and `_snapshot` stores documents
+  for re-ingest. A pod restart means re-indexing 29 M docs, hours on 1 core.
+  Design exists, never implemented:
+  `docs/paper/persistence-iceberg-architecture.md`.
+  - [ ] Segment files + atomic manifest in a data directory; reopen at
+    startup (FST, term entries, block directories, doc maps, live docs,
+    mapping, settings, aliases).
+  - [ ] Snapshot = copy of sealed segment files (S3 artefact built offline,
+    loaded without re-indexing).
+  - [ ] Proof: restart at 29 M under the target caps, time to first query.
+- [ ] L7 — Lucene score parity (needed for the byte-identical bar).
+  - [ ] BM25 as Lucene 9 `BM25Similarity`: f32, no `(k1+1)` factor,
+    256-entry norm cache; Surch scores are ~2.2x ES today, which changes
+    `min_score: 5` full-text result sets (`buildRequest.ts:506`).
+  - [ ] Boolean scorer sums (double accumulation then f32 cast per scorer).
+  - [ ] Fuzzy `TopTermsBlendedFreqScoringRewrite` (max_expansions 50,
+    blended df/ttf, per-term boost `1 - ed/min(len)`).
+  - [ ] `function_score` arithmetic as ES; `_score` serialized as f32 the
+    way ES 8.6.1 (Jackson/JDK) prints it.
+  - [ ] Tie order: index Surch in the `sort:_doc` order exported from the
+    reference ES index (1 shard) so docid tie-breaks match.
+  - [ ] Differential gate: `_score` per hit vs ES 8.6.1, with ES `explain`
+    to localise each gap.
 
 ## Out of scope
 
@@ -138,4 +169,7 @@ estimated by matchid (unverified until k8s measures allocatable):
 
 ## Merge status
 
-- [ ] L0 committed on `main`.
+- [x] L0 committed on `main`: `cd018b9` (local, not pushed).
+- [x] L2/L4 quick compat fixes fast-forwarded on `main`: `4c1a83e`,
+  `ea2cd47` (local, not pushed). L1 WIP on worktree branch
+  `worktree-agent-af16e91d23b04f656` (`b4ebe9a`, uncompiled).
