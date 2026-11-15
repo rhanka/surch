@@ -105,7 +105,13 @@ estimated by matchid (unverified until k8s measures allocatable):
     per form.
     - [x] Unit/parity tests (fuzzy part): `matchid_compat` and existing
       fuzzy tests green; 200 k synthetic measurement
-      (`fuzzy_postings::measure_candidates_vs_full_scan_on_200k_docs`).
+      (`fuzzy_postings::measure_candidates_vs_full_scan_on_200k_docs`,
+      release, local, 5 runs): `match nom dupont` AUTO 3 615 candidates
+      (1.8 %) median 8.7 ms; `bool must[fuzzy nom, fuzzy prenoms] +
+      filter` 145 candidates median 3.3 ms; `match prenoms "jean pierre"`
+      AUTO OR 30 802 candidates (15.4 %) median 139.8 ms (scoring cost
+      O(candidates x expanded terms), follow-up); full-scan baseline
+      (`wildcard`) median 151.8 ms.
     - [ ] B1 oracle re-run on `ci-k8s` and 1.36 M smoke latency per form.
   - ES fuzzy deviations accepted (L1): BM25 kernel is Surch's (keeps
     `(k1+1)`, f64, lot L7) applied over the expanded terms with Lucene's
