@@ -6,6 +6,7 @@ pub mod directory;
 pub mod index_io;
 pub mod index_store;
 pub mod lock;
+pub mod persist;
 pub mod segment_store;
 pub mod wal;
 

@@ -158,7 +158,7 @@ mod subfield_segment {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("surch-subfields-{pid}-{seq}-{nanos}.dat"))
+        crate::postings::spill_dir().join(format!("surch-subfields-{pid}-{seq}-{nanos}.dat"))
     }
 
     /// Append-only, `pread`-addressed sub-field segment — see the module
@@ -169,9 +169,48 @@ mod subfield_segment {
         next_offset: u64,
         extended_len: u64,
         path: PathBuf,
+        /// MVP L6: `true` once reopened from the data directory — the file
+        /// then belongs to the index manifest and `Drop` must not unlink it.
+        persistent: bool,
     }
 
     impl SubfieldSegment {
+        /// MVP L6 (`docs/ops/persistence.md`): reopen a sealed sub-field
+        /// file from the data directory, read-only, addressing exactly its
+        /// first `len` bytes (the manifest-verified length).
+        pub(crate) fn open_persisted(path: &std::path::Path, len: u64) -> std::io::Result<Self> {
+            let file = OpenOptions::new().read(true).open(path)?;
+            let found = file.metadata()?.len();
+            if found < len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("{}: {found} bytes, manifest expects {len}", path.display()),
+                ));
+            }
+            Ok(Self {
+                file,
+                next_offset: len,
+                extended_len: found,
+                path: path.to_path_buf(),
+                persistent: true,
+            })
+        }
+
+        /// MVP L6: the file backing this segment.
+        pub(crate) fn backing_path(&self) -> Option<&std::path::Path> {
+            Some(&self.path)
+        }
+
+        /// MVP L6: drop the `set_len` pre-extension before the file is
+        /// linked into the data directory (sealed: never appended again,
+        /// reads are bounded by the descriptors).
+        pub(crate) fn trim_to_written(&self) -> std::io::Result<()> {
+            if self.persistent {
+                return Ok(());
+            }
+            self.file.set_len(self.next_offset)
+        }
+
         /// Best-effort constructor: NEVER panics — a SHADOW/best-effort
         /// feature must not be able to crash indexation. Returns `None` on
         /// any I/O failure (unwritable `TMPDIR`, `ENOSPC`, permissions…):
@@ -191,6 +230,7 @@ mod subfield_segment {
                 next_offset: 0,
                 extended_len: 0,
                 path,
+                persistent: false,
             })
         }
 
@@ -243,7 +283,9 @@ mod subfield_segment {
 
     impl Drop for SubfieldSegment {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            if !self.persistent {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 }
@@ -261,6 +303,20 @@ mod subfield_segment {
     impl SubfieldSegment {
         pub(crate) fn try_new() -> Option<Self> {
             Some(Self::default())
+        }
+
+        pub(crate) fn open_persisted(path: &std::path::Path, len: u64) -> std::io::Result<Self> {
+            let mut buf = std::fs::read(path)?;
+            buf.truncate(len as usize);
+            Ok(Self { buf })
+        }
+
+        pub(crate) fn backing_path(&self) -> Option<&std::path::Path> {
+            None
+        }
+
+        pub(crate) fn trim_to_written(&self) -> std::io::Result<()> {
+            Ok(())
         }
 
         pub(crate) fn append(&mut self, bytes: &[u8]) -> Option<u64> {
@@ -282,6 +338,9 @@ mod subfield_segment {
 }
 
 use subfield_segment::SubfieldSegment;
+
+mod persist;
+pub use persist::{PersistedSegment, SegmentPersistCache, SEGMENT_FORMAT_VERSION};
 
 #[derive(Debug, Clone)]
 pub struct DocumentIndex {
