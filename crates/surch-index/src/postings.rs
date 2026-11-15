@@ -901,7 +901,7 @@ pub fn set_spill_dir(dir: Option<std::path::PathBuf>) {
 }
 
 /// Directory for new spill tempfiles: the configured spill dir, else `TMPDIR`.
-pub(crate) fn spill_dir() -> std::path::PathBuf {
+pub fn spill_dir() -> std::path::PathBuf {
     SPILL_DIR
         .read()
         .ok()

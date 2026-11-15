@@ -27,6 +27,7 @@ pub mod index_template;
 pub mod metrics;
 pub mod mget;
 pub mod msearch;
+pub mod persist;
 pub mod root;
 pub mod scroll;
 pub mod search;
