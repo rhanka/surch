@@ -1256,6 +1256,7 @@ fn every_build_request_shape_is_served_without_full_scan() {
         .expect("runtime");
     let docs = corpus(600);
     let shapes = shapes(&docs);
+    assert_eq!(shapes.len(), 47, "buildRequest.ts shapes under guard");
     for layout in [Layout::SingleRam, Layout::MultiSegment, Layout::DiskBacked] {
         runtime.block_on(async {
             let (router, state) = build(layout, &docs).await;
