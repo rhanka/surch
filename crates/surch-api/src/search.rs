@@ -81,9 +81,9 @@ pub enum AggSpec {
     /// capped to `size` (default 10). When `after` is present, every
     /// bucket whose key is lexicographically less-than-or-equal to
     /// `after` is skipped (cursor round-trip). The response carries
-    /// `after_key` set to the key of the last emitted bucket whenever
-    /// the cap was reached (otherwise omitted, marking the end of the
-    /// stream).
+    /// `after_key` set to the key of the last emitted bucket on every
+    /// non-empty page (Elasticsearch semantics; omitted only when the
+    /// page is empty, marking the end of the stream).
     Composite {
         sources: Vec<CompositeSource>,
         size: usize,
@@ -479,9 +479,9 @@ pub enum AggResult {
     Value {
         value: Value,
     },
-    /// A12.4: composite payload. `after_key` is `None` when the engine
-    /// emitted fewer buckets than the cap (i.e. the cursor stream has
-    /// reached its end), and `Some(<last bucket's key>)` otherwise so
+    /// A12.4: composite payload. `after_key` is `None` when the page
+    /// is empty (the cursor stream has reached its end), and
+    /// `Some(<last bucket's key>)` on every non-empty page so
     /// the caller can round-trip it into the next request's
     /// `composite.after`.
     Composite {
@@ -1758,8 +1758,8 @@ fn record_terms_value(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Val
 /// stream (lex comparison on each source's value, in the order the
 /// sources were declared). The first `size` surviving buckets are
 /// emitted. `after_key` is set to the key of the last emitted bucket
-/// when (and only when) the cap chopped the stream — otherwise it is
-/// omitted, signalling end-of-stream to the caller.
+/// on every non-empty page and omitted on an empty one, which is what
+/// signals end-of-stream (Elasticsearch semantics).
 fn compute_composite_aggregation(
     matched_documents: &[ScoredDocument],
     sources: &[CompositeSource],
@@ -1864,7 +1864,6 @@ fn compute_composite_aggregation(
         })
         .collect();
 
-    let total = filtered.len();
     let buckets: Vec<AggBucket> = filtered
         .into_iter()
         .take(size)
@@ -1881,11 +1880,12 @@ fn compute_composite_aggregation(
         })
         .collect();
 
-    // `after_key` is emitted only when the cap actually truncated the
-    // stream (more buckets remained behind `size`). Otherwise the
-    // caller has reached the end and we omit the field — round-trip
-    // contract documented on `AggResult::Composite`.
-    let after_key = if buckets.len() == size && total > size {
+    // Elasticsearch emits `after_key` (the last bucket key) on EVERY
+    // non-empty page and omits it only once a page comes back empty.
+    // Clients such as matchID deces-backend page until `buckets` is
+    // empty and re-send `after_key`; omitting it on the last non-empty
+    // page makes them restart from page 1 forever.
+    let after_key = if !buckets.is_empty() {
         buckets.last().and_then(|bucket| match &bucket.key {
             Value::Object(map) => Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
             _ => None,
@@ -4786,14 +4786,15 @@ fn parse_bool_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     let must_not = parse_bool_clause_bucket(object, "must_not")?;
     let should = parse_bool_clause_bucket(object, "should")?;
 
-    // Each bucket-key is optional individually but at least one must be
-    // present, otherwise the body is empty and the request is malformed.
+    // Elasticsearch rewrites a clause-less `bool` (`{}`, `{"should":[]}`)
+    // to `match_all`; matchID deces-backend sends it for `/agg` without
+    // criteria and for link rows with no mapped column.
     if must.is_empty() && filter.is_empty() && must_not.is_empty() && should.is_empty() {
-        return Err(OpenSearchError::new(
-            StatusCode::BAD_REQUEST,
-            "parsing_exception",
-            "bool query must contain at least one of `must`, `filter`, `must_not`, or `should`",
-        ));
+        let boost = match object.get("boost") {
+            Some(raw) => parse_boost(raw)?,
+            None => 1.0,
+        };
+        return Ok(SearchQuery::MatchAll { boost });
     }
 
     let minimum_should_match = match object.get("minimum_should_match") {

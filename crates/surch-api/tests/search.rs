@@ -2756,7 +2756,7 @@ async fn bool_matchid_nested_should_with_boost_disambiguates_name_order() {
 }
 
 #[tokio::test]
-async fn bool_rejects_empty_body() {
+async fn bool_empty_body_matches_all_like_elasticsearch() {
     let router = app_router();
     let create_index = router
         .clone()
@@ -2783,13 +2783,11 @@ async fn bool_rejects_empty_body() {
         .await
         .expect("router should respond");
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Elasticsearch rewrites a clause-less bool to match_all.
+    assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
-    assert_eq!(body["error"]["type"], "parsing_exception");
-    assert!(body["error"]["reason"]
-        .as_str()
-        .expect("reason")
-        .contains("at least one of"));
+    assert_eq!(body["hits"]["total"]["value"], 0);
+    assert!(body["hits"]["hits"].as_array().expect("hits").is_empty());
 }
 
 #[tokio::test]
@@ -4560,10 +4558,15 @@ async fn search_router_a12_4_composite_emits_one_bucket_per_unique_key() {
     assert_eq!(buckets[2]["key"]["lastName"], "MARTIN");
     assert_eq!(buckets[2]["key"]["birthDate"], "19620201");
     assert_eq!(buckets[2]["doc_count"], 1);
-    // End-of-stream: cap not reached → `after_key` omitted.
-    assert!(
-        body["aggregations"]["by_pair"].get("after_key").is_none(),
-        "after_key must be omitted when the cap was not reached",
+    // Elasticsearch emits `after_key` on every non-empty page, even when
+    // the cap was not reached; only an empty page omits it.
+    assert_eq!(
+        body["aggregations"]["by_pair"]["after_key"]["lastName"],
+        "MARTIN"
+    );
+    assert_eq!(
+        body["aggregations"]["by_pair"]["after_key"]["birthDate"],
+        "19620201"
     );
 }
 
@@ -4640,11 +4643,27 @@ async fn search_router_a12_4_composite_caps_at_size_and_emits_after_key() {
     assert_eq!(buckets_next.len(), 1);
     assert_eq!(buckets_next[0]["key"]["lastName"], "MARTIN");
     assert_eq!(buckets_next[0]["key"]["birthDate"], "19620201");
+    // Last non-empty page still carries `after_key` (Elasticsearch
+    // semantics) ...
+    assert_eq!(
+        body_next["aggregations"]["by_pair"]["after_key"]["birthDate"],
+        "19620201"
+    );
+    // ... and the page after it is empty and omits it.
+    let body_end = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{}},"size":0,"aggs":{"by_pair":{"composite":{"size":2,"sources":[{"lastName":{"terms":{"field":"NOM"}}},{"birthDate":{"terms":{"field":"DATE_NAISSANCE"}}}],"after":{"lastName":"MARTIN","birthDate":"19620201"}}}}}"#,
+    )
+    .await;
+    assert!(body_end["aggregations"]["by_pair"]["buckets"]
+        .as_array()
+        .expect("buckets array")
+        .is_empty());
     assert!(
-        body_next["aggregations"]["by_pair"]
+        body_end["aggregations"]["by_pair"]
             .get("after_key")
             .is_none(),
-        "end-of-stream → after_key omitted",
+        "empty page → after_key omitted",
     );
 }
 
@@ -4719,10 +4738,10 @@ async fn search_router_a12_4_phase2_composite_mixed_sources_emits_one_bucket_per
     assert_eq!(buckets[2]["key"]["lastName"], "MARTIN");
     assert_eq!(buckets[2]["key"]["birthDate"], "19620201");
     assert_eq!(buckets[2]["doc_count"], 1);
-    // End-of-stream: cap not reached.
-    assert!(
-        body["aggregations"]["by_pair"].get("after_key").is_none(),
-        "after_key must be omitted when the cap was not reached",
+    // Elasticsearch semantics: a non-empty page always carries `after_key`.
+    assert_eq!(
+        body["aggregations"]["by_pair"]["after_key"]["birthDate"],
+        "19620201"
     );
 }
 
@@ -4837,9 +4856,10 @@ async fn search_router_a12_4_phase2_composite_mixed_sources_round_trips_after_cu
     assert_eq!(buckets[0]["key"]["lastName"], "MARTIN");
     assert_eq!(buckets[0]["key"]["birthDate"], "19620201");
     assert_eq!(buckets[0]["doc_count"], 1);
-    assert!(
-        body["aggregations"]["by_pair"].get("after_key").is_none(),
-        "end-of-stream → after_key omitted",
+    // Last non-empty page still carries `after_key` (Elasticsearch semantics).
+    assert_eq!(
+        body["aggregations"]["by_pair"]["after_key"]["lastName"],
+        "MARTIN"
     );
 }
 
@@ -5077,4 +5097,41 @@ async fn search_router_a2_geo_distance_rejects_unknown_unit_with_parsing_excepti
         "got: {}",
         body["error"]["reason"],
     );
+}
+
+#[tokio::test]
+async fn bool_with_empty_should_matches_all_documents() {
+    // matchID link rows with no mapped column send `bool{should:[]}`.
+    let router = app_router();
+    let bulk = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/deces/_bulk?refresh=true")
+                .header("content-type", "application/x-ndjson")
+                .body(Body::from(
+                    "{\"index\":{\"_id\":\"1\"}}\n{\"NOM\":\"MARTIN\"}\n{\"index\":{\"_id\":\"2\"}}\n{\"NOM\":\"DURAND\"}\n",
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    assert!(bulk.status().is_success());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/deces/_search")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":{"bool":{"should":[]}}}"#))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["hits"]["total"]["value"], 2);
 }
