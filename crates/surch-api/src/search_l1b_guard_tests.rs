@@ -8,10 +8,11 @@
 //! search (fuzzy and exact), the adaptive link block and the advanced block
 //! (link `_msearch` chunks, `track_total_hits: false`), and the `/agg`
 //! shapes (terms, date_histogram, composite + cardinality, `after`). The
-//! index uses the real `deces_index.yml` mapping, except that the `DATE_*`
-//! text fields declare `analyzer: standard` explicitly (ES's default; Surch
-//! defaults `text` to `simple`, which drops digits — lot L2) and the custom
-//! `norm` analysis chain is Surch's builtin `norm`.
+//! index is created through `PUT /deces` with the real `deces_index.yml`
+//! definition (`tests/matchid_compat/deces/mapping_real.json`, lot L2):
+//! custom `norm` analyzer and normalizer with the `alphanum`
+//! `pattern_replace` char filter, `DATE_*` text fields on the default
+//! `standard` analyzer with `index_prefixes{4,6}`.
 //!
 //! Each shape runs on three layouts (single RAM segment, multi-segment,
 //! disk-backed postings), through `_search` and `_msearch`, and its match
@@ -24,7 +25,6 @@ use axum::{
     http::{Method, Request},
 };
 use serde_json::{json, Value};
-use surch_index::mapping::IndexMapping;
 use tower::ServiceExt;
 
 use super::{
@@ -37,45 +37,10 @@ use crate::{app_router_with_state, state::AppState, AppRouterState};
 // Fixture: real deces mapping + synthetic corpus.
 // ---------------------------------------------------------------------------
 
-fn deces_mapping() -> IndexMapping {
-    let norm_text_raw = json!({"type": "text", "analyzer": "norm",
-        "fields": {"raw": {"type": "keyword", "normalizer": "norm"}}});
-    let date_text = json!({"type": "text", "analyzer": "standard",
-        "index_prefixes": {"min_chars": 4, "max_chars": 6},
-        "fields": {"raw": {"type": "keyword"}}});
-    let keyword_norm = json!({"type": "keyword", "normalizer": "norm"});
-    IndexMapping::from_properties_value(&json!({
-        "UID": {"type": "keyword"},
-        "SOURCE": keyword_norm.clone(),
-        "SOURCE_LINE": {"type": "integer"},
-        "PRENOMS_NOM": {"type": "text", "analyzer": "norm"},
-        "PRENOM_NOM": {"type": "text", "analyzer": "norm"},
-        "NOM": norm_text_raw.clone(),
-        "PRENOM": norm_text_raw.clone(),
-        "PRENOMS": norm_text_raw.clone(),
-        "SEXE": {"type": "keyword"},
-        "DATE_NAISSANCE": date_text.clone(),
-        "DATE_NAISSANCE_NORM": {"type": "date", "format": "yyyyMMdd"},
-        "COMMUNE_NAISSANCE": norm_text_raw.clone(),
-        "CODE_INSEE_NAISSANCE": keyword_norm.clone(),
-        "CODE_POSTAL_NAISSANCE": keyword_norm.clone(),
-        "CODE_INSEE_NAISSANCE_HISTORIQUE": keyword_norm.clone(),
-        "DEPARTEMENT_NAISSANCE": keyword_norm.clone(),
-        "PAYS_NAISSANCE": norm_text_raw.clone(),
-        "GEOPOINT_NAISSANCE": {"type": "geo_point"},
-        "DATE_DECES": date_text,
-        "DATE_DECES_NORM": {"type": "date", "format": "yyyyMMdd"},
-        "AGE_DECES": {"type": "short"},
-        "COMMUNE_DECES": norm_text_raw.clone(),
-        "CODE_INSEE_DECES": keyword_norm.clone(),
-        "CODE_POSTAL_DECES": keyword_norm.clone(),
-        "CODE_INSEE_DECES_HISTORIQUE": keyword_norm.clone(),
-        "DEPARTEMENT_DECES": keyword_norm,
-        "PAYS_DECES": norm_text_raw,
-        "GEOPOINT_DECES": {"type": "geo_point"}
-    }))
-    .expect("deces mapping parses")
-}
+/// matchID `deces_index.yml` as ES receives it (provenance in
+/// `tests/matchid_compat/deces/README.md`).
+const DECES_INDEX_REAL: &str =
+    include_str!("../../../tests/matchid_compat/deces/mapping_real.json");
 
 const NOMS: &[&str] = &[
     "DUPONT", "DUPOND", "DURAND", "MARTIN", "MATRIN", "BERNARD", "PETIT", "LEROY", "MOREAU",
@@ -201,7 +166,18 @@ async fn send(router: &axum::Router, method: Method, uri: &str, body: String) ->
 
 async fn build(layout: Layout, docs: &[(String, Value)]) -> (axum::Router, AppState) {
     let state = AppState::default();
-    state.create_index(INDEX, Some(deces_mapping()), json!({}), Default::default());
+    let router = app_router_with_state(AppRouterState {
+        app: state.clone(),
+        ..Default::default()
+    });
+    let created = send(
+        &router,
+        Method::PUT,
+        &format!("/{INDEX}"),
+        DECES_INDEX_REAL.to_owned(),
+    )
+    .await;
+    assert_eq!(created["acknowledged"], true, "PUT /{INDEX}: {created}");
     state.set_merge_fanin_override(INDEX, 0);
     match layout {
         Layout::SingleRam => state.set_flush_budget_bytes_override(INDEX, None),
@@ -211,10 +187,6 @@ async fn build(layout: Layout, docs: &[(String, Value)]) -> (axum::Router, AppSt
             state.set_postings_disk_enabled(INDEX, true);
         }
     }
-    let router = app_router_with_state(AppRouterState {
-        app: state.clone(),
-        ..Default::default()
-    });
     for chunk in docs.chunks(docs.len().div_ceil(5).max(1)) {
         let mut ndjson = String::new();
         for (id, source) in chunk {
@@ -1284,6 +1256,7 @@ fn every_build_request_shape_is_served_without_full_scan() {
         .expect("runtime");
     let docs = corpus(600);
     let shapes = shapes(&docs);
+    assert_eq!(shapes.len(), 47, "buildRequest.ts shapes under guard");
     for layout in [Layout::SingleRam, Layout::MultiSegment, Layout::DiskBacked] {
         runtime.block_on(async {
             let (router, state) = build(layout, &docs).await;
@@ -1304,15 +1277,10 @@ fn every_build_request_shape_is_served_without_full_scan() {
             // The synthetic inputs are chosen to hit the corpus: an empty
             // match set would make a shape's check vacuous. Only the
             // "every field" conjunctions may legitimately match nothing.
-            // Known analysis gap (lot L2, not L1b): a `match` on a keyword
-            // sub-field (`DATE_NAISSANCE.raw`) analyses the query with the
-            // default `simple` analyzer, which drops digits, so the exact
-            // date clause matches nothing — on postings and on `_source`
-            // alike (the equality check above still holds).
-            empty.retain(|label| {
-                !label.ends_with("every field")
-                    && label != "advanced exact name + full birth date + birth city"
-            });
+            // Lot L2 closed the former `DATE_NAISSANCE.raw` /
+            // `COMMUNE_NAISSANCE.raw` exception: a `match` on a keyword
+            // sub-field now analyses the query with its normalizer.
+            empty.retain(|label| !label.ends_with("every field"));
             assert!(
                 empty.is_empty(),
                 "{layout:?}: shapes with an empty match set: {empty:?}"

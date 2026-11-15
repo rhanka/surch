@@ -222,7 +222,7 @@ fn oracle(
     require_all: bool,
 ) -> BTreeSet<String> {
     let mapping = state.index_mapping(index).expect("mapping");
-    let analyzer = mapping.analyzer(field);
+    let analyzer = mapping.index_analyzer(field);
     let query_tokens = analyzer.terms(query);
     docs.iter()
         .filter(|(_, source)| {

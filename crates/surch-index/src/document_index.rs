@@ -6,13 +6,9 @@ use std::sync::{
 };
 
 use rayon::prelude::*;
-use surch_analysis::{
-    Analyzer, KeywordAnalyzer, NormAnalyzer, Normalizer, SimpleAnalyzer, StandardAnalyzer,
-    StopAnalyzer, WhitespaceAnalyzer,
-};
 use thiserror::Error;
 
-use crate::mapping::{AnalysisSettings, AnalyzerName, FieldType, IndexMapping};
+use crate::mapping::{AnalysisSettings, IndexMapping, ResolvedAnalyzer};
 use crate::postings::{
     merge_term_dictionaries, postings_disk_enabled, BlockMeta, BlockedEncodeStats, CheckedPostings,
     DiskPostingsAdvance, DiskPostingsCursor, P2IntegrityMetrics, PostingsBlockSkipIter,
@@ -3610,13 +3606,17 @@ fn analyze_document(
 
     for (field, value) in fields {
         let field_mapping = mapping.field(field);
-        let analyzer = field_mapping.map_or(AnalyzerName::default_for(FieldType::Text), |field| {
-            field.analyzer()
-        });
+        // L2: the field's ES analysis chain (custom analyzer / normalizer
+        // from `settings.analysis`, `standard` default for text, verbatim
+        // for keyword and other types).
+        let analyzer = match field_mapping {
+            Some(field_mapping) => field_mapping.index_analyzer(mapping.analysis()),
+            None => mapping.analysis().default_index_analyzer(),
+        };
         let norms_enabled = field_mapping.is_none_or(|field| field.norms_enabled());
         let index_prefixes = field_mapping.and_then(|m| m.index_prefixes);
 
-        let analyzed = analyzed_terms(analyzer, value);
+        let analyzed = analyzed_terms(&analyzer, value);
         let token_count = analyzed
             .values()
             .map(|positions| positions.len() as u64)
@@ -3694,83 +3694,43 @@ fn lowest_position_term(analyzed: &BTreeMap<String, Vec<u32>>) -> Option<String>
 /// (O(tokens), even repeated tokens that collapse into one entry) and carried
 /// the field bytes through every BTreeMap key comparison. Matches Lucene's
 /// single `FieldInvertState` (field identity never re-materialised per token).
-fn analyzed_terms(analyzer: AnalyzerName, value: &str) -> BTreeMap<String, Vec<u32>> {
-    let tokenized = match analyzer {
-        AnalyzerName::Standard => StandardAnalyzer.token_stream(value),
-        AnalyzerName::Simple => SimpleAnalyzer.token_stream(value),
-        AnalyzerName::Stop => StopAnalyzer.token_stream(value),
-        AnalyzerName::Keyword => KeywordAnalyzer.token_stream(value),
-        AnalyzerName::Whitespace => WhitespaceAnalyzer.token_stream(value),
-        AnalyzerName::Norm => NormAnalyzer.token_stream(value),
-    };
-
+///
+/// Positions follow the token position increments (stacked tokens such as
+/// `asciifolding.preserve_original` share a position).
+fn analyzed_terms(analyzer: &ResolvedAnalyzer, value: &str) -> BTreeMap<String, Vec<u32>> {
     let mut terms = BTreeMap::<String, Vec<u32>>::new();
     let mut position = 0_u32;
 
-    for token in tokenized {
+    for token in analyzer.tokens(value) {
         position += token.position_increment;
-        terms.entry(token.term).or_default().push(position - 1);
+        terms
+            .entry(token.term)
+            .or_default()
+            .push(position.saturating_sub(1));
     }
 
     terms
 }
 
-/// A10 (Phase 4): analyze the parent `value` for a multi-field sub-field,
-/// keyed by the qualified `field` path.
-///
-/// Routes the value through the sub-field's analysis chain with ES-faithful
-/// semantics:
-///
-/// - `keyword` + `normalizer`: the WHOLE value as one token, lowercased +
-///   asciifolded via [`Normalizer`]. A normalizer in ES is a char/token
-///   filter chain applied to the single keyword token — it never tokenizes,
-///   so `"Étienne DUPRÉ"` stores `"etienne dupre"`, not `["etienne",
-///   "dupre"]`.
-/// - `keyword` without normalizer: the whole value verbatim as one token
-///   (identity, via [`KeywordAnalyzer`]).
-/// - any other type (e.g. `text`): the declared / default analyzer, which
-///   tokenizes (`analyzed_terms`).
+/// A10 (Phase 4): analyze the parent `value` for a multi-field sub-field
+/// with the sub-field's own ES analysis chain
+/// ([`crate::mapping::FieldMapping::index_analyzer`]): a `keyword` sub-field
+/// with a `normalizer` stores the WHOLE value passed through that
+/// normalizer (one token: `"Saint-Étienne"` -> `"saint etienne"` with the
+/// deces `norm`), a `keyword` without one stores the value verbatim, a
+/// `text` sub-field tokenizes with its (custom or builtin) analyzer.
 fn subfield_terms(
     sub_mapping: &crate::mapping::FieldMapping,
     value: &str,
     analysis: &AnalysisSettings,
 ) -> BTreeMap<String, Vec<u32>> {
-    if sub_mapping.field_type == FieldType::Keyword {
-        let tokens = match sub_mapping.normalizer {
-            Some(_) => Normalizer.token_stream(value),
-            None => KeywordAnalyzer.token_stream(value),
-        };
-        let mut terms = BTreeMap::<String, Vec<u32>>::new();
-        let mut position = 0_u32;
-        for token in tokens {
-            position += token.position_increment;
-            terms.entry(token.term).or_default().push(position - 1);
-        }
-        return terms;
-    }
-
-    // A1/A13: a text sub-field may declare a custom analyzer (e.g.
-    // `autocomplete_analyzer` = edge_ngram + lowercase/asciifolding). Resolve
-    // it against the index analysis settings and fan out its emitted terms as
-    // postings. Falls back to the builtin analyzer when the name is unknown
-    // (resolution returns None) so a bad reference degrades gracefully.
-    if let Some(name) = &sub_mapping.custom_analyzer {
-        if let Some(resolved) = analysis.resolve_analyzer(name) {
-            let mut terms = BTreeMap::<String, Vec<u32>>::new();
-            for (position, term) in resolved.terms(value).into_iter().enumerate() {
-                terms.entry(term).or_default().push(position as u32);
-            }
-            return terms;
-        }
-    }
-
-    analyzed_terms(sub_mapping.analyzer(), value)
+    analyzed_terms(&sub_mapping.index_analyzer(analysis), value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::{FieldMapping, FieldPrefixes, FieldType};
+    use crate::mapping::{AnalyzerName, FieldMapping, FieldPrefixes, FieldType};
 
     fn mapping_with_prefixes(field: &str, prefixes: FieldPrefixes) -> IndexMapping {
         let mut mapping = IndexMapping::new();

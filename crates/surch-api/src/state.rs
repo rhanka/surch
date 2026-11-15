@@ -1527,7 +1527,7 @@ use surch_search::topk::MinCompetitiveScore;
 
 use crate::persist::{
     get_json, get_mapping, put_json, put_mapping, DataDir, IndexManifest, IndexPersistState,
-    FORMAT_VERSION, IDMAP_KIND, MANIFEST_NAME, META_KIND, SOURCE_NAME,
+    FORMAT_VERSION, IDMAP_KIND, MANIFEST_NAME, META_FORMAT_VERSION, META_KIND, SOURCE_NAME,
 };
 use crate::scroll::ScrollTable;
 use crate::stats::{
@@ -4626,19 +4626,19 @@ pub enum DocumentWriteResult {
     },
 }
 
+/// L2: the single term a term-level query (`term`, `prefix`) looks up —
+/// the keyword normalizer (or the value verbatim) on keyword fields,
+/// including multi-field sub-fields such as `NOM.raw`.
 fn normalized_term_for_field(value: &str, field: &str, mapping: &IndexMapping) -> String {
-    mapping.analyzer(field).first_term(value)
+    mapping.term_query_value(field, value)
 }
 
+/// L2: the terms a full-text query (`match` & co) looks up — the field's ES
+/// search analysis (`search_analyzer`, custom chains from
+/// `settings.analysis`, the keyword normalizer for keyword fields and
+/// sub-fields, `standard` by default for text).
 fn normalized_terms_for_field(value: &str, field: &str, mapping: &IndexMapping) -> Vec<String> {
-    // A1/A13: a field with a custom analyzer or explicit `search_analyzer`
-    // resolves its query tokens against the index analysis settings (e.g. an
-    // edge_ngram autocomplete sub-field searched with `standard`). Every
-    // builtin-only field returns `None` here and keeps the legacy path.
-    if let Some(terms) = mapping.custom_search_terms_for_field(value, field) {
-        return terms;
-    }
-    mapping.analyzer(field).terms(value)
+    mapping.search_terms(field, value)
 }
 
 fn indexed_fields_for_document(document: &Value, mapping: &IndexMapping) -> Vec<(String, String)> {
@@ -6093,16 +6093,12 @@ impl AppState {
         }
         let mut terms: Vec<TermCtx<'_>> = Vec::with_capacity(clauses.len());
         for &(field, value) in clauses {
-            // The generic path RECALLS with `normalized_terms_for_field` (custom
-            // search analyzer / search_analyzer / custom_analyzer, else the
-            // builtin) but SCORES with `analyzer(field).terms` (the field's main
-            // analyzer). The fused walk captures the recall token's freq AND
-            // scores it, so it is bit-identical only when the two normalisations
-            // agree on a SINGLE token — true for builtin and custom-MAIN
-            // analyzers (the deces French folding), false when a separate search
-            // analyzer is set (then decline → generic path, the parity ref).
+            // The generic path recalls AND scores with the field's search
+            // analysis (`IndexMapping::search_terms`, L2). The fused walk
+            // captures the recall token's freq and scores it, so it applies
+            // only when that analysis yields a SINGLE token.
             let recall = normalized_terms_for_field(value, field, &data.mapping);
-            if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
+            if recall.len() != 1 {
                 return None;
             }
             let token = recall.into_iter().next().expect("len checked == 1");
@@ -6244,7 +6240,7 @@ impl AppState {
         let mut block_metrics = P2DiskBlockMetrics::default();
         for &(field, value) in clauses {
             let recall = normalized_terms_for_field(value, field, &data.mapping);
-            if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
+            if recall.len() != 1 {
                 block_metrics.observe_segmented(&segmented_terms);
                 block_metrics.publish(index_name, &data.index);
                 return None;
@@ -6445,7 +6441,7 @@ impl AppState {
         // token unique. C'est cette garde qui rend le boost de répétition
         // égal à 1 et le `total` égal au `df` du terme.
         let recall = normalized_terms_for_field(value, field, &data.mapping);
-        if recall.len() != 1 || recall != data.mapping.analyzer(field).terms(value) {
+        if recall.len() != 1 {
             return None;
         }
         let token = recall.into_iter().next().expect("len checked == 1");
@@ -7357,7 +7353,7 @@ impl InMemoryIndex {
 
         // 4. Mapping, settings, counters, block directory, side postings.
         let meta_name = state.file_name("meta");
-        let meta = write_framed_file(&dir, &meta_name, META_KIND, FORMAT_VERSION, |out| {
+        let meta = write_framed_file(&dir, &meta_name, META_KIND, META_FORMAT_VERSION, |out| {
             self.encode_meta(out)
         })?;
         fsync_dir(&dir)?;
@@ -7419,7 +7415,7 @@ impl InMemoryIndex {
         manifest.collect_garbage(dir)?;
         manifest.verify_data_files(dir, full_verification_enabled())?;
 
-        let mut meta = open_framed_file(dir, &manifest.meta, META_KIND, FORMAT_VERSION)?;
+        let mut meta = open_framed_file(dir, &manifest.meta, META_KIND, META_FORMAT_VERSION)?;
         let mapping = get_mapping(&mut meta)?;
         let settings = get_json(&mut meta)?;
         let next_doc_id = meta.get_u32()?;

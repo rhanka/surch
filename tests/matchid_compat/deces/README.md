@@ -86,6 +86,39 @@ to keep this fixture disjoint from the synthetic `deces_NNNNN`
 namespace used by `slice-1000.ndjson` — the B1 replay can therefore
 target either slice without id collisions.
 
+## Real index definition (`mapping_real.json`, lot L2)
+
+`mapping_real.json` is the `PUT /deces` body matchID sends to
+Elasticsearch, converted by hand from
+`packages/deces-dataprep/projects/deces-dataprep/datasets/deces_index.yml`
+at matchID `main` commit `673275520dfec018b171d13ed621d834a8924448`
+(2026-11-11). Conversion rules:
+
+- `body.settings` and `body.mappings` are copied as JSON, key order kept.
+- `analysis.analyzer.autocomplete_analyzer` declares `tokenizer` twice
+  in the YAML (`edge_tokenizer2`, then `keyword`). The YAML loader keeps
+  the last value, so ES receives `"tokenizer": "keyword"`; the fixture
+  does the same. No field references `autocomplete_analyzer`, and the
+  `edge_tokenizer2` tokenizer (`edge_ngram`, `min_gram` 2, `max_gram`
+  10, `token_chars` letter/digit) is declared but referenced by no
+  analyzer.
+- `settings.index.store.preload: !ENV ${ES_PRELOAD}` is dropped (an
+  environment-driven ES store hint with no Surch equivalent);
+  `refresh_interval` and `number_of_replicas` are kept.
+- `dynamic: False` becomes `"dynamic": false` (Surch accepts and ignores
+  it; it still maps unknown fields dynamically).
+- There is no `copy_to`: `PRENOMS_NOM` / `PRENOM_NOM` are plain `text`
+  fields filled by the dataprep recipe.
+
+`analyze_parity.json` is the `_analyze` parity table on this definition:
+each row is an ES `POST /deces/_analyze` body (`analyzer`, `normalizer`,
+`field` or `tokenizer`), a text, and the tokens ES 8.6.1 is expected to
+return, with a `status` saying where the expectation comes from (no row
+has been run against ES yet; the ES 8.6.1 oracle gate will replay
+them). `crates/surch-index/tests/deces_analyze_parity.rs` checks Surch
+against it, and `crates/surch-api/src/search_l1b_guard_tests.rs` creates
+its index from `mapping_real.json`.
+
 ## Regenerating the fixtures
 
 ### Synthetic slice

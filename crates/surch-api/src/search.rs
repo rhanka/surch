@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
-use surch_index::mapping::{AnalyzerName, FieldType, IndexMapping};
+use surch_index::mapping::{FieldType, IndexMapping, ResolvedAnalyzer};
 use surch_index::postings::{BlockMeta, BLOCK_SIZE};
 use surch_search::fuzzy::{
     bounded_damerau_levenshtein, edits_for_term_len, fuzzy_token_plan, parse_fuzziness, Fuzziness,
@@ -3298,7 +3298,7 @@ fn maxscore_match(
     if field_stats.doc_count == 0 {
         return None;
     }
-    let tokens = ctx.mapping().analyzer(field).terms(value);
+    let tokens = ctx.mapping().search_terms(field, value);
     if tokens.is_empty() {
         return None;
     }
@@ -4272,7 +4272,7 @@ fn insert_scoring_tokens(
     field: &str,
     query: &str,
 ) {
-    let tokens = mapping.analyzer(field).terms(query);
+    let tokens = mapping.search_terms(field, query);
     if tokens.is_empty() {
         return;
     }
@@ -4288,7 +4288,7 @@ fn bm25_field_score(
     query: &str,
     internal_doc_id: u32,
 ) -> Option<f64> {
-    let query_tokens = scoring_context.mapping().analyzer(field).terms(query);
+    let query_tokens = scoring_context.mapping().search_terms(field, query);
     let field_stats = scoring_context.field_stats(field)?;
     if query_tokens.is_empty() || field_stats.doc_count == 0 {
         return None;
@@ -4446,19 +4446,11 @@ fn field_tokens_for_source(source: &Value, field: &str, mapping: &IndexMapping) 
     // the PARENT value with the sub-field's own chain (mirroring
     // `DocumentIndex::index_subfields`), otherwise a `match`/`term` on a
     // sub-field inside a bool always sees zero tokens and fails.
-    if mapping.field(field).is_none() {
-        if let Some((parent, _)) = field.split_once('.') {
-            if let Some(sub_mapping) = mapping.resolve_field(field) {
-                return match field_text(source, parent) {
-                    Some(text) => sub_mapping.analyze_subfield_value(&text, mapping.analysis()),
-                    None => Vec::new(),
-                };
-            }
-        }
-    }
-    field_text(source, field)
-        .map(|text| mapping.analyzer(field).terms(&text))
-        .unwrap_or_default()
+    //
+    // L2: every value is analysed with the field's index-time ES chain
+    // (`IndexMapping::index_terms`), array values one by one, exactly like
+    // the postings.
+    index_terms_for_source(source, field, mapping)
 }
 
 pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError> {
@@ -7429,12 +7421,9 @@ fn field_matches_with_mapping(
     operator: MatchOperator,
     mapping: &IndexMapping,
 ) -> bool {
-    // A1/A13: a field with a custom analyzer or explicit `search_analyzer`
-    // (e.g. an edge_ngram autocomplete sub-field searched with `standard`)
-    // tokenizes the query through that chain; builtins keep the legacy path.
-    let query_tokens = mapping
-        .custom_search_terms_for_field(query, field)
-        .unwrap_or_else(|| mapping.analyzer(field).terms(query));
+    // L2: the query is analysed with the field's ES search analysis
+    // (`search_analyzer`, custom chain, keyword normalizer, `standard`).
+    let query_tokens = mapping.search_terms(field, query);
     if query_tokens.is_empty() {
         return false;
     }
@@ -7477,9 +7466,7 @@ fn match_phrase_field_matches_with_mapping(
     query: &str,
     mapping: &IndexMapping,
 ) -> bool {
-    let query_tokens = mapping
-        .custom_search_terms_for_field(query, field)
-        .unwrap_or_else(|| mapping.analyzer(field).terms(query));
+    let query_tokens = mapping.search_terms(field, query);
     if query_tokens.is_empty() {
         return false;
     }
@@ -7496,10 +7483,9 @@ fn term_field_matches_with_mapping(
     query: &str,
     mapping: &IndexMapping,
 ) -> bool {
-    let query = mapping
-        .custom_search_terms_for_field(query, field)
-        .and_then(|tokens| tokens.into_iter().next())
-        .unwrap_or_else(|| mapping.analyzer(field).first_term(query));
+    // L2: term-level semantics — the keyword normalizer (or the value
+    // verbatim) on keyword fields, as the postings path does.
+    let query = mapping.term_query_value(field, query);
     if query.is_empty() {
         return false;
     }
@@ -7807,22 +7793,29 @@ fn in_bound_range<T: PartialOrd + ?Sized>(
     above && below
 }
 
-/// The index-time terms of `value` for `field`, mirroring the indexer: a
-/// derived sub-field (`parent.sub`) uses its own chain
-/// (`FieldMapping::analyze_subfield_value`), any other field its mapped
-/// analyzer (same resolution as `field_tokens_for_source`).
+/// The index-time terms of `value` for `field`, mirroring the indexer
+/// (`IndexMapping::index_terms`: a derived sub-field `parent.sub` uses its
+/// own chain, any other field its mapped analysis).
 fn index_terms_for_value(mapping: &IndexMapping, field: &str, value: &str) -> Vec<String> {
-    if mapping.field(field).is_none() && field.contains('.') {
-        if let Some(sub_mapping) = mapping.resolve_field(field) {
-            return sub_mapping.analyze_subfield_value(value, mapping.analysis());
+    mapping.index_terms(field, value)
+}
+
+/// The `_source` key holding the values of `field`: the parent for a
+/// derived multi-field sub-field (`NOM.raw` -> `NOM`), the field itself
+/// otherwise.
+fn source_path<'f>(mapping: &IndexMapping, field: &'f str) -> &'f str {
+    if mapping.field(field).is_none() && mapping.resolve_field(field).is_some() {
+        if let Some((parent, _)) = field.rsplit_once('.') {
+            return parent;
         }
     }
-    mapping.analyzer(field).terms(value)
+    field
 }
 
 /// Every index-time term of `field` for `source`, over all scalar values
-/// (arrays flattened) — what the postings of that document hold for the
-/// field. A sub-field reads its parent's value.
+/// (arrays flattened, each value analysed on its own as the indexer does)
+/// — what the postings of that document hold for the field. A sub-field
+/// reads its parent's value.
 fn index_terms_for_source(source: &Value, field: &str, mapping: &IndexMapping) -> Vec<String> {
     fn scalars(value: &Value, out: &mut Vec<String>) {
         match value {
@@ -7833,13 +7826,8 @@ fn index_terms_for_source(source: &Value, field: &str, mapping: &IndexMapping) -
             Value::Object(_) | Value::Null => {}
         }
     }
-    let path = if mapping.field(field).is_none() {
-        field.split_once('.').map_or(field, |(parent, _)| parent)
-    } else {
-        field
-    };
     let mut values = Vec::new();
-    if let Some(value) = source.get(path) {
+    if let Some(value) = source.get(source_path(mapping, field)) {
         scalars(value, &mut values);
     }
     values
@@ -8062,9 +8050,7 @@ fn fuzzy_field_matches(
     operator: MatchOperator,
     mapping: &IndexMapping,
 ) -> bool {
-    let query_tokens = mapping
-        .custom_search_terms_for_field(query, field)
-        .unwrap_or_else(|| mapping.analyzer(field).terms(query));
+    let query_tokens = mapping.search_terms(field, query);
     if query_tokens.is_empty() {
         return false;
     }
@@ -8149,15 +8135,20 @@ fn sort_scored_documents(
     // a write-time stored projection — when A10 storage is present (the
     // common matchID path), `compare_sort_clause` reads the pre-analysed
     // value directly and never touches the normalizer.
-    let normalizers: Vec<Option<AnalyzerName>> = clauses
+    let normalizers: Vec<Option<ResolvedAnalyzer>> = clauses
         .iter()
         .map(|clause| mapping.and_then(|m| m.subfield_normalizer(&clause.field)))
         .collect();
 
     documents.sort_by(|left, right| {
         for (clause, normalizer) in clauses.iter().zip(normalizers.iter()) {
-            let ordering =
-                compare_sort_clause(left, right, clause, *normalizer, subfield_projections);
+            let ordering = compare_sort_clause(
+                left,
+                right,
+                clause,
+                normalizer.as_ref(),
+                subfield_projections,
+            );
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
             }
@@ -8170,7 +8161,7 @@ fn compare_sort_clause(
     left: &ScoredDocument,
     right: &ScoredDocument,
     clause: &SortClause,
-    normalizer: Option<AnalyzerName>,
+    normalizer: Option<&ResolvedAnalyzer>,
     subfield_projections: &SubfieldProjections,
 ) -> std::cmp::Ordering {
     if clause.field == "_score" {
@@ -8215,7 +8206,7 @@ fn compare_sort_clause(
 /// to a stored `_source` value for sort-time comparison only. Non-string
 /// values are returned verbatim so numeric/bool sub-fields keep their
 /// native ordering.
-fn normalize_sort_value(value: &Value, analyzer: AnalyzerName) -> Value {
+fn normalize_sort_value(value: &Value, analyzer: &ResolvedAnalyzer) -> Value {
     match value {
         Value::String(text) => {
             let normalized = analyzer.first_term(text);

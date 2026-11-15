@@ -184,8 +184,9 @@ estimated by matchid (unverified until k8s measures allocatable):
   - [ ] Analysis parity: `pattern_replace` char_filter (`alphanum`),
     configurable normalizer chain, real `deces_index.yml` mapping
     (DATE_* are `text` + `index_prefixes{4,6}`, `PRENOMS_NOM`, `PRENOM_NOM`,
-    edge_ngram `max_gram` 10).
-    - [ ] Found by the L1b guard: Surch's default `text` analyzer is
+    edge_ngram `max_gram` 10). Branch `worktree-agent-a095842a58b580b53`
+    (base `292c037`), not merged to `main`.
+    - [x] Found by the L1b guard: Surch's default `text` analyzer is
       `simple` (drops digits) where ES uses `standard`, so DATE_* without
       an explicit analyzer index no term; and a `match` on a keyword
       sub-field (`DATE_NAISSANCE.raw`, `COMMUNE_NAISSANCE.raw`) analyses
@@ -194,6 +195,42 @@ estimated by matchid (unverified until k8s measures allocatable):
       `match DATE_NAISSANCE.raw "19290107"` and `match
       COMMUNE_NAISSANCE.raw "Saint-Etienne"` match nothing (exact-mode
       advanced search and the `.raw` boost of `fuzzyShouldTermQuery`).
+      Fixed: default `text` analyzer = ES `standard` (UAX#29, Java
+      lowercase, `max_token_length` 255) `95a9e0b`; every field and
+      sub-field indexed and queried through its declared chain, keyword
+      `match`/`term` through the normalizer `5e1e9b7`.
+    - [x] `pattern_replace` char filter (Java regex translated to the
+      `regex` crate, Lucene offset correction) and configurable
+      `char_filter -> tokenizer -> filter` chains for analyzers and
+      normalizers, compiled from `settings.analysis`; unsupported
+      referenced components fail index creation `95a9e0b`, `5e1e9b7`.
+    - [x] Real mapping fixture `tests/matchid_compat/deces/mapping_real.json`
+      (matchID `6732755`, conversion rules in the deces README) `5e1e9b7`,
+      `e184d0d`.
+    - [x] `_analyze` parity table `analyze_parity.json` (53 rows: 1 es-doc,
+      49 spec-derived, 2 es-unverified, 1 known-deviation; Surch matches
+      all) `e184d0d`.
+    - [x] L1b guard on the real mapping (`PUT /deces` with the fixture):
+      47 shapes x 3 layouts, 0 full-scan fallbacks, match sets equal to
+      brute force, L2 empty-set exception removed `5e1e9b7`, `013e73b`.
+    - [x] Persistence: `META` format version 2 (custom normalizer name,
+      analysis stored as declared JSON); version-1 data directories fail
+      closed and must be re-indexed `5e1e9b7`.
+    - [ ] ES 8.6.1 oracle replay of `analyze_parity.json` (no row run
+      against ES yet).
+    - [ ] Snapshot restore re-parses `settings.analysis` (today
+      `snapshot.rs` rebuilds the mapping from `properties` only, so a
+      restored index falls back to the legacy builtin `norm`; Track C).
+  - ES analysis deviations accepted (L2): emoji dropped by the standard
+    tokenizer (Lucene emits `<EMOJI>`); South-East Asian scripts split per
+    UAX#29 defaults; a lone `No` character (`²`) kept as a token; empty
+    keyword values not indexed (ES indexes `""`); unknown analyzer /
+    normalizer names in a mapping fall back to `standard` / verbatim on
+    both sides (ES rejects the mapping); a `normalizer` on a `text` field
+    is rejected as in ES; `term`/`prefix` on a `text` field still use the
+    first search-analyzer term (ES does not analyse them); Java regex
+    constructs without a `regex` crate equivalent (look-around,
+    back-references, possessive quantifiers, `\p{InBlock}`) are rejected.
   - [x] Fuzzy semantics: OR over tokens (not AND), BM25 on expanded terms,
     `boost` honoured inside `match` objects (L1 `b746f0f`, tests `632c9fd`).
   - [ ] `date_histogram` keys as epoch ms + empty buckets.
