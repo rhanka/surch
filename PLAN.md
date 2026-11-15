@@ -1,6 +1,7 @@
 # Surch Global Plan
 
-Updated: 2026-05-31
+Updated: 2026-11-15 (MVP matchID line added; track sections A-D not yet
+re-audited since 2026-07-29)
 
 This is the live conductor plan for Surch. It tracks the repo by the
 official tracks A-E and points to branch-level plans under `plan/`.
@@ -62,6 +63,26 @@ single-threaded status loops advanced too little per user turn.
   detailed plan: `plan/main-infra.md`.
 - [ ] Objective F (scientific perf write-up): lives on `main`;
   detailed plan: `plan/wp-f-perf-paper.md`.
+- [ ] MVP matchID (owner order 2026-11-15): Surch replaces Elasticsearch
+  in matchID on a node half the memory; lives on `main`; detailed plan:
+  `plan/mvp-matchid.md`. This is now the priority line; the Track A-D
+  sections below date from 2026-05-31 to 2026-07-29 and are refreshed
+  against it.
+
+## MVP matchID - Priority Line (2026-11-15)
+
+Exit criteria agreed with the matchid session: 29.3 M docs under cgroup
+caps 4.5 GiB memory and 1 CPU core, `deces_v2` parity gate vs ES 8.6.1,
+search p95 and bulk-link throughput measured against ES under the same
+caps, S3 restore time and artefact size measured.
+
+- [x] L0 — Plans refreshed (`plan/mvp-matchid.md`).
+- [ ] L1 — Fuzzy / `function_score` / `range` / `geo_distance` served from
+  the index instead of a full document scan (blocker).
+- [ ] L2 — `deces_v2` contract and ES 8.6.1 oracle gate.
+- [ ] L3 — 29.3 M campaign under the target caps, ES vs Surch.
+- [ ] L4 — Monthly reload path (build → S3 → restore rename → alias).
+- [ ] L5 — Double run with matchid.
 
 ## Track A - Perf / Optimisation
 
