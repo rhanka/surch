@@ -230,9 +230,21 @@ estimated by matchid (unverified until k8s measures allocatable):
   for re-ingest. A pod restart means re-indexing 29 M docs, hours on 1 core.
   Design exists, never implemented:
   `docs/paper/persistence-iceberg-architecture.md`.
-  - [ ] Segment files + atomic manifest in a data directory; reopen at
+  - [x] Segment files + atomic manifest in a data directory; reopen at
     startup (FST, term entries, block directories, doc maps, live docs,
-    mapping, settings, aliases).
+    mapping, settings, aliases). Step 1 on branch
+    `worktree-agent-ae0f04c13f8ade733`: `9c3b335` (framed blake3 files,
+    segment / term-dictionary encode + reopen), `3191623`
+    (`SURCH_DATA_DIR`, manifest per index, persist on refresh / create /
+    mapping / alias / delete, crash recovery, round-trip + crash +
+    version tests). Layout and crash-safety argument:
+    `docs/ops/persistence.md`. 200 k local proof: restart to first query
+    46 ms, responses identical, RSS after reopen 30.8 MiB.
+  - [ ] Step 2 follow-ups found by step 1: index / component templates
+    not persisted; `_bulk?refresh=true` and `_restore` do not commit
+    (no `_refresh`); id maps rewritten whole per changing refresh
+    (append-only layout); no translog; writes after a reopen take the
+    existing full `rebuild_index()` path.
   - [ ] Snapshot = copy of sealed segment files (S3 artefact built offline,
     loaded without re-indexing).
   - [ ] Proof: restart at 29 M under the target caps, time to first query.
