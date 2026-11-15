@@ -1280,6 +1280,126 @@ mod p1a_direct_must_tests {
 }
 
 #[cfg(test)]
+mod l1_fuzzy_full_scan_guard_tests {
+    //! MVP L1 guard: no fuzzy / bool-of-fuzzy shape reaches the `_source`
+    //! full scan (`full_scan_documents`, counted per thread).
+    use serde_json::json;
+
+    use super::{parse_search_request, run_search, take_full_scan_fallbacks_for_test};
+    use crate::state::AppState;
+
+    fn fixture(disk: bool) -> (AppState, String) {
+        let index = format!("l1-guard-{disk}");
+        let state = AppState::default();
+        state.create_index(&index, None, json!({}), Default::default());
+        state.set_postings_disk_enabled(&index, disk);
+        let names = [
+            ("dupont", "jean pierre", "M"),
+            ("dupond", "jean", "F"),
+            ("martin", "marie", "F"),
+            ("matrin", "pierre", "M"),
+            ("durand", "louis", "M"),
+        ];
+        for (doc, (nom, prenoms, sexe)) in names.iter().enumerate() {
+            state.index_document(
+                &index,
+                &doc.to_string(),
+                json!({"nom": nom, "prenoms": prenoms, "sexe": sexe}),
+            );
+        }
+        state.refresh_index(&index);
+        (state, index)
+    }
+
+    fn run(state: &AppState, index: &str, body: serde_json::Value) -> (u64, u64) {
+        let request = parse_search_request(&body.to_string()).expect("valid request");
+        take_full_scan_fallbacks_for_test();
+        let response = run_search(state, &[index.to_owned()], &request);
+        let total = response.hits.total.map_or(0, |total| total.value);
+        (take_full_scan_fallbacks_for_test(), total)
+    }
+
+    #[test]
+    fn fuzzy_shapes_never_take_the_full_scan() {
+        let fuzzy_nom = json!({"match": {"nom": {"query": "dupont", "fuzziness": "auto"}}});
+        let fuzzy_prenoms = json!({"match": {"prenoms": {"query": "jean", "fuzziness": "auto"}}});
+        let shapes = vec![
+            ("root match+fuzziness", fuzzy_nom.clone(), 2),
+            (
+                "root fuzzy query",
+                json!({"fuzzy": {"nom": {"value": "martin", "fuzziness": 1}}}),
+                2,
+            ),
+            (
+                "bool must fuzzy + filter term",
+                json!({"bool": {"must": [fuzzy_nom.clone()], "filter": [{"term": {"sexe": "M"}}]}}),
+                1,
+            ),
+            (
+                "bool should fuzzy msm 1",
+                json!({"bool": {"should": [fuzzy_nom.clone(), fuzzy_prenoms.clone()],
+                                 "minimum_should_match": 1}}),
+                2,
+            ),
+            (
+                "bool should fuzzy msm 2",
+                json!({"bool": {"should": [fuzzy_nom.clone(), fuzzy_prenoms.clone()],
+                                 "minimum_should_match": 2}}),
+                2,
+            ),
+            (
+                "bool must fuzzy must_not fuzzy",
+                json!({"bool": {"must": [fuzzy_nom.clone()],
+                                 "must_not": [{"match": {"prenoms": {"query": "pierre", "fuzziness": "auto"}}}]}}),
+                1,
+            ),
+            (
+                "function_score over bool of fuzzy",
+                json!({"function_score": {"query": {"bool": {"should": [fuzzy_nom.clone()],
+                                                              "minimum_should_match": 1}}}}),
+                2,
+            ),
+        ];
+        for disk in [false, true] {
+            let (state, index) = fixture(disk);
+            for (label, query, expected_total) in &shapes {
+                for with_aggs in [false, true] {
+                    // `function_score` at the root with aggregations is the
+                    // separate L1 "function_score push-down" item.
+                    if with_aggs && label.starts_with("function_score") {
+                        continue;
+                    }
+                    let mut body = json!({"query": query, "track_total_hits": true});
+                    if with_aggs {
+                        // Aggregations force the general path
+                        // (`match_documents_for_index`).
+                        body["aggs"] = json!({"by_sex": {"terms": {"field": "sexe"}}});
+                    }
+                    let (full_scans, total) = run(&state, &index, body);
+                    assert_eq!(
+                        full_scans, 0,
+                        "{label} (disk={disk}, aggs={with_aggs}) hit the full scan"
+                    );
+                    assert_eq!(
+                        total, *expected_total,
+                        "{label} (disk={disk}, aggs={with_aggs})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_counter_sees_a_shape_that_still_full_scans() {
+        let (state, index) = fixture(false);
+        let body = json!({"query": {"wildcard": {"nom": "dup*"}}, "track_total_hits": true});
+        let (full_scans, total) = run(&state, &index, body);
+        assert_eq!(full_scans, 1);
+        assert_eq!(total, 2);
+    }
+}
+
+#[cfg(test)]
 mod p2_erreur_tardive_tests {
     use serde_json::json;
 
