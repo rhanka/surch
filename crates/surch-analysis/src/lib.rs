@@ -4,6 +4,14 @@
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
+pub mod chain;
+pub mod char_filter;
+pub mod standard;
+
+pub use chain::{CharFilter, CustomAnalyzer, TokenChars, TokenFilter, Tokenizer};
+pub use char_filter::{AnalysisError, OffsetCorrection, PatternReplaceCharFilter};
+pub use standard::{StandardTokenizer, DEFAULT_MAX_TOKEN_LENGTH};
+
 /// Short crate purpose used by workspace smoke tests.
 pub const CRATE_PURPOSE: &str = "Lucene-compatible analysis";
 
@@ -71,7 +79,9 @@ where
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeywordAnalyzer;
 
-/// Analyzer that keeps alphanumeric sequences as lowercased tokens.
+/// ES `standard` analyzer: Lucene `StandardTokenizer` (UAX#29 word
+/// boundaries, `max_token_length` 255) followed by `lowercase`. ES's
+/// default `stopwords` for it is `_none_`, so no stop filter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StandardAnalyzer;
 
@@ -92,35 +102,49 @@ impl Analyzer for KeywordAnalyzer {
 
 impl Analyzer for StandardAnalyzer {
     fn token_stream(&self, text: &str) -> Vec<Token> {
-        let mut tokens = Vec::new();
-        let mut token_start = None;
-
-        for (offset, character) in text.char_indices() {
-            if character.is_alphanumeric() {
-                if token_start.is_none() {
-                    token_start = Some(offset);
-                }
-            } else if let Some(start_offset) = token_start.take() {
-                tokens.push(Token {
-                    term: text[start_offset..offset].to_lowercase(),
-                    start_offset,
-                    end_offset: offset,
-                    position_increment: 1,
-                });
-            }
-        }
-
-        if let Some(start_offset) = token_start {
-            tokens.push(Token {
-                term: text[start_offset..].to_lowercase(),
-                start_offset,
-                end_offset: text.len(),
-                position_increment: 1,
-            });
-        }
-
-        tokens
+        StandardTokenizer::default()
+            .tokenize(text)
+            .into_iter()
+            .map(|token| Token {
+                term: java_lowercase(&token.term),
+                ..token
+            })
+            .collect()
     }
+}
+
+/// Lowercases like Lucene's `LowerCaseFilter`: Java
+/// `Character.toLowerCase(int)` per code point (simple case mapping, no
+/// context-sensitive final sigma, `İ` -> `i`).
+pub fn java_lowercase(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '\u{0130}' {
+            out.push('i');
+            continue;
+        }
+        let mut lower = character.to_lowercase();
+        match (lower.next(), lower.next()) {
+            (Some(single), None) => out.push(single),
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
+/// Uppercases like Lucene's `UpperCaseFilter`: Java
+/// `Character.toUpperCase(int)` per code point (simple case mapping, so
+/// `ß` stays `ß`).
+pub fn java_uppercase(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        let mut upper = character.to_uppercase();
+        match (upper.next(), upper.next()) {
+            (Some(single), None) => out.push(single),
+            _ => out.push(character),
+        }
+    }
+    out
 }
 
 /// Analyzer that splits terms on Rust Unicode whitespace.
@@ -294,18 +318,28 @@ fn asciifold_override(input: char) -> Option<&'static str> {
 /// 2. For every remaining character, run NFD canonical decomposition and
 ///    drop combining marks. This covers virtually all Latin / Greek /
 ///    Cyrillic diacritics (`é → e`, `ñ → n`, `ć → c`, `ỹ → y`, …).
-/// 3. Characters that survive both steps are passed through unchanged.
+/// 3. Lucene only ever folds a character to ASCII: when the NFD result is
+///    not pure ASCII (Cyrillic `й`, Greek `ά`, a standalone combining mark,
+///    ...) the character is kept unchanged.
 pub fn asciifold_string(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     for character in input.chars() {
+        if character.is_ascii() {
+            output.push(character);
+            continue;
+        }
         if let Some(replacement) = asciifold_override(character) {
             output.push_str(replacement);
             continue;
         }
-        for decomposed in character.nfd() {
-            if !is_combining_mark(decomposed) {
-                output.push(decomposed);
-            }
+        let folded: String = character
+            .nfd()
+            .filter(|decomposed| !is_combining_mark(*decomposed))
+            .collect();
+        if !folded.is_empty() && folded.is_ascii() {
+            output.push_str(&folded);
+        } else {
+            output.push(character);
         }
     }
     output
