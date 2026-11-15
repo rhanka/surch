@@ -3137,7 +3137,7 @@ impl FieldPostings {
 /// `prefix.*` scan. Returns `None` when `prefix` is empty or composed
 /// entirely of `0xFF` bytes, in which case the caller must omit the upper
 /// bound (the half-open range degenerates to `[prefix, +inf)`).
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     if prefix.is_empty() {
         return None;
     }
@@ -3744,6 +3744,46 @@ impl TermDictionary {
             .get(field)
             .map(|field_postings| field_postings.collect_prefix_doc_ids(prefix.as_bytes()))
             .unwrap_or_default()
+    }
+
+    /// MVP L1b: every term of `field` whose bytes fall in `(lower, upper)`
+    /// (each side inclusive, exclusive or unbounded), in FST
+    /// (byte-lexicographic) order — Lucene's `TermRangeQuery` term walk.
+    /// Reads ONLY the resident FST, so it is layout-independent like
+    /// [`Self::fuzzy_terms`]: callers fetch the postings of each returned
+    /// term through the layout-aware accessor (RAM channel or disk decode).
+    /// Cost O(terms in range); `Unbounded` on both sides walks the whole
+    /// field dictionary (numeric / geo predicates filter it afterwards).
+    pub fn range_terms(
+        &self,
+        field: &str,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Vec<String> {
+        use std::ops::Bound;
+        let Some(field_postings) = self.fields.get(field) else {
+            return Vec::new();
+        };
+        let mut builder = field_postings.fst.range();
+        builder = match lower {
+            Bound::Included(bytes) => builder.ge(bytes),
+            Bound::Excluded(bytes) => builder.gt(bytes),
+            Bound::Unbounded => builder,
+        };
+        builder = match upper {
+            Bound::Included(bytes) => builder.le(bytes),
+            Bound::Excluded(bytes) => builder.lt(bytes),
+            Bound::Unbounded => builder,
+        };
+        let mut stream = builder.into_stream();
+        let mut out = Vec::new();
+        while let Some((bytes, _)) = stream.next() {
+            // Analyzer output is always UTF-8 (see `fuzzy_terms`).
+            if let Ok(term) = std::str::from_utf8(bytes) {
+                out.push(term.to_owned());
+            }
+        }
+        out
     }
 
     /// MVP L1: every term of `field` accepted by the fuzzy `automaton`, with
