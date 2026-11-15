@@ -3229,6 +3229,7 @@ dependencies = [
  "surch-codec",
  "surch-index",
  "surch-search",
+ "surch-store",
  "surch-types",
  "tar",
  "testcontainers",

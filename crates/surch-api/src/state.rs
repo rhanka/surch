@@ -194,10 +194,15 @@ mod source_segment {
 
         fn ensure_capacity(&mut self, write_end: u64) {
             while (write_end as i64) > self.fallocated_len {
+                let before = self.fallocated_len;
                 self.fallocate(FALLOCATE_CHUNK);
                 // Si fallocate a echoue, on sort de la boucle apres
-                // un seul tour pour eviter le spin.
-                if self.fallocated_len == 0 {
+                // un seul tour pour eviter le spin. MVP L6 : la garde
+                // compare a la valeur d'avant l'appel (et non a 0) — un
+                // `source.dat` rouvert ou tronque au commit part d'un
+                // `fallocated_len` non nul, et un FS sans `fallocate`
+                // bouclerait sinon indefiniment.
+                if self.fallocated_len == before {
                     break;
                 }
             }
@@ -7271,8 +7276,19 @@ impl InMemoryIndex {
     /// [`Self::finalize_terms_for_refresh`] (or the index is brand new), so
     /// the overlays are drained and the term dictionaries materialized.
     fn persist(&mut self, data_dir: &DataDir, name: &str) -> Result<(), PersistError> {
-        if self.index.terms_dirty() {
-            self.index.materialize_terms();
+        // Writes not yet sealed (e.g. `create_index` replayed on an index
+        // with un-refreshed documents): seal them exactly as `_refresh`
+        // would, so postings, id maps and `_source` describe the same
+        // documents. A brand-new or freshly refreshed index has nothing
+        // pending and is left untouched (same in-memory state as without a
+        // data directory).
+        let pending = self.index.terms_dirty()
+            || !self.forward_dirty.is_empty()
+            || !self.reverse_dirty.is_empty()
+            || !self.documents_dirty.is_empty()
+            || !self.deleted_since_dense.is_empty();
+        if pending {
+            self.finalize_terms_for_refresh();
         }
         self.source_store.flush_pending_block();
         let mut state = match self.persist.take() {

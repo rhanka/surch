@@ -636,3 +636,59 @@ async fn data_dir_is_exclusive_and_deletes_are_durable() {
         "{aliases}"
     );
 }
+
+#[tokio::test]
+async fn mapping_change_and_out_of_refresh_commits_stay_consistent() {
+    let dir = TestDir::new("mapping");
+    let (router, app) = open(dir.path());
+    must(
+        &router,
+        Call::new(
+            Method::PUT,
+            "/places",
+            json!({"mappings": {"properties": {"name": {"type": "text"}, "kind": {"type": "keyword"}}}}),
+        ),
+    )
+    .await;
+    // Documents NOT refreshed, then a mapping change: it seals and commits
+    // postings, id maps and `_source` together.
+    must(&router, Call::ndjson("/_bulk", places_ndjson(0..30, "m"))).await;
+    must(
+        &router,
+        Call::new(
+            Method::PUT,
+            "/places/_mapping",
+            json!({"properties": {"note": {"type": "keyword"}}}),
+        ),
+    )
+    .await;
+    // More un-refreshed documents, then an explicit re-create through the
+    // state API: the commit must seal them too, never persist postings that
+    // reference doc ids the id maps do not know.
+    must(&router, Call::ndjson("/_bulk", places_ndjson(30..45, "n"))).await;
+    app.create_index("places", None, json!({}), Default::default());
+    let calls = vec![
+        Call::new(Method::GET, "/places/_mapping", Value::Null),
+        Call::new(
+            Method::POST,
+            "/places/_search",
+            json!({"query": {"match": {"name": "place"}}, "size": 50}),
+        ),
+        Call::new(
+            Method::POST,
+            "/places/_search",
+            json!({"query": {"range": {"rating": {"gte": 2}}}, "sort": [{"rating": "asc"}], "size": 50}),
+        ),
+        Call::new(Method::POST, "/places/_count", Value::Null),
+    ];
+    let before = record(&router, &calls).await;
+    assert!(before.iter().all(|(status, _)| *status == 200));
+    assert!(String::from_utf8_lossy(&before[0].1).contains("\"note\""));
+    assert!(String::from_utf8_lossy(&before[3].1).contains("\"count\":45"));
+    drop(router);
+    drop(app);
+
+    let (router, _app) = open(dir.path());
+    let after = record(&router, &calls).await;
+    assert_same("mapping change", &calls, &before, &after);
+}
