@@ -12,7 +12,8 @@ use std::time::Instant;
 use surch_index::mapping::{AnalyzerName, FieldType, IndexMapping};
 use surch_index::postings::{BlockMeta, BLOCK_SIZE};
 use surch_search::fuzzy::{
-    bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness,
+    bounded_damerau_levenshtein, edits_for_term_len, fuzzy_token_plan, parse_fuzziness, Fuzziness,
+    FuzzyQueryConfig, DEFAULT_MAX_EXPANSIONS,
 };
 use surch_search::maxscore::{MaxScoreExecutor, MaxScoreToken};
 use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
@@ -20,7 +21,10 @@ use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
 use crate::{
     index::validate_index_name,
     scroll::{parse_scroll_ttl, ScrollContext},
-    state::{AppState, FieldScoringStats, IndexReader, StoredDocument, TermScoringView},
+    state::{
+        AppState, FieldScoringStats, FuzzyTokenExpansion, IndexReader, StoredDocument,
+        TermScoringView,
+    },
     topn::TopN,
     OpenSearchError,
 };
@@ -265,10 +269,23 @@ pub enum SearchQuery {
         score_mode: ScoreMode,
         boost_mode: BoostMode,
     },
+    /// `fuzzy` query or `match` + `fuzziness` (MVP L1). Served from the
+    /// term dictionary: each analysed token of `value` is expanded with a
+    /// Damerau-Levenshtein FST walk, the `max_expansions` best terms are
+    /// kept (Lucene top-terms order), and the clause matches the union of
+    /// their postings; tokens are combined with `operator` (ES `match`
+    /// default OR; Surch's `fuzzy` query keeps AND over its analysed
+    /// tokens). Scored with BM25 over the expanded terms (blended doc freq,
+    /// per-term Lucene similarity boost), times `boost`.
     Fuzzy {
         field: String,
         value: String,
         fuzziness: Fuzziness,
+        operator: MatchOperator,
+        prefix_length: usize,
+        max_expansions: usize,
+        transpositions: bool,
+        boost: f64,
     },
     Range {
         field: String,
@@ -632,6 +649,22 @@ fn documents_for_ids(state: &AppState, index: &str, ids: &[String]) -> Vec<Store
     state.documents_by_ids(index, ids)
 }
 
+/// MVP L1: runtime fuzzy configuration of a parsed `SearchQuery::Fuzzy`
+/// (values already validated at parse time).
+fn fuzzy_config(
+    fuzziness: Fuzziness,
+    prefix_length: usize,
+    max_expansions: usize,
+    transpositions: bool,
+) -> FuzzyQueryConfig {
+    FuzzyQueryConfig {
+        fuzziness,
+        prefix_length,
+        max_expansions,
+        transpositions,
+    }
+}
+
 fn posting_candidate_ids(
     state: &AppState,
     index: &str,
@@ -683,6 +716,31 @@ fn posting_candidate_ids(
             }
             Some(matches)
         }
+        // MVP L1: fuzzy clauses (`fuzzy`, `match`+`fuzziness`) resolve from
+        // the postings of their FST-expanded terms — never a `_source` scan.
+        // Always `Some` (possibly empty): the set is exact, see
+        // `candidate_set_is_exact`.
+        SearchQuery::Fuzzy {
+            field,
+            value,
+            fuzziness,
+            operator,
+            prefix_length,
+            max_expansions,
+            transpositions,
+            ..
+        } => Some(
+            state
+                .documents_for_fuzzy_internal(
+                    index,
+                    field,
+                    value,
+                    fuzzy_config(*fuzziness, *prefix_length, *max_expansions, *transpositions),
+                    *operator == MatchOperator::And,
+                )
+                .into_iter()
+                .collect(),
+        ),
         SearchQuery::Bool {
             must,
             filter,
@@ -1218,6 +1276,126 @@ mod p1a_direct_must_tests {
             filter.push(leaf("COMMUNE", "PARIS"));
         }
         assert!(reduce_direct_must_conjunction(&with_filter).is_none());
+    }
+}
+
+#[cfg(test)]
+mod l1_fuzzy_full_scan_guard_tests {
+    //! MVP L1 guard: no fuzzy / bool-of-fuzzy shape reaches the `_source`
+    //! full scan (`full_scan_documents`, counted per thread).
+    use serde_json::json;
+
+    use super::{parse_search_request, run_search, take_full_scan_fallbacks_for_test};
+    use crate::state::AppState;
+
+    fn fixture(disk: bool) -> (AppState, String) {
+        let index = format!("l1-guard-{disk}");
+        let state = AppState::default();
+        state.create_index(&index, None, json!({}), Default::default());
+        state.set_postings_disk_enabled(&index, disk);
+        let names = [
+            ("dupont", "jean pierre", "M"),
+            ("dupond", "jean", "F"),
+            ("martin", "marie", "F"),
+            ("matrin", "pierre", "M"),
+            ("durand", "louis", "M"),
+        ];
+        for (doc, (nom, prenoms, sexe)) in names.iter().enumerate() {
+            state.index_document(
+                &index,
+                &doc.to_string(),
+                json!({"nom": nom, "prenoms": prenoms, "sexe": sexe}),
+            );
+        }
+        state.refresh_index(&index);
+        (state, index)
+    }
+
+    fn run(state: &AppState, index: &str, body: serde_json::Value) -> (u64, u64) {
+        let request = parse_search_request(&body.to_string()).expect("valid request");
+        take_full_scan_fallbacks_for_test();
+        let response = run_search(state, &[index.to_owned()], &request);
+        let total = response.hits.total.map_or(0, |total| total.value);
+        (take_full_scan_fallbacks_for_test(), total)
+    }
+
+    #[test]
+    fn fuzzy_shapes_never_take_the_full_scan() {
+        let fuzzy_nom = json!({"match": {"nom": {"query": "dupont", "fuzziness": "auto"}}});
+        let fuzzy_prenoms = json!({"match": {"prenoms": {"query": "jean", "fuzziness": "auto"}}});
+        let shapes = vec![
+            ("root match+fuzziness", fuzzy_nom.clone(), 2),
+            (
+                "root fuzzy query",
+                json!({"fuzzy": {"nom": {"value": "martin", "fuzziness": 1}}}),
+                2,
+            ),
+            (
+                "bool must fuzzy + filter term",
+                json!({"bool": {"must": [fuzzy_nom.clone()], "filter": [{"term": {"sexe": "M"}}]}}),
+                1,
+            ),
+            (
+                "bool should fuzzy msm 1",
+                json!({"bool": {"should": [fuzzy_nom.clone(), fuzzy_prenoms.clone()],
+                                 "minimum_should_match": 1}}),
+                2,
+            ),
+            (
+                "bool should fuzzy msm 2",
+                json!({"bool": {"should": [fuzzy_nom.clone(), fuzzy_prenoms.clone()],
+                                 "minimum_should_match": 2}}),
+                2,
+            ),
+            (
+                "bool must fuzzy must_not fuzzy",
+                json!({"bool": {"must": [fuzzy_nom.clone()],
+                                 "must_not": [{"match": {"prenoms": {"query": "pierre", "fuzziness": "auto"}}}]}}),
+                1,
+            ),
+            (
+                "function_score over bool of fuzzy",
+                json!({"function_score": {"query": {"bool": {"should": [fuzzy_nom.clone()],
+                                                              "minimum_should_match": 1}}}}),
+                2,
+            ),
+        ];
+        for disk in [false, true] {
+            let (state, index) = fixture(disk);
+            for (label, query, expected_total) in &shapes {
+                for with_aggs in [false, true] {
+                    // `function_score` at the root with aggregations is the
+                    // separate L1 "function_score push-down" item.
+                    if with_aggs && label.starts_with("function_score") {
+                        continue;
+                    }
+                    let mut body = json!({"query": query, "track_total_hits": true});
+                    if with_aggs {
+                        // Aggregations force the general path
+                        // (`match_documents_for_index`).
+                        body["aggs"] = json!({"by_sex": {"terms": {"field": "sexe"}}});
+                    }
+                    let (full_scans, total) = run(&state, &index, body);
+                    assert_eq!(
+                        full_scans, 0,
+                        "{label} (disk={disk}, aggs={with_aggs}) hit the full scan"
+                    );
+                    assert_eq!(
+                        total, *expected_total,
+                        "{label} (disk={disk}, aggs={with_aggs})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_counter_sees_a_shape_that_still_full_scans() {
+        let (state, index) = fixture(false);
+        let body = json!({"query": {"wildcard": {"nom": "dup*"}}, "track_total_hits": true});
+        let (full_scans, total) = run(&state, &index, body);
+        assert_eq!(full_scans, 1);
+        assert_eq!(total, 2);
     }
 }
 
@@ -2054,9 +2232,12 @@ fn run_topk_exact_bool(
         return None;
     }
     let query = request.query.as_ref()?;
+    // MVP L1: a root `Fuzzy` (deces `match`+`fuzziness`) takes the same
+    // generic exact top-K: exact candidate set from the expanded postings,
+    // source-independent BM25, only the window hydrated.
     if !matches!(
         query,
-        SearchQuery::Bool { .. } | SearchQuery::FunctionScore { .. }
+        SearchQuery::Bool { .. } | SearchQuery::FunctionScore { .. } | SearchQuery::Fuzzy { .. }
     ) || !candidate_set_is_exact(query)
         || scoring_needs_source(query)
     {
@@ -2874,6 +3055,10 @@ fn candidate_set_is_exact(query: &SearchQuery) -> bool {
         SearchQuery::Term { .. } | SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. } => {
             true
         }
+        // MVP L1: the fuzzy candidate set IS the clause's match set (union
+        // of the postings of the kept expansions, per-token OR/AND), so the
+        // `_source` re-check is skipped.
+        SearchQuery::Fuzzy { .. } => true,
         SearchQuery::FunctionScore { inner, .. } => candidate_set_is_exact(inner),
         SearchQuery::Bool {
             must,
@@ -2954,17 +3139,14 @@ fn match_documents_for_index(
                         };
                     (docs, Some(kept))
                 } else {
-                    (
-                        state
-                            .documents(index)
-                            .into_iter()
-                            .filter(|document| query_matches(query, &document.source, &mapping))
-                            .collect(),
-                        None,
-                    )
+                    (full_scan_documents(state, index, query, &mapping), None)
                 }
             }
-            SearchQuery::Match { .. } | SearchQuery::MultiMatch { .. } => {
+            // MVP L1: `Fuzzy` joins the exact postings-backed arms (its
+            // candidate set is the match set, no `_source` re-check).
+            SearchQuery::Match { .. }
+            | SearchQuery::MultiMatch { .. }
+            | SearchQuery::Fuzzy { .. } => {
                 if let Some(ids) = posting_candidate_ids(state, index, query) {
                     let ids = ids.into_iter().collect::<Vec<u32>>();
                     let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = state
@@ -2974,28 +3156,76 @@ fn match_documents_for_index(
                         .unzip();
                     (docs, Some(kept))
                 } else {
-                    (
-                        state
-                            .documents(index)
-                            .into_iter()
-                            .filter(|document| query_matches(query, &document.source, &mapping))
-                            .collect(),
-                        None,
-                    )
+                    (full_scan_documents(state, index, query, &mapping), None)
                 }
             }
             SearchQuery::MatchAll { .. } => (state.documents(index), None),
-            _ => (
-                state
-                    .documents(index)
-                    .into_iter()
-                    .filter(|document| query_matches(query, &document.source, &mapping))
-                    .collect(),
-                None,
-            ),
+            _ => (full_scan_documents(state, index, query, &mapping), None),
         },
     };
     score_documents(state, index, query, plain, known_ids)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread mirror of `surch_dbg_full_scan_fallback_total` (the
+    /// `metrics` recorder is process-global and tests run in parallel), so a
+    /// unit test can assert that THIS query never reached the full scan.
+    static FULL_SCAN_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Resets and returns the number of full-scan fallbacks taken on this
+/// thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_full_scan_fallbacks_for_test() -> u64 {
+    FULL_SCAN_FALLBACKS.with(|count| count.replace(0))
+}
+
+/// MVP L1 guard: the `_source` full scan — every stored document hydrated
+/// and filtered by `query_matches` — taken when no postings-backed candidate
+/// set exists for `query`. On the 29 M-doc matchID index this is the
+/// blocker, so every hit is counted in
+/// `surch_dbg_full_scan_fallback_total{query_type}` (root clause kind).
+fn full_scan_documents(
+    state: &AppState,
+    index: &str,
+    query: &SearchQuery,
+    mapping: &IndexMapping,
+) -> Vec<StoredDocument> {
+    metrics::counter!(
+        "surch_dbg_full_scan_fallback_total",
+        "query_type" => query_kind(query),
+    )
+    .increment(1);
+    #[cfg(test)]
+    FULL_SCAN_FALLBACKS.with(|count| count.set(count.get().saturating_add(1)));
+    state
+        .documents(index)
+        .into_iter()
+        .filter(|document| query_matches(query, &document.source, mapping))
+        .collect()
+}
+
+/// Root clause kind, for the full-scan fallback counter label.
+fn query_kind(query: &SearchQuery) -> &'static str {
+    match query {
+        SearchQuery::MatchAll { .. } => "match_all",
+        SearchQuery::Match { .. } => "match",
+        SearchQuery::MatchPhrase { .. } => "match_phrase",
+        SearchQuery::Term { .. } => "term",
+        SearchQuery::Bool { .. } => "bool",
+        SearchQuery::FunctionScore { .. } => "function_score",
+        SearchQuery::Fuzzy { .. } => "fuzzy",
+        SearchQuery::Range { .. } => "range",
+        SearchQuery::Exists { .. } => "exists",
+        SearchQuery::Terms { .. } => "terms",
+        SearchQuery::Prefix { .. } => "prefix",
+        SearchQuery::Wildcard { .. } => "wildcard",
+        SearchQuery::MultiMatch { .. } => "multi_match",
+        SearchQuery::GeoDistance { .. } => "geo_distance",
+        SearchQuery::GeoBoundingBox { .. } => "geo_bounding_box",
+        SearchQuery::GeoPolygon { .. } => "geo_polygon",
+    }
 }
 
 fn score_documents(
@@ -3089,8 +3319,12 @@ fn score_for_query(
         SearchQuery::MatchPhrase { field, value } => {
             bm25_field_score(scoring_context, field, value, internal_doc_id).unwrap_or(1.0)
         }
-        SearchQuery::Fuzzy { field, value, .. } => {
-            bm25_field_score(scoring_context, field, value, internal_doc_id).unwrap_or(1.0)
+        // MVP L1: BM25 over the expanded terms, times the clause `boost`
+        // (the 1.0 placeholder, unboosted, is kept for a doc without any
+        // expanded term so `bool.should` keeps filtering it out).
+        SearchQuery::Fuzzy { boost, .. } => {
+            fuzzy_bm25_score(scoring_context, query, internal_doc_id)
+                .map_or(1.0, |score| score * *boost)
         }
         SearchQuery::Bool {
             must,
@@ -3392,6 +3626,10 @@ struct SearchScoringContext<'a> {
     mapping: Option<&'a IndexMapping>,
     field_stats_by_field: BTreeMap<String, FieldScoringStats<'a>>,
     term_stats_by_field: BTreeMap<String, BTreeMap<String, TermScoringView<'a>>>,
+    /// MVP L1: per fuzzy clause (keyed by [`fuzzy_clause_key`]), the
+    /// expansions of each analysed token, resolved once per query. Their
+    /// terms' stats live in `term_stats_by_field` like any other token.
+    fuzzy_expansions: HashMap<String, Vec<FuzzyTokenExpansion>>,
 }
 
 impl<'a> SearchScoringContext<'a> {
@@ -3408,9 +3646,45 @@ impl<'a> SearchScoringContext<'a> {
         let mapping = reader.mapping();
         let mut field_tokens = BTreeMap::<String, BTreeSet<String>>::new();
         collect_scoring_field_tokens(query, mapping, &mut field_tokens);
+        // MVP L1: fuzzy clauses score over their EXPANDED terms, so expand
+        // them once here (same FST walk + top-terms selection as candidate
+        // resolution) and register every kept term for stats loading.
+        let mut fuzzy_expansions = HashMap::new();
+        let mut fuzzy_clauses = Vec::new();
+        collect_fuzzy_clauses(query, &mut fuzzy_clauses);
+        for clause in fuzzy_clauses {
+            let SearchQuery::Fuzzy {
+                field,
+                value,
+                fuzziness,
+                prefix_length,
+                max_expansions,
+                transpositions,
+                ..
+            } = clause
+            else {
+                continue;
+            };
+            let key = fuzzy_clause_key(clause);
+            if fuzzy_expansions.contains_key(&key) {
+                continue;
+            }
+            let expansions = reader.fuzzy_expansions(
+                field,
+                value,
+                fuzzy_config(*fuzziness, *prefix_length, *max_expansions, *transpositions),
+            );
+            let terms = field_tokens.entry(field.clone()).or_default();
+            for expansion in &expansions {
+                terms.extend(expansion.terms.iter().map(|scored| scored.term.clone()));
+            }
+            fuzzy_expansions.insert(key, expansions);
+        }
+        field_tokens.retain(|_, tokens| !tokens.is_empty());
         if field_tokens.is_empty() {
             return Self {
                 mapping: Some(mapping),
+                fuzzy_expansions,
                 ..Self::default()
             };
         }
@@ -3485,6 +3759,7 @@ impl<'a> SearchScoringContext<'a> {
             mapping: Some(mapping),
             field_stats_by_field,
             term_stats_by_field,
+            fuzzy_expansions,
         }
     }
 
@@ -3517,11 +3792,12 @@ fn collect_scoring_field_tokens(
     field_tokens: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     match query {
-        SearchQuery::Match { field, value, .. }
-        | SearchQuery::MatchPhrase { field, value }
-        | SearchQuery::Fuzzy { field, value, .. } => {
+        SearchQuery::Match { field, value, .. } | SearchQuery::MatchPhrase { field, value } => {
             insert_scoring_tokens(field_tokens, mapping, field, value);
         }
+        // MVP L1: fuzzy clauses register their EXPANDED terms instead (see
+        // `SearchScoringContext::new` / `collect_fuzzy_clauses`).
+        SearchQuery::Fuzzy { .. } => {}
         SearchQuery::MultiMatch { query, fields, .. } => {
             for field in fields {
                 insert_scoring_tokens(field_tokens, mapping, field, query);
@@ -3625,6 +3901,107 @@ fn bm25_field_score(
     } else {
         None
     }
+}
+
+/// MVP L1: the fuzzy clauses whose score `score_for_query` computes (root,
+/// `bool.must` / `bool.should`, `function_score` inner) — `filter` and
+/// `must_not` never score.
+fn collect_fuzzy_clauses<'q>(query: &'q SearchQuery, out: &mut Vec<&'q SearchQuery>) {
+    match query {
+        SearchQuery::Fuzzy { .. } => out.push(query),
+        SearchQuery::Bool { must, should, .. } => {
+            for clause in must.iter().chain(should.iter()) {
+                collect_fuzzy_clauses(clause, out);
+            }
+        }
+        SearchQuery::FunctionScore { inner, .. } => collect_fuzzy_clauses(inner, out),
+        _ => {}
+    }
+}
+
+/// MVP L1: identity of a fuzzy clause's expansion inside one query (two
+/// clauses with the same field, text and expansion parameters share it).
+fn fuzzy_clause_key(query: &SearchQuery) -> String {
+    match query {
+        SearchQuery::Fuzzy {
+            field,
+            value,
+            fuzziness,
+            prefix_length,
+            max_expansions,
+            transpositions,
+            ..
+        } => format!(
+            "{field}\u{1f}{value}\u{1f}{fuzziness:?}\u{1f}{prefix_length}\u{1f}{max_expansions}\u{1f}{transpositions}"
+        ),
+        _ => String::new(),
+    }
+}
+
+/// MVP L1: BM25 of a fuzzy clause over its expanded terms, approximating
+/// ES's rewrite (`top_terms_blended_freqs_N`: Lucene `BlendedTermQuery`
+/// with `BOOLEAN_REWRITE`): per analysed token, every kept expansion the doc
+/// contains contributes `similarity_boost × BM25(tf)`, with the doc freq of
+/// ALL the token's expansions blended to their maximum (rare misspellings do
+/// not outrank the real name on idf). Tokens sum (a repeated token counts
+/// twice). Uses the Surch BM25 kernel (`bm25_score`, which keeps the
+/// `(k1 + 1)` factor in `f64` — lot L7), so absolute values differ from
+/// Lucene 9 by that constant factor; ranking within the clause follows ES.
+fn fuzzy_bm25_score(
+    scoring_context: &SearchScoringContext<'_>,
+    query: &SearchQuery,
+    internal_doc_id: u32,
+) -> Option<f64> {
+    let SearchQuery::Fuzzy { field, .. } = query else {
+        return None;
+    };
+    let expansions = scoring_context
+        .fuzzy_expansions
+        .get(&fuzzy_clause_key(query))?;
+    let field_stats = scoring_context.field_stats(field)?;
+    if field_stats.doc_count == 0 {
+        return None;
+    }
+    let doc_len = if field_stats.norms_enabled {
+        field_stats.doc_len(internal_doc_id)?
+    } else {
+        1
+    };
+    let config = Bm25Config::default();
+    let mut total = 0.0_f64;
+    for expansion in expansions {
+        let blended_df = expansion
+            .terms
+            .iter()
+            .filter_map(|scored| scoring_context.term_stats(field, &scored.term))
+            .map(|stats| stats.doc_freq)
+            .max()
+            .unwrap_or(0)
+            .min(field_stats.doc_count);
+        if blended_df == 0 {
+            continue;
+        }
+        for scored in &expansion.terms {
+            let Some(term_stats) = scoring_context.term_stats(field, &scored.term) else {
+                continue;
+            };
+            let term_freq = term_stats.term_freq(internal_doc_id);
+            if term_freq == 0 {
+                continue;
+            }
+            if let Ok(score) = bm25_score(
+                config,
+                field_stats.doc_count,
+                blended_df,
+                term_freq,
+                doc_len,
+                field_stats.avg_doc_len,
+            ) {
+                total += score * f64::from(scored.boost);
+            }
+        }
+    }
+    (total > 0.0).then_some(total)
 }
 
 fn field_tokens_for_source(source: &Value, field: &str, mapping: &IndexMapping) -> Vec<String> {
@@ -4682,25 +5059,108 @@ fn parse_match_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
     let query_text = parse_query_text(body, "match query")?;
     let operator = parse_match_operator(body, "match")?;
 
+    // MVP L1: `boost` inside the match object scales the clause score
+    // (ES `BoostQuery`). Absent / 1.0 keeps the historical shape.
+    let boost = match body.as_object().and_then(|object| object.get("boost")) {
+        Some(raw) => parse_boost_value("match", raw)?,
+        None => 1.0,
+    };
+
     // Object form: `{ "match": { "F": { "query": "…", "fuzziness": "AUTO|N" } } }`.
-    // When `fuzziness` is present, route to the fuzzy executor so that
-    // bounded Damerau-Levenshtein is applied per analyzed token.
+    // When `fuzziness` is present, route to the fuzzy executor: each
+    // analysed token is expanded over the term dictionary (Lucene
+    // `FuzzyQuery` per token) and tokens combine with `operator` (ES
+    // default OR).
     if let Some(object) = body.as_object() {
         if let Some(raw) = object.get("fuzziness") {
             let fuzziness = parse_fuzzy_query_fuzziness(raw)?;
+            let (prefix_length, max_expansions) = parse_fuzzy_expansion_options(object, "match")?;
+            let transpositions =
+                parse_optional_bool(object, "fuzzy_transpositions", "match")?.unwrap_or(true);
             return Ok(SearchQuery::Fuzzy {
                 field,
                 value: query_text,
                 fuzziness,
+                operator,
+                prefix_length,
+                max_expansions,
+                transpositions,
+                boost,
             });
         }
     }
 
-    Ok(SearchQuery::Match {
+    let query = SearchQuery::Match {
         field,
         value: query_text,
         operator,
+    };
+    if boost == 1.0 {
+        return Ok(query);
+    }
+    // A boosted plain `match` is carried by a single-clause `bool` whose
+    // `boost` multiplies the clause score: same match set, score × boost.
+    Ok(SearchQuery::Bool {
+        must: vec![query],
+        filter: Vec::new(),
+        must_not: Vec::new(),
+        should: Vec::new(),
+        minimum_should_match: 0,
+        boost,
     })
+}
+
+/// MVP L1: `prefix_length` (default 0) and `max_expansions` (default 50,
+/// must be > 0 like ES) of a `fuzzy` / `match`+`fuzziness` body.
+fn parse_fuzzy_expansion_options(
+    object: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<(usize, usize), OpenSearchError> {
+    let integer = |key: &str| -> Result<Option<usize>, OpenSearchError> {
+        object
+            .get(key)
+            .map(|raw| {
+                raw.as_u64()
+                    .and_then(|number| usize::try_from(number).ok())
+                    .ok_or_else(|| {
+                        OpenSearchError::new(
+                            StatusCode::BAD_REQUEST,
+                            "parsing_exception",
+                            format!("{context} `{key}` must be a non-negative integer"),
+                        )
+                    })
+            })
+            .transpose()
+    };
+    let prefix_length = integer("prefix_length")?.unwrap_or(0);
+    let max_expansions = integer("max_expansions")?.unwrap_or(DEFAULT_MAX_EXPANSIONS);
+    if max_expansions == 0 {
+        return Err(OpenSearchError::new(
+            StatusCode::BAD_REQUEST,
+            "parsing_exception",
+            format!("{context} `max_expansions` must be positive"),
+        ));
+    }
+    Ok((prefix_length, max_expansions))
+}
+
+fn parse_optional_bool(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<bool>, OpenSearchError> {
+    object
+        .get(key)
+        .map(|raw| {
+            raw.as_bool().ok_or_else(|| {
+                OpenSearchError::new(
+                    StatusCode::BAD_REQUEST,
+                    "parsing_exception",
+                    format!("{context} `{key}` must be a boolean"),
+                )
+            })
+        })
+        .transpose()
 }
 
 fn parse_match_operator(body: &Value, context: &str) -> Result<MatchOperator, OpenSearchError> {
@@ -4963,12 +5423,29 @@ fn parse_fuzzy_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         .get("fuzziness")
         .map(parse_fuzzy_query_fuzziness)
         .transpose()?
-        .unwrap_or(Fuzziness::Edits(2));
+        // ES `fuzzy` query default: `fuzziness: AUTO` (was a fixed 2 before L1).
+        .unwrap_or(Fuzziness::Auto { low: 3, high: 6 });
+    let (prefix_length, max_expansions) = parse_fuzzy_expansion_options(object, "fuzzy")?;
+    let transpositions = parse_optional_bool(object, "transpositions", "fuzzy")?.unwrap_or(true);
+    let boost = match object.get("boost") {
+        Some(raw) => parse_boost_value("fuzzy", raw)?,
+        None => 1.0,
+    };
 
+    // Deviation (kept from the pre-L1 behaviour, documented in
+    // plan/mvp-matchid.md L1): ES does not analyse a `fuzzy` query value
+    // (one raw term). Surch analyses it with the field analyzer and
+    // requires EVERY token to match (AND), so a multi-word `value` still
+    // behaves like the BAN demo expects.
     Ok(SearchQuery::Fuzzy {
         field,
         value,
         fuzziness,
+        operator: MatchOperator::And,
+        prefix_length,
+        max_expansions,
+        transpositions,
+        boost,
     })
 }
 
@@ -6396,7 +6873,18 @@ fn query_matches(query: &SearchQuery, source: &Value, mapping: &IndexMapping) ->
             field,
             value,
             fuzziness,
-        } => fuzzy_field_matches(source, field, value, *fuzziness),
+            operator,
+            prefix_length,
+            transpositions,
+            ..
+        } => fuzzy_field_matches(
+            source,
+            field,
+            value,
+            fuzzy_config(*fuzziness, *prefix_length, usize::MAX, *transpositions),
+            *operator,
+            mapping,
+        ),
         SearchQuery::Range { field, bounds } => range_field_matches(source, field, bounds, mapping),
         SearchQuery::Exists { field } => exists_field_matches(source, field),
         SearchQuery::Terms { field, values } => values
@@ -6815,22 +7303,61 @@ fn text_in_bounds(value: &str, bounds: &RangeBounds) -> bool {
     true
 }
 
-fn fuzzy_field_matches(source: &Value, field: &str, query: &str, fuzziness: Fuzziness) -> bool {
-    let query_tokens = tokenize_for_search(query);
+/// `_source` evaluation of a fuzzy clause, used only where the clause is NOT
+/// resolved from postings (e.g. under `must_not`, or a `should` disjunction
+/// whose candidate set is a superset). MVP L1: aligned with the postings
+/// path — the field's analyzer on both sides (like a `match`), the Lucene
+/// per-token plan (AUTO edits, `prefix_length`, exact fallback),
+/// `transpositions`, and `operator` across tokens. The one gap left is
+/// `max_expansions`: a `_source` check cannot know the index-wide top-N, so
+/// it accepts every term within the edit budget (documented deviation).
+fn fuzzy_field_matches(
+    source: &Value,
+    field: &str,
+    query: &str,
+    config: FuzzyQueryConfig,
+    operator: MatchOperator,
+    mapping: &IndexMapping,
+) -> bool {
+    let query_tokens = mapping
+        .custom_search_terms_for_field(query, field)
+        .unwrap_or_else(|| mapping.analyzer(field).terms(query));
     if query_tokens.is_empty() {
         return false;
     }
-
-    let Some(field_text) = field_text(source, field) else {
+    let field_tokens = field_tokens_for_source(source, field, mapping);
+    if field_tokens.is_empty() {
         return false;
+    }
+    let token_matches = |query_token: &String| {
+        let Ok(plan) = fuzzy_token_plan(query_token, config.fuzziness, config.prefix_length) else {
+            return false;
+        };
+        field_tokens.iter().any(|field_token| {
+            if plan.max_edits == 0 {
+                return field_token == query_token;
+            }
+            let prefix_ok = query_token
+                .chars()
+                .zip(field_token.chars())
+                .take(plan.prefix_chars)
+                .filter(|(left, right)| left == right)
+                .count()
+                == plan.prefix_chars;
+            prefix_ok
+                && bounded_damerau_levenshtein(
+                    query_token,
+                    field_token,
+                    plan.max_edits,
+                    config.transpositions,
+                )
+                .is_ok_and(|distance| distance.is_some())
+        })
     };
-    let field_tokens = tokenize_for_search(&field_text);
-
-    query_tokens.iter().all(|query_token| {
-        field_tokens
-            .iter()
-            .any(|field_token| fuzzy_token_matches(query_token, field_token, fuzziness))
-    })
+    match operator {
+        MatchOperator::Or => query_tokens.iter().any(token_matches),
+        MatchOperator::And => query_tokens.iter().all(token_matches),
+    }
 }
 
 fn fuzzy_token_matches(query: &str, candidate: &str, fuzziness: Fuzziness) -> bool {
@@ -7331,6 +7858,7 @@ fn highlight_spans_for_query(text: &str, query: &SearchQuery, field: &str) -> Ve
             field: query_field,
             value,
             fuzziness,
+            ..
         } if query_field == field => {
             fuzzy_token_spans(&tokens, &tokenize_for_search(value), *fuzziness)
         }

@@ -16,10 +16,14 @@ use surch_index::{
         DocumentIndex, SegmentPostingsAdvance, SegmentPostingsCursor, SegmentedPostings,
         SegmentedPostingsError,
     },
+    fuzzy::DamerauLevenshteinAutomaton,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
     postings::{BlockMeta, BlockedEncodeStats, PostingsBlockSkipIter, PostingsList},
     roaring::RoaringDocSet,
+};
+use surch_search::fuzzy::{
+    fuzzy_token_plan, select_top_fuzzy_terms, FuzzyQueryConfig, FuzzyTermMatch, ScoredFuzzyTerm,
 };
 use zstd::bulk::{Compressor as ZstdCompressor, Decompressor as ZstdDecompressor};
 
@@ -3823,6 +3827,100 @@ impl InMemoryIndex {
         matches.unwrap_or_default().into_iter().collect()
     }
 
+    /// MVP L1: per analysed query token, the fuzzy expansions kept for
+    /// `(field, value)` — the FST walk of every segment
+    /// ([`DocumentIndex::fuzzy_terms`]) followed by the Lucene top-terms
+    /// selection (`max_expansions`, similarity then term order). The query
+    /// is analysed exactly like a `match` (`normalized_terms_for_field`), so
+    /// the expanded terms live in the same dictionary the postings use.
+    /// Tokens are returned in query order, duplicates included (a repeated
+    /// token weighs twice, as in a Lucene boolean of per-token clauses).
+    fn fuzzy_expansions(
+        &self,
+        field: &str,
+        value: &str,
+        config: FuzzyQueryConfig,
+    ) -> Vec<FuzzyTokenExpansion> {
+        if field.trim().is_empty() || value.is_empty() {
+            return Vec::new();
+        }
+        normalized_terms_for_field(value, field, &self.mapping)
+            .into_iter()
+            .map(|token| {
+                let terms = match fuzzy_token_plan(&token, config.fuzziness, config.prefix_length) {
+                    Ok(plan) if plan.max_edits == 0 => {
+                        // Lucene `SingleTermsEnum`: exact term only.
+                        if self.index.term_doc_ids(field, &token).is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![ScoredFuzzyTerm {
+                                term: token.clone(),
+                                edits: 0,
+                                boost: 1.0,
+                            }]
+                        }
+                    }
+                    Ok(plan) => {
+                        let automaton = DamerauLevenshteinAutomaton::new(
+                            &token,
+                            plan.max_edits,
+                            plan.prefix_chars,
+                            config.transpositions,
+                        );
+                        let hits =
+                            self.index
+                                .fuzzy_terms(field, &automaton)
+                                .into_iter()
+                                .map(|hit| FuzzyTermMatch {
+                                    term: hit.term,
+                                    edits: hit.edits,
+                                });
+                        select_top_fuzzy_terms(&token, hits, config.max_expansions)
+                    }
+                    Err(_) => Vec::new(),
+                };
+                FuzzyTokenExpansion { token, terms }
+            })
+            .collect()
+    }
+
+    /// MVP L1: exact candidate set of a fuzzy clause from the postings of
+    /// the expanded terms — per token the union of its expansions' postings,
+    /// then tokens combined with OR (union) or AND (intersection). Ascending.
+    fn fuzzy_hits_internal(
+        &self,
+        field: &str,
+        value: &str,
+        config: FuzzyQueryConfig,
+        require_all_terms: bool,
+    ) -> Vec<u32> {
+        let expansions = self.fuzzy_expansions(field, value, config);
+        if expansions.is_empty() {
+            return Vec::new();
+        }
+        let mut matches: Option<BTreeSet<u32>> = None;
+        for expansion in &expansions {
+            let mut current = BTreeSet::new();
+            for scored in &expansion.terms {
+                current.extend(self.index.term_doc_ids(field, &scored.term));
+            }
+            matches = Some(match matches {
+                None => current,
+                Some(previous) if require_all_terms => {
+                    previous.intersection(&current).copied().collect()
+                }
+                Some(mut previous) => {
+                    previous.extend(current);
+                    previous
+                }
+            });
+            if require_all_terms && matches.as_ref().is_some_and(BTreeSet::is_empty) {
+                break;
+            }
+        }
+        matches.unwrap_or_default().into_iter().collect()
+    }
+
     /// Optimisation #11 (beat-ES): leapfrog/galloping intersection of several
     /// single-term posting lists WITHOUT materialising any of them. Drives the
     /// rarest term and `advance_to`s the others over their block skip-lists
@@ -4229,6 +4327,16 @@ pub struct IndexReader<'a> {
     data: &'a InMemoryIndex,
 }
 
+/// MVP L1: the fuzzy expansions of one analysed query token — the terms of
+/// the dictionary kept by the Lucene top-terms selection, each with its
+/// edit distance and Lucene similarity boost. Empty `terms` = the token
+/// matches nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuzzyTokenExpansion {
+    pub token: String,
+    pub terms: Vec<ScoredFuzzyTerm>,
+}
+
 impl<'a> IndexReader<'a> {
     /// The index mapping (borrowed). Threading this avoids the separate
     /// `index_mapping` read-lock acquisition the scoring context used to
@@ -4293,6 +4401,18 @@ impl<'a> IndexReader<'a> {
     ) -> Vec<u32> {
         self.data
             .match_hits_internal(field, value, require_all_terms)
+    }
+
+    /// MVP L1: fuzzy expansions of `(field, value)` per analysed token,
+    /// read through the shared guard (scoring context). See
+    /// `InMemoryIndex::fuzzy_expansions`.
+    pub fn fuzzy_expansions(
+        &self,
+        field: &str,
+        value: &str,
+        config: FuzzyQueryConfig,
+    ) -> Vec<FuzzyTokenExpansion> {
+        self.data.fuzzy_expansions(field, value, config)
     }
 
     /// Hydrate `_source` documents for internal ids through the shared
@@ -5604,6 +5724,28 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         store.indices.get(index).map_or_else(Vec::new, |data| {
             data.match_hits_internal(field, value, require_all_terms)
+        })
+    }
+
+    /// MVP L1: internal doc ids of a fuzzy clause (`fuzzy` query or
+    /// `match`+`fuzziness`), served from the postings of the expanded terms
+    /// — never a `_source` scan. Exact w.r.t. the Lucene top-terms
+    /// semantics (`max_expansions`): see `InMemoryIndex::fuzzy_hits_internal`.
+    pub fn documents_for_fuzzy_internal(
+        &self,
+        index: &str,
+        field: &str,
+        value: &str,
+        config: FuzzyQueryConfig,
+        require_all_terms: bool,
+    ) -> Vec<u32> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.get(index).map_or_else(Vec::new, |data| {
+            data.fuzzy_hits_internal(field, value, config, require_all_terms)
         })
     }
 
