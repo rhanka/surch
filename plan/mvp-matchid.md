@@ -73,21 +73,49 @@ estimated by matchid (unverified until k8s measures allocatable):
 
 - [x] L0 — Refresh conductor plans: this file + `PLAN.md` MVP section.
 - [ ] L1 — Fuzzy and non-term clauses served from the index (blocker).
-  - [ ] Fuzzy term expansion over the per-field FST term dictionary with a
+  - [x] Fuzzy term expansion over the per-field FST term dictionary with a
     custom Damerau-Levenshtein `fst::Automaton` (the `fst` levenshtein
     feature has no transpositions); wire the unused
     `surch_search::expand_fuzzy_terms` semantics (`prefix_length`,
     `max_expansions`). Fuzzy is ON by default in deces-backend
     (`requestInput.ts`), so this covers default UI search, `q`, `/agg`,
     CSV export scroll pages and link rows.
-  - [ ] Postings-backed candidates for `match`+`fuzziness` and `fuzzy`.
+    Branch `worktree-agent-af16e91d23b04f656`: `b4ebe9a` (automaton
+    `surch_index::fuzzy`, `TermDictionary::fuzzy_terms`,
+    `DocumentIndex::fuzzy_terms` over every segment, Lucene top-terms
+    selection in `surch_search::fuzzy`), `c79231f` (property tests vs
+    `bounded_damerau_levenshtein`, single / multi-segment / disk-backed FST
+    walk).
+  - [x] Postings-backed candidates for `match`+`fuzziness` and `fuzzy`
+    (`e53df7f` state accessors, `b746f0f` search wiring + exact candidate
+    set + BM25 over expansions, `632c9fd` oracle parity tests on RAM /
+    multi-segment / disk layouts).
   - [ ] Candidate push-down through root `function_score` (inner query).
   - [ ] `range` on date keyword and `geo_distance` as filters over a
     candidate set instead of a full scan.
   - [ ] Guard: no full-scan path reachable from any `deces_v2` shape
     (counter + test).
+    - [x] Counter `surch_dbg_full_scan_fallback_total{query_type}` on every
+      `_source` full-scan fallback of `match_documents_for_index`, and a
+      test proving fuzzy / bool-of-fuzzy shapes never reach it (`a480f2a`).
+    - [ ] Extend the test to every `deces_v2` shape once the corpus
+      generator exists (root `function_score` + aggs, `range`,
+      `geo_distance` still full-scan today).
   - [ ] Proof: B1 oracle unchanged, unit/parity tests, 1.36 M smoke latency
     per form.
+    - [x] Unit/parity tests (fuzzy part): `matchid_compat` and existing
+      fuzzy tests green; 200 k synthetic measurement
+      (`fuzzy_postings::measure_candidates_vs_full_scan_on_200k_docs`).
+    - [ ] B1 oracle re-run on `ci-k8s` and 1.36 M smoke latency per form.
+  - ES fuzzy deviations accepted (L1): BM25 kernel is Surch's (keeps
+    `(k1+1)`, f64, lot L7) applied over the expanded terms with Lucene's
+    per-term similarity boost and blended (max) doc freq per token — ranking
+    follows ES's `top_terms_blended_freqs_N`, absolute scores do not; the
+    `fuzzy` query still analyses its `value` and ANDs the tokens (ES takes
+    one raw term); a `_source` re-check of a fuzzy clause (only under
+    `must_not` or a should-disjunction superset) does not apply
+    `max_expansions`; `match` `minimum_should_match` with `fuzziness` is not
+    parsed.
 - [ ] L2 — `deces_v2` contract.
   - [x] DSL gap map deces-backend ↔ Surch with file:line evidence
     (matchID main `6732755`, Surch `37314e6`; kept outside the repo at
@@ -105,8 +133,8 @@ estimated by matchid (unverified until k8s measures allocatable):
     configurable normalizer chain, real `deces_index.yml` mapping
     (DATE_* are `text` + `index_prefixes{4,6}`, `PRENOMS_NOM`, `PRENOM_NOM`,
     edge_ngram `max_gram` 10).
-  - [ ] Fuzzy semantics: OR over tokens (not AND), BM25 on expanded terms,
-    `boost` honoured inside `match` objects.
+  - [x] Fuzzy semantics: OR over tokens (not AND), BM25 on expanded terms,
+    `boost` honoured inside `match` objects (L1 `b746f0f`, tests `632c9fd`).
   - [ ] `date_histogram` keys as epoch ms + empty buckets.
   - [ ] Avoid whole-index materialisation for sort/agg on `.raw` and for
     `/version` (top-1 by date over 29 M docs).

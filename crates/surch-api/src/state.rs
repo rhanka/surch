@@ -16,10 +16,10 @@ use surch_index::{
         DocumentIndex, SegmentPostingsAdvance, SegmentPostingsCursor, SegmentedPostings,
         SegmentedPostingsError,
     },
+    fuzzy::DamerauLevenshteinAutomaton,
     mapping::{AnalysisSettings, FieldMapping, FieldType, IndexMapping},
     memory::{document_index_memory_usage, MemoryUsage},
     postings::{BlockMeta, BlockedEncodeStats, PostingsBlockSkipIter, PostingsList},
-    fuzzy::DamerauLevenshteinAutomaton,
     roaring::RoaringDocSet,
 };
 use surch_search::fuzzy::{
@@ -3847,8 +3847,7 @@ impl InMemoryIndex {
         normalized_terms_for_field(value, field, &self.mapping)
             .into_iter()
             .map(|token| {
-                let terms = match fuzzy_token_plan(&token, config.fuzziness, config.prefix_length)
-                {
+                let terms = match fuzzy_token_plan(&token, config.fuzziness, config.prefix_length) {
                     Ok(plan) if plan.max_edits == 0 => {
                         // Lucene `SingleTermsEnum`: exact term only.
                         if self.index.term_doc_ids(field, &token).is_empty() {
@@ -3868,14 +3867,14 @@ impl InMemoryIndex {
                             plan.prefix_chars,
                             config.transpositions,
                         );
-                        let hits = self
-                            .index
-                            .fuzzy_terms(field, &automaton)
-                            .into_iter()
-                            .map(|hit| FuzzyTermMatch {
-                                term: hit.term,
-                                edits: hit.edits,
-                            });
+                        let hits =
+                            self.index
+                                .fuzzy_terms(field, &automaton)
+                                .into_iter()
+                                .map(|hit| FuzzyTermMatch {
+                                    term: hit.term,
+                                    edits: hit.edits,
+                                });
                         select_top_fuzzy_terms(&token, hits, config.max_expansions)
                     }
                     Err(_) => Vec::new(),

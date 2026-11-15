@@ -12,18 +12,80 @@ use std::collections::BTreeMap;
 use surch_index::document_index::DocumentIndex;
 use surch_index::fuzzy::{automaton_distance, DamerauLevenshteinAutomaton, FuzzyTermHit};
 use surch_search::fuzzy::{
-    bounded_damerau_levenshtein, fuzzy_token_plan, lucene_fuzzy_similarity,
-    select_top_fuzzy_terms, Fuzziness, FuzzyTermMatch,
+    bounded_damerau_levenshtein, fuzzy_token_plan, lucene_fuzzy_similarity, select_top_fuzzy_terms,
+    Fuzziness, FuzzyTermMatch,
 };
 
 const NAMES: &[&str] = &[
-    "dupont", "dupond", "dupon", "dupontt", "dpuont", "durand", "durant", "martin", "martine",
-    "martins", "matrin", "marten", "bernard", "bernadr", "petit", "petti", "jean", "jaen", "jeanne",
-    "jeann", "joan", "hélène", "helene", "hélèn", "éloïse", "eloise", "éolïse", "françois",
-    "francois", "franços", "çaïd", "zoé", "zoe", "ozé", "noël", "noel", "léa", "lea", "ael", "a",
-    "ab", "ba", "abc", "acb", "bac", "", "œuvre", "oeuvre", "straße", "strasse", "müller",
-    "muller", "mülller", "日本", "日本語", "本日", "x", "xy", "yx", "lefèvre", "lefevre", "lefébvre",
-    "lefebvre", "le", "el", "dubois", "duboiss", "dubios", "ubois",
+    "dupont",
+    "dupond",
+    "dupon",
+    "dupontt",
+    "dpuont",
+    "durand",
+    "durant",
+    "martin",
+    "martine",
+    "martins",
+    "matrin",
+    "marten",
+    "bernard",
+    "bernadr",
+    "petit",
+    "petti",
+    "jean",
+    "jaen",
+    "jeanne",
+    "jeann",
+    "joan",
+    "hélène",
+    "helene",
+    "hélèn",
+    "éloïse",
+    "eloise",
+    "éolïse",
+    "françois",
+    "francois",
+    "franços",
+    "çaïd",
+    "zoé",
+    "zoe",
+    "ozé",
+    "noël",
+    "noel",
+    "léa",
+    "lea",
+    "ael",
+    "a",
+    "ab",
+    "ba",
+    "abc",
+    "acb",
+    "bac",
+    "",
+    "œuvre",
+    "oeuvre",
+    "straße",
+    "strasse",
+    "müller",
+    "muller",
+    "mülller",
+    "日本",
+    "日本語",
+    "本日",
+    "x",
+    "xy",
+    "yx",
+    "lefèvre",
+    "lefevre",
+    "lefébvre",
+    "lefebvre",
+    "le",
+    "el",
+    "dubois",
+    "duboiss",
+    "dubios",
+    "ubois",
 ];
 
 /// Oracle: `expand_fuzzy_terms`-style prefix rule + bounded OSA distance.
@@ -256,8 +318,14 @@ fn fst_walk_unions_every_segment_ram_and_disk() {
 fn lucene_plan_degrades_to_exact_term() {
     let auto = Fuzziness::Auto { low: 3, high: 6 };
     assert_eq!(fuzzy_token_plan("le", auto, 0).expect("plan").max_edits, 0);
-    assert_eq!(fuzzy_token_plan("jean", auto, 0).expect("plan").max_edits, 1);
-    assert_eq!(fuzzy_token_plan("dupont", auto, 0).expect("plan").max_edits, 2);
+    assert_eq!(
+        fuzzy_token_plan("jean", auto, 0).expect("plan").max_edits,
+        1
+    );
+    assert_eq!(
+        fuzzy_token_plan("dupont", auto, 0).expect("plan").max_edits,
+        2
+    );
     // prefix_length covering the whole token: exact lookup (Lucene
     // `SingleTermsEnum`).
     let plan = fuzzy_token_plan("jean", Fuzziness::Edits(2), 4).expect("plan");

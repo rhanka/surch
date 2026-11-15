@@ -157,7 +157,13 @@ async fn build(index: &str, layout: Layout, docs: &[(String, Value)]) -> (axum::
         let body = send(&router, Method::POST, &format!("/{index}/_bulk"), ndjson).await;
         assert_eq!(body["errors"], false, "bulk failed: {body:?}");
     }
-    send(&router, Method::POST, &format!("/{index}/_refresh"), String::new()).await;
+    send(
+        &router,
+        Method::POST,
+        &format!("/{index}/_refresh"),
+        String::new(),
+    )
+    .await;
     match layout {
         Layout::SingleRam => assert_eq!(state.index_segment_count(index), 1),
         Layout::MultiSegment => assert!(state.index_segment_count(index) > 1),
@@ -170,7 +176,13 @@ async fn build(index: &str, layout: Layout, docs: &[(String, Value)]) -> (axum::
 }
 
 async fn search(router: &axum::Router, index: &str, body: Value) -> Value {
-    send(router, Method::POST, &format!("/{index}/_search"), body.to_string()).await
+    send(
+        router,
+        Method::POST,
+        &format!("/{index}/_search"),
+        body.to_string(),
+    )
+    .await
 }
 
 fn hit_ids(body: &Value) -> BTreeSet<String> {
@@ -198,6 +210,7 @@ fn scored_hits(body: &Value) -> Vec<(String, u64)> {
 
 /// Brute-force oracle: ES `match`+`fuzziness` semantics without the
 /// `max_expansions` cap (callers pass a large cap).
+#[allow(clippy::too_many_arguments)] // test oracle: one argument per ES knob
 fn oracle(
     state: &AppState,
     index: &str,
@@ -248,14 +261,56 @@ async fn fuzzy_hits_equal_oracle_and_are_identical_across_layouts() {
         layouts.push((layout, build(index, layout, &docs).await));
     }
     let cases: Vec<(&str, &str, Value, Fuzziness, usize, bool)> = vec![
-        ("nom", "dupont", json!("auto"), Fuzziness::Auto { low: 3, high: 6 }, 0, false),
-        ("nom", "durnad", json!("AUTO"), Fuzziness::Auto { low: 3, high: 6 }, 0, false),
+        (
+            "nom",
+            "dupont",
+            json!("auto"),
+            Fuzziness::Auto { low: 3, high: 6 },
+            0,
+            false,
+        ),
+        (
+            "nom",
+            "durnad",
+            json!("AUTO"),
+            Fuzziness::Auto { low: 3, high: 6 },
+            0,
+            false,
+        ),
         ("nom", "martin", json!(1), Fuzziness::Edits(1), 0, false),
         ("nom", "bernard", json!(2), Fuzziness::Edits(2), 2, false),
-        ("nom", "roux", json!("auto"), Fuzziness::Auto { low: 3, high: 6 }, 0, false),
-        ("prenoms", "jean pierre", json!("auto"), Fuzziness::Auto { low: 3, high: 6 }, 0, false),
-        ("prenoms", "jean pierre", json!("auto"), Fuzziness::Auto { low: 3, high: 6 }, 0, true),
-        ("prenoms", "marie helene", json!(1), Fuzziness::Edits(1), 1, false),
+        (
+            "nom",
+            "roux",
+            json!("auto"),
+            Fuzziness::Auto { low: 3, high: 6 },
+            0,
+            false,
+        ),
+        (
+            "prenoms",
+            "jean pierre",
+            json!("auto"),
+            Fuzziness::Auto { low: 3, high: 6 },
+            0,
+            false,
+        ),
+        (
+            "prenoms",
+            "jean pierre",
+            json!("auto"),
+            Fuzziness::Auto { low: 3, high: 6 },
+            0,
+            true,
+        ),
+        (
+            "prenoms",
+            "marie helene",
+            json!(1),
+            Fuzziness::Edits(1),
+            1,
+            false,
+        ),
     ];
     for (field, text, fuzziness_json, fuzziness, prefix_length, and) in cases {
         let mut inner = json!({
@@ -424,7 +479,10 @@ async fn exact_spelling_outranks_variants_and_max_expansions_keeps_best_terms() 
         .iter()
         .map(|hit| hit["_score"].as_f64().expect("score"))
         .collect();
-    assert!(scores[0] > scores[1], "exact must outrank variants: {scores:?}");
+    assert!(
+        scores[0] > scores[1],
+        "exact must outrank variants: {scores:?}"
+    );
 
     // max_expansions = 2: Lucene keeps the best similarity terms —
     // `dupont` (1.0), then `dpuont` / `dupond` (1 edit, 0.833) by term

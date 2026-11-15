@@ -12,8 +12,8 @@ use std::time::Instant;
 use surch_index::mapping::{AnalyzerName, FieldType, IndexMapping};
 use surch_index::postings::{BlockMeta, BLOCK_SIZE};
 use surch_search::fuzzy::{
-    bounded_damerau_levenshtein, edits_for_term_len, parse_fuzziness, Fuzziness, FuzzyQueryConfig,
-    fuzzy_token_plan, DEFAULT_MAX_EXPANSIONS,
+    bounded_damerau_levenshtein, edits_for_term_len, fuzzy_token_plan, parse_fuzziness, Fuzziness,
+    FuzzyQueryConfig, DEFAULT_MAX_EXPANSIONS,
 };
 use surch_search::maxscore::{MaxScoreExecutor, MaxScoreToken};
 use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
@@ -3322,8 +3322,10 @@ fn score_for_query(
         // MVP L1: BM25 over the expanded terms, times the clause `boost`
         // (the 1.0 placeholder, unboosted, is kept for a doc without any
         // expanded term so `bool.should` keeps filtering it out).
-        SearchQuery::Fuzzy { boost, .. } => fuzzy_bm25_score(scoring_context, query, internal_doc_id)
-            .map_or(1.0, |score| score * *boost),
+        SearchQuery::Fuzzy { boost, .. } => {
+            fuzzy_bm25_score(scoring_context, query, internal_doc_id)
+                .map_or(1.0, |score| score * *boost)
+        }
         SearchQuery::Bool {
             must,
             must_not,
@@ -5420,7 +5422,8 @@ fn parse_fuzzy_query(value: &Value) -> Result<SearchQuery, OpenSearchError> {
         .get("fuzziness")
         .map(parse_fuzzy_query_fuzziness)
         .transpose()?
-        .unwrap_or(Fuzziness::Edits(2));
+        // ES `fuzzy` query default: `fuzziness: AUTO` (was a fixed 2 before L1).
+        .unwrap_or(Fuzziness::Auto { low: 3, high: 6 });
     let (prefix_length, max_expansions) = parse_fuzzy_expansion_options(object, "fuzzy")?;
     let transpositions = parse_optional_bool(object, "transpositions", "fuzzy")?.unwrap_or(true);
     let boost = match object.get("boost") {
