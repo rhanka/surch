@@ -5749,6 +5749,75 @@ impl AppState {
         })
     }
 
+    /// MVP L1b: internal doc ids of every document holding at least one term
+    /// of `field` that lies in the byte range `(lower, upper)` AND that
+    /// `accept` keeps — the term-dictionary walk behind `range` (Lucene
+    /// `TermRangeQuery`, numeric terms) and the geo filters. Served from the
+    /// FST plus the postings of the accepted terms, never from `_source`;
+    /// layout-independent (RAM, multi-segment, disk-backed).
+    ///
+    /// `accept` returns `Some(true)` to keep a term, `Some(false)` to skip
+    /// it, and `None` to DECLINE the whole walk (the term cannot be judged,
+    /// e.g. a geo field indexed from the `[lon, lat]` array form) — the
+    /// method then returns `None` and the caller falls back.
+    ///
+    /// `within`: when given, only its members can be returned (the caller
+    /// intersects with it anyway); the union is kept as a bitset so a broad
+    /// range used as a filter never builds a large `BTreeSet`.
+    pub fn documents_for_term_scan_internal(
+        &self,
+        index: &str,
+        field: &str,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+        accept: &mut dyn FnMut(&str) -> Option<bool>,
+        within: Option<&BTreeSet<u32>>,
+    ) -> Option<BTreeSet<u32>> {
+        self.ensure_terms_ready(index);
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        let Some(data) = store.indices.get(index) else {
+            return Some(BTreeSet::new());
+        };
+        let mut accepted = Vec::new();
+        for term in data.index.range_terms(field, lower, upper) {
+            match accept(&term) {
+                None => return None,
+                Some(true) => accepted.push(term),
+                Some(false) => {}
+            }
+        }
+        let mut bits: Vec<u64> = Vec::new();
+        for term in &accepted {
+            for doc_id in data.index.term_doc_ids(field, term) {
+                let word = (doc_id >> 6) as usize;
+                if word >= bits.len() {
+                    bits.resize(word + 1, 0);
+                }
+                bits[word] |= 1_u64 << (doc_id & 63);
+            }
+        }
+        let is_set = |doc_id: u32| {
+            bits.get((doc_id >> 6) as usize)
+                .is_some_and(|word| word & (1_u64 << (doc_id & 63)) != 0)
+        };
+        Some(match within {
+            Some(within) => within.iter().copied().filter(|&id| is_set(id)).collect(),
+            None => bits
+                .iter()
+                .enumerate()
+                .flat_map(|(word_idx, &word)| {
+                    let base = (word_idx as u32) << 6;
+                    (0..64_u32)
+                        .filter(move |bit| word & (1_u64 << bit) != 0)
+                        .map(move |bit| base + bit)
+                })
+                .collect(),
+        })
+    }
+
     /// Optimisation #11: leapfrog conjunction over single-term clauses.
     /// `clauses` is the FULL conjunction — every `(field, value)` must match.
     /// Returns `Some(intersected internal doc-ids)` when EVERY clause analyses

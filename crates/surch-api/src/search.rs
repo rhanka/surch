@@ -665,41 +665,202 @@ fn fuzzy_config(
     }
 }
 
-fn posting_candidate_ids(
-    state: &AppState,
-    index: &str,
+/// MVP L1b: a postings-backed candidate set, and whether it is EXACTLY the
+/// clause's match set (no `_source` re-check needed). Exactness is decided
+/// during resolution, so a sub-clause skipped as unresolvable can never be
+/// reported exact.
+///
+/// Contract with `within` (see [`posting_candidates`]): for the documents of
+/// `within`, `ids` contains every match (superset) and, when `exact`, only
+/// matches. Outside `within` the set is unspecified — callers intersect
+/// with `within` anyway.
+struct Candidates {
+    ids: BTreeSet<u32>,
+    exact: bool,
+}
+
+impl Candidates {
+    fn exact(ids: BTreeSet<u32>) -> Self {
+        Self { ids, exact: true }
+    }
+}
+
+/// Per-request candidate resolution context. The index mapping is cloned
+/// lazily, only when a `range` / geo clause needs its field type.
+struct CandidateCtx<'a> {
+    state: &'a AppState,
+    index: &'a str,
+    mapping: std::cell::OnceCell<Option<IndexMapping>>,
+}
+
+impl<'a> CandidateCtx<'a> {
+    fn new(state: &'a AppState, index: &'a str) -> Self {
+        Self {
+            state,
+            index,
+            mapping: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn mapping(&self) -> Option<&IndexMapping> {
+        self.mapping
+            .get_or_init(|| self.state.index_mapping(self.index))
+            .as_ref()
+    }
+}
+
+/// Whether resolving `query` walks a term dictionary with a predicate
+/// (`range`, geo filters) — cheaper once a smaller candidate set from the
+/// sibling clauses can restrict it (`within`), so such clauses resolve last.
+fn contains_term_scan(query: &SearchQuery) -> bool {
+    match query {
+        SearchQuery::Range { .. }
+        | SearchQuery::GeoDistance { .. }
+        | SearchQuery::GeoBoundingBox { .. }
+        | SearchQuery::GeoPolygon { .. } => true,
+        SearchQuery::Bool {
+            must,
+            filter,
+            should,
+            ..
+        } => must
+            .iter()
+            .chain(filter.iter())
+            .chain(should.iter())
+            .any(contains_term_scan),
+        SearchQuery::FunctionScore { inner, .. } => contains_term_scan(inner),
+        _ => false,
+    }
+}
+
+/// MVP L1b: whether `query` matches every live document of the index
+/// (`match_all`, an empty `bool`, `bool.must:[match_all]`, a
+/// `function_score` over one of those, …). Such a query has no candidate
+/// set to resolve: callers serve it as `match_all` instead of a `_source`
+/// full scan.
+fn matches_every_document(query: &SearchQuery) -> bool {
+    match query {
+        SearchQuery::MatchAll { .. } => true,
+        SearchQuery::Bool {
+            must,
+            filter,
+            must_not,
+            should,
+            minimum_should_match,
+            ..
+        } => {
+            must_not.is_empty()
+                && must.iter().chain(filter.iter()).all(matches_every_document)
+                && (should.is_empty()
+                    || should
+                        .iter()
+                        .filter(|clause| matches_every_document(clause))
+                        .count()
+                        >= *minimum_should_match as usize)
+        }
+        SearchQuery::FunctionScore { inner, .. } => matches_every_document(inner),
+        _ => false,
+    }
+}
+
+/// MVP L1b: the constant `_score` of a query that matches every document
+/// and scores them all alike (no `should` clause, no scoring function), as
+/// `score_for_query` computes it; `None` when the score may vary per
+/// document.
+fn constant_match_all_score(query: &SearchQuery) -> Option<f64> {
+    match query {
+        SearchQuery::MatchAll { boost } => Some(*boost),
+        SearchQuery::Bool {
+            must,
+            filter,
+            must_not,
+            should,
+            boost,
+            ..
+        } => {
+            if !must_not.is_empty() || !should.is_empty() {
+                return None;
+            }
+            if !filter.iter().all(matches_every_document) {
+                return None;
+            }
+            let mut sum = 0.0;
+            for clause in must {
+                sum += constant_match_all_score(clause)?;
+            }
+            let base = if sum > 0.0 { sum } else { 1.0 };
+            Some(base * *boost)
+        }
+        SearchQuery::FunctionScore {
+            inner,
+            boost,
+            functions,
+            ..
+        } => {
+            if !functions.is_empty() {
+                return None;
+            }
+            Some(constant_match_all_score(inner)? * *boost)
+        }
+        _ => None,
+    }
+}
+
+fn intersect_candidates(left: BTreeSet<u32>, right: BTreeSet<u32>) -> BTreeSet<u32> {
+    let (small, large) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    small.into_iter().filter(|id| large.contains(id)).collect()
+}
+
+/// Resolve the postings-backed candidate set of `query` (see
+/// [`Candidates`]). `None` means "no candidate set" (the caller falls back
+/// to a scan, or skips the clause inside a `bool`). `within`, when given,
+/// lets a term-scan clause (`range`, geo) keep only those documents instead
+/// of materialising its whole match set.
+fn posting_candidates(
+    ctx: &CandidateCtx<'_>,
     query: &SearchQuery,
-) -> Option<BTreeSet<u32>> {
+    within: Option<&BTreeSet<u32>>,
+) -> Option<Candidates> {
+    let (state, index) = (ctx.state, ctx.index);
     // Optimisation #10 (beat-ES): candidate resolution + intersection works on
     // internal `u32` doc-ids (cheap integer compares, no allocation) instead of
     // public `_id` `BTreeSet<String>` (which clones a `String` per matching doc
     // — tens of thousands per clause per query on common name terms, the deces
     // 87 ms residual). Public ids are resolved only for the final top-K window.
     match query {
-        SearchQuery::Term { field, value } => Some(
+        SearchQuery::Term { field, value } => Some(Candidates::exact(
             state
                 .documents_for_term_internal(index, field, value)
                 .into_iter()
                 .collect(),
-        ),
+        )),
         SearchQuery::Match {
             field,
             value,
             operator,
-        } => Some(
+        } => Some(Candidates::exact(
             state
                 .documents_for_match_internal(index, field, value, *operator == MatchOperator::And)
                 .into_iter()
                 .collect(),
-        ),
+        )),
         // A6 phase 2: `index_prefixes` write-time prefix postings turn a
         // length-bounded `prefix` query into a direct lookup. Outside the
         // declared `[min_chars..=max_chars]` window (or absent mapping)
         // we return `None` so the candidate-set path falls back to the
         // full-scan `query_matches` (which still uses `prefix_field_matches`).
+        // Not declared exact: `prefix_field_matches` (the `_source` side)
+        // compares the raw value, not the analysed terms.
         SearchQuery::Prefix { field, value } => state
             .documents_for_prefix_internal(index, field, value)
-            .map(|ids| ids.into_iter().collect()),
+            .map(|ids| Candidates {
+                ids: ids.into_iter().collect(),
+                exact: false,
+            }),
         SearchQuery::MultiMatch {
             query,
             fields,
@@ -714,12 +875,11 @@ fn posting_candidate_ids(
                     *operator == MatchOperator::And,
                 ));
             }
-            Some(matches)
+            Some(Candidates::exact(matches))
         }
         // MVP L1: fuzzy clauses (`fuzzy`, `match`+`fuzziness`) resolve from
         // the postings of their FST-expanded terms — never a `_source` scan.
-        // Always `Some` (possibly empty): the set is exact, see
-        // `candidate_set_is_exact`.
+        // Always `Some` (possibly empty) and exact.
         SearchQuery::Fuzzy {
             field,
             value,
@@ -729,7 +889,7 @@ fn posting_candidate_ids(
             max_expansions,
             transpositions,
             ..
-        } => Some(
+        } => Some(Candidates::exact(
             state
                 .documents_for_fuzzy_internal(
                     index,
@@ -740,11 +900,64 @@ fn posting_candidate_ids(
                 )
                 .into_iter()
                 .collect(),
-        ),
+        )),
+        // MVP L1b: `range` on a mapped text / keyword / numeric field walks
+        // the term dictionary (FST byte range, or every term filtered
+        // numerically) and unions the postings — exact by construction
+        // (`range_field_matches` applies the same `RangeTermPlan`).
+        SearchQuery::Range { field, bounds } => {
+            let plan = range_term_plan(ctx.mapping()?, field, bounds)?;
+            if matches!(plan, RangeTermPlan::Nothing) {
+                return Some(Candidates::exact(BTreeSet::new()));
+            }
+            let (lower, upper) = plan.fst_bounds();
+            let ids = state.documents_for_term_scan_internal(
+                index,
+                field,
+                lower,
+                upper,
+                &mut |term| Some(plan.accepts(term)),
+                within,
+            )?;
+            Some(Candidates::exact(ids))
+        }
+        // MVP L1b: geo filters on a `geo_point` field walk the field's term
+        // dictionary (one term per distinct indexed point) with the same
+        // point predicate as the `_source` check.
+        SearchQuery::GeoDistance {
+            field,
+            lat,
+            lon,
+            distance_meters,
+        } => geo_candidates(ctx, field, within, |p_lat, p_lon| {
+            geo_distance_point_matches(p_lat, p_lon, *lat, *lon, *distance_meters)
+        }),
+        SearchQuery::GeoBoundingBox {
+            field,
+            top_lat,
+            bottom_lat,
+            left_lon,
+            right_lon,
+        } => geo_candidates(ctx, field, within, |p_lat, p_lon| {
+            geo_bounding_box_point_matches(
+                p_lat,
+                p_lon,
+                *top_lat,
+                *bottom_lat,
+                *left_lon,
+                *right_lon,
+            )
+        }),
+        SearchQuery::GeoPolygon { field, points } => {
+            geo_candidates(ctx, field, within, |p_lat, p_lon| {
+                geo_polygon_point_matches(p_lat, p_lon, points)
+            })
+        }
         SearchQuery::Bool {
             must,
             filter,
             should,
+            must_not,
             minimum_should_match,
             ..
         } => {
@@ -801,8 +1014,12 @@ fn posting_candidate_ids(
                 if flat && pairs.len() >= 2 {
                     // Single-token conjunction: the galloping leapfrog. Declines
                     // (None) when any clause is multi-token (a compound name).
+                    // Exact unless a `must_not` (never applied here) remains.
                     if let Some(ids) = state.conjunction_leapfrog(index, &pairs) {
-                        return Some(ids.into_iter().collect());
+                        return Some(Candidates {
+                            ids: ids.into_iter().collect(),
+                            exact: must_not.is_empty(),
+                        });
                     }
                     // #20 fix: a multi-token clause (e.g. prénom "JEAN PIERRE")
                     // made the leapfrog decline; the old fallback materialised
@@ -811,84 +1028,24 @@ fn posting_candidate_ids(
                     // membership-check instead — no union allocation.
                     if all_match {
                         if let Some(ids) = state.conjunction_of_matches(index, &match_clauses) {
-                            return Some(ids.into_iter().collect());
+                            return Some(Candidates {
+                                ids: ids.into_iter().collect(),
+                                exact: must_not.is_empty(),
+                            });
                         }
                     }
                 }
             }
 
-            // Pre-compute candidate sets for every postings-backed clause and
-            // intersect in ascending-size order. Starting with the smallest
-            // set keeps the running intersection small and turns
-            // `BTreeSet::intersection` (O(N + M)) into roughly O(K * size_min)
-            // instead of O(K * size_first_seen).
-            //
-            // `must` and `filter` both restrict the candidate space via
-            // intersection (only their scoring contribution differs, which
-            // is handled in `score_for_query`). `should` only restricts the
-            // candidate space when `minimum_should_match >= 1`, in which
-            // case the union of postings-backed `should` clauses limits the
-            // candidate space.
-            let mut sets: Vec<BTreeSet<u32>> = must
-                .iter()
-                .chain(filter.iter())
-                .filter_map(|q| posting_candidate_ids(state, index, q))
-                .collect();
-            let mut used_postings = !sets.is_empty();
-
-            // `should` with MSM >= 1 restricts the candidate pool from
-            // postings. If any `should` clause cannot be answered from
-            // postings we conservatively skip the contribution (must/filter
-            // still restricts; the final `query_matches` pass enforces MSM).
-            if !should.is_empty() && *minimum_should_match >= 1 {
-                let should_sets: Vec<BTreeSet<u32>> = should
-                    .iter()
-                    .filter_map(|q| posting_candidate_ids(state, index, q))
-                    .collect();
-                if should_sets.len() == should.len() {
-                    if *minimum_should_match as usize == should.len() {
-                        // Optimisation #1 (beat-ES): MSM == n_should means
-                        // EVERY should clause is required — it is a conjunction
-                        // (the matchID deces query is `minimum_should_match:2`
-                        // over 2 shoulds). Push each should set individually so
-                        // the ascending-size intersection below ANDs them into
-                        // a small candidate set, instead of scoring the full
-                        // UNION (tens of thousands of docs for common name
-                        // terms on 1.36M). Parity-safe: a doc matching all
-                        // should clauses is exactly their intersection, and
-                        // `query_matches` still enforces MSM.
-                        for s in should_sets {
-                            sets.push(s);
-                        }
-                    } else {
-                        // True disjunction (MSM < n_should): the union of the
-                        // should clauses bounds the candidate space.
-                        let mut union = BTreeSet::new();
-                        for s in should_sets {
-                            union.extend(s);
-                        }
-                        sets.push(union);
-                    }
-                    used_postings = true;
-                }
-            }
-
-            sets.sort_by_key(|s| s.len());
-            let mut matches: Option<BTreeSet<u32>> = None;
-            for current in sets {
-                matches = Some(match matches {
-                    Some(previous) => previous.intersection(&current).cloned().collect(),
-                    None => current,
-                });
-                if matches.as_ref().is_some_and(BTreeSet::is_empty) {
-                    break;
-                }
-            }
-            if used_postings {
-                matches
-            } else {
-                None
-            }
+            bool_generic_candidates(
+                ctx,
+                must,
+                filter,
+                must_not,
+                should,
+                *minimum_should_match,
+                within,
+            )
         }
         // Optimisation #1 (beat-ES): a `function_score` matches EXACTLY the
         // docs its inner query matches — the scoring functions only re-rank,
@@ -897,9 +1054,178 @@ fn posting_candidate_ids(
         // deces query `bool.must[function_score{ bool{should…} }]` failed
         // candidate resolution at the wrapper (`_ => None`) and fell back to a
         // full 1.36M-doc scan. Parity-safe: same matched set.
-        SearchQuery::FunctionScore { inner, .. } => posting_candidate_ids(state, index, inner),
+        SearchQuery::FunctionScore { inner, .. } => posting_candidates(ctx, inner, within),
         _ => None,
     }
+}
+
+/// Generic `bool` candidate resolution (the leapfrog shortcuts declined).
+///
+/// Postings-backed `must` / `filter` clauses and a restricting `should`
+/// (MSM >= 1) are computed first and intersected in ascending-size order
+/// (the smallest set first keeps the running intersection small). Clauses
+/// that walk a term dictionary (`range`, geo — see [`contains_term_scan`])
+/// resolve AFTER, restricted to that running intersection (`within`), so a
+/// broad range or geo filter never drives the candidate set when a cheaper
+/// clause exists. A `match_all` required clause restricts nothing and keeps
+/// exactness. `must_not` is never applied here (superset → not exact).
+#[allow(clippy::too_many_arguments)]
+fn bool_generic_candidates(
+    ctx: &CandidateCtx<'_>,
+    must: &[SearchQuery],
+    filter: &[SearchQuery],
+    must_not: &[SearchQuery],
+    should: &[SearchQuery],
+    minimum_should_match: u32,
+    within: Option<&BTreeSet<u32>>,
+) -> Option<Candidates> {
+    let mut exact = must_not.is_empty();
+    let mut used_postings = false;
+    let required: Vec<&SearchQuery> = must
+        .iter()
+        .chain(filter.iter())
+        .filter(|clause| !matches!(clause, SearchQuery::MatchAll { .. }))
+        .collect();
+    let (cheap, scans): (Vec<&SearchQuery>, Vec<&SearchQuery>) = required
+        .into_iter()
+        .partition(|clause| !contains_term_scan(clause));
+    let should_restricts = !should.is_empty() && minimum_should_match >= 1;
+    let should_scans = should_restricts && should.iter().any(contains_term_scan);
+
+    // Resolve the `should` contribution: the per-clause sets when every
+    // should is required (MSM == n), their union otherwise. Any unresolvable
+    // should clause skips the contribution (superset; `query_matches`
+    // enforces MSM).
+    let resolve_should =
+        |within: Option<&BTreeSet<u32>>, exact: &mut bool| -> Option<Vec<BTreeSet<u32>>> {
+            let mut resolved = Vec::with_capacity(should.len());
+            for clause in should {
+                match posting_candidates(ctx, clause, within) {
+                    Some(candidates) => resolved.push(candidates),
+                    None => {
+                        *exact = false;
+                        return None;
+                    }
+                }
+            }
+            if minimum_should_match as usize == should.len() {
+                // Optimisation #1 (beat-ES): MSM == n_should means EVERY
+                // should clause is required — a conjunction (the matchID
+                // deces query is `minimum_should_match:2` over 2 shoulds).
+                *exact &= resolved.iter().all(|candidates| candidates.exact);
+                Some(
+                    resolved
+                        .into_iter()
+                        .map(|candidates| candidates.ids)
+                        .collect(),
+                )
+            } else {
+                // True disjunction (MSM < n_should): the union bounds the
+                // candidate space but is a superset.
+                *exact = false;
+                let mut union = BTreeSet::new();
+                for candidates in resolved {
+                    union.extend(candidates.ids);
+                }
+                Some(vec![union])
+            }
+        };
+
+    let mut sets: Vec<BTreeSet<u32>> = Vec::new();
+    for clause in cheap {
+        match posting_candidates(ctx, clause, within) {
+            Some(candidates) => {
+                exact &= candidates.exact;
+                sets.push(candidates.ids);
+            }
+            None => exact = false,
+        }
+    }
+    if should_restricts && !should_scans {
+        if let Some(should_sets) = resolve_should(within, &mut exact) {
+            sets.extend(should_sets);
+        }
+    }
+    used_postings |= !sets.is_empty();
+    sets.sort_by_key(BTreeSet::len);
+    let mut running: Option<BTreeSet<u32>> = None;
+    for current in sets {
+        running = Some(match running {
+            Some(previous) => intersect_candidates(previous, current),
+            None => current,
+        });
+        if running.as_ref().is_some_and(BTreeSet::is_empty) {
+            // Every required set is a superset of the matches within
+            // `within`: an empty intersection is the exact answer.
+            return Some(Candidates::exact(BTreeSet::new()));
+        }
+    }
+
+    for clause in scans {
+        let restrict = running.as_ref().or(within);
+        match posting_candidates(ctx, clause, restrict) {
+            Some(candidates) => {
+                exact &= candidates.exact;
+                used_postings = true;
+                running = Some(match running {
+                    Some(previous) => intersect_candidates(previous, candidates.ids),
+                    None => candidates.ids,
+                });
+                if running.as_ref().is_some_and(BTreeSet::is_empty) {
+                    return Some(Candidates::exact(BTreeSet::new()));
+                }
+            }
+            None => exact = false,
+        }
+    }
+    if should_scans {
+        let should_sets = resolve_should(running.as_ref().or(within), &mut exact);
+        if let Some(should_sets) = should_sets {
+            used_postings = true;
+            for current in should_sets {
+                running = Some(match running {
+                    Some(previous) => intersect_candidates(previous, current),
+                    None => current,
+                });
+            }
+        }
+    }
+
+    if !used_postings {
+        return None;
+    }
+    running.map(|ids| Candidates { ids, exact })
+}
+
+/// MVP L1b: candidate set of a geo filter on a `geo_point` field, from a
+/// walk of the field's term dictionary (one term per distinct indexed
+/// point: ~40 k communes for matchID's `GEOPOINT_*`, versus 29 M documents)
+/// with the same point predicate as the `_source` check — exact. Declines
+/// (`None`) on a non-`geo_point` field or when a term is a bare number (the
+/// `[lon, lat]` array form, whose two coordinates the indexer flattened).
+fn geo_candidates(
+    ctx: &CandidateCtx<'_>,
+    field: &str,
+    within: Option<&BTreeSet<u32>>,
+    inside: impl Fn(f64, f64) -> bool,
+) -> Option<Candidates> {
+    use std::ops::Bound;
+    if ctx.mapping()?.resolve_field(field)?.field_type != FieldType::GeoPoint {
+        return None;
+    }
+    let ids = ctx.state.documents_for_term_scan_internal(
+        ctx.index,
+        field,
+        Bound::Unbounded,
+        Bound::Unbounded,
+        &mut |term| match geo_term_point(term) {
+            GeoTerm::Point(lat, lon) => Some(inside(lat, lon)),
+            GeoTerm::Invalid => Some(false),
+            GeoTerm::Ambiguous => None,
+        },
+        within,
+    )?;
+    Some(Candidates::exact(ids))
 }
 
 /// Axum handler for the OpenSearch-compatible `/{index}/_search` endpoint.
@@ -1280,6 +1606,10 @@ mod p1a_direct_must_tests {
 }
 
 #[cfg(test)]
+#[path = "search_l1b_guard_tests.rs"]
+mod l1b_build_request_guard_tests;
+
+#[cfg(test)]
 mod l1_fuzzy_full_scan_guard_tests {
     //! MVP L1 guard: no fuzzy / bool-of-fuzzy shape reaches the `_source`
     //! full scan (`full_scan_documents`, counted per thread).
@@ -1364,11 +1694,8 @@ mod l1_fuzzy_full_scan_guard_tests {
             let (state, index) = fixture(disk);
             for (label, query, expected_total) in &shapes {
                 for with_aggs in [false, true] {
-                    // `function_score` at the root with aggregations is the
-                    // separate L1 "function_score push-down" item.
-                    if with_aggs && label.starts_with("function_score") {
-                        continue;
-                    }
+                    // MVP L1b: root `function_score` + aggregations is now
+                    // pushed down to its inner query too.
                     let mut body = json!({"query": query, "track_total_hits": true});
                     if with_aggs {
                         // Aggregations force the general path
@@ -1465,6 +1792,11 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     if request.aggs.is_empty() {
         if let Some(response) =
             run_topk_search(state, indices, request, scoring_enabled, started_at)
+        {
+            return response;
+        }
+        if let Some(response) =
+            run_topk_constant_match_all(state, indices, request, scoring_enabled, started_at)
         {
             return response;
         }
@@ -2132,6 +2464,7 @@ fn run_topk_search(
             &indices[0],
             request,
             scoring_enabled,
+            1.0,
             started_at,
         ));
     }
@@ -2303,9 +2636,24 @@ fn run_topk_exact_bool(
     // candidate set + per-candidate `score_for_query`. Confirm directly.
     metrics::counter!("surch_dbg_generic_total").increment(1);
     let t_grecall = std::time::Instant::now();
-    let ids: Vec<u32> = posting_candidate_ids(state, &indices[0], query)?
-        .into_iter()
-        .collect();
+    let ctx = CandidateCtx::new(state, &indices[0]);
+    let candidates = posting_candidates(&ctx, query, None)?;
+    let ids: Vec<u32> = if candidates.exact {
+        candidates.ids.into_iter().collect()
+    } else {
+        // MVP L1b: the static gate is optimistic for `range` / geo clauses
+        // (their exactness depends on the field mapping); when resolution
+        // reports a superset, re-check the candidates on `_source` here
+        // rather than resolving the whole query again in the general path.
+        let mapping = ctx.mapping().cloned().unwrap_or_default();
+        let ids: Vec<u32> = candidates.ids.into_iter().collect();
+        state
+            .documents_with_internal_ids(&indices[0], &ids)
+            .into_iter()
+            .filter(|(_, document)| query_matches(query, &document.source, &mapping))
+            .map(|(id, _)| id)
+            .collect()
+    };
     metrics::histogram!("surch_dbg_generic_recall_us")
         .record(t_grecall.elapsed().as_micros() as f64);
     metrics::histogram!("surch_dbg_generic_ids").record(ids.len() as f64);
@@ -2562,6 +2910,7 @@ fn run_topk_match_all(
     index: &str,
     request: &SearchRequest,
     scoring_enabled: bool,
+    constant_score: f64,
     started_at: Instant,
 ) -> SearchResponse {
     let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
@@ -2578,7 +2927,7 @@ fn run_topk_match_all(
                 // match_all is non-scoring, but keep the conditional so a
                 // future wrapper (e.g. function_score on match_all) sees
                 // a uniform code path.
-                scoring_enabled.then_some(1.0),
+                scoring_enabled.then_some(constant_score),
                 request.highlight.as_ref(),
                 request.query.as_ref(),
             )
@@ -2596,11 +2945,51 @@ fn run_topk_match_all(
     // return `None` for an empty top-K window even when `total > 0`, so
     // we set it explicitly to stay consistent with the full-scan path.
     response.hits.max_score = if scoring_enabled && total > 0 {
-        Some(1.0)
+        Some(constant_score)
     } else {
         None
     };
     response
+}
+
+/// MVP L1b: top-K for a query that matches every document with one
+/// constant score (deces-backend wraps `match_all` as
+/// `bool.must:[match_all]` or `bool.must:[function_score{bool{}}]`): only
+/// the `[from, from+size)` window is hydrated, as for a root `match_all`,
+/// instead of materialising and sorting the whole index. Same hits, scores,
+/// order (natural doc order: all scores tie) and total as the general path;
+/// a `min_score` above the constant score yields no hit.
+fn run_topk_constant_match_all(
+    state: &AppState,
+    indices: &[String],
+    request: &SearchRequest,
+    scoring_enabled: bool,
+    started_at: Instant,
+) -> Option<SearchResponse> {
+    if indices.len() != 1 || !is_default_score_sort(&request.sort) || request.highlight.is_some() {
+        return None;
+    }
+    let query = request.query.as_ref()?;
+    if !matches_every_document(query) {
+        return None;
+    }
+    let constant_score = constant_match_all_score(query)?;
+    if scoring_enabled && request.min_score.is_some_and(|min| constant_score < min) {
+        let total_summary = resolve_total_hits(0, request.track_total_hits.as_ref());
+        return Some(build_search_response_with_total(
+            Vec::new(),
+            total_summary,
+            started_at.elapsed().as_millis() as u64,
+        ));
+    }
+    Some(run_topk_match_all(
+        state,
+        &indices[0],
+        request,
+        scoring_enabled,
+        constant_score,
+        started_at,
+    ))
 }
 
 fn topk_scored_documents(
@@ -3043,12 +3432,13 @@ fn compute_max_score(documents: &[ScoredDocument], scoring_enabled: bool) -> Opt
         })
 }
 
-/// Whether `posting_candidate_ids(query)` returns the EXACT match set (no false
-/// positives), letting the caller skip the per-doc `query_matches` filter. MUST
-/// stay in sync with `posting_candidate_ids`: a clause is "exact" iff that
-/// function resolves it to precisely its match set. Conservative — anything not
-/// provably exact returns `false` (the filter stays). The b1/b2 oracles assert
-/// exact result sets vs ES, so a wrong `true` here trips CI.
+/// Static pre-check: whether `posting_candidates(query)` MAY return the
+/// EXACT match set (no false positives). Used only by `run_topk_exact_bool`
+/// to decline early; the authoritative flag is `Candidates::exact`, decided
+/// during resolution. Conservative for every clause whose exactness does not
+/// depend on the mapping; optimistic for `range` / geo (exact whenever they
+/// resolve, which depends on the field type) and for a `match_all` required
+/// clause (restricts nothing).
 fn candidate_set_is_exact(query: &SearchQuery) -> bool {
     match query {
         // term / match / multi_match resolve to exactly their match set.
@@ -3059,6 +3449,12 @@ fn candidate_set_is_exact(query: &SearchQuery) -> bool {
         // of the postings of the kept expansions, per-token OR/AND), so the
         // `_source` re-check is skipped.
         SearchQuery::Fuzzy { .. } => true,
+        // MVP L1b: see the doc comment above.
+        SearchQuery::Range { .. }
+        | SearchQuery::GeoDistance { .. }
+        | SearchQuery::GeoBoundingBox { .. }
+        | SearchQuery::GeoPolygon { .. }
+        | SearchQuery::MatchAll { .. } => true,
         SearchQuery::FunctionScore { inner, .. } => candidate_set_is_exact(inner),
         SearchQuery::Bool {
             must,
@@ -3070,7 +3466,7 @@ fn candidate_set_is_exact(query: &SearchQuery) -> bool {
         } => {
             // must_not is never applied during candidate resolution -> superset.
             // must/filter must all be exact (a non-postings clause is skipped by
-            // posting_candidate_ids -> superset).
+            // candidate resolution -> superset).
             if !must_not.is_empty()
                 || !must.iter().all(candidate_set_is_exact)
                 || !filter.iter().all(candidate_set_is_exact)
@@ -3110,57 +3506,45 @@ fn match_documents_for_index(
             SearchQuery::Term { field, value } => {
                 (documents_by_term(state, index, field, value), None)
             }
-            SearchQuery::Bool { .. } => {
-                if let Some(ids) = posting_candidate_ids(state, index, query) {
-                    let ids = ids.into_iter().collect::<Vec<u32>>();
+            // MVP L1b: `match_all` and every shape equivalent to it (empty
+            // `bool`, `bool.must:[match_all]`, `function_score` over one of
+            // those — deces-backend's `/agg` without criteria) select every
+            // live document; nothing to evaluate per document.
+            _ if matches_every_document(query) => (state.documents(index), None),
+            // Every other clause resolves from the postings when it can
+            // (MVP L1b: root `function_score`, `range`, geo filters, `prefix`
+            // and `bool` alike). When the candidate set is PROVABLY the exact
+            // match set the per-doc `query_matches` re-evaluation is a no-op —
+            // and on the deces tail it is the dominant cost (2 field
+            // re-analyses per candidate over a high-`df` intersection). Skip it
+            // then; otherwise (superset: must_not, should-disjunction, a
+            // non-postings clause, …) the filter still enforces correctness.
+            // Validated by the b1/b2 oracles (they assert exact result sets vs
+            // ES).
+            _ => {
+                let ctx = CandidateCtx::new(state, index);
+                if let Some(candidates) = posting_candidates(&ctx, query, None) {
+                    let ids = candidates.ids.into_iter().collect::<Vec<u32>>();
                     let pairs = state.documents_with_internal_ids(index, &ids);
-                    // When the postings candidate set is PROVABLY the exact match
-                    // set (no false positives), the per-doc `query_matches`
-                    // re-evaluation is a no-op — and on the deces tail it is the
-                    // dominant cost (2 field re-analyses per candidate over a
-                    // high-`df` intersection). Skip it then; otherwise (superset:
-                    // must_not, should-disjunction, a non-postings clause, …) the
-                    // filter still enforces correctness. Validated by the b1/b2
-                    // oracles (they assert exact result sets vs ES).
-                    let (docs, kept): (Vec<StoredDocument>, Vec<u32>) =
-                        if candidate_set_is_exact(query) {
-                            pairs
-                                .into_iter()
-                                .map(|(id, document)| (document, id))
-                                .unzip()
-                        } else {
-                            pairs
-                                .into_iter()
-                                .filter(|(_, document)| {
-                                    query_matches(query, &document.source, &mapping)
-                                })
-                                .map(|(id, document)| (document, id))
-                                .unzip()
-                        };
+                    let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = if candidates.exact {
+                        pairs
+                            .into_iter()
+                            .map(|(id, document)| (document, id))
+                            .unzip()
+                    } else {
+                        pairs
+                            .into_iter()
+                            .filter(|(_, document)| {
+                                query_matches(query, &document.source, &mapping)
+                            })
+                            .map(|(id, document)| (document, id))
+                            .unzip()
+                    };
                     (docs, Some(kept))
                 } else {
                     (full_scan_documents(state, index, query, &mapping), None)
                 }
             }
-            // MVP L1: `Fuzzy` joins the exact postings-backed arms (its
-            // candidate set is the match set, no `_source` re-check).
-            SearchQuery::Match { .. }
-            | SearchQuery::MultiMatch { .. }
-            | SearchQuery::Fuzzy { .. } => {
-                if let Some(ids) = posting_candidate_ids(state, index, query) {
-                    let ids = ids.into_iter().collect::<Vec<u32>>();
-                    let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = state
-                        .documents_with_internal_ids(index, &ids)
-                        .into_iter()
-                        .map(|(id, document)| (document, id))
-                        .unzip();
-                    (docs, Some(kept))
-                } else {
-                    (full_scan_documents(state, index, query, &mapping), None)
-                }
-            }
-            SearchQuery::MatchAll { .. } => (state.documents(index), None),
-            _ => (full_scan_documents(state, index, query, &mapping), None),
         },
     };
     score_documents(state, index, query, plain, known_ids)
@@ -6503,9 +6887,9 @@ fn haversine_distance_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 
     EARTH_RADIUS_METERS * c
 }
 
-/// Returns `true` when the geo_point stored under `field` in `source`
-/// is within `distance_meters` of `(lat, lon)`. Documents whose field
-/// is missing or in an unrecognised shape do not match.
+/// Returns `true` when one of the geo_points stored under `field` in
+/// `source` is within `distance_meters` of `(lat, lon)`. Documents whose
+/// field is missing or in an unrecognised shape do not match.
 pub fn geo_distance_field_matches(
     source: &Value,
     field: &str,
@@ -6513,13 +6897,67 @@ pub fn geo_distance_field_matches(
     target_lon: f64,
     distance_meters: f64,
 ) -> bool {
-    let Some(point) = source.get(field) else {
-        return false;
-    };
-    let Ok((lat, lon)) = parse_geo_point_source(point) else {
-        return false;
-    };
+    geo_source_points(source, field)
+        .into_iter()
+        .any(|(lat, lon)| {
+            geo_distance_point_matches(lat, lon, target_lat, target_lon, distance_meters)
+        })
+}
+
+/// Point predicate of `geo_distance`, shared by the `_source` check and the
+/// term-dictionary walk (MVP L1b) so both decide identically.
+fn geo_distance_point_matches(
+    lat: f64,
+    lon: f64,
+    target_lat: f64,
+    target_lon: f64,
+    distance_meters: f64,
+) -> bool {
     haversine_distance_meters(target_lat, target_lon, lat, lon) <= distance_meters
+}
+
+/// Every geo_point stored under `field` in `source`: a single point in any
+/// accepted shape, or (MVP L1b, ES multi-valued `geo_point`) an array of
+/// points, each element in object / `"lat,lon"` / `[lon, lat]` shape;
+/// unparseable elements are ignored. A bare `[lon, lat]` pair stays ONE
+/// point.
+fn geo_source_points(source: &Value, field: &str) -> Vec<(f64, f64)> {
+    let Some(value) = source.get(field) else {
+        return Vec::new();
+    };
+    if let Ok(point) = parse_geo_point_source(value) {
+        return vec![point];
+    }
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| parse_geo_point_source(item).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// MVP L1b: how one indexed term of a `geo_point` field reads back. The
+/// indexer stores an object point as its JSON text and a `"lat,lon"` string
+/// verbatim (keyword analyzer), so both parse back to the exact source
+/// coordinates; the `[lon, lat]` array form is flattened into two bare
+/// numbers that cannot be paired back, so the walk must decline.
+enum GeoTerm {
+    Point(f64, f64),
+    Invalid,
+    Ambiguous,
+}
+
+fn geo_term_point(term: &str) -> GeoTerm {
+    let value =
+        serde_json::from_str::<Value>(term).unwrap_or_else(|_| Value::String(term.to_owned()));
+    if value.is_number() {
+        return GeoTerm::Ambiguous;
+    }
+    match parse_geo_point_source(&value) {
+        Ok((lat, lon)) => GeoTerm::Point(lat, lon),
+        Err(_) => GeoTerm::Invalid,
+    }
 }
 
 /// A2: point-in-box test for `geo_bounding_box`. The box is inclusive on
@@ -6533,12 +6971,21 @@ pub fn geo_bounding_box_field_matches(
     left_lon: f64,
     right_lon: f64,
 ) -> bool {
-    let Some(point) = source.get(field) else {
-        return false;
-    };
-    let Ok((lat, lon)) = parse_geo_point_source(point) else {
-        return false;
-    };
+    geo_source_points(source, field)
+        .into_iter()
+        .any(|(lat, lon)| {
+            geo_bounding_box_point_matches(lat, lon, top_lat, bottom_lat, left_lon, right_lon)
+        })
+}
+
+fn geo_bounding_box_point_matches(
+    lat: f64,
+    lon: f64,
+    top_lat: f64,
+    bottom_lat: f64,
+    left_lon: f64,
+    right_lon: f64,
+) -> bool {
     lat <= top_lat && lat >= bottom_lat && lon >= left_lon && lon <= right_lon
 }
 
@@ -6546,15 +6993,15 @@ pub fn geo_bounding_box_field_matches(
 /// lon as x). `points` are `(lat, lon)` vertices; the polygon is treated as
 /// implicitly closed. Antimeridian-crossing polygons are out of scope.
 pub fn geo_polygon_field_matches(source: &Value, field: &str, points: &[(f64, f64)]) -> bool {
+    geo_source_points(source, field)
+        .into_iter()
+        .any(|(lat, lon)| geo_polygon_point_matches(lat, lon, points))
+}
+
+fn geo_polygon_point_matches(lat: f64, lon: f64, points: &[(f64, f64)]) -> bool {
     if points.len() < 3 {
         return false;
     }
-    let Some(point) = source.get(field) else {
-        return false;
-    };
-    let Ok((lat, lon)) = parse_geo_point_source(point) else {
-        return false;
-    };
     let (y, x) = (lat, lon);
     let mut inside = false;
     let mut j = points.len() - 1;
@@ -7112,12 +7559,257 @@ pub fn exists_field_matches(source: &Value, field: &str) -> bool {
     }
 }
 
+/// MVP L1b: term-level plan of a `range` clause on a mapped `text`,
+/// `keyword` or numeric field — the ES semantics for that field type, run
+/// identically over the term dictionary (candidate resolution) and over the
+/// `_source` value's index-time tokens (`range_field_matches`), so the
+/// postings candidate set is the EXACT match set.
+///
+/// - `text`: Lucene `TermRangeQuery` over the analysed terms, bounds taken
+///   verbatim (ES `TextFieldType` does not analyse range bounds); a numeric
+///   bound is compared as its decimal text.
+/// - `keyword`: same, bounds passed through the field's index-time chain
+///   (ES normalises keyword range bounds with the field normalizer).
+/// - numeric (`byte`/`short`/`integer`/`long`/`float`/`double`): numeric
+///   comparison of each term parsed as `f64`; a non-numeric bound matches no
+///   document (ES rejects it with HTTP 400).
+///
+/// `date`, `boolean`, geo and unmapped fields return `None` (legacy
+/// `_source` comparison, no postings path).
+#[derive(Debug)]
+enum RangeTermPlan {
+    Bytes {
+        lower: std::ops::Bound<Vec<u8>>,
+        upper: std::ops::Bound<Vec<u8>>,
+    },
+    Numeric {
+        lower: std::ops::Bound<f64>,
+        upper: std::ops::Bound<f64>,
+    },
+    Nothing,
+}
+
+fn range_term_plan(
+    mapping: &IndexMapping,
+    field: &str,
+    bounds: &RangeBounds,
+) -> Option<RangeTermPlan> {
+    use std::ops::Bound;
+    let field_mapping = mapping.resolve_field(field)?;
+    match field_mapping.field_type {
+        FieldType::Text | FieldType::Keyword => {
+            let keyword = field_mapping.field_type == FieldType::Keyword;
+            let encode = |value: &RangeValue| -> Vec<u8> {
+                let text = match value {
+                    RangeValue::Text(text) => text.clone(),
+                    RangeValue::Number(number) => range_number_text(*number),
+                };
+                if keyword {
+                    let mut tokens = index_terms_for_value(mapping, field, &text);
+                    if tokens.len() == 1 {
+                        return tokens.remove(0).into_bytes();
+                    }
+                }
+                text.into_bytes()
+            };
+            let lower = tighter_lower(
+                bounds.gt.as_ref().map(|v| Bound::Excluded(encode(v))),
+                bounds.gte.as_ref().map(|v| Bound::Included(encode(v))),
+            );
+            let upper = tighter_upper(
+                bounds.lt.as_ref().map(|v| Bound::Excluded(encode(v))),
+                bounds.lte.as_ref().map(|v| Bound::Included(encode(v))),
+            );
+            Some(RangeTermPlan::Bytes { lower, upper })
+        }
+        FieldType::Integer
+        | FieldType::Long
+        | FieldType::Short
+        | FieldType::Byte
+        | FieldType::Float
+        | FieldType::Double => {
+            let number = |value: &RangeValue| -> Option<f64> {
+                match value {
+                    RangeValue::Number(number) => Some(*number),
+                    RangeValue::Text(text) => text.trim().parse::<f64>().ok(),
+                }
+            };
+            // `Err(())`: the bound is given but is not a number.
+            let parse = |bound: &Option<RangeValue>| -> Result<Option<f64>, ()> {
+                match bound {
+                    None => Ok(None),
+                    Some(value) => number(value).map(Some).ok_or(()),
+                }
+            };
+            let (Ok(gt), Ok(gte), Ok(lt), Ok(lte)) = (
+                parse(&bounds.gt),
+                parse(&bounds.gte),
+                parse(&bounds.lt),
+                parse(&bounds.lte),
+            ) else {
+                return Some(RangeTermPlan::Nothing);
+            };
+            let lower = tighter_lower(gt.map(Bound::Excluded), gte.map(Bound::Included));
+            let upper = tighter_upper(lt.map(Bound::Excluded), lte.map(Bound::Included));
+            Some(RangeTermPlan::Numeric { lower, upper })
+        }
+        _ => None,
+    }
+}
+
+/// A numeric `range` bound on a string field, as the decimal text Java's
+/// `toString` gives the parsed JSON number (`19800101`, `1.5`).
+fn range_number_text(number: f64) -> String {
+    if number.fract() == 0.0 && number.abs() < 1e15 {
+        format!("{}", number as i64)
+    } else {
+        format!("{number}")
+    }
+}
+
+/// The tighter of a `gt` / `gte` pair (both given: their intersection).
+fn tighter_lower<T: PartialOrd>(
+    gt: Option<std::ops::Bound<T>>,
+    gte: Option<std::ops::Bound<T>>,
+) -> std::ops::Bound<T> {
+    use std::ops::Bound;
+    match (gt, gte) {
+        (Some(Bound::Excluded(a)), Some(Bound::Included(b))) => {
+            if b > a {
+                Bound::Included(b)
+            } else {
+                Bound::Excluded(a)
+            }
+        }
+        (Some(bound), None) | (None, Some(bound)) => bound,
+        _ => Bound::Unbounded,
+    }
+}
+
+/// The tighter of a `lt` / `lte` pair (both given: their intersection).
+fn tighter_upper<T: PartialOrd>(
+    lt: Option<std::ops::Bound<T>>,
+    lte: Option<std::ops::Bound<T>>,
+) -> std::ops::Bound<T> {
+    use std::ops::Bound;
+    match (lt, lte) {
+        (Some(Bound::Excluded(a)), Some(Bound::Included(b))) => {
+            if b < a {
+                Bound::Included(b)
+            } else {
+                Bound::Excluded(a)
+            }
+        }
+        (Some(bound), None) | (None, Some(bound)) => bound,
+        _ => Bound::Unbounded,
+    }
+}
+
+impl RangeTermPlan {
+    /// Byte bounds handed to the FST walk (numeric plans walk the whole
+    /// field dictionary and filter each parsed term).
+    fn fst_bounds(&self) -> (std::ops::Bound<&[u8]>, std::ops::Bound<&[u8]>) {
+        use std::ops::Bound;
+        match self {
+            RangeTermPlan::Bytes { lower, upper } => (
+                lower.as_ref().map(Vec::as_slice),
+                upper.as_ref().map(Vec::as_slice),
+            ),
+            RangeTermPlan::Numeric { .. } | RangeTermPlan::Nothing => {
+                (Bound::Unbounded, Bound::Unbounded)
+            }
+        }
+    }
+
+    fn accepts(&self, term: &str) -> bool {
+        match self {
+            RangeTermPlan::Bytes { lower, upper } => in_bound_range(
+                term.as_bytes(),
+                lower.as_ref().map(Vec::as_slice),
+                upper.as_ref().map(Vec::as_slice),
+            ),
+            RangeTermPlan::Numeric { lower, upper } => term
+                .trim()
+                .parse::<f64>()
+                .is_ok_and(|value| in_bound_range(&value, lower.as_ref(), upper.as_ref())),
+            RangeTermPlan::Nothing => false,
+        }
+    }
+}
+
+fn in_bound_range<T: PartialOrd + ?Sized>(
+    value: &T,
+    lower: std::ops::Bound<&T>,
+    upper: std::ops::Bound<&T>,
+) -> bool {
+    use std::ops::Bound;
+    let above = match lower {
+        Bound::Included(bound) => value >= bound,
+        Bound::Excluded(bound) => value > bound,
+        Bound::Unbounded => true,
+    };
+    let below = match upper {
+        Bound::Included(bound) => value <= bound,
+        Bound::Excluded(bound) => value < bound,
+        Bound::Unbounded => true,
+    };
+    above && below
+}
+
+/// The index-time terms of `value` for `field`, mirroring the indexer: a
+/// derived sub-field (`parent.sub`) uses its own chain
+/// (`FieldMapping::analyze_subfield_value`), any other field its mapped
+/// analyzer (same resolution as `field_tokens_for_source`).
+fn index_terms_for_value(mapping: &IndexMapping, field: &str, value: &str) -> Vec<String> {
+    if mapping.field(field).is_none() && field.contains('.') {
+        if let Some(sub_mapping) = mapping.resolve_field(field) {
+            return sub_mapping.analyze_subfield_value(value, mapping.analysis());
+        }
+    }
+    mapping.analyzer(field).terms(value)
+}
+
+/// Every index-time term of `field` for `source`, over all scalar values
+/// (arrays flattened) — what the postings of that document hold for the
+/// field. A sub-field reads its parent's value.
+fn index_terms_for_source(source: &Value, field: &str, mapping: &IndexMapping) -> Vec<String> {
+    fn scalars(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Number(number) => out.push(number.to_string()),
+            Value::Bool(flag) => out.push(flag.to_string()),
+            Value::Array(items) => items.iter().for_each(|item| scalars(item, out)),
+            Value::Object(_) | Value::Null => {}
+        }
+    }
+    let path = if mapping.field(field).is_none() {
+        field.split_once('.').map_or(field, |(parent, _)| parent)
+    } else {
+        field
+    };
+    let mut values = Vec::new();
+    if let Some(value) = source.get(path) {
+        scalars(value, &mut values);
+    }
+    values
+        .iter()
+        .flat_map(|value| index_terms_for_value(mapping, field, value))
+        .collect()
+}
+
 pub fn range_field_matches(
     source: &Value,
     field: &str,
     bounds: &RangeBounds,
     mapping: &IndexMapping,
 ) -> bool {
+    // MVP L1b: text / keyword / numeric fields follow the term-level ES
+    // semantics, exactly as the postings candidate path does.
+    if let Some(plan) = range_term_plan(mapping, field, bounds) {
+        return index_terms_for_source(source, field, mapping)
+            .iter()
+            .any(|term| plan.accepts(term));
+    }
     let Some(field_value) = source.get(field) else {
         return false;
     };
