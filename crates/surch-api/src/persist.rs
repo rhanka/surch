@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use surch_index::document_index::{PersistedSegment, SegmentPersistCache};
 use surch_index::mapping::{
-    AnalysisSettings, AnalyzerDefinition, AnalyzerName, EdgeNgramTokenizerDefinition, FieldMapping,
-    FieldPrefixes, FieldType, IndexMapping, NormalizerDefinition,
+    AnalysisSettings, AnalyzerName, FieldMapping, FieldPrefixes, FieldType, IndexMapping,
 };
 use surch_store::persist::{
     atomic_replace_framed, fsync_dir, is_tmp_name, FramedReader, FramedWriter, PersistError,
@@ -27,6 +26,14 @@ use surch_store::persist::{
 /// `IDMP`, `ALIA`). Any incompatible change bumps it; older/newer files
 /// then fail closed with an explicit version error at startup.
 pub(crate) const FORMAT_VERSION: u32 = 1;
+/// Version of the `META` file (mapping + analysis codec). Bumped to 2 by
+/// lot L2: `custom_normalizer` per field, the `settings.analysis` block
+/// stored as its declared JSON, and an analysis change (default `text`
+/// analyzer `standard` instead of `simple`, `pattern_replace` char filters,
+/// normalizer chains) that makes postings written by version 1 inconsistent
+/// with the query-side analysis. A version-1 directory fails closed and must
+/// be re-indexed.
+pub(crate) const META_FORMAT_VERSION: u32 = 2;
 pub(crate) const MANIFEST_KIND: [u8; 4] = *b"MANI";
 pub(crate) const META_KIND: [u8; 4] = *b"META";
 pub(crate) const IDMAP_KIND: [u8; 4] = *b"IDMP";
@@ -325,19 +332,6 @@ fn analyzer_from_tag(input: &FramedReader, tag: u8) -> Result<Option<AnalyzerNam
     })
 }
 
-fn put_strings(out: &mut FramedWriter, values: &[String]) -> Result<()> {
-    out.put_u64(values.len() as u64)?;
-    for value in values {
-        out.put_str(value)?;
-    }
-    Ok(())
-}
-
-fn get_strings(input: &mut FramedReader) -> Result<Vec<String>> {
-    let count = input.get_count(8)?;
-    (0..count).map(|_| input.get_str()).collect()
-}
-
 fn put_field_mapping(out: &mut FramedWriter, field: &FieldMapping) -> Result<()> {
     out.put_u8(field_type_tag(field.field_type))?;
     out.put_u8(analyzer_tag(field.analyzer))?;
@@ -350,6 +344,7 @@ fn put_field_mapping(out: &mut FramedWriter, field: &FieldMapping) -> Result<()>
         Some(true) => 2,
     })?;
     out.put_u8(analyzer_tag(field.normalizer))?;
+    out.put_opt_str(field.custom_normalizer.as_deref())?;
     match field.index_prefixes {
         Some(prefixes) => {
             out.put_u8(1)?;
@@ -387,6 +382,7 @@ fn get_field_mapping(input: &mut FramedReader, depth: u32) -> Result<FieldMappin
     };
     let tag = input.get_u8()?;
     let normalizer = analyzer_from_tag(input, tag)?;
+    let custom_normalizer = input.get_opt_str()?;
     let index_prefixes = match input.get_u8()? {
         0 => None,
         1 => Some(FieldPrefixes {
@@ -410,12 +406,16 @@ fn get_field_mapping(input: &mut FramedReader, depth: u32) -> Result<FieldMappin
         custom_search_analyzer,
         norms,
         normalizer,
+        custom_normalizer,
         index_prefixes,
         date_format,
         fields,
     })
 }
 
+/// Field mappings, then the declared `settings.analysis` object verbatim
+/// (JSON). The analysis chains are recompiled from it at load, so what is
+/// persisted is exactly what `PUT /:index` accepted.
 pub(crate) fn put_mapping(out: &mut FramedWriter, mapping: &IndexMapping) -> Result<()> {
     let fields: Vec<(&str, &FieldMapping)> = mapping.fields().collect();
     out.put_u64(fields.len() as u64)?;
@@ -423,27 +423,7 @@ pub(crate) fn put_mapping(out: &mut FramedWriter, mapping: &IndexMapping) -> Res
         out.put_str(name)?;
         put_field_mapping(out, field)?;
     }
-    let analysis = mapping.analysis();
-    out.put_u64(analysis.tokenizers.len() as u64)?;
-    for (name, tokenizer) in &analysis.tokenizers {
-        out.put_str(name)?;
-        out.put_u64(tokenizer.min_gram as u64)?;
-        out.put_u64(tokenizer.max_gram as u64)?;
-        put_strings(out, &tokenizer.token_chars)?;
-    }
-    out.put_u64(analysis.analyzers.len() as u64)?;
-    for (name, analyzer) in &analysis.analyzers {
-        out.put_str(name)?;
-        out.put_str(&analyzer.tokenizer)?;
-        put_strings(out, &analyzer.filter)?;
-    }
-    out.put_u64(analysis.normalizers.len() as u64)?;
-    for (name, normalizer) in &analysis.normalizers {
-        out.put_str(name)?;
-        out.put_str(&normalizer.kind)?;
-        put_strings(out, &normalizer.filter)?;
-    }
-    Ok(())
+    put_json(out, &mapping.analysis().to_value())
 }
 
 pub(crate) fn get_mapping(input: &mut FramedReader) -> Result<IndexMapping> {
@@ -454,40 +434,9 @@ pub(crate) fn get_mapping(input: &mut FramedReader) -> Result<IndexMapping> {
         let field = get_field_mapping(input, 0)?;
         mapping.set_field_mapping(name, field);
     }
-    let mut analysis = AnalysisSettings::default();
-    let count = input.get_count(8)?;
-    for _ in 0..count {
-        let name = input.get_str()?;
-        let min_gram = input.get_u64()? as usize;
-        let max_gram = input.get_u64()? as usize;
-        let token_chars = get_strings(input)?;
-        analysis.tokenizers.insert(
-            name,
-            EdgeNgramTokenizerDefinition {
-                min_gram,
-                max_gram,
-                token_chars,
-            },
-        );
-    }
-    let count = input.get_count(8)?;
-    for _ in 0..count {
-        let name = input.get_str()?;
-        let tokenizer = input.get_str()?;
-        let filter = get_strings(input)?;
-        analysis
-            .analyzers
-            .insert(name, AnalyzerDefinition { tokenizer, filter });
-    }
-    let count = input.get_count(8)?;
-    for _ in 0..count {
-        let name = input.get_str()?;
-        let kind = input.get_str()?;
-        let filter = get_strings(input)?;
-        analysis
-            .normalizers
-            .insert(name, NormalizerDefinition { kind, filter });
-    }
+    let analysis = get_json(input)?;
+    let analysis = AnalysisSettings::from_analysis_value(&analysis)
+        .map_err(|error| input.corrupt(format!("invalid persisted analysis: {error}")))?;
     mapping.set_analysis(analysis);
     Ok(mapping)
 }

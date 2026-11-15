@@ -1,10 +1,12 @@
 use surch_analysis::{
-    asciifold_string, Analyzer, EdgeNgramAnalyzer, KeywordAnalyzer, NormAnalyzer, Normalizer,
-    SimpleAnalyzer, StandardAnalyzer, StopAnalyzer, WhitespaceAnalyzer,
+    Analyzer, CharFilter, CustomAnalyzer, KeywordAnalyzer, NormAnalyzer, Normalizer,
+    PatternReplaceCharFilter, SimpleAnalyzer, StandardAnalyzer, StopAnalyzer, Token, TokenChars,
+    TokenFilter, Tokenizer, WhitespaceAnalyzer, DEFAULT_MAX_TOKEN_LENGTH,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::iter::FromIterator;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -115,7 +117,7 @@ impl AnalyzerName {
             .collect()
     }
 
-    fn token_stream(&self, text: &str) -> Vec<surch_analysis::Token> {
+    fn token_stream(&self, text: &str) -> Vec<Token> {
         match self {
             Self::Standard => StandardAnalyzer.token_stream(text),
             Self::Simple => SimpleAnalyzer.token_stream(text),
@@ -138,9 +140,12 @@ impl AnalyzerName {
         }
     }
 
+    /// ES default analysis per field type: `text` uses the `standard`
+    /// analyzer (UAX#29 + lowercase, digits kept), every other type indexes
+    /// its value verbatim.
     pub fn default_for(field_type: FieldType) -> Self {
         match field_type {
-            FieldType::Text => Self::Simple,
+            FieldType::Text => Self::Standard,
             _ => Self::Keyword,
         }
     }
@@ -208,10 +213,15 @@ pub struct FieldMapping {
     /// `search_analyzer`.
     pub custom_search_analyzer: Option<String>,
     pub norms: Option<bool>,
-    /// Field-level `normalizer` reference for keyword fields. Resolved to a
-    /// builtin (`AnalyzerName::Norm`) when the named normalizer matches the
-    /// canonical `lowercase + asciifolding` shape; otherwise `None`.
+    /// Field-level `normalizer` reference for keyword fields when its name
+    /// is one of the builtin names (`norm`, ...). At index/query time a
+    /// normalizer of the same name declared in `settings.analysis.normalizer`
+    /// takes precedence (see [`FieldMapping::index_analyzer`]); otherwise the
+    /// legacy builtin lowercase + asciifolding chain applies.
     pub normalizer: Option<AnalyzerName>,
+    /// Raw `normalizer` name when it is not a builtin name (e.g. `lowercase`
+    /// or a user-defined normalizer). Mutually exclusive with `normalizer`.
+    pub custom_normalizer: Option<String>,
     /// Field-level `index_prefixes` option (text fields only).
     pub index_prefixes: Option<FieldPrefixes>,
     /// `format` token captured when `field_type == Date`. Defaults to
@@ -256,6 +266,7 @@ impl FieldMapping {
             custom_search_analyzer: None,
             norms,
             normalizer: None,
+            custom_normalizer: None,
             index_prefixes: None,
             date_format: None,
             fields: BTreeMap::new(),
@@ -284,6 +295,86 @@ impl FieldMapping {
     pub fn with_normalizer(mut self, normalizer: Option<AnalyzerName>) -> Self {
         self.normalizer = normalizer;
         self
+    }
+
+    /// Sets a non-builtin `normalizer` name (see
+    /// [`FieldMapping::custom_normalizer`]).
+    pub fn with_custom_normalizer(mut self, normalizer: Option<String>) -> Self {
+        self.custom_normalizer = normalizer;
+        self
+    }
+
+    /// The declared `normalizer` name, builtin or custom.
+    pub fn normalizer_name(&self) -> Option<&str> {
+        self.custom_normalizer
+            .as_deref()
+            .or_else(|| self.normalizer.map(|name| name.as_str()))
+    }
+
+    /// The declared index `analyzer` name, builtin or custom.
+    pub fn analyzer_name(&self) -> Option<&str> {
+        self.custom_analyzer
+            .as_deref()
+            .or_else(|| self.analyzer.map(|name| name.as_str()))
+    }
+
+    /// The declared `search_analyzer` name, builtin or custom.
+    pub fn search_analyzer_name(&self) -> Option<&str> {
+        self.custom_search_analyzer
+            .as_deref()
+            .or_else(|| self.search_analyzer.map(|name| name.as_str()))
+    }
+
+    /// Index-time analysis chain of this field, resolved against the index
+    /// `settings.analysis` (ES semantics):
+    /// - `text`: the declared `analyzer` (a `settings.analysis.analyzer`
+    ///   definition shadows a builtin of the same name), else the index
+    ///   `default` analyzer, else `standard`;
+    /// - `keyword`: the declared `normalizer` applied to the whole value
+    ///   (single token), else the value verbatim;
+    /// - any other type: the value verbatim.
+    ///
+    /// An analyzer or normalizer name that resolves nowhere falls back to
+    /// the type default (`standard` / verbatim) on both the index and the
+    /// query side, so postings and query terms stay consistent. ES rejects
+    /// such a mapping at creation instead (documented deviation).
+    pub fn index_analyzer(&self, analysis: &AnalysisSettings) -> ResolvedAnalyzer {
+        match self.field_type {
+            FieldType::Text => match self.analyzer_name() {
+                Some(name) => analysis
+                    .resolve_analyzer(name)
+                    .unwrap_or(ResolvedAnalyzer::Builtin(AnalyzerName::Standard)),
+                None => analysis.default_index_analyzer(),
+            },
+            FieldType::Keyword => match self.normalizer_name() {
+                Some(name) => analysis
+                    .resolve_normalizer(name)
+                    .unwrap_or(ResolvedAnalyzer::Builtin(AnalyzerName::Keyword)),
+                None => ResolvedAnalyzer::Builtin(AnalyzerName::Keyword),
+            },
+            _ => ResolvedAnalyzer::Builtin(AnalyzerName::Keyword),
+        }
+    }
+
+    /// Query-time analysis chain (`match` & co): a `text` field's
+    /// `search_analyzer` when declared, else the index `default_search`
+    /// analyzer when the field declares no analyzer, else its index
+    /// analyzer. Keyword fields analyse the query with their normalizer
+    /// (one term), as ES does.
+    pub fn search_analyzer(&self, analysis: &AnalysisSettings) -> ResolvedAnalyzer {
+        if self.field_type == FieldType::Text {
+            if let Some(name) = self.search_analyzer_name() {
+                return analysis
+                    .resolve_analyzer(name)
+                    .unwrap_or(ResolvedAnalyzer::Builtin(AnalyzerName::Standard));
+            }
+            if self.analyzer_name().is_none() {
+                if let Some(default_search) = analysis.default_search_analyzer() {
+                    return default_search;
+                }
+            }
+        }
+        self.index_analyzer(analysis)
     }
 
     pub fn with_index_prefixes(mut self, prefixes: Option<FieldPrefixes>) -> Self {
@@ -315,35 +406,6 @@ impl FieldMapping {
     pub fn analyzer(&self) -> AnalyzerName {
         self.analyzer
             .unwrap_or_else(|| AnalyzerName::default_for(self.field_type))
-    }
-
-    /// Index-time terms this mapping produces for `value` **as a sub-field**,
-    /// mirroring `DocumentIndex::index_subfields` exactly so the query-side
-    /// source scan sees the same tokens the postings hold:
-    /// - `keyword` + `normalizer`: the whole value lowercased + asciifolded
-    ///   (single token, via [`Normalizer`]);
-    /// - `keyword` without normalizer: the whole value verbatim
-    ///   (via [`KeywordAnalyzer`]);
-    /// - a custom analyzer (e.g. `edge_ngram`): the resolved chain;
-    /// - otherwise: the field's builtin analyzer.
-    ///
-    /// `analysis` supplies the index `settings.analysis` for resolving custom
-    /// analyzer names. Used by the bool / source-scan match path which cannot
-    /// read a derived sub-field from `_source` (it does not exist there).
-    pub fn analyze_subfield_value(&self, value: &str, analysis: &AnalysisSettings) -> Vec<String> {
-        if self.field_type == FieldType::Keyword {
-            let tokens = match self.normalizer {
-                Some(_) => Normalizer.token_stream(value),
-                None => KeywordAnalyzer.token_stream(value),
-            };
-            return tokens.into_iter().map(|token| token.term).collect();
-        }
-        if let Some(name) = &self.custom_analyzer {
-            if let Some(resolved) = analysis.resolve_analyzer(name) {
-                return resolved.terms(value);
-            }
-        }
-        self.analyzer().terms(value)
     }
 
     pub fn norms_enabled(&self) -> bool {
@@ -396,10 +458,10 @@ impl FieldMapping {
             object.insert("norms".to_owned(), Value::Bool(norms));
         }
 
-        if let Some(normalizer) = self.normalizer {
+        if let Some(normalizer) = self.normalizer_name() {
             object.insert(
                 "normalizer".to_owned(),
-                Value::String(normalizer.as_str().to_owned()),
+                Value::String(normalizer.to_owned()),
             );
         }
 
@@ -443,129 +505,602 @@ fn default_norms_for(field_type: FieldType) -> bool {
     matches!(field_type, FieldType::Text)
 }
 
-/// Parsed `settings.analysis.tokenizer.<name>` for `type: edge_ngram`.
+/// The five `settings.analysis` sections, in the order ES applies them.
+const ANALYSIS_SECTIONS: [&str; 5] = [
+    "char_filter",
+    "tokenizer",
+    "filter",
+    "analyzer",
+    "normalizer",
+];
+
+/// Parsed and compiled `settings.analysis` block of an index.
 ///
-/// `token_chars` (`letter`, `digit`, …) is captured for parity but not
-/// enforced by the executor — see A13 notes in
-/// `docs/wp-d-matchid/gap-analysis.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeNgramTokenizerDefinition {
-    pub min_gram: usize,
-    pub max_gram: usize,
-    pub token_chars: Vec<String>,
-}
-
-/// Parsed `settings.analysis.analyzer.<name>` for `tokenizer + filter[]`
-/// chains. Used to register user-defined analyzers (e.g. `norm`,
-/// `autocomplete_analyzer`) declared in `deces_index.yml`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnalyzerDefinition {
-    pub tokenizer: String,
-    pub filter: Vec<String>,
-}
-
-/// Parsed `settings.analysis.normalizer.<name>` for `type: custom` chains.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizerDefinition {
-    pub kind: String,
-    pub filter: Vec<String>,
-}
-
-/// Settings parsed from `PUT /:index` body's `settings.analysis` block.
+/// The declared JSON is kept verbatim (it is what `GET _settings` shows and
+/// what persistence stores); every `analyzer` and `normalizer` is compiled
+/// once, at parse time, into a [`CustomAnalyzer`] chain: char filters, then
+/// the tokenizer, then token filters, in declaration order. A definition
+/// that cannot be compiled (unsupported component type, invalid regex,
+/// reference to an undeclared component) fails the parse, so index creation
+/// fails closed instead of analysing differently from ES.
 ///
-/// Captured per matchID's `deces_index.yml` shape (excerpted in
-/// `docs/wp-d-matchid/incoming/2026-05-15-deces-backend-dsl-inventory.md`
-/// §2.12). Each map is keyed by the user-chosen name (e.g. `norm`,
-/// `edge_ngram_tokenizer`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Supported components (others are rejected with
+/// [`MappingError::AnalysisComponent`]):
+/// - char filters: `pattern_replace` (`pattern`, `replacement`, `flags`);
+/// - tokenizers: `standard` (`max_token_length`), `keyword`, `whitespace`,
+///   `letter`, `lowercase`, `edge_ngram` (`min_gram`, `max_gram`,
+///   `token_chars`, `custom_token_chars`);
+/// - token filters: `lowercase`, `uppercase`, `asciifolding`
+///   (`preserve_original`), `trim`, `stop` (`stopwords`, `ignore_case`);
+/// - analyzer types: `custom`, `standard`, `simple`, `whitespace`,
+///   `keyword`, `stop`; normalizer type: `custom`.
+#[derive(Debug, Clone, Default)]
 pub struct AnalysisSettings {
-    pub tokenizers: BTreeMap<String, EdgeNgramTokenizerDefinition>,
-    pub analyzers: BTreeMap<String, AnalyzerDefinition>,
-    pub normalizers: BTreeMap<String, NormalizerDefinition>,
+    source: Map<String, Value>,
+    analyzers: BTreeMap<String, Arc<CustomAnalyzer>>,
+    normalizers: BTreeMap<String, Arc<CustomAnalyzer>>,
 }
 
-impl AnalysisSettings {
-    /// Resolves an analyzer name to a runnable [`ResolvedAnalyzer`].
-    ///
-    /// Builtin names (`standard`, `norm`, …) resolve directly. Otherwise the
-    /// name is looked up in the user-defined `settings.analysis.analyzer`
-    /// block and composed from its tokenizer + filter chain. Only the
-    /// `edge_ngram` tokenizer is supported for custom analyzers today (the
-    /// deces `autocomplete_analyzer` shape: `edge_ngram` tokenizer +
-    /// `[lowercase, asciifolding]` filters); a custom analyzer that
-    /// references any other tokenizer resolves to `None` so callers fall
-    /// back to the field-type default.
-    pub fn resolve_analyzer(&self, name: &str) -> Option<ResolvedAnalyzer> {
-        if let Some(builtin) = AnalyzerName::from_name(name) {
-            return Some(ResolvedAnalyzer::Builtin(builtin));
-        }
-        let definition = self.analyzers.get(name)?;
-        let tokenizer = self.tokenizers.get(&definition.tokenizer)?;
-        let lowercase = definition
-            .filter
-            .iter()
-            .any(|filter| filter.eq_ignore_ascii_case("lowercase"));
-        let asciifold = definition
-            .filter
-            .iter()
-            .any(|filter| filter.eq_ignore_ascii_case("asciifolding"));
-        Some(ResolvedAnalyzer::EdgeNgram {
-            min_gram: tokenizer.min_gram,
-            max_gram: tokenizer.max_gram,
-            lowercase,
-            asciifold,
-        })
+impl PartialEq for AnalysisSettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
     }
 }
 
-/// A resolved, runnable analyzer: either one of the builtins or a custom
-/// chain composed from `settings.analysis`.
-///
-/// The custom variant currently models the deces `autocomplete_analyzer`
-/// shape: an `edge_ngram` tokenizer followed by optional `lowercase` and
-/// `asciifolding` token filters (applied in that order, matching the Lucene
-/// chain order in `deces_index.yml`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Eq for AnalysisSettings {}
+
+impl AnalysisSettings {
+    /// Parses and compiles an `analysis` object (the value of
+    /// `settings.analysis`).
+    pub fn from_analysis_value(analysis: &Value) -> Result<Self, MappingError> {
+        let analysis = analysis
+            .as_object()
+            .ok_or(MappingError::AnalysisNotObject)?;
+        let mut source = Map::new();
+        for (section, entries) in analysis {
+            if !ANALYSIS_SECTIONS.contains(&section.as_str()) {
+                // Unknown sections are kept verbatim (forward compatible).
+                source.insert(section.clone(), entries.clone());
+                continue;
+            }
+            let entries =
+                entries
+                    .as_object()
+                    .ok_or_else(|| MappingError::AnalysisSectionNotObject {
+                        section: section.clone(),
+                    })?;
+            for (name, definition) in entries {
+                if !definition.is_object() {
+                    return Err(MappingError::AnalysisEntryNotObject {
+                        section: section.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            source.insert(section.clone(), Value::Object(entries.clone()));
+        }
+
+        let mut settings = Self {
+            source,
+            analyzers: BTreeMap::new(),
+            normalizers: BTreeMap::new(),
+        };
+        let compiler = ChainCompiler {
+            source: &settings.source,
+        };
+        let mut analyzers = BTreeMap::new();
+        for (name, definition) in compiler.section("analyzer") {
+            let chain = compiler.analyzer(name, definition)?;
+            analyzers.insert(name.clone(), Arc::new(chain));
+        }
+        let mut normalizers = BTreeMap::new();
+        for (name, definition) in compiler.section("normalizer") {
+            let chain = compiler.normalizer(name, definition)?;
+            normalizers.insert(name.clone(), Arc::new(chain));
+        }
+        settings.analyzers = analyzers;
+        settings.normalizers = normalizers;
+        Ok(settings)
+    }
+
+    /// The declared `analysis` object, verbatim.
+    pub fn to_value(&self) -> Value {
+        Value::Object(self.source.clone())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.source.is_empty()
+    }
+
+    /// Names of the declared (compiled) analyzers.
+    pub fn analyzer_names(&self) -> impl Iterator<Item = &str> {
+        self.analyzers.keys().map(String::as_str)
+    }
+
+    /// Names of the declared (compiled) normalizers.
+    pub fn normalizer_names(&self) -> impl Iterator<Item = &str> {
+        self.normalizers.keys().map(String::as_str)
+    }
+
+    /// Resolves an analyzer name: a declared `settings.analysis.analyzer`
+    /// first (it shadows a builtin of the same name, e.g. the deces `norm`),
+    /// then the builtins (`standard`, `simple`, `stop`, `keyword`,
+    /// `whitespace`, Surch's legacy `norm`).
+    pub fn resolve_analyzer(&self, name: &str) -> Option<ResolvedAnalyzer> {
+        if let Some(chain) = self.analyzers.get(name) {
+            return Some(ResolvedAnalyzer::Custom(Arc::clone(chain)));
+        }
+        AnalyzerName::from_name(name).map(ResolvedAnalyzer::Builtin)
+    }
+
+    /// Resolves a normalizer name: a declared
+    /// `settings.analysis.normalizer` first, then ES's builtin `lowercase`
+    /// normalizer, then Surch's legacy builtin names (lowercase +
+    /// asciifolding on the whole value).
+    pub fn resolve_normalizer(&self, name: &str) -> Option<ResolvedAnalyzer> {
+        if let Some(chain) = self.normalizers.get(name) {
+            return Some(ResolvedAnalyzer::Custom(Arc::clone(chain)));
+        }
+        if name == "lowercase" {
+            return Some(ResolvedAnalyzer::Custom(Arc::new(CustomAnalyzer::new(
+                Vec::new(),
+                Tokenizer::Keyword,
+                vec![TokenFilter::Lowercase],
+            ))));
+        }
+        AnalyzerName::from_name(name).map(|_| ResolvedAnalyzer::LegacyNormalizer)
+    }
+
+    /// Index analyzer of a `text` field that declares none: the index
+    /// `default` analyzer when declared, else `standard`.
+    pub fn default_index_analyzer(&self) -> ResolvedAnalyzer {
+        self.analyzers
+            .get("default")
+            .map(|chain| ResolvedAnalyzer::Custom(Arc::clone(chain)))
+            .unwrap_or(ResolvedAnalyzer::Builtin(AnalyzerName::Standard))
+    }
+
+    /// The index `default_search` analyzer, when declared.
+    pub fn default_search_analyzer(&self) -> Option<ResolvedAnalyzer> {
+        self.analyzers
+            .get("default_search")
+            .map(|chain| ResolvedAnalyzer::Custom(Arc::clone(chain)))
+    }
+}
+
+/// Builds [`CustomAnalyzer`] chains from the declared sections.
+struct ChainCompiler<'a> {
+    source: &'a Map<String, Value>,
+}
+
+impl<'a> ChainCompiler<'a> {
+    fn section(&self, section: &str) -> impl Iterator<Item = (&'a String, &'a Map<String, Value>)> {
+        self.source
+            .get(section)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .filter_map(|(name, definition)| definition.as_object().map(|object| (name, object)))
+    }
+
+    fn declared(&self, section: &str, name: &str) -> Option<&'a Map<String, Value>> {
+        self.source.get(section)?.get(name)?.as_object()
+    }
+
+    fn analyzer(
+        &self,
+        name: &str,
+        definition: &Map<String, Value>,
+    ) -> Result<CustomAnalyzer, MappingError> {
+        let error = |reason: String| component_error("analyzer", name, reason);
+        let kind = match definition.get("type") {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| error("`type` must be a string".to_owned()))?,
+            None if definition.contains_key("tokenizer") => "custom",
+            None => {
+                return Err(error(
+                    "must specify either an analyzer type, or a tokenizer".to_owned(),
+                ))
+            }
+        };
+        match kind {
+            "custom" => {
+                let tokenizer_name = definition
+                    .get("tokenizer")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| error("custom analyzer requires a `tokenizer`".to_owned()))?;
+                let char_filters = names(definition.get("char_filter"))
+                    .map_err(|reason| error(format!("`char_filter` {reason}")))?
+                    .iter()
+                    .map(|filter| self.char_filter(filter))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let tokenizer = self.tokenizer(tokenizer_name)?;
+                let filters = names(definition.get("filter"))
+                    .map_err(|reason| error(format!("`filter` {reason}")))?
+                    .iter()
+                    .map(|filter| self.token_filter(filter))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(CustomAnalyzer::new(char_filters, tokenizer, filters))
+            }
+            "standard" => {
+                let max_token_length = usize_param(definition, "max_token_length")
+                    .map_err(error)?
+                    .unwrap_or(DEFAULT_MAX_TOKEN_LENGTH);
+                let stop = stop_words(definition.get("stopwords"), false).map_err(error)?;
+                let stop = (!stop.is_empty()).then_some(TokenFilter::Stop {
+                    words: stop,
+                    ignore_case: false,
+                });
+                Ok(CustomAnalyzer::standard(max_token_length, stop))
+            }
+            "simple" => Ok(CustomAnalyzer::new(
+                Vec::new(),
+                Tokenizer::Lowercase,
+                Vec::new(),
+            )),
+            "whitespace" => Ok(CustomAnalyzer::new(
+                Vec::new(),
+                Tokenizer::Whitespace,
+                Vec::new(),
+            )),
+            "keyword" => Ok(CustomAnalyzer::new(
+                Vec::new(),
+                Tokenizer::Keyword,
+                Vec::new(),
+            )),
+            "stop" => {
+                let words = stop_words(definition.get("stopwords"), true).map_err(error)?;
+                Ok(CustomAnalyzer::new(
+                    Vec::new(),
+                    Tokenizer::Lowercase,
+                    vec![TokenFilter::Stop {
+                        words,
+                        ignore_case: false,
+                    }],
+                ))
+            }
+            other => Err(error(format!("analyzer type [{other}] is not supported"))),
+        }
+    }
+
+    fn normalizer(
+        &self,
+        name: &str,
+        definition: &Map<String, Value>,
+    ) -> Result<CustomAnalyzer, MappingError> {
+        let error = |reason: String| component_error("normalizer", name, reason);
+        let kind = definition
+            .get("type")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| error("`type` must be a string".to_owned()))
+            })
+            .transpose()?
+            .unwrap_or("custom");
+        if kind != "custom" {
+            return Err(error(format!("normalizer type [{kind}] is not supported")));
+        }
+        if definition.contains_key("tokenizer") {
+            return Err(error("a normalizer cannot declare a tokenizer".to_owned()));
+        }
+        let char_filters = names(definition.get("char_filter"))
+            .map_err(|reason| error(format!("`char_filter` {reason}")))?
+            .iter()
+            .map(|filter| self.char_filter(filter))
+            .collect::<Result<Vec<_>, _>>()?;
+        let filters = names(definition.get("filter"))
+            .map_err(|reason| error(format!("`filter` {reason}")))?
+            .iter()
+            .map(|filter| self.token_filter(filter))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CustomAnalyzer::new(
+            char_filters,
+            Tokenizer::Keyword,
+            filters,
+        ))
+    }
+
+    fn char_filter(&self, name: &str) -> Result<CharFilter, MappingError> {
+        let error = |reason: String| component_error("char_filter", name, reason);
+        let Some(definition) = self.declared("char_filter", name) else {
+            return Err(error(format!(
+                "char_filter [{name}] is neither declared nor a supported builtin"
+            )));
+        };
+        let kind = definition.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "pattern_replace" => {
+                let pattern = definition
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| error("pattern_replace requires a `pattern`".to_owned()))?;
+                let replacement = definition
+                    .get("replacement")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let flags = definition
+                    .get("flags")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                PatternReplaceCharFilter::new(pattern, replacement, flags)
+                    .map(CharFilter::PatternReplace)
+                    .map_err(|analysis| error(analysis.message))
+            }
+            other => Err(error(format!(
+                "char_filter type [{other}] is not supported"
+            ))),
+        }
+    }
+
+    fn tokenizer(&self, name: &str) -> Result<Tokenizer, MappingError> {
+        let error = |reason: String| component_error("tokenizer", name, reason);
+        let Some(definition) = self.declared("tokenizer", name) else {
+            return builtin_tokenizer(name).ok_or_else(|| {
+                error(format!(
+                    "tokenizer [{name}] is neither declared nor a supported builtin"
+                ))
+            });
+        };
+        let kind = definition.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "standard" => Ok(Tokenizer::Standard {
+                max_token_length: usize_param(definition, "max_token_length")
+                    .map_err(error)?
+                    .unwrap_or(DEFAULT_MAX_TOKEN_LENGTH),
+            }),
+            "keyword" => Ok(Tokenizer::Keyword),
+            "whitespace" => Ok(Tokenizer::Whitespace),
+            "letter" => Ok(Tokenizer::Letter),
+            "lowercase" => Ok(Tokenizer::Lowercase),
+            "edge_ngram" | "edgeNGram" => {
+                let min_gram = usize_param(definition, "min_gram")
+                    .map_err(error)?
+                    .unwrap_or(1);
+                let max_gram = usize_param(definition, "max_gram")
+                    .map_err(error)?
+                    .unwrap_or(2);
+                if min_gram == 0 || min_gram > max_gram {
+                    return Err(error(format!(
+                        "edge_ngram requires 1 <= min_gram <= max_gram (got {min_gram}, {max_gram})"
+                    )));
+                }
+                let token_chars = token_chars(definition).map_err(error)?;
+                Ok(Tokenizer::EdgeNgram {
+                    min_gram,
+                    max_gram,
+                    token_chars,
+                })
+            }
+            other => Err(error(format!("tokenizer type [{other}] is not supported"))),
+        }
+    }
+
+    fn token_filter(&self, name: &str) -> Result<TokenFilter, MappingError> {
+        let error = |reason: String| component_error("filter", name, reason);
+        let Some(definition) = self.declared("filter", name) else {
+            return builtin_token_filter(name).ok_or_else(|| {
+                error(format!(
+                    "filter [{name}] is neither declared nor a supported builtin"
+                ))
+            });
+        };
+        let kind = definition.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "lowercase" if definition.get("language").is_none() => Ok(TokenFilter::Lowercase),
+            "uppercase" => Ok(TokenFilter::Uppercase),
+            "trim" => Ok(TokenFilter::Trim),
+            "asciifolding" => Ok(TokenFilter::AsciiFolding {
+                preserve_original: bool_param(definition, "preserve_original")
+                    .map_err(error)?
+                    .unwrap_or(false),
+            }),
+            "stop" => {
+                let ignore_case = bool_param(definition, "ignore_case")
+                    .map_err(error)?
+                    .unwrap_or(false);
+                let mut words = stop_words(definition.get("stopwords"), true).map_err(error)?;
+                if ignore_case {
+                    words = words
+                        .iter()
+                        .map(|word| surch_analysis::java_lowercase(word))
+                        .collect();
+                }
+                Ok(TokenFilter::Stop { words, ignore_case })
+            }
+            other => Err(error(format!("filter type [{other}] is not supported"))),
+        }
+    }
+}
+
+fn builtin_tokenizer(name: &str) -> Option<Tokenizer> {
+    Some(match name {
+        "standard" => Tokenizer::Standard {
+            max_token_length: DEFAULT_MAX_TOKEN_LENGTH,
+        },
+        "keyword" => Tokenizer::Keyword,
+        "whitespace" => Tokenizer::Whitespace,
+        "letter" => Tokenizer::Letter,
+        "lowercase" => Tokenizer::Lowercase,
+        "edge_ngram" | "edgeNGram" => Tokenizer::EdgeNgram {
+            min_gram: 1,
+            max_gram: 2,
+            token_chars: TokenChars::default(),
+        },
+        _ => return None,
+    })
+}
+
+fn builtin_token_filter(name: &str) -> Option<TokenFilter> {
+    Some(match name {
+        "lowercase" => TokenFilter::Lowercase,
+        "uppercase" => TokenFilter::Uppercase,
+        "asciifolding" => TokenFilter::AsciiFolding {
+            preserve_original: false,
+        },
+        "trim" => TokenFilter::Trim,
+        "stop" => TokenFilter::english_stop(),
+        _ => return None,
+    })
+}
+
+fn component_error(section: &str, name: &str, reason: String) -> MappingError {
+    MappingError::AnalysisComponent {
+        section: section.to_owned(),
+        name: name.to_owned(),
+        reason,
+    }
+}
+
+/// A component list: a JSON array of names, or a single name.
+fn names(value: Option<&Value>) -> Result<Vec<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(name)) => Ok(vec![name.clone()]),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "entries must be strings".to_owned())
+            })
+            .collect(),
+        Some(_) => Err("must be a string or an array of strings".to_owned()),
+    }
+}
+
+/// ES accepts numbers and numeric strings for integer parameters.
+fn usize_param(definition: &Map<String, Value>, key: &str) -> Result<Option<usize>, String> {
+    match definition.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(|value| Some(value as usize))
+            .ok_or_else(|| format!("`{key}` must be a non-negative integer")),
+        Some(Value::String(text)) => text
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("`{key}` must be a non-negative integer")),
+        Some(_) => Err(format!("`{key}` must be a non-negative integer")),
+    }
+}
+
+fn bool_param(definition: &Map<String, Value>, key: &str) -> Result<Option<bool>, String> {
+    match definition.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::String(text)) if text == "true" || text == "false" => Ok(Some(text == "true")),
+        Some(_) => Err(format!("`{key}` must be a boolean")),
+    }
+}
+
+/// `stopwords`: a list, `_english_`, or `_none_`. `english_default` is the
+/// value when absent (`stop` filter / analyzer: `_english_`; `standard`
+/// analyzer: `_none_`).
+fn stop_words(value: Option<&Value>, english_default: bool) -> Result<BTreeSet<String>, String> {
+    let english = || {
+        surch_analysis::ENGLISH_STOP_WORDS
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    match value {
+        None | Some(Value::Null) => Ok(if english_default {
+            english()
+        } else {
+            BTreeSet::new()
+        }),
+        Some(Value::String(name)) if name == "_english_" => Ok(english()),
+        Some(Value::String(name)) if name == "_none_" => Ok(BTreeSet::new()),
+        Some(Value::String(name)) => Err(format!("stopwords set [{name}] is not supported")),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "`stopwords` entries must be strings".to_owned())
+            })
+            .collect(),
+        Some(_) => Err("`stopwords` must be a list or a predefined set".to_owned()),
+    }
+}
+
+fn token_chars(definition: &Map<String, Value>) -> Result<TokenChars, String> {
+    let mut chars = TokenChars::default();
+    for class in
+        names(definition.get("token_chars")).map_err(|reason| format!("`token_chars` {reason}"))?
+    {
+        match class.as_str() {
+            "letter" => chars.letter = true,
+            "digit" => chars.digit = true,
+            "whitespace" => chars.whitespace = true,
+            "punctuation" => chars.punctuation = true,
+            "symbol" => chars.symbol = true,
+            "custom" => {
+                let custom = definition
+                    .get("custom_token_chars")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "token_chars `custom` requires `custom_token_chars`".to_owned()
+                    })?;
+                chars.custom.extend(custom.chars());
+            }
+            other => return Err(format!("unknown token_chars class [{other}]")),
+        }
+    }
+    Ok(chars)
+}
+
+/// A resolved, runnable analysis chain for one field.
+#[derive(Debug, Clone)]
 pub enum ResolvedAnalyzer {
+    /// One of Surch's builtin analyzers.
     Builtin(AnalyzerName),
-    EdgeNgram {
-        min_gram: usize,
-        max_gram: usize,
-        lowercase: bool,
-        asciifold: bool,
-    },
+    /// Surch's legacy builtin normalizer (lowercase + asciifolding on the
+    /// whole value), used when a keyword field names a builtin normalizer
+    /// that `settings.analysis` does not declare.
+    LegacyNormalizer,
+    /// A chain compiled from `settings.analysis`.
+    Custom(Arc<CustomAnalyzer>),
+}
+
+impl PartialEq for ResolvedAnalyzer {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Builtin(left), Self::Builtin(right)) => left == right,
+            (Self::LegacyNormalizer, Self::LegacyNormalizer) => true,
+            (Self::Custom(left), Self::Custom(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 impl ResolvedAnalyzer {
+    /// The token stream (terms, offsets, position increments).
+    pub fn tokens(&self, text: &str) -> Vec<Token> {
+        match self {
+            Self::Builtin(name) => name.token_stream(text),
+            Self::LegacyNormalizer => Normalizer.token_stream(text),
+            Self::Custom(chain) => chain.token_stream(text),
+        }
+    }
+
     /// All terms the analyzer emits for `text`, in emission order.
     pub fn terms(&self, text: &str) -> Vec<String> {
-        match self {
-            Self::Builtin(name) => name.terms(text),
-            Self::EdgeNgram {
-                min_gram,
-                max_gram,
-                lowercase,
-                asciifold,
-            } => EdgeNgramAnalyzer::new(*min_gram, *max_gram)
-                .token_stream(text)
-                .into_iter()
-                .map(|token| {
-                    let mut term = token.term;
-                    if *lowercase {
-                        term = term.to_lowercase();
-                    }
-                    if *asciifold {
-                        term = asciifold_string(&term);
-                    }
-                    term
-                })
-                .collect(),
-        }
+        self.tokens(text)
+            .into_iter()
+            .map(|token| token.term)
+            .collect()
     }
 
     /// The first emitted term (or empty string), for single-value projections.
     pub fn first_term(&self, text: &str) -> String {
-        self.terms(text).into_iter().next().unwrap_or_default()
+        self.tokens(text)
+            .into_iter()
+            .next()
+            .map(|token| token.term)
+            .unwrap_or_default()
     }
 }
 
@@ -594,45 +1129,52 @@ impl IndexMapping {
         self.analysis = analysis;
     }
 
-    pub fn analyzer(&self, field: &str) -> AnalyzerName {
-        self.fields
-            .get(field)
-            .map(|mapping| mapping.analyzer())
-            .unwrap_or_else(|| AnalyzerName::default_for(FieldType::Text))
+    /// Index-time analysis chain of `field` (a top-level field or a
+    /// multi-field sub-field `parent.sub`), see
+    /// [`FieldMapping::index_analyzer`]. An unmapped field is analysed as a
+    /// `text` field without analyzer (index `default`, else `standard`).
+    pub fn index_analyzer(&self, field: &str) -> ResolvedAnalyzer {
+        match self.resolve_field(field) {
+            Some(mapping) => mapping.index_analyzer(&self.analysis),
+            None => self.analysis.default_index_analyzer(),
+        }
     }
 
-    /// A1/A13: query-time tokens for `field` when it declares a custom
-    /// analyzer or an explicit `search_analyzer`; `None` otherwise so the
-    /// caller keeps the legacy `analyzer(field).terms(value)` path
-    /// (regression-safe for every field that uses only builtins).
-    ///
-    /// Resolution order mirrors ES: a `search_analyzer` (custom then builtin)
-    /// overrides the index `analyzer` (custom then builtin) at query time.
-    /// Resolves subfield paths (`parent.sub`) via [`Self::resolve_field`]. An
-    /// unresolvable custom name yields empty tokens (no match) rather than
-    /// silently falling back.
-    pub fn custom_search_terms_for_field(&self, value: &str, field: &str) -> Option<Vec<String>> {
-        let mapping = self.resolve_field(field)?;
-        if let Some(name) = &mapping.custom_search_analyzer {
-            return Some(
-                self.analysis
-                    .resolve_analyzer(name)
-                    .map(|resolved| resolved.terms(value))
-                    .unwrap_or_default(),
-            );
+    /// Query-time analysis chain of `field` (`match`, `match_phrase`,
+    /// `multi_match`, fuzzy `match`), see [`FieldMapping::search_analyzer`].
+    pub fn search_analyzer(&self, field: &str) -> ResolvedAnalyzer {
+        match self.resolve_field(field) {
+            Some(mapping) => mapping.search_analyzer(&self.analysis),
+            None => self
+                .analysis
+                .default_search_analyzer()
+                .unwrap_or_else(|| self.analysis.default_index_analyzer()),
         }
-        if let Some(builtin) = mapping.search_analyzer {
-            return Some(builtin.terms(value));
+    }
+
+    /// The terms the index holds for `value` in `field`.
+    pub fn index_terms(&self, field: &str, value: &str) -> Vec<String> {
+        self.index_analyzer(field).terms(value)
+    }
+
+    /// The terms a full-text query on `field` looks up for `value`.
+    pub fn search_terms(&self, field: &str, value: &str) -> Vec<String> {
+        self.search_analyzer(field).terms(value)
+    }
+
+    /// The single term a term-level query (`term`, `terms`, `prefix`) looks
+    /// up for `value` in `field`. On a `keyword` field this is the value
+    /// passed through the field's normalizer (ES `normalize`), verbatim
+    /// without one. On a `text` field ES does not analyse term-level
+    /// queries; Surch keeps its historical behaviour there (first term of
+    /// the search analyzer), a documented deviation.
+    pub fn term_query_value(&self, field: &str, value: &str) -> String {
+        match self.resolve_field(field) {
+            Some(mapping) if mapping.field_type != FieldType::Text => {
+                mapping.index_analyzer(&self.analysis).first_term(value)
+            }
+            _ => self.search_analyzer(field).first_term(value),
         }
-        if let Some(name) = &mapping.custom_analyzer {
-            return Some(
-                self.analysis
-                    .resolve_analyzer(name)
-                    .map(|resolved| resolved.terms(value))
-                    .unwrap_or_default(),
-            );
-        }
-        None
     }
 
     pub fn norms_enabled(&self, field: &str) -> bool {
@@ -669,9 +1211,11 @@ impl IndexMapping {
     /// declared with a `normalizer`, returns that normalizer so callers
     /// (e.g. sort) can apply it to the parent's stored value at read
     /// time, until write-time fan-out lands.
-    pub fn subfield_normalizer(&self, path: &str) -> Option<AnalyzerName> {
+    pub fn subfield_normalizer(&self, path: &str) -> Option<ResolvedAnalyzer> {
         let (parent, sub) = path.rsplit_once('.')?;
-        self.fields.get(parent)?.fields.get(sub)?.normalizer
+        let sub = self.fields.get(parent)?.fields.get(sub)?;
+        sub.normalizer_name()?;
+        Some(sub.index_analyzer(&self.analysis))
     }
 
     pub fn as_value(&self) -> Value {
@@ -737,156 +1281,22 @@ impl IndexMapping {
         Ok(mapping)
     }
 
-    /// Parses the `settings.analysis` block of a `PUT /:index` body.
-    ///
-    /// Accepted shape (subset, matching `deces_index.yml`):
-    ///
-    /// ```json
-    /// {
-    ///   "analysis": {
-    ///     "tokenizer": {
-    ///       "edge_ngram_tokenizer": {
-    ///         "type": "edge_ngram",
-    ///         "min_gram": 2,
-    ///         "max_gram": 20,
-    ///         "token_chars": ["letter", "digit"]
-    ///       }
-    ///     },
-    ///     "analyzer": {
-    ///       "norm": { "tokenizer": "standard", "filter": ["lowercase", "asciifolding"] }
-    ///     },
-    ///     "normalizer": {
-    ///       "norm": { "type": "custom", "filter": ["lowercase", "asciifolding"] }
-    ///     }
-    ///   }
-    /// }
-    /// ```
-    ///
-    /// Unknown tokenizer types are skipped silently (forward-compatible);
-    /// only `edge_ngram` is captured for the MVP. Filter names other than
-    /// `lowercase`/`asciifolding` are accepted but stored verbatim for
-    /// later inspection — the executor honours only the two we ship.
+    /// Parses and compiles the `analysis` block of a `PUT /:index`
+    /// `settings` object (`settings.analysis`, or the long form
+    /// `settings.index.analysis`). See [`AnalysisSettings`] for the
+    /// supported components; an absent block yields empty settings.
     pub fn from_index_settings_value(value: &Value) -> Result<AnalysisSettings, MappingError> {
         let settings = value.as_object().ok_or(MappingError::SettingsNotObject)?;
-
-        let analysis = match settings.get("analysis") {
-            Some(value) => value.as_object().ok_or(MappingError::AnalysisNotObject)?,
-            None => return Ok(AnalysisSettings::default()),
-        };
-
-        let mut parsed = AnalysisSettings::default();
-
-        if let Some(tokenizers) = analysis.get("tokenizer") {
-            let tokenizers =
-                tokenizers
-                    .as_object()
-                    .ok_or(MappingError::AnalysisSectionNotObject {
-                        section: "tokenizer".to_owned(),
-                    })?;
-            for (name, definition) in tokenizers {
-                let definition =
-                    definition
-                        .as_object()
-                        .ok_or_else(|| MappingError::AnalysisEntryNotObject {
-                            section: "tokenizer".to_owned(),
-                            name: name.clone(),
-                        })?;
-                let kind = definition.get("type").and_then(Value::as_str).unwrap_or("");
-                if kind != "edge_ngram" {
-                    // forward-compatible: skip unsupported tokenizer types
-                    continue;
-                }
-                let min_gram = definition
-                    .get("min_gram")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| MappingError::EdgeNgramMissingBound {
-                        name: name.clone(),
-                        bound: "min_gram".to_owned(),
-                    })? as usize;
-                let max_gram = definition
-                    .get("max_gram")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| MappingError::EdgeNgramMissingBound {
-                        name: name.clone(),
-                        bound: "max_gram".to_owned(),
-                    })? as usize;
-                let token_chars = definition
-                    .get("token_chars")
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                parsed.tokenizers.insert(
-                    name.clone(),
-                    EdgeNgramTokenizerDefinition {
-                        min_gram,
-                        max_gram,
-                        token_chars,
-                    },
-                );
-            }
+        let analysis = settings.get("analysis").or_else(|| {
+            settings
+                .get("index")
+                .and_then(Value::as_object)
+                .and_then(|index| index.get("analysis"))
+        });
+        match analysis {
+            Some(analysis) => AnalysisSettings::from_analysis_value(analysis),
+            None => Ok(AnalysisSettings::default()),
         }
-
-        if let Some(analyzers) = analysis.get("analyzer") {
-            let analyzers =
-                analyzers
-                    .as_object()
-                    .ok_or(MappingError::AnalysisSectionNotObject {
-                        section: "analyzer".to_owned(),
-                    })?;
-            for (name, definition) in analyzers {
-                let definition =
-                    definition
-                        .as_object()
-                        .ok_or_else(|| MappingError::AnalysisEntryNotObject {
-                            section: "analyzer".to_owned(),
-                            name: name.clone(),
-                        })?;
-                let tokenizer = definition
-                    .get("tokenizer")
-                    .and_then(Value::as_str)
-                    .unwrap_or("standard")
-                    .to_owned();
-                let filter = read_filter_chain(definition, name, "analyzer")?;
-                parsed
-                    .analyzers
-                    .insert(name.clone(), AnalyzerDefinition { tokenizer, filter });
-            }
-        }
-
-        if let Some(normalizers) = analysis.get("normalizer") {
-            let normalizers =
-                normalizers
-                    .as_object()
-                    .ok_or(MappingError::AnalysisSectionNotObject {
-                        section: "normalizer".to_owned(),
-                    })?;
-            for (name, definition) in normalizers {
-                let definition =
-                    definition
-                        .as_object()
-                        .ok_or_else(|| MappingError::AnalysisEntryNotObject {
-                            section: "normalizer".to_owned(),
-                            name: name.clone(),
-                        })?;
-                let kind = definition
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("custom")
-                    .to_owned();
-                let filter = read_filter_chain(definition, name, "normalizer")?;
-                parsed
-                    .normalizers
-                    .insert(name.clone(), NormalizerDefinition { kind, filter });
-            }
-        }
-
-        Ok(parsed)
     }
 }
 
@@ -975,21 +1385,29 @@ fn parse_field_definition(
         });
     }
 
-    let normalizer = match object.get("normalizer") {
+    // A builtin name (`norm`, ...) is kept as `normalizer`; any other name
+    // (ES builtin `lowercase`, a user-defined normalizer) as
+    // `custom_normalizer`. Both resolve against `settings.analysis` at
+    // index/query time.
+    let (normalizer, custom_normalizer) = match object.get("normalizer") {
         Some(value) => {
             let value = value
                 .as_str()
                 .ok_or_else(|| MappingError::NormalizerNotString {
                     field: field.to_owned(),
                 })?;
-            Some(AnalyzerName::from_name(value).ok_or_else(|| {
-                MappingError::UnsupportedNormalizer {
+            if field_type != FieldType::Keyword {
+                return Err(MappingError::UnsupportedNormalizer {
                     field: field.to_owned(),
                     normalizer: value.to_owned(),
-                }
-            })?)
+                });
+            }
+            match AnalyzerName::from_name(value) {
+                Some(builtin) => (Some(builtin), None),
+                None => (None, Some(value.to_owned())),
+            }
         }
-        None => None,
+        None => (None, None),
     };
 
     let index_prefixes = match object.get("index_prefixes") {
@@ -1055,6 +1473,7 @@ fn parse_field_definition(
         .with_custom_analyzer(custom_analyzer)
         .with_search_analyzer(search_analyzer, custom_search_analyzer)
         .with_normalizer(normalizer)
+        .with_custom_normalizer(custom_normalizer)
         .with_index_prefixes(index_prefixes)
         .with_date_format(date_format)
         .with_subfields(subfields))
@@ -1118,25 +1537,6 @@ fn parse_index_prefixes(field: &str, value: &Value) -> Result<FieldPrefixes, Map
     })
 }
 
-fn read_filter_chain(
-    definition: &Map<String, Value>,
-    name: &str,
-    section: &str,
-) -> Result<Vec<String>, MappingError> {
-    match definition.get("filter") {
-        Some(Value::Array(values)) => Ok(values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect()),
-        Some(_) => Err(MappingError::AnalysisFilterNotArray {
-            section: section.to_owned(),
-            name: name.to_owned(),
-        }),
-        None => Ok(Vec::new()),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MappingError {
     #[error("mapping properties must be an object")]
@@ -1171,10 +1571,12 @@ pub enum MappingError {
     AnalysisSectionNotObject { section: String },
     #[error("settings.analysis.{section}.{name} must be an object")]
     AnalysisEntryNotObject { section: String, name: String },
-    #[error("settings.analysis.{section}.{name}.filter must be an array")]
-    AnalysisFilterNotArray { section: String, name: String },
-    #[error("edge_ngram tokenizer `{name}` missing required field `{bound}`")]
-    EdgeNgramMissingBound { name: String, bound: String },
+    #[error("settings.analysis.{section}.{name}: {reason}")]
+    AnalysisComponent {
+        section: String,
+        name: String,
+        reason: String,
+    },
     #[error("field `{field}` index_prefixes must be an object")]
     IndexPrefixesNotObject { field: String },
     #[error("field `{field}` index_prefixes has unknown key `{key}`")]
@@ -1276,17 +1678,9 @@ mod tests {
         let resolved = settings
             .resolve_analyzer("autocomplete_analyzer")
             .expect("custom analyzer resolves");
-        assert_eq!(
-            resolved,
-            ResolvedAnalyzer::EdgeNgram {
-                min_gram: 2,
-                max_gram: 4,
-                lowercase: true,
-                asciifold: true,
-            }
-        );
-        // Édgg-ngram prefixes of "Élan" (len 2..=4) then lowercase + asciifold:
-        // "Él"/"Éla"/"Élan" -> "el"/"ela"/"elan".
+        assert!(matches!(resolved, ResolvedAnalyzer::Custom(_)));
+        // Edge-ngram prefixes of "Élan" (len 2..=4) then lowercase +
+        // asciifold: "Él"/"Éla"/"Élan" -> "el"/"ela"/"elan".
         assert_eq!(resolved.terms("Élan"), vec!["el", "ela", "elan"]);
         assert_eq!(resolved.first_term("Élan"), "el");
     }
@@ -1317,18 +1711,19 @@ mod tests {
     }
 
     #[test]
-    fn custom_search_terms_use_search_analyzer_not_edge_ngram() {
+    fn search_terms_use_search_analyzer_not_edge_ngram() {
         let mapping = nom_autocomplete_index_mapping();
         // The autocomplete sub-field indexes edge_ngram prefixes, but its
         // `search_analyzer: standard` tokenizes the QUERY whole (lowercased),
         // so "Dupont" -> ["dupont"], NOT the ngram expansion.
         assert_eq!(
-            mapping.custom_search_terms_for_field("Dupont", "NOM.autocomplete"),
-            Some(vec!["dupont".to_owned()])
+            mapping.search_terms("NOM.autocomplete", "Dupont"),
+            vec!["dupont".to_owned()]
         );
-        // A plain builtin field returns None so the caller keeps the legacy
-        // `analyzer(field).terms()` path (regression-safe).
-        assert_eq!(mapping.custom_search_terms_for_field("Dupont", "NOM"), None);
+        assert_eq!(
+            mapping.index_terms("NOM.autocomplete", "Dupont"),
+            vec!["du", "dup", "dupo"]
+        );
     }
 
     #[test]
@@ -1347,81 +1742,207 @@ mod tests {
         let mut mapping = IndexMapping::from_properties_value(&properties).expect("mapping parse");
         mapping.set_analysis(deces_autocomplete_settings());
         assert_eq!(
-            mapping.custom_search_terms_for_field("Dup", "NOM.ac"),
-            Some(vec!["du".to_owned(), "dup".to_owned()])
+            mapping.search_terms("NOM.ac", "Dup"),
+            vec!["du".to_owned(), "dup".to_owned()]
         );
     }
 
-    #[test]
-    fn parses_deces_index_settings_with_edge_ngram_norm_and_normalizer() {
-        // JSON equivalent of the deces_index.yml `settings:` block excerpted
-        // in docs/wp-d-matchid/incoming/2026-05-15-deces-backend-dsl-inventory.md §2.12.
-        let settings = serde_json::json!({
+    /// `settings.analysis` of matchID's `deces_index.yml` (main `6732755`),
+    /// as the Python YAML loader hands it to ES: the duplicated
+    /// `autocomplete_analyzer.tokenizer` key keeps its last value
+    /// (`keyword`).
+    fn deces_real_settings() -> Value {
+        serde_json::json!({
             "analysis": {
-                "tokenizer": {
-                    "edge_ngram_tokenizer": {
-                        "type": "edge_ngram",
-                        "min_gram": 2,
-                        "max_gram": 20,
-                        "token_chars": ["letter", "digit"]
-                    }
-                },
                 "analyzer": {
-                    "autocomplete_analyzer": { "tokenizer": "edge_ngram_tokenizer" },
+                    "autocomplete_analyzer": {
+                        "filter": ["asciifolding", "lowercase"],
+                        "tokenizer": "keyword"
+                    },
                     "norm": {
                         "tokenizer": "standard",
-                        "filter": ["lowercase", "asciifolding"]
+                        "char_filter": ["alphanum"],
+                        "filter": ["asciifolding", "lowercase"]
                     }
                 },
                 "normalizer": {
                     "norm": {
                         "type": "custom",
-                        "filter": ["lowercase", "asciifolding"]
+                        "char_filter": ["alphanum"],
+                        "filter": ["asciifolding", "lowercase"]
+                    }
+                },
+                "tokenizer": {
+                    "edge_tokenizer2": {
+                        "type": "edge_ngram",
+                        "min_gram": 2,
+                        "max_gram": 10,
+                        "token_chars": ["letter", "digit"]
+                    }
+                },
+                "char_filter": {
+                    "alphanum": {
+                        "type": "pattern_replace",
+                        "pattern": "[^\\p{L}\\d]",
+                        "replacement": " "
                     }
                 }
             }
-        });
+        })
+    }
 
-        let analysis = IndexMapping::from_index_settings_value(&settings)
-            .expect("settings.analysis should parse without error");
-
-        let tokenizer = analysis
-            .tokenizers
-            .get("edge_ngram_tokenizer")
-            .expect("edge_ngram_tokenizer registered");
-        assert_eq!(tokenizer.min_gram, 2);
-        assert_eq!(tokenizer.max_gram, 20);
-        assert_eq!(
-            tokenizer.token_chars,
-            vec!["letter".to_owned(), "digit".to_owned()]
+    fn deces_real_mapping() -> IndexMapping {
+        let mut mapping = IndexMapping::from_properties_value(&serde_json::json!({
+            "NOM": {"type": "text", "analyzer": "norm",
+                    "fields": {"raw": {"type": "keyword", "normalizer": "norm"}}},
+            "CODE_INSEE_NAISSANCE": {"type": "keyword", "normalizer": "norm"},
+            "SEXE": {"type": "keyword"},
+            "DATE_NAISSANCE": {"type": "text",
+                "index_prefixes": {"min_chars": 4, "max_chars": 6},
+                "fields": {"raw": {"type": "keyword"}}}
+        }))
+        .expect("deces properties parse");
+        mapping.set_analysis(
+            IndexMapping::from_index_settings_value(&deces_real_settings())
+                .expect("deces settings compile"),
         );
+        mapping
+    }
 
-        let norm_analyzer = analysis
-            .analyzers
-            .get("norm")
-            .expect("norm analyzer registered");
-        assert_eq!(norm_analyzer.tokenizer, "standard");
+    #[test]
+    fn deces_settings_compile_every_declared_chain() {
+        let analysis = IndexMapping::from_index_settings_value(&deces_real_settings())
+            .expect("settings.analysis should compile");
         assert_eq!(
-            norm_analyzer.filter,
-            vec!["lowercase".to_owned(), "asciifolding".to_owned()]
+            analysis.analyzer_names().collect::<Vec<_>>(),
+            vec!["autocomplete_analyzer", "norm"]
         );
-
+        assert_eq!(
+            analysis.normalizer_names().collect::<Vec<_>>(),
+            vec!["norm"]
+        );
+        // The declared JSON round-trips verbatim (persistence, _settings).
+        assert_eq!(analysis.to_value(), deces_real_settings()["analysis"]);
         let autocomplete = analysis
-            .analyzers
-            .get("autocomplete_analyzer")
-            .expect("autocomplete_analyzer registered");
-        assert_eq!(autocomplete.tokenizer, "edge_ngram_tokenizer");
-        assert!(autocomplete.filter.is_empty());
+            .resolve_analyzer("autocomplete_analyzer")
+            .expect("declared");
+        assert_eq!(autocomplete.terms("Saint-Étienne"), vec!["saint-etienne"]);
+    }
 
-        let normalizer = analysis
-            .normalizers
-            .get("norm")
-            .expect("norm normalizer registered");
-        assert_eq!(normalizer.kind, "custom");
+    #[test]
+    fn deces_custom_norm_shadows_the_legacy_builtin() {
+        let mapping = deces_real_mapping();
+        // Custom `norm` analyzer: alphanum char filter splits apostrophes.
         assert_eq!(
-            normalizer.filter,
-            vec!["lowercase".to_owned(), "asciifolding".to_owned()]
+            mapping.index_terms("NOM", "D'ARTAGNAN"),
+            vec!["d", "artagnan"]
         );
+        // Custom `norm` normalizer on the `.raw` sub-field: one term.
+        assert_eq!(
+            mapping.index_terms("NOM.raw", "Saint-Étienne"),
+            vec!["saint etienne"]
+        );
+        // A `match` on the keyword sub-field analyses the query with the
+        // same normalizer.
+        assert_eq!(
+            mapping.search_terms("NOM.raw", "SAINT-ETIENNE"),
+            vec!["saint etienne"]
+        );
+        // Top-level keyword with a normalizer: index and term query agree.
+        assert_eq!(
+            mapping.index_terms("CODE_INSEE_NAISSANCE", "2A004"),
+            vec!["2a004"]
+        );
+        assert_eq!(
+            mapping.term_query_value("CODE_INSEE_NAISSANCE", "2A004"),
+            "2a004"
+        );
+        // Keyword without normalizer: verbatim.
+        assert_eq!(mapping.term_query_value("SEXE", "M"), "M");
+    }
+
+    #[test]
+    fn deces_dates_use_the_standard_default_and_keep_digits() {
+        let mapping = deces_real_mapping();
+        assert_eq!(
+            mapping.index_terms("DATE_NAISSANCE", "19290107"),
+            vec!["19290107"]
+        );
+        assert_eq!(
+            mapping.search_terms("DATE_NAISSANCE", "19290107"),
+            vec!["19290107"]
+        );
+        assert_eq!(
+            mapping.search_terms("DATE_NAISSANCE.raw", "19290107"),
+            vec!["19290107"]
+        );
+        assert_eq!(mapping.term_query_value("DATE_NAISSANCE", "1929"), "1929");
+    }
+
+    #[test]
+    fn analysis_rejects_unsupported_or_dangling_components() {
+        let cases = [
+            serde_json::json!({"analysis": {"char_filter": {"h": {"type": "html_strip"}},
+                "analyzer": {"a": {"tokenizer": "standard", "char_filter": ["h"]}}}}),
+            serde_json::json!({"analysis": {"analyzer": {"a": {"tokenizer": "missing"}}}}),
+            serde_json::json!({"analysis": {"analyzer": {"a": {"tokenizer": "standard",
+                "filter": ["snowball"]}}}}),
+            serde_json::json!({"analysis": {"char_filter": {"c": {"type": "pattern_replace",
+                "pattern": "(?<=a)b"}}, "normalizer": {"n": {"char_filter": ["c"]}}}}),
+            serde_json::json!({"analysis": {"analyzer": {"a": {"filter": ["lowercase"]}}}}),
+        ];
+        for settings in cases {
+            let error =
+                IndexMapping::from_index_settings_value(&settings).expect_err("must fail closed");
+            assert!(
+                matches!(error, MappingError::AnalysisComponent { .. }),
+                "{settings}: {error:?}"
+            );
+        }
+        // An unsupported component nobody references is accepted.
+        IndexMapping::from_index_settings_value(&serde_json::json!({
+            "analysis": {"char_filter": {"h": {"type": "html_strip"}}}
+        }))
+        .expect("unreferenced components are kept verbatim");
+    }
+
+    #[test]
+    fn settings_index_analysis_long_form_is_read() {
+        let analysis = IndexMapping::from_index_settings_value(&serde_json::json!({
+            "index": {"analysis": {"normalizer": {"n": {"filter": ["lowercase"]}}}}
+        }))
+        .expect("long form parses");
+        assert_eq!(analysis.normalizer_names().collect::<Vec<_>>(), vec!["n"]);
+    }
+
+    #[test]
+    fn es_lowercase_builtin_normalizer_and_default_analyzer() {
+        let mut mapping = IndexMapping::from_properties_value(&serde_json::json!({
+            "code": {"type": "keyword", "normalizer": "lowercase"},
+            "body": {"type": "text"}
+        }))
+        .expect("parse");
+        assert_eq!(mapping.index_terms("code", "AbC-1"), vec!["abc-1"]);
+        mapping.set_analysis(
+            IndexMapping::from_index_settings_value(&serde_json::json!({
+                "analysis": {"analyzer": {"default": {"tokenizer": "whitespace"}}}
+            }))
+            .expect("parse"),
+        );
+        // `default` replaces `standard` for text fields declaring no analyzer.
+        assert_eq!(
+            mapping.index_terms("body", "Jean-Paul X"),
+            vec!["Jean-Paul", "X"]
+        );
+    }
+
+    #[test]
+    fn normalizer_is_rejected_on_text_fields() {
+        let error = IndexMapping::from_properties_value(&serde_json::json!({
+            "NOM": {"type": "text", "normalizer": "norm"}
+        }))
+        .expect_err("ES rejects a normalizer on text");
+        assert!(matches!(error, MappingError::UnsupportedNormalizer { .. }));
     }
 
     #[test]
@@ -1711,7 +2232,7 @@ mod tests {
         assert_eq!(raw.field_type, FieldType::Keyword);
         assert_eq!(
             mapping.subfield_normalizer("NOM.raw"),
-            Some(AnalyzerName::Norm),
+            Some(ResolvedAnalyzer::LegacyNormalizer),
         );
         // Top-level paths are unaffected.
         assert!(mapping.resolve_field("NOM").is_some());

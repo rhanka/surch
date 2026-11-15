@@ -100,7 +100,11 @@ pub struct JavaRegexFlags {
 impl JavaRegexFlags {
     pub fn parse(flags: &str) -> Result<Self, AnalysisError> {
         let mut parsed = Self::default();
-        for flag in flags.split('|').map(str::trim).filter(|flag| !flag.is_empty()) {
+        for flag in flags
+            .split('|')
+            .map(str::trim)
+            .filter(|flag| !flag.is_empty())
+        {
             match flag {
                 "CASE_INSENSITIVE" => parsed.case_insensitive = true,
                 "MULTILINE" => parsed.multiline = true,
@@ -343,7 +347,9 @@ impl PatternReplaceCharFilter {
         let flags = JavaRegexFlags::parse(flags)?;
         let translated = translate_java_regex(pattern, flags)?;
         let regex = Regex::new(&translated).map_err(|error| {
-            AnalysisError::new(format!("invalid pattern_replace pattern [{pattern}]: {error}"))
+            AnalysisError::new(format!(
+                "invalid pattern_replace pattern [{pattern}]: {error}"
+            ))
         })?;
         let group_count = regex.captures_len().saturating_sub(1);
         let replacement = translate_java_replacement(replacement, group_count)?;

@@ -128,8 +128,8 @@ mod tests {
                 "The 2 QUICK Brown-Foxes jumped over the lazy dog's bone."
             ),
             vec![
-                "The", "2", "QUICK", "Brown", "Foxes", "jumpe", "d", "over", "the", "lazy", "dog's",
-                "bone"
+                "The", "2", "QUICK", "Brown", "Foxes", "jumpe", "d", "over", "the", "lazy",
+                "dog's", "bone"
             ]
         );
     }
@@ -146,6 +146,9 @@ mod tests {
 
     #[test]
     fn splits_ideographs_one_per_token() {
-        assert_eq!(terms(StandardTokenizer::default(), "北京"), vec!["北", "京"]);
+        assert_eq!(
+            terms(StandardTokenizer::default(), "北京"),
+            vec!["北", "京"]
+        );
     }
 }

@@ -64,7 +64,7 @@ impl TokenChars {
 }
 
 fn is_symbol(character: char) -> bool {
-    matches!(character, '$' | '+' | '<' | '=' | '>' | '|' | '~' | '^' | '`')
+    is_symbol_ascii(character)
         || (!character.is_ascii()
             && !character.is_alphanumeric()
             && !character.is_whitespace()
@@ -85,7 +85,10 @@ fn is_punctuation(character: char) -> bool {
 }
 
 fn is_symbol_ascii(character: char) -> bool {
-    matches!(character, '$' | '+' | '<' | '=' | '>' | '|' | '~' | '^' | '`')
+    matches!(
+        character,
+        '$' | '+' | '<' | '=' | '>' | '|' | '~' | '^' | '`'
+    )
 }
 
 /// The tokenizer of a chain.
@@ -291,7 +294,11 @@ pub struct CustomAnalyzer {
 }
 
 impl CustomAnalyzer {
-    pub fn new(char_filters: Vec<CharFilter>, tokenizer: Tokenizer, filters: Vec<TokenFilter>) -> Self {
+    pub fn new(
+        char_filters: Vec<CharFilter>,
+        tokenizer: Tokenizer,
+        filters: Vec<TokenFilter>,
+    ) -> Self {
         Self {
             char_filters,
             tokenizer,
@@ -321,9 +328,7 @@ impl Analyzer for CustomAnalyzer {
             corrections.push(correction);
             filtered = Some(next);
         }
-        let mut tokens = self
-            .tokenizer
-            .tokenize(filtered.as_deref().unwrap_or(text));
+        let mut tokens = self.tokenizer.tokenize(filtered.as_deref().unwrap_or(text));
         if !corrections.is_empty() {
             for token in &mut tokens {
                 for correction in corrections.iter().rev() {
@@ -413,8 +418,18 @@ mod tests {
         assert_eq!(
             terms(&edge, "Jean-Baptistounet X"),
             vec![
-                "Je", "Jea", "Jean", "Ba", "Bap", "Bapt", "Bapti", "Baptis", "Baptist",
-                "Baptisto", "Baptistou", "Baptistoun"
+                "Je",
+                "Jea",
+                "Jean",
+                "Ba",
+                "Bap",
+                "Bapt",
+                "Bapti",
+                "Baptis",
+                "Baptist",
+                "Baptisto",
+                "Baptistou",
+                "Baptistoun"
             ]
         );
     }
