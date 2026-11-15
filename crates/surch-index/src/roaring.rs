@@ -116,6 +116,97 @@ impl RoaringDocSet {
         bytes
     }
 
+    /// MVP L6 persistence (`docs/ops/persistence.md`): exact container-level
+    /// encoding — `len u64 | chunk count u32 | per chunk: key u16, tag u8
+    /// (0 = array, 1 = bitmap), then either `count u32` + `count` low-16
+    /// values or the 1 024 bitmap words`, all little-endian. Decoding
+    /// rebuilds the identical structure without re-deriving it from doc-ids.
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.len as u64).to_le_bytes());
+        out.extend_from_slice(&(self.chunks.len() as u32).to_le_bytes());
+        for (key, container) in &self.chunks {
+            out.extend_from_slice(&key.to_le_bytes());
+            match container {
+                Container::Array(values) => {
+                    out.push(0);
+                    out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                    for value in values {
+                        out.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                Container::Bitmap(words) => {
+                    out.push(1);
+                    for word in words.iter() {
+                        out.extend_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inverse of [`Self::encode_into`]. `None` on any structural
+    /// inconsistency (truncation, unsorted keys or values, length mismatch,
+    /// trailing bytes) — the caller treats it as a corrupt file.
+    pub(crate) fn decode_from(bytes: &[u8]) -> Option<Self> {
+        fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            if bytes.len() < n {
+                return None;
+            }
+            let (head, tail) = bytes.split_at(n);
+            *bytes = tail;
+            Some(head)
+        }
+        let mut input = bytes;
+        let len = u64::from_le_bytes(take(&mut input, 8)?.try_into().ok()?);
+        let chunk_count = u32::from_le_bytes(take(&mut input, 4)?.try_into().ok()?) as usize;
+        if chunk_count > input.len() {
+            return None;
+        }
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut total = 0u64;
+        let mut previous_key: Option<u16> = None;
+        for _ in 0..chunk_count {
+            let key = u16::from_le_bytes(take(&mut input, 2)?.try_into().ok()?);
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return None;
+            }
+            previous_key = Some(key);
+            let container = match take(&mut input, 1)?[0] {
+                0 => {
+                    let count = u32::from_le_bytes(take(&mut input, 4)?.try_into().ok()?) as usize;
+                    let raw = take(&mut input, count.checked_mul(2)?)?;
+                    let values: Vec<u16> = raw
+                        .chunks_exact(2)
+                        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                        .collect();
+                    if count == 0 || values.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return None;
+                    }
+                    total += count as u64;
+                    Container::Array(values)
+                }
+                1 => {
+                    let raw = take(&mut input, WORDS_PER_CHUNK * 8)?;
+                    let mut words = Box::new([0u64; WORDS_PER_CHUNK]);
+                    for (word, chunk) in words.iter_mut().zip(raw.chunks_exact(8)) {
+                        *word = u64::from_le_bytes(chunk.try_into().ok()?);
+                        total += u64::from(word.count_ones());
+                    }
+                    Container::Bitmap(words)
+                }
+                _ => return None,
+            };
+            chunks.push((key, container));
+        }
+        if !input.is_empty() || total != len {
+            return None;
+        }
+        Some(Self {
+            chunks,
+            len: usize::try_from(len).ok()?,
+        })
+    }
+
     /// Call `f(doc_id)` for every doc-id in `self ∩ other`, ascending. The
     /// word-parallel AND of two dense chunks is the hot path (the gap-closer);
     /// mixed/sparse chunks fall back to membership tests / a sorted merge.
@@ -205,6 +296,29 @@ mod tests {
         let mut out = Vec::new();
         ra.intersect_for_each(&rb, |d| out.push(d));
         out
+    }
+
+    /// MVP L6: the persisted container encoding round-trips exactly and
+    /// rejects truncation / trailing bytes.
+    #[test]
+    fn persisted_encoding_round_trips_dense_and_sparse_chunks() {
+        let mut ids: Vec<u32> = (0..70_000).step_by(2).collect();
+        ids.extend((200_000..200_050).step_by(3));
+        let set = RoaringDocSet::from_sorted(&ids);
+        let mut bytes = Vec::new();
+        set.encode_into(&mut bytes);
+        let decoded = RoaringDocSet::decode_from(&bytes).expect("round trip");
+        let mut a = Vec::new();
+        set.intersect_for_each(&set, |d| a.push(d));
+        let mut b = Vec::new();
+        decoded.intersect_for_each(&decoded, |d| b.push(d));
+        assert_eq!(a, ids);
+        assert_eq!(b, ids);
+        assert_eq!(decoded.len(), set.len());
+        assert!(RoaringDocSet::decode_from(&bytes[..bytes.len() - 1]).is_none());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(RoaringDocSet::decode_from(&trailing).is_none());
     }
 
     /// Parity oracle: roaring ∩ == naive set ∩, across multi-chunk inputs that

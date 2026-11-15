@@ -3229,6 +3229,7 @@ dependencies = [
  "surch-codec",
  "surch-index",
  "surch-search",
+ "surch-store",
  "surch-types",
  "tar",
  "testcontainers",
@@ -3308,6 +3309,7 @@ dependencies = [
 name = "surch-store"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "surch-codec",

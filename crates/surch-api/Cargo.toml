@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 surch-analysis = { path = "../surch-analysis" }
 surch-index = { path = "../surch-index" }
+surch-store = { path = "../surch-store" }
 surch-search = { path = "../surch-search" }
 surch-types = { path = "../surch-types" }
 # C2: dense id maps use an FST for uid -> doc_id (kills the ~1.36M per-uid

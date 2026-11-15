@@ -528,7 +528,7 @@ mod postings_segment {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        std::env::temp_dir().join(format!("surch-postings-{pid}-{seq}-{nanos}.dat"))
+        super::spill_dir().join(format!("surch-postings-{pid}-{seq}-{nanos}.dat"))
     }
 
     /// Append-only FoR-postings segment. `pread`-addressed via the
@@ -541,6 +541,10 @@ mod postings_segment {
         next_offset: u64,
         extended_len: u64,
         path: PathBuf,
+        /// MVP L6: `true` for a segment reopened from the data directory
+        /// ([`Self::open_persisted`]). Such a file is owned by the index
+        /// manifest, not by this handle: `Drop` must not unlink it.
+        persistent: bool,
         #[cfg(test)]
         checked_reads: AtomicU64,
         #[cfg(test)]
@@ -548,6 +552,49 @@ mod postings_segment {
     }
 
     impl PostingsSegment {
+        /// MVP L6 (`docs/ops/persistence.md`): reopen a sealed segment file
+        /// from the data directory, read-only, addressing exactly its first
+        /// `len` bytes (the length the manifest recorded and verified).
+        pub(crate) fn open_persisted(path: &std::path::Path, len: u64) -> std::io::Result<Self> {
+            let file = OpenOptions::new().read(true).open(path)?;
+            let found = file.metadata()?.len();
+            if found < len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("{}: {found} bytes, manifest expects {len}", path.display()),
+                ));
+            }
+            Ok(Self {
+                file,
+                next_offset: len,
+                extended_len: found,
+                path: path.to_path_buf(),
+                persistent: true,
+                #[cfg(test)]
+                checked_reads: AtomicU64::new(0),
+                #[cfg(test)]
+                last_checked_read_len: AtomicU64::new(0),
+            })
+        }
+
+        /// MVP L6: the file backing this segment (spill tempfile or
+        /// persisted data-directory file).
+        pub(crate) fn backing_path(&self) -> Option<&std::path::Path> {
+            Some(&self.path)
+        }
+
+        /// MVP L6: drop the `set_len` pre-extension past the written bytes
+        /// before the file is linked into the data directory. Sealed
+        /// segments are never appended to again (they live behind an `Arc`
+        /// once built), and every read is bounded by `next_offset`, so
+        /// shrinking the logical length is invisible to readers.
+        pub(crate) fn trim_to_written(&self) -> std::io::Result<()> {
+            if self.persistent {
+                return Ok(());
+            }
+            self.file.set_len(self.next_offset)
+        }
+
         /// Best-effort constructor: NEVER panics. A SHADOW feature must
         /// not be able to crash indexation (the C1a-batché lesson: the
         /// historical `Default::default()` here `.expect()`'d on tempfile
@@ -574,6 +621,7 @@ mod postings_segment {
                 next_offset: 0,
                 extended_len: 0,
                 path,
+                persistent: false,
                 #[cfg(test)]
                 checked_reads: AtomicU64::new(0),
                 #[cfg(test)]
@@ -705,7 +753,9 @@ mod postings_segment {
 
     impl Drop for PostingsSegment {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            if !self.persistent {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 }
@@ -727,6 +777,22 @@ mod postings_segment {
         /// never fails to allocate in practice, so this is always `Some`.
         pub(crate) fn try_new() -> Option<Self> {
             Some(Self::default())
+        }
+
+        /// MVP L6: the data directory is Unix-only; the in-RAM fallback
+        /// loads the persisted bytes so the crate still builds and reads.
+        pub(crate) fn open_persisted(path: &std::path::Path, len: u64) -> std::io::Result<Self> {
+            let mut buf = std::fs::read(path)?;
+            buf.truncate(len as usize);
+            Ok(Self { buf })
+        }
+
+        pub(crate) fn backing_path(&self) -> Option<&std::path::Path> {
+            None
+        }
+
+        pub(crate) fn trim_to_written(&self) -> std::io::Result<()> {
+            Ok(())
         }
 
         pub(crate) fn append(&mut self, bytes: &[u8]) -> Option<u64> {
@@ -817,6 +883,36 @@ pub fn postings_disk_enabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// MVP L6 (`docs/ops/persistence.md`): directory receiving every spill
+/// tempfile this crate creates (postings segments, sub-field columns, merge
+/// FST scratch). `None` (the default) keeps the historical `TMPDIR`. The
+/// server points it at `<SURCH_DATA_DIR>/tmp` so a sealed segment file can be
+/// hard-linked into its index directory (same filesystem, zero copy) when
+/// the manifest is committed. Settable at any time: only files created
+/// afterwards are affected.
+static SPILL_DIR: std::sync::RwLock<Option<std::path::PathBuf>> = std::sync::RwLock::new(None);
+
+/// See [`SPILL_DIR`].
+pub fn set_spill_dir(dir: Option<std::path::PathBuf>) {
+    if let Ok(mut guard) = SPILL_DIR.write() {
+        *guard = dir;
+    }
+}
+
+/// Directory for new spill tempfiles: the configured spill dir, else `TMPDIR`.
+pub fn spill_dir() -> std::path::PathBuf {
+    SPILL_DIR
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+mod persist;
+pub(crate) use persist::{
+    decode_term_dictionary, encode_term_dictionary, postings_file_for_persist,
+};
 
 pub type Result<T> = std::result::Result<T, PostingsError>;
 
@@ -1788,7 +1884,7 @@ fn merge_fst_temp_path() -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("surch-fst-merge-{pid}-{seq}-{nanos}.dat"))
+    spill_dir().join(format!("surch-fst-merge-{pid}-{seq}-{nanos}.dat"))
 }
 
 /// Best-effort tempfile open for [`MergeFstBuilder::new`] — `None` on any

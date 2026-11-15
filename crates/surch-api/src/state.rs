@@ -93,12 +93,20 @@ mod source_segment {
         /// pas le 0 post-truncate de la compaction.
         peak_offset: u64,
         path: PathBuf,
+        /// MVP L6: `true` when the file is the data directory's
+        /// `source.dat` (reopened at startup). The manifest owns it then:
+        /// `Drop` must not unlink it.
+        persistent: bool,
     }
 
     impl Default for SourceSegment {
         fn default() -> Self {
             let id = uuid::Uuid::new_v4();
-            let path = std::env::temp_dir().join(format!("surch-source-{id}.dat"));
+            // MVP L6: `spill_dir()` is `TMPDIR` unless the server runs with
+            // `SURCH_DATA_DIR`, in which case it is `<data>/tmp` (same
+            // filesystem as the index directories, so persisting links the
+            // file instead of copying it).
+            let path = surch_index::postings::spill_dir().join(format!("surch-source-{id}.dat"));
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -112,6 +120,7 @@ mod source_segment {
                 fallocated_len: 0,
                 peak_offset: 0,
                 path,
+                persistent: false,
             };
             store.fallocate(FALLOCATE_CHUNK);
             store
@@ -119,6 +128,43 @@ mod source_segment {
     }
 
     impl SourceSegment {
+        /// MVP L6 (`docs/ops/persistence.md`): reopen the data directory's
+        /// `source.dat`, keeping exactly the manifest-verified prefix `len`
+        /// (anything past it was appended after the last committed
+        /// generation and is discarded). Appends resume at `len`.
+        pub(super) fn open_persisted(path: &std::path::Path, len: u64) -> std::io::Result<Self> {
+            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            if file.metadata()?.len() < len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("{} is shorter than its manifest", path.display()),
+                ));
+            }
+            file.set_len(len)?;
+            Ok(Self {
+                file: Arc::new(file),
+                next_offset: len,
+                fallocated_len: len as i64,
+                peak_offset: len,
+                path: path.to_path_buf(),
+                persistent: true,
+            })
+        }
+
+        pub(super) fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        /// MVP L6: shrink the file to the written bytes (dropping the
+        /// `posix_fallocate` reserve) and `fsync` it, so a committed
+        /// manifest only ever points at durable bytes. The next append
+        /// re-reserves a fresh chunk.
+        pub(super) fn trim_and_sync(&mut self) -> std::io::Result<()> {
+            self.file.set_len(self.next_offset)?;
+            self.fallocated_len = self.next_offset as i64;
+            self.file.sync_all()
+        }
+
         /// `posix_fallocate(fd, 0, fallocated_len + extra)` via
         /// l'appel direct `libc::posix_fallocate`. Mute
         /// `fallocated_len`. Pas d'erreur fatale si le syscall echoue
@@ -148,10 +194,15 @@ mod source_segment {
 
         fn ensure_capacity(&mut self, write_end: u64) {
             while (write_end as i64) > self.fallocated_len {
+                let before = self.fallocated_len;
                 self.fallocate(FALLOCATE_CHUNK);
                 // Si fallocate a echoue, on sort de la boucle apres
-                // un seul tour pour eviter le spin.
-                if self.fallocated_len == 0 {
+                // un seul tour pour eviter le spin. MVP L6 : la garde
+                // compare a la valeur d'avant l'appel (et non a 0) — un
+                // `source.dat` rouvert ou tronque au commit part d'un
+                // `fallocated_len` non nul, et un FS sans `fallocate`
+                // bouclerait sinon indefiniment.
+                if self.fallocated_len == before {
                     break;
                 }
             }
@@ -221,7 +272,9 @@ mod source_segment {
 
     impl Drop for SourceSegment {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
+            if !self.persistent {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
 }
@@ -238,6 +291,25 @@ mod source_segment {
     }
 
     impl SourceSegment {
+        /// MVP L6: the data directory targets Linux; this fallback only
+        /// keeps the crate building elsewhere.
+        pub(super) fn open_persisted(path: &std::path::Path, len: u64) -> std::io::Result<Self> {
+            let mut buf = std::fs::read(path)?;
+            buf.truncate(len as usize);
+            Ok(Self { buf })
+        }
+
+        pub(super) fn path(&self) -> &std::path::Path {
+            std::path::Path::new("")
+        }
+
+        pub(super) fn trim_and_sync(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "SURCH_DATA_DIR requires Linux",
+            ))
+        }
+
         pub(super) fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
             let offset = self.buf.len() as u64;
             self.buf.extend_from_slice(bytes);
@@ -445,6 +517,18 @@ thread_local! {
 type CachedSourceBlock = (u64, u64, Vec<u8>);
 
 impl SourceStore {
+    /// MVP L6: reopen the data directory's `source.dat` with its persisted
+    /// block directory (D1). `pending` starts empty: a persist always seals
+    /// the in-progress block first.
+    fn open_persisted(path: &std::path::Path, len: u64, blocks: Vec<u64>) -> std::io::Result<Self> {
+        Ok(Self {
+            segment: SourceSegment::open_persisted(path, len)?,
+            blocks,
+            pending: Vec::new(),
+            epoch: next_source_store_epoch(),
+        })
+    }
+
     /// Append d'octets OPAQUES (codecs `raw` / zstd par-doc). Inchange
     /// depuis `mmap M1`.
     fn append(&mut self, bytes: &[u8]) -> (u64, u32) {
@@ -1441,11 +1525,19 @@ fn merge_forward_fst(
 use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
 use surch_search::topk::MinCompetitiveScore;
 
+use crate::persist::{
+    get_json, get_mapping, put_json, put_mapping, DataDir, IndexManifest, IndexPersistState,
+    FORMAT_VERSION, IDMAP_KIND, MANIFEST_NAME, META_KIND, SOURCE_NAME,
+};
 use crate::scroll::ScrollTable;
 use crate::stats::{
     clear_memory_gauges, refresh_jemalloc_purge, refresh_memory_gauges, set_p2_integrity_gauges,
 };
 use crate::topn::TopN;
+use surch_store::persist::{
+    fsync_dir, full_verification_enabled, hash_file_range, link_or_copy, open_framed_file,
+    write_framed_file, FramedWriter, PersistError,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FusedConjunctionScoreMode {
@@ -1589,6 +1681,9 @@ struct MemoryStore {
     aliases: BTreeMap<String, BTreeMap<String, Value>>,
     component_templates: BTreeMap<String, StoredComponentTemplate>,
     index_templates: BTreeMap<String, StoredIndexTemplate>,
+    /// MVP L6: opened `SURCH_DATA_DIR` (`None` = historical in-memory
+    /// engine, nothing ever written outside the spill tempfiles).
+    data_dir: Option<Arc<DataDir>>,
 }
 
 // `mmap M1` : `InMemoryIndex` n'est plus `Clone`. Le champ
@@ -1913,6 +2008,47 @@ mod source_block_store_tests {
             i % 1231
         )
         .into_bytes()
+    }
+
+    /// MVP L6: every write mode (raw, zstd per doc, D1 blocks — the codec
+    /// tag is per slot, so a mixed store is legal) reads back byte for byte
+    /// from the reopened, persisted `source.dat` + block directory, and the
+    /// reopened store keeps appending after the committed prefix.
+    #[test]
+    fn persisted_store_reopens_every_codec_byte_for_byte() {
+        let mut store = SourceStore::default();
+        let mut written = Vec::new();
+        for i in 0..400 {
+            let mode = match i % 3 {
+                0 => SourceWriteMode::Raw,
+                1 => SourceWriteMode::ZstdPerDoc,
+                _ => SourceWriteMode::ZstdBlock,
+            };
+            let payload = doc(i);
+            written.push((write(&mut store, &payload, mode), payload));
+        }
+        store.flush_pending_block();
+        store.segment.trim_and_sync().expect("trim + fsync");
+        let len = store.bytes_written();
+        let persisted = store.segment.path().with_extension("persisted");
+        std::fs::hard_link(store.segment.path(), &persisted).expect("link");
+        let blocks = store.blocks.clone();
+        drop(store);
+
+        let mut reopened = SourceStore::open_persisted(&persisted, len, blocks).expect("reopen");
+        for (i, (blob, payload)) in written.iter().enumerate() {
+            assert_reads_back(&reopened, blob, payload, &format!("doc {i}"));
+        }
+        let extra = write(&mut reopened, &doc(9_999), SourceWriteMode::ZstdBlock);
+        reopened.flush_pending_block();
+        assert_reads_back(&reopened, &extra, &doc(9_999), "append after reopen");
+        assert!(reopened.bytes_written() > len);
+        drop(reopened);
+        assert!(
+            persisted.exists(),
+            "a persisted source.dat is never unlinked on drop"
+        );
+        std::fs::remove_file(&persisted).unwrap();
     }
 
     #[test]
@@ -2274,6 +2410,12 @@ struct InMemoryIndex {
     /// `OnceLock`-cannot-flip-mid-run rationale as `DocumentIndex`'s
     /// `FlushBudgetOverride`/`MergeFaninOverride` (`surch_index::document_index`).
     densify_budget_override: DensifyBudgetOverride,
+    /// MVP L6: bumped every time [`Self::densify`] actually rewrites
+    /// `dense`, so a persist rewrites the id-maps file only when it changed.
+    dense_epoch: u64,
+    /// MVP L6: data-directory bookkeeping, `Some` once this index has been
+    /// persisted (or reopened) under `SURCH_DATA_DIR`.
+    persist: Option<IndexPersistState>,
 }
 
 /// See `InMemoryIndex`'s `densify_budget_override` field. `UseEnv` (the
@@ -3003,6 +3145,7 @@ impl InMemoryIndex {
             // deja a jour, evite un rescan O(doc_count) inutile.
             return;
         }
+        self.dense_epoch += 1;
 
         let old_boundary = self.dense.doc_count();
         // Interference = un update OU un delete touchant un doc_id DEJA
@@ -4590,6 +4733,10 @@ impl AppState {
             settings,
             aliases,
         );
+        // MVP L6: an explicitly created index (and its aliases) is durable
+        // from the moment the call returns, even before any document.
+        store.persist_index(index);
+        store.persist_aliases();
         drop(store);
         // Empty index, but seed the gauges at zero so the scrape advertises
         // the index from the moment it exists rather than only after the
@@ -4778,6 +4925,8 @@ impl AppState {
         for alias in stale_aliases {
             store.aliases.remove(&alias);
         }
+        store.remove_persisted_index(index);
+        store.persist_aliases();
         drop(store);
         self.invalidate_search_cache(index);
         // Index gone: zero out its gauges so dashboards do not advertise
@@ -4873,6 +5022,10 @@ impl AppState {
         if let Some(data) = store.indices.get_mut(index) {
             data.finalize_terms_for_refresh();
         }
+        // MVP L6: `_refresh` is the durability point — the sealed state
+        // just materialized becomes the new committed generation.
+        store.persist_index(index);
+        store.persist_aliases();
         drop(store);
         // Match the post-bulk cache + gauge maintenance contract so a
         // refresh that frees the builder is observable through the
@@ -4964,6 +5117,7 @@ impl AppState {
                 InMemoryIndex::new(IndexMapping::default(), Value::Object(Default::default()))
             })
             .set_mapping(mapping);
+        store.persist_mapping_change(index);
         drop(store);
         self.invalidate_search_cache(index);
         // A mapping change triggers a `rebuild_index()` on the
@@ -5003,6 +5157,7 @@ impl AppState {
         }
 
         data.set_mapping(merged);
+        store.persist_mapping_change(index);
         drop(store);
         self.invalidate_search_cache(index);
         refresh_memory_gauges(self, index);
@@ -5280,6 +5435,7 @@ impl AppState {
             .entry(alias.to_owned())
             .or_default()
             .insert(index.to_owned(), definition);
+        store.persist_aliases();
         true
     }
 
@@ -5343,6 +5499,12 @@ impl AppState {
                 }
             }
         }
+        // MVP L6: the whole batch lands in ONE atomic alias-file rename, so
+        // a restart sees either the pre- or the post-swap aliases.
+        store.persist_aliases();
+        for index in &deleted {
+            store.remove_persisted_index(index);
+        }
         drop(store);
         for index in &deleted {
             self.invalidate_search_cache(index);
@@ -5362,6 +5524,9 @@ impl AppState {
             if entry.is_empty() {
                 store.aliases.remove(alias);
             }
+        }
+        if removed {
+            store.persist_aliases();
         }
         removed
     }
@@ -7034,6 +7199,445 @@ impl AppState {
             .indices
             .get(index)
             .map_or(0, |data| data.count_term_hits(field, value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MVP L6 — data-directory persistence of one index (`docs/ops/persistence.md`,
+// catalog in `crate::persist`).
+// ---------------------------------------------------------------------------
+
+/// Make `live[..to)` durable as `target`: hard link (or copy) on first use;
+/// nothing when `target` already IS the live file (same inode — the usual
+/// case: spill dir under the data dir, or a reopened index); otherwise
+/// append-copy the new range `[from, to)` (spill dir on another filesystem).
+fn sync_source_file(
+    live: &std::path::Path,
+    target: &std::path::Path,
+    from: u64,
+    to: u64,
+) -> Result<(), PersistError> {
+    if !target.exists() {
+        return link_or_copy(live, target);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let same = match (std::fs::metadata(live), std::fs::metadata(target)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        };
+        if same {
+            return Ok(());
+        }
+        use std::os::unix::fs::FileExt;
+        let source = std::fs::File::open(live).map_err(|error| PersistError::io(live, error))?;
+        let sink = OpenOptions::new()
+            .write(true)
+            .open(target)
+            .map_err(|error| PersistError::io(target, error))?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut offset = from;
+        while offset < to {
+            let take = (to - offset).min(buf.len() as u64) as usize;
+            source
+                .read_exact_at(&mut buf[..take], offset)
+                .map_err(|error| PersistError::io(live, error))?;
+            sink.write_all_at(&buf[..take], offset)
+                .map_err(|error| PersistError::io(target, error))?;
+            offset += take as u64;
+        }
+        sink.set_len(to)
+            .and_then(|()| sink.sync_all())
+            .map_err(|error| PersistError::io(target, error))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+        Err(PersistError::io(
+            target,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "SURCH_DATA_DIR requires Unix",
+            ),
+        ))
+    }
+}
+
+impl InMemoryIndex {
+    /// MVP L6: commit the current (refreshed) state of this index as a new
+    /// generation in `data_dir`. Order (design §1 "Durabilité"): `_source`
+    /// bytes, then segment files, id maps and meta — each `fsync`ed — then
+    /// the directory, and only then the atomic manifest rename. A crash at
+    /// any point before the rename leaves the previous manifest valid; the
+    /// files written so far are unreferenced orphans removed at next open.
+    ///
+    /// Callers hold the store write lock and have just run
+    /// [`Self::finalize_terms_for_refresh`] (or the index is brand new), so
+    /// the overlays are drained and the term dictionaries materialized.
+    fn persist(&mut self, data_dir: &DataDir, name: &str) -> Result<(), PersistError> {
+        // Writes not yet sealed (e.g. `create_index` replayed on an index
+        // with un-refreshed documents): seal them exactly as `_refresh`
+        // would, so postings, id maps and `_source` describe the same
+        // documents. A brand-new or freshly refreshed index has nothing
+        // pending and is left untouched (same in-memory state as without a
+        // data directory).
+        let pending = self.index.terms_dirty()
+            || !self.forward_dirty.is_empty()
+            || !self.reverse_dirty.is_empty()
+            || !self.documents_dirty.is_empty()
+            || !self.deleted_since_dense.is_empty();
+        if pending {
+            self.finalize_terms_for_refresh();
+        }
+        self.source_store.flush_pending_block();
+        let mut state = match self.persist.take() {
+            Some(state) => state,
+            None => {
+                let dir = data_dir.index_dir(name);
+                std::fs::create_dir_all(&dir).map_err(|error| PersistError::io(&dir, error))?;
+                fsync_dir(&data_dir.indices_dir())?;
+                IndexPersistState::fresh(dir)
+            }
+        };
+        let result = self.persist_generation(&mut state, name);
+        self.persist = Some(state);
+        result
+    }
+
+    fn persist_generation(
+        &mut self,
+        state: &mut IndexPersistState,
+        name: &str,
+    ) -> Result<(), PersistError> {
+        let dir = state.dir.clone();
+
+        // 1. `_source` store: durable bytes reachable as `<dir>/source.dat`.
+        let source_target = dir.join(SOURCE_NAME);
+        let source_len = self.source_store.bytes_written();
+        if source_len < state.source_len {
+            return Err(PersistError::corrupt(
+                &source_target,
+                "the live _source store shrank below its committed length",
+            ));
+        }
+        let mut source_chunks = state.source_chunks.clone();
+        if source_len > state.source_len || !source_target.exists() {
+            self.source_store
+                .segment
+                .trim_and_sync()
+                .map_err(|error| PersistError::io(self.source_store.segment.path(), error))?;
+            sync_source_file(
+                self.source_store.segment.path(),
+                &source_target,
+                state.source_len,
+                source_len,
+            )?;
+            if source_len > state.source_len {
+                let hash = hash_file_range(&source_target, state.source_len, source_len)?;
+                source_chunks.push((source_len, hash));
+            }
+        }
+
+        // 2. Sealed segments (only the ones not already on disk).
+        let (segments, segment_cache) =
+            self.index
+                .persist_segments(&dir, &state.segment_cache, &mut state.next_file_id)?;
+
+        // 3. Dense id maps, rewritten only when `densify` changed them.
+        let ids = match &state.ids {
+            Some((epoch, file)) if *epoch == self.dense_epoch => file.clone(),
+            _ => {
+                let file_name = state.file_name("ids");
+                write_framed_file(&dir, &file_name, IDMAP_KIND, FORMAT_VERSION, |out| {
+                    self.encode_id_maps(out)
+                })?
+            }
+        };
+
+        // 4. Mapping, settings, counters, block directory, side postings.
+        let meta_name = state.file_name("meta");
+        let meta = write_framed_file(&dir, &meta_name, META_KIND, FORMAT_VERSION, |out| {
+            self.encode_meta(out)
+        })?;
+        fsync_dir(&dir)?;
+
+        // 5. Commit point.
+        let manifest = IndexManifest {
+            name: name.to_owned(),
+            generation: state.generation + 1,
+            next_file_id: state.next_file_id,
+            meta,
+            ids: ids.clone(),
+            segments,
+            source_len,
+            source_chunks: source_chunks.clone(),
+        };
+        manifest.write(&dir)?;
+
+        state.generation = manifest.generation;
+        state.segment_cache = segment_cache;
+        state.ids = Some((self.dense_epoch, ids));
+        state.source_len = source_len;
+        state.source_chunks = source_chunks;
+
+        // 6. Best-effort cleanup of the previous generation's files.
+        if let Err(error) = manifest.collect_garbage(&dir) {
+            tracing::warn!(target: "surch_api::persist", index = name, %error,
+                "could not remove files of a superseded generation; they are swept at next open");
+        }
+        Ok(())
+    }
+
+    fn encode_id_maps(&self, out: &mut FramedWriter) -> Result<(), PersistError> {
+        match &self.dense.forward {
+            Some(map) => {
+                out.put_u8(1)?;
+                out.put_bytes(map.as_fst().as_bytes())?;
+            }
+            None => out.put_u8(0)?,
+        }
+        out.put_bytes(&self.dense.reverse_uids)?;
+        out.put_u32s(&self.dense.reverse_offsets)?;
+        out.put_u64s(&self.dense.documents)
+    }
+
+    fn encode_meta(&self, out: &mut FramedWriter) -> Result<(), PersistError> {
+        put_mapping(out, &self.mapping)?;
+        put_json(out, &self.settings)?;
+        out.put_u32(self.next_doc_id)?;
+        out.put_u32(self.live_count)?;
+        out.put_u64s(&self.source_store.blocks)?;
+        self.index.encode_index_state(out)
+    }
+
+    /// MVP L6: reopen one committed index directory without re-analysing a
+    /// single document. Fails closed on any missing/short/corrupt file or
+    /// format-version mismatch; the error names the offending file.
+    fn open_persisted(dir: &std::path::Path) -> Result<(String, Self), PersistError> {
+        let manifest = IndexManifest::read(dir)?;
+        manifest.collect_garbage(dir)?;
+        manifest.verify_data_files(dir, full_verification_enabled())?;
+
+        let mut meta = open_framed_file(dir, &manifest.meta, META_KIND, FORMAT_VERSION)?;
+        let mapping = get_mapping(&mut meta)?;
+        let settings = get_json(&mut meta)?;
+        let next_doc_id = meta.get_u32()?;
+        let live_count = meta.get_u32()?;
+        let blocks = meta.get_u64s()?;
+        let (index, segment_cache) =
+            DocumentIndex::open_persisted(dir, &manifest.segments, &mut meta)?;
+        meta.finish()?;
+
+        let mut ids = open_framed_file(dir, &manifest.ids, IDMAP_KIND, FORMAT_VERSION)?;
+        let forward = match ids.get_u8()? {
+            0 => None,
+            1 => {
+                let bytes = ids.get_bytes()?;
+                Some(
+                    Map::new(bytes)
+                        .map_err(|error| ids.corrupt(format!("invalid uid FST: {error}")))?,
+                )
+            }
+            other => return Err(ids.corrupt(format!("invalid option tag {other}"))),
+        };
+        let reverse_uids = ids.get_bytes()?;
+        let reverse_offsets = ids.get_u32s()?;
+        let documents = ids.get_u64s()?;
+        let ids_path = dir.join(&manifest.ids.name);
+        ids.finish()?;
+
+        // Structural checks before anything dereferences these tables.
+        let shape_ok = if reverse_offsets.is_empty() {
+            documents.is_empty() && reverse_uids.is_empty()
+        } else {
+            reverse_offsets.len() == documents.len() + 1
+                && reverse_offsets[0] == 0
+                && reverse_offsets.windows(2).all(|pair| pair[0] <= pair[1])
+                && *reverse_offsets.last().expect("non-empty") as usize == reverse_uids.len()
+                && documents.len() <= next_doc_id as usize
+        };
+        if !shape_ok || live_count > next_doc_id {
+            return Err(PersistError::corrupt(
+                &ids_path,
+                "id maps disagree with the index counters",
+            ));
+        }
+        for &packed in &documents {
+            let Some((offset, length, codec)) = unpack_document_slot(packed) else {
+                continue;
+            };
+            let in_bounds = match codec {
+                SOURCE_CODEC_BLOCK => {
+                    let (block_id, _) = unpack_block_locator(offset);
+                    (block_id as usize) < blocks.len()
+                }
+                _ => offset.saturating_add(u64::from(length)) <= manifest.source_len,
+            };
+            if !in_bounds {
+                return Err(PersistError::corrupt(
+                    &ids_path,
+                    "a _source slot points outside the persisted source store",
+                ));
+            }
+        }
+        for &entry in &blocks {
+            let (file_offset, compressed_len) = unpack_block_dir_entry(entry);
+            if file_offset.saturating_add(u64::from(compressed_len)) > manifest.source_len {
+                return Err(PersistError::corrupt(
+                    dir.join(&manifest.meta.name),
+                    "a _source block points outside the persisted source store",
+                ));
+            }
+        }
+
+        let source_path = dir.join(SOURCE_NAME);
+        let source_store = SourceStore::open_persisted(&source_path, manifest.source_len, blocks)
+            .map_err(|error| PersistError::io(&source_path, error))?;
+
+        let state = IndexPersistState {
+            dir: dir.to_path_buf(),
+            generation: manifest.generation,
+            next_file_id: manifest.next_file_id,
+            segment_cache,
+            ids: Some((0, manifest.ids.clone())),
+            source_len: manifest.source_len,
+            source_chunks: manifest.source_chunks.clone(),
+        };
+        let index = InMemoryIndex {
+            dense: DenseIdMaps {
+                forward,
+                reverse_uids,
+                reverse_offsets,
+                documents,
+            },
+            live_count,
+            source_store,
+            next_doc_id,
+            mapping,
+            settings,
+            index,
+            // Same state a `_refresh` leaves behind: the next write takes
+            // the `rebuild_index()` path exactly as it would in-process.
+            terms_finalized: true,
+            dense_epoch: 0,
+            persist: Some(state),
+            ..InMemoryIndex::default()
+        };
+        Ok((manifest.name, index))
+    }
+}
+
+impl MemoryStore {
+    /// MVP L6: persist `index` if a data directory is open. A failure keeps
+    /// the previous generation committed (crash-safe by construction) and
+    /// is reported loudly: error log + `surch_persist_failures_total`.
+    fn persist_index(&mut self, index: &str) {
+        let Some(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let Some(data) = self.indices.get_mut(index) else {
+            return;
+        };
+        if let Err(error) = data.persist(&data_dir, index) {
+            metrics::counter!("surch_persist_failures_total").increment(1);
+            tracing::error!(target: "surch_api::persist", index, %error,
+                "persisting the index failed; the previous generation stays committed");
+        }
+    }
+
+    /// MVP L6: a mapping change rebuilds the index in memory; with a data
+    /// directory it is also sealed (as `_refresh` would) and committed, so
+    /// the persisted mapping never disagrees with the persisted segments.
+    /// No-op without a data directory (historical behaviour unchanged).
+    fn persist_mapping_change(&mut self, index: &str) {
+        if self.data_dir.is_none() {
+            return;
+        }
+        if let Some(data) = self.indices.get_mut(index) {
+            data.finalize_terms_for_refresh();
+        }
+        self.persist_index(index);
+    }
+
+    fn persist_aliases(&self) {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            return;
+        };
+        if let Err(error) = data_dir.write_aliases(&self.aliases) {
+            metrics::counter!("surch_persist_failures_total").increment(1);
+            tracing::error!(target: "surch_api::persist", %error,
+                "persisting aliases failed; the previous alias file stays committed");
+        }
+    }
+
+    fn remove_persisted_index(&self, index: &str) {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            return;
+        };
+        if let Err(error) = data_dir.remove_index_dir(index) {
+            metrics::counter!("surch_persist_failures_total").increment(1);
+            tracing::error!(target: "surch_api::persist", index, %error,
+                "removing the deleted index directory failed; it is retried at next open");
+        }
+    }
+}
+
+impl AppState {
+    /// MVP L6: open (or initialise) the data directory `root` and reopen
+    /// every committed index from its manifest — no document is re-analysed,
+    /// postings / `_source` / spilled sub-fields are read back through the
+    /// same `pread` paths as before the restart. Crash recovery first sweeps
+    /// spill tempfiles, half-deleted directories, uncommitted index
+    /// directories and unreferenced generation files.
+    ///
+    /// Fails closed: any checksum, length, structure or format-version
+    /// mismatch aborts with an error naming the file, instead of serving a
+    /// partially loaded index.
+    pub fn open_with_data_dir(root: &std::path::Path) -> Result<Self, PersistError> {
+        let data_dir = Arc::new(DataDir::open(root)?);
+        data_dir.sweep_orphans()?;
+        let mut store = MemoryStore {
+            data_dir: Some(Arc::clone(&data_dir)),
+            ..MemoryStore::default()
+        };
+        for dir in data_dir.index_dirs()? {
+            if !dir.join(MANIFEST_NAME).exists() {
+                // Created, never committed (crash before the first manifest
+                // rename): the index never existed for any reader.
+                std::fs::remove_dir_all(&dir).map_err(|error| PersistError::io(&dir, error))?;
+                continue;
+            }
+            let (name, index) = InMemoryIndex::open_persisted(&dir)?;
+            store.indices.insert(name, index);
+        }
+        let mut aliases = data_dir.read_aliases()?;
+        aliases.retain(|_, targets| {
+            targets.retain(|index, _| store.indices.contains_key(index));
+            !targets.is_empty()
+        });
+        store.aliases = aliases;
+        let state = AppState {
+            store: Arc::new(RwLock::new(store)),
+            ..AppState::default()
+        };
+        for name in state.index_names() {
+            refresh_memory_gauges(&state, &name);
+        }
+        Ok(state)
+    }
+
+    /// MVP L6: root of the opened data directory, `None` in the historical
+    /// in-memory mode.
+    pub fn data_dir(&self) -> Option<std::path::PathBuf> {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store
+            .data_dir
+            .as_ref()
+            .map(|data_dir| data_dir.root().to_path_buf())
     }
 }
 

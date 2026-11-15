@@ -20,8 +20,10 @@ surch-api
 Run the local Surch HTTP API server.
 
 Environment:
-  SURCH_HOST  Bind host, defaults to 127.0.0.1
-  SURCH_PORT  Bind port, defaults to 7700
+  SURCH_HOST      Bind host, defaults to 127.0.0.1
+  SURCH_PORT      Bind port, defaults to 7700
+  SURCH_DATA_DIR  Persist indices under this directory and reopen them at
+                  start (unset: in-memory only). See docs/ops/persistence.md
 ";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -62,6 +64,20 @@ where
     Ok(ServerConfig { host, port })
 }
 
+/// MVP L6: `SURCH_DATA_DIR` when set to a non-empty path.
+fn data_dir_from_env<I, K, V>(vars: I) -> Option<std::path::PathBuf>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    vars.into_iter()
+        .find(|(key, _)| key.as_ref() == surch_api::persist::DATA_DIR_ENV)
+        .map(|(_, value)| value.as_ref().trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 fn run_mode_from_args<I, S>(args: I) -> RunMode
 where
     I: IntoIterator<Item = S>,
@@ -91,7 +107,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bind_addr = config.bind_addr();
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
-    let shared = surch_api::AppRouterState::default();
+    // MVP L6 (`docs/ops/persistence.md`): opt-in data directory. Unset keeps
+    // the historical in-memory engine bit-for-bit. Set, every committed
+    // index is reopened from its manifest before the listener accepts a
+    // request; any corrupt or version-mismatched file aborts the start.
+    let shared = match data_dir_from_env(env::vars()) {
+        Some(root) => {
+            let app = surch_api::state::AppState::open_with_data_dir(&root).map_err(|error| {
+                eprintln!(
+                    "surch-api: cannot open {} {}: {error}",
+                    surch_api::persist::DATA_DIR_ENV,
+                    root.display()
+                );
+                error
+            })?;
+            // Spill tempfiles on the data directory's filesystem: sealing a
+            // segment then hard-links it into its index directory.
+            surch_index::postings::set_spill_dir(Some(root.join("tmp")));
+            eprintln!(
+                "surch-api: data directory {} opened ({} indices)",
+                root.display(),
+                app.index_names().len()
+            );
+            surch_api::AppRouterState {
+                app,
+                ..Default::default()
+            }
+        }
+        None => surch_api::AppRouterState::default(),
+    };
     let _slm_scheduler = surch_api::slm::scheduler::spawn(
         surch_api::slm::SchedulerConfig::default(),
         shared.slm_policies.clone(),
@@ -107,7 +151,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_mode_from_args, server_config_from_env, RunMode};
+    use super::{data_dir_from_env, run_mode_from_args, server_config_from_env, RunMode};
+
+    #[test]
+    fn data_dir_is_opt_in() {
+        assert_eq!(data_dir_from_env(std::iter::empty::<(&str, &str)>()), None);
+        assert_eq!(data_dir_from_env([("SURCH_DATA_DIR", "  ")]), None);
+        assert_eq!(
+            data_dir_from_env([("SURCH_DATA_DIR", "/var/lib/surch")]),
+            Some(std::path::PathBuf::from("/var/lib/surch"))
+        );
+    }
 
     #[test]
     fn server_config_uses_default_loopback_address() {
