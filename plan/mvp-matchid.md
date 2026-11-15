@@ -90,17 +90,50 @@ estimated by matchid (unverified until k8s measures allocatable):
     (`e53df7f` state accessors, `b746f0f` search wiring + exact candidate
     set + BM25 over expansions, `632c9fd` oracle parity tests on RAM /
     multi-segment / disk layouts).
-  - [ ] Candidate push-down through root `function_score` (inner query).
-  - [ ] `range` on date keyword and `geo_distance` as filters over a
-    candidate set instead of a full scan.
-  - [ ] Guard: no full-scan path reachable from any `deces_v2` shape
+  - [x] Candidate push-down through root `function_score` (inner query),
+    including with aggregations / custom sort / `min_score`; candidate
+    resolution returns `(ids, exact)` decided during resolution (`81473ed`,
+    branch `worktree-agent-a38723b4f2ef11543`).
+  - [x] `range` on text / keyword / numeric fields from the term
+    dictionary (FST byte range or numeric term walk, every segment, RAM and
+    disk-backed; `range_field_matches` applies the same per-type ES plan, so
+    the set is exact) and `geo_distance` / `geo_bounding_box` /
+    `geo_polygon` from the `geo_point` term dictionary (one term per
+    distinct point); both resolve last inside a `bool`, restricted to the
+    sibling intersection, and next to <= 2 048 sibling candidates they are
+    checked on those documents' `_source` (`48bc647`, `81473ed`,
+    `7bfb33a`). `match_all`-equivalent wrappers served as `match_all`.
+  - [x] Guard: no full-scan path reachable from any `deces_v2` shape
     (counter + test).
     - [x] Counter `surch_dbg_full_scan_fallback_total{query_type}` on every
       `_source` full-scan fallback of `match_documents_for_index`, and a
       test proving fuzzy / bool-of-fuzzy shapes never reach it (`a480f2a`).
-    - [ ] Extend the test to every `deces_v2` shape once the corpus
-      generator exists (root `function_score` + aggs, `range`,
-      `geo_distance` still full-scan today).
+    - [x] Extend the test to every `deces_v2` shape: module
+      `l1b_build_request_guard_tests` (`crates/surch-api/src/search_l1b_guard_tests.rs`)
+      ports `buildRequest.ts` / `queries.ts` and emits 47 shapes (simple
+      `q`, `id` via `_msearch`, advanced fuzzy / exact, date prefix / range /
+      limits, age, geo, link blocks via `_msearch`, `/agg` terms /
+      date_histogram / composite + cardinality / `after`, no-criteria
+      `/agg`); RAM, multi-segment and disk-backed: 0 fallbacks and match
+      set equal to brute force (`81473ed`, `7bfb33a`).
+  - [x] Pre-existing bug fixed on the way: keyword `prefix` matched nothing
+    on a disk-backed layout (`48bc647`).
+  - [ ] High-df fuzzy OR scoring cost (`q` "jean pierre": 42 501 hits of
+    200 k, 43.7 ms; ~21 % of 29 M would be scored). MaxScore / top-k
+    pruning does not apply to the deces `q` and advanced shapes
+    (`track_total_hits: true` + `min_score` require scoring every match,
+    in ES too); next lever is a fused per-candidate fuzzy scorer (score
+    from the expanded postings in one walk, as #18 does for `match`).
+  - L1b 200 k synthetic release measurement
+    (`tests/l1b_measure.rs`, local, median of 5, before = `1422bd1`):
+    birth range alone 968 -> 0.87 ms; age range alone 926 -> 0.81 ms;
+    death > 2000 + sex 513 -> 11.3 ms; geo 5 km alone 896 -> 1.3 ms;
+    name + geo 25.2 -> 4.1-4.4 ms; name + birth range 20.0 -> 4.3-5.0 ms;
+    link name + birth range 56.9 -> 4.4-4.8 ms; `q` stop words only
+    (`match_all`, `min_score` 5) 864 ms -> 7 us; unchanged: name-only
+    shapes (21-31 ms both, noise), link name + full date (4.6-5.2 ms),
+    `/agg` without criteria 950-990 ms (whole-index `_source`
+    aggregation, lot L2 item "avoid whole-index materialisation").
   - [ ] Proof: B1 oracle unchanged, unit/parity tests, 1.36 M smoke latency
     per form.
     - [x] Unit/parity tests (fuzzy part): `matchid_compat` and existing
@@ -122,6 +155,19 @@ estimated by matchid (unverified until k8s measures allocatable):
     `must_not` or a should-disjunction superset) does not apply
     `max_expansions`; `match` `minimum_should_match` with `fuzziness` is not
     parsed.
+  - ES range / geo deviations accepted (L1b): a non-numeric bound on a
+    numeric field matches nothing (ES: HTTP 400); `float`/`double` compare
+    as f64 (ES: field precision); `gt`+`gte` both given intersect (ES: the
+    last one wins; Surch behaviour unchanged); a numeric bound on a
+    text/keyword field is compared as its decimal text (Java `toString` for
+    integers, Rust shortest repr otherwise); `range` on a `date` field has
+    no term walk (counted full scan unless <= 2 048 sibling candidates; not
+    emitted by `buildRequest.ts`); a `geo_point` indexed as a `[lon, lat]`
+    array declines to the counted full scan (the indexer flattens it).
+    `range_field_matches` now follows the term-level ES semantics on
+    `_source` too (analysed tokens for text, normalised bound for keyword,
+    numeric order for numbers, multi-valued); geo `_source` checks accept
+    arrays of points.
 - [ ] L2 — `deces_v2` contract.
   - [x] DSL gap map deces-backend ↔ Surch with file:line evidence
     (matchID main `6732755`, Surch `37314e6`; kept outside the repo at
@@ -139,6 +185,15 @@ estimated by matchid (unverified until k8s measures allocatable):
     configurable normalizer chain, real `deces_index.yml` mapping
     (DATE_* are `text` + `index_prefixes{4,6}`, `PRENOMS_NOM`, `PRENOM_NOM`,
     edge_ngram `max_gram` 10).
+    - [ ] Found by the L1b guard: Surch's default `text` analyzer is
+      `simple` (drops digits) where ES uses `standard`, so DATE_* without
+      an explicit analyzer index no term; and a `match` on a keyword
+      sub-field (`DATE_NAISSANCE.raw`, `COMMUNE_NAISSANCE.raw`) analyses
+      the query with that same `simple` default (`IndexMapping::analyzer`
+      only looks up top-level fields): digits dropped, hyphens split, so
+      `match DATE_NAISSANCE.raw "19290107"` and `match
+      COMMUNE_NAISSANCE.raw "Saint-Etienne"` match nothing (exact-mode
+      advanced search and the `.raw` boost of `fuzzyShouldTermQuery`).
   - [x] Fuzzy semantics: OR over tokens (not AND), BM25 on expanded terms,
     `boost` honoured inside `match` objects (L1 `b746f0f`, tests `632c9fd`).
   - [ ] `date_histogram` keys as epoch ms + empty buckets.

@@ -2805,10 +2805,49 @@ impl DocumentIndex {
     /// same set the previous direct-field call returned (a `BTreeSet`
     /// built from one source is identical to that source).
     pub fn term_prefix_doc_ids(&self, field: &str, prefix: &str) -> BTreeSet<u32> {
+        // MVP L1b: the RAM `doc_ids_flat` channel read by
+        // `TermDictionary::prefix_doc_ids` is intentionally empty on a
+        // disk-backed or multi-segment-decoded layout, which made a keyword
+        // prefix silently match nothing there. Walk the FST range and fetch
+        // each term's postings through the layout-aware `term_doc_ids`.
+        if self.postings_disk_backed() {
+            let upper = crate::postings::prefix_upper_bound(prefix.as_bytes());
+            let upper = match upper.as_deref() {
+                Some(bytes) => std::ops::Bound::Excluded(bytes),
+                None => std::ops::Bound::Unbounded,
+            };
+            let mut out = BTreeSet::new();
+            for term in self.range_terms(field, std::ops::Bound::Included(prefix.as_bytes()), upper)
+            {
+                out.extend(self.term_doc_ids(field, &term));
+            }
+            return out;
+        }
         self.segments
             .iter()
             .flat_map(|segment| segment.terms.prefix_doc_ids(field, prefix))
             .collect()
+    }
+
+    /// MVP L1b: terms of `field` in the byte range `(lower, upper)` across
+    /// EVERY sealed segment (Lucene `TermRangeQuery` term walk), each term
+    /// once, sorted by bytes. FST-only, hence layout-independent: fetch the
+    /// postings of each term with [`Self::term_doc_ids`].
+    pub fn range_terms(
+        &self,
+        field: &str,
+        lower: std::ops::Bound<&[u8]>,
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Vec<String> {
+        if self.segments.len() == 1 {
+            return self.segment().terms.range_terms(field, lower, upper);
+        }
+        let merged: BTreeSet<String> = self
+            .segments
+            .iter()
+            .flat_map(|segment| segment.terms.range_terms(field, lower, upper))
+            .collect();
+        merged.into_iter().collect()
     }
 
     /// MVP L1: fuzzy term expansion of `field` across EVERY sealed segment.
