@@ -237,7 +237,9 @@ estimated by matchid (unverified until k8s measures allocatable):
     segment / term-dictionary encode + reopen), `3191623`
     (`SURCH_DATA_DIR`, manifest per index, persist on refresh / create /
     mapping / alias / delete, crash recovery, round-trip + crash +
-    version tests). Layout and crash-safety argument:
+    version tests), `e42da5b` (ops doc), `f19d8ad` (out-of-refresh
+    commit seals pending writes, fallocate retry guard). Layout and
+    crash-safety argument:
     `docs/ops/persistence.md`. 200 k local proof: restart to first query
     46 ms, responses identical, RSS after reopen 30.8 MiB.
   - [ ] Step 2 follow-ups found by step 1: index / component templates
