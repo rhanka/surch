@@ -260,3 +260,95 @@ fn damerau_levenshtein_chars(left: &[char], right: &[char], transpositions: bool
 
     rows[left.len()][right_len]
 }
+
+/// MVP L1: effective per-token fuzzy plan, following Lucene `FuzzyQuery`:
+/// the edit budget comes from the token length (AUTO) or the fixed
+/// fuzziness; when it is 0, or when `prefix_length` covers the whole token,
+/// Lucene degrades to an exact single-term lookup (`SingleTermsEnum`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuzzyTokenPlan {
+    /// Maximum edit distance for this token (0 = exact term only).
+    pub max_edits: u8,
+    /// Leading chars that must match exactly (0 when `max_edits == 0`).
+    pub prefix_chars: usize,
+}
+
+/// Resolves the [`FuzzyTokenPlan`] of one analysed query token.
+pub fn fuzzy_token_plan(
+    token: &str,
+    fuzziness: Fuzziness,
+    prefix_length: usize,
+) -> Result<FuzzyTokenPlan, FuzzyError> {
+    let len = token.chars().count();
+    let max_edits = edits_for_term_len(fuzziness, len)?;
+    if max_edits == 0 || prefix_length >= len {
+        return Ok(FuzzyTokenPlan {
+            max_edits: 0,
+            prefix_chars: 0,
+        });
+    }
+    Ok(FuzzyTokenPlan {
+        max_edits,
+        prefix_chars: prefix_length,
+    })
+}
+
+/// Lucene `FuzzyTermsEnum` boost of an expanded term: `1.0` for the exact
+/// term, otherwise `1 - edits / min(term_chars, query_chars)` (computed in
+/// `f32`, like Lucene, so tie-breaking on equal boosts is reproducible).
+pub fn lucene_fuzzy_similarity(query_chars: usize, term: &str, edits: u8) -> f32 {
+    if edits == 0 {
+        return 1.0;
+    }
+    let min_len = term.chars().count().min(query_chars);
+    if min_len == 0 {
+        return 0.0;
+    }
+    1.0_f32 - f32::from(edits) / min_len as f32
+}
+
+/// An expanded term kept by [`select_top_fuzzy_terms`], with the Lucene
+/// boost it carries into scoring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredFuzzyTerm {
+    pub term: String,
+    pub edits: u8,
+    pub boost: f32,
+}
+
+/// Keeps the `max_expansions` best fuzzy expansions the way Lucene's
+/// `TopTermsRewrite` (ES default `top_terms_blended_freqs_N` for `fuzzy`
+/// and `match`+`fuzziness`) does: highest [`lucene_fuzzy_similarity`]
+/// first, ties broken by ascending term bytes (UTF-8 byte order equals
+/// `str` order). The selection is global over the whole index (callers
+/// pass the union of every segment's matches). Returned in that rank
+/// order.
+///
+/// Note: this differs from [`expand_fuzzy_terms`], which orders by raw
+/// edit count then term and is kept as the plain-list oracle.
+pub fn select_top_fuzzy_terms(
+    query: &str,
+    hits: impl IntoIterator<Item = FuzzyTermMatch>,
+    max_expansions: usize,
+) -> Vec<ScoredFuzzyTerm> {
+    let query_chars = query.chars().count();
+    let mut scored: Vec<ScoredFuzzyTerm> = hits
+        .into_iter()
+        .map(|hit| ScoredFuzzyTerm {
+            boost: lucene_fuzzy_similarity(query_chars, &hit.term, hit.edits),
+            term: hit.term,
+            edits: hit.edits,
+        })
+        .collect();
+    scored.sort_by(|left, right| {
+        right
+            .boost
+            .total_cmp(&left.boost)
+            .then_with(|| left.term.cmp(&right.term))
+    });
+    scored.truncate(max_expansions);
+    scored
+}
+
+/// ES / Lucene default `max_expansions` for `fuzzy` and `match`+`fuzziness`.
+pub const DEFAULT_MAX_EXPANSIONS: usize = 50;

@@ -16,6 +16,7 @@ use surch_codec::postings_block::{
 /// ventilation du codec sans dépendre directement de `surch-codec`.
 pub use surch_codec::postings_block::BlockedEncodeStats;
 
+use crate::fuzzy::{DamerauLevenshteinAutomaton, FuzzyTermHit};
 use crate::roaring::RoaringDocSet;
 use postings_segment::PostingsSegment;
 
@@ -3743,6 +3744,49 @@ impl TermDictionary {
             .get(field)
             .map(|field_postings| field_postings.collect_prefix_doc_ids(prefix.as_bytes()))
             .unwrap_or_default()
+    }
+
+    /// MVP L1: every term of `field` accepted by the fuzzy `automaton`, with
+    /// its edit distance, in FST (byte-lexicographic) order. Walks ONLY the
+    /// FST (`can_match` prunes every branch already beyond `max_edits`), so
+    /// it works identically for RAM-resident and disk-backed dictionaries —
+    /// the FST stays resident in both layouts; postings are fetched
+    /// afterwards per selected term by the caller. When the automaton
+    /// carries a `prefix_length`, the walk is additionally bounded to the
+    /// `[prefix, upper_bound(prefix))` key range.
+    pub fn fuzzy_terms(
+        &self,
+        field: &str,
+        automaton: &DamerauLevenshteinAutomaton,
+    ) -> Vec<FuzzyTermHit> {
+        let Some(field_postings) = self.fields.get(field) else {
+            return Vec::new();
+        };
+        let prefix = automaton.required_prefix();
+        let mut builder = field_postings.fst.search_with_state(automaton);
+        if !prefix.is_empty() {
+            builder = builder.ge(prefix.as_bytes());
+            if let Some(upper) = prefix_upper_bound(prefix.as_bytes()) {
+                builder = builder.lt(upper);
+            }
+        }
+        let mut stream = builder.into_stream();
+        let mut out = Vec::new();
+        while let Some((bytes, _, state)) = stream.next() {
+            let Some(edits) = automaton.distance(&state) else {
+                continue;
+            };
+            // Analyzer output is always UTF-8; a non-UTF-8 key cannot be
+            // produced by a query term, so it is skipped rather than lossily
+            // converted.
+            if let Ok(term) = std::str::from_utf8(bytes) {
+                out.push(FuzzyTermHit {
+                    term: term.to_owned(),
+                    edits,
+                });
+            }
+        }
+        out
     }
 
     #[cfg(test)]

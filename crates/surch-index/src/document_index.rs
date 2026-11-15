@@ -2811,6 +2811,52 @@ impl DocumentIndex {
             .collect()
     }
 
+    /// MVP L1: fuzzy term expansion of `field` across EVERY sealed segment.
+    /// Each segment's FST is walked with the same automaton
+    /// ([`TermDictionary::fuzzy_terms`]); a term present in several segments
+    /// is reported once (its distance to the query does not depend on the
+    /// segment). Result sorted by term bytes. Layout-independent: works on
+    /// RAM-resident and disk-backed segments alike, since only the resident
+    /// FST is read — callers fetch postings per selected term through
+    /// [`Self::postings`] (single RAM segment) or
+    /// [`Self::decode_from_segment`] (disk-backed / multi-segment).
+    pub fn fuzzy_terms(
+        &self,
+        field: &str,
+        automaton: &crate::fuzzy::DamerauLevenshteinAutomaton,
+    ) -> Vec<crate::fuzzy::FuzzyTermHit> {
+        if self.segments.len() == 1 {
+            return self.segment().terms.fuzzy_terms(field, automaton);
+        }
+        let mut merged: BTreeMap<String, u8> = BTreeMap::new();
+        for segment in &self.segments {
+            for hit in segment.terms.fuzzy_terms(field, automaton) {
+                merged.entry(hit.term).or_insert(hit.edits);
+            }
+        }
+        merged
+            .into_iter()
+            .map(|(term, edits)| crate::fuzzy::FuzzyTermHit { term, edits })
+            .collect()
+    }
+
+    /// MVP L1: the full doc-id list of `(field, term)` whatever the layout —
+    /// the zero-copy RAM channel when the index is a single RAM segment,
+    /// otherwise the merged owned decode ([`Self::decode_from_segment`]).
+    /// Ascending, one entry per doc. Empty when the term is absent.
+    pub fn term_doc_ids(&self, field: &str, term: &str) -> Vec<u32> {
+        if self.postings_disk_backed() {
+            return self
+                .decode_from_segment(field, term)
+                .map(|(doc_ids, _freqs)| doc_ids)
+                .unwrap_or_default();
+        }
+        self.postings(field, term)
+            .into_iter()
+            .flat_map(|postings| postings.map(|posting| posting.doc_id))
+            .collect()
+    }
+
     /// Plan segments S1: `Σ` over every sealed segment's live-doc count
     /// — with one segment this is that segment's own `count()`, O(1),
     /// unchanged from before this refactor.

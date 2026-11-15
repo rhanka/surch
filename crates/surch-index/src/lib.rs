@@ -8,6 +8,7 @@ pub mod field_infos;
 // `surch-search` that consume the quantized doc-length slice.
 pub use document_index::decode_doc_len_byte;
 pub mod field_infos_codec;
+pub mod fuzzy;
 pub mod live_docs;
 pub mod mapping;
 pub mod memory;
