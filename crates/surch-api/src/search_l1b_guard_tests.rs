@@ -27,7 +27,10 @@ use serde_json::{json, Value};
 use surch_index::mapping::IndexMapping;
 use tower::ServiceExt;
 
-use super::{parse_search_request, query_matches, run_search, take_full_scan_fallbacks_for_test};
+use super::{
+    parse_search_request, query_matches, run_search, set_term_scan_source_check_max_for_test,
+    take_full_scan_fallbacks_for_test,
+};
 use crate::{app_router_with_state, state::AppState, AppRouterState};
 
 // ---------------------------------------------------------------------------
@@ -1285,12 +1288,19 @@ fn every_build_request_shape_is_served_without_full_scan() {
         runtime.block_on(async {
             let (router, state) = build(layout, &docs).await;
             let mut empty = Vec::new();
-            for (label, body, msearch) in &shapes {
-                let matched = run_shape(&router, &state, label, body, *msearch, layout).await;
-                if matched == 0 {
-                    empty.push(label.clone());
+            // `Some(0)`: range / geo clauses always walk their term
+            // dictionary, even restricted to a small sibling set; `None`:
+            // production threshold (small sets checked on `_source`).
+            for source_check_max in [Some(0), None] {
+                set_term_scan_source_check_max_for_test(source_check_max);
+                for (label, body, msearch) in &shapes {
+                    let matched = run_shape(&router, &state, label, body, *msearch, layout).await;
+                    if matched == 0 && source_check_max.is_none() {
+                        empty.push(label.clone());
+                    }
                 }
             }
+            set_term_scan_source_check_max_for_test(None);
             // The synthetic inputs are chosen to hit the corpus: an empty
             // match set would make a shape's check vacuous. Only the
             // "every field" conjunctions may legitimately match nothing.
@@ -1427,15 +1437,22 @@ fn range_follows_the_es_semantics_of_each_field_type() {
                             .to_string(),
                     )
                     .expect("request parses");
-                    take_full_scan_fallbacks_for_test();
-                    let response = run_search(&state, &[INDEX.to_owned()], &request);
-                    assert_eq!(
-                        take_full_scan_fallbacks_for_test(),
-                        0,
-                        "{label} ({layout:?}) took the full scan"
-                    );
-                    let got = hit_ids(&serde_json::to_value(response).expect("serialises"));
-                    assert_eq!(got, want, "{label} ({layout:?}): {wrapped}");
+                    for source_check_max in [Some(0), None] {
+                        set_term_scan_source_check_max_for_test(source_check_max);
+                        take_full_scan_fallbacks_for_test();
+                        let response = run_search(&state, &[INDEX.to_owned()], &request);
+                        assert_eq!(
+                            take_full_scan_fallbacks_for_test(),
+                            0,
+                            "{label} ({layout:?}) took the full scan"
+                        );
+                        let got = hit_ids(&serde_json::to_value(response).expect("serialises"));
+                        assert_eq!(
+                            got, want,
+                            "{label} ({layout:?}, {source_check_max:?}): {wrapped}"
+                        );
+                    }
+                    set_term_scan_source_check_max_for_test(None);
                 }
             }
         });

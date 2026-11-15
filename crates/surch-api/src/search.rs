@@ -806,6 +806,35 @@ fn constant_match_all_score(query: &SearchQuery) -> Option<f64> {
     }
 }
 
+/// MVP L1b: largest sibling candidate set (`within`) for which a `range` /
+/// geo clause is checked on the candidates' `_source` instead of walking
+/// its term dictionary (hydrating ~2 k documents costs a few ms; a geo
+/// walk over ~40 k distinct points or a broad date range over millions of
+/// postings costs more at 29 M documents).
+const TERM_SCAN_SOURCE_CHECK_MAX: usize = 2_048;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of [`TERM_SCAN_SOURCE_CHECK_MAX`] (per thread), so
+    /// the guard exercises both the `_source` check and the restricted walk
+    /// on a small fixture.
+    static TERM_SCAN_SOURCE_CHECK_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_term_scan_source_check_max_for_test(max: Option<usize>) {
+    TERM_SCAN_SOURCE_CHECK_OVERRIDE.with(|cell| cell.set(max));
+}
+
+fn term_scan_source_check_max() -> usize {
+    #[cfg(test)]
+    if let Some(max) = TERM_SCAN_SOURCE_CHECK_OVERRIDE.with(std::cell::Cell::get) {
+        return max;
+    }
+    TERM_SCAN_SOURCE_CHECK_MAX
+}
+
 fn intersect_candidates(left: BTreeSet<u32>, right: BTreeSet<u32>) -> BTreeSet<u32> {
     let (small, large) = if left.len() <= right.len() {
         (left, right)
@@ -901,6 +930,28 @@ fn posting_candidates(
                 .into_iter()
                 .collect(),
         )),
+        // MVP L1b: a term-scan filter restricted to a SMALL sibling candidate
+        // set is cheaper checked on those documents' `_source` (the
+        // reference semantics, hence exact) than by walking a whole term
+        // dictionary — e.g. a geo filter next to a name clause.
+        SearchQuery::Range { .. }
+        | SearchQuery::GeoDistance { .. }
+        | SearchQuery::GeoBoundingBox { .. }
+        | SearchQuery::GeoPolygon { .. }
+            if within.is_some_and(|within| within.len() <= term_scan_source_check_max()) =>
+        {
+            let within = within?;
+            let mapping = ctx.mapping()?;
+            let ids: Vec<u32> = within.iter().copied().collect();
+            Some(Candidates::exact(
+                state
+                    .documents_with_internal_ids(index, &ids)
+                    .into_iter()
+                    .filter(|(_, document)| query_matches(query, &document.source, mapping))
+                    .map(|(id, _)| id)
+                    .collect(),
+            ))
+        }
         // MVP L1b: `range` on a mapped text / keyword / numeric field walks
         // the term dictionary (FST byte range, or every term filtered
         // numerically) and unions the postings — exact by construction
