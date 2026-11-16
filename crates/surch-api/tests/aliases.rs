@@ -882,3 +882,57 @@ async fn aliases_batch_is_all_or_nothing_on_missing_index() {
         serde_json::json!({ "deces-old": {"aliases": {"deces": {}}} })
     );
 }
+
+async fn get_text(router: &Router, path: &str) -> (StatusCode, String) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                // What curl sends by default.
+                .header("accept", "*/*")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    (status, String::from_utf8(body.to_vec()).expect("utf8"))
+}
+
+#[tokio::test]
+async fn cat_reads_of_the_matchid_restore_job_are_plain_text() {
+    // matchID restore Job prune step:
+    //   aliased="$(curl -fsS "$ES_URL/_cat/aliases/$ES_INDEX?h=index")"
+    //   candidates="$(curl -fsS "$ES_URL/_cat/indices/$ES_INDEX-*?h=index")"
+    // then compares the whitespace-separated words.
+    let router = app_router();
+    create_index(&router, "deces-old").await;
+    create_index(&router, "deces-new").await;
+    create_index(&router, "other").await;
+    post_aliases(
+        &router,
+        r#"{"actions":[{"add":{"index":"deces-new","alias":"deces"}}]}"#,
+    )
+    .await;
+
+    let (status, aliased) = get_text(&router, "/_cat/aliases/deces?h=index").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(aliased, "deces-new\n");
+
+    let (status, candidates) = get_text(&router, "/_cat/indices/deces-*?h=index").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(candidates, "deces-new\ndeces-old\n");
+
+    // Column aliases and verbose header, ES text table.
+    let (_, verbose) = get_text(&router, "/_cat/aliases?h=a,i&v=true").await;
+    assert_eq!(verbose, "a     i\ndeces deces-new\n");
+
+    // JSON stays available on request.
+    let (_, json) = get_text(&router, "/_cat/aliases/deces?h=index&format=json").await;
+    assert_eq!(json, r#"[{"index":"deces-new"}]"#);
+}

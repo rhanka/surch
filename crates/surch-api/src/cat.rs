@@ -417,16 +417,22 @@ pub async fn cat_health_handler(State(state): State<AppState>) -> impl IntoRespo
 }
 
 /// Axum handler for `GET /_cat/aliases`.
-pub async fn cat_aliases_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn cat_aliases_handler(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
     let rows = collect_alias_rows(&state, None);
-    cat_response(rows)
+    render_alias_table(rows, &params, &headers)
 }
 
 /// Axum handler for `GET /_cat/aliases/{name}`.
 pub async fn cat_aliases_by_name_handler(
     State(state): State<AppState>,
     Path(alias): Path<String>,
-) -> impl IntoResponse {
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> axum::response::Response {
     if !state.alias_exists(&alias) {
         return OpenSearchError::new(
             StatusCode::NOT_FOUND,
@@ -436,7 +442,7 @@ pub async fn cat_aliases_by_name_handler(
         .into_response();
     }
     let rows = collect_alias_rows(&state, Some(alias.as_str()));
-    cat_response(rows)
+    render_alias_table(rows, &params, &headers)
 }
 
 /// Axum handler for `GET /_cat/count`.
@@ -497,6 +503,121 @@ fn collect_alias_rows(state: &AppState, filter: Option<&str>) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// `_cat/aliases` columns (ES 8.6.1 `RestAliasAction.getTableWithHeader`):
+/// name, accepted aliases. All are default columns.
+const CAT_ALIASES_COLUMNS: &[(&str, &[&str])] = &[
+    ("alias", &["a"]),
+    ("index", &["i", "idx"]),
+    ("filter", &["f", "fi"]),
+    ("routing.index", &["ri", "routingIndex"]),
+    ("routing.search", &["rs", "routingSearch"]),
+    ("is_write_index", &["w", "isWriteIndex"]),
+];
+
+/// MVP L2b: `_cat/aliases` with the same `h` / `format` / `Accept`
+/// negotiation as `_cat/indices`. matchID's restore Job reads
+/// `curl _cat/aliases/deces?h=index` as whitespace-separated text to decide
+/// which `deces-*` indices still serve the alias before pruning; a JSON
+/// body there would make every aliased index look unaliased.
+fn render_alias_table(
+    rows: Vec<Value>,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> axum::response::Response {
+    let columns: Vec<(&'static str, String)> = match params.get("h").map(String::as_str) {
+        None => CAT_ALIASES_COLUMNS
+            .iter()
+            .map(|(name, _)| (*name, (*name).to_owned()))
+            .collect(),
+        Some(h) => {
+            let mut out: Vec<(&'static str, String)> = Vec::new();
+            for wanted in h.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                for (name, aliases) in CAT_ALIASES_COLUMNS {
+                    let hit = if wanted.contains('*') {
+                        wildcard_match(wanted, name)
+                            || aliases.iter().any(|alias| wildcard_match(wanted, alias))
+                    } else {
+                        *name == wanted || aliases.contains(&wanted)
+                    };
+                    if hit && !out.iter().any(|(n, _)| n == name) {
+                        let display = if wanted.contains('*') {
+                            (*name).to_owned()
+                        } else {
+                            wanted.to_owned()
+                        };
+                        out.push((*name, display));
+                    }
+                }
+            }
+            out
+        }
+    };
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            columns
+                .iter()
+                .map(|(name, _)| {
+                    row.get(*name)
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned()
+                })
+                .collect()
+        })
+        .collect();
+
+    if cat_wants_json(params, headers) {
+        let body: Vec<Value> = cells
+            .iter()
+            .map(|row| {
+                let mut object = serde_json::Map::with_capacity(columns.len());
+                for ((_, display), cell) in columns.iter().zip(row) {
+                    object.insert(display.clone(), Value::String(cell.clone()));
+                }
+                Value::Object(object)
+            })
+            .collect();
+        return cat_response(body);
+    }
+
+    let verbose = params.get("v").is_some_and(|v| v.is_empty() || v == "true");
+    let mut widths: Vec<usize> = columns
+        .iter()
+        .map(|(_, display)| if verbose { display.chars().count() } else { 0 })
+        .collect();
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut text = String::new();
+    let mut push_row = |row: Vec<&str>| {
+        let last = row.len().saturating_sub(1);
+        for (col, value) in row.into_iter().enumerate() {
+            text.push_str(value);
+            if col != last {
+                let pad = widths[col].saturating_sub(value.chars().count());
+                text.push_str(&" ".repeat(pad));
+                text.push(' ');
+            }
+        }
+        text.push('\n');
+    };
+    if verbose {
+        push_row(columns.iter().map(|(_, d)| d.as_str()).collect());
+    }
+    for row in &cells {
+        push_row(row.iter().map(String::as_str).collect());
+    }
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; charset=UTF-8")],
+        text,
+    )
+        .into_response()
 }
 
 fn cat_response(rows: Vec<Value>) -> axum::response::Response {
