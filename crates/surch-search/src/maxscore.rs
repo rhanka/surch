@@ -312,8 +312,9 @@ impl MaxScoreExecutor {
             None
         };
 
-        for (token_idx, token) in ordered {
-            let allow_new_docs = token.max_contrib >= threshold;
+        let remaining = remaining_upper_bounds(&ordered);
+        for (position, (token_idx, token)) in ordered.into_iter().enumerate() {
+            let allow_new_docs = admits_new_docs(remaining[position], threshold);
             let skip_list = skip_lists[token_idx].as_ref();
 
             let walk = self.run_token(
@@ -519,6 +520,33 @@ fn seek_block(skip_list: &BlockSkipList, target: u32, from_block: usize) -> usiz
     }
 }
 
+/// L7: upper bound of the final score of a document first seen at each
+/// position of `ordered`: the sum of the `max_contrib` of that token and
+/// every later one. The previous gate compared the CURRENT token's bound
+/// alone, which could exclude a document matching several later tokens
+/// whose bounds add up past the threshold (classic MaxScore keeps the
+/// cumulative bound of the non-essential lists).
+fn remaining_upper_bounds(ordered: &[(usize, &MaxScoreToken<'_>)]) -> Vec<f64> {
+    let mut remaining = vec![0.0_f64; ordered.len()];
+    let mut sum = 0.0_f64;
+    for (position, (_, token)) in ordered.iter().enumerate().rev() {
+        sum += token.max_contrib;
+        remaining[position] = sum;
+    }
+    remaining
+}
+
+/// L7: whether a document whose final score is bounded by `upper_bound` may
+/// still enter the top-K whose current K-th best (partial) score is
+/// `threshold`. Callers round the final `f64` sum to `f32` (Lucene's
+/// `(float)` of a `double` sum), and two `f64` sums that round to the SAME
+/// `f32` tie and are then broken by doc id — so the comparison is made on
+/// the rounded values: `(f32) bound < (f32) threshold` proves the document
+/// strictly loses, anything else must still be scored.
+fn admits_new_docs(upper_bound: f64, threshold: f64) -> bool {
+    threshold == f64::NEG_INFINITY || (upper_bound as f32) >= (threshold as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,8 +569,9 @@ mod tests {
         });
         let mut scored: BTreeMap<u32, f64> = BTreeMap::new();
         let mut threshold = f64::NEG_INFINITY;
-        for (token_idx, token) in ordered {
-            let allow_new_docs = token.max_contrib >= threshold;
+        let remaining = remaining_upper_bounds(&ordered);
+        for (position, (token_idx, token)) in ordered.into_iter().enumerate() {
+            let allow_new_docs = admits_new_docs(remaining[position], threshold);
             let blocks = token
                 .doc_ids
                 .chunks(BLOCK_SIZE)

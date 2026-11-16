@@ -123,10 +123,12 @@ fn document_index_omits_field_lengths_when_norms_are_disabled() {
 
     let stats = index.field_stats("body").expect("body stats");
     assert_eq!(stats.doc_count, 2);
-    assert_eq!(stats.total_terms, 0);
+    // L7: no per-doc norm, but `sumTotalTermFreq` (4 tokens) still feeds
+    // Lucene's `avgFieldLength` (`LENGTH_TABLE[1] / avgdl`).
+    assert_eq!(stats.total_terms, 4);
     assert_eq!(stats.doc_len(0), None);
     assert_eq!(stats.doc_len(1), None);
-    assert_eq!(stats.avg_doc_len(), None);
+    assert_eq!(stats.avg_doc_len(), Some(2.0));
 
     let rust = index
         .postings("body", "rust")

@@ -16,7 +16,7 @@ use surch_search::fuzzy::{
     FuzzyQueryConfig, DEFAULT_MAX_EXPANSIONS,
 };
 use surch_search::maxscore::{MaxScoreExecutor, MaxScoreToken};
-use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
+use surch_search::scoring::{lucene_double_sum, lucene_req_opt_sum, Bm25Config, Bm25TermScorer};
 
 use crate::{
     index::validate_index_name,
@@ -768,14 +768,22 @@ fn matches_every_document(query: &SearchQuery) -> bool {
 /// `score_for_query` computes it; `None` when the score may vary per
 /// document.
 fn constant_match_all_score(query: &SearchQuery) -> Option<f64> {
+    constant_match_all_score_f32(query, 1.0).map(f64::from)
+}
+
+/// L7: [`constant_match_all_score`] with the Lucene semantics of
+/// [`lucene_score`]: `MatchAllDocsQuery` scores its boost, an empty `bool`
+/// is a `MatchAllDocsQuery`, a FILTER-only `bool` scores `0`, MUST clauses
+/// sum in `double` then cast, boosts multiply top-down.
+fn constant_match_all_score_f32(query: &SearchQuery, boost: f32) -> Option<f32> {
     match query {
-        SearchQuery::MatchAll { boost } => Some(*boost),
+        SearchQuery::MatchAll { boost: own } => Some(clause_boost(*own) * boost),
         SearchQuery::Bool {
             must,
             filter,
             must_not,
             should,
-            boost,
+            boost: own,
             ..
         } => {
             if !must_not.is_empty() || !should.is_empty() {
@@ -784,23 +792,30 @@ fn constant_match_all_score(query: &SearchQuery) -> Option<f64> {
             if !filter.iter().all(matches_every_document) {
                 return None;
             }
-            let mut sum = 0.0;
-            for clause in must {
-                sum += constant_match_all_score(clause)?;
+            let boost = clause_boost(*own) * boost;
+            if must.is_empty() && filter.is_empty() {
+                return Some(boost);
             }
-            let base = if sum > 0.0 { sum } else { 1.0 };
-            Some(base * *boost)
+            let mut scores = Vec::with_capacity(must.len());
+            for clause in must {
+                scores.push(constant_match_all_score_f32(clause, boost)?);
+            }
+            Some(if scores.is_empty() {
+                0.0
+            } else {
+                lucene_double_sum(scores)
+            })
         }
         SearchQuery::FunctionScore {
             inner,
-            boost,
+            boost: own,
             functions,
             ..
         } => {
             if !functions.is_empty() {
                 return None;
             }
-            Some(constant_match_all_score(inner)? * *boost)
+            constant_match_all_score_f32(inner, clause_boost(*own) * boost)
         }
         _ => None,
     }
@@ -1661,6 +1676,10 @@ mod p1a_direct_must_tests {
 mod l1b_build_request_guard_tests;
 
 #[cfg(test)]
+#[path = "search_l7_score_tests.rs"]
+mod l7_score_tests;
+
+#[cfg(test)]
 mod l1_fuzzy_full_scan_guard_tests {
     //! MVP L1 guard: no fuzzy / bool-of-fuzzy shape reaches the `_source`
     //! full scan (`full_scan_documents`, counted per thread).
@@ -1882,7 +1901,7 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
     metrics::histogram!("surch_dbg_general_matched").record(matched_documents.len() as f64);
     if scoring_enabled {
         if let Some(min) = request.min_score {
-            matched_documents.retain(|doc| doc.score >= min);
+            matched_documents.retain(|doc| !below_min_score(doc.score, min));
         }
     }
     let sort_mapping = indices.first().and_then(|index| state.index_mapping(index));
@@ -2572,15 +2591,60 @@ fn is_default_score_sort(sort: &[SortClause]) -> bool {
 /// stats in the scoring context, so scoring can run from internal doc-ids
 /// WITHOUT hydrating the candidate's `_source`.
 fn scoring_needs_source(query: &SearchQuery) -> bool {
+    clause_needs_source(query, true)
+}
+
+/// L7: whether scoring `query` at a position that is (`required`) or is not
+/// known to match needs `_source`: scoring functions read field values, and a
+/// clause the term statistics cannot evaluate (constant-score `prefix`,
+/// `range`, geo, `exists`, ..., or a phrase) must be checked with
+/// `query_matches` when its match status is not implied by the candidate set
+/// (`should`, or anything under a `should`).
+fn clause_needs_source(query: &SearchQuery, required: bool) -> bool {
     match query {
         SearchQuery::FunctionScore {
             inner, functions, ..
-        } => !functions.is_empty() || scoring_needs_source(inner),
-        // Only `must`/`should` contribute to the score (see `score_for_query`).
-        SearchQuery::Bool { must, should, .. } => {
-            must.iter().chain(should.iter()).any(scoring_needs_source)
+        } => !functions.is_empty() || clause_needs_source(inner, required),
+        SearchQuery::Bool {
+            must,
+            filter,
+            must_not,
+            should,
+            minimum_should_match,
+            ..
+        } => {
+            let has_required = !must.is_empty() || !filter.is_empty();
+            let effective_msm = if !has_required && *minimum_should_match == 0 {
+                1
+            } else {
+                *minimum_should_match as usize
+            };
+            let should_required = required && !should.is_empty() && effective_msm == should.len();
+            must.iter()
+                .any(|clause| clause_needs_source(clause, required))
+                || (!required
+                    && filter
+                        .iter()
+                        .chain(must_not.iter())
+                        .any(|clause| clause_needs_source(clause, false)))
+                || should
+                    .iter()
+                    .any(|clause| clause_needs_source(clause, should_required))
         }
-        _ => false,
+        SearchQuery::Match { .. }
+        | SearchQuery::Term { .. }
+        | SearchQuery::MultiMatch { .. }
+        | SearchQuery::Fuzzy { .. }
+        | SearchQuery::MatchAll { .. } => false,
+        SearchQuery::MatchPhrase { .. }
+        | SearchQuery::Range { .. }
+        | SearchQuery::Exists { .. }
+        | SearchQuery::Terms { .. }
+        | SearchQuery::Prefix { .. }
+        | SearchQuery::Wildcard { .. }
+        | SearchQuery::GeoDistance { .. }
+        | SearchQuery::GeoBoundingBox { .. }
+        | SearchQuery::GeoPolygon { .. } => !required,
     }
 }
 
@@ -2722,7 +2786,10 @@ fn run_topk_exact_bool(
         let mut max_score = f64::NEG_INFINITY;
         for &id in &ids {
             let score = score_for_query(query, id, &scoring_context, None);
-            if request.min_score.is_some_and(|min| score < min) {
+            if request
+                .min_score
+                .is_some_and(|min| below_min_score(score, min))
+            {
                 continue;
             }
             total += 1;
@@ -2825,12 +2892,13 @@ fn reduce_direct_must_conjunction(query: &SearchQuery) -> Option<[(&str, &str); 
 /// path runs) when they do not hold.
 fn reduce_deces_conjunction(query: &SearchQuery) -> Option<Vec<(&str, &str)>> {
     let mut out = Vec::new();
-    (reduce_deces_conjunction_into(query, &mut out) && !out.is_empty()).then_some(out)
+    (reduce_deces_conjunction_into(query, &mut out, true) && !out.is_empty()).then_some(out)
 }
 
 fn reduce_deces_conjunction_into<'q>(
     query: &'q SearchQuery,
     out: &mut Vec<(&'q str, &'q str)>,
+    allow_group: bool,
 ) -> bool {
     match query {
         SearchQuery::FunctionScore {
@@ -2838,7 +2906,11 @@ fn reduce_deces_conjunction_into<'q>(
             boost,
             functions,
             ..
-        } => functions.is_empty() && *boost == 1.0 && reduce_deces_conjunction_into(inner, out),
+        } => {
+            functions.is_empty()
+                && *boost == 1.0
+                && reduce_deces_conjunction_into(inner, out, allow_group)
+        }
         SearchQuery::Bool {
             must,
             filter,
@@ -2853,16 +2925,24 @@ fn reduce_deces_conjunction_into<'q>(
             if should.is_empty() {
                 // Pure single-child `must` wrapper (e.g. `function_score`'s
                 // `bool.must[inner_bool]`).
-                must.len() == 1 && reduce_deces_conjunction_into(&must[0], out)
+                // A single-clause `BooleanQuery` rewrites to its clause
+                // (BooleanQuery.rewrite 9.4.2): no extra rounding.
+                must.len() == 1 && reduce_deces_conjunction_into(&must[0], out, allow_group)
             } else {
                 // Terminal `should`-conjunction: every `should` required, no
-                // `must`. (`must` + `should` mixed would change the generic
-                // sum's `!= 1.0` filtering, so decline it.)
-                must.is_empty()
+                // `must`. L7: exactly ONE such group, of direct leaves — its
+                // score is `(float)` of the `double` sum of the leaves
+                // (WANDScorer / ConjunctionScorer), computed once by the
+                // fused walk. A nested group would round its own sum first
+                // (`(float)(a + b) + c`), which a flat fused sum cannot
+                // reproduce, so it declines to the generic scorer.
+                let single = should.len() == 1;
+                (allow_group || single)
+                    && must.is_empty()
                     && *minimum_should_match as usize == should.len()
-                    && should
-                        .iter()
-                        .all(|clause| reduce_deces_conjunction_into(clause, out))
+                    && should.iter().all(|clause| {
+                        reduce_deces_conjunction_into(clause, out, single && allow_group)
+                    })
             }
         }
         SearchQuery::Match { field, value, .. } => {
@@ -2894,7 +2974,10 @@ fn finalize_fused_topk(
     let mut total: u64 = 0;
     let mut max_score = f64::NEG_INFINITY;
     for (score, id) in scored {
-        if request.min_score.is_some_and(|min| score < min) {
+        if request
+            .min_score
+            .is_some_and(|min| below_min_score(score, min))
+        {
             continue;
         }
         total += 1;
@@ -3025,7 +3108,11 @@ fn run_topk_constant_match_all(
         return None;
     }
     let constant_score = constant_match_all_score(query)?;
-    if scoring_enabled && request.min_score.is_some_and(|min| constant_score < min) {
+    if scoring_enabled
+        && request
+            .min_score
+            .is_some_and(|min| below_min_score(constant_score, min))
+    {
         let total_summary = resolve_total_hits(0, request.track_total_hits.as_ref());
         return Some(build_search_response_with_total(
             Vec::new(),
@@ -3250,12 +3337,11 @@ fn maxscore_multi_match(
     }
 
     let mut combined: BTreeMap<u32, f64> = BTreeMap::new();
-    let mut any_field = false;
     for field in fields {
-        let Some(field_scores) = maxscore_match(field, value, limit, ctx, 0, false) else {
-            continue;
-        };
-        any_field = true;
+        // L7: a field this path cannot score (no statistics, constant-score
+        // field) would silently lose its matches here; decline so the
+        // generic scorer (`lucene_score`, dis_max over every field) runs.
+        let field_scores = maxscore_match(field, value, limit, ctx, 0, false)?;
         for (score, doc_id) in field_scores {
             let entry = combined.entry(doc_id).or_insert(0.0);
             if score > *entry {
@@ -3264,15 +3350,12 @@ fn maxscore_multi_match(
         }
     }
 
-    if !any_field {
-        return None;
-    }
-
-    let floor = 1.0 / 1e9_f64.max(1.0);
+    // ES `best_fields` => `DisjunctionMaxQuery` with tie breaker 0: the max
+    // of the per-field `f32` scores (DisjunctionMaxScorer 9.4.2).
     Some(
         combined
             .into_iter()
-            .map(|(id, score)| (score.max(floor), id))
+            .map(|(id, score)| (score, id))
             .collect(),
     )
 }
@@ -3303,6 +3386,14 @@ fn maxscore_match(
         return None;
     }
 
+    // L7: numeric / date fields are constant-score in ES (generic path);
+    // keyword fields score with `freq = 1`.
+    let docs_only = match field_scoring_kind(ctx.mapping(), field) {
+        FieldScoringKind::Constant => return None,
+        FieldScoringKind::Bm25 { docs_only } => docs_only,
+    };
+    let effective_tf = |tf: u64| if docs_only { 1 } else { tf };
+
     let avg_doc_len = field_stats.avg_doc_len;
     let config = Bm25Config::default();
     let norms_enabled = field_stats.norms_enabled;
@@ -3314,10 +3405,11 @@ fn maxscore_match(
     };
 
     // Deduplicate repeated tokens (e.g. analyzer-emitted duplicates from
-    // queries like "Paris Paris Paris") and turn the count into a boost.
-    // Equivalent to Lucene's "to be or not to be" -> "to^2 be^2 or not"
-    // rewrite, but applied at scoring time so each posting list is walked
-    // once per distinct token.
+    // queries like "Paris Paris Paris") and turn the count into a boost:
+    // Lucene `BooleanQuery.rewrite` merges duplicate SHOULD clauses into
+    // `BoostQuery(term, count)`, so the count multiplies the BM25 WEIGHT
+    // (`Bm25TermScorer::with_boost`), not the final score. Each posting list
+    // is walked once per distinct token.
     let mut token_boosts: BTreeMap<String, u32> = BTreeMap::new();
     for token in tokens {
         *token_boosts.entry(token).or_insert(0) += 1;
@@ -3327,7 +3419,6 @@ fn maxscore_match(
         stats: &'a TermScoringView<'a>,
         scorer: Bm25TermScorer,
         max_contrib: f64,
-        boost: f64,
     }
 
     let mut token_infos: Vec<TokenInfo<'_>> = token_boosts
@@ -3339,19 +3430,23 @@ fn maxscore_match(
             }
             // Optimisation #6: validate config/corpus and precompute idf ONCE
             // per token; the block + per-doc loops below then call the
-            // branch-free, ln()-free `scorer.score(tf, doc_len)` (bit-identical
-            // to the previous per-call `bm25_score`).
-            let scorer =
-                Bm25TermScorer::new(config, field_stats.doc_count, stats.doc_freq, avg_doc_len)
-                    .ok()?;
-            let max_tf = stats.max_term_freq().max(1);
-            let boost = *count as f64;
-            let single = scorer.score(max_tf, min_doc_len);
+            // branch-free, ln()-free `scorer.score(tf, doc_len)`.
+            let scorer = Bm25TermScorer::with_boost(
+                config,
+                field_stats.doc_count,
+                stats.doc_freq,
+                avg_doc_len,
+                *count as f32,
+            )
+            .ok()?;
+            let max_tf = effective_tf(stats.max_term_freq().max(1));
+            // Lucene's BM25 rewrite is monotone in `freq` and in the norm
+            // (BM25Similarity.java:241-249), so this is a valid upper bound.
+            let max_contrib = scorer.score(max_tf, min_doc_len);
             Some(TokenInfo {
                 stats,
                 scorer,
-                max_contrib: single * boost,
-                boost,
+                max_contrib,
             })
         })
         .collect();
@@ -3372,8 +3467,8 @@ fn maxscore_match(
     // `PostingsBuilder::build()` time when the postings were folded
     // into 128-entry chunks — so this loop is O(num_blocks) BM25 calls
     // and no longer iterates the postings themselves. The block max
-    // contrib is `bm25(max_tf_in_block, min_doc_len, …)` times the
-    // token's repeat boost.
+    // contrib is `bm25(max_tf_in_block, min_doc_len, …)` (the repeat
+    // boost lives in the scorer weight).
     let block_max_contribs: Vec<Vec<f64>> = token_infos
         .iter()
         .map(|token| {
@@ -3382,9 +3477,8 @@ fn maxscore_match(
                 .block_metas
                 .iter()
                 .map(|meta| {
-                    let block_max_tf = u64::from(meta.max_term_freq).max(1);
-                    let block_score = token.scorer.score(block_max_tf, min_doc_len);
-                    block_score * token.boost
+                    let block_max_tf = effective_tf(u64::from(meta.max_term_freq).max(1));
+                    token.scorer.score(block_max_tf, min_doc_len)
                 })
                 .collect()
         })
@@ -3429,7 +3523,7 @@ fn maxscore_match(
             } else {
                 1
             };
-            Some(token.scorer.score(tf, doc_len) * token.boost)
+            Some(token.scorer.score(effective_tf(tf), doc_len))
         })
         .ok()?;
 
@@ -3446,11 +3540,14 @@ fn maxscore_match(
         .increment(u64::try_from(outcome.blocks_skipped).unwrap_or(u64::MAX));
 
     let _ = total_hint;
+    // L7: a multi-token `match` is a SHOULD `BooleanQuery` whose
+    // `DisjunctionSumScorer` returns `(float)` of the `double` sum of the
+    // matching term scores; one token is the `TermQuery` score itself.
     Some(
         outcome
             .scored
             .into_iter()
-            .map(|(id, score)| (score, id))
+            .map(|(id, score)| (f64::from(score as f32), id))
             .collect(),
     )
 }
@@ -3467,6 +3564,13 @@ fn is_scoring_query(query: &SearchQuery) -> bool {
         SearchQuery::GeoDistance { .. } => false,
         _ => false,
     }
+}
+
+/// L7: ES `MinimumScoreCollector.collect` (ES 8.6.1, l.45) keeps a hit when
+/// `scorer.score() >= minimumScore`, both `float` (`min_score` parsed as a
+/// Java `float`). Surch scores are `f32` values carried in `f64`.
+fn below_min_score(score: f64, min_score: f64) -> bool {
+    (score as f32) < (min_score as f32)
 }
 
 fn compute_max_score(documents: &[ScoredDocument], scoring_enabled: bool) -> Option<f64> {
@@ -3734,110 +3838,434 @@ fn score_documents(
     })
 }
 
+/// `_score` of a document the caller already knows matches `query` (a
+/// candidate of the exact or `_source`-verified match set), as ES 8.6.1
+/// computes it — see [`lucene_score`]. Returned as the `f32` score widened to
+/// `f64` (exact). A required clause whose score cannot be evaluated from the
+/// scoring context (no term statistics) contributes `0.0`.
 fn score_for_query(
     query: &SearchQuery,
     internal_doc_id: u32,
     scoring_context: &SearchScoringContext<'_>,
     source: Option<&Value>,
 ) -> f64 {
+    f64::from(
+        lucene_score(query, internal_doc_id, scoring_context, source, 1.0, true).unwrap_or(0.0),
+    )
+}
+
+/// L7: how ES 8.6.1 scores a full-text / term query on `field`, from the
+/// field's mapping type.
+///
+/// * `text` (and unmapped fields, Surch's dynamic default): BM25 with norms
+///   and term frequencies.
+/// * `keyword` / `boolean`: BM25 with `IndexOptions.DOCS` (term frequency
+///   always 1) and, by default, no norms (`LeafSimScorer` norm `1L`).
+/// * numeric / `date`: `NumberFieldType` / `DateFieldType.termQuery` build
+///   point queries scored as a `ConstantScoreWeight` (score = boost).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FieldScoringKind {
+    Bm25 { docs_only: bool },
+    Constant,
+}
+
+pub(crate) fn field_scoring_kind(mapping: &IndexMapping, field: &str) -> FieldScoringKind {
+    match mapping.resolve_field(field).map(|field| field.field_type) {
+        Some(
+            FieldType::Integer
+            | FieldType::Long
+            | FieldType::Short
+            | FieldType::Byte
+            | FieldType::Float
+            | FieldType::Double
+            | FieldType::Date,
+        ) => FieldScoringKind::Constant,
+        Some(FieldType::Keyword | FieldType::Boolean) => FieldScoringKind::Bm25 { docs_only: true },
+        _ => FieldScoringKind::Bm25 { docs_only: false },
+    }
+}
+
+/// `f64` clause boost as the Java `float` ES parses it (Jackson
+/// `getFloatValue()` casts the parsed `double`).
+#[inline]
+fn clause_boost(boost: f64) -> f32 {
+    boost as f32
+}
+
+/// Distinct analysed tokens of a query text, in first-occurrence order, with
+/// their repeat count. Lucene `BooleanQuery.rewrite` ("Deduplicate SHOULD /
+/// MUST clauses by summing up their boosts", BooleanQuery.java 9.4.2) turns
+/// `jean jean` into one clause `BoostQuery(jean, 2f)`.
+fn dedup_tokens(tokens: &[String]) -> Vec<(&str, u32)> {
+    let mut out: Vec<(&str, u32)> = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        match out.iter_mut().find(|(seen, _)| *seen == token.as_str()) {
+            Some((_, count)) => *count += 1,
+            None => out.push((token.as_str(), 1)),
+        }
+    }
+    out
+}
+
+/// L7: ES 8.6.1 / Lucene 9.4.2 score of `query` for `internal_doc_id`.
+///
+/// `None` means the clause does not match the document (as far as the
+/// scoring context can tell); `Some(score)` is the clause's `f32` score.
+/// `boost` is the product of every enclosing boost, threaded top-down the way
+/// Lucene's `createWeight(searcher, scoreMode, boost)` does
+/// (`BoostQuery.createWeight` passes `this.boost * boost`, BooleanWeight
+/// forwards it to every clause). `required` is true when the document is
+/// known to match this clause (every clause on the root's required path);
+/// it lets constant-score clauses that the scoring context cannot evaluate
+/// (prefix, range, geo, ...) count as matching without `_source`.
+///
+/// Combination follows the Lucene 9.4.2 scorers ES builds for
+/// `track_total_hits`/`min_score` searches (`ScoreMode.COMPLETE`, see
+/// `Boolean2ScorerSupplier.getInternal` l.110-150):
+/// * required part `req()` = `ConjunctionScorer` over the scoring MUST
+///   clauses: `(float)` of the `double` sum (ConjunctionScorer.java:58-63);
+///   FILTER-only => `FilterScorer` score `0f` (l.173-185);
+/// * optional part `opt()` = the single SHOULD scorer, or
+///   `DisjunctionSumScorer` / `WANDScorer` (msm > 1): `(float)` of the
+///   `double` sum of the matching clauses;
+/// * MUST + SHOULD: msm > 0 => `ConjunctionScorer([req, opt])` (double sum of
+///   two floats), msm == 0 => `ReqOptSumScorer` (`float` addition). Both are
+///   the correctly rounded `req + opt`.
+fn lucene_score(
+    query: &SearchQuery,
+    doc: u32,
+    ctx: &SearchScoringContext<'_>,
+    source: Option<&Value>,
+    boost: f32,
+    required: bool,
+) -> Option<f32> {
     match query {
-        SearchQuery::Match { field, value, .. } => {
-            bm25_field_score(scoring_context, field, value, internal_doc_id).unwrap_or(1.0)
-        }
-        SearchQuery::MultiMatch { query, fields, .. } => fields
-            .iter()
-            .map(|field| {
-                bm25_field_score(scoring_context, field, query, internal_doc_id).unwrap_or(0.0)
-            })
-            .fold(0.0_f64, f64::max)
-            .max(1.0 / 1e9_f64.max(1.0)),
+        SearchQuery::Match {
+            field,
+            value,
+            operator,
+        } => match_query_score(ctx, field, value, *operator, doc, boost),
         SearchQuery::MatchPhrase { field, value } => {
-            bm25_field_score(scoring_context, field, value, internal_doc_id).unwrap_or(1.0)
+            // Not a phrase scorer: bag-of-words approximation (AND over the
+            // tokens). Lucene `PhraseQuery` scores the phrase frequency with
+            // the sum of the term idfs — not covered by L7.
+            match_query_score(ctx, field, value, MatchOperator::And, doc, boost)
         }
-        // MVP L1: BM25 over the expanded terms, times the clause `boost`
-        // (the 1.0 placeholder, unboosted, is kept for a doc without any
-        // expanded term so `bool.should` keeps filtering it out).
-        SearchQuery::Fuzzy { boost, .. } => {
-            fuzzy_bm25_score(scoring_context, query, internal_doc_id)
-                .map_or(1.0, |score| score * *boost)
+        SearchQuery::Term { field, value } => {
+            let token = ctx.mapping().term_query_value(field, value);
+            match field_scoring_kind(ctx.mapping(), field) {
+                FieldScoringKind::Constant => {
+                    (ctx.term_freq(field, &token, doc) > 0).then_some(boost)
+                }
+                FieldScoringKind::Bm25 { docs_only } => {
+                    term_bm25_score(ctx, field, &token, doc, boost, None, docs_only)
+                }
+            }
         }
+        SearchQuery::MultiMatch {
+            query: text,
+            fields,
+            operator,
+        } => {
+            // ES `best_fields` => `DisjunctionMaxQuery(tie_breaker 0)`:
+            // Lucene 9.4.2 `DisjunctionMaxScorer.score` returns
+            // `(float) (scoreMax + otherScoreSum * tieBreakerMultiplier)`,
+            // i.e. the max with a 0 tie breaker.
+            fields
+                .iter()
+                .filter_map(|field| match_query_score(ctx, field, text, *operator, doc, boost))
+                .reduce(f32::max)
+        }
+        SearchQuery::Fuzzy { .. } => fuzzy_query_score(ctx, query, doc, boost),
+        SearchQuery::MatchAll { boost: own } => Some(clause_boost(*own) * boost),
         SearchQuery::Bool {
             must,
+            filter,
             must_not,
             should,
             minimum_should_match,
-            boost,
-            ..
+            boost: own,
         } => {
-            // `filter` and `must_not` clauses are excluded — they restrict
-            // candidacy, not score.
-            let must_score: f64 = must
+            let boost = clause_boost(*own) * boost;
+            if must.is_empty() && filter.is_empty() && must_not.is_empty() && should.is_empty() {
+                // `BoolQueryBuilder.doToQuery`: no clause => MatchAllDocsQuery.
+                return Some(boost);
+            }
+            let mut must_scores = Vec::with_capacity(must.len());
+            for clause in must {
+                match lucene_score(clause, doc, ctx, source, boost, required) {
+                    Some(score) => must_scores.push(score),
+                    None if required => must_scores.push(0.0),
+                    None => return None,
+                }
+            }
+            if !required {
+                for clause in filter {
+                    lucene_score(clause, doc, ctx, source, boost, false)?;
+                }
+                if must_not
+                    .iter()
+                    .any(|clause| lucene_score(clause, doc, ctx, source, boost, false).is_some())
+                {
+                    return None;
+                }
+            }
+            let has_required = !must.is_empty() || !filter.is_empty();
+            let effective_msm = if !has_required && *minimum_should_match == 0 {
+                1
+            } else {
+                *minimum_should_match as usize
+            };
+            let should_required = required && !should.is_empty() && effective_msm == should.len();
+            let should_scores: Vec<f32> = should
                 .iter()
-                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context, source))
-                .sum();
-            let _ = must_not;
-
-            // The wildcard arm at the bottom returns 1.0 for non-scoring
-            // sub-queries; filter that placeholder out so it doesn't inflate
-            // the sum. BM25 always emits > 1.0 for real matches.
-            let should_score: f64 = should
-                .iter()
-                .map(|clause| score_for_query(clause, internal_doc_id, scoring_context, source))
-                .filter(|score| *score != 1.0)
-                .sum();
-
-            // `minimum_should_match` gates candidacy in query_matches; it
-            // does not affect scoring once we are in this arm.
-            let _ = minimum_should_match;
-            let combined = must_score + should_score;
-            let base = if combined > 0.0 { combined } else { 1.0 };
-            base * *boost
+                .filter_map(|clause| lucene_score(clause, doc, ctx, source, boost, should_required))
+                .collect();
+            if !required && should_scores.len() < effective_msm {
+                return None;
+            }
+            let required_score = (!must_scores.is_empty()).then(|| lucene_double_sum(must_scores));
+            let optional_score =
+                (!should_scores.is_empty()).then(|| lucene_double_sum(should_scores));
+            if should.is_empty() {
+                // Pure conjunction (or FILTER / MUST_NOT only: score 0).
+                return Some(required_score.unwrap_or(0.0));
+            }
+            if !has_required {
+                // Pure disjunction.
+                return Some(optional_score.unwrap_or(0.0));
+            }
+            Some(lucene_req_opt_sum(
+                required_score.unwrap_or(0.0),
+                optional_score,
+            ))
         }
-        SearchQuery::MatchAll { boost } => *boost,
         SearchQuery::FunctionScore {
             inner,
-            boost,
+            boost: own,
             functions,
             score_mode,
             boost_mode,
         } => {
-            let inner_score =
-                score_for_query(inner, internal_doc_id, scoring_context, source) * *boost;
-
+            // `FunctionScoreQuery.createWeight` (ES 8.6.1, l.223-246) passes
+            // the incoming boost to the sub-query weight; the `function_score`
+            // boost itself is a `BoostQuery` around it (AbstractQueryBuilder
+            // .toQuery l.114-121).
+            let boost = clause_boost(*own) * boost;
+            let sub_score = lucene_score(inner, doc, ctx, source, boost, required)?;
             if functions.is_empty() {
-                // A5 phase 1 fast path: pure no-op wrapper, no
-                // scoring-function machinery, baseline preserved.
-                return inner_score;
+                // `CustomBoostFactorScorer.score` l.408-410: no function =>
+                // the sub-query score.
+                return Some(sub_score);
             }
-
-            let combined_factor = combine_scoring_functions(
-                functions,
-                *score_mode,
-                source,
-                scoring_context.mapping(),
-            );
-            combine_with_boost_mode(inner_score, combined_factor, *boost_mode)
+            let factor = combine_scoring_functions(functions, *score_mode, source, ctx.mapping());
+            Some(combine_with_boost_mode(sub_score, factor, *boost_mode))
         }
-        // `geo_distance` is a filter — constant score so it does not
-        // perturb BM25 ranking (matchID always wraps it in `bool.filter`).
-        SearchQuery::GeoDistance { .. } => 1.0,
-        _ => 1.0,
+        SearchQuery::Range { .. }
+        | SearchQuery::Exists { .. }
+        | SearchQuery::Terms { .. }
+        | SearchQuery::Prefix { .. }
+        | SearchQuery::Wildcard { .. }
+        | SearchQuery::GeoDistance { .. }
+        | SearchQuery::GeoBoundingBox { .. }
+        | SearchQuery::GeoPolygon { .. } => {
+            // Constant-score queries (`ConstantScoreWeight`: score = boost):
+            // multi-term rewrites (`CONSTANT_SCORE_REWRITE`), `TermInSetQuery`,
+            // point / doc-values ranges, geo and `exists` queries.
+            if required {
+                return Some(boost);
+            }
+            match source {
+                Some(source) => query_matches(query, source, ctx.mapping()).then_some(boost),
+                // Unknown without `_source`: `scoring_needs_source` routes
+                // every query with such a clause to a `_source`-backed path.
+                None => Some(boost),
+            }
+        }
     }
 }
 
-/// A5 phase 2: evaluate every `function_score.functions[]` entry
-/// against `source` and combine the resulting factors with `mode`.
-/// When a function carries a `filter` that the doc does not match,
-/// the function contributes the score-mode identity (1.0 for
-/// `Multiply`, 0.0 for `Sum`/`Avg`, and is dropped from `First`/
-/// `Min`/`Max`) — matches ES 7.x semantics.
+/// Lucene `TermQuery` score of one analysed `token` of `field` (ES legacy
+/// BM25, `f32`). `doc_freq` overrides the term's own document frequency (the
+/// blended frequency of a fuzzy rewrite). `docs_only`: `IndexOptions.DOCS`
+/// fields (keyword) score with `freq = 1`.
+fn term_bm25_score(
+    ctx: &SearchScoringContext<'_>,
+    field: &str,
+    token: &str,
+    doc: u32,
+    boost: f32,
+    doc_freq: Option<u64>,
+    docs_only: bool,
+) -> Option<f32> {
+    let field_stats = ctx.field_stats(field)?;
+    let term_stats = ctx.term_stats(field, token)?;
+    let term_freq = term_stats.term_freq(doc);
+    if term_freq == 0 {
+        return None;
+    }
+    let doc_freq = doc_freq.unwrap_or(term_stats.doc_freq);
+    if field_stats.doc_count == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
+        return None;
+    }
+    let doc_len = if field_stats.norms_enabled {
+        field_stats.doc_len(doc)?
+    } else {
+        // `LeafSimScorer.getNormValue`: no norms => encoded norm `1L`.
+        1
+    };
+    let freq = if docs_only { 1 } else { term_freq };
+    let scorer = Bm25TermScorer::with_boost(
+        Bm25Config::default(),
+        field_stats.doc_count,
+        doc_freq,
+        field_stats.avg_doc_len,
+        boost,
+    )
+    .ok()?;
+    Some(scorer.score_f32(freq, doc_len))
+}
+
+/// ES `match` query score (`MatchQueryParser`): one `TermQuery` per analysed
+/// token, combined by a `BooleanQuery` (SHOULD for `OR`, MUST for `AND`)
+/// whose duplicate clauses are merged with summed boosts; a single clause is
+/// the `TermQuery` itself.
+fn match_query_score(
+    ctx: &SearchScoringContext<'_>,
+    field: &str,
+    value: &str,
+    operator: MatchOperator,
+    doc: u32,
+    boost: f32,
+) -> Option<f32> {
+    let tokens = ctx.mapping().search_terms(field, value);
+    if tokens.is_empty() {
+        return None;
+    }
+    let kind = field_scoring_kind(ctx.mapping(), field);
+    let mut scores = Vec::with_capacity(tokens.len());
+    for (token, count) in dedup_tokens(&tokens) {
+        // `BoostQuery(TermQuery, count).createWeight(boost)` => `count * boost`.
+        let token_boost = count as f32 * boost;
+        let score = match kind {
+            FieldScoringKind::Constant => {
+                (ctx.term_freq(field, token, doc) > 0).then_some(token_boost)
+            }
+            FieldScoringKind::Bm25 { docs_only } => {
+                term_bm25_score(ctx, field, token, doc, token_boost, None, docs_only)
+            }
+        };
+        match score {
+            Some(score) => scores.push(score),
+            None if operator == MatchOperator::And => return None,
+            None => {}
+        }
+    }
+    (!scores.is_empty()).then(|| lucene_double_sum(scores))
+}
+
+/// L7: ES `match`+`fuzziness` / `fuzzy` score. Per analysed token, Lucene
+/// `FuzzyQuery` rewritten by `TopTermsBlendedFreqScoringRewrite`
+/// (`FuzzyQuery.defaultRewriteMethod`, FuzzyQuery.java 9.4.2 l.60-62):
+/// `TopTermsRewrite.rewrite` keeps the `max_expansions` best terms
+/// (TopTermsRewrite.java l.64-175, boost clamped `Math.max(0f, boost)`), then
+/// `BlendedTermQuery.rewrite` gives every kept term the MAX document
+/// frequency of the group (and the summed total term frequency, unused by
+/// BM25) and builds `BOOLEAN_REWRITE`: a SHOULD `BooleanQuery` of
+/// `BoostQuery(TermQuery, similarity)`. The per-term boost comes from
+/// `FuzzyTermsEnum.next` (l.248-255): `1f` for the exact term, otherwise
+/// `1.0f - (float) ed / (float) Math.min(codePointCount(term), termLength)`.
+/// The tokens then combine like a `match` query.
+fn fuzzy_query_score(
+    ctx: &SearchScoringContext<'_>,
+    query: &SearchQuery,
+    doc: u32,
+    boost: f32,
+) -> Option<f32> {
+    let SearchQuery::Fuzzy {
+        field,
+        operator,
+        boost: own,
+        ..
+    } = query
+    else {
+        return None;
+    };
+    let boost = clause_boost(*own) * boost;
+    let expansions = ctx.fuzzy_expansions.get(&fuzzy_clause_key(query))?;
+    let field_stats = ctx.field_stats(field)?;
+    let kind = field_scoring_kind(ctx.mapping(), field);
+    // Duplicate analysed tokens are duplicate `FuzzyQuery` clauses, merged
+    // by `BooleanQuery.rewrite` with a summed boost.
+    let mut seen: Vec<(&str, u32, &FuzzyTokenExpansion)> = Vec::with_capacity(expansions.len());
+    for expansion in expansions {
+        match seen
+            .iter_mut()
+            .find(|(token, _, _)| *token == expansion.token.as_str())
+        {
+            Some((_, count, _)) => *count += 1,
+            None => seen.push((expansion.token.as_str(), 1, expansion)),
+        }
+    }
+    let mut token_scores = Vec::with_capacity(seen.len());
+    for (_, count, expansion) in seen {
+        let token_boost = count as f32 * boost;
+        let blended_df = expansion
+            .terms
+            .iter()
+            .filter_map(|scored| ctx.term_stats(field, &scored.term))
+            .map(|stats| stats.doc_freq)
+            .max()
+            .unwrap_or(0)
+            .min(field_stats.doc_count);
+        let mut term_scores = Vec::with_capacity(expansion.terms.len());
+        if blended_df > 0 {
+            for scored in &expansion.terms {
+                // `BoostQuery(TermQuery, similarity).createWeight(boost)`.
+                let term_boost = scored.boost.max(0.0) * token_boost;
+                let score = match kind {
+                    FieldScoringKind::Constant => {
+                        (ctx.term_freq(field, &scored.term, doc) > 0).then_some(term_boost)
+                    }
+                    FieldScoringKind::Bm25 { docs_only } => term_bm25_score(
+                        ctx,
+                        field,
+                        &scored.term,
+                        doc,
+                        term_boost,
+                        Some(blended_df),
+                        docs_only,
+                    ),
+                };
+                if let Some(score) = score {
+                    term_scores.push(score);
+                }
+            }
+        }
+        if term_scores.is_empty() {
+            if *operator == MatchOperator::And {
+                return None;
+            }
+            continue;
+        }
+        token_scores.push(lucene_double_sum(term_scores));
+    }
+    (!token_scores.is_empty()).then(|| lucene_double_sum(token_scores))
+}
+
+/// L7: `FunctionScoreQuery.FunctionFactorScorer.computeScore` (ES 8.6.1
+/// FunctionScoreQuery.java l.420-480): every function in `double`, combined
+/// with `score_mode`; a function whose filter does not match the document is
+/// skipped; no applicable function => factor `1d`. `AVG` divides the total by
+/// the sum of the applied functions' weights (`ScoreFunction.getWeight`, 1
+/// for an unweighted function), `SUM` keeps the total.
 fn combine_scoring_functions(
     functions: &[ScoringFunctionClause],
     mode: ScoreMode,
     source: Option<&Value>,
     mapping: &IndexMapping,
 ) -> f64 {
-    let mut factors: Vec<f64> = Vec::with_capacity(functions.len());
+    let mut applied: Vec<(f64, f64)> = Vec::with_capacity(functions.len());
     for clause in functions {
         let applies = match (&clause.filter, source) {
             (Some(filter), Some(src)) => query_matches(filter, src, mapping),
@@ -3845,55 +4273,66 @@ fn combine_scoring_functions(
             (None, _) => true,
         };
         if !applies {
-            // Function is filtered out for this doc — contribute the
-            // score-mode identity so it does not perturb the result.
-            match mode {
-                ScoreMode::Multiply => factors.push(1.0),
-                ScoreMode::Sum | ScoreMode::Avg => factors.push(0.0),
-                ScoreMode::First | ScoreMode::Min | ScoreMode::Max => {
-                    // Skip — these modes treat absence as "no contribution".
-                }
-            }
             continue;
         }
         let raw = evaluate_scoring_function(&clause.function, source);
-        let weighted = match clause.weight {
-            Some(w) => raw * w,
+        // `WeightFactorFunction`: `leafFunction.score(..) * getWeight()`, the
+        // weight being a `float`.
+        let weight = clause.weight.map_or(1.0, |w| f64::from(w as f32));
+        let score = match clause.weight {
+            Some(_) => raw * weight,
             None => raw,
         };
-        factors.push(weighted);
+        applied.push((score, weight));
+        if mode == ScoreMode::First {
+            break;
+        }
     }
-
-    if factors.is_empty() {
-        // Every function was filtered out under First/Min/Max — fall
-        // back to the score-mode identity so the inner score survives.
-        return match mode {
-            ScoreMode::Multiply => 1.0,
-            ScoreMode::Sum | ScoreMode::Avg => 0.0,
-            ScoreMode::First | ScoreMode::Min | ScoreMode::Max => 1.0,
-        };
+    if applied.is_empty() {
+        return 1.0;
     }
-
     match mode {
-        ScoreMode::Multiply => factors.iter().product(),
-        ScoreMode::Sum => factors.iter().sum(),
-        ScoreMode::Avg => factors.iter().sum::<f64>() / factors.len() as f64,
-        ScoreMode::First => factors[0],
-        ScoreMode::Min => factors.iter().copied().fold(f64::INFINITY, f64::min),
-        ScoreMode::Max => factors.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        ScoreMode::First => applied[0].0,
+        ScoreMode::Multiply => applied
+            .iter()
+            .fold(1.0, |factor, (score, _)| factor * score),
+        ScoreMode::Max => applied
+            .iter()
+            .fold(f64::NEG_INFINITY, |max, (score, _)| max.max(*score)),
+        ScoreMode::Min => applied
+            .iter()
+            .fold(f64::INFINITY, |min, (score, _)| min.min(*score)),
+        ScoreMode::Sum | ScoreMode::Avg => {
+            let mut total = 0.0_f64;
+            let mut weight_sum = 0.0_f64;
+            for (score, weight) in &applied {
+                total += score;
+                weight_sum += weight;
+            }
+            if weight_sum == 0.0 {
+                1.0
+            } else if mode == ScoreMode::Avg {
+                total / weight_sum
+            } else {
+                total
+            }
+        }
     }
 }
 
-/// A5 phase 2: combine the inner BM25 `_score` with the combined
-/// function factor using `mode`. Mirrors ES 7.x semantics.
-fn combine_with_boost_mode(inner: f64, factor: f64, mode: BoostMode) -> f64 {
+/// L7: ES 8.6.1 `CombineFunction.combine(double queryScore, double funcScore,
+/// double maxBoost)` (CombineFunction.java), `maxBoost` at its default
+/// `Float.MAX_VALUE`, result cast to `float`.
+fn combine_with_boost_mode(inner: f32, factor: f64, mode: BoostMode) -> f32 {
+    let query_score = f64::from(inner);
+    let func = factor.min(f64::from(f32::MAX));
     match mode {
-        BoostMode::Multiply => inner * factor,
-        BoostMode::Sum => inner + factor,
-        BoostMode::Avg => (inner + factor) * 0.5,
-        BoostMode::Replace => factor,
-        BoostMode::Min => inner.min(factor),
-        BoostMode::Max => inner.max(factor),
+        BoostMode::Multiply => (query_score * func) as f32,
+        BoostMode::Replace => func as f32,
+        BoostMode::Sum => (query_score + func) as f32,
+        BoostMode::Avg => ((func + query_score) / 2.0) as f32,
+        BoostMode::Min => query_score.min(func) as f32,
+        BoostMode::Max => query_score.max(func) as f32,
     }
 }
 
@@ -3903,7 +4342,8 @@ fn combine_with_boost_mode(inner: f64, factor: f64, mode: BoostMode) -> f64 {
 /// (1.0 for `Weight`, the `decay` floor for `GaussDecay`).
 fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>) -> f64 {
     match function {
-        ScoringFunction::Weight { value } => *value,
+        // `WeightFactorFunction` over `ScoreOne`: `1.0 * weight` (float).
+        ScoringFunction::Weight { value } => f64::from(*value as f32),
         ScoringFunction::FieldValueFactor {
             field,
             factor,
@@ -3913,7 +4353,9 @@ fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>)
             let raw = source
                 .and_then(|src| lookup_numeric_field(src, field))
                 .unwrap_or(*missing);
-            let scaled = raw * *factor;
+            // `FieldValueFactorFunction`: `value * boostFactor` with a float
+            // `boostFactor`.
+            let scaled = raw * f64::from(*factor as f32);
             apply_field_value_modifier(scaled, *modifier)
         }
         ScoringFunction::Decay {
@@ -3932,7 +4374,8 @@ fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>)
                 return *decay;
             };
             let distance = (origin_days - doc_days).abs() as f64;
-            // ES 7.x decay curves (no offset in MVP).
+            // ES 7.x decay curves (no offset in MVP). Not bit-aligned with
+            // ES's millisecond date decay (L7: not used by deces-backend).
             match kind {
                 DecayKind::Gauss => {
                     let sigma_sq = scale_days * scale_days;
@@ -3945,10 +4388,13 @@ fn evaluate_scoring_function(function: &ScoringFunction, source: Option<&Value>)
     }
 }
 
+/// ES 8.6.1 `FieldValueFactorFunction.Modifier` (l.140-199): `LOG1P` is
+/// `Math.log10(n + 1)`, `SQRT` `Math.sqrt(n)`, `RECIPROCAL` `1.0 / n`. The
+/// negative / zero guards are Surch's (ES rejects a negative result).
 fn apply_field_value_modifier(value: f64, modifier: FieldValueModifier) -> f64 {
     match modifier {
         FieldValueModifier::None => value,
-        FieldValueModifier::Log1p => (1.0 + value).ln(),
+        FieldValueModifier::Log1p => (value + 1.0).log10(),
         FieldValueModifier::Sqrt => {
             if value < 0.0 {
                 0.0
@@ -4213,6 +4659,13 @@ impl<'a> SearchScoringContext<'a> {
             .get(field)
             .and_then(|tokens| tokens.get(token))
     }
+
+    /// Term frequency of `(field, token)` in `doc` (0 when absent or when
+    /// the term's statistics were not loaded).
+    fn term_freq(&self, field: &str, token: &str, doc: u32) -> u64 {
+        self.term_stats(field, token)
+            .map_or(0, |stats| stats.term_freq(doc))
+    }
 }
 
 /// Shared empty mapping so [`SearchScoringContext::mapping`] can hand out
@@ -4233,6 +4686,13 @@ fn collect_scoring_field_tokens(
         // MVP L1: fuzzy clauses register their EXPANDED terms instead (see
         // `SearchScoringContext::new` / `collect_fuzzy_clauses`).
         SearchQuery::Fuzzy { .. } => {}
+        // L7: a `term` query scores with BM25 on its normalised term.
+        SearchQuery::Term { field, value } => {
+            field_tokens
+                .entry(field.clone())
+                .or_default()
+                .insert(mapping.term_query_value(field, value));
+        }
         SearchQuery::MultiMatch { query, fields, .. } => {
             for field in fields {
                 insert_scoring_tokens(field_tokens, mapping, field, query);
@@ -4282,70 +4742,26 @@ fn insert_scoring_tokens(
         .extend(tokens);
 }
 
-fn bm25_field_score(
-    scoring_context: &SearchScoringContext<'_>,
-    field: &str,
-    query: &str,
-    internal_doc_id: u32,
-) -> Option<f64> {
-    let query_tokens = scoring_context.mapping().search_terms(field, query);
-    let field_stats = scoring_context.field_stats(field)?;
-    if query_tokens.is_empty() || field_stats.doc_count == 0 {
-        return None;
-    }
-
-    let doc_len = if field_stats.norms_enabled {
-        field_stats.doc_len(internal_doc_id)?
-    } else {
-        1
-    };
-    let avg_doc_len = field_stats.avg_doc_len;
-
-    // Deduplicate repeated tokens; each repeat boosts the same posting
-    // lookup instead of walking the same term_freq twice.
-    let mut token_boosts: BTreeMap<&str, u32> = BTreeMap::new();
-    for token in &query_tokens {
-        *token_boosts.entry(token.as_str()).or_insert(0) += 1;
-    }
-
-    let config = Bm25Config::default();
-    let mut total = 0.0_f64;
-    for (query_token, boost) in &token_boosts {
-        let term_stats = scoring_context.term_stats(field, query_token)?;
-        let term_freq = term_stats.term_freq(internal_doc_id);
-        if term_freq == 0 {
-            continue;
-        }
-        let doc_freq = term_stats.doc_freq;
-        if doc_freq == 0 || doc_freq > field_stats.doc_count {
-            continue;
-        }
-        if let Ok(score) = bm25_score(
-            config,
-            field_stats.doc_count,
-            doc_freq,
-            term_freq,
-            doc_len,
-            avg_doc_len,
-        ) {
-            total += score * (*boost as f64);
-        }
-    }
-    if total > 0.0 {
-        Some(total)
-    } else {
-        None
-    }
-}
-
-/// MVP L1: the fuzzy clauses whose score `score_for_query` computes (root,
-/// `bool.must` / `bool.should`, `function_score` inner) — `filter` and
-/// `must_not` never score.
+/// MVP L1: the fuzzy clauses `lucene_score` evaluates. L7: `filter` and
+/// `must_not` clauses are included — they never score, but under a
+/// non-required (`should`) branch their match status decides whether the
+/// branch matches.
 fn collect_fuzzy_clauses<'q>(query: &'q SearchQuery, out: &mut Vec<&'q SearchQuery>) {
     match query {
         SearchQuery::Fuzzy { .. } => out.push(query),
-        SearchQuery::Bool { must, should, .. } => {
-            for clause in must.iter().chain(should.iter()) {
+        SearchQuery::Bool {
+            must,
+            filter,
+            must_not,
+            should,
+            ..
+        } => {
+            for clause in must
+                .iter()
+                .chain(filter.iter())
+                .chain(must_not.iter())
+                .chain(should.iter())
+            {
                 collect_fuzzy_clauses(clause, out);
             }
         }
@@ -4371,72 +4787,6 @@ fn fuzzy_clause_key(query: &SearchQuery) -> String {
         ),
         _ => String::new(),
     }
-}
-
-/// MVP L1: BM25 of a fuzzy clause over its expanded terms, approximating
-/// ES's rewrite (`top_terms_blended_freqs_N`: Lucene `BlendedTermQuery`
-/// with `BOOLEAN_REWRITE`): per analysed token, every kept expansion the doc
-/// contains contributes `similarity_boost × BM25(tf)`, with the doc freq of
-/// ALL the token's expansions blended to their maximum (rare misspellings do
-/// not outrank the real name on idf). Tokens sum (a repeated token counts
-/// twice). Uses the Surch BM25 kernel (`bm25_score`, which keeps the
-/// `(k1 + 1)` factor in `f64` — lot L7), so absolute values differ from
-/// Lucene 9 by that constant factor; ranking within the clause follows ES.
-fn fuzzy_bm25_score(
-    scoring_context: &SearchScoringContext<'_>,
-    query: &SearchQuery,
-    internal_doc_id: u32,
-) -> Option<f64> {
-    let SearchQuery::Fuzzy { field, .. } = query else {
-        return None;
-    };
-    let expansions = scoring_context
-        .fuzzy_expansions
-        .get(&fuzzy_clause_key(query))?;
-    let field_stats = scoring_context.field_stats(field)?;
-    if field_stats.doc_count == 0 {
-        return None;
-    }
-    let doc_len = if field_stats.norms_enabled {
-        field_stats.doc_len(internal_doc_id)?
-    } else {
-        1
-    };
-    let config = Bm25Config::default();
-    let mut total = 0.0_f64;
-    for expansion in expansions {
-        let blended_df = expansion
-            .terms
-            .iter()
-            .filter_map(|scored| scoring_context.term_stats(field, &scored.term))
-            .map(|stats| stats.doc_freq)
-            .max()
-            .unwrap_or(0)
-            .min(field_stats.doc_count);
-        if blended_df == 0 {
-            continue;
-        }
-        for scored in &expansion.terms {
-            let Some(term_stats) = scoring_context.term_stats(field, &scored.term) else {
-                continue;
-            };
-            let term_freq = term_stats.term_freq(internal_doc_id);
-            if term_freq == 0 {
-                continue;
-            }
-            if let Ok(score) = bm25_score(
-                config,
-                field_stats.doc_count,
-                blended_df,
-                term_freq,
-                doc_len,
-                field_stats.avg_doc_len,
-            ) {
-                total += score * f64::from(scored.boost);
-            }
-        }
-    }
-    (total > 0.0).then_some(total)
 }
 
 fn field_tokens_for_source(source: &Value, field: &str, mapping: &IndexMapping) -> Vec<String> {

@@ -1545,11 +1545,14 @@ enum FusedConjunctionScoreMode {
     Must,
 }
 
-fn fused_bm25_contribution(score: Option<f64>, mode: FusedConjunctionScoreMode) -> f64 {
-    match mode {
-        FusedConjunctionScoreMode::Should => score.filter(|score| *score != 1.0).unwrap_or(0.0),
-        FusedConjunctionScoreMode::Must => score.filter(|score| *score > 0.0).unwrap_or(1.0),
-    }
+/// One fused term's contribution to the conjunction's `double` sum. L7: a
+/// matched term contributes its BM25 score whatever its value (the former
+/// generic scorer dropped a `should` term scoring exactly `1.0`, a
+/// placeholder artefact Lucene does not have); an unscorable term (no norm)
+/// contributes `0`. Both modes now sum identically; the mode is kept as the
+/// provenance of the shape (`bool.must` pair vs `should` conjunction).
+fn fused_bm25_contribution(score: Option<f64>, _mode: FusedConjunctionScoreMode) -> f64 {
+    score.unwrap_or(0.0)
 }
 
 /// Accumule les blocs FoR observés pendant UNE tentative P2. Les compteurs
@@ -1641,8 +1644,13 @@ mod p1a_fused_must_tests {
             fused_bm25_contribution(Some(1.0), FusedConjunctionScoreMode::Must),
             1.0
         );
+        // L7: Lucene never drops a matched term scoring exactly 1.0.
         assert_eq!(
             fused_bm25_contribution(Some(1.0), FusedConjunctionScoreMode::Should),
+            1.0
+        );
+        assert_eq!(
+            fused_bm25_contribution(None, FusedConjunctionScoreMode::Must),
             0.0
         );
     }
@@ -3715,10 +3723,14 @@ impl InMemoryIndex {
         // the pre-segment code path.
         let aggregated = self.index.field_stats_aggregated(field)?;
         let norms_enabled = self.mapping.norms_enabled(field);
+        // L7: without norms Lucene still divides `LENGTH_TABLE[1]` by
+        // `avgFieldLength = sumTotalTermFreq / docCount` (1.0 for a
+        // single-valued keyword field); indices persisted before L7 recorded
+        // no `total_terms` for such fields and keep the 1.0 fallback.
         let avg_doc_len = if norms_enabled {
             aggregated.avg_doc_len()?
         } else {
-            1.0
+            aggregated.avg_doc_len().unwrap_or(1.0)
         };
         // Plan segments S2: `doc_len` needs to resolve a GLOBAL doc_id to
         // the right segment's LOCALLY-indexed dense byte slice (see
@@ -6071,6 +6083,15 @@ impl AppState {
             .expect("in-memory API state lock should not be poisoned");
         let data = store.indices.get(index)?;
 
+        // L7: a `match` on a numeric / date field is a constant-score point
+        // query in ES, not BM25 — the generic scorer handles it.
+        if clauses.iter().any(|&(field, _)| {
+            crate::search::field_scoring_kind(&data.mapping, field)
+                == crate::search::FieldScoringKind::Constant
+        }) {
+            return None;
+        }
+
         // P2 couvre maintenant le disque et le multi-segment avec une lecture
         // checked : un `bool.must` direct peut donc emprunter ce chemin sans
         // confondre l'absence locale d'un terme avec une erreur de lecture.
@@ -6090,6 +6111,8 @@ impl AppState {
             doc_ids: &'a [u32],
             freqs: &'a [u32],
             roaring: Option<&'a RoaringDocSet>,
+            /// L7: keyword (`IndexOptions.DOCS`) — scored with `freq = 1`.
+            docs_only: bool,
         }
         let mut terms: Vec<TermCtx<'_>> = Vec::with_capacity(clauses.len());
         for &(field, value) in clauses {
@@ -6114,6 +6137,10 @@ impl AppState {
                 doc_ids: list.doc_ids(),
                 freqs: list.freqs(),
                 roaring: list.roaring(),
+                docs_only: matches!(
+                    crate::search::field_scoring_kind(&data.mapping, field),
+                    crate::search::FieldScoringKind::Bm25 { docs_only: true }
+                ),
             });
         }
 
@@ -6140,8 +6167,10 @@ impl AppState {
             }
         };
 
-        // One term's BM25 contribution — replicates `bm25_field_score` exactly
-        // (same `bm25_score` primitive + guards) but with the captured `freq`.
+        // One term's BM25 contribution — replicates `term_bm25_score` (search.rs)
+        // exactly (same `bm25_score` primitive + guards) but with the captured
+        // `freq`. The caller sums the contributions in `f64` and casts the sum
+        // to `f32` (Lucene `ConjunctionScorer` / `WANDScorer`).
         let term_contrib = |t: &TermCtx<'_>, doc_id: u32, freq: u32| -> f64 {
             if freq == 0 || t.doc_freq == 0 || t.doc_freq > t.field_stats.doc_count {
                 return fused_bm25_contribution(None, mode);
@@ -6154,6 +6183,7 @@ impl AppState {
             } else {
                 1
             };
+            let freq = if t.docs_only { 1 } else { freq };
             let score = bm25_score(
                 config,
                 t.field_stats.doc_count,
@@ -6185,7 +6215,7 @@ impl AppState {
                     let f1 = freq_at(terms[1].doc_ids, terms[1].freqs, &mut c1, doc_id);
                     let sum =
                         term_contrib(&terms[0], doc_id, f0) + term_contrib(&terms[1], doc_id, f1);
-                    scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+                    scored.push((f64::from(sum as f32), doc_id));
                 }
                 return Some(scored);
             }
@@ -6220,7 +6250,7 @@ impl AppState {
                     _ => continue 'docs,
                 }
             }
-            scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+            scored.push((f64::from(sum as f32), doc_id));
         }
         Some(scored)
     }
@@ -6271,36 +6301,44 @@ impl AppState {
                 block_metrics.publish(index_name, &data.index);
                 return None;
             };
-            scoring_terms.push((field_stats, postings.global_df()));
+            let docs_only = matches!(
+                crate::search::field_scoring_kind(&data.mapping, field),
+                crate::search::FieldScoringKind::Bm25 { docs_only: true }
+            );
+            scoring_terms.push((field_stats, postings.global_df(), docs_only));
             segmented_terms.push(postings);
         }
 
         let config = Bm25Config::default();
 
-        let term_contrib =
-            |field_stats: &FieldScoringStats<'_>, doc_freq: u64, doc_id: u32, freq: u32| -> f64 {
-                if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
-                    return fused_bm25_contribution(None, mode);
+        let term_contrib = |field_stats: &FieldScoringStats<'_>,
+                            doc_freq: u64,
+                            docs_only: bool,
+                            doc_id: u32,
+                            freq: u32|
+         -> f64 {
+            if freq == 0 || doc_freq == 0 || doc_freq > field_stats.doc_count {
+                return fused_bm25_contribution(None, mode);
+            }
+            let doc_len = if field_stats.norms_enabled {
+                match field_stats.doc_len(doc_id) {
+                    Some(len) => len,
+                    None => return fused_bm25_contribution(None, mode),
                 }
-                let doc_len = if field_stats.norms_enabled {
-                    match field_stats.doc_len(doc_id) {
-                        Some(len) => len,
-                        None => return fused_bm25_contribution(None, mode),
-                    }
-                } else {
-                    1
-                };
-                let score = bm25_score(
-                    config,
-                    field_stats.doc_count,
-                    doc_freq,
-                    u64::from(freq),
-                    doc_len,
-                    field_stats.avg_doc_len,
-                )
-                .ok();
-                fused_bm25_contribution(score, mode)
+            } else {
+                1
             };
+            let score = bm25_score(
+                config,
+                field_stats.doc_count,
+                doc_freq,
+                u64::from(if docs_only { 1 } else { freq }),
+                doc_len,
+                field_stats.avg_doc_len,
+            )
+            .ok();
+            fused_bm25_contribution(score, mode)
+        };
 
         let mut scored: Vec<(f64, u32)> = Vec::new();
         for segment_idx in 0..data.index.segment_count() {
@@ -6357,11 +6395,18 @@ impl AppState {
                     // L'ordre de sommation suit les clauses de la requête,
                     // jamais le tri local des drivers : les bits restent stables.
                     let mut sum = 0.0;
-                    for (clause_idx, (field_stats, doc_freq)) in scoring_terms.iter().enumerate() {
-                        sum +=
-                            term_contrib(field_stats, *doc_freq, doc_id, frequencies[clause_idx]);
+                    for (clause_idx, (field_stats, doc_freq, docs_only)) in
+                        scoring_terms.iter().enumerate()
+                    {
+                        sum += term_contrib(
+                            field_stats,
+                            *doc_freq,
+                            *docs_only,
+                            doc_id,
+                            frequencies[clause_idx],
+                        );
                     }
-                    scored.push((if sum > 0.0 { sum } else { 1.0 }, doc_id));
+                    scored.push((f64::from(sum as f32), doc_id));
                     #[cfg(test)]
                     if consommer_erreur_p2_tardive_injectee() {
                         return Err(());
@@ -6450,6 +6495,12 @@ impl AppState {
         if field_stats.doc_count == 0 {
             return None;
         }
+        // L7: numeric / date `match` is constant-score in ES (generic path);
+        // keyword fields score with `freq = 1` (`IndexOptions.DOCS`).
+        let docs_only = match crate::search::field_scoring_kind(&data.mapping, field) {
+            crate::search::FieldScoringKind::Constant => return None,
+            crate::search::FieldScoringKind::Bm25 { docs_only } => docs_only,
+        };
 
         let mut postings = match data.index.segmented_postings_checked(field, &token) {
             Ok(Some(postings)) => postings,
@@ -6532,7 +6583,7 @@ impl AppState {
                 if freq == 0 {
                     continue;
                 }
-                let term_freq = u64::from(freq);
+                let term_freq = if docs_only { 1 } else { u64::from(freq) };
                 // Chantier C1 — élagage AVANT la lecture aléatoire de
                 // `doc_len`, qui est le poste dominant restant de cette
                 // boucle (un défaut de cache par document dans un tableau
