@@ -1237,8 +1237,15 @@ fn bool_generic_candidates(
                 )
             } else {
                 // True disjunction (MSM < n_should): the union bounds the
-                // candidate space but is a superset.
-                *exact = false;
+                // candidate space; a superset unless MSM == 1 (MVP L1c: a
+                // document matches at least one should clause iff it is in
+                // the union of their exact sets — deces `nameQuery` and the
+                // two-name `q` shape).
+                if minimum_should_match == 1 {
+                    *exact &= resolved.iter().all(|candidates| candidates.exact);
+                } else {
+                    *exact = false;
+                }
                 let mut union = BTreeSet::new();
                 for candidates in resolved {
                     union.extend(candidates.ids);
@@ -1744,6 +1751,13 @@ mod l7_score_tests;
 #[path = "search_l2b_tests.rs"]
 mod l2b_sorted_top_tests;
 
+#[path = "search_doc_values_aggs.rs"]
+mod doc_values_aggs;
+
+#[cfg(test)]
+#[path = "search_l1c_tests.rs"]
+mod l1c_tests;
+
 #[cfg(test)]
 mod l1_fuzzy_full_scan_guard_tests {
     //! MVP L1 guard: no fuzzy / bool-of-fuzzy shape reaches the `_source`
@@ -1957,6 +1971,25 @@ fn run_search_paths(
         }
     }
 
+    // MVP L1c: `size: 0` aggregations (deces-backend `/agg`) counted from
+    // the index (sub-field columns, term dictionary x postings) over the
+    // matched ids, without hydrating a single `_source`. A candidate set it
+    // resolved before declining is reused below (single index only).
+    let mut resolved_candidates: Option<Candidates> = None;
+    if !request.aggs.is_empty() {
+        if let Some(response) = doc_values_aggs::run_doc_values_aggregations(
+            state,
+            indices,
+            request,
+            constant_score,
+            scoring_enabled,
+            started_at,
+            &mut resolved_candidates,
+        ) {
+            return response;
+        }
+    }
+
     // A12.1: when aggregations are requested we must walk every matched
     // document (not just the top-K window) so the bucket counts cover
     // the full match set. Skip the top-K shortcut in that case.
@@ -1991,10 +2024,11 @@ fn run_search_paths(
     let t_general = std::time::Instant::now();
     let mut matched_documents: Vec<ScoredDocument> = Vec::new();
     for index in indices {
-        matched_documents.extend(match_documents_for_index(
+        matched_documents.extend(match_documents_for_index_reusing(
             state,
             index,
             request.query.as_ref(),
+            resolved_candidates.take(),
         ));
     }
     if let Some(constant) = constant_score {
@@ -2326,7 +2360,12 @@ fn compute_terms_aggregation(
             other => record_terms_value(&mut counts, other),
         }
     }
+    finish_terms_aggregation(counts, size)
+}
 
+/// A12.1 / L1c: the `terms` payload from the per-key counts (shared by the
+/// `_source` path above and the doc-values path).
+fn finish_terms_aggregation(counts: BTreeMap<TermsKey, (Value, u64)>, size: usize) -> AggResult {
     // Two-stage sort: doc_count desc, then key asc as tiebreak.
     let mut sorted: Vec<(TermsKey, Value, u64)> = counts
         .into_iter()
@@ -2389,15 +2428,24 @@ fn compute_date_histogram_aggregation(
             other => record(other),
         }
     }
+    finish_date_histogram_aggregation(&counts, calendar_interval, format.unwrap_or(&field_format))
+}
 
-    let print_format = format.unwrap_or(&field_format).to_owned();
+/// A12.2 / L1c: the `date_histogram` payload from the per-bucket counts
+/// (bucket start in days since the epoch), shared by the `_source` and the
+/// doc-values paths.
+fn finish_date_histogram_aggregation(
+    counts: &BTreeMap<i64, u64>,
+    calendar_interval: CalendarInterval,
+    print_format: &str,
+) -> AggResult {
     let mut buckets = Vec::with_capacity(counts.len());
     if let (Some(&first), Some(&last)) = (counts.keys().next(), counts.keys().next_back()) {
         let mut day = first;
         while day <= last {
             let millis = day * MILLIS_PER_DAY;
             buckets.push(AggBucket {
-                key_as_string: Some(crate::es_json::format_es_date(millis, &print_format)),
+                key_as_string: Some(crate::es_json::format_es_date(millis, print_format)),
                 key: Value::from(millis),
                 doc_count: counts.get(&day).copied().unwrap_or(0),
             });
@@ -2505,12 +2553,19 @@ fn compute_cardinality_aggregation(
 }
 
 fn record_terms_value(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Value) {
+    record_terms_count(counts, value, 1);
+}
+
+/// L1c: `count` occurrences of `value` (the doc-values path counts each
+/// distinct value once with its document count). The first recorded value
+/// of a key is the bucket key, as in the per-document path.
+fn record_terms_count(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Value, count: u64) {
     if matches!(value, Value::Null) {
         return;
     }
     let key = TermsKey::from_value(value);
     let entry = counts.entry(key).or_insert_with(|| (value.clone(), 0));
-    entry.1 += 1;
+    entry.1 += count;
 }
 
 /// A12.4: `composite` aggregation executor.
@@ -2608,13 +2663,29 @@ fn compute_composite_aggregation(
             .or_insert_with(|| (composite_values, 0));
         entry.1 += 1;
     }
+    finish_composite_aggregation(counts, sources, &views, size, after)
+}
 
+/// Per composite key (one `TermsKey` per source), the per-source response
+/// values and the document count.
+type CompositeCounts = BTreeMap<Vec<TermsKey>, (Vec<Value>, u64)>;
+
+/// A12.4 / L1c: the `composite` page (`after` cursor, `size`, `after_key`)
+/// from the per-key counts, shared by the `_source` and the doc-values
+/// paths.
+fn finish_composite_aggregation(
+    counts: CompositeCounts,
+    sources: &[CompositeSource],
+    views: &[FieldValueView<'_>],
+    size: usize,
+    after: Option<&BTreeMap<String, Value>>,
+) -> AggResult {
     // Apply `after` as a strict `>` filter on the composite key. A
     // missing source name lex-compares as JSON `null`.
     let after_key_terms: Option<Vec<TermsKey>> = after.map(|cursor| {
         sources
             .iter()
-            .zip(&views)
+            .zip(views)
             .map(|(source, view)| {
                 let Some(value) = cursor.get(&source.name) else {
                     return TermsKey::from_value(&Value::Null);
@@ -3211,14 +3282,17 @@ fn run_topk_exact_bool(
     state.with_search_reader(&indices[0], |reader| -> Option<SearchResponse> {
         let reader = reader?;
         let mut arena = ScoringArena::default();
-        let scoring_context = SearchScoringContext::new(&reader, query, &mut arena);
+        let mut scoring_context = SearchScoringContext::new(&reader, query, &mut arena);
+        // MVP L1c: fuzzy clauses scored in one merged pass over the batch.
+        scoring_context.prepare_batch(query, &ids);
         // Chantier C1 : cette closure recopiait mot pour mot
         // `scored_pair_ordering`. Une seule définition de l'ordre dans tout
         // le dépôt — une dérive silencieuse entre chemins était possible.
         let mut topn = TopN::new(limit, scored_pair_ordering);
         let mut total: u64 = 0;
         let mut max_score = f64::NEG_INFINITY;
-        for &id in &ids {
+        for (slot, &id) in ids.iter().enumerate() {
+            scoring_context.set_batch_slot(slot);
             let score = score_for_query(query, id, &scoring_context, None);
             if request
                 .min_score
@@ -4071,9 +4145,11 @@ fn candidate_set_is_exact(query: &SearchQuery) -> bool {
             // and each should is itself exact. MSM == 0 / empty should does not
             // restrict matching (exactness rides on must/filter). MSM in
             // [1, n_should) is a union superset -> not exact.
+            // MVP L1c: MSM == 1 resolves to the union of the should sets,
+            // the exact set of documents matching at least one of them.
             should.is_empty()
                 || *minimum_should_match == 0
-                || (*minimum_should_match as usize == should.len()
+                || ((*minimum_should_match as usize == should.len() || *minimum_should_match == 1)
                     && should.iter().all(candidate_set_is_exact))
         }
         // prefix may be a superset outside the index_prefixes window; everything
@@ -4082,10 +4158,14 @@ fn candidate_set_is_exact(query: &SearchQuery) -> bool {
     }
 }
 
-fn match_documents_for_index(
+/// MVP L1c: `resolved` is the candidate set of `query` when
+/// `posting_candidates` already ran for it (the doc-values aggregation path
+/// declined after resolving it), so it is not resolved twice.
+fn match_documents_for_index_reusing(
     state: &AppState,
     index: &str,
     query: Option<&SearchQuery>,
+    resolved: Option<Candidates>,
 ) -> Vec<ScoredDocument> {
     let mapping = state.index_mapping(index).unwrap_or_default();
     // Each arm yields the candidate documents plus, when candidate resolution
@@ -4116,7 +4196,8 @@ fn match_documents_for_index(
             // ES).
             _ => {
                 let ctx = CandidateCtx::new(state, index);
-                if let Some(candidates) = posting_candidates(&ctx, query, None) {
+                let candidates = resolved.or_else(|| posting_candidates(&ctx, query, None));
+                if let Some(candidates) = candidates {
                     let ids = candidates.ids.into_iter().collect::<Vec<u32>>();
                     let pairs = state.documents_with_internal_ids(index, &ids);
                     let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = if candidates.exact {
@@ -4235,7 +4316,7 @@ fn score_documents(
         };
 
         let mut arena = ScoringArena::default();
-        let scoring_context = SearchScoringContext::new(&reader, query, &mut arena);
+        let mut scoring_context = SearchScoringContext::new(&reader, query, &mut arena);
 
         // When candidate resolution already produced the internal ids (Bool /
         // Match candidate paths), they are aligned with `documents` — score
@@ -4244,10 +4325,14 @@ fn score_documents(
         // score is bit-identical, without the per-doc String-hashmap lookup
         // that dominated the high-`df` deces `bool`/`function_score` tail.
         if let Some(ids) = known_ids {
+            // MVP L1c: fuzzy clauses scored in one merged pass over the batch.
+            scoring_context.prepare_batch(query, &ids);
             return documents
                 .into_iter()
                 .zip(ids)
-                .map(|(doc, id)| {
+                .enumerate()
+                .map(|(slot, (doc, id))| {
+                    scoring_context.set_batch_slot(slot);
                     let score =
                         score_for_query(query, id, &scoring_context, Some(doc.source.as_ref()));
                     ScoredDocument { doc, score }
@@ -4620,6 +4705,11 @@ fn fuzzy_query_score(
     doc: u32,
     boost: f32,
 ) -> Option<f32> {
+    // MVP L1c: the clause was scored for the whole candidate batch in one
+    // merged pass over its expanded postings (same arithmetic, same order).
+    if let Some(score) = ctx.batched_fuzzy_score(query, boost, doc) {
+        return score;
+    }
     let SearchQuery::Fuzzy {
         field,
         operator,
@@ -4689,6 +4779,234 @@ fn fuzzy_query_score(
         token_scores.push(lucene_double_sum(term_scores));
     }
     (!token_scores.is_empty()).then(|| lucene_double_sum(token_scores))
+}
+
+/// MVP L1c: smallest candidate batch scored with the merged fuzzy pass
+/// (below it the per-document lookups are cheaper than the setup).
+const FUZZY_BATCH_MIN_IDS: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: disable the merged fuzzy pass (per-document reference).
+    static FUZZY_BATCH_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_fuzzy_batch_disabled_for_test(disabled: bool) {
+    FUZZY_BATCH_DISABLED.with(|cell| cell.set(disabled));
+}
+
+fn fuzzy_batch_disabled() -> bool {
+    #[cfg(test)]
+    {
+        FUZZY_BATCH_DISABLED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// MVP L1c: every fuzzy clause of `query` with the boost [`lucene_score`]
+/// passes it (the product of the enclosing `bool` / `function_score`
+/// boosts, threaded top-down exactly as there; the root is scored with
+/// `1.0`).
+fn collect_fuzzy_occurrences<'q>(
+    query: &'q SearchQuery,
+    boost: f32,
+    out: &mut Vec<(&'q SearchQuery, f32)>,
+) {
+    match query {
+        SearchQuery::Fuzzy { .. } => out.push((query, boost)),
+        SearchQuery::Bool {
+            must,
+            filter,
+            must_not,
+            should,
+            boost: own,
+            ..
+        } => {
+            let boost = clause_boost(*own) * boost;
+            for clause in must
+                .iter()
+                .chain(filter.iter())
+                .chain(must_not.iter())
+                .chain(should.iter())
+            {
+                collect_fuzzy_occurrences(clause, boost, out);
+            }
+        }
+        SearchQuery::FunctionScore {
+            inner, boost: own, ..
+        } => collect_fuzzy_occurrences(inner, clause_boost(*own) * boost, out),
+        _ => {}
+    }
+}
+
+/// MVP L1c: call `visit(slot, posting)` for every `ids[slot] ==
+/// doc_ids[posting]` (both ascending), galloping through the longer list.
+fn for_each_common_doc(ids: &[u32], doc_ids: &[u32], mut visit: impl FnMut(usize, usize)) {
+    fn gallop(list: &[u32], from: usize, target: u32) -> usize {
+        if from >= list.len() || list[from] >= target {
+            return from;
+        }
+        let mut low = from;
+        let mut step = 1;
+        while low + step < list.len() && list[low + step] < target {
+            low += step;
+            step *= 2;
+        }
+        let high = (low + step).min(list.len());
+        low + 1 + list[low + 1..high].partition_point(|&doc| doc < target)
+    }
+    if ids.len() <= doc_ids.len() {
+        let mut posting = 0;
+        for (slot, &doc) in ids.iter().enumerate() {
+            posting = gallop(doc_ids, posting, doc);
+            if posting >= doc_ids.len() {
+                return;
+            }
+            if doc_ids[posting] == doc {
+                visit(slot, posting);
+            }
+        }
+    } else {
+        let mut slot = 0;
+        for (posting, &doc) in doc_ids.iter().enumerate() {
+            slot = gallop(ids, slot, doc);
+            if slot >= ids.len() {
+                return;
+            }
+            if ids[slot] == doc {
+                visit(slot, posting);
+            }
+        }
+    }
+}
+
+/// MVP L1c: [`fuzzy_query_score`] for every document of `ids` (ascending)
+/// at once. Each expanded term's postings are walked once against the
+/// batch, accumulating per document in the term order of the expansion
+/// (the order `fuzzy_query_score` pushes its `term_scores`), then each
+/// token's `double` sum is rounded to `float` and summed over the tokens in
+/// their first-occurrence order: bit-identical to the per-document scorer,
+/// without its per-document `binary_search` x expanded terms (and the
+/// per-document blended-frequency recomputation).
+fn batch_fuzzy_scores(
+    ctx: &SearchScoringContext<'_>,
+    query: &SearchQuery,
+    boost: f32,
+    ids: &[u32],
+) -> Vec<Option<f32>> {
+    let none = || vec![None; ids.len()];
+    let SearchQuery::Fuzzy {
+        field,
+        operator,
+        boost: own,
+        ..
+    } = query
+    else {
+        return none();
+    };
+    let boost = clause_boost(*own) * boost;
+    let Some(expansions) = ctx.fuzzy_expansions.get(&fuzzy_clause_key(query)) else {
+        return none();
+    };
+    let Some(field_stats) = ctx.field_stats(field) else {
+        return none();
+    };
+    let kind = field_scoring_kind(ctx.mapping(), field);
+    let mut seen: Vec<(&str, u32, &FuzzyTokenExpansion)> = Vec::with_capacity(expansions.len());
+    for expansion in expansions {
+        match seen
+            .iter_mut()
+            .find(|(token, _, _)| *token == expansion.token.as_str())
+        {
+            Some((_, count, _)) => *count += 1,
+            None => seen.push((expansion.token.as_str(), 1, expansion)),
+        }
+    }
+    let and = *operator == MatchOperator::And;
+    let n = ids.len();
+    let mut total = vec![0.0_f64; n];
+    let mut any_token = vec![false; n];
+    let mut missing_token = vec![false; n];
+    let mut token_sum = vec![0.0_f64; n];
+    let mut token_hit = vec![false; n];
+    for (_, count, expansion) in seen {
+        token_sum.fill(0.0);
+        token_hit.fill(false);
+        let token_boost = count as f32 * boost;
+        let blended_df = expansion
+            .terms
+            .iter()
+            .filter_map(|scored| ctx.term_stats(field, &scored.term))
+            .map(|stats| stats.doc_freq)
+            .max()
+            .unwrap_or(0)
+            .min(field_stats.doc_count);
+        if blended_df > 0 {
+            for scored in &expansion.terms {
+                let term_boost = scored.boost.max(0.0) * token_boost;
+                let Some(term_stats) = ctx.term_stats(field, &scored.term) else {
+                    continue;
+                };
+                match kind {
+                    FieldScoringKind::Constant => {
+                        for_each_common_doc(ids, term_stats.doc_ids, |slot, posting| {
+                            if term_stats.freqs[posting] > 0 {
+                                token_sum[slot] += f64::from(term_boost);
+                                token_hit[slot] = true;
+                            }
+                        });
+                    }
+                    FieldScoringKind::Bm25 { docs_only } => {
+                        // `term_bm25_score` with `doc_freq = Some(blended_df)`.
+                        if field_stats.doc_count == 0 || blended_df > field_stats.doc_count {
+                            continue;
+                        }
+                        let Ok(scorer) = Bm25TermScorer::with_boost(
+                            Bm25Config::default(),
+                            field_stats.doc_count,
+                            blended_df,
+                            field_stats.avg_doc_len,
+                            term_boost,
+                        ) else {
+                            continue;
+                        };
+                        for_each_common_doc(ids, term_stats.doc_ids, |slot, posting| {
+                            let term_freq = u64::from(term_stats.freqs[posting]);
+                            if term_freq == 0 {
+                                return;
+                            }
+                            let doc_len = if field_stats.norms_enabled {
+                                match field_stats.doc_len(ids[slot]) {
+                                    Some(doc_len) => doc_len,
+                                    None => return,
+                                }
+                            } else {
+                                1
+                            };
+                            let freq = if docs_only { 1 } else { term_freq };
+                            token_sum[slot] += f64::from(scorer.score_f32(freq, doc_len));
+                            token_hit[slot] = true;
+                        });
+                    }
+                }
+            }
+        }
+        for slot in 0..n {
+            if token_hit[slot] {
+                total[slot] += f64::from(token_sum[slot] as f32);
+                any_token[slot] = true;
+            } else if and {
+                missing_token[slot] = true;
+            }
+        }
+    }
+    (0..n)
+        .map(|slot| (any_token[slot] && !missing_token[slot]).then(|| total[slot] as f32))
+        .collect()
 }
 
 /// L7: `FunctionScoreQuery.FunctionFactorScorer.computeScore` (ES 8.6.1
@@ -4949,6 +5267,16 @@ struct SearchScoringContext<'a> {
     /// expansions of each analysed token, resolved once per query. Their
     /// terms' stats live in `term_stats_by_field` like any other token.
     fuzzy_expansions: HashMap<String, Vec<FuzzyTokenExpansion>>,
+    /// MVP L1c: per fuzzy clause occurrence (clause address, bits of the
+    /// boost `lucene_score` passes it), its score for every id of
+    /// `batch_ids` ([`batch_fuzzy_scores`]), filled by
+    /// [`Self::prepare_batch`].
+    fuzzy_batch: HashMap<(usize, u32), Vec<Option<f32>>>,
+    /// MVP L1c: the ascending ids the batch was computed for.
+    batch_ids: Vec<u32>,
+    /// MVP L1c: position in `batch_ids` of the document being scored,
+    /// set by the scoring loop ([`Self::set_batch_slot`]).
+    batch_slot: std::cell::Cell<usize>,
 }
 
 impl<'a> SearchScoringContext<'a> {
@@ -5079,7 +5407,60 @@ impl<'a> SearchScoringContext<'a> {
             field_stats_by_field,
             term_stats_by_field,
             fuzzy_expansions,
+            ..Self::default()
         }
+    }
+
+    /// MVP L1c: score every fuzzy clause of `query` for all of `ids`
+    /// (ascending, the order the caller then scores them in) in one merged
+    /// pass each. The caller announces each document's position with
+    /// [`Self::set_batch_slot`]; a document scored out of that order falls
+    /// back to the per-document scorer (same result).
+    fn prepare_batch(&mut self, query: &SearchQuery, ids: &[u32]) {
+        if fuzzy_batch_disabled()
+            || ids.len() < FUZZY_BATCH_MIN_IDS
+            || !ids.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return;
+        }
+        let mut occurrences = Vec::new();
+        collect_fuzzy_occurrences(query, 1.0, &mut occurrences);
+        if occurrences.is_empty() {
+            return;
+        }
+        let mut batch = HashMap::new();
+        for (clause, boost) in occurrences {
+            let key = (std::ptr::from_ref(clause) as usize, boost.to_bits());
+            if let std::collections::hash_map::Entry::Vacant(entry) = batch.entry(key) {
+                entry.insert(batch_fuzzy_scores(self, clause, boost, ids));
+            }
+        }
+        self.fuzzy_batch = batch;
+        self.batch_ids = ids.to_vec();
+        self.batch_slot.set(0);
+    }
+
+    /// MVP L1c: `ids[slot]` (of [`Self::prepare_batch`]) is scored next.
+    fn set_batch_slot(&self, slot: usize) {
+        self.batch_slot.set(slot);
+    }
+
+    /// MVP L1c: the batched score of the fuzzy clause `query` reached with
+    /// `boost` for `doc`, when `doc` is the announced batch document.
+    fn batched_fuzzy_score(
+        &self,
+        query: &SearchQuery,
+        boost: f32,
+        doc: u32,
+    ) -> Option<Option<f32>> {
+        if self.fuzzy_batch.is_empty() {
+            return None;
+        }
+        let scores = self
+            .fuzzy_batch
+            .get(&(std::ptr::from_ref(query) as usize, boost.to_bits()))?;
+        let slot = self.batch_slot.get();
+        (self.batch_ids.get(slot) == Some(&doc)).then(|| scores[slot])
     }
 
     /// The index mapping. Empty/default mapping when the index was absent

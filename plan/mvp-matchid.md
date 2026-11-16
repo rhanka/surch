@@ -134,12 +134,11 @@ Owner decisions relayed by matchid (2026-11-16):
       set equal to brute force (`81473ed`, `7bfb33a`).
   - [x] Pre-existing bug fixed on the way: keyword `prefix` matched nothing
     on a disk-backed layout (`48bc647`).
-  - [ ] High-df fuzzy OR scoring cost (`q` "jean pierre": 42 501 hits of
+  - [x] High-df fuzzy OR scoring cost (`q` "jean pierre": 42 501 hits of
     200 k, 43.7 ms; ~21 % of 29 M would be scored). MaxScore / top-k
     pruning does not apply to the deces `q` and advanced shapes
     (`track_total_hits: true` + `min_score` require scoring every match,
-    in ES too); next lever is a fused per-candidate fuzzy scorer (score
-    from the expanded postings in one walk, as #18 does for `match`).
+    in ES too); merged fuzzy pass delivered by L1c below (`39bdebc`).
   - L1b 200 k synthetic release measurement
     (`tests/l1b_measure.rs`, local, median of 5, before = `1422bd1`):
     birth range alone 968 -> 0.87 ms; age range alone 926 -> 0.81 ms;
@@ -185,6 +184,67 @@ Owner decisions relayed by matchid (2026-11-16):
     `_source` too (analysed tokens for text, normalised bound for keyword,
     numeric order for numbers, multi-valued); geo `_source` checks accept
     arrays of points.
+- [ ] L1c — deces-backend `/agg` and high-df fuzzy at 29 M scale (Track A/D,
+  #3 SearchEngine). Branch `worktree-agent-a7571aeec3a07e136`, base `39ceb03`,
+  not merged to `main`.
+  - [x] Index-time JSON value kinds per top-level scalar field (one
+    non-blank term equal to the read value, or an integer `|n| <= 2^53`
+    indexed as its decimal text), recomputed by a full rebuild, OR-ed by
+    appends; `META` format 3 (format 2 still opens, kinds unknown);
+    `IndexReader` doc-values accessors (`edeafe1`).
+  - [x] `size: 0` aggregations (terms, date_histogram, cardinality,
+    composite incl. `after`) served from sub-field columns (`.raw`) or term
+    dictionary x postings over the matched ids, never `_source`; same
+    finishing code as the `_source` path. Declines: field not provably
+    rebuildable, superset candidates, index missing live documents,
+    <= 2 048 matches (`39bdebc`).
+  - [x] Whole-index `/agg` counts from term document frequencies (term
+    metadata only); a declined candidate set is reused by the general path;
+    `min_score <= 0` skips per-document scoring (`d8a8642`).
+  - [x] Merged fuzzy scoring pass: each fuzzy clause occurrence scored for
+    the whole candidate batch in one walk of its expanded postings,
+    bit-identical (`39bdebc`).
+  - [x] `bool.should` with `minimum_should_match: 1` resolves to the exact
+    union (deces `nameQuery`, two-name `q`): no `_source` re-check
+    (`39bdebc`).
+  - [x] Tests: doc values vs brute force on RAM / multi-segment /
+    disk-backed / disk multi-segment layouts with deletes, composite paging
+    to exhaustion, declining fields, restart from the data directory;
+    merged fuzzy pass vs per-document scorer (f32 bits + full responses)
+    (`search_l1c_tests.rs`, `39bdebc`, `d8a8642`).
+  - [x] Measurement `tests/l1c_measure.rs` (`bbd9618`), release, local,
+    median of 5, real `deces_index.yml` analysis, prod env (disk postings,
+    block `_source`, 256 MiB flush budget), 4.5 GiB cgroup cap. Response
+    digests identical before/after on every shape. 200 k (before -> after):
+    `/agg` terms no criteria 1 186 -> 1.6 ms; terms `NOM.raw` 1 130 -> 1.8 ms;
+    date_histogram 1 134 -> 9.5 ms; composite sex x dept 1 565 -> 3.2 ms;
+    composite page 2 1 213 -> 3.3 ms; composite city x date page 2
+    1 328 -> 42 ms; composite with fuzzy prenoms criteria 168 -> 4.2 ms;
+    `q` two names 25.9 -> 3.9 ms; advanced fuzzy prenoms 4.9 -> 1.7 ms;
+    RSS peak 1 367 -> 710 MiB. 1.36 M (before -> after): `/agg` terms no
+    criteria did not finish its first shape in 13 min (RSS 4.2 GiB at the
+    cap, reclaim thrash) -> 11.6 ms; date_histogram -> 52 ms; composite
+    -> 23 ms; city x date page 2 -> 211 ms; composite with fuzzy criteria
+    1 206 -> 38 ms; `/agg` name criteria 209 -> 47 ms; `q` two names
+    214 -> 33 ms; fuzzy prenoms 62 -> 9 ms; RSS steady 1.23 GiB. Builtin
+    tokenizing analysis (L1 shape, 291 k fuzzy matches of 1.36 M): fuzzy
+    prenoms 216 -> 62-75 ms, `q` two names 415 -> 92-130 ms, `q` jean
+    pierre 74-113 -> 85-119 ms (no gain, within the run-to-run noise).
+  - [ ] 29 M measurement under caps (estimate only, linear in documents:
+    `/agg` terms ~0.25 s, date_histogram ~1 s, composite ~0.5 s,
+    composite on two high-cardinality fields ~4.5 s, composite transient
+    4 B x 29 M per source; not measured).
+  - [ ] Remaining general-path shapes: aggregations with hits (`size > 0`),
+    field sorts with a real query on `.raw` (whole-index projection map),
+    composite over > 4 sources.
+  - [ ] Finding for #2 Indexer (not fixed, out of L1c ownership): a value
+    analysed to a blank term (`"--"` or `" "` through the deces `norm`
+    normalizer) makes `PostingsBuilder::add` return `EmptyTerm`, and
+    `DocumentIndex::add_documents_with_mapping_*` stops the batch merge
+    there (`merge_analyzed(document)?`), silently leaving that document
+    and the rest of the batch out of the index while their `_source` is
+    served. L1c guards its own path (`index_covers_live_documents`,
+    test `an_index_missing_live_documents_keeps_the_source_path`).
 - [ ] L2 — `deces_v2` contract.
   - [x] DSL gap map deces-backend ↔ Surch with file:line evidence
     (matchID main `6732755`, Surch `37314e6`; kept outside the repo at
@@ -286,6 +346,8 @@ Owner decisions relayed by matchid (2026-11-16):
       window hydrated; equal to the general path on 3 layouts
       (`72a32e6`). Not measured at 29 M.
     - [ ] Field sorts with a real query and aggregations on `.raw`
+      (`size: 0` aggregations done by L1c `39bdebc`; field sorts and
+      aggregations with hits remain)
       (whole-index projection map, `_source` hydration).
   - [ ] `@elastic` client 8.18.2: ship with `SURCH_ELASTIC_PRODUCT_COMPAT=1`
     in the matchID deployment (header required on every 2xx).

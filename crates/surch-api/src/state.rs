@@ -1525,9 +1525,14 @@ fn merge_forward_fst(
 use surch_search::scoring::{bm25_score, Bm25Config, Bm25TermScorer};
 use surch_search::topk::MinCompetitiveScore;
 
+#[path = "state_doc_values.rs"]
+pub(crate) mod doc_values;
+pub use doc_values::{DocBitSet, DocValueKind};
+
 use crate::persist::{
     get_json, get_mapping, put_json, put_mapping, DataDir, IndexManifest, IndexPersistState,
-    FORMAT_VERSION, IDMAP_KIND, MANIFEST_NAME, META_FORMAT_VERSION, META_KIND, SOURCE_NAME,
+    FORMAT_VERSION, IDMAP_KIND, MANIFEST_NAME, META_FORMAT_VERSION, META_FORMAT_VERSION_V2,
+    META_KIND, SOURCE_NAME,
 };
 use crate::scroll::ScrollTable;
 use crate::stats::{
@@ -2424,6 +2429,10 @@ struct InMemoryIndex {
     /// MVP L6: data-directory bookkeeping, `Some` once this index has been
     /// persisted (or reopened) under `SURCH_DATA_DIR`.
     persist: Option<IndexPersistState>,
+    /// MVP L1c: JSON value kinds of every top-level scalar field across the
+    /// indexed documents, so aggregations can prove per field that the
+    /// index terms rebuild the values they would read from `_source`.
+    value_kinds: doc_values::FieldValueKinds,
 }
 
 /// See `InMemoryIndex`'s `densify_budget_override` field. `UseEnv` (the
@@ -2773,6 +2782,13 @@ impl InMemoryIndex {
         (0..self.next_doc_id).filter(move |&doc_id| !self.deleted_since_dense.contains(&doc_id))
     }
 
+    /// MVP L1c: whether `doc_id` is a document the hydrating readers
+    /// (`AppState::documents`, `documents_with_internal_ids`) return: a
+    /// live public id AND a stored `_source`.
+    fn is_live_document(&self, doc_id: u32) -> bool {
+        self.uid_for_doc_id(doc_id).is_some() && self.blob_for_doc_id(doc_id).is_some()
+    }
+
     fn upsert_document_deferred(&mut self, id: &str, source: Value) {
         // `mmap M1` + option B : on serialise puis on append au segment
         // `source.dat` file-backed (cf. module `source_store`). Le slot
@@ -2878,6 +2894,10 @@ impl InMemoryIndex {
     fn rebuild_index(&mut self) {
         self.index.clear();
         let mut documents: Vec<(u32, Vec<(String, String)>)> = Vec::new();
+        // MVP L1c: a full rebuild re-records the value kinds from scratch
+        // (deleted / overwritten documents no longer count).
+        let tracker = doc_values::KindTracker::new(&self.mapping);
+        let mut value_kinds = doc_values::FieldValueKinds::default();
         for doc_id in 0..self.next_doc_id {
             let Some(blob) = self.blob_for_doc_id(doc_id) else {
                 continue;
@@ -2887,8 +2907,13 @@ impl InMemoryIndex {
             // thread-local). Seul chemin d'INDEXATION qui touche le
             // decode/pread ; pas le hot path bulk steady-state.
             let parsed = parse_source_blob(&blob, &self.source_store);
+            if !tracker.is_empty() {
+                value_kinds.merge(&tracker, &tracker.classify(&parsed));
+            }
             documents.push((doc_id, indexed_fields_for_document(&parsed, &self.mapping)));
         }
+        drop(tracker);
+        self.value_kinds = value_kinds;
         // Lot 1.6: defer the FST rebuild. The bulk path then chains
         // several rebuild/append calls without paying the per-call
         // build cost; the next `_refresh` or first search will
@@ -2957,17 +2982,34 @@ impl InMemoryIndex {
         // doc_id-keyed, ce que `reverse_document_ids.get` +
         // `parsed_source(uid)` faisait en deux temps auparavant.
         let self_ref = &*self;
-        let documents = new_doc_ids
+        // MVP L1c: the value kinds of the appended documents are classified
+        // in the same parallel pass (the `_source` is already parsed there).
+        let tracker = doc_values::KindTracker::new(&self_ref.mapping);
+        let analyzed = new_doc_ids
             .par_iter()
             .filter_map(|&doc_id| {
                 let blob = self_ref.blob_for_doc_id(doc_id)?;
                 let source = parse_source_blob(&blob, &self_ref.source_store);
+                let kinds = (!tracker.is_empty()).then(|| tracker.classify(&source));
                 Some((
                     doc_id,
                     indexed_fields_for_document(&source, &self_ref.mapping),
+                    kinds,
                 ))
             })
             .collect::<Vec<_>>();
+        let mut value_kinds = self.value_kinds.clone();
+        let documents = analyzed
+            .into_iter()
+            .map(|(doc_id, fields, kinds)| {
+                if let Some(kinds) = kinds {
+                    value_kinds.merge(&tracker, &kinds);
+                }
+                (doc_id, fields)
+            })
+            .collect::<Vec<_>>();
+        drop(tracker);
+        self.value_kinds = value_kinds;
         // Lot 1.6: defer the FST rebuild on the bulk hot path. Reads
         // arriving between two `_bulk` POSTs go through
         // `AppState::ensure_terms_ready`, which materializes lazily.
@@ -4584,6 +4626,156 @@ impl<'a> IndexReader<'a> {
             .iter()
             .map(|id| self.data.resolve_uid(id))
             .collect()
+    }
+
+    /// MVP L1c: the documents [`AppState::documents`] would hydrate (live
+    /// id with a stored `_source`), as a bitset over `[0, next_doc_id)`.
+    pub(crate) fn live_doc_bitset(&self) -> DocBitSet {
+        let mut set = DocBitSet::with_len(self.data.next_doc_id);
+        for doc in self.data.live_doc_ids() {
+            if self.data.is_live_document(doc) {
+                set.insert(doc);
+            }
+        }
+        set
+    }
+
+    /// MVP L1c: `ids` restricted to the documents
+    /// `documents_with_internal_ids` would hydrate, as a bitset.
+    pub(crate) fn live_bitset_of(&self, ids: impl IntoIterator<Item = u32>) -> DocBitSet {
+        let mut set = DocBitSet::with_len(self.data.next_doc_id);
+        for doc in ids {
+            if self.data.is_live_document(doc) {
+                set.insert(doc);
+            }
+        }
+        set
+    }
+
+    /// MVP L1c: whether the index holds exactly the live documents (its
+    /// live-doc count equals the id maps' one). Not the case when a batch
+    /// merge stopped early: `DocumentIndex::add_documents_with_mapping_*`
+    /// returns on the first document whose analysis yields a
+    /// whitespace-only term (`PostingsError::EmptyTerm`), leaving the
+    /// following documents of the batch out of the index while their
+    /// `_source` stays readable. Doc values must not be read then.
+    pub(crate) fn index_covers_live_documents(&self) -> bool {
+        self.data.index.live_doc_count() == self.data.live_count as usize
+    }
+
+    /// MVP L1c: number of live documents the index holds.
+    pub(crate) fn index_live_doc_count(&self) -> u64 {
+        self.data.index.live_doc_count() as u64
+    }
+
+    /// MVP L1c: for a field of `kind` ([`Self::doc_value_kind`]), every
+    /// value with the number of indexed documents carrying it, from the
+    /// term metadata alone (document frequencies, no postings decoded).
+    /// Equal to counting the field over every live document only when the
+    /// index holds exactly the live documents
+    /// ([`Self::index_covers_live_documents`]): every delete / update
+    /// rebuilds the postings, so they never reference a removed document.
+    pub(crate) fn doc_value_frequencies(
+        &self,
+        field: &str,
+        kind: DocValueKind,
+    ) -> Option<(Vec<Value>, Vec<u64>)> {
+        // A term whose disk encode failed has a count but no readable
+        // postings (`postings_segment_skipped_terms`, 0 in steady state):
+        // keep the postings walk, which sees what the queries see.
+        if self.data.index.postings_segment_skipped_terms() != 0 {
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut counts = Vec::new();
+        for (term, count) in self.data.index.term_doc_freqs(field)? {
+            values.push(doc_values::value_from_term(&term, kind)?);
+            counts.push(count);
+        }
+        Some((values, counts))
+    }
+
+    /// MVP L1c: whether `path` is a multi-field sub-field with a write-time
+    /// column (what [`AppState::subfield_projection`] reads).
+    pub(crate) fn has_subfield_column(&self, path: &str) -> bool {
+        self.data.index.has_subfield_values(path)
+    }
+
+    /// MVP L1c: how the values of the top-level field `field` rebuild from
+    /// its index terms, when they provably do: a mapped scalar type indexed
+    /// one term per value (no `index_prefixes`), and every indexed value of
+    /// one JSON kind that round-trips through its term
+    /// ([`doc_values::FieldValueKinds`]).
+    pub(crate) fn doc_value_kind(&self, field: &str) -> Option<DocValueKind> {
+        let mapping = self.data.mapping.field(field)?;
+        if !doc_values::is_doc_value_type(mapping.field_type) || mapping.index_prefixes.is_some() {
+            return None;
+        }
+        self.data.value_kinds.kind(field)
+    }
+
+    /// MVP L1c: call `visit(doc, ordinal)` for every document of `matched`
+    /// carrying a value of `field`, reading the sub-field column
+    /// (`kind == None`) or the field's term dictionary x postings
+    /// (`Some(kind)`, from [`Self::doc_value_kind`]). Returns the value of
+    /// each ordinal, or `None` when a term does not rebuild a value (the
+    /// caller then keeps the `_source` path).
+    pub(crate) fn for_each_doc_value(
+        &self,
+        field: &str,
+        kind: Option<DocValueKind>,
+        matched: &DocBitSet,
+        mut visit: impl FnMut(u32, u32),
+    ) -> Option<Vec<Value>> {
+        let mut values: Vec<Value> = Vec::new();
+        match kind {
+            None => {
+                let mut ordinals: HashMap<String, u32> = HashMap::new();
+                let found = self.data.index.for_each_subfield_column(
+                    field,
+                    |start, end| matched.any_in(start, end),
+                    |doc_base, column| {
+                        let codes: Vec<u32> = column
+                            .dict()
+                            .iter()
+                            .map(|value| {
+                                *ordinals.entry(value.to_string()).or_insert_with(|| {
+                                    values.push(Value::String(value.to_string()));
+                                    (values.len() - 1) as u32
+                                })
+                            })
+                            .collect();
+                        for (local, &code) in column.codes().iter().enumerate() {
+                            if code == surch_index::document_index::SubfieldColumn::ABSENT {
+                                continue;
+                            }
+                            let doc = doc_base + local as u32;
+                            if matched.contains(doc) {
+                                visit(doc, codes[code as usize]);
+                            }
+                        }
+                    },
+                );
+                found.then_some(values)
+            }
+            Some(kind) => {
+                let terms = self.data.index.range_terms(
+                    field,
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Unbounded,
+                );
+                for term in terms {
+                    let ordinal = values.len() as u32;
+                    values.push(doc_values::value_from_term(&term, kind)?);
+                    for doc in self.data.index.term_doc_ids(field, &term) {
+                        if matched.contains(doc) {
+                            visit(doc, ordinal);
+                        }
+                    }
+                }
+                Some(values)
+            }
+        }
     }
 }
 
@@ -7455,7 +7647,16 @@ impl InMemoryIndex {
         out.put_u32(self.next_doc_id)?;
         out.put_u32(self.live_count)?;
         out.put_u64s(&self.source_store.blocks)?;
-        self.index.encode_index_state(out)
+        self.index.encode_index_state(out)?;
+        // MVP L1c (`META` format 3): per-field value kinds.
+        out.put_u8(u8::from(self.value_kinds.is_unknown()))?;
+        let kinds = self.value_kinds.by_field();
+        out.put_u32(u32::try_from(kinds.len()).unwrap_or(u32::MAX))?;
+        for (field, bits) in kinds {
+            out.put_str(field)?;
+            out.put_u8(*bits)?;
+        }
+        Ok(())
     }
 
     /// MVP L6: reopen one committed index directory without re-analysing a
@@ -7466,7 +7667,20 @@ impl InMemoryIndex {
         manifest.collect_garbage(dir)?;
         manifest.verify_data_files(dir, full_verification_enabled())?;
 
-        let mut meta = open_framed_file(dir, &manifest.meta, META_KIND, META_FORMAT_VERSION)?;
+        // MVP L1c: `META` format 3 appends the value kinds; a format-2
+        // file still opens with unknown kinds.
+        let (mut meta, has_kinds) =
+            match open_framed_file(dir, &manifest.meta, META_KIND, META_FORMAT_VERSION) {
+                Err(PersistError::VersionMismatch { found, .. })
+                    if found == META_FORMAT_VERSION_V2 =>
+                {
+                    (
+                        open_framed_file(dir, &manifest.meta, META_KIND, META_FORMAT_VERSION_V2)?,
+                        false,
+                    )
+                }
+                other => (other?, true),
+            };
         let mapping = get_mapping(&mut meta)?;
         let settings = get_json(&mut meta)?;
         let next_doc_id = meta.get_u32()?;
@@ -7474,6 +7688,23 @@ impl InMemoryIndex {
         let blocks = meta.get_u64s()?;
         let (index, segment_cache) =
             DocumentIndex::open_persisted(dir, &manifest.segments, &mut meta)?;
+        let value_kinds = if has_kinds {
+            let unknown = meta.get_u8()? != 0;
+            let count = meta.get_u32()?;
+            let mut by_field = BTreeMap::new();
+            for _ in 0..count {
+                let field = meta.get_str()?;
+                let bits = meta.get_u8()?;
+                by_field.insert(field, bits);
+            }
+            if unknown {
+                doc_values::FieldValueKinds::unknown()
+            } else {
+                doc_values::FieldValueKinds::from_parts(by_field)
+            }
+        } else {
+            doc_values::FieldValueKinds::unknown()
+        };
         meta.finish()?;
 
         let mut ids = open_framed_file(dir, &manifest.ids, IDMAP_KIND, FORMAT_VERSION)?;
@@ -7569,6 +7800,7 @@ impl InMemoryIndex {
             terms_finalized: true,
             dense_epoch: 0,
             persist: Some(state),
+            value_kinds,
             ..InMemoryIndex::default()
         };
         Ok((manifest.name, index))

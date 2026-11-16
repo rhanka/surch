@@ -1001,6 +1001,19 @@ impl SubfieldColumn {
         }
     }
 
+    /// MVP L1c: the distinct values, indexed by code (read accessor for the
+    /// aggregation doc-values path; empty on a spilled column, read it
+    /// through [`DocumentIndex::for_each_subfield_column`]).
+    pub fn dict(&self) -> &[Box<str>] {
+        &self.dict
+    }
+
+    /// MVP L1c: one code per LOCAL doc id ([`Self::ABSENT`] = no value),
+    /// as long as the highest doc id written + 1.
+    pub fn codes(&self) -> &[u32] {
+        &self.codes
+    }
+
     /// `(doc_id, value)` pairs in ascending `doc_id` order, `ABSENT`
     /// entries omitted — the exact iteration contract the previous
     /// `BTreeMap<u32, String>::iter()` provided.
@@ -2912,6 +2925,24 @@ impl DocumentIndex {
         merged.into_iter().collect()
     }
 
+    /// MVP L1c: every term of `field` across EVERY sealed segment with its
+    /// total postings count (the sum of the per-segment document
+    /// frequencies — segments cover disjoint doc ids), sorted by bytes, from
+    /// the term metadata only (no postings payload read). `None` when a
+    /// segment's term table cannot be read.
+    pub fn term_doc_freqs(&self, field: &str) -> Option<Vec<(String, u64)>> {
+        if self.segments.len() == 1 {
+            return self.segment().terms.term_doc_freqs(field);
+        }
+        let mut merged: BTreeMap<String, u64> = BTreeMap::new();
+        for segment in &self.segments {
+            for (term, count) in segment.terms.term_doc_freqs(field)? {
+                *merged.entry(term).or_insert(0) += count;
+            }
+        }
+        Some(merged.into_iter().collect())
+    }
+
     /// MVP L1: fuzzy term expansion of `field` across EVERY sealed segment.
     /// Each segment's FST is walked with the same automaton
     /// ([`TermDictionary::fuzzy_terms`]); a term present in several segments
@@ -3135,6 +3166,39 @@ impl DocumentIndex {
     /// `iter()`), so the whole "resolve segment, materialize, offset
     /// `doc_base`" plumbing now lives here, next to the segment/disk
     /// internals it depends on.
+    /// MVP L1c: visit `field_path`'s column segment by segment, as
+    /// `(doc_base, column)` with the column materialized (a disk-spilled
+    /// column is read back with the same grouped `pread`s as
+    /// [`Self::subfield_projection`], one segment at a time, and dropped
+    /// before the next one). `wanted(start, end)` is asked first with the
+    /// segment's GLOBAL doc-id range `[start, end)`; a segment it rejects
+    /// is skipped without any I/O. Returns `false` iff no segment declares
+    /// the path (same contract as [`Self::has_subfield_values`]).
+    pub fn for_each_subfield_column(
+        &self,
+        field_path: &str,
+        mut wanted: impl FnMut(u32, u32) -> bool,
+        mut visit: impl FnMut(u32, &SubfieldColumn),
+    ) -> bool {
+        let mut found = false;
+        for (position, segment) in self.segments.iter().enumerate() {
+            let Some(column) = segment.subfield_values.get(field_path) else {
+                continue;
+            };
+            found = true;
+            let end = self
+                .segments
+                .get(position + 1)
+                .map_or(u32::MAX, |next| next.doc_base);
+            if !wanted(segment.doc_base, end) {
+                continue;
+            }
+            let materialized = column.materialized(segment.subfield_segment.as_deref());
+            visit(segment.doc_base, &materialized);
+        }
+        found
+    }
+
     pub fn subfield_projection(&self, field_path: &str) -> Option<BTreeMap<u32, String>> {
         let mut found = false;
         let mut projection = BTreeMap::new();
