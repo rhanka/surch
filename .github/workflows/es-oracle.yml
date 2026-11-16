@@ -1,0 +1,134 @@
+# matchID Elasticsearch 8.6.1 oracle on a GitHub-hosted runner.
+#
+# Same gate as deploy/k8s/jobs/b1-oracle-gate.yaml (b1_oracle replaying
+# tests/matchid_compat/replays/deces_v1.json against Surch and ES 8.6.1),
+# without any Kubernetes cluster: ES 8.6.1 runs as a service container on
+# the runner and Surch is built from the checked-out commit. The k8s
+# variant must not be dispatched while its only cluster node is shared with
+# matchID production (decision relayed by the matchid session, 2026-11-16).
+#
+# Two passes:
+#   - `mapping.json`  : the historical B1 gate (blocking);
+#   - `mapping_real.json` : matchID's real deces_index.yml analysis chains
+#     (L2), reported but non-blocking until its first green run.
+
+name: es-oracle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+concurrency:
+  group: es-oracle-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  b1-oracle:
+    name: b1_oracle vs Elasticsearch 8.6.1
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    services:
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.6.1
+        ports:
+          - 9200:9200
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms1g -Xmx1g
+          bootstrap.memory_lock: "false"
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-es-oracle-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build surch-api and b1_oracle (release)
+        run: cargo build --release --locked -p surch-api --bin surch-api -p surch-demo --bin b1_oracle
+      - name: Elasticsearch version
+        run: curl -fsS http://127.0.0.1:9200/ | tee es-version.json
+      - name: Oracle pass 1 — B1 gate (mapping.json, blocking)
+        id: pass1
+        run: |
+          set -u
+          mkdir -p reports
+          SURCH_HOST=127.0.0.1 SURCH_PORT=7700 SURCH_ELASTIC_PRODUCT_COMPAT=1 \
+            ./target/release/surch-api > reports/surch-pass1.log 2>&1 &
+          echo $! > surch.pid
+          until curl -fsS http://127.0.0.1:7700/ >/dev/null 2>&1; do sleep 0.5; done
+          rc=0
+          ./target/release/b1_oracle \
+            --url-surch http://127.0.0.1:7700 \
+            --url-es http://127.0.0.1:9200 \
+            --mapping tests/matchid_compat/deces/mapping.json \
+            --slice tests/matchid_compat/deces/slice-10000.ndjson.gz \
+            --replay tests/matchid_compat/replays/deces_v1.json \
+            --out reports/b1-oracle-mapping.json || rc=$?
+          kill "$(cat surch.pid)" || true
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          cat reports/b1-oracle-mapping.json || echo '{"error":"report missing"}'
+          exit "$rc"
+      - name: Reset Elasticsearch indices
+        if: always()
+        run: curl -fsS -XDELETE 'http://127.0.0.1:9200/_all?expand_wildcards=all' || true
+      - name: Oracle pass 2 — real deces mapping (non-blocking)
+        if: always()
+        continue-on-error: true
+        run: |
+          set -u
+          SURCH_HOST=127.0.0.1 SURCH_PORT=7701 SURCH_ELASTIC_PRODUCT_COMPAT=1 \
+            ./target/release/surch-api > reports/surch-pass2.log 2>&1 &
+          echo $! > surch2.pid
+          until curl -fsS http://127.0.0.1:7701/ >/dev/null 2>&1; do sleep 0.5; done
+          rc=0
+          ./target/release/b1_oracle \
+            --url-surch http://127.0.0.1:7701 \
+            --url-es http://127.0.0.1:9200 \
+            --mapping tests/matchid_compat/deces/mapping_real.json \
+            --slice tests/matchid_compat/deces/slice-10000.ndjson.gz \
+            --replay tests/matchid_compat/replays/deces_v1.json \
+            --out reports/b1-oracle-mapping-real.json || rc=$?
+          kill "$(cat surch2.pid)" || true
+          cat reports/b1-oracle-mapping-real.json || echo '{"error":"report missing"}'
+          exit "$rc"
+      - name: Step summary
+        if: always()
+        run: |
+          {
+            echo "## es-oracle (${GITHUB_SHA})"
+            echo
+            echo "Elasticsearch: $(jq -r '.version.number' es-version.json 2>/dev/null || echo unknown)"
+            for f in reports/b1-oracle-mapping.json reports/b1-oracle-mapping-real.json; do
+              echo
+              echo "### $(basename "$f")"
+              echo '```json'
+              head -c 4000 "$f" 2>/dev/null || echo "missing"
+              echo
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: es-oracle-${{ github.sha }}
+          path: |
+            reports/
+            es-version.json
+          retention-days: 30

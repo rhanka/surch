@@ -1,5 +1,12 @@
 # Surch — K8s burst-bench CI/CD.
 #
+# DO NOT DISPATCH while KUBE_CONFIG_DATA targets the Scaleway Kapsule
+# cluster 979c11ad: since the burst pool was removed it has a single node
+# shared with matchID production (ES evicted for memory pressure on
+# 2026-11-08); a surch Job there can evict production (matchid session,
+# 2026-11-16). Use `es-oracle.yml` (GitHub-hosted runner, no cluster) for
+# the ES 8.6.1 oracle until k8s provides a dedicated bench namespace.
+#
 # Runs heavy CI gates (BEIR NDCG@10, INSEE paired bench) on the Scaleway
 # Kapsule burst pool described in poc-k8s (rhanka/poc-k8s#2 + #6
 # amendment). Every Job is short-lived; the burst pool autoscales 0 → 1
