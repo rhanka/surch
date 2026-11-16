@@ -361,13 +361,29 @@ Owner decisions relayed by matchid (2026-11-16):
 - [ ] L4 — Monthly reload path.
   - [x] `POST /_aliases` atomic across actions (single lock), `remove_index`
     action, `index: "*"` wildcard in remove: `4c1a83e`.
-  - [ ] Alias persistence across restart: NOT persisted (state is
-    in-memory, see L6).
-  - [ ] `_restore` `rename_pattern` / `rename_replacement`.
-  - [ ] S3 repo settings parity (`path_style_access`, `protocol`,
-    `readonly`), credentials via env/secret.
-  - [ ] `_cluster/health/<idx>?wait_for_status=green`, marker index write.
-  - [ ] Offline build → S3 → restore → alias swap timed at 29.3 M.
+  - [x] Alias persistence across restart: `ALIASES` file of L6 step 1
+    (`3191623`), re-checked after a restore + swap + restart by
+    `tests/snapshot_v2.rs` (L6.2).
+  - [x] `_restore` `rename_pattern` / `rename_replacement` (Java
+    `replaceAll` syntax), `indices` filter, `ignore_unavailable`,
+    `include_aliases`, `index_settings` / `ignore_index_settings` (ES
+    unmodifiable list), `wait_for_completion=false` in the background:
+    `f249b7f`. Branch `worktree-agent-a7340e25b18f229a3`, not merged.
+  - [x] S3 repo settings parity (`path_style_access`, `protocol`,
+    `readonly`, `endpoint`, `region`, `client`, `buffer_size` multipart),
+    credentials from `SURCH_S3_CLIENT_<NAME>_ACCESS_KEY` /
+    `_SECRET_KEY` then `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`:
+    `f249b7f`; S3 runtime that never drove IO fixed + in-process S3 mock
+    wire test: `0099a6f`. Doc: `docs/ops/snapshot-v2.md`.
+  - [x] `_cluster/health/<idx>?wait_for_status=green&timeout=` (ES 408 red
+    on timeout for a missing index), `PUT/GET /<idx>/_settings`,
+    `GET /<idx>/_doc/<id>` (the Job's marker read was a 405): `f249b7f`.
+  - [ ] Marker write durability: `PUT _doc` is not committed without a
+    `_refresh` (no translog); recommended Job change `POST
+    $RESTORE_MARKER_INDEX/_refresh` after `write_marker` (decision
+    matchID, `docs/ops/snapshot-v2.md`).
+  - [ ] Offline build → S3 → restore → alias swap timed at 29.3 M (200 k
+    local fs measurement only, `docs/ops/snapshot-v2.md`).
 - [ ] L5 — Double run ES/Surch with matchid (matchid owns infra). The owner
   widened it on 2026-11-15 to a multi-engine bench (ES, Postgres, DuckDB,
   Surch, others) on ephemeral OVH GRA b3-8 nodes created by k8s, replaying
@@ -393,12 +409,20 @@ Owner decisions relayed by matchid (2026-11-16):
     `docs/ops/persistence.md`. 200 k local proof: restart to first query
     46 ms, responses identical, RSS after reopen 30.8 MiB.
   - [ ] Step 2 follow-ups found by step 1: index / component templates
-    not persisted; `_bulk?refresh=true` and `_restore` do not commit
-    (no `_refresh`); id maps rewritten whole per changing refresh
+    not persisted; `_bulk?refresh=true` and `PUT _doc` do not commit
+    (no `_refresh`; `_restore` commits since L6.2 `f249b7f`); id maps
+    rewritten whole per changing refresh
     (append-only layout); no translog; writes after a reopen take the
     existing full `rebuild_index()` path.
-  - [ ] Snapshot = copy of sealed segment files (S3 artefact built offline,
-    loaded without re-indexing).
+  - [x] Snapshot = copy of sealed segment files (S3 artefact built offline,
+    loaded without re-indexing): L6.2 format v2, blake3-addressed blobs
+    (dedup across snapshots, GC on delete), staging + atomic rename
+    restore, v1 logical snapshots still readable: `f249b7f`, `0099a6f`.
+    Gate `tests/snapshot_v2.rs` (exact matchID Job body, byte-identical
+    searches, 0 term dictionary built) + `tests/snapshot_v2_s3_mock.rs`.
+    Branch `worktree-agent-a7340e25b18f229a3`, not merged.
+  - [x] `_restore` commits the restored index (v2: committed before going
+    live; v1: re-ingest + `_refresh`): `f249b7f`.
   - [ ] Proof: restart at 29 M under the target caps, time to first query.
 - [ ] L7 — Lucene score parity (needed for the byte-identical bar).
   Branch `worktree-agent-a3c9adc9e9b4682ab` (base `01f2d94`), not merged to

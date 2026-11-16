@@ -103,9 +103,11 @@ versions: `MANI`/`META`/`IDMP`/`ALIA` = 1 (`surch-api::persist`),
 Documents written after the last `_refresh` are **not** durable: a crash
 loses them (there is no translog; design §9 "Append-only WAL: skipped").
 The bulk-then-refresh loading pattern (matchID) is fully covered.
-`_bulk?refresh=true` and `_snapshot/.../_restore` do not go through
-`_refresh` today: send an explicit `POST /<index>/_refresh` after them
-to make the result durable.
+`_bulk?refresh=true` and single-document `PUT /<index>/_doc/<id>` do not
+go through `_refresh` today: send an explicit `POST /<index>/_refresh`
+after them to make the result durable. `_snapshot/.../_restore` commits
+the restored index before answering (L6.2, `docs/ops/snapshot-v2.md`),
+and `PUT /<index>/_settings` commits the new settings.
 
 A commit only writes what changed: segments already on disk are
 recognised by identity and never rewritten; `ids-*.ids` is rewritten
@@ -161,9 +163,15 @@ surch-api: cannot open SURCH_DATA_DIR /data: /data/indices/i-deces/seg-00000003.
 truncated or resized file (expected 41213 bytes, found 20606)
 ```
 
-Operator action: restore the directory from a backup (or the S3
-snapshot once L6 step 2 lands) or move it aside and re-index. Never edit
-files in place.
+Operator action: restore the index from a segment snapshot
+(`docs/ops/snapshot-v2.md`, no re-indexing) or move the directory aside
+and re-index. Never edit files in place.
+
+`tmp/` also holds the L6.2 snapshot pins (`tmp/snapshot-*`, hard links of
+a committed generation being uploaded) and restore staging directories
+(`tmp/restore-*/i-<index>/`, downloaded files before the atomic rename
+into `indices/`); both are removed when the operation ends and swept at
+start after a crash.
 
 ## Behaviour after a restart
 
@@ -185,8 +193,9 @@ files in place.
 
 ## Not covered yet (L6 step 2+)
 
-- S3 snapshot of sealed segment files (`_snapshot` still stores
-  documents for re-ingest).
+- ~~S3 snapshot of sealed segment files~~: done in L6.2, segment
+  snapshots v2 (`docs/ops/snapshot-v2.md`): the files of this layout are
+  uploaded as blake3-addressed blobs and restored without re-indexing.
 - Index templates and component templates are not persisted.
 - No translog: writes since the last `_refresh` are lost on crash.
 - Incremental writes after a reopen (or after any refresh) rebuild the
