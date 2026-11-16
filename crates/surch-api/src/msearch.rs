@@ -4,7 +4,6 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use serde_json::{json, Value};
 
@@ -46,7 +45,7 @@ fn handle_msearch(
                 .into_iter()
                 .map(|pair| build_pair_response(state, pair))
                 .collect();
-            (StatusCode::OK, Json(json!({ "responses": responses }))).into_response()
+            crate::es_json::es_json_response(&json!({ "responses": responses }))
         }
         Err(error) => error.into_response(),
     }

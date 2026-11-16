@@ -2,7 +2,6 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use chrono::{Duration, Months, NaiveDate, Utc};
 use serde::Serialize;
@@ -1393,7 +1392,7 @@ pub async fn search_handler(
                 }
             }
             let t_ser = std::time::Instant::now();
-            let serialized = serde_json::to_vec(&response);
+            let serialized = crate::es_json::to_es_json_vec(&response);
             metrics::histogram!("surch_dbg_serialize_us")
                 .record(t_ser.elapsed().as_micros() as f64);
             let bytes = match serialized {
@@ -1407,7 +1406,7 @@ pub async fn search_handler(
                     .increment(1);
                     metrics::histogram!("surch_search_duration_seconds")
                         .record(started_at.elapsed().as_secs_f64());
-                    return (StatusCode::OK, Json(response)).into_response();
+                    return crate::es_json::es_json_response(&response);
                 }
             };
             if let (Some(key), Some(index)) = (cache_key, indices.first()) {
@@ -1415,7 +1414,7 @@ pub async fn search_handler(
                 // server time and stay distinguishable from cold paths.
                 let mut cached = response.clone();
                 cached.took = 0;
-                if let Ok(cache_bytes) = serde_json::to_vec(&cached) {
+                if let Ok(cache_bytes) = crate::es_json::to_es_json_vec(&cached) {
                     state.search_cache_put(index, key, cache_bytes, response.direct_must_fused);
                 }
             }
@@ -1491,7 +1490,7 @@ pub async fn scroll_handler(
     // Always overwrite `took` so the scroll response measures the
     // scroll fetch, not the upstream `_search` walk.
     response.took = started_at.elapsed().as_millis() as u64;
-    (StatusCode::OK, Json(response)).into_response()
+    crate::es_json::es_json_response(&response)
 }
 
 /// Body of a `POST /_search/scroll` request.

@@ -21,6 +21,7 @@ pub mod component_template;
 pub mod count;
 pub mod document;
 pub mod error;
+mod es_json;
 pub mod field_caps;
 pub mod index;
 pub mod index_template;
