@@ -1098,3 +1098,12 @@ fn d2_postings_bit_packes_relus_a_l_identique() {
         );
     }
 }
+
+#[test]
+fn postings_accept_whitespace_only_terms_like_lucene_keyword() {
+    // matchID `norm` normalizer turns "--" into "  "; ES indexes that term.
+    let mut builder = PostingsBuilder::new();
+    builder
+        .add("SOURCE", "  ", 1, vec![0])
+        .expect("whitespace-only keyword term is valid");
+}

@@ -1102,7 +1102,10 @@ impl PostingsBuilder {
         }
 
         let term = term.into();
-        if term.trim().is_empty() {
+        // Only the empty term is rejected. A whitespace-only term is a valid
+        // keyword term in Lucene/ES (matchID `norm` normalizer turns `"--"`
+        // into `"  "`, which ES indexes and serves).
+        if term.is_empty() {
             return Err(PostingsError::EmptyTerm);
         }
 

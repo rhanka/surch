@@ -3049,6 +3049,13 @@ impl DocumentIndex {
                 .insert(doc_id);
         }
         for (field, term, positions) in document.postings {
+            // An empty term (empty keyword value) is not indexed; skipping it
+            // here keeps one odd value from aborting the merge of the rest of
+            // the batch, which used to leave documents missing from the index
+            // while their `_source` stayed served.
+            if term.is_empty() {
+                continue;
+            }
             self.postings_builder.add(field, term, doc_id, positions)?;
         }
         {

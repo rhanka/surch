@@ -586,13 +586,13 @@ async fn merged_fuzzy_pass_keeps_search_responses_identical() {
 }
 
 /// A document whose analysis yields a blank term (`"--"` through the deces
-/// `norm` normalizer gives `"  "`) stops the batch merge of
-/// `DocumentIndex::add_documents_with_mapping_*` (`PostingsError::EmptyTerm`,
-/// a pre-existing indexer behaviour): that document and the following ones
-/// of the batch are missing from the index while their `_source` is still
-/// served. Doc values must then decline for every field.
+/// `norm` normalizer gives `"  "`) used to stop the batch merge
+/// (`PostingsError::EmptyTerm`), leaving it and the following documents out
+/// of the index. Whitespace-only terms are now indexed like ES does and
+/// empty terms are skipped, so the index covers every live document and the
+/// doc-values path serves the same answer as the `_source` path.
 #[tokio::test]
-async fn an_index_missing_live_documents_keeps_the_source_path() {
+async fn a_blank_term_document_is_indexed_with_the_rest_of_its_batch() {
     let docs = corpus(120);
     let blank = vec![("blank".to_owned(), json!({"UID": "b1", "SOURCE": "--"}))];
     let mut after = blank.clone();
@@ -607,8 +607,8 @@ async fn an_index_missing_live_documents_keeps_the_source_path() {
         reader.expect("index").index_covers_live_documents()
     });
     assert!(
-        !covers,
-        "the blank term no longer stops the merge: drop this guard test"
+        covers,
+        "a blank-term document must not stop the batch merge"
     );
     for aggs in [
         json!({"sex": {"terms": {"field": "SEXE"}}}),
@@ -617,6 +617,6 @@ async fn an_index_missing_live_documents_keeps_the_source_path() {
         let body = agg_body(no_criteria(), 0.0, aggs);
         let (reference, fast, served) = both_paths(&state, &body);
         assert_eq!(fast, reference, "{body}");
-        assert!(!served, "doc values served {body}");
+        assert!(served, "doc values declined {body}");
     }
 }
