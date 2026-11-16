@@ -264,6 +264,48 @@ fn boosted_fuzzy_clause_multiplies_similarity_by_the_clause_boost() {
 }
 
 #[test]
+fn function_score_without_functions_threads_its_boost_into_the_sub_query() {
+    let state = fixture();
+    let (hits, _) = search(
+        &state,
+        json!({"query": {"function_score": {"query": {"match": {"NOM": "dupont"}}, "boost": 2}}}),
+    );
+    // BoostQuery(FunctionScoreQuery, 2).createWeight => sub-query weight
+    // boost 2 (FunctionScoreQuery.createWeight l.245); no function => the
+    // sub-query score (CustomBoostFactorScorer.score l.408-410).
+    let d0 = dupont((1, 2), 2.0);
+    let d1 = dupont((1, 1), 2.0);
+    let d2 = dupont((2, 3), 2.0);
+    let mut expected = vec![("0", d0), ("1", d1), ("2", d2)];
+    expected.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    assert_eq!(hits, bits(&expected));
+}
+
+#[test]
+fn function_score_combines_in_double_and_casts_once() {
+    let state = fixture();
+    let (hits, _) = search(
+        &state,
+        json!({"query": {"function_score": {
+            "query": {"match": {"NOM": "dupont"}},
+            "functions": [
+                {"field_value_factor": {"field": "AGE", "modifier": "log1p", "factor": 1}}
+            ],
+            "boost_mode": "multiply"
+        }}}),
+    );
+    // FieldValueFactorFunction: LOG1P = Math.log10(value * factor + 1);
+    // CombineFunction.MULTIPLY: (float) (queryScore * min(funcScore, maxBoost)).
+    let combine = |score: f32, age: f64| r(f64::from(score) * (age + 1.0).log10());
+    let d0 = combine(dupont((1, 2), 1.0), 70.0);
+    let d1 = combine(dupont((1, 1), 1.0), 80.0);
+    let d2 = combine(dupont((2, 3), 1.0), 70.0);
+    let mut expected = vec![("0", d0), ("1", d1), ("2", d2)];
+    expected.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    assert_eq!(hits, bits(&expected));
+}
+
+#[test]
 fn min_score_compares_float_values() {
     let state = fixture();
     let d1 = dupont((1, 1), 1.0);
