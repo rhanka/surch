@@ -2808,6 +2808,48 @@ fn decode_postings_payload_checked(
 }
 
 impl FieldPostings {
+    /// MVP L1c: `(term, postings count)` of every term, in FST order, read
+    /// from the same metadata [`Self::term_entry`] resolves (the resident
+    /// CSR `offsets`, or the spilled per-term table, fetched in ONE `pread`
+    /// for the whole field) without reading any postings payload. Non
+    /// UTF-8 terms are skipped like [`TermDictionary::range_terms`] does.
+    /// `None` on an unreadable or oversized table.
+    fn term_doc_freqs(&self, segment: Option<&PostingsSegment>) -> Option<Vec<(String, u64)>> {
+        /// Largest spilled term table read in one go.
+        const MAX_TABLE_BYTES: u64 = 256 << 20;
+        let table = match self.term_entries_directory {
+            Some((base, term_count)) => {
+                let len = u64::from(term_count) * TERM_ENTRY_ENCODED_LEN;
+                if len > MAX_TABLE_BYTES {
+                    return None;
+                }
+                Some(segment?.read(base, u32::try_from(len).ok()?)?)
+            }
+            None => None,
+        };
+        let mut out = Vec::new();
+        let mut stream = self.fst.stream();
+        while let Some((bytes, idx)) = stream.next() {
+            let idx = idx as usize;
+            let count = match &table {
+                Some(table) => {
+                    let start = idx.checked_mul(TERM_ENTRY_ENCODED_LEN as usize)?;
+                    let end = start.checked_add(TERM_ENTRY_ENCODED_LEN as usize)?;
+                    u64::from(decode_term_entry(table.get(start..end)?)?.postings_count)
+                }
+                None => {
+                    let start = *self.offsets.get(idx)?;
+                    let end = *self.offsets.get(idx + 1)?;
+                    u64::from(end.saturating_sub(start))
+                }
+            };
+            if let Ok(term) = std::str::from_utf8(bytes) {
+                out.push((term.to_owned(), count));
+            }
+        }
+        Some(out)
+    }
+
     /// Resolve `term` through the FST, then the term's `[start, end)` range
     /// in the CSR `offsets` table. Shared by every `lookup*` method below.
     fn term_range(&self, term: &str) -> Option<(usize, usize, usize)> {
@@ -3850,6 +3892,16 @@ impl TermDictionary {
     /// term through the layout-aware accessor (RAM channel or disk decode).
     /// Cost O(terms in range); `Unbounded` on both sides walks the whole
     /// field dictionary (numeric / geo predicates filter it afterwards).
+    /// MVP L1c: every term of `field` with its postings count (document
+    /// frequency), in byte order, without reading any postings payload.
+    /// Empty when the field is unknown; `None` on an unreadable term table.
+    pub fn term_doc_freqs(&self, field: &str) -> Option<Vec<(String, u64)>> {
+        match self.fields.get(field) {
+            Some(field_postings) => field_postings.term_doc_freqs(self.postings_segment.as_deref()),
+            None => Some(Vec::new()),
+        }
+    }
+
     pub fn range_terms(
         &self,
         field: &str,

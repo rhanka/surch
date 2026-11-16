@@ -1973,7 +1973,9 @@ fn run_search_paths(
 
     // MVP L1c: `size: 0` aggregations (deces-backend `/agg`) counted from
     // the index (sub-field columns, term dictionary x postings) over the
-    // matched ids, without hydrating a single `_source`.
+    // matched ids, without hydrating a single `_source`. A candidate set it
+    // resolved before declining is reused below (single index only).
+    let mut resolved_candidates: Option<Candidates> = None;
     if !request.aggs.is_empty() {
         if let Some(response) = doc_values_aggs::run_doc_values_aggregations(
             state,
@@ -1982,6 +1984,7 @@ fn run_search_paths(
             constant_score,
             scoring_enabled,
             started_at,
+            &mut resolved_candidates,
         ) {
             return response;
         }
@@ -2021,10 +2024,11 @@ fn run_search_paths(
     let t_general = std::time::Instant::now();
     let mut matched_documents: Vec<ScoredDocument> = Vec::new();
     for index in indices {
-        matched_documents.extend(match_documents_for_index(
+        matched_documents.extend(match_documents_for_index_reusing(
             state,
             index,
             request.query.as_ref(),
+            resolved_candidates.take(),
         ));
     }
     if let Some(constant) = constant_score {
@@ -4154,10 +4158,14 @@ fn candidate_set_is_exact(query: &SearchQuery) -> bool {
     }
 }
 
-fn match_documents_for_index(
+/// MVP L1c: `resolved` is the candidate set of `query` when
+/// `posting_candidates` already ran for it (the doc-values aggregation path
+/// declined after resolving it), so it is not resolved twice.
+fn match_documents_for_index_reusing(
     state: &AppState,
     index: &str,
     query: Option<&SearchQuery>,
+    resolved: Option<Candidates>,
 ) -> Vec<ScoredDocument> {
     let mapping = state.index_mapping(index).unwrap_or_default();
     // Each arm yields the candidate documents plus, when candidate resolution
@@ -4188,7 +4196,8 @@ fn match_documents_for_index(
             // ES).
             _ => {
                 let ctx = CandidateCtx::new(state, index);
-                if let Some(candidates) = posting_candidates(&ctx, query, None) {
+                let candidates = resolved.or_else(|| posting_candidates(&ctx, query, None));
+                if let Some(candidates) = candidates {
                     let ids = candidates.ids.into_iter().collect::<Vec<u32>>();
                     let pairs = state.documents_with_internal_ids(index, &ids);
                     let (docs, kept): (Vec<StoredDocument>, Vec<u32>) = if candidates.exact {

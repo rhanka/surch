@@ -4642,9 +4642,9 @@ impl<'a> IndexReader<'a> {
 
     /// MVP L1c: `ids` restricted to the documents
     /// `documents_with_internal_ids` would hydrate, as a bitset.
-    pub(crate) fn live_bitset_of(&self, ids: &[u32]) -> DocBitSet {
+    pub(crate) fn live_bitset_of(&self, ids: impl IntoIterator<Item = u32>) -> DocBitSet {
         let mut set = DocBitSet::with_len(self.data.next_doc_id);
-        for &doc in ids {
+        for doc in ids {
             if self.data.is_live_document(doc) {
                 set.insert(doc);
             }
@@ -4661,6 +4661,38 @@ impl<'a> IndexReader<'a> {
     /// `_source` stays readable. Doc values must not be read then.
     pub(crate) fn index_covers_live_documents(&self) -> bool {
         self.data.index.live_doc_count() == self.data.live_count as usize
+    }
+
+    /// MVP L1c: number of live documents the index holds.
+    pub(crate) fn index_live_doc_count(&self) -> u64 {
+        self.data.index.live_doc_count() as u64
+    }
+
+    /// MVP L1c: for a field of `kind` ([`Self::doc_value_kind`]), every
+    /// value with the number of indexed documents carrying it, from the
+    /// term metadata alone (document frequencies, no postings decoded).
+    /// Equal to counting the field over every live document only when the
+    /// index holds exactly the live documents
+    /// ([`Self::index_covers_live_documents`]): every delete / update
+    /// rebuilds the postings, so they never reference a removed document.
+    pub(crate) fn doc_value_frequencies(
+        &self,
+        field: &str,
+        kind: DocValueKind,
+    ) -> Option<(Vec<Value>, Vec<u64>)> {
+        // A term whose disk encode failed has a count but no readable
+        // postings (`postings_segment_skipped_terms`, 0 in steady state):
+        // keep the postings walk, which sees what the queries see.
+        if self.data.index.postings_segment_skipped_terms() != 0 {
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut counts = Vec::new();
+        for (term, count) in self.data.index.term_doc_freqs(field)? {
+            values.push(doc_values::value_from_term(&term, kind)?);
+            counts.push(count);
+        }
+        Some((values, counts))
     }
 
     /// MVP L1c: whether `path` is a multi-field sub-field with a write-time

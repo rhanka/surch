@@ -2925,6 +2925,24 @@ impl DocumentIndex {
         merged.into_iter().collect()
     }
 
+    /// MVP L1c: every term of `field` across EVERY sealed segment with its
+    /// total postings count (the sum of the per-segment document
+    /// frequencies — segments cover disjoint doc ids), sorted by bytes, from
+    /// the term metadata only (no postings payload read). `None` when a
+    /// segment's term table cannot be read.
+    pub fn term_doc_freqs(&self, field: &str) -> Option<Vec<(String, u64)>> {
+        if self.segments.len() == 1 {
+            return self.segment().terms.term_doc_freqs(field);
+        }
+        let mut merged: BTreeMap<String, u64> = BTreeMap::new();
+        for segment in &self.segments {
+            for (term, count) in segment.terms.term_doc_freqs(field)? {
+                *merged.entry(term).or_insert(0) += count;
+            }
+        }
+        Some(merged.into_iter().collect())
+    }
+
     /// MVP L1: fuzzy term expansion of `field` across EVERY sealed segment.
     /// Each segment's FST is walked with the same automaton
     /// ([`TermDictionary::fuzzy_terms`]); a term present in several segments

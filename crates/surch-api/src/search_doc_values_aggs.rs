@@ -31,7 +31,7 @@ use super::{
     date_value_epoch_days, finish_composite_aggregation, finish_date_histogram_aggregation,
     finish_terms_aggregation, matches_every_document, posting_candidates, record_terms_count,
     resolve_total_hits, round_days_to_interval, score_for_query, scoring_needs_source, AggResult,
-    AggSpec, AggregationResults, CandidateCtx, CompositeCounts, CompositeSource,
+    AggSpec, AggregationResults, CandidateCtx, Candidates, CompositeCounts, CompositeSource,
     CompositeSourceKind, FieldValueView, ScoringArena, SearchRequest, SearchResponse,
     SearchScoringContext, SubfieldProjections, TermsKey, MILLIS_PER_DAY,
 };
@@ -117,7 +117,9 @@ fn source_field(source: &CompositeSource) -> &str {
 
 /// `size: 0` search with aggregations over one index, served without
 /// hydrating `_source`. `constant_score` / `scoring_enabled` are the ones
-/// [`super::run_search_paths`] computed for the request.
+/// [`super::run_search_paths`] computed for the request. When it declines
+/// after resolving the query's candidate set, that set is left in
+/// `resolved` for the general path to reuse (no second resolution).
 pub(super) fn run_doc_values_aggregations(
     state: &AppState,
     indices: &[String],
@@ -125,6 +127,7 @@ pub(super) fn run_doc_values_aggregations(
     constant_score: Option<f64>,
     scoring_enabled: bool,
     started_at: Instant,
+    resolved: &mut Option<Candidates>,
 ) -> Option<SearchResponse> {
     let forced = match override_mode() {
         Some(false) => return None,
@@ -137,23 +140,10 @@ pub(super) fn run_doc_values_aggregations(
     let index = indices[0].as_str();
     let query = request.query.as_ref();
     let min_score = request.min_score.filter(|_| scoring_enabled);
-
-    // Candidate ids (internal), `None` = every live document.
-    let candidate_ids: Option<Vec<u32>> = match query {
-        None => None,
-        Some(query) if matches_every_document(query) => None,
-        Some(query) => {
-            if !candidate_set_is_exact(query) {
-                return None;
-            }
-            let ctx = CandidateCtx::new(state, index);
-            let candidates = posting_candidates(&ctx, query, None)?;
-            if !candidates.exact {
-                return None;
-            }
-            Some(candidates.ids.into_iter().collect())
-        }
-    };
+    let every_document = query.is_none_or(matches_every_document);
+    if !every_document && !query.is_some_and(candidate_set_is_exact) {
+        return None;
+    }
     let score_each = min_score.is_some() && constant_score.is_none();
     if score_each && query.is_some_and(scoring_needs_source) {
         return None;
@@ -164,7 +154,37 @@ pub(super) fn run_doc_values_aggregations(
     // sends `0`) filters nothing: no per-document scoring then.
     let min_score = min_score.filter(|min| !(score_each && (*min as f32) <= 0.0));
 
-    state.with_search_reader(index, |reader| -> Option<SearchResponse> {
+    // Field sources and index coverage first (cheap, before resolving).
+    let servable = state.with_search_reader(index, |reader| {
+        let Some(reader) = reader else {
+            return false;
+        };
+        reader.index_covers_live_documents()
+            && request.aggs.iter().all(|(_, spec)| {
+                agg_fields(spec)
+                    .into_iter()
+                    .all(|field| doc_values_source(&reader, field).is_some())
+            })
+    });
+    if !servable {
+        return None;
+    }
+
+    // Candidate ids (internal), `None` = every live document.
+    let candidates: Option<Candidates> = match query {
+        Some(query) if !every_document => {
+            let ctx = CandidateCtx::new(state, index);
+            let candidates = posting_candidates(&ctx, query, None)?;
+            if !candidates.exact {
+                *resolved = Some(candidates);
+                return None;
+            }
+            Some(candidates)
+        }
+        _ => None,
+    };
+
+    let served = state.with_search_reader(index, |reader| -> Option<SearchResponse> {
         let reader = reader?;
         if !reader.index_covers_live_documents() {
             return None;
@@ -175,9 +195,9 @@ pub(super) fn run_doc_values_aggregations(
                 sources.insert(field, doc_values_source(&reader, field)?);
             }
         }
-        let mut matched = match &candidate_ids {
+        let mut matched = match &candidates {
             None => reader.live_doc_bitset(),
-            Some(ids) => reader.live_bitset_of(ids),
+            Some(candidates) => reader.live_bitset_of(candidates.ids.iter().copied()),
         };
         if !forced && matched.count() <= DOC_VALUES_MIN_MATCHED {
             return None;
@@ -209,10 +229,18 @@ pub(super) fn run_doc_values_aggregations(
             }
         }
 
+        // Every document the index holds is matched: a top-level field's
+        // per-value counts are its terms' document frequencies.
+        let scope = Scope {
+            matched: &matched,
+            whole_index: candidates.is_none()
+                && !matched.is_empty()
+                && matched.count() == reader.index_live_doc_count(),
+        };
         let mapping = reader.mapping();
         let mut results: Vec<(String, AggResult)> = Vec::with_capacity(request.aggs.len());
         for (name, spec) in &request.aggs {
-            let result = aggregate(&reader, spec, &sources, &matched, mapping)?;
+            let result = aggregate(&reader, spec, &sources, &scope, mapping)?;
             results.push((name.clone(), result));
         }
 
@@ -226,16 +254,40 @@ pub(super) fn run_doc_values_aggregations(
         response.hits.max_score = None;
         response.aggregations = Some(AggregationResults(results));
         Some(response)
-    })
+    });
+    if served.is_none() {
+        *resolved = candidates;
+    }
+    served
 }
 
-/// Per ordinal value of `field` over `matched`, with its document count.
+/// The matched documents of one request.
+struct Scope<'m> {
+    matched: &'m DocBitSet,
+    /// `matched` is every document the index holds (checked against
+    /// `IndexReader::index_covers_live_documents` upstream).
+    whole_index: bool,
+}
+
+/// Per ordinal value of `field` over the matched documents, with its
+/// document count.
 fn value_counts(
     reader: &IndexReader<'_>,
     field: &str,
     source: DocValuesSource,
-    matched: &DocBitSet,
+    scope: &Scope<'_>,
 ) -> Option<(Vec<Value>, Vec<u64>)> {
+    let matched = scope.matched;
+    if matched.is_empty() {
+        // Nothing to count (e.g. every candidate under `min_score`): the
+        // `_source` path sees no document either.
+        return Some((Vec::new(), Vec::new()));
+    }
+    if let (true, Some(kind)) = (scope.whole_index, source) {
+        if let Some(frequencies) = reader.doc_value_frequencies(field, kind) {
+            return Some(frequencies);
+        }
+    }
     let mut counts: Vec<u64> = Vec::new();
     let values = reader.for_each_doc_value(field, source, matched, |_, ordinal| {
         let ordinal = ordinal as usize;
@@ -252,14 +304,14 @@ fn aggregate(
     reader: &IndexReader<'_>,
     spec: &AggSpec,
     sources: &BTreeMap<&str, DocValuesSource>,
-    matched: &DocBitSet,
+    scope: &Scope<'_>,
     mapping: &IndexMapping,
 ) -> Option<AggResult> {
     let no_projections = SubfieldProjections::default();
     match spec {
         AggSpec::Terms { field, size } => {
             let (values, counts) =
-                value_counts(reader, field, *sources.get(field.as_str())?, matched)?;
+                value_counts(reader, field, *sources.get(field.as_str())?, scope)?;
             let mut by_key: BTreeMap<TermsKey, (Value, u64)> = BTreeMap::new();
             for (value, count) in values.iter().zip(counts) {
                 if count > 0 {
@@ -276,7 +328,7 @@ fn aggregate(
             let view = FieldValueView::new(field, Some(mapping), &no_projections);
             let field_format = view.date_format_or_default().to_owned();
             let (values, counts) =
-                value_counts(reader, field, *sources.get(field.as_str())?, matched)?;
+                value_counts(reader, field, *sources.get(field.as_str())?, scope)?;
             let mut by_bucket: BTreeMap<i64, u64> = BTreeMap::new();
             for (value, count) in values.iter().zip(counts) {
                 if count == 0 {
@@ -296,7 +348,7 @@ fn aggregate(
         }
         AggSpec::Cardinality { field } => {
             let (values, counts) =
-                value_counts(reader, field, *sources.get(field.as_str())?, matched)?;
+                value_counts(reader, field, *sources.get(field.as_str())?, scope)?;
             let distinct: BTreeSet<TermsKey> = values
                 .iter()
                 .zip(counts)
@@ -317,7 +369,7 @@ fn aggregate(
             *size,
             after.as_ref(),
             sources,
-            matched,
+            scope.matched,
             mapping,
         ),
     }
@@ -406,6 +458,15 @@ fn composite(
         .iter()
         .map(|source| FieldValueView::new(source_field(source), Some(mapping), &no_projections))
         .collect();
+    if matched.is_empty() {
+        return Some(finish_composite_aggregation(
+            CompositeCounts::new(),
+            composite_sources,
+            &views,
+            size,
+            after,
+        ));
+    }
     let mut per_source: Vec<SourceKeys> = Vec::with_capacity(composite_sources.len());
     for (source, view) in composite_sources.iter().zip(&views) {
         let doc_values = *sources.get(source_field(source))?;

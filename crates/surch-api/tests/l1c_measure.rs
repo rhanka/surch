@@ -370,27 +370,37 @@ async fn measure_agg_and_fuzzy_shapes() {
     );
 
     let uri = format!("/{INDEX}/_search?request_cache=false");
+    let wanted = |label: &str| {
+        only.as_ref()
+            .is_none_or(|list| list.iter().any(|name| name == label))
+    };
+    // First composite pages (their `after_key` drives the page-2 shapes),
+    // only requested when a page-2 shape runs.
+    let first_after = |sources: Vec<(&'static str, &'static str)>, label: &'static str| {
+        let router = router.clone();
+        let uri = uri.clone();
+        let run = wanted(label);
+        async move {
+            if !run {
+                return Value::Null;
+            }
+            let page = send(
+                &router,
+                Method::POST,
+                &uri,
+                body(advanced(vec![]), 0, 0, Some(composite(&sources, None))).to_string(),
+            )
+            .await;
+            page["aggregations"]["bucketResults"]["after_key"].clone()
+        }
+    };
     let sex_dept = [("sex", "SEXE"), ("deathDepartment", "DEPARTEMENT_DECES")];
-    let first_page = send(
-        &router,
-        Method::POST,
-        &uri,
-        body(advanced(vec![]), 0, 0, Some(composite(&sex_dept, None))).to_string(),
-    )
-    .await;
-    let after = first_page["aggregations"]["bucketResults"]["after_key"].clone();
     let city_date = [
         ("birthCity", "COMMUNE_NAISSANCE.raw"),
         ("deathDate", "DATE_DECES_NORM"),
     ];
-    let city_first = send(
-        &router,
-        Method::POST,
-        &uri,
-        body(advanced(vec![]), 0, 0, Some(composite(&city_date, None))).to_string(),
-    )
-    .await;
-    let city_after = city_first["aggregations"]["bucketResults"]["after_key"].clone();
+    let after = first_after(sex_dept.to_vec(), "agg_none_composite_page2").await;
+    let city_after = first_after(city_date.to_vec(), "agg_none_composite_city_date_page2").await;
 
     let shapes: Vec<(&str, Value)> = vec![
         (
