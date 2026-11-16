@@ -94,6 +94,53 @@ where
     }
 }
 
+/// Default idle interval of the small-index auto-commit (ms).
+const AUTO_COMMIT_INTERVAL_MS_DEFAULT: u64 = 1_000;
+/// Default size bound of an auto-committed index (live documents).
+const AUTO_COMMIT_MAX_DOCS_DEFAULT: u32 = 100_000;
+
+/// MVP L6: with a data directory, commit small indices left with
+/// uncommitted writes once they stay idle for one interval, so a single
+/// acknowledged write (matchID's restore marker) survives a restart.
+/// `SURCH_AUTO_COMMIT_INTERVAL_MS=0` disables it;
+/// `SURCH_AUTO_COMMIT_MAX_DOCS` bounds the index size it applies to.
+fn spawn_idle_auto_commit(app: &surch_api::state::AppState) {
+    if app.data_dir().is_none() {
+        return;
+    }
+    let interval_ms = env::var("SURCH_AUTO_COMMIT_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(AUTO_COMMIT_INTERVAL_MS_DEFAULT);
+    if interval_ms == 0 {
+        return;
+    }
+    let max_docs = env::var("SURCH_AUTO_COMMIT_MAX_DOCS")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(AUTO_COMMIT_MAX_DOCS_DEFAULT);
+    let app = app.clone();
+    tokio::spawn(async move {
+        let mut previous = std::collections::BTreeMap::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+        loop {
+            ticker.tick().await;
+            let app = app.clone();
+            let carried = std::mem::take(&mut previous);
+            match tokio::task::spawn_blocking(move || {
+                let mut carried = carried;
+                app.auto_commit_idle_small_indices(&mut carried, max_docs);
+                carried
+            })
+            .await
+            {
+                Ok(carried) => previous = carried,
+                Err(error) => eprintln!("surch-api: idle auto-commit tick failed: {error}"),
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     if run_mode_from_args(env::args()) == RunMode::Help {
@@ -136,6 +183,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         None => surch_api::AppRouterState::default(),
     };
+    spawn_idle_auto_commit(&shared.app);
     let _slm_scheduler = surch_api::slm::scheduler::spawn(
         surch_api::slm::SchedulerConfig::default(),
         shared.slm_policies.clone(),

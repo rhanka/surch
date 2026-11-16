@@ -196,14 +196,14 @@ env:
   `GET /<idx>/_settings` echoes them.
 - `GET /<idx>/_doc/<id>` exists (the Job reads its marker with it; before
   L6.2 the route answered 405 and the marker always read as absent).
-- **Gap: the marker write is not durable.** `PUT
-  /.matchid-restore-state/_doc/deces` is in memory until a `_refresh`
-  commits it (Surch has no translog). After a pod restart without a
-  refresh the marker is gone and the next Job run takes its "no marker;
-  recording and skipping restore" branch. Recommended Job change
-  (matchID): `curl -fsS -XPOST "$ES_URL/$RESTORE_MARKER_INDEX/_refresh"`
-  right after `write_marker`. Covered by
-  `tests/snapshot_v2.rs::deces_job_restores_segment_snapshot_without_reindexing`.
+- The marker write is made durable without changing the Job: `PUT
+  /.matchid-restore-state/_doc/deces` is in memory until a commit (Surch
+  has no translog), and the idle auto-commit (see `persistence.md`, "When
+  state is committed") commits a small index once it saw no write for one
+  interval (`SURCH_AUTO_COMMIT_INTERVAL_MS`, default 1000 ms). A pod
+  killed less than one interval after the write can still lose it; an
+  explicit `_refresh` after `write_marker` closes that window. Covered by
+  `tests/persistence.rs::idle_auto_commit_makes_an_unrefreshed_marker_write_durable`.
 
 ## Proof
 

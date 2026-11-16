@@ -727,3 +727,108 @@ async fn mapping_change_and_out_of_refresh_commits_stay_consistent() {
     let after = record(&router, &calls).await;
     assert_same("mapping change", &calls, &before, &after);
 }
+
+/// matchID restore Job: `PUT <marker>/_doc/deces` with no `_refresh`. With
+/// no translog, the idle auto-commit is what makes that acknowledged write
+/// survive a restart (the main binary runs it every
+/// `SURCH_AUTO_COMMIT_INTERVAL_MS`; the tick is driven by hand here).
+#[tokio::test]
+async fn idle_auto_commit_makes_an_unrefreshed_marker_write_durable() {
+    let dir = TestDir::new("idle-commit");
+    let marker =
+        r#"{"snapshot_name":"esdata_53836a67_c62c0ccb","updated_at":"2026-11-16T10:00:00Z"}"#;
+    {
+        let (router, app) = open(dir.path());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/.matchid-restore-state/_doc/deces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(marker))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert!(response.status().is_success());
+
+        let mut previous = std::collections::BTreeMap::new();
+        // First tick only records the write fingerprint; nothing is idle yet.
+        assert!(app
+            .auto_commit_idle_small_indices(&mut previous, 100_000)
+            .is_empty());
+        // Second tick: no write in between, the small index is committed.
+        assert_eq!(
+            app.auto_commit_idle_small_indices(&mut previous, 100_000),
+            vec![".matchid-restore-state".to_owned()]
+        );
+        // Nothing left to commit afterwards.
+        assert!(app
+            .auto_commit_idle_small_indices(&mut previous, 100_000)
+            .is_empty());
+    }
+
+    let (router, _app) = open(dir.path());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/.matchid-restore-state/_doc/deces")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), 200, "marker lost across restart");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let doc: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(doc["_source"]["snapshot_name"], "esdata_53836a67_c62c0ccb");
+}
+
+/// A busy or large index is never auto-committed: committing would make the
+/// next write rebuild the whole index.
+#[tokio::test]
+async fn idle_auto_commit_skips_busy_and_large_indices() {
+    let dir = TestDir::new("idle-commit-skip");
+    let (router, app) = open(dir.path());
+    let put = |id: u32| {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/big/_doc/{id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"n":{id}}}"#)))
+            .expect("request builds")
+    };
+    for id in 0..3 {
+        assert!(router
+            .clone()
+            .oneshot(put(id))
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+    let mut previous = std::collections::BTreeMap::new();
+    // Over the size bound (2 docs): never committed, however idle.
+    for _ in 0..3 {
+        assert!(app
+            .auto_commit_idle_small_indices(&mut previous, 2)
+            .is_empty());
+    }
+    // Under the bound but written between every tick: never idle.
+    for id in 3..6 {
+        assert!(app
+            .auto_commit_idle_small_indices(&mut previous, 100)
+            .is_empty());
+        assert!(router
+            .clone()
+            .oneshot(put(id))
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+}

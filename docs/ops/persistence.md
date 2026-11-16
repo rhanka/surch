@@ -109,6 +109,18 @@ after them to make the result durable. `_snapshot/.../_restore` commits
 the restored index before answering (L6.2, `docs/ops/snapshot-v2.md`),
 and `PUT /<index>/_settings` commits the new settings.
 
+**Idle auto-commit (small indices).** With a data directory, the server
+also commits, as a `_refresh` would, every index that has uncommitted
+writes, holds at most `SURCH_AUTO_COMMIT_MAX_DOCS` live documents
+(default 100 000) and received no write during one whole
+`SURCH_AUTO_COMMIT_INTERVAL_MS` interval (default 1000 ms; `0` disables
+it). This makes isolated acknowledged writes such as matchID's restore
+marker durable without a client-side `_refresh`. Large indices are
+excluded on purpose: a write that follows a refresh rebuilds the whole
+index (`append_to_index`), so auto-committing a large index during a bulk
+load that pauses would turn into repeated full rebuilds; large indices
+keep the explicit bulk-then-`_refresh` contract.
+
 A commit only writes what changed: segments already on disk are
 recognised by identity and never rewritten; `ids-*.ids` is rewritten
 only when the id maps changed; `meta-*.meta` is small except for the D1

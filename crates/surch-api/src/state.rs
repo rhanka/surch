@@ -7909,6 +7909,53 @@ impl AppState {
         Ok(state)
     }
 
+    /// MVP L6: idle auto-commit for small indices. Surch has no translog,
+    /// so a write is durable only once a `_refresh` commits it. Elasticsearch
+    /// acknowledges a single-document write as durable; matchID's restore
+    /// Job writes its marker document with `PUT <marker>/_doc/deces` and no
+    /// `_refresh`, so the next pod restart would lose it.
+    ///
+    /// One tick: every index with uncommitted writes and at most `max_docs`
+    /// live documents whose write fingerprint `(next_doc_id, live_count)` did
+    /// not move since the previous tick (no write for a whole interval) is
+    /// refreshed, i.e. sealed and committed. Large indices are left to an
+    /// explicit `_refresh`: a write after a refresh rebuilds the whole index
+    /// (`append_to_index`), which must not be triggered under a bulk load
+    /// that pauses for one interval. Returns the committed index names.
+    pub fn auto_commit_idle_small_indices(
+        &self,
+        previous: &mut BTreeMap<String, (u32, u32)>,
+        max_docs: u32,
+    ) -> Vec<String> {
+        let dirty: Vec<(String, (u32, u32))> = {
+            let store = self
+                .store
+                .read()
+                .expect("in-memory API state lock should not be poisoned");
+            if store.data_dir.is_none() {
+                return Vec::new();
+            }
+            store
+                .indices
+                .iter()
+                .filter(|(_, data)| !data.terms_finalized && data.live_count <= max_docs)
+                .map(|(name, data)| (name.clone(), (data.next_doc_id, data.live_count)))
+                .collect()
+        };
+        let mut committed = Vec::new();
+        let mut next = BTreeMap::new();
+        for (name, fingerprint) in dirty {
+            if previous.get(&name) == Some(&fingerprint) {
+                self.refresh_index(&name);
+                committed.push(name);
+            } else {
+                next.insert(name, fingerprint);
+            }
+        }
+        *previous = next;
+        committed
+    }
+
     /// MVP L6: root of the opened data directory, `None` in the historical
     /// in-memory mode.
     pub fn data_dir(&self) -> Option<std::path::PathBuf> {
