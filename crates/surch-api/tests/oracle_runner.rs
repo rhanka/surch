@@ -108,7 +108,8 @@ async fn execute_api_request(
     path: &str,
     body: String,
 ) -> Result<OracleResponse, String> {
-    let response = router
+    // `Router::oneshot` is infallible (`Result<_, Infallible>`).
+    let Ok(response) = router
         .oneshot(
             Request::builder()
                 .method(method)
@@ -117,8 +118,7 @@ async fn execute_api_request(
                 .body(Body::from(body))
                 .map_err(|error| error.to_string())?,
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await;
 
     let status = response.status().as_u16();
     let body_bytes = to_bytes(response.into_body(), usize::MAX)

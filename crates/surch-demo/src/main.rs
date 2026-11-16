@@ -275,7 +275,8 @@ async fn execute_json(
     path: &str,
     body: Option<String>,
 ) -> Result<Value, CliError> {
-    let response = router
+    // `Router::oneshot` is infallible (`Result<_, Infallible>`).
+    let Ok(response) = router
         .oneshot(
             Request::builder()
                 .method(method)
@@ -284,8 +285,7 @@ async fn execute_json(
                 .body(Body::from(body.unwrap_or_default()))
                 .map_err(|error| CliError::Http(error.to_string()))?,
         )
-        .await
-        .map_err(|error| CliError::Http(error.to_string()))?;
+        .await;
 
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX)

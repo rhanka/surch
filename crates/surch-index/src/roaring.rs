@@ -176,8 +176,10 @@ impl RoaringDocSet {
                     let count = u32::from_le_bytes(take(&mut input, 4)?.try_into().ok()?) as usize;
                     let raw = take(&mut input, count.checked_mul(2)?)?;
                     let values: Vec<u16> = raw
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|chunk| u16::from_le_bytes(*chunk))
                         .collect();
                     if count == 0 || values.windows(2).any(|pair| pair[0] >= pair[1]) {
                         return None;
@@ -188,8 +190,8 @@ impl RoaringDocSet {
                 1 => {
                     let raw = take(&mut input, WORDS_PER_CHUNK * 8)?;
                     let mut words = Box::new([0u64; WORDS_PER_CHUNK]);
-                    for (word, chunk) in words.iter_mut().zip(raw.chunks_exact(8)) {
-                        *word = u64::from_le_bytes(chunk.try_into().ok()?);
+                    for (word, chunk) in words.iter_mut().zip(raw.as_chunks::<8>().0) {
+                        *word = u64::from_le_bytes(*chunk);
                         total += u64::from(word.count_ones());
                     }
                     Container::Bitmap(words)

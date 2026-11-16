@@ -1221,8 +1221,8 @@ impl SubfieldColumn {
         let dict_bytes = store.read(disk.dict_bytes_base, disk.dict_bytes_len)?;
 
         let mut offsets = Vec::with_capacity(disk.dict_len as usize + 1);
-        for chunk in offsets_bytes.chunks_exact(4) {
-            offsets.push(u32::from_le_bytes(chunk.try_into().ok()?));
+        for chunk in offsets_bytes.as_chunks::<4>().0 {
+            offsets.push(u32::from_le_bytes(*chunk));
         }
         let mut dict = Vec::with_capacity(disk.dict_len as usize);
         for window in offsets.windows(2) {
@@ -1242,8 +1242,8 @@ impl SubfieldColumn {
     ) -> Option<Vec<u32>> {
         let codes_bytes = store.read(disk.codes_base, disk.codes_len.saturating_mul(4))?;
         let mut codes = Vec::with_capacity(disk.codes_len as usize);
-        for chunk in codes_bytes.chunks_exact(4) {
-            codes.push(u32::from_le_bytes(chunk.try_into().ok()?));
+        for chunk in codes_bytes.as_chunks::<4>().0 {
+            codes.push(u32::from_le_bytes(*chunk));
         }
         Some(codes)
     }

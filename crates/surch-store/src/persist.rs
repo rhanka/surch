@@ -541,8 +541,10 @@ impl FramedReader {
             self.get_raw(&mut buf[..take * 4])?;
             values.extend(
                 buf[..take * 4]
-                    .chunks_exact(4)
-                    .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("4 bytes"))),
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| u32::from_le_bytes(*chunk)),
             );
             left -= take;
         }
@@ -559,8 +561,10 @@ impl FramedReader {
             self.get_raw(&mut buf[..take * 8])?;
             values.extend(
                 buf[..take * 8]
-                    .chunks_exact(8)
-                    .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8 bytes"))),
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_le_bytes(*chunk)),
             );
             left -= take;
         }
