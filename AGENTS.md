@@ -119,8 +119,11 @@ Avant de donner un statut ou de lancer du travail, un agent doit:
 2. verifier `git status --short --branch`
 3. verifier l'etat des branches et worktrees utiles
 4. lire les docs du track concerne si elles existent
-5. verifier les derniers runs `ci` / `ci-k8s` si le travail touche
-   perf, packaging, snapshots ou infra
+5. verifier les derniers runs `ci` / `es-oracle` si le travail touche
+   perf, packaging, snapshots ou infra (`ci-k8s` est retire depuis le
+   2026-11-16 : le seul noeud Kapsule est la prod matchID ; les charges
+   lourdes passent par les VM du banc moteurs OVH GRA11, sur demande
+   portee par la session matchid)
 6. produire le premier statut utilisateur dans le format obligatoire
 
 ## Format de task
@@ -399,8 +402,9 @@ Preferences:
 - ne jamais pousser sans demande explicite du user ou du Conductor
 - les tracks A-D ont aujourd'hui des branches longues:
   `wp/a-optim`, `wp/b-test-auto`, `wp/c-ops`, `wp/d-matchid`
-- Track E vit pour l'instant surtout sur `main`, `ci-k8s` et
-  `deploy/k8s/`
+- Track E vit sur `main` : `es-oracle.yml` (runner GitHub) et les
+  manifestes historiques `deploy/k8s/` ; aucun cluster k8s n.est
+  disponible pour surch depuis le 2026-11-16
 - ne jamais utiliser de commande destructive sans ordre explicite
 
 ## Verification minimale avant de clore

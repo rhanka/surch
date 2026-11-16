@@ -40,7 +40,7 @@ help:
 	@echo "  bench-artillery-rs Rust keep-alive artillery_bench vs Surch & OS (~6 min)"
 	@echo "  bench-perf        bench-local + bench-stress + RSS sampling"
 	@echo "  bench-remote-scw  bench-perf on a Scaleway DEV1-M (hard 30 min cap)"
-	@echo "  bench-k8s         dispatch the .github/workflows/ci-k8s.yml burst-pool bench (gh CLI)"
+	@echo "  bench-k8s         disabled (ci-k8s.yml removed 2026-11-16; see es-oracle.yml)"
 	@echo "  bench-all         full local suite, sequenced"
 	@echo "  surch-up          launch surch-api release in the background"
 	@echo "  surch-down        stop a backgrounded surch-api"
@@ -183,6 +183,7 @@ K8S_IMAGE ?= $(K8S_IMAGE_REPO):$(K8S_IMAGE_TAG)
 K8S_BENCH_IMAGE_TAG ?= bench-sha-$(K8S_SHA)
 K8S_BENCH_IMAGE ?= $(K8S_IMAGE_REPO):$(K8S_BENCH_IMAGE_TAG)
 bench-k8s:
+	@echo "bench-k8s: disabled since 2026-11-16: ci-k8s.yml was removed (the Kapsule node is matchID production, access revoked). Use es-oracle.yml on GitHub runners, or a bench VM via the matchid bench (docs/wp-d-matchid/)." >&2; exit 2
 	@case "$(K8S_JOB)" in \
 	  ndcg-gate|insee-bench|00-init-corpora) ;; \
 	  *) echo "bench-k8s: invalid K8S_JOB=$(K8S_JOB) (expected ndcg-gate|insee-bench|00-init-corpora)" >&2; exit 2 ;; \
