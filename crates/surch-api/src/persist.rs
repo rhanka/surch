@@ -33,7 +33,14 @@ pub(crate) const FORMAT_VERSION: u32 = 1;
 /// normalizer chains) that makes postings written by version 1 inconsistent
 /// with the query-side analysis. A version-1 directory fails closed and must
 /// be re-indexed.
-pub(crate) const META_FORMAT_VERSION: u32 = 2;
+///
+/// Bumped to 3 by lot L1c: the per-field JSON value kinds the
+/// aggregation doc-values path relies on are appended after the index
+/// state. A version-2 file still opens (its kinds are `unknown`, so
+/// aggregations keep the `_source` path until the next full rebuild).
+pub(crate) const META_FORMAT_VERSION: u32 = 3;
+/// The previous `META` version, still readable (no value kinds).
+pub(crate) const META_FORMAT_VERSION_V2: u32 = 2;
 pub(crate) const MANIFEST_KIND: [u8; 4] = *b"MANI";
 pub(crate) const META_KIND: [u8; 4] = *b"META";
 pub(crate) const IDMAP_KIND: [u8; 4] = *b"IDMP";
