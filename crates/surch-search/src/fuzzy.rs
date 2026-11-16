@@ -296,6 +296,14 @@ pub fn fuzzy_token_plan(
 /// Lucene `FuzzyTermsEnum` boost of an expanded term: `1.0` for the exact
 /// term, otherwise `1 - edits / min(term_chars, query_chars)` (computed in
 /// `f32`, like Lucene, so tie-breaking on equal boosts is reproducible).
+///
+/// L7: verified against Lucene 9.4.2 `FuzzyTermsEnum.next` (l.248-255):
+/// `ed == 0 ? 1.0F : 1.0f - (float) ed / (float) Math.min(codePointCount(term), termLength)`
+/// where `termLength` is the code-point length of the WHOLE query term,
+/// prefix included (`FuzzyAutomatonBuilder` l.50-51). The value may be
+/// negative (`ed > min length`): `TopTermsRewrite` selects on the raw value
+/// and only clamps it when building the clause (`Math.max(0.0f, st.boost)`,
+/// TopTermsRewrite.java l.171-172) — the scorer applies that clamp.
 pub fn lucene_fuzzy_similarity(query_chars: usize, term: &str, edits: u8) -> f32 {
     if edits == 0 {
         return 1.0;

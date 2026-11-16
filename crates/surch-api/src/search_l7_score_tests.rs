@@ -220,6 +220,49 @@ fn repeated_token_boosts_the_weight_not_the_score() {
     assert_eq!(hits, bits(&expected));
 }
 
+/// `FuzzyTermsEnum.next` (Lucene 9.4.2 l.248-255) similarity boost:
+/// `1.0f - (float) ed / (float) Math.min(codePointCount(term), termLength)`.
+fn fuzzy_similarity(ed: u32, term_len: u32, query_len: u32) -> f32 {
+    r(1.0
+        - w(r(
+            f64::from(ed as f32) / f64::from(term_len.min(query_len) as f32)
+        )))
+}
+
+#[test]
+fn fuzzy_match_uses_similarity_boost_and_blended_max_doc_freq() {
+    let state = fixture();
+    let (hits, _) = search(
+        &state,
+        json!({"query": {"match": {"NOM": {"query": "dupond", "fuzziness": "auto"}}}}),
+    );
+    // AUTO on 6 chars => 2 edits. Kept terms: dupont (ed 1), durand (ed 2).
+    // BlendedTermQuery.rewrite: df = max(df(dupont)=3, df(durand)=1) = 3.
+    let dupont_boost = fuzzy_similarity(1, 6, 6);
+    let durand_boost = fuzzy_similarity(2, 6, 6);
+    // BoostQuery(TermQuery, similarity).createWeight(1f) => similarity * 1f.
+    let d0 = oracle_bm25(4, 3, 7, 1, Some(2), dupont_boost);
+    let d1 = oracle_bm25(4, 3, 7, 1, Some(1), dupont_boost);
+    let d2 = oracle_bm25(4, 3, 7, 2, Some(3), dupont_boost);
+    let d3 = oracle_bm25(4, 3, 7, 1, Some(1), durand_boost);
+    let mut expected = vec![("0", d0), ("1", d1), ("2", d2), ("3", d3)];
+    expected.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    assert_eq!(hits, bits(&expected));
+}
+
+#[test]
+fn boosted_fuzzy_clause_multiplies_similarity_by_the_clause_boost() {
+    let state = fixture();
+    let (hits, _) = search(
+        &state,
+        json!({"query": {"match": {"NOM": {"query": "durant", "fuzziness": 1, "boost": 2}}}}),
+    );
+    // durant -> durand (ed 1); dupont is 2 edits away (excluded).
+    let boost = r(w(fuzzy_similarity(1, 6, 6)) * 2.0);
+    let d3 = oracle_bm25(4, 1, 7, 1, Some(1), boost);
+    assert_eq!(hits, bits(&[("3", d3)]));
+}
+
 #[test]
 fn min_score_compares_float_values() {
     let state = fixture();
