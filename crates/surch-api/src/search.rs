@@ -42,7 +42,7 @@ pub struct SearchRequest {
     /// A12.1: declared aggregations. Today only `terms` aggs are
     /// honoured; the parser rejects every other type with an explicit
     /// "phase 2" error so the wire shape stays diagnosable.
-    pub aggs: BTreeMap<String, AggSpec>,
+    pub aggs: Vec<(String, AggSpec)>,
 }
 
 /// A12.1+A12.2+A12.3+A12.4: aggregation specification subset supported
@@ -457,38 +457,84 @@ pub enum RangeValue {
 }
 
 /// OpenSearch-compatible `_search` response for the bootstrap engine-less API.
+///
+/// L2b: fields are declared in the ES 8.6.1 emission order
+/// (`SearchResponse.innerToXContent`, server/.../action/search/
+/// SearchResponse.java:274-301): `_scroll_id` first, then `took`,
+/// `timed_out`, `_shards`, `hits`, `aggregations`. serde serializes struct
+/// fields in declaration order, so the byte order follows ES.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SearchResponse {
+    /// Opaque cursor for `POST /_search/scroll`. Only present when the
+    /// caller passed `?scroll=…` on the initial `_search` request and on
+    /// each page returned by `scroll_handler`.
+    #[serde(rename = "_scroll_id", skip_serializing_if = "Option::is_none")]
+    pub scroll_id: Option<String>,
     pub took: u64,
     pub timed_out: bool,
     #[serde(rename = "_shards")]
     pub shards: SearchShards,
     pub hits: SearchHits,
-    /// Opaque cursor for `POST /_search/scroll`. Only present when the
-    /// caller passed `?scroll=…` on the initial `_search` request and on
-    /// each non-empty page returned by `scroll_handler`.
-    #[serde(rename = "_scroll_id", skip_serializing_if = "Option::is_none")]
-    pub scroll_id: Option<String>,
-    /// A12.1: per-aggregation result, keyed by the aggregation name
-    /// supplied in the request. Omitted when the request carries no
-    /// `aggs` (or `aggregations`) block, so existing zero-agg callers
-    /// continue to see the same response shape.
+    /// A12.1: per-aggregation result, in the order the request declared
+    /// the aggregations (ES `AggregatorFactories.Builder` keeps a
+    /// `LinkedHashSet`; `Aggregations.toXContentInternal`,
+    /// Aggregations.java:117-122, writes them in that order). Omitted when
+    /// the request carries no `aggs` block.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aggregations: Option<BTreeMap<String, AggResult>>,
+    pub aggregations: Option<AggregationResults>,
     /// Provenance interne, absente du contrat HTTP. Elle est transférée au
     /// cache afin de conserver le compteur du chemin direct P1a.
     #[serde(skip)]
     direct_must_fused: bool,
 }
 
-/// A12.1+A12.2+A12.3+A12.4: shape of the per-aggregation payload.
-/// `terms` and `date_histogram` emit `{ buckets: [...] }`;
-/// `cardinality` emits `{ value: N }`; `composite` emits
-/// `{ buckets: [...], after_key?: {...} }`. Serialized untagged so the
-/// JSON envelope stays ES-7.x identical.
+/// L2b: aggregation results in request order, serialized as one JSON
+/// object (`{"<name>": <result>, ...}`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AggregationResults(pub Vec<(String, AggResult)>);
+
+impl AggregationResults {
+    /// The result of the aggregation named `name`.
+    pub fn get(&self, name: &str) -> Option<&AggResult> {
+        self.0
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, result)| result)
+    }
+}
+
+impl Serialize for AggregationResults {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, result) in &self.0 {
+            map.serialize_entry(name, result)?;
+        }
+        map.end()
+    }
+}
+
+/// A12.1+A12.2+A12.3+A12.4: shape of the per-aggregation payload,
+/// serialized untagged. L2b: each variant declares its fields in the
+/// ES 8.6.1 emission order:
+/// - `terms`: `doc_count_error_upper_bound`, `sum_other_doc_count`,
+///   `buckets` (`AbstractInternalTerms.doXContentCommon`,
+///   AbstractInternalTerms.java:365-380);
+/// - `date_histogram`: `buckets` (`InternalDateHistogram.doXContentBody`,
+///   InternalDateHistogram.java:535-550);
+/// - `cardinality`: `value` (`InternalCardinality.doXContentBody`,
+///   InternalCardinality.java:96-100);
+/// - `composite`: `after_key` BEFORE `buckets`
+///   (`CompositeAggregation.toXContentFragment`,
+///   CompositeAggregation.java:41-51).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum AggResult {
+    Terms {
+        doc_count_error_upper_bound: u64,
+        sum_other_doc_count: u64,
+        buckets: Vec<AggBucket>,
+    },
     Buckets {
         buckets: Vec<AggBucket>,
     },
@@ -499,24 +545,29 @@ pub enum AggResult {
     /// is empty (the cursor stream has reached its end), and
     /// `Some(<last bucket's key>)` on every non-empty page so
     /// the caller can round-trip it into the next request's
-    /// `composite.after`.
+    /// `composite.after`. Keys follow the declared source order.
     Composite {
-        buckets: Vec<AggBucket>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        after_key: Option<BTreeMap<String, Value>>,
+        after_key: Option<serde_json::Map<String, Value>>,
+        buckets: Vec<AggBucket>,
     },
 }
 
-/// A12.1+A12.2: ES-7.x compatible bucket payload. `terms` emits
-/// `{ "key": …, "doc_count": N }`; `date_histogram` additionally
-/// emits `{ "key_as_string": "…" }` when the agg body declared a
-/// `format`. `key` carries the verbatim JSON type so numeric /
-/// string keys round-trip through the response unchanged.
+/// A12.1+A12.2: bucket payload. L2b: ES 8.6.1 order. A `date_histogram`
+/// bucket writes `key_as_string`, `key`, `doc_count`
+/// (`InternalDateHistogram.Bucket.toXContent`,
+/// InternalDateHistogram.java:119-134); a `terms` bucket writes `key`,
+/// `doc_count` (`InternalTerms.Bucket.toXContent`, InternalTerms.java:
+/// 125-135, `StringTerms.keyToXContent` / `LongTerms.keyToXContent` with
+/// the RAW format); a composite bucket writes `key` (object, source order)
+/// and `doc_count` (`CompositeAggregation.bucketToXContent`,
+/// CompositeAggregation.java:31-39). `key` carries the verbatim JSON type
+/// so numeric / string keys round-trip unchanged.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AggBucket {
-    pub key: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_as_string: Option<String>,
+    pub key: Value,
     pub doc_count: u64,
 }
 
@@ -1476,17 +1527,28 @@ pub async fn scroll_handler(
     // bound, not an exact count).
     let returned = response.hits.hits.len();
     ctx.cursor = ctx.cursor.saturating_add(returned);
-
-    // Re-install the context when we still have something to serve;
-    // an empty page or one where `from + size` overshoots the total
-    // ends the scroll without a re-install (matches ES — the next
-    // `_search/scroll` then 404s like an unknown id).
-    if returned > 0 {
-        let ttl = parse_scroll_ttl(&request.scroll);
-        ctx.expires_at = Instant::now() + ttl;
-        let new_id = state.scroll_table.insert(ctx);
-        response.scroll_id = Some(new_id);
+    // L2b: a scroll page collects only the documents after the previous
+    // page (`ScrollingTopDocsCollectorContext`), so ES's `max_score` is the
+    // best score OF THIS PAGE, `null` once the page is empty
+    // (TopDocsCollectorContext.java:278-286).
+    if response.hits.max_score.is_some() {
+        response.hits.max_score = response
+            .hits
+            .hits
+            .iter()
+            .filter_map(|hit| hit.get("_score").and_then(Value::as_f64))
+            .reduce(f64::max);
     }
+
+    // L2b: ES keeps the scroll context alive until its keep-alive expires
+    // or `DELETE _search/scroll`, and every scroll page — the empty one
+    // that ends the stream included — carries `_scroll_id` first
+    // (SearchResponse.java:275-277). Re-install the context with a fresh
+    // expiry on every page; an exhausted context answers empty pages.
+    let ttl = parse_scroll_ttl(&request.scroll);
+    ctx.expires_at = Instant::now() + ttl;
+    let new_id = state.scroll_table.insert(ctx);
+    response.scroll_id = Some(new_id);
     // Always overwrite `took` so the scroll response measures the
     // scroll fetch, not the upstream `_search` walk.
     response.took = started_at.elapsed().as_millis() as u64;
@@ -1679,6 +1741,10 @@ mod l1b_build_request_guard_tests;
 mod l7_score_tests;
 
 #[cfg(test)]
+#[path = "search_l2b_tests.rs"]
+mod l2b_sorted_top_tests;
+
+#[cfg(test)]
 mod l1_fuzzy_full_scan_guard_tests {
     //! MVP L1 guard: no fuzzy / bool-of-fuzzy shape reaches the `_source`
     //! full scan (`full_scan_documents`, counted per thread).
@@ -1852,8 +1918,44 @@ struct ScoredDocument {
 
 /// Execute a parsed search request against a set of physical indices and build the response.
 pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest) -> SearchResponse {
+    let mut response = run_search_paths(state, indices, request);
+    // L2b: `size: 0` runs ES's `EmptyTopDocsCollectorContext`, whose max
+    // score is `NaN` -> `"max_score":null` whatever matched
+    // (TopDocsCollectorContext.java:447-455, 154).
+    if request.size == Some(0) {
+        response.hits.max_score = None;
+    }
+    response
+}
+
+fn run_search_paths(
+    state: &AppState,
+    indices: &[String],
+    request: &SearchRequest,
+) -> SearchResponse {
     let started_at = Instant::now();
-    let scoring_enabled = request.query.as_ref().is_some_and(is_scoring_query);
+    // L2b: ES scores a request without `query` as `match_all` (1.0) and a
+    // root `match_all` (or any shape matching every document with one
+    // constant score) with its boost, so `_score` / `max_score` are numbers
+    // there, not absent (`MatchAllDocsQuery` + `ConstantScoreScorer`).
+    let constant_score = match request.query.as_ref() {
+        None => Some(1.0),
+        Some(query) if !is_scoring_query(query) && matches_every_document(query) => {
+            constant_match_all_score(query)
+        }
+        Some(_) => None,
+    };
+    let scoring_enabled =
+        constant_score.is_some() || request.query.as_ref().is_some_and(is_scoring_query);
+
+    // L2b: `/version` shape (no query, sort on keyword / date fields,
+    // size 1) served from the term dictionaries instead of hydrating and
+    // sorting the whole index.
+    if request.aggs.is_empty() {
+        if let Some(response) = run_sorted_match_all_top(state, indices, request, started_at) {
+            return response;
+        }
+    }
 
     // A12.1: when aggregations are requested we must walk every matched
     // document (not just the top-K window) so the bucket counts cover
@@ -1895,6 +1997,11 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
             request.query.as_ref(),
         ));
     }
+    if let Some(constant) = constant_score {
+        for document in &mut matched_documents {
+            document.score = constant;
+        }
+    }
     metrics::histogram!("surch_dbg_general_match_us")
         .record(t_general.elapsed().as_micros() as f64);
     metrics::histogram!("surch_dbg_general_matched").record(matched_documents.len() as f64);
@@ -1921,11 +2028,30 @@ pub fn run_search(state: &AppState, indices: &[String], request: &SearchRequest)
         sort_mapping.as_ref(),
         &subfield_projections,
     );
-    let max_score = compute_max_score(&matched_documents, scoring_enabled);
+    // L2b: with a field sort ES does not track `max_score` (`NaN` -> `null`)
+    // unless `track_scores` (TopDocsCollectorContext.java:278-292).
+    let default_sort = is_default_score_sort(&request.sort);
+    let max_score = if default_sort {
+        compute_max_score(&matched_documents, scoring_enabled)
+    } else {
+        None
+    };
     let total = matched_documents.len() as u64;
-    let aggregations =
-        compute_aggregations(&request.aggs, &matched_documents, &subfield_projections);
-    let hits = paginate_hits(request, &matched_documents, scoring_enabled);
+    let aggregations = compute_aggregations(
+        &request.aggs,
+        &matched_documents,
+        &subfield_projections,
+        sort_mapping.as_ref(),
+    );
+    let sort_values = (!default_sort).then(|| {
+        SortValueContext::new(&request.sort, sort_mapping.as_ref(), &subfield_projections)
+    });
+    let hits = paginate_hits(
+        request,
+        &matched_documents,
+        scoring_enabled,
+        sort_values.as_ref(),
+    );
     let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
 
     let mut response = build_search_response_with_total(
@@ -1995,7 +2121,7 @@ fn collect_subfield_projections(
             paths.insert(clause.field.as_str());
         }
     }
-    for spec in request.aggs.values() {
+    for (_, spec) in &request.aggs {
         match spec {
             AggSpec::Terms { field, .. }
             | AggSpec::DateHistogram { field, .. }
@@ -2031,34 +2157,40 @@ fn collect_subfield_projections(
 /// A12.1+A12.2+A12.3+A12.4: dispatch every declared aggregation against
 /// the post-filter matched-document set. Returns `None` when no aggs
 /// are declared so the response stays shape-compatible with zero-agg
-/// callers.
+/// callers. L2b: results keep the request order and read field values
+/// through the field's mapping (keyword normalizer, date format).
 fn compute_aggregations(
-    specs: &BTreeMap<String, AggSpec>,
+    specs: &[(String, AggSpec)],
     matched_documents: &[ScoredDocument],
     subfield_projections: &SubfieldProjections,
-) -> Option<BTreeMap<String, AggResult>> {
+    mapping: Option<&IndexMapping>,
+) -> Option<AggregationResults> {
     if specs.is_empty() {
         return None;
     }
-    let mut out: BTreeMap<String, AggResult> = BTreeMap::new();
+    let mut out: Vec<(String, AggResult)> = Vec::with_capacity(specs.len());
     for (name, spec) in specs {
         let result = match spec {
             AggSpec::Terms { field, size } => {
-                compute_terms_aggregation(matched_documents, field, *size, subfield_projections)
+                let view = FieldValueView::new(field, mapping, subfield_projections);
+                compute_terms_aggregation(matched_documents, &view, *size)
             }
             AggSpec::DateHistogram {
                 field,
                 calendar_interval,
                 format,
-            } => compute_date_histogram_aggregation(
-                matched_documents,
-                field,
-                *calendar_interval,
-                format.as_deref(),
-                subfield_projections,
-            ),
+            } => {
+                let view = FieldValueView::new(field, mapping, subfield_projections);
+                compute_date_histogram_aggregation(
+                    matched_documents,
+                    &view,
+                    *calendar_interval,
+                    format.as_deref(),
+                )
+            }
             AggSpec::Cardinality { field } => {
-                compute_cardinality_aggregation(matched_documents, field, subfield_projections)
+                let view = FieldValueView::new(field, mapping, subfield_projections);
+                compute_cardinality_aggregation(matched_documents, &view)
             }
             AggSpec::Composite {
                 sources,
@@ -2070,59 +2202,119 @@ fn compute_aggregations(
                 *size,
                 after.as_ref(),
                 subfield_projections,
+                mapping,
             ),
         };
-        out.insert(name.clone(), result);
+        out.push((name.clone(), result));
     }
-    Some(out)
+    Some(AggregationResults(out))
 }
 
-/// A10 → A12 (Phase 4): resolve a per-document aggregation/sort value for
-/// `field`, preferring the write-time stored sub-field projection over a
-/// `_source` scan.
+/// L2b: how an aggregation / sort reads one field of a matched document,
+/// resolved once per request against the index mapping.
 ///
-/// When `field` is a stored multi-field sub-field (`NOM.raw`/`.norm`), the
-/// value comes straight from the A10 side-table (already analysed with the
-/// sub-field's chain). A document missing the projection on a stored
-/// sub-field yields `None` — its parent field was absent, so it does not
-/// contribute a bucket / distinct value (parity with ES, which skips
-/// docs lacking the field). Otherwise we fall back to the legacy
-/// `lookup_sort_value` alias, cloning the borrowed `_source` value so the
-/// caller owns a uniform [`Value`].
-fn aggregation_value(
-    scored: &ScoredDocument,
-    field: &str,
-    subfield_projections: &SubfieldProjections,
-) -> Option<Value> {
-    if subfield_projections.is_stored_subfield(field) {
-        return subfield_projections.value(field, &scored.doc.id);
-    }
-    lookup_sort_value(&scored.doc.source, field).cloned()
+/// ES reads doc values, which hold the value AFTER the field's
+/// normalizer for a `keyword` (so a `terms` key on
+/// `DEPARTEMENT_NAISSANCE` with `normalizer: norm` is `"2a"`, not `"2A"`)
+/// and the epoch-millis long for a `date`. Surch reads the stored
+/// sub-field projection when there is one (already normalised at write
+/// time), otherwise `_source` through the legacy `.raw` alias, then
+/// applies the keyword normalizer of the resolved field.
+struct FieldValueView<'a> {
+    field: &'a str,
+    projections: &'a SubfieldProjections,
+    normalizer: Option<ResolvedAnalyzer>,
+    field_type: Option<FieldType>,
+    /// Declared `format` of a `date` field (ES default
+    /// `strict_date_optional_time||epoch_millis` when absent).
+    date_format: Option<String>,
 }
 
-/// A12.1: `terms` aggregation executor. Iterates the matched documents,
-/// reads `_source[field]` (with the `.raw` / `.norm` sub-field alias
-/// already handled by `lookup_sort_value`), counts buckets, and returns
-/// the top `size` ordered by `doc_count` desc + key asc tiebreak.
+impl<'a> FieldValueView<'a> {
+    fn new(
+        field: &'a str,
+        mapping: Option<&IndexMapping>,
+        projections: &'a SubfieldProjections,
+    ) -> Self {
+        let resolved = mapping.and_then(|m| m.resolve_field(field));
+        let normalizer = mapping.and_then(|m| keyword_normalizer(m, field));
+        Self {
+            field,
+            projections,
+            normalizer,
+            field_type: resolved.map(|f| f.field_type),
+            date_format: resolved.and_then(|f| f.date_format().map(str::to_owned)),
+        }
+    }
+
+    /// The document's value for the field, as ES doc values expose it for
+    /// keyword fields (normalised), else the `_source` JSON value.
+    fn value(&self, scored: &ScoredDocument) -> Option<Value> {
+        if self.projections.is_stored_subfield(self.field) {
+            return self.projections.value(self.field, &scored.doc.id);
+        }
+        let raw = lookup_sort_value(&scored.doc.source, self.field)?;
+        Some(match &self.normalizer {
+            Some(analyzer) => match raw {
+                Value::Array(items) => Value::Array(
+                    items
+                        .iter()
+                        .map(|item| normalize_sort_value(item, analyzer))
+                        .collect(),
+                ),
+                other => normalize_sort_value(other, analyzer),
+            },
+            None => raw.clone(),
+        })
+    }
+
+    /// The format date values of this field are parsed and printed with:
+    /// the declared format of a `date` field, ES's default date format for
+    /// a `date` field without one. A field that is not mapped as `date`
+    /// (ES rejects `date_histogram` on it) keeps Surch's legacy reading of
+    /// `YYYYMMDD` keyword dates.
+    fn date_format_or_default(&self) -> &str {
+        match (self.field_type, self.date_format.as_deref()) {
+            (Some(FieldType::Date), Some(format)) => format,
+            (Some(FieldType::Date), None) => crate::es_json::ES_DEFAULT_DATE_FORMAT,
+            _ => "yyyyMMdd",
+        }
+    }
+}
+
+/// L2b: the normalizer of a `keyword` field (top-level or multi-field
+/// sub-field) when it declares one.
+fn keyword_normalizer(mapping: &IndexMapping, path: &str) -> Option<ResolvedAnalyzer> {
+    let field = mapping.resolve_field(path)?;
+    if field.field_type != FieldType::Keyword {
+        return None;
+    }
+    field.normalizer_name()?;
+    Some(field.index_analyzer(mapping.analysis()))
+}
+
+/// A12.1: `terms` aggregation executor. Counts the distinct values of the
+/// field over the matched documents and returns the top `size` buckets
+/// ordered by `doc_count` desc, key asc (ES default `BucketOrder`
+/// `_count desc, _key asc`).
+///
+/// L2b: the payload carries `doc_count_error_upper_bound` (0: one shard,
+/// every term counted exactly) and `sum_other_doc_count` (the doc counts
+/// of the terms beyond `size`), as ES 8.6.1 `InternalMappedTerms` emits
+/// them for a single-shard index.
 ///
 /// Behaviour notes:
-/// - `null` and missing values are skipped (matches ES default — a
-///   `missing` bucket would need an explicit `missing: "…"` option,
-///   which is out of scope here),
-/// - array-valued fields contribute one increment per element (matches
-///   ES `keyword[]` semantics),
-/// - `size = 0` returns an empty bucket list (ES rejects this with 400,
-///   but Surch treats it as "no buckets requested" today; tighten when
-///   matchID's UI starts emitting it).
+/// - `null` and missing values are skipped,
+/// - array-valued fields contribute one increment per element,
+/// - `size = 0` returns an empty bucket list (ES rejects it with 400).
 fn compute_terms_aggregation(
     matched_documents: &[ScoredDocument],
-    field: &str,
+    view: &FieldValueView<'_>,
     size: usize,
-    subfield_projections: &SubfieldProjections,
 ) -> AggResult {
     let mut counts: BTreeMap<TermsKey, (Value, u64)> = BTreeMap::new();
     for scored in matched_documents {
-        let Some(value) = aggregation_value(scored, field, subfield_projections) else {
+        let Some(value) = view.value(scored) else {
             continue;
         };
         match &value {
@@ -2136,161 +2328,160 @@ fn compute_terms_aggregation(
     }
 
     // Two-stage sort: doc_count desc, then key asc as tiebreak.
-    let mut sorted: Vec<(Value, u64)> = counts.into_values().collect();
-    sorted.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| compare_values(&left.0, &right.0))
-    });
+    let mut sorted: Vec<(TermsKey, Value, u64)> = counts
+        .into_iter()
+        .map(|(key, (value, count))| (key, value, count))
+        .collect();
+    sorted.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
 
-    let buckets = sorted
+    let total: u64 = sorted.iter().map(|(_, _, count)| *count).sum();
+    let buckets: Vec<AggBucket> = sorted
         .into_iter()
         .take(size)
-        .map(|(key, doc_count)| AggBucket {
-            key,
+        .map(|(_, key, doc_count)| AggBucket {
             key_as_string: None,
+            key,
             doc_count,
         })
         .collect();
-    AggResult::Buckets { buckets }
+    let returned: u64 = buckets.iter().map(|bucket| bucket.doc_count).sum();
+    AggResult::Terms {
+        doc_count_error_upper_bound: 0,
+        sum_other_doc_count: total - returned,
+        buckets,
+    }
 }
 
-/// A12.2: `date_histogram` aggregation executor. Each matched document
-/// contributes its `field` value (string `YYYYMMDD`, as stored by the
-/// A7 `date{format:yyyyMMdd}` field type) to the bucket obtained by
-/// truncating the date to the requested `calendar_interval`. Buckets
-/// are returned sorted by key ascending — matchID's analytics tab
-/// renders the timeline left-to-right and depends on that order.
+/// A12.2: `date_histogram` aggregation executor, ES 8.6.1 semantics:
 ///
-/// Behaviour notes:
-/// - Values that do not parse as `YYYYMMDD` are skipped (no synthetic
-///   bucket — matches ES default when no `missing` option is set),
-/// - array-valued fields contribute one increment per element,
-/// - `format` is forwarded verbatim into `key_as_string` when set; we
-///   do not re-render the date through a different pattern in this
-///   MVP (matchID only ever emits `yyyyMMdd`, which happens to match
-///   the storage shape).
+/// - each value is read as a date (field format, or epoch millis for a
+///   JSON number) and rounded down to the calendar interval in UTC;
+/// - `key` is the bucket start in epoch milliseconds (a JSON integer),
+///   `key_as_string` that instant printed with the request `format`, else
+///   the field's format (a `date` field never uses the RAW format, so
+///   `key_as_string` is always written: `InternalDateHistogram.Bucket.
+///   toXContent`, InternalDateHistogram.java:119-134);
+/// - `min_doc_count` defaults to 0, so empty buckets fill every gap
+///   between the first and the last non-empty bucket
+///   (`InternalDateHistogram.addEmptyBuckets`); no bucket at all when no
+///   document has a value.
 fn compute_date_histogram_aggregation(
     matched_documents: &[ScoredDocument],
-    field: &str,
+    view: &FieldValueView<'_>,
     calendar_interval: CalendarInterval,
     format: Option<&str>,
-    subfield_projections: &SubfieldProjections,
 ) -> AggResult {
-    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    let field_format = view.date_format_or_default().to_owned();
+    let mut counts: BTreeMap<i64, u64> = BTreeMap::new();
     for scored in matched_documents {
-        let Some(value) = aggregation_value(scored, field, subfield_projections) else {
+        let Some(value) = view.value(scored) else {
             continue;
         };
+        let mut record = |item: &Value| {
+            if let Some(days) = date_value_epoch_days(item, &field_format) {
+                *counts
+                    .entry(round_days_to_interval(days, calendar_interval))
+                    .or_insert(0) += 1;
+            }
+        };
         match &value {
-            Value::Array(items) => {
-                for item in items {
-                    if let Some(bucket_key) = bucket_key_for_date(item, calendar_interval) {
-                        *counts.entry(bucket_key).or_insert(0) += 1;
-                    }
-                }
-            }
-            other => {
-                if let Some(bucket_key) = bucket_key_for_date(other, calendar_interval) {
-                    *counts.entry(bucket_key).or_insert(0) += 1;
-                }
-            }
+            Value::Array(items) => items.iter().for_each(&mut record),
+            other => record(other),
         }
     }
 
-    // BTreeMap iteration already yields keys ascending — but we still
-    // map through `Vec` so the response shape is identical to
-    // `terms`.
-    let buckets = counts
-        .into_iter()
-        .map(|(key, doc_count)| AggBucket {
-            key: Value::String(key.clone()),
-            key_as_string: format.map(|_| key),
-            doc_count,
-        })
-        .collect();
+    let print_format = format.unwrap_or(&field_format).to_owned();
+    let mut buckets = Vec::with_capacity(counts.len());
+    if let (Some(&first), Some(&last)) = (counts.keys().next(), counts.keys().next_back()) {
+        let mut day = first;
+        while day <= last {
+            let millis = day * MILLIS_PER_DAY;
+            buckets.push(AggBucket {
+                key_as_string: Some(crate::es_json::format_es_date(millis, &print_format)),
+                key: Value::from(millis),
+                doc_count: counts.get(&day).copied().unwrap_or(0),
+            });
+            day = next_interval_start(day, calendar_interval);
+        }
+    }
     AggResult::Buckets { buckets }
 }
 
-/// A12.2: truncate a `YYYYMMDD` JSON value to the requested calendar
-/// interval. Returns `None` for any value that does not parse.
-fn bucket_key_for_date(value: &Value, interval: CalendarInterval) -> Option<String> {
-    let s = value.as_str()?;
-    if s.len() != 8 || !s.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let year: i32 = s[0..4].parse().ok()?;
-    let month: u32 = s[4..6].parse().ok()?;
-    let day: u32 = s[6..8].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    Some(match interval {
-        CalendarInterval::Day => format!("{year:04}{month:02}{day:02}"),
-        CalendarInterval::Month => format!("{year:04}{month:02}01"),
-        CalendarInterval::Year => format!("{year:04}0101"),
-        CalendarInterval::Week => {
-            // Truncate to the Monday of the ISO week containing the
-            // input date. We compute the day-of-year via the Gregorian
-            // calendar (no chrono dependency), then anchor on Monday
-            // using Zeller's congruence-style weekday derivation.
-            let (anchor_year, anchor_month, anchor_day) = week_anchor_monday(year, month, day);
-            format!("{anchor_year:04}{anchor_month:02}{anchor_day:02}")
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
+/// L2b: a date value as days since 1970-01-01 (UTC). A JSON number is
+/// epoch milliseconds; a string is parsed with each `||` alternative of
+/// the field `format` (ES `DateFormatter` tries them in order). A bare
+/// 8-digit string falls back to `yyyyMMdd` (legacy keyword-typed date
+/// fields of the matchID fixtures).
+fn date_value_epoch_days(value: &Value, field_format: &str) -> Option<i64> {
+    match value {
+        Value::Number(number) => {
+            let millis = number
+                .as_i64()
+                .or_else(|| number.as_f64().map(|f| f as i64))?;
+            Some(millis.div_euclid(MILLIS_PER_DAY))
         }
-    })
+        Value::String(text) => {
+            let text = text.trim();
+            field_format
+                .split("||")
+                .find_map(|format| crate::es_json::parse_es_date_days(text, format.trim()))
+                .or_else(|| crate::es_json::parse_es_date_days(text, "yyyyMMdd"))
+        }
+        _ => None,
+    }
 }
 
-/// A12.2 helper: return the (year, month, day) of the Monday of the
-/// ISO week containing the given Gregorian date. Pure-Rust, no
-/// dependency.
-fn week_anchor_monday(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
-    // Convert to Rata Die (day number since 0000-12-31). Algorithm
-    // from Howard Hinnant's date library, transcribed for u32 / i32.
-    fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y } as i64;
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = (y - era * 400) as u64; // [0, 399]
-        let m = m as i64;
-        let d = d as i64;
-        let doy = ((153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1) as u64;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146097 + doe as i64 - 719468
+/// A12.2: round a day number down to the start of its calendar interval
+/// (UTC; `week` starts on Monday as ES's ISO week rounding).
+fn round_days_to_interval(days: i64, interval: CalendarInterval) -> i64 {
+    match interval {
+        CalendarInterval::Day => days,
+        CalendarInterval::Week => days - (days + 3).rem_euclid(7),
+        CalendarInterval::Month => {
+            let (year, month, _) = crate::es_json::civil_from_days(days);
+            crate::es_json::days_from_civil(year, month, 1)
+        }
+        CalendarInterval::Year => {
+            let (year, _, _) = crate::es_json::civil_from_days(days);
+            crate::es_json::days_from_civil(year, 1, 1)
+        }
     }
-    fn civil_from_days(z: i64) -> (i32, u32, u32) {
-        let z = z + 719468;
-        let era = if z >= 0 { z } else { z - 146096 } / 146097;
-        let doe = (z - era * 146097) as u64;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe as i64 + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-        let y = if m <= 2 { y + 1 } else { y } as i32;
-        (y, m, d)
+}
+
+/// A12.2: the start of the interval following the one starting at `days`.
+fn next_interval_start(days: i64, interval: CalendarInterval) -> i64 {
+    match interval {
+        CalendarInterval::Day => days + 1,
+        CalendarInterval::Week => days + 7,
+        CalendarInterval::Month => {
+            let (year, month, _) = crate::es_json::civil_from_days(days);
+            if month == 12 {
+                crate::es_json::days_from_civil(year + 1, 1, 1)
+            } else {
+                crate::es_json::days_from_civil(year, month + 1, 1)
+            }
+        }
+        CalendarInterval::Year => {
+            let (year, _, _) = crate::es_json::civil_from_days(days);
+            crate::es_json::days_from_civil(year + 1, 1, 1)
+        }
     }
-    let z = days_from_civil(year, month, day);
-    // 1970-01-01 was a Thursday → weekday(Thu) = 3 in Mon=0 system.
-    // weekday = (z + 3).rem_euclid(7)
-    let weekday = (z + 3).rem_euclid(7); // 0=Mon..6=Sun
-    civil_from_days(z - weekday)
 }
 
 /// A12.3: `cardinality` aggregation executor. Counts the number of
-/// distinct values of `field` across the matched-document set. The
-/// `.raw` / `.norm` sub-field alias is handled by `lookup_sort_value`
-/// (same path as terms / sort). MVP: exact count, no HyperLogLog
-/// estimation — matchID's analytics tab consumes the exact value
-/// today.
+/// distinct values of the field across the matched-document set. MVP:
+/// exact count. ES 8.6.1 uses HyperLogLog++ (`precision_threshold`
+/// default 3000): counts below the threshold are exact in practice, above
+/// it ES returns an estimate this exact count does not reproduce.
 fn compute_cardinality_aggregation(
     matched_documents: &[ScoredDocument],
-    field: &str,
-    subfield_projections: &SubfieldProjections,
+    view: &FieldValueView<'_>,
 ) -> AggResult {
     let mut distinct: BTreeSet<TermsKey> = BTreeSet::new();
     for scored in matched_documents {
-        let Some(value) = aggregation_value(scored, field, subfield_projections) else {
+        let Some(value) = view.value(scored) else {
             continue;
         };
         match &value {
@@ -2325,53 +2516,55 @@ fn record_terms_value(counts: &mut BTreeMap<TermsKey, (Value, u64)>, value: &Val
 /// A12.4: `composite` aggregation executor.
 ///
 /// For each matched document, project the composite key by applying
-/// each source's projection (`terms` reads `_source[field]` verbatim,
-/// `date_histogram` truncates a `YYYYMMDD` keyword to the requested
+/// each source's projection (`terms` reads the field value as doc values
+/// expose it, `date_histogram` rounds the date down to the requested
 /// `calendar_interval`). Documents that miss any source value are
-/// dropped (matches ES `missing_bucket` default `false`). Identical
-/// composite keys accumulate `doc_count`. Buckets are then sorted
-/// lexicographically (source-by-source, ascending) so the cursor
-/// stream is deterministic.
+/// dropped (ES `missing_bucket` default `false`). Identical composite
+/// keys accumulate `doc_count`. Buckets are sorted source by source,
+/// ascending (numbers numerically, dates by instant, strings by bytes).
 ///
-/// `after` is applied as a strict `>` filter against the sorted key
-/// stream (lex comparison on each source's value, in the order the
-/// sources were declared). The first `size` surviving buckets are
-/// emitted. `after_key` is set to the key of the last emitted bucket
-/// on every non-empty page and omitted on an empty one, which is what
-/// signals end-of-stream (Elasticsearch semantics).
+/// L2b: a `date_histogram` source key is the bucket start formatted with
+/// the source `format` when one is given, else the epoch-millis long
+/// (`InternalComposite.formatObject` with `DocValueFormat.RAW`,
+/// InternalComposite.java:494-530). `after` values are parsed back with
+/// the same format. `after_key` is set to the key of the last emitted
+/// bucket on every non-empty page and omitted on an empty one; keys follow
+/// the declared source order.
 fn compute_composite_aggregation(
     matched_documents: &[ScoredDocument],
     sources: &[CompositeSource],
     size: usize,
     after: Option<&BTreeMap<String, Value>>,
     subfield_projections: &SubfieldProjections,
+    mapping: Option<&IndexMapping>,
 ) -> AggResult {
+    let views: Vec<FieldValueView<'_>> = sources
+        .iter()
+        .map(|source| {
+            let field = match &source.kind {
+                CompositeSourceKind::Terms { field } => field,
+                CompositeSourceKind::DateHistogram { field, .. } => field,
+            };
+            FieldValueView::new(field, mapping, subfield_projections)
+        })
+        .collect();
+
     // Collect bucket counts keyed by the composite tuple. Each entry
-    // stores both the canonical per-source `Value` (for the response
-    // payload) and the count.
+    // stores both the per-source response `Value` and the count.
     let mut counts: BTreeMap<Vec<TermsKey>, (Vec<Value>, u64)> = BTreeMap::new();
     for scored in matched_documents {
         let mut composite_key: Vec<TermsKey> = Vec::with_capacity(sources.len());
         let mut composite_values: Vec<Value> = Vec::with_capacity(sources.len());
         let mut all_present = true;
-        for source in sources {
-            let field = match &source.kind {
-                CompositeSourceKind::Terms { field } => field,
-                CompositeSourceKind::DateHistogram { field, .. } => field,
-            };
-            // A10 → A12 (Phase 4): prefer the write-time stored sub-field
-            // projection (owned `Value`); otherwise the legacy `_source`
-            // alias. Bound to a local so `scalar` can borrow from it.
-            let Some(value) = aggregation_value(scored, field, subfield_projections) else {
+        for (source, view) in sources.iter().zip(&views) {
+            let Some(value) = view.value(scored) else {
                 all_present = false;
                 break;
             };
             // Array-valued fields: ES expands the cartesian product
             // across array elements per source. The MVP collapses to
-            // the first element to keep the executor scalar — matchID
-            // only emits composite over scalar keyword / date fields,
-            // so the trade-off is invisible in practice. Tightening
-            // tracked in A12.4 phase 3.
+            // the first element (matchID only emits composite over
+            // scalar keyword / date fields).
             let scalar = match &value {
                 Value::Array(items) => items.iter().find(|v| !matches!(v, Value::Null)),
                 Value::Null => None,
@@ -2381,26 +2574,31 @@ fn compute_composite_aggregation(
                 all_present = false;
                 break;
             };
-            // Project the scalar through the source kind. `terms`
-            // keeps the value verbatim; `date_histogram` truncates the
-            // `YYYYMMDD` keyword to the requested calendar interval —
-            // identical logic to the standalone date_histogram agg so
-            // a (source, bucket) pair carries the same key on either
-            // path.
-            let projected = match &source.kind {
-                CompositeSourceKind::Terms { .. } => scalar.clone(),
+            match &source.kind {
+                CompositeSourceKind::Terms { .. } => {
+                    composite_key.push(TermsKey::from_value(scalar));
+                    composite_values.push(scalar.clone());
+                }
                 CompositeSourceKind::DateHistogram {
-                    calendar_interval, ..
-                } => match bucket_key_for_date(scalar, *calendar_interval) {
-                    Some(bucket_key) => Value::String(bucket_key),
-                    None => {
+                    calendar_interval,
+                    format,
+                    ..
+                } => {
+                    let field_format = view.date_format_or_default();
+                    let Some(days) = date_value_epoch_days(scalar, field_format) else {
                         all_present = false;
                         break;
-                    }
-                },
-            };
-            composite_key.push(TermsKey::from_value(&projected));
-            composite_values.push(projected);
+                    };
+                    let millis = round_days_to_interval(days, *calendar_interval) * MILLIS_PER_DAY;
+                    composite_key.push(TermsKey::number(millis as f64));
+                    composite_values.push(match format {
+                        Some(format) => {
+                            Value::String(crate::es_json::format_es_date(millis, format))
+                        }
+                        None => Value::from(millis),
+                    });
+                }
+            }
         }
         if !all_present {
             continue;
@@ -2411,49 +2609,52 @@ fn compute_composite_aggregation(
         entry.1 += 1;
     }
 
-    // Materialise (key, values, doc_count) sorted by the BTreeMap
-    // iteration order — TermsKey's `Ord` impl already provides the
-    // source-by-source lex order ES emits.
-    let sorted: Vec<(Vec<TermsKey>, Vec<Value>, u64)> = counts
-        .into_iter()
-        .map(|(key, (values, doc_count))| (key, values, doc_count))
-        .collect();
-
-    // Apply `after` as a strict `>` filter on the composite key. The
-    // cursor object must carry every declared source name; missing
-    // ones are treated as JSON `null` and lex-compare smaller than any
-    // present scalar.
+    // Apply `after` as a strict `>` filter on the composite key. A
+    // missing source name lex-compares as JSON `null`.
     let after_key_terms: Option<Vec<TermsKey>> = after.map(|cursor| {
         sources
             .iter()
-            .map(|source| {
-                cursor
-                    .get(&source.name)
-                    .map(TermsKey::from_value)
-                    .unwrap_or_else(|| TermsKey::from_value(&Value::Null))
+            .zip(&views)
+            .map(|(source, view)| {
+                let Some(value) = cursor.get(&source.name) else {
+                    return TermsKey::from_value(&Value::Null);
+                };
+                match &source.kind {
+                    CompositeSourceKind::Terms { .. } => TermsKey::from_value(value),
+                    CompositeSourceKind::DateHistogram { format, .. } => {
+                        let parse_format = format
+                            .as_deref()
+                            .unwrap_or_else(|| view.date_format_or_default());
+                        let millis = match value {
+                            Value::Number(number) => number.as_i64(),
+                            _ => date_value_epoch_days(value, parse_format)
+                                .map(|days| days * MILLIS_PER_DAY),
+                        };
+                        millis.map_or_else(
+                            || TermsKey::from_value(value),
+                            |millis| TermsKey::number(millis as f64),
+                        )
+                    }
+                }
             })
             .collect()
     });
 
-    let filtered: Vec<(Vec<TermsKey>, Vec<Value>, u64)> = sorted
+    let buckets: Vec<AggBucket> = counts
         .into_iter()
-        .filter(|(key, _, _)| match &after_key_terms {
+        .filter(|(key, _)| match &after_key_terms {
             Some(cursor) => key.as_slice() > cursor.as_slice(),
             None => true,
         })
-        .collect();
-
-    let buckets: Vec<AggBucket> = filtered
-        .into_iter()
         .take(size)
-        .map(|(_, values, doc_count)| {
+        .map(|(_, (values, doc_count))| {
             let mut key_obj = serde_json::Map::new();
             for (source, value) in sources.iter().zip(values) {
                 key_obj.insert(source.name.clone(), value);
             }
             AggBucket {
-                key: Value::Object(key_obj),
                 key_as_string: None,
+                key: Value::Object(key_obj),
                 doc_count,
             }
         })
@@ -2464,39 +2665,273 @@ fn compute_composite_aggregation(
     // Clients such as matchID deces-backend page until `buckets` is
     // empty and re-send `after_key`; omitting it on the last non-empty
     // page makes them restart from page 1 forever.
-    let after_key = if !buckets.is_empty() {
-        buckets.last().and_then(|bucket| match &bucket.key {
-            Value::Object(map) => Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-            _ => None,
-        })
-    } else {
-        None
-    };
+    let after_key = buckets.last().and_then(|bucket| match &bucket.key {
+        Value::Object(map) => Some(map.clone()),
+        _ => None,
+    });
 
-    AggResult::Composite { buckets, after_key }
+    AggResult::Composite { after_key, buckets }
 }
 
-/// A12.1: dedup key for the `terms` aggregation. We cannot hash a
-/// `serde_json::Value` directly (NaN poisons `Number` equality), so we
-/// project to a stable byte-shape that round-trips through `BTreeMap`
-/// without losing JSON type fidelity.
+/// A12.1: dedup / order key for `terms`, `cardinality` and `composite`.
+/// We cannot hash a `serde_json::Value` directly (NaN poisons `Number`
+/// equality), so we project to a totally ordered shape. L2b: numbers
+/// compare numerically (ES sorts long / double keys by value; the former
+/// decimal-string key put `100` before `65`).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TermsKey {
     Bool(bool),
-    Number(String),
+    Number(OrderedNumber),
     String(String),
     Other(String),
 }
 
+/// A JSON number ordered by value (`f64::total_cmp`).
+#[derive(Clone, Copy, Debug)]
+struct OrderedNumber(f64);
+
+impl PartialEq for OrderedNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0).is_eq()
+    }
+}
+
+impl Eq for OrderedNumber {}
+
+impl PartialOrd for OrderedNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedNumber {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 impl TermsKey {
+    fn number(value: f64) -> Self {
+        TermsKey::Number(OrderedNumber(value))
+    }
+
     fn from_value(value: &Value) -> Self {
         match value {
             Value::Bool(b) => TermsKey::Bool(*b),
-            Value::Number(n) => TermsKey::Number(n.to_string()),
+            Value::Number(n) => match n.as_f64() {
+                Some(value) => TermsKey::number(value),
+                None => TermsKey::Other(n.to_string()),
+            },
             Value::String(s) => TermsKey::String(s.clone()),
             other => TermsKey::Other(other.to_string()),
         }
     }
+}
+
+/// L2b: largest `from + size` the sorted `match_all` walk serves; larger
+/// windows take the general path.
+const SORTED_TOP_MAX_WINDOW: usize = 1_000;
+
+/// L2b: the deces-backend `/version` shape — no `query` (or a root
+/// `match_all`), a sort made only of `keyword` fields (`[{SOURCE: desc},
+/// {"DATE_DECES.raw": desc}]`), a small window — served by walking each
+/// sort field's term dictionary in sort order and intersecting postings,
+/// instead of hydrating and sorting every document (29 M on matchID).
+///
+/// Same result as the general path and as ES: hits in sort order, ties on
+/// ascending internal id (Lucene doc id), a document without a value for a
+/// clause sorts after every document with one (`missing: _last`), sort
+/// values are the keyword terms (normalised by the field normalizer, `null`
+/// when missing), `_score` and `max_score` are `null` (field sort, no
+/// `track_scores`). Returns `None` (general path) for any other shape, or
+/// when fewer than `from + size` documents carry the first sort field.
+fn run_sorted_match_all_top(
+    state: &AppState,
+    indices: &[String],
+    request: &SearchRequest,
+    started_at: Instant,
+) -> Option<SearchResponse> {
+    if indices.len() != 1
+        || is_default_score_sort(&request.sort)
+        || request.highlight.is_some()
+        || request.min_score.is_some()
+    {
+        return None;
+    }
+    match request.query.as_ref() {
+        None | Some(SearchQuery::MatchAll { .. }) => {}
+        Some(_) => return None,
+    }
+    let index = &indices[0];
+    let mapping = state.index_mapping(index)?;
+    for clause in &request.sort {
+        if clause.field == "_score"
+            || mapping.resolve_field(&clause.field)?.field_type != FieldType::Keyword
+        {
+            return None;
+        }
+    }
+    let from = usize::try_from(request.from.unwrap_or(0)).ok()?;
+    let size = usize::try_from(request.size.unwrap_or(10)).ok()?;
+    let window = from.checked_add(size)?;
+    if window > SORTED_TOP_MAX_WINDOW {
+        return None;
+    }
+
+    let mut walk = SortedTermWalk {
+        state,
+        index,
+        clauses: &request.sort,
+        terms: Vec::with_capacity(request.sort.len()),
+        window,
+        prefix: Vec::with_capacity(request.sort.len()),
+        out: Vec::with_capacity(window),
+    };
+    for clause in &request.sort {
+        let mut terms = Vec::new();
+        state.documents_for_term_scan_internal(
+            index,
+            &clause.field,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            &mut |term| {
+                terms.push(term.to_owned());
+                Some(false)
+            },
+            None,
+        );
+        walk.terms.push(terms);
+    }
+    if window > 0 {
+        walk.descend(0, None)?;
+    }
+
+    let hits: Vec<Value> = walk
+        .out
+        .into_iter()
+        .skip(from)
+        .take(size)
+        .map(|(document, values)| {
+            let mut hit = build_hit(&document, request.source.as_ref(), None, None, None);
+            append_sort_values(&mut hit, values);
+            hit
+        })
+        .collect();
+    let total = state.document_count(index);
+    let total_summary = resolve_total_hits(total, request.track_total_hits.as_ref());
+    Some(build_search_response_with_total(
+        hits,
+        total_summary,
+        started_at.elapsed().as_millis() as u64,
+    ))
+}
+
+/// State of [`run_sorted_match_all_top`]'s depth-first term walk.
+struct SortedTermWalk<'a> {
+    state: &'a AppState,
+    index: &'a str,
+    clauses: &'a [SortClause],
+    /// Terms of each sort field, ascending bytes (FST order).
+    terms: Vec<Vec<String>>,
+    window: usize,
+    /// Sort values of the enclosing levels.
+    prefix: Vec<Value>,
+    out: Vec<(StoredDocument, Vec<Value>)>,
+}
+
+impl SortedTermWalk<'_> {
+    /// Emit, in sort order, the documents of `candidates` (every document
+    /// when `None`) at sort level `level`. `None` = decline.
+    fn descend(&mut self, level: usize, candidates: Option<&[u32]>) -> Option<()> {
+        let Some(mut rest) = candidates.filter(|_| level == self.clauses.len()) else {
+            return self.descend_terms(level, candidates);
+        };
+        // Leaf: every candidate shares the full sort key; ascending
+        // internal id breaks the tie. Deleted ids hydrate to nothing, so
+        // hydrate at most the missing count per round.
+        while !rest.is_empty() && self.out.len() < self.window {
+            let need = self.window - self.out.len();
+            let (batch, tail) = rest.split_at(need.min(rest.len()));
+            for (_, document) in self.state.documents_with_internal_ids(self.index, batch) {
+                self.out.push((document, self.prefix.clone()));
+            }
+            rest = tail;
+        }
+        Some(())
+    }
+
+    fn descend_terms(&mut self, level: usize, candidates: Option<&[u32]>) -> Option<()> {
+        let clause = &self.clauses[level];
+        let count = self.terms[level].len();
+        let mut with_value: Vec<u32> = Vec::new();
+        for step in 0..count {
+            let position = match clause.order {
+                SortOrder::Asc => step,
+                SortOrder::Desc => count - 1 - step,
+            };
+            let term = self.terms[level][position].clone();
+            let postings = self
+                .state
+                .documents_for_term_internal(self.index, &clause.field, &term);
+            let matched = match candidates {
+                None => postings,
+                Some(candidates) => intersect_sorted_ids(candidates, &postings),
+            };
+            if matched.is_empty() {
+                continue;
+            }
+            if candidates.is_some() {
+                with_value.extend_from_slice(&matched);
+            }
+            self.prefix.push(Value::String(term));
+            let result = self.descend(level + 1, Some(&matched));
+            self.prefix.pop();
+            result?;
+            if self.out.len() >= self.window {
+                return Some(());
+            }
+        }
+        // Documents without a value for this clause sort last. At the top
+        // level every live document carrying the field has been emitted
+        // (the walk is exhausted below the window): done when that is every
+        // live document, otherwise "live documents minus the term union" is
+        // not worth computing here — decline to the general path.
+        let Some(candidates) = candidates else {
+            let emitted = self.out.len() as u64;
+            return (emitted == self.state.document_count(self.index)).then_some(());
+        };
+        with_value.sort_unstable();
+        let missing: Vec<u32> = candidates
+            .iter()
+            .copied()
+            .filter(|id| with_value.binary_search(id).is_err())
+            .collect();
+        if missing.is_empty() {
+            return Some(());
+        }
+        self.prefix.push(Value::Null);
+        let result = self.descend(level + 1, Some(&missing));
+        self.prefix.pop();
+        result
+    }
+}
+
+/// Intersection of two ascending doc-id lists.
+fn intersect_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(left[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
 }
 
 fn run_topk_search(
@@ -2533,7 +2968,7 @@ fn run_topk_search(
             &indices[0],
             request,
             scoring_enabled,
-            1.0,
+            constant_match_all_score(query).unwrap_or(1.0),
             started_at,
         ));
     }
@@ -3034,10 +3469,9 @@ fn finalize_fused_topk(
 /// order and the cheap document-count for `total`. No clones outside
 /// the window, no full-corpus sort, no scoring loop.
 ///
-/// `scoring_enabled` is always `false` for `match_all` today
-/// (`is_scoring_query` returns false), so `_score` is intentionally
-/// omitted from the hit payload — matches OpenSearch behaviour for
-/// `match_all` with no rescoring wrapper.
+/// L2b: `run_search` passes `scoring_enabled = true` for `match_all` (and
+/// for a request without `query`): ES 8.6.1 reports the constant score
+/// (`boost`, 1.0 by default) as `_score` and `max_score`.
 fn run_topk_match_all(
     state: &AppState,
     index: &str,
@@ -3102,11 +3536,16 @@ fn run_topk_constant_match_all(
     if indices.len() != 1 || !is_default_score_sort(&request.sort) || request.highlight.is_some() {
         return None;
     }
-    let query = request.query.as_ref()?;
-    if !matches_every_document(query) {
-        return None;
-    }
-    let constant_score = constant_match_all_score(query)?;
+    // L2b: no `query` is ES `match_all` (score 1.0), served the same way.
+    let constant_score = match request.query.as_ref() {
+        None => 1.0,
+        Some(query) => {
+            if !matches_every_document(query) {
+                return None;
+            }
+            constant_match_all_score(query)?
+        }
+    };
     if scoring_enabled
         && request
             .min_score
@@ -4813,7 +5252,7 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
             sort: Vec::new(),
             highlight: None,
             min_score: None,
-            aggs: BTreeMap::new(),
+            aggs: Vec::new(),
         });
     }
 
@@ -4890,7 +5329,7 @@ pub fn parse_search_request(body: &str) -> Result<SearchRequest, OpenSearchError
 /// is honoured today — every other agg type returns a deterministic
 /// "phase 2" parse error so matchID's analytics tab sees a parseable
 /// 400 instead of a silent zero-bucket response.
-fn parse_aggs(value: &Value) -> Result<BTreeMap<String, AggSpec>, OpenSearchError> {
+fn parse_aggs(value: &Value) -> Result<Vec<(String, AggSpec)>, OpenSearchError> {
     let object = value.as_object().ok_or_else(|| {
         OpenSearchError::new(
             StatusCode::BAD_REQUEST,
@@ -4898,7 +5337,7 @@ fn parse_aggs(value: &Value) -> Result<BTreeMap<String, AggSpec>, OpenSearchErro
             "`aggs` must be an object",
         )
     })?;
-    let mut aggs = BTreeMap::new();
+    let mut aggs: Vec<(String, AggSpec)> = Vec::new();
     for (name, body) in object {
         if name.is_empty() {
             return Err(OpenSearchError::new(
@@ -4957,7 +5396,7 @@ fn parse_aggs(value: &Value) -> Result<BTreeMap<String, AggSpec>, OpenSearchErro
                 format!("agg `{name}` must declare an agg type"),
             )
         })?;
-        aggs.insert(name.clone(), spec);
+        aggs.push((name.clone(), spec));
     }
     Ok(aggs)
 }
@@ -8534,7 +8973,7 @@ fn sort_scored_documents(
     // value directly and never touches the normalizer.
     let normalizers: Vec<Option<ResolvedAnalyzer>> = clauses
         .iter()
-        .map(|clause| mapping.and_then(|m| m.subfield_normalizer(&clause.field)))
+        .map(|clause| mapping.and_then(|m| keyword_normalizer(m, &clause.field)))
         .collect();
 
     documents.sort_by(|left, right| {
@@ -8672,30 +9111,52 @@ fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
     }
 }
 
+/// L2b: one page of hits from the general path. With the default sort
+/// (`[]` or `[{"_score":"desc"}]`, which ES `SortBuilder.buildSort`
+/// collapses to "no sort") a hit carries its score when `scoring_enabled`;
+/// with a field sort ES reports `_score` only when a `_score` clause is
+/// part of the sort (`SearchPhaseController.getHits`,
+/// SearchPhaseController.java:384-392, 421-428) and every hit carries its
+/// `sort` values.
 fn paginate_hits(
     request: &SearchRequest,
     documents: &[ScoredDocument],
     scoring_enabled: bool,
+    sort_values: Option<&SortValueContext<'_>>,
 ) -> Vec<Value> {
     let from = usize::try_from(request.from.unwrap_or(0)).unwrap_or(usize::MAX);
     let size = usize::try_from(request.size.unwrap_or(10)).unwrap_or(usize::MAX);
+    let show_score = match sort_values {
+        None => scoring_enabled,
+        Some(_) => scoring_enabled && request.sort.iter().any(|c| c.field == "_score"),
+    };
 
     documents
         .iter()
         .skip(from)
         .take(size)
         .map(|scored| {
-            build_hit(
+            let mut hit = build_hit(
                 &scored.doc,
                 request.source.as_ref(),
-                scoring_enabled.then_some(scored.score),
+                show_score.then_some(scored.score),
                 request.highlight.as_ref(),
                 request.query.as_ref(),
-            )
+            );
+            if let Some(context) = sort_values {
+                append_sort_values(&mut hit, context.values(scored));
+            }
+            hit
         })
         .collect()
 }
 
+/// L2b: one ES 8.6.1 hit. `SearchHit.toInnerXContent`
+/// (SearchHit.java:636-723) writes `_index`, `_id`, then `_score` ALWAYS
+/// (`null` when the score is not tracked, l.664-668), the metadata fields,
+/// `_source`, `fields`, `highlight` and last the `sort` values (l.716,
+/// [`append_sort_values`]). The workspace enables serde_json
+/// `preserve_order`, so the insertion order below is the byte order.
 fn build_hit(
     document: &StoredDocument,
     filter: Option<&SourceFilter>,
@@ -8703,14 +9164,10 @@ fn build_hit(
     highlight: Option<&HighlightRequest>,
     query: Option<&SearchQuery>,
 ) -> Value {
-    let mut hit = json!({
-        "_index": document.index,
-        "_id": document.id,
-    });
-    let object = hit.as_object_mut().expect("hit object");
-    if let Some(score) = score {
-        object.insert("_score".to_owned(), json!(score));
-    }
+    let mut object = serde_json::Map::with_capacity(5);
+    object.insert("_index".to_owned(), Value::String(document.index.clone()));
+    object.insert("_id".to_owned(), Value::String(document.id.clone()));
+    object.insert("_score".to_owned(), score.map_or(Value::Null, Value::from));
     if let Some(source) = apply_source_filter(&document.source, filter) {
         object.insert("_source".to_owned(), source);
     }
@@ -8719,7 +9176,118 @@ fn build_hit(
     {
         object.insert("highlight".to_owned(), highlight);
     }
-    hit
+    Value::Object(object)
+}
+
+/// L2b: append a hit's `sort` array, after every other key
+/// (`SearchSortValues.toXContent` is called after `highlight`,
+/// SearchHit.java:716).
+fn append_sort_values(hit: &mut Value, values: Vec<Value>) {
+    if let Some(object) = hit.as_object_mut() {
+        object.insert("sort".to_owned(), Value::Array(values));
+    }
+}
+
+/// L2b: per-request resolution of the ES `sort` values of a hit
+/// (`SearchSortValues`: the raw sort value of each clause, formatted by
+/// the field's `DocValueFormat.formatSortValue`).
+///
+/// - `_score`: the score (a Java `float`).
+/// - `keyword`: the doc-values term (normalised), or `null` when missing.
+/// - numeric (`integer`, `long`, `short`, `byte`) and `date`: a `long`
+///   (epoch millis for a date). A missing value is the `_last` sentinel of
+///   the clause: `Long.MAX_VALUE` ascending, `Long.MIN_VALUE` descending
+///   (`LongValuesComparatorSource` missing value).
+/// - `float` / `double`: the number; a missing one is `"Infinity"` /
+///   `"-Infinity"` (Jackson writes non-finite doubles as strings).
+/// - multi-valued fields: the minimum ascending, the maximum descending
+///   (ES default `sort.mode`).
+struct SortValueContext<'a> {
+    clauses: &'a [SortClause],
+    views: Vec<FieldValueView<'a>>,
+}
+
+impl<'a> SortValueContext<'a> {
+    fn new(
+        clauses: &'a [SortClause],
+        mapping: Option<&IndexMapping>,
+        projections: &'a SubfieldProjections,
+    ) -> Self {
+        let views = clauses
+            .iter()
+            .map(|clause| FieldValueView::new(&clause.field, mapping, projections))
+            .collect();
+        Self { clauses, views }
+    }
+
+    fn values(&self, scored: &ScoredDocument) -> Vec<Value> {
+        self.clauses
+            .iter()
+            .zip(&self.views)
+            .map(|(clause, view)| {
+                if clause.field == "_score" {
+                    return Value::from(scored.score);
+                }
+                let picked =
+                    view.value(scored).and_then(|value| match value {
+                        Value::Array(items) => items
+                            .into_iter()
+                            .filter(|item| !item.is_null())
+                            .reduce(|best, item| {
+                                let ordering = compare_values(&item, &best);
+                                let better = match clause.order {
+                                    SortOrder::Asc => ordering.is_lt(),
+                                    SortOrder::Desc => ordering.is_gt(),
+                                };
+                                if better {
+                                    item
+                                } else {
+                                    best
+                                }
+                            }),
+                        Value::Null => None,
+                        other => Some(other),
+                    });
+                sort_value_for_type(picked, view, clause.order)
+            })
+            .collect()
+    }
+}
+
+fn sort_value_for_type(value: Option<Value>, view: &FieldValueView<'_>, order: SortOrder) -> Value {
+    let long_missing = || match order {
+        SortOrder::Asc => Value::from(i64::MAX),
+        SortOrder::Desc => Value::from(i64::MIN),
+    };
+    match view.field_type {
+        Some(FieldType::Integer | FieldType::Long | FieldType::Short | FieldType::Byte) => value
+            .and_then(|v| match v {
+                Value::Number(n) => n.as_i64().map(Value::from),
+                Value::String(s) => s.trim().parse::<i64>().ok().map(Value::from),
+                _ => None,
+            })
+            .unwrap_or_else(long_missing),
+        Some(FieldType::Date) => value
+            .and_then(|v| date_value_epoch_days(&v, view.date_format_or_default()))
+            .map(|days| Value::from(days * MILLIS_PER_DAY))
+            .unwrap_or_else(long_missing),
+        Some(FieldType::Float | FieldType::Double) => value
+            .and_then(|v| match v {
+                Value::Number(n) => n.as_f64().map(Value::from),
+                Value::String(s) => s.trim().parse::<f64>().ok().map(Value::from),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                Value::String(
+                    match order {
+                        SortOrder::Asc => "Infinity",
+                        SortOrder::Desc => "-Infinity",
+                    }
+                    .to_owned(),
+                )
+            }),
+        _ => value.unwrap_or(Value::Null),
+    }
 }
 
 fn build_highlight(

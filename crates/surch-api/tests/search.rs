@@ -47,6 +47,7 @@ async fn search_router_match_all_returns_document_indexed_by_doc_api() {
     assert_eq!(search_response.status(), StatusCode::OK);
 
     let search_body = response_json(search_response).await;
+    // L2b: ES 8.6.1 scores `match_all` with its boost (1.0).
     assert_eq!(
         search_body["hits"]["hits"]
             .as_array()
@@ -54,6 +55,7 @@ async fn search_router_match_all_returns_document_indexed_by_doc_api() {
         &[serde_json::json!({
             "_index": "products",
             "_id": "sku-1",
+            "_score": 1.0,
             "_source": {"name": "desk"},
         })]
     );
@@ -109,6 +111,9 @@ async fn search_router_term_returns_exact_text_match_indexed_by_doc_api() {
 
     let search_body = response_json(search_response).await;
     assert_eq!(search_body["hits"]["total"]["value"], 1);
+    // L2b: `_score` is always written (SearchHit.java:664-668). Surch does
+    // not score a root `term` query yet (ES: BM25), so it is `null` here —
+    // a known L7 residual, not the ES value.
     assert_eq!(
         search_body["hits"]["hits"]
             .as_array()
@@ -116,6 +121,7 @@ async fn search_router_term_returns_exact_text_match_indexed_by_doc_api() {
         &[serde_json::json!({
             "_index": "products",
             "_id": "sku-1",
+            "_score": null,
             "_source": {"name": "desk"},
         })]
     );
@@ -507,9 +513,11 @@ async fn search_router_omits_source_when_disabled() {
         body["hits"]["hits"]
             .as_array()
             .expect("hits should be an array"),
+        // L2b: ES 8.6.1 scores `match_all` with its boost (1.0).
         &[serde_json::json!({
             "_index": "products",
             "_id": "sku-1",
+            "_score": 1.0,
         })]
     );
 }
@@ -2368,18 +2376,28 @@ async fn bool_must_mixed_term_and_range_uses_index_analyzer_for_keyword_fields()
 }
 
 #[tokio::test]
-async fn match_all_query_keeps_max_score_null_and_omits_score_field() {
+async fn match_all_query_scores_its_boost_like_es() {
+    // L2b: ES 8.6.1 `MatchAllDocsQuery` scores every hit with its boost
+    // (1.0 by default): `_score` and `max_score` are 1.0, not null.
     let router = app_router();
     index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
     index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
 
     let body = search_with_body(&router, r#"{"query":{"match_all":{}},"_source":false}"#).await;
 
-    assert!(body["hits"]["max_score"].is_null());
+    assert_eq!(body["hits"]["max_score"], 1.0);
     let hits = body["hits"]["hits"].as_array().expect("hits");
     for hit in hits {
-        assert!(hit.get("_score").is_none());
+        assert_eq!(hit["_score"], 1.0);
     }
+
+    let boosted = search_with_body(
+        &router,
+        r#"{"query":{"match_all":{"boost":2.5}},"_source":false}"#,
+    )
+    .await;
+    assert_eq!(boosted["hits"]["max_score"], 2.5);
+    assert_eq!(boosted["hits"]["hits"][0]["_score"], 2.5);
 }
 
 #[tokio::test]
@@ -2451,9 +2469,12 @@ async fn match_query_respects_norms_disabled_for_text_fields() {
     )
     .await;
 
+    // L2b: a field sort makes ES report `_score: null` (no `_score` sort
+    // clause, no `track_scores`), so the scores are read from the default
+    // score-sorted response.
     let body = search_with_body(
         &router,
-        r#"{"query":{"match":{"body":"rust"}},"sort":[{"_id":"asc"}],"_source":false}"#,
+        r#"{"query":{"match":{"body":"rust"}},"_source":false}"#,
     )
     .await;
 
@@ -3315,16 +3336,17 @@ async fn search_router_a11_min_score_zero_keeps_every_scored_hit() {
 }
 
 #[tokio::test]
-async fn search_router_a11_min_score_is_ignored_on_unscored_queries() {
-    // match_all returns _score = null (no BM25), so `min_score` must
-    // not silently drop everything — the filter only applies when
-    // scoring is enabled.
+async fn search_router_a11_min_score_applies_to_the_match_all_constant() {
+    // L2b: ES 8.6.1 scores `match_all` 1.0 (its boost), and
+    // `MinimumScoreCollector` drops every hit below `min_score`.
     let router = app_router();
     index_product(&router, "sku-1", r#"{"name":"desk"}"#).await;
     index_product(&router, "sku-2", r#"{"name":"chair"}"#).await;
 
     let body = search_with_body(&router, r#"{"query":{"match_all":{}},"min_score":1000.0}"#).await;
+    assert_eq!(body["hits"]["total"]["value"], 0);
 
+    let body = search_with_body(&router, r#"{"query":{"match_all":{}},"min_score":1.0}"#).await;
     assert_eq!(body["hits"]["total"]["value"], 2);
 }
 
@@ -4345,8 +4367,23 @@ async fn search_router_a12_accepts_aggregations_long_form_alias() {
 // `YYYYMMDD` keyword-stored birth/death dates. Each test below pins
 // one calendar_interval against a small in-memory corpus and asserts
 // that bucket keys are emitted ascending with the expected
-// truncation. `key_as_string` is verified to round-trip when `format`
-// is provided.
+// truncation.
+//
+// L2b (es-source-derived, InternalDateHistogram.java:119-134): `key` is
+// the bucket start in epoch milliseconds (UTC), `key_as_string` that
+// instant printed with the request `format` (else the field format;
+// these auto-mapped keyword fields keep Surch's legacy `yyyyMMdd`
+// reading).
+
+/// Epoch milliseconds of `y-m-d` at 00:00 UTC.
+fn epoch_millis(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) * 86_400_000
+}
 
 #[tokio::test]
 async fn search_router_a12_2_date_histogram_month_buckets_documents() {
@@ -4368,10 +4405,10 @@ async fn search_router_a12_2_date_histogram_month_buckets_documents() {
         .expect("buckets array");
     assert_eq!(buckets.len(), 2, "two distinct months");
     // Ascending key order, parity with ES.
-    assert_eq!(buckets[0]["key"], "19620101");
+    assert_eq!(buckets[0]["key"], epoch_millis(1962, 1, 1));
     assert_eq!(buckets[0]["key_as_string"], "19620101");
     assert_eq!(buckets[0]["doc_count"], 2);
-    assert_eq!(buckets[1]["key"], "19620201");
+    assert_eq!(buckets[1]["key"], epoch_millis(1962, 2, 1));
     assert_eq!(buckets[1]["key_as_string"], "19620201");
     assert_eq!(buckets[1]["doc_count"], 3);
 }
@@ -4394,13 +4431,14 @@ async fn search_router_a12_2_date_histogram_day_emits_one_bucket_per_day() {
         .as_array()
         .expect("buckets array");
     assert_eq!(buckets.len(), 3);
-    assert_eq!(buckets[0]["key"], "19620115");
+    assert_eq!(buckets[0]["key"], epoch_millis(1962, 1, 15));
     assert_eq!(buckets[0]["doc_count"], 2);
-    // No `format` declared → no `key_as_string` field in the bucket.
-    assert!(buckets[0].get("key_as_string").is_none());
-    assert_eq!(buckets[1]["key"], "19620116");
+    // No request `format`: `key_as_string` uses the field format (a date
+    // field never has the RAW format, so the key is always printed).
+    assert_eq!(buckets[0]["key_as_string"], "19620115");
+    assert_eq!(buckets[1]["key"], epoch_millis(1962, 1, 16));
     assert_eq!(buckets[1]["doc_count"], 1);
-    assert_eq!(buckets[2]["key"], "19620117");
+    assert_eq!(buckets[2]["key"], epoch_millis(1962, 1, 17));
     assert_eq!(buckets[2]["doc_count"], 1);
 }
 
@@ -4423,11 +4461,11 @@ async fn search_router_a12_2_date_histogram_year_groups_across_months() {
         .as_array()
         .expect("buckets array");
     assert_eq!(buckets.len(), 3);
-    assert_eq!(buckets[0]["key"], "19620101");
+    assert_eq!(buckets[0]["key"], epoch_millis(1962, 1, 1));
     assert_eq!(buckets[0]["doc_count"], 2);
-    assert_eq!(buckets[1]["key"], "19630101");
+    assert_eq!(buckets[1]["key"], epoch_millis(1963, 1, 1));
     assert_eq!(buckets[1]["doc_count"], 1);
-    assert_eq!(buckets[2]["key"], "19640101");
+    assert_eq!(buckets[2]["key"], epoch_millis(1964, 1, 1));
     assert_eq!(buckets[2]["doc_count"], 2);
 }
 
@@ -4789,10 +4827,13 @@ async fn search_router_a12_4_phase2_composite_mixed_sources_caps_at_size_and_emi
         .as_array()
         .expect("buckets array");
     assert_eq!(buckets.len(), 2, "size=2 must cap the bucket list");
+    // L2b (es-source-derived, InternalComposite.formatObject with the RAW
+    // format): without a source `format` the date key is the epoch-millis
+    // long of the bucket start.
     assert_eq!(buckets[0]["key"]["lastName"], "DUPONT");
-    assert_eq!(buckets[0]["key"]["birthDate"], "19500701");
+    assert_eq!(buckets[0]["key"]["birthDate"], epoch_millis(1950, 7, 1));
     assert_eq!(buckets[1]["key"]["lastName"], "MARTIN");
-    assert_eq!(buckets[1]["key"]["birthDate"], "19620101");
+    assert_eq!(buckets[1]["key"]["birthDate"], epoch_millis(1962, 1, 1));
     // `after_key` echoes the last emitted bucket's (already-truncated)
     // composite key so the caller can replay it as `composite.after`.
     assert_eq!(
@@ -4801,7 +4842,7 @@ async fn search_router_a12_4_phase2_composite_mixed_sources_caps_at_size_and_emi
     );
     assert_eq!(
         body["aggregations"]["by_pair"]["after_key"]["birthDate"],
-        "19620101"
+        epoch_millis(1962, 1, 1)
     );
 }
 
@@ -4854,7 +4895,7 @@ async fn search_router_a12_4_phase2_composite_mixed_sources_round_trips_after_cu
         .expect("buckets array");
     assert_eq!(buckets.len(), 1);
     assert_eq!(buckets[0]["key"]["lastName"], "MARTIN");
-    assert_eq!(buckets[0]["key"]["birthDate"], "19620201");
+    assert_eq!(buckets[0]["key"]["birthDate"], epoch_millis(1962, 2, 1));
     assert_eq!(buckets[0]["doc_count"], 1);
     // Last non-empty page still carries `after_key` (Elasticsearch semantics).
     assert_eq!(

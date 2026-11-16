@@ -7705,6 +7705,10 @@ fn create_index_if_missing(
     merge_mapping_fields(&mut mapping, &explicit_mapping);
     let mut settings = defaults.settings;
     merge_settings(&mut settings, &explicit_settings);
+    // MVP L2b: ES stamps `index.creation_date` (epoch millis) when an
+    // index is created; `_cat/indices?h=creation.date.string` reads it.
+    // Kept in the settings object, which META persists verbatim (L6).
+    crate::index::stamp_creation_date(&mut settings);
     let mut aliases = defaults.aliases;
     aliases.extend(explicit_aliases);
     store

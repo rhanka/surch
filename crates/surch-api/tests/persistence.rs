@@ -452,8 +452,43 @@ async fn unset_data_dir_keeps_in_memory_engine_identical() {
     });
     load(&router, &app).await;
     let memory = record(&router, &calls).await;
-    assert_same("in-memory vs persisted", &calls, &memory, &persisted);
+    // L2b: the two engines created their indices at different instants, so
+    // `index.creation_date` (wall clock, like `took`) is the one value
+    // allowed to differ between these two runs. Reopening the SAME data
+    // directory (the other tests) still compares it byte for byte.
+    let mask = |runs: Vec<(u16, Vec<u8>)>| -> Vec<(u16, Vec<u8>)> {
+        runs.into_iter()
+            .map(|(status, body)| (status, mask_creation_date(&body)))
+            .collect()
+    };
+    assert_same(
+        "in-memory vs persisted",
+        &calls,
+        &mask(memory),
+        &mask(persisted),
+    );
     assert!(app.data_dir().is_none());
+}
+
+/// Replace every `"creation_date":"<digits>"` value by `"0"`.
+fn mask_creation_date(bytes: &[u8]) -> Vec<u8> {
+    const KEY: &[u8] = b"\"creation_date\":\"";
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(KEY) {
+            out.extend_from_slice(KEY);
+            i += KEY.len();
+            out.push(b'0');
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn index_dir(root: &Path, name: &str) -> PathBuf {

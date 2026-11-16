@@ -16,6 +16,50 @@ const INDEX_NAME_FORBIDDEN_CHARACTERS: [char; 14] = [
     ':', '"', '*', '+', '/', '\\', '|', '?', '#', '>', '<', ',', ' ', '\t',
 ];
 
+/// MVP L2b: settings key holding the index creation date, as ES 8.6.1
+/// `IndexMetadata.SETTING_CREATION_DATE` (`index.creation_date`, epoch
+/// millis serialized as a string). Surch stores index settings without
+/// the `index.` prefix and `GET /:index` wraps them under `index`.
+pub(crate) const CREATION_DATE_SETTING: &str = "creation_date";
+
+/// MVP L2b: stamp the creation date (now, epoch millis) into the settings
+/// of an index being created, unless the settings already carry one (a
+/// restored or migrated index keeps its original date, as ES restore
+/// does).
+pub(crate) fn stamp_creation_date(settings: &mut Value) {
+    if creation_date_millis(settings).is_some() {
+        return;
+    }
+    if !settings.is_object() {
+        *settings = Value::Object(Map::new());
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+    let target = match settings.get_mut("index") {
+        Some(Value::Object(index)) => index,
+        _ => settings.as_object_mut().expect("settings is an object"),
+    };
+    target.insert(
+        CREATION_DATE_SETTING.to_owned(),
+        Value::String(millis.to_string()),
+    );
+}
+
+/// MVP L2b: the index creation date (epoch millis) recorded in `settings`
+/// (`creation_date` or `index.creation_date`, string or number).
+pub(crate) fn creation_date_millis(settings: &Value) -> Option<i64> {
+    let value = settings
+        .get(CREATION_DATE_SETTING)
+        .or_else(|| settings.get("index")?.get(CREATION_DATE_SETTING))?;
+    match value {
+        Value::String(text) => text.trim().parse().ok(),
+        Value::Number(number) => number.as_i64(),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CreateIndexResponse {
     pub acknowledged: bool,

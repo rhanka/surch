@@ -194,6 +194,10 @@ fn record_to_source(record: &BanRecord) -> Value {
             "lon": record.longitude,
         }),
     );
+    // The committed fixtures were generated with sorted keys; serde_json
+    // `preserve_order` (workspace, MVP L2b) keeps insertion order, so sort
+    // explicitly to keep the generated bulk byte-identical.
+    source.sort_keys();
     Value::Object(source)
 }
 
