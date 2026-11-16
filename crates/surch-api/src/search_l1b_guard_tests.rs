@@ -100,6 +100,11 @@ fn corpus(total: usize) -> Vec<(String, Value)> {
             let (commune_d, insee_d, dep_d, lat_d, lon_d) = COMMUNES[rng.below(COMMUNES.len())];
             let jitter = |rng: &mut Rng| (rng.below(2000) as f64 - 1000.0) / 100_000.0;
             let uid = format!("uid{n:05}");
+            // Same RNG draw order as before: birth lat, birth lon, death lat, death lon.
+            let (gn_lat, gn_lon) = (lat_n + jitter(&mut rng), lon_n + jitter(&mut rng));
+            let (gd_lat, gd_lon) = (lat_d + jitter(&mut rng), lon_d + jitter(&mut rng));
+            // matchID dataprep writes geopoint_2d as WKT `POINT (lon lat)`.
+            let geopoint_deces = format!("POINT ({gd_lon} {gd_lat})");
             let source = json!({
                 "UID": uid,
                 "SOURCE": format!("deces-{}-m{:02}", birth_year + age, 1 + n % 12),
@@ -118,9 +123,10 @@ fn corpus(total: usize) -> Vec<(String, Value)> {
                 "CODE_INSEE_NAISSANCE_HISTORIQUE": [insee_n, format!("{dep_n}999")],
                 "DEPARTEMENT_NAISSANCE": dep_n,
                 "PAYS_NAISSANCE": "France",
-                // Both accepted source shapes of a geo_point.
-                "GEOPOINT_NAISSANCE": {"lat": lat_n + jitter(&mut rng), "lon": lon_n + jitter(&mut rng)},
-                "GEOPOINT_DECES": format!("{},{}", lat_d + jitter(&mut rng), lon_d + jitter(&mut rng)),
+                // Object shape on one field, and on the other the WKT
+                // `POINT (lon lat)` string matchID dataprep really writes.
+                "GEOPOINT_NAISSANCE": {"lat": gn_lat, "lon": gn_lon},
+                "GEOPOINT_DECES": geopoint_deces,
                 "DATE_DECES": death,
                 "DATE_DECES_NORM": death,
                 "AGE_DECES": age,

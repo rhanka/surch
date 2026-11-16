@@ -6837,10 +6837,45 @@ fn geo_distance_unit_meters(unit: &str) -> Option<f64> {
 /// matchID intake):
 /// - `{ "lat": <number>, "lon": <number> }` — matchID's canonical wire shape,
 /// - `"<lat>,<lon>"` (string, ES compat),
-/// - `[<lon>, <lat>]` (GeoJSON array, ES compat).
+/// - `[<lon>, <lat>]` (GeoJSON array, ES compat),
+/// - `"POINT (<lon> <lat>)"` (WKT, ES compat; matchID dataprep form).
 ///
 /// Returns a static-friendly `&'static str` reason on parse failure so
 /// callers can wrap it in their own `OpenSearchError` context.
+/// Parses a WKT `POINT (lon lat [z])` string (keyword case-insensitive,
+/// free whitespace). `Ok(None)` when the text is not WKT, so the caller
+/// falls through to the `"lat,lon"` form; `Err` when it is WKT but
+/// malformed. Returns `(lat, lon)`.
+fn parse_wkt_point(text: &str) -> Result<Option<(f64, f64)>, String> {
+    let trimmed = text.trim();
+    let Some(head) = trimmed.get(..5) else {
+        return Ok(None);
+    };
+    if !head.eq_ignore_ascii_case("POINT") {
+        return Ok(None);
+    }
+    let rest = trimmed[5..].trim_start();
+    let inner = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .ok_or_else(|| "WKT form must be `POINT (<lon> <lat>)`".to_owned())?;
+    let coords: Vec<&str> = inner.split_whitespace().collect();
+    if !(2..=3).contains(&coords.len()) {
+        return Err("WKT POINT must carry `<lon> <lat>` (optional z)".to_owned());
+    }
+    let lon: f64 = coords[0]
+        .parse()
+        .map_err(|_| format!("WKT `lon` part `{}` is not numeric", coords[0]))?;
+    let lat: f64 = coords[1]
+        .parse()
+        .map_err(|_| format!("WKT `lat` part `{}` is not numeric", coords[1]))?;
+    if let Some(z) = coords.get(2) {
+        z.parse::<f64>()
+            .map_err(|_| format!("WKT `z` part `{z}` is not numeric"))?;
+    }
+    Ok(Some((lat, lon)))
+}
+
 pub fn parse_geo_point_source(value: &Value) -> Result<(f64, f64), String> {
     let finite_coord = |label: &str, raw: f64| -> Result<f64, String> {
         if !raw.is_finite() {
@@ -6865,9 +6900,22 @@ pub fn parse_geo_point_source(value: &Value) -> Result<(f64, f64), String> {
             Ok((lat, lon))
         }
         Value::String(text) => {
+            // WKT `POINT (lon lat)` (ES geo_point WKT form). matchID's
+            // dataprep emits exactly this for GEOPOINT_NAISSANCE / _DECES
+            // (deces_dataprep.yml geopoint_2d; deces-backend result.ts parses
+            // `^POINT\s*\((lon)\s+(lat)\)\s*$`). A third (z) ordinate is
+            // ignored like ES's default `ignore_z_value: true`.
+            if let Some((lat, lon)) = parse_wkt_point(text)? {
+                let lat = finite_coord("`lat`", lat)?;
+                let lon = finite_coord("`lon`", lon)?;
+                validate_geo_point_bounds(lat, lon)?;
+                return Ok((lat, lon));
+            }
             let parts: Vec<&str> = text.split(',').collect();
             if parts.len() != 2 {
-                return Err("string form must be `\"<lat>,<lon>\"`".to_owned());
+                return Err(
+                    "string form must be `\"<lat>,<lon>\"` or WKT `POINT (<lon> <lat>)`".to_owned(),
+                );
             }
             let lat: f64 = parts[0]
                 .trim()

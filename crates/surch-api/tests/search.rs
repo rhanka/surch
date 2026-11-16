@@ -5015,6 +5015,50 @@ async fn search_router_a2_geo_distance_accepts_lat_lon_string_shape() {
 }
 
 #[tokio::test]
+async fn search_router_a2_geo_distance_accepts_wkt_point_shape() {
+    // WKT `POINT (lon lat)` — the exact form matchID dataprep writes into
+    // GEOPOINT_NAISSANCE / GEOPOINT_DECES (geopoint_2d). Longitude FIRST.
+    let router =
+        seed_geo_point_corpus(|lat, lon| serde_json::json!(format!("POINT ({lon} {lat})"))).await;
+
+    for query in [
+        r#"{"query":{"geo_distance":{"distance":"50km","GEOPOINT_NAISSANCE":{"lat":48.85,"lon":2.35}}}}"#,
+        r#"{"query":{"bool":{"must":[{"match_all":{}}],"filter":{"geo_distance":{"distance":"50km","GEOPOINT_NAISSANCE":"48.85,2.35"}}}}}"#,
+        r#"{"query":{"geo_bounding_box":{"GEOPOINT_NAISSANCE":{"top_left":{"lat":49.0,"lon":2.0},"bottom_right":{"lat":48.0,"lon":3.0}}}}}"#,
+    ] {
+        let body = search_with_body(&router, query).await;
+        assert_eq!(body["hits"]["total"]["value"], 1, "query: {query}");
+        assert_eq!(hit_ids(&body), vec!["paris".to_string()]);
+        // `_source` is returned verbatim (deces-backend result.ts parses it).
+        assert_eq!(
+            body["hits"]["hits"][0]["_source"]["GEOPOINT_NAISSANCE"],
+            "POINT (2.35 48.85)"
+        );
+    }
+}
+
+#[test]
+fn geo_point_source_parses_wkt_variants() {
+    use serde_json::json;
+    use surch_api::search::parse_geo_point_source;
+    assert_eq!(
+        parse_geo_point_source(&json!("POINT (2.35 48.85)")),
+        Ok((48.85, 2.35))
+    );
+    assert_eq!(
+        parse_geo_point_source(&json!("point(2.35   48.85)")),
+        Ok((48.85, 2.35))
+    );
+    assert_eq!(
+        parse_geo_point_source(&json!("  POINT ( -1.5 47.2 12 ) ")),
+        Ok((47.2, -1.5))
+    );
+    assert!(parse_geo_point_source(&json!("POINT (2.35)")).is_err());
+    assert!(parse_geo_point_source(&json!("POINT 2.35 48.85")).is_err());
+    assert!(parse_geo_point_source(&json!("POINT (200 48.85)")).is_err());
+}
+
+#[tokio::test]
 async fn search_router_a2_geo_distance_accepts_geojson_lon_lat_array_shape() {
     // GeoJSON array `[lon, lat]` — longitude FIRST. ES compat.
     let router = seed_geo_point_corpus(|lat, lon| serde_json::json!([lon, lat])).await;

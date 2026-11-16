@@ -40,6 +40,22 @@ estimated by matchid (unverified until k8s measures allocatable):
   under the same caps, real deces-backend query shapes.
 - [ ] Restore time from S3 and artefact size measured at 29.3 M.
 
+Owner decisions relayed by matchid (2026-11-16):
+
+- Parity is judged on deces-backend outputs, not on raw engine responses:
+  same hit selection under `min_score: 5`, same top-k order, same totals,
+  and every score that reaches the backend output (`maxScoreES` raw,
+  `scores.es` rounded in steps, score.ts). `maxScoreES` raw keeps the
+  exact-parity bar unless the owner masks it (matchID decision D18). L7
+  therefore still targets bit-exact `_score` / `max_score`.
+- Bench targets both OVH b3-8 (2 vCPU / 8 GB) and d2-8 (4 shared vCPU /
+  8 GB); the OVH migration waits on that result.
+- The Node backend is inside the envelope: "half the memory and load"
+  applies to the whole matchID stack, not only the engine.
+- GEOPOINT_NAISSANCE / GEOPOINT_DECES are WKT strings `POINT (lon lat)`
+  (dataprep `geopoint_2d`); Surch must index, query and return them
+  verbatim.
+
 ## Interface decision
 
 - [ ] Owner ratifies option (a): Surch exposes the ES-compatible subset used
