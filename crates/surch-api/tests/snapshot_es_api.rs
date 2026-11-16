@@ -485,8 +485,11 @@ async fn snapshot_restore_over_existing_index_returns_snapshot_exception() {
         json!({ "indices": "source" }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["type"], json!("snapshot_exception"));
+    // L6.2: ES 8.6.1 `RestoreService` raises a `SnapshotRestoreException`
+    // (no REST status of its own -> 500), `[repo:snap/uuid] cannot restore
+    // index [x] because an open index with same name already exists ...`.
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["type"], json!("snapshot_restore_exception"));
     let reason = body["error"]["reason"].as_str().unwrap_or_default();
     assert!(
         reason.contains("cannot restore index [source]") && reason.contains("already exists"),

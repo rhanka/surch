@@ -99,22 +99,73 @@ async fn cluster_health_index_endpoint_returns_indices_breakdown() {
     assert_eq!(body["indices"]["products"]["active_primary_shards"], 1);
 }
 
+/// L6.2: ES 8.6.1 `TransportClusterHealthAction` treats a missing index as
+/// RED; the wait can never be satisfied, so the call answers after
+/// `timeout` with `timed_out: true` and HTTP 408
+/// (`ClusterHealthResponse.status()`).
 #[tokio::test]
-async fn cluster_health_returns_404_for_missing_index() {
+async fn cluster_health_times_out_red_408_for_missing_index() {
     let response = app_router()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/_cluster/health/missing")
+                .uri("/_cluster/health/missing?wait_for_status=green&timeout=0s")
                 .body(Body::empty())
                 .expect("request should build"),
         )
         .await
         .expect("router should respond");
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        response_json(response).await["error"]["type"],
-        "index_not_found_exception"
-    );
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "red");
+    assert_eq!(body["timed_out"], true);
+}
+
+#[tokio::test]
+async fn cluster_health_waits_for_an_index_created_during_the_wait() {
+    let router = app_router();
+    let waiter = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/_cluster/health/late?wait_for_status=green&timeout=10s")
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("router should respond")
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    create_index(&router, "late").await;
+    let response = waiter.await.expect("waiter joins");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "green");
+    assert_eq!(body["timed_out"], false);
+    assert_eq!(body["indices"]["late"]["status"], "green");
+}
+
+#[tokio::test]
+async fn cluster_health_rejects_unknown_status_and_bad_timeout() {
+    for uri in [
+        "/_cluster/health?wait_for_status=blue",
+        "/_cluster/health?timeout=10",
+    ] {
+        let response = app_router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
 }

@@ -7,7 +7,12 @@
 //! rather than via `serde` flattening, so the surface contract is
 //! readable in one place and trivially diffable against the upstream
 //! reference.
+//!
+//! Snapshot take, delete and restore move whole index directories (GiB at
+//! the matchID scale): they run on the blocking pool, never on an async
+//! worker.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -19,9 +24,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::repository::{FsRepository, S3Repository, S3RepositoryConfig};
+use super::repository::{
+    echo_settings, parse_byte_size, setting_bool, FsRepository, S3Repository, S3RepositoryConfig,
+};
 use super::service::{
-    self, RegisteredRepository, SnapshotRepositoryRegistry, SnapshotServiceError,
+    self, flatten_index_settings, normalize_index_key, RegisteredRepository, RestoreOptions,
+    SnapshotRepositoryRegistry, SnapshotServiceError,
 };
 use crate::{state::AppState, OpenSearchError};
 
@@ -43,11 +51,29 @@ pub struct CreateSnapshotRequest {
     pub include_global_state: bool,
 }
 
-/// Body of `POST /_snapshot/{repository}/{snapshot}/_restore`.
+/// Body of `POST /_snapshot/{repository}/{snapshot}/_restore` (ES
+/// `RestoreSnapshotRequest.source`). Booleans are accepted as JSON
+/// booleans or `"true"` / `"false"` strings, as ES does.
 #[derive(Debug, Default, Deserialize)]
 pub struct RestoreRequest {
     #[serde(default)]
     pub indices: Option<Value>,
+    #[serde(default)]
+    pub ignore_unavailable: Option<Value>,
+    #[serde(default)]
+    pub include_global_state: Option<Value>,
+    #[serde(default)]
+    pub include_aliases: Option<Value>,
+    #[serde(default)]
+    pub partial: Option<Value>,
+    #[serde(default)]
+    pub rename_pattern: Option<String>,
+    #[serde(default)]
+    pub rename_replacement: Option<String>,
+    #[serde(default)]
+    pub index_settings: Option<Value>,
+    #[serde(default)]
+    pub ignore_index_settings: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -92,6 +118,28 @@ fn from_service_error(error: SnapshotServiceError) -> axum::response::Response {
             "index_not_found_exception",
             format!("index [{name}] missing"),
         ),
+        NoSuchIndex { ref name } => err(
+            StatusCode::NOT_FOUND,
+            "index_not_found_exception",
+            format!("no such index [{name}]"),
+        ),
+        // ES `RepositoryException` / `SnapshotRestoreException` carry no
+        // REST status of their own: 500.
+        ref error @ ReadonlyRepository { .. } => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "repository_exception",
+            error.to_string(),
+        ),
+        ref error @ Restore { .. } => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot_restore_exception",
+            error.to_string(),
+        ),
+        ref error @ (Integrity(_) | DataDir(_)) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "snapshot_exception",
+            error.to_string(),
+        ),
         Repository(repo_err) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "repository_exception",
@@ -103,6 +151,14 @@ fn from_service_error(error: SnapshotServiceError) -> axum::response::Response {
             message,
         ),
     }
+}
+
+fn join_error(error: tokio::task::JoinError) -> axum::response::Response {
+    err(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "snapshot_exception",
+        format!("snapshot task failed: {error}"),
+    )
 }
 
 /// Bundle the two pieces of state every snapshot handler needs.
@@ -138,6 +194,83 @@ fn parse_indices_value(value: Option<&Value>) -> Vec<String> {
     }
 }
 
+/// ES lenient boolean: JSON boolean or `"true"` / `"false"`.
+fn parse_bool(value: Option<&Value>, name: &str, default: bool) -> Result<bool, String> {
+    match value {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::String(s)) if s == "true" => Ok(true),
+        Some(Value::String(s)) if s == "false" => Ok(false),
+        Some(other) => Err(format!(
+            "Failed to parse value [{}] as only [true] or [false] are allowed for [{name}]",
+            other
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| other.to_string())
+        )),
+    }
+}
+
+fn str_setting(settings: &Value, key: &str) -> Option<String> {
+    match settings.get(key)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// `settings` of an `s3` repository -> client configuration (ES
+/// `repository-s3` names: `bucket`, `region`, `endpoint`, `protocol`,
+/// `path_style_access`, `client`, `base_path`, `readonly`, `buffer_size`).
+pub fn s3_config_from_settings(settings: &Value) -> Result<S3RepositoryConfig, String> {
+    let bucket = match settings.get("bucket").and_then(Value::as_str) {
+        Some(s) if !s.is_empty() => s.to_owned(),
+        _ => return Err("s3 repository requires a non-empty `settings.bucket` string".to_owned()),
+    };
+    let bool_of = |key: &str| setting_bool(settings, key).map_err(|error| error.to_string());
+    let endpoint = str_setting(settings, "endpoint");
+    let buffer_size = match settings.get("buffer_size") {
+        None | Some(Value::Null) => 0,
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| format!("invalid s3 `buffer_size` [{n}]"))?,
+        Some(Value::String(s)) => {
+            parse_byte_size(s).ok_or_else(|| format!("invalid s3 `buffer_size` [{s}]"))?
+        }
+        Some(other) => return Err(format!("invalid s3 `buffer_size` [{other}]")),
+    };
+    // Flexible Checksums (CRC trailers on PUT) are an AWS extension that
+    // several S3-compatible stores reject; with a custom endpoint the SDK
+    // only checksums when the API requires it, unless the operator sets
+    // `disable_request_checksum: false`. Integrity of snapshot blobs is
+    // enforced end to end by blake3 anyway (`segments.rs`).
+    let disable_request_checksum = match settings
+        .get("disable_request_checksum")
+        .or_else(|| settings.get("_disable_request_checksum"))
+    {
+        None | Some(Value::Null) => endpoint.is_some(),
+        Some(_) => bool_of("disable_request_checksum")?
+            .or(bool_of("_disable_request_checksum")?)
+            .unwrap_or(false),
+    };
+    Ok(S3RepositoryConfig {
+        bucket,
+        region: str_setting(settings, "region"),
+        endpoint,
+        access_key: str_setting(settings, "access_key"),
+        secret_key: str_setting(settings, "secret_key"),
+        session_token: str_setting(settings, "session_token"),
+        base_path: str_setting(settings, "base_path"),
+        disable_request_checksum,
+        path_style_access: bool_of("path_style_access")?,
+        protocol: str_setting(settings, "protocol"),
+        client: str_setting(settings, "client"),
+        readonly: bool_of("readonly")?.unwrap_or(false),
+        buffer_size,
+        echo: Some(echo_settings(settings)),
+    })
+}
+
 /// `PUT /_snapshot/{repository}`.
 pub async fn register_repository_handler(
     State(state): State<SnapshotAppState>,
@@ -161,8 +294,18 @@ pub async fn register_repository_handler(
                     );
                 }
             };
+            let readonly = match setting_bool(&body.settings, "readonly") {
+                Ok(value) => value.unwrap_or(false),
+                Err(error) => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "repository_exception",
+                        error.to_string(),
+                    )
+                }
+            };
             let fs_repo = match FsRepository::new(location.into()) {
-                Ok(repo) => repo,
+                Ok(repo) => repo.with_readonly(readonly),
                 Err(error) => {
                     return err(
                         StatusCode::BAD_REQUEST,
@@ -175,68 +318,9 @@ pub async fn register_repository_handler(
             Json(json!({ "acknowledged": true })).into_response()
         }
         "s3" => {
-            // Strict static-credentials shape (IAM role chaining,
-            // STS, IMDS are intentionally out of scope for the MVP).
-            let bucket = match body
-                .settings
-                .get("bucket")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-            {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        "repository_exception",
-                        "s3 repository requires a non-empty `settings.bucket` string",
-                    );
-                }
-            };
-            let config = S3RepositoryConfig {
-                bucket,
-                region: body
-                    .settings
-                    .get("region")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                endpoint: body
-                    .settings
-                    .get("endpoint")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                access_key: body
-                    .settings
-                    .get("access_key")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                secret_key: body
-                    .settings
-                    .get("secret_key")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                session_token: body
-                    .settings
-                    .get("session_token")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                base_path: body
-                    .settings
-                    .get("base_path")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                // Test-only escape hatch: `disable_request_checksum`
-                // (or its alias `_disable_request_checksum`) drops the
-                // AWS Flexible Checksums request layer so the in-process
-                // mock-S3 fixture in `tests/snapshot_s3.rs` can speak
-                // SigV4 without re-implementing CRC32/SHA256 response
-                // contracts. Real S3 / MinIO / R2 configs leave this
-                // false (default).
-                disable_request_checksum: body
-                    .settings
-                    .get("disable_request_checksum")
-                    .or_else(|| body.settings.get("_disable_request_checksum"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+            let config = match s3_config_from_settings(&body.settings) {
+                Ok(config) => config,
+                Err(reason) => return err(StatusCode::BAD_REQUEST, "repository_exception", reason),
             };
             // The S3 client is built eagerly inside `S3Repository::new`
             // so misconfiguration surfaces here (and not on the first
@@ -276,15 +360,8 @@ pub async fn register_repository_handler(
 pub async fn list_repositories_handler(State(state): State<SnapshotAppState>) -> impl IntoResponse {
     let mut body = serde_json::Map::new();
     for (name, repo) in state.registry.list() {
-        if let Some(Value::Object(map)) = repository_metadata_response(&name, repo.as_ref())
-            .as_object()
-            .cloned()
-            .map(Value::Object)
-            .as_ref()
-        {
-            for (k, v) in map {
-                body.insert(k.clone(), v.clone());
-            }
+        if let Value::Object(map) = repository_metadata_response(&name, repo.as_ref()) {
+            body.extend(map);
         }
     }
     Json(Value::Object(body)).into_response()
@@ -352,15 +429,22 @@ pub async fn create_snapshot_handler(
     };
 
     let indices = parse_indices_value(request.indices.as_ref());
-    match service::create_snapshot(
-        repo.as_ref(),
-        &repo_name,
-        &snap_name,
-        &indices,
-        request.include_global_state,
-        &state.app,
-    ) {
-        Ok(entry) => Json(json!({
+    let include_global_state = request.include_global_state;
+    let app = state.app.clone();
+    let task_repo_name = repo_name.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        service::create_snapshot_with_report(
+            repo.as_ref(),
+            &task_repo_name,
+            &snap_name,
+            &indices,
+            include_global_state,
+            &app,
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok((entry, report))) => Json(json!({
             "snapshot": {
                 "snapshot": entry.name,
                 "uuid": entry.uuid,
@@ -368,11 +452,13 @@ pub async fn create_snapshot_handler(
                 "indices": entry.indices,
                 "start_time_in_millis": entry.start_time_millis,
                 "end_time_in_millis": entry.end_time_millis,
-                "include_global_state": request.include_global_state,
+                "include_global_state": include_global_state,
+                "surch": report,
             }
         }))
         .into_response(),
-        Err(error) => from_service_error(error),
+        Ok(Err(error)) => from_service_error(error),
+        Err(error) => join_error(error),
     }
 }
 
@@ -421,16 +507,74 @@ pub async fn delete_snapshot_handler(
             format!("repository [{repo_name}] missing"),
         );
     };
-    match service::delete_snapshot(repo.as_ref(), &repo_name, &snap_name) {
-        Ok(()) => Json(json!({ "acknowledged": true })).into_response(),
-        Err(error) => from_service_error(error),
+    let outcome = tokio::task::spawn_blocking(move || {
+        service::delete_snapshot(repo.as_ref(), &repo_name, &snap_name)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => Json(json!({ "acknowledged": true })).into_response(),
+        Ok(Err(error)) => from_service_error(error),
+        Err(error) => join_error(error),
+    }
+}
+
+/// Parse a `_restore` body into [`RestoreOptions`].
+pub fn parse_restore_request(request: &RestoreRequest) -> Result<RestoreOptions, String> {
+    let index_settings = match &request.index_settings {
+        None => Default::default(),
+        Some(value) => flatten_index_settings(value)?,
+    };
+    let ignore_index_settings = parse_indices_value(request.ignore_index_settings.as_ref())
+        .iter()
+        .map(|key| normalize_index_key(key))
+        .collect();
+    Ok(RestoreOptions {
+        indices: parse_indices_value(request.indices.as_ref()),
+        ignore_unavailable: parse_bool(
+            request.ignore_unavailable.as_ref(),
+            "ignore_unavailable",
+            false,
+        )?,
+        include_global_state: parse_bool(
+            request.include_global_state.as_ref(),
+            "include_global_state",
+            false,
+        )?,
+        include_aliases: parse_bool(request.include_aliases.as_ref(), "include_aliases", true)?,
+        partial: parse_bool(request.partial.as_ref(), "partial", false)?,
+        rename_pattern: request.rename_pattern.clone(),
+        rename_replacement: request.rename_replacement.clone(),
+        index_settings,
+        ignore_index_settings,
+    })
+}
+
+/// `wait_for_completion` query flag: `None` when absent, ES boolean
+/// parsing otherwise (`?wait_for_completion` alone = `true`).
+fn wait_for_completion(params: &HashMap<String, String>) -> Result<Option<bool>, String> {
+    match params.get("wait_for_completion").map(String::as_str) {
+        None => Ok(None),
+        Some("" | "true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(other) => Err(format!(
+            "Failed to parse value [{other}] as only [true] or [false] are allowed."
+        )),
     }
 }
 
 /// `POST /_snapshot/{repository}/{snapshot}/_restore`.
+///
+/// `wait_for_completion=true` (and, unlike ES, an absent flag — the
+/// historical Surch behaviour, kept so existing callers do not change)
+/// answers once every index is live with the ES `RestoreInfo` shape.
+/// `wait_for_completion=false` validates the request, answers
+/// `{"accepted": true}` and restores in the background; the restored
+/// index appears atomically when ready (`_cluster/health/<idx>
+/// ?wait_for_status=green` waits for it).
 pub async fn restore_snapshot_handler(
     State(state): State<SnapshotAppState>,
     Path((repo_name, snap_name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let request: RestoreRequest = if body.is_empty() {
@@ -447,6 +591,26 @@ pub async fn restore_snapshot_handler(
             }
         }
     };
+    let options = match parse_restore_request(&request) {
+        Ok(options) => options,
+        Err(reason) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                reason,
+            )
+        }
+    };
+    let wait = match wait_for_completion(&params) {
+        Ok(wait) => wait.unwrap_or(true),
+        Err(reason) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "illegal_argument_exception",
+                reason,
+            )
+        }
+    };
     let Some(repo) = state.registry.get(&repo_name) else {
         return err(
             StatusCode::NOT_FOUND,
@@ -454,35 +618,57 @@ pub async fn restore_snapshot_handler(
             format!("repository [{repo_name}] missing"),
         );
     };
-    let indices = parse_indices_value(request.indices.as_ref());
-    let selector = if indices.is_empty() {
-        None
-    } else {
-        Some(indices.as_slice())
+    let app = state.app.clone();
+    let plan = {
+        let (repo, app, repo_name, snap_name) = (
+            Arc::clone(&repo),
+            app.clone(),
+            repo_name.clone(),
+            snap_name.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            service::plan_restore(repo.as_ref(), &repo_name, &snap_name, &options, &app)
+        })
+        .await
     };
-    match service::restore_snapshot(repo.as_ref(), &repo_name, &snap_name, selector, &state.app) {
-        Ok(restored) => Json(json!({
-            "snapshot": {
-                "snapshot": snap_name,
-                "indices": restored,
-                "shards": {
-                    "total": 0,
-                    "failed": 0,
-                    "successful": 0,
-                }
+    let plan = match plan {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(error)) => return from_service_error(error),
+        Err(error) => return join_error(error),
+    };
+    if !wait {
+        let indices = plan.restored_indices();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = service::execute_restore(repo.as_ref(), &plan, &app) {
+                tracing::error!(target: "surch_api::snapshot", repository = %repo_name,
+                    snapshot = %snap_name, ?indices, %error, "background restore failed");
             }
-        }))
-        .into_response(),
-        Err(error) => from_service_error(error),
+        });
+        return Json(json!({ "accepted": true })).into_response();
+    }
+    match tokio::task::spawn_blocking(move || service::execute_restore(repo.as_ref(), &plan, &app))
+        .await
+    {
+        Ok(Ok(outcome)) => {
+            let total = outcome.indices.len();
+            Json(json!({
+                "snapshot": {
+                    "snapshot": outcome.snapshot,
+                    "indices": outcome.indices,
+                    "shards": {
+                        "total": total,
+                        "failed": 0,
+                        "successful": total,
+                    }
+                }
+            }))
+            .into_response()
+        }
+        Ok(Err(error)) => from_service_error(error),
+        Err(error) => join_error(error),
     }
 }
 
-/// `POST /_snapshot/{repository}/_verify` (also `GET`).
-///
-/// ES uses this to validate that the repository is reachable from every
-/// master-eligible node. Surch is single-node so the response simply
-/// names the local node; reachability is proven by writing a transient
-/// probe blob and reading it back through the repository trait.
 pub async fn verify_repository_handler(
     State(state): State<SnapshotAppState>,
     Path(repo_name): Path<String>,
@@ -668,3 +854,92 @@ fn now_nanos() -> u128 {
 // constructor branch is exercised by the public API surface.
 #[allow(dead_code)]
 fn _force_registered_repository_alive(_r: RegisteredRepository) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The repository body of the matchID prod restore Job.
+    #[test]
+    fn matchid_job_s3_settings_map_to_the_client_config() {
+        let settings = json!({
+            "bucket": "fichier-des-personnes-decedees-elasticsearch",
+            "client": "default",
+            "region": "fr-par",
+            "endpoint": "s3.fr-par.scw.cloud",
+            "path_style_access": true,
+            "protocol": "https",
+            "readonly": true
+        });
+        let config = s3_config_from_settings(&settings).unwrap();
+        assert_eq!(
+            config.bucket,
+            "fichier-des-personnes-decedees-elasticsearch"
+        );
+        assert_eq!(config.region.as_deref(), Some("fr-par"));
+        assert_eq!(config.client.as_deref(), Some("default"));
+        assert!(config.readonly);
+        assert_eq!(config.path_style_access, Some(true));
+        assert!(
+            config.disable_request_checksum,
+            "custom endpoint: checksums when required"
+        );
+        assert_eq!(
+            config.endpoint_url().unwrap().as_deref(),
+            Some("https://s3.fr-par.scw.cloud")
+        );
+        assert_eq!(
+            config.echo.as_ref().unwrap()["path_style_access"],
+            json!("true")
+        );
+        // ES string booleans and byte sizes.
+        let config = s3_config_from_settings(&json!({
+            "bucket": "b", "readonly": "false", "buffer_size": "16mb"
+        }))
+        .unwrap();
+        assert!(!config.readonly);
+        assert_eq!(config.buffer_size, 16 << 20);
+        assert!(
+            !config.disable_request_checksum,
+            "AWS endpoint keeps full checksums"
+        );
+        assert!(s3_config_from_settings(&json!({"bucket": "b", "readonly": "maybe"})).is_err());
+        assert!(s3_config_from_settings(&json!({"region": "x"})).is_err());
+    }
+
+    #[test]
+    fn restore_body_of_the_job_parses() {
+        let request: RestoreRequest = serde_json::from_value(json!({
+            "indices": "deces",
+            "ignore_unavailable": true,
+            "include_global_state": false,
+            "rename_pattern": "^deces$",
+            "rename_replacement": "deces-snap",
+            "index_settings": {"index.number_of_replicas": 0}
+        }))
+        .unwrap();
+        let options = parse_restore_request(&request).unwrap();
+        assert_eq!(options.indices, vec!["deces".to_owned()]);
+        assert!(options.ignore_unavailable);
+        assert!(!options.include_global_state);
+        assert!(options.include_aliases);
+        assert_eq!(options.rename_pattern.as_deref(), Some("^deces$"));
+        assert_eq!(
+            options.index_settings.get("index.number_of_replicas"),
+            Some(&json!(0))
+        );
+        let bad: RestoreRequest =
+            serde_json::from_value(json!({"include_aliases": "nope"})).unwrap();
+        assert!(parse_restore_request(&bad).is_err());
+    }
+
+    #[test]
+    fn wait_for_completion_flag_parses_like_es() {
+        let params = |v: &str| HashMap::from([("wait_for_completion".to_owned(), v.to_owned())]);
+        assert_eq!(wait_for_completion(&HashMap::new()), Ok(None));
+        assert_eq!(wait_for_completion(&params("true")), Ok(Some(true)));
+        assert_eq!(wait_for_completion(&params("")), Ok(Some(true)));
+        assert_eq!(wait_for_completion(&params("false")), Ok(Some(false)));
+        assert!(wait_for_completion(&params("1")).is_err());
+    }
+}

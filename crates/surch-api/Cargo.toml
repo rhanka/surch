@@ -81,6 +81,8 @@ tar = { workspace = true }
 flate2 = { workspace = true }
 rayon = { workspace = true }
 uuid = { workspace = true }
+regex = { workspace = true }
+blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 aws-sdk-s3 = { workspace = true }

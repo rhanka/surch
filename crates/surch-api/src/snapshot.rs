@@ -131,13 +131,24 @@ pub fn build_index_tarball_for_es_snapshot(
 /// Refuses to overwrite an existing index (same contract as the
 /// legacy `_surch/snapshot/import` route — the caller deletes first
 /// if they want to overwrite, matching ES `restore` defaults).
+///
+/// L6.2: the index is restored under `target` (ES `rename_pattern` /
+/// `rename_replacement`, resolved by the caller), `patch_settings` applies
+/// the ES `index_settings`, the `settings.analysis` block is recompiled
+/// onto the mapping (it used to be dropped, leaving custom analyzers
+/// unresolved), the original `creation_date` is kept (ES
+/// `RestoreService.restoreToCreateNewIndex` copies the snapshot settings),
+/// and the re-ingested documents are refreshed — the commit point under
+/// `SURCH_DATA_DIR`.
 pub fn restore_index_tarball_for_es_snapshot(
     state: &AppState,
-    index: &str,
+    target: &str,
     body: &[u8],
+    patch_settings: impl FnOnce(&mut Value) -> Result<(), String>,
+    include_aliases: bool,
 ) -> Result<u64, String> {
-    if state.index_exists(index) {
-        return Err(format!("index [{index}] already exists"));
+    if state.index_exists(target) {
+        return Err(format!("index [{target}] already exists"));
     }
     let parsed = parse_tarball(body)?;
     if parsed.manifest.format_version != SNAPSHOT_FORMAT_VERSION {
@@ -146,11 +157,23 @@ pub fn restore_index_tarball_for_es_snapshot(
             parsed.manifest.format_version, SNAPSHOT_FORMAT_VERSION
         ));
     }
-    state.create_index(index, Some(parsed.mapping), parsed.settings, parsed.aliases);
+    let mut settings = parsed.settings;
+    patch_settings(&mut settings)?;
+    let mut mapping = parsed.mapping;
+    let analysis = IndexMapping::from_index_settings_value(&settings)
+        .map_err(|e| format!("settings.analysis invalid: {e}"))?;
+    mapping.set_analysis(analysis);
+    let aliases = if include_aliases {
+        parsed.aliases
+    } else {
+        BTreeMap::new()
+    };
+    state.create_index(target, Some(mapping), settings, aliases);
     for (id, source) in parsed.documents {
-        state.index_document(index, &id, source);
+        state.index_document(target, &id, source);
     }
-    Ok(parsed.manifest.doc_count)
+    state.refresh_index(target);
+    Ok(state.document_count(target))
 }
 
 /// `POST /_surch/snapshot/export?index=<name>` → tar.gz body.

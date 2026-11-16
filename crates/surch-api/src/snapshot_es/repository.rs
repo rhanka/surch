@@ -84,6 +84,126 @@ pub trait SnapshotRepository: Send + Sync {
     /// Repository settings as exposed to clients (`{"location": "..."}`
     /// for `fs`, `{"bucket": "...", "base_path": "..."}` for `s3`).
     fn settings(&self) -> serde_json::Value;
+
+    /// ES `readonly` repository setting: a readonly repository refuses
+    /// snapshot creation and deletion (`SnapshotsService.createSnapshot`,
+    /// ES 8.6.1) but serves listing and restore.
+    fn readonly(&self) -> bool {
+        false
+    }
+
+    /// `true` when `key` exists. Used by the L6.2 segment snapshots to
+    /// skip a content-addressed blob already present in the repository.
+    fn object_exists(&self, key: &str) -> RepositoryResult<bool> {
+        Ok(self.read_etag(key)?.is_some())
+    }
+
+    /// Store `path[offset .. offset + len)` under `key`. The default reads
+    /// the range into memory; the `fs` and `s3` implementations stream it
+    /// (a sealed postings file of the 29 M matchID index is several GiB).
+    fn put_file_range(
+        &self,
+        key: &str,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> RepositoryResult<()> {
+        let bytes = read_file_range(path, offset, len)?;
+        self.put_object(key, Bytes::from(bytes))
+    }
+
+    /// Stream the object `key` into `sink`, returning the byte count. The
+    /// default buffers the whole object; `fs` and `s3` stream it.
+    fn get_object_to_writer(&self, key: &str, sink: &mut dyn Write) -> RepositoryResult<u64> {
+        let bytes = self.get_object(key)?;
+        sink.write_all(&bytes)
+            .map_err(|source| RepositoryError::Io {
+                key: key.to_owned(),
+                source,
+            })?;
+        Ok(bytes.len() as u64)
+    }
+}
+
+fn read_file_range(path: &Path, offset: u64, len: u64) -> RepositoryResult<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let io_err = |source| RepositoryError::Io {
+        key: path.display().to_string(),
+        source,
+    };
+    let mut file = fs::File::open(path).map_err(io_err)?;
+    file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
+    let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+    file.read_exact(&mut out).map_err(io_err)?;
+    Ok(out)
+}
+
+/// Copy `path[offset .. offset + len)` into `sink` through a bounded buffer.
+fn copy_file_range_to(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    sink: &mut dyn Write,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let copied = std::io::copy(&mut (&mut file).take(len), sink)?;
+    if copied != len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("{} is shorter than {} bytes", path.display(), offset + len),
+        ));
+    }
+    Ok(())
+}
+
+/// ES renders every repository setting as a string in
+/// `GET /_snapshot/{repo}` (settings are flattened `Settings`). Credentials
+/// and Surch test switches are never echoed.
+pub(crate) fn echo_settings(settings: &serde_json::Value) -> serde_json::Value {
+    const HIDDEN: &[&str] = &[
+        "access_key",
+        "secret_key",
+        "session_token",
+        "disable_request_checksum",
+        "_disable_request_checksum",
+    ];
+    let mut out = serde_json::Map::new();
+    if let Some(map) = settings.as_object() {
+        for (key, value) in map {
+            if HIDDEN.contains(&key.as_str()) {
+                continue;
+            }
+            let rendered = match value {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Null => continue,
+                other => other.to_string(),
+            };
+            out.insert(key.clone(), serde_json::Value::String(rendered));
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// ES boolean setting parsing (`Booleans.parseBoolean`): `true` / `false`
+/// as JSON booleans or strings; anything else is a configuration error.
+pub(crate) fn setting_bool(
+    settings: &serde_json::Value,
+    key: &str,
+) -> RepositoryResult<Option<bool>> {
+    match settings.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+        Some(serde_json::Value::String(text)) if text == "true" => Ok(Some(true)),
+        Some(serde_json::Value::String(text)) if text == "false" => Ok(Some(false)),
+        Some(other) => {
+            Err(RepositoryError::InvalidConfig(format!(
+            "Failed to parse value [{}] as only [true] or [false] are allowed for setting [{key}]",
+            other.as_str().map(str::to_owned).unwrap_or_else(|| other.to_string())
+        )))
+        }
+    }
 }
 
 /// Filesystem-backed implementation of [`SnapshotRepository`].
@@ -111,6 +231,7 @@ pub trait SnapshotRepository: Send + Sync {
 pub struct FsRepository {
     root: PathBuf,
     cas_locks: Mutex<()>,
+    readonly: bool,
 }
 
 impl FsRepository {
@@ -131,7 +252,15 @@ impl FsRepository {
         Ok(Self {
             root,
             cas_locks: Mutex::new(()),
+            readonly: false,
         })
+    }
+
+    /// ES `readonly: true` on an `fs` repository (snapshot creation and
+    /// deletion refused, restore allowed).
+    pub fn with_readonly(mut self, readonly: bool) -> Self {
+        self.readonly = readonly;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -156,20 +285,27 @@ impl FsRepository {
     }
 
     fn write_atomic(&self, target: &Path, bytes: &[u8]) -> RepositoryResult<()> {
+        self.write_atomic_with(target, |file| file.write_all(bytes))
+    }
+
+    fn write_atomic_with(
+        &self,
+        target: &Path,
+        fill: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+    ) -> RepositoryResult<()> {
         self.ensure_parent(target)?;
-        let tmp = target.with_extension(format!(
-            "tmp.{}",
-            // unique suffix avoids tmp collisions when two threads
-            // race on the same key (one of them is going to lose the
-            // CAS upstream anyway).
-            std::process::id(),
-        ));
-        let tmp = tmp.with_file_name(format!(
-            "{}.{}",
+        // `<name>.tmp.<pid>.<nanos>.<seq>`: unique per writer (two threads
+        // racing on one key, one of them loses the CAS upstream anyway) and
+        // skipped by `list_objects` thanks to the `.tmp.` marker.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = target.with_file_name(format!(
+            "{}.tmp.{}.{}.{seq}",
             target
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("blob"),
+            std::process::id(),
             now_nanos(),
         ));
         {
@@ -177,11 +313,14 @@ impl FsRepository {
                 key: tmp.display().to_string(),
                 source,
             })?;
-            file.write_all(bytes)
-                .map_err(|source| RepositoryError::Io {
+            if let Err(source) = fill(&mut file) {
+                drop(file);
+                let _ = fs::remove_file(&tmp);
+                return Err(RepositoryError::Io {
                     key: tmp.display().to_string(),
                     source,
-                })?;
+                });
+            }
             file.sync_all().map_err(|source| RepositoryError::Io {
                 key: tmp.display().to_string(),
                 source,
@@ -345,7 +484,52 @@ impl SnapshotRepository for FsRepository {
     }
 
     fn settings(&self) -> serde_json::Value {
-        serde_json::json!({ "location": self.root.display().to_string() })
+        let mut settings = serde_json::json!({ "location": self.root.display().to_string() });
+        if self.readonly {
+            settings["readonly"] = serde_json::Value::String("true".to_owned());
+        }
+        settings
+    }
+
+    fn readonly(&self) -> bool {
+        self.readonly
+    }
+
+    fn put_file_range(
+        &self,
+        key: &str,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> RepositoryResult<()> {
+        let target = self.key_path(key)?;
+        self.write_atomic_with(&target, |file| {
+            let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+            copy_file_range_to(path, offset, len, &mut writer)?;
+            writer.flush()
+        })
+    }
+
+    fn get_object_to_writer(&self, key: &str, sink: &mut dyn Write) -> RepositoryResult<u64> {
+        let path = self.key_path(key)?;
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RepositoryError::NotFound {
+                    key: key.to_owned(),
+                })
+            }
+            Err(source) => {
+                return Err(RepositoryError::Io {
+                    key: key.to_owned(),
+                    source,
+                })
+            }
+        };
+        std::io::copy(&mut file, sink).map_err(|source| RepositoryError::Io {
+            key: key.to_owned(),
+            source,
+        })
     }
 
     fn read_etag(&self, key: &str) -> RepositoryResult<Option<String>> {
@@ -385,6 +569,182 @@ pub struct S3RepositoryConfig {
     /// contract; prod paths against MinIO / R2 / real S3 keep the
     /// default (full validation).
     pub disable_request_checksum: bool,
+    /// ES `path_style_access`. `None` keeps the historical Surch default:
+    /// path-style addressing whenever a custom `endpoint` is set, the
+    /// SDK default (virtual-hosted) otherwise.
+    pub path_style_access: Option<bool>,
+    /// ES `protocol` (`http` / `https`, default `https`), used to build the
+    /// endpoint URL when `endpoint` is a bare host (`s3.fr-par.scw.cloud`,
+    /// the ES convention).
+    pub protocol: Option<String>,
+    /// ES `client`: the named client whose credentials are read from the
+    /// environment (`SURCH_S3_CLIENT_<NAME>_ACCESS_KEY`, see
+    /// [`resolve_s3_credentials`]). ES reads them from its keystore
+    /// (`s3.client.<name>.access_key`), which Surch does not have.
+    pub client: Option<String>,
+    /// ES `readonly`: snapshot creation / deletion refused.
+    pub readonly: bool,
+    /// ES `buffer_size`: objects larger than this go through the S3
+    /// multipart upload API, in parts of this size. `0` = default 100 MiB
+    /// (ES default `100mb`).
+    pub buffer_size: u64,
+    /// The declared settings as `GET /_snapshot/{repo}` echoes them
+    /// (strings, credentials removed). `None` = built from the fields.
+    pub echo: Option<serde_json::Value>,
+}
+
+/// ES `buffer_size` default (`100mb`) and minimum (`5mb`, the S3 part
+/// floor).
+pub const S3_DEFAULT_BUFFER_SIZE: u64 = 100 * 1024 * 1024;
+pub const S3_MIN_BUFFER_SIZE: u64 = 5 * 1024 * 1024;
+
+impl S3RepositoryConfig {
+    fn part_size(&self) -> u64 {
+        if self.buffer_size == 0 {
+            S3_DEFAULT_BUFFER_SIZE
+        } else {
+            self.buffer_size
+        }
+    }
+
+    /// Endpoint URL handed to the SDK: `endpoint` as is when it carries a
+    /// scheme, `<protocol>://<endpoint>` otherwise (ES semantics).
+    pub fn endpoint_url(&self) -> RepositoryResult<Option<String>> {
+        let Some(endpoint) = self.endpoint.as_deref().map(str::trim) else {
+            return Ok(None);
+        };
+        if endpoint.is_empty() {
+            return Ok(None);
+        }
+        if endpoint.contains("://") {
+            return Ok(Some(endpoint.to_owned()));
+        }
+        let protocol = self
+            .protocol
+            .as_deref()
+            .unwrap_or("https")
+            .to_ascii_lowercase();
+        if protocol != "http" && protocol != "https" {
+            return Err(RepositoryError::InvalidConfig(format!(
+                "invalid s3 `protocol` [{protocol}] (expected `http` or `https`)"
+            )));
+        }
+        Ok(Some(format!("{protocol}://{endpoint}")))
+    }
+
+    /// Effective path-style addressing (see [`Self::path_style_access`]).
+    pub fn effective_path_style(&self) -> bool {
+        self.path_style_access.unwrap_or_else(|| {
+            self.endpoint
+                .as_deref()
+                .is_some_and(|e| !e.trim().is_empty())
+        })
+    }
+}
+
+/// Static S3 credentials and where they were found (logged, never echoed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedS3Credentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+    pub source: String,
+}
+
+/// Environment variable prefix of the per-client credentials, the Surch
+/// stand-in for the ES keystore entries `s3.client.<name>.access_key` /
+/// `secret_key` / `session_token`.
+pub const S3_CLIENT_ENV_PREFIX: &str = "SURCH_S3_CLIENT_";
+
+/// `SURCH_S3_CLIENT_<NAME>_<SUFFIX>`: client name upper-cased, every
+/// character outside `[A-Z0-9]` replaced by `_` (`default` ->
+/// `SURCH_S3_CLIENT_DEFAULT_ACCESS_KEY`).
+pub fn s3_client_env_name(client: &str, suffix: &str) -> String {
+    let name: String = client
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{S3_CLIENT_ENV_PREFIX}{name}_{suffix}")
+}
+
+/// Credential resolution, first match wins:
+///
+/// 1. `access_key` / `secret_key` (+ `session_token`) in the repository
+///    settings (historical Surch shape; ES 8 rejects them there),
+/// 2. `SURCH_S3_CLIENT_<CLIENT>_ACCESS_KEY` / `_SECRET_KEY` /
+///    `_SESSION_TOKEN` for the repository's `client` (default `default`),
+/// 3. the standard AWS variables `AWS_ACCESS_KEY_ID` /
+///    `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`.
+///
+/// `None` = no credentials found: the repository still registers (as in
+/// ES, where missing keystore entries surface on first use) and the S3
+/// calls fail with the SDK credentials error.
+pub fn resolve_s3_credentials(
+    config: &S3RepositoryConfig,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<ResolvedS3Credentials> {
+    let non_empty = |value: Option<String>| value.filter(|v| !v.trim().is_empty());
+    if let (Some(access_key), Some(secret_key)) = (
+        non_empty(config.access_key.clone()),
+        non_empty(config.secret_key.clone()),
+    ) {
+        return Some(ResolvedS3Credentials {
+            access_key,
+            secret_key,
+            session_token: non_empty(config.session_token.clone()),
+            source: "repository settings".to_owned(),
+        });
+    }
+    let client = config.client.as_deref().unwrap_or("default");
+    let access_name = s3_client_env_name(client, "ACCESS_KEY");
+    let secret_name = s3_client_env_name(client, "SECRET_KEY");
+    if let (Some(access_key), Some(secret_key)) =
+        (non_empty(env(&access_name)), non_empty(env(&secret_name)))
+    {
+        return Some(ResolvedS3Credentials {
+            access_key,
+            secret_key,
+            session_token: non_empty(env(&s3_client_env_name(client, "SESSION_TOKEN"))),
+            source: format!("{access_name} / {secret_name}"),
+        });
+    }
+    if let (Some(access_key), Some(secret_key)) = (
+        non_empty(env("AWS_ACCESS_KEY_ID")),
+        non_empty(env("AWS_SECRET_ACCESS_KEY")),
+    ) {
+        return Some(ResolvedS3Credentials {
+            access_key,
+            secret_key,
+            session_token: non_empty(env("AWS_SESSION_TOKEN")),
+            source: "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY".to_owned(),
+        });
+    }
+    None
+}
+
+/// Parse an ES byte-size setting (`100mb`, `5MB`, `1gb`, `512kb`, `1048576`).
+pub fn parse_byte_size(text: &str) -> Option<u64> {
+    let lower = text.trim().to_ascii_lowercase();
+    let (digits, unit) = match lower.find(|c: char| !c.is_ascii_digit()) {
+        Some(at) => lower.split_at(at),
+        None => (lower.as_str(), ""),
+    };
+    let value: u64 = digits.parse().ok()?;
+    let factor: u64 = match unit.trim() {
+        "" | "b" => 1,
+        "k" | "kb" => 1 << 10,
+        "m" | "mb" => 1 << 20,
+        "g" | "gb" => 1 << 30,
+        "t" | "tb" => 1 << 40,
+        _ => return None,
+    };
+    value.checked_mul(factor)
 }
 
 /// S3-backed implementation of [`SnapshotRepository`].
@@ -424,14 +784,14 @@ pub struct S3Repository {
 /// drop on *its* thread (where blocking is allowed).
 struct DedicatedRuntime {
     handle: tokio::runtime::Handle,
-    shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl DedicatedRuntime {
     fn new(name: &str) -> RepositoryResult<Self> {
         let (handle_tx, handle_rx) = std::sync::mpsc::channel::<tokio::runtime::Handle>();
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let thread_name = format!("surch-s3-{name}");
         let join_handle = std::thread::Builder::new()
             .name(thread_name)
@@ -444,12 +804,17 @@ impl DedicatedRuntime {
                     Err(_) => return,
                 };
                 let _ = handle_tx.send(runtime.handle().clone());
-                // Park here until the owning `S3Repository` drops the
-                // matching shutdown sender. `recv()` returns Err when
-                // the sender side has been closed — that's the cue to
-                // tear the runtime down (drop happens on this thread,
-                // where blocking is fine).
-                let _ = shutdown_rx.recv();
+                // Drive the runtime here until the owning `S3Repository`
+                // drops the shutdown sender. L6.2 fix: on a current-thread
+                // runtime only `Runtime::block_on` drives the IO and timer
+                // drivers — `Handle::block_on` from the callers cannot (tokio
+                // docs). The former plain `std::sync::mpsc::recv()` parked
+                // this thread without driving anything, so every S3 request
+                // waited forever for its socket. The runtime is then dropped
+                // on this thread, where blocking is fine.
+                runtime.block_on(async move {
+                    let _ = shutdown_rx.await;
+                });
                 drop(runtime);
             })
             .map_err(|source| RepositoryError::Io {
@@ -503,8 +868,25 @@ impl S3Repository {
                 "s3 repository requires a non-empty `bucket`".to_owned(),
             ));
         }
+        if config.buffer_size != 0 && config.buffer_size < S3_MIN_BUFFER_SIZE {
+            return Err(RepositoryError::InvalidConfig(format!(
+                "s3 `buffer_size` must be at least 5mb, got {} bytes",
+                config.buffer_size
+            )));
+        }
+        let endpoint_url = config.endpoint_url()?;
+        let credentials = resolve_s3_credentials(&config, |name| std::env::var(name).ok());
+        match &credentials {
+            Some(found) => tracing::info!(target: "surch_api::snapshot", bucket = %config.bucket,
+                source = %found.source, "s3 repository credentials resolved"),
+            None => tracing::warn!(target: "surch_api::snapshot", bucket = %config.bucket,
+                "s3 repository has no credentials (settings, SURCH_S3_CLIENT_<NAME>_ACCESS_KEY, \
+                 AWS_ACCESS_KEY_ID): requests will fail unless the backend allows them"),
+        }
         let runtime = Arc::new(DedicatedRuntime::new(&config.bucket)?);
-        let client = runtime.handle().block_on(build_s3_client(&config));
+        let client = runtime
+            .handle()
+            .block_on(build_s3_client(&config, endpoint_url, credentials));
         Ok(Self {
             config,
             client,
@@ -547,7 +929,11 @@ impl S3Repository {
     }
 }
 
-async fn build_s3_client(config: &S3RepositoryConfig) -> aws_sdk_s3::Client {
+async fn build_s3_client(
+    config: &S3RepositoryConfig,
+    endpoint_url: Option<String>,
+    credentials: Option<ResolvedS3Credentials>,
+) -> aws_sdk_s3::Client {
     use aws_sdk_s3::config::{Credentials, Region};
 
     let mut builder = aws_sdk_s3::Config::builder()
@@ -569,24 +955,22 @@ async fn build_s3_client(config: &S3RepositoryConfig) -> aws_sdk_s3::Client {
             );
     }
 
-    if let (Some(access_key), Some(secret_key)) =
-        (config.access_key.as_deref(), config.secret_key.as_deref())
-    {
-        let credentials = Credentials::new(
-            access_key,
-            secret_key,
-            config.session_token.clone(),
+    if let Some(credentials) = credentials {
+        builder = builder.credentials_provider(Credentials::new(
+            credentials.access_key,
+            credentials.secret_key,
+            credentials.session_token,
             None,
             "surch-snapshot-s3-static",
-        );
-        builder = builder.credentials_provider(credentials);
+        ));
     }
 
-    if let Some(endpoint) = config.endpoint.as_deref() {
-        // Non-AWS backends (MinIO, R2, GCS interop, axum test
-        // server) use path-style addressing.
-        builder = builder.endpoint_url(endpoint).force_path_style(true);
+    if let Some(endpoint) = endpoint_url {
+        builder = builder.endpoint_url(endpoint);
     }
+    // ES `path_style_access`; unset keeps the historical Surch default
+    // (path style for every custom endpoint: MinIO, R2, Scaleway, mocks).
+    builder = builder.force_path_style(config.effective_path_style());
 
     aws_sdk_s3::Client::from_conf(builder.build())
 }
@@ -595,9 +979,11 @@ fn s3_error_to_repository<E: std::error::Error + Send + Sync + 'static>(
     key: &str,
     error: E,
 ) -> RepositoryError {
+    // `DisplayErrorContext` walks the source chain: the bare `to_string()`
+    // of an SDK service error is often just "unhandled error".
     RepositoryError::Io {
         key: key.to_owned(),
-        source: std::io::Error::other(error.to_string()),
+        source: std::io::Error::other(aws_sdk_s3::error::DisplayErrorContext(&error).to_string()),
     }
 }
 
@@ -799,7 +1185,181 @@ impl SnapshotRepository for S3Repository {
         "s3"
     }
 
+    fn readonly(&self) -> bool {
+        self.config.readonly
+    }
+
+    fn put_file_range(
+        &self,
+        key: &str,
+        path: &Path,
+        offset: u64,
+        len: u64,
+    ) -> RepositoryResult<()> {
+        use aws_sdk_s3::primitives::{ByteStream, Length};
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let full = self.full_key(key)?;
+        let bucket = self.config.bucket.clone();
+        let client = self.client.clone();
+        let part_size = self.config.part_size();
+        let path = path.to_path_buf();
+        let stream = |from: u64, take: u64| {
+            let path = path.clone();
+            async move {
+                if take == 0 {
+                    return Ok(ByteStream::from_static(b""));
+                }
+                ByteStream::read_from()
+                    .path(&path)
+                    .offset(from)
+                    .length(Length::Exact(take))
+                    .build()
+                    .await
+            }
+        };
+        tokio::task::block_in_place(|| {
+            self.runtime.handle().block_on(async {
+                if len <= part_size {
+                    let body = stream(offset, len)
+                        .await
+                        .map_err(|error| s3_error_to_repository(&full, error))?;
+                    return client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(&full)
+                        .content_length(len as i64)
+                        .body(body)
+                        .send()
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| {
+                            s3_error_to_repository(&full, error.into_service_error())
+                        });
+                }
+                // ES `buffer_size` semantics: beyond it, multipart upload in
+                // parts of `buffer_size` bytes (S3: <= 5 GiB per PUT,
+                // <= 10 000 parts).
+                let created = client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&full)
+                    .send()
+                    .await
+                    .map_err(|error| s3_error_to_repository(&full, error.into_service_error()))?;
+                let upload_id =
+                    created
+                        .upload_id()
+                        .map(str::to_owned)
+                        .ok_or_else(|| RepositoryError::Io {
+                            key: full.clone(),
+                            source: std::io::Error::other(
+                                "CreateMultipartUpload returned no UploadId",
+                            ),
+                        })?;
+                let upload = async {
+                    let mut parts = Vec::new();
+                    let mut done = 0u64;
+                    let mut number = 1i32;
+                    while done < len {
+                        let take = part_size.min(len - done);
+                        let body = stream(offset + done, take)
+                            .await
+                            .map_err(|error| s3_error_to_repository(&full, error))?;
+                        let output = client
+                            .upload_part()
+                            .bucket(&bucket)
+                            .key(&full)
+                            .upload_id(&upload_id)
+                            .part_number(number)
+                            .content_length(take as i64)
+                            .body(body)
+                            .send()
+                            .await
+                            .map_err(|error| {
+                                s3_error_to_repository(&full, error.into_service_error())
+                            })?;
+                        parts.push(
+                            CompletedPart::builder()
+                                .part_number(number)
+                                .set_e_tag(output.e_tag().map(str::to_owned))
+                                .build(),
+                        );
+                        done += take;
+                        number += 1;
+                    }
+                    client
+                        .complete_multipart_upload()
+                        .bucket(&bucket)
+                        .key(&full)
+                        .upload_id(&upload_id)
+                        .multipart_upload(
+                            CompletedMultipartUpload::builder()
+                                .set_parts(Some(parts))
+                                .build(),
+                        )
+                        .send()
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| s3_error_to_repository(&full, error.into_service_error()))
+                };
+                let result = upload.await;
+                if result.is_err() {
+                    let _ = client
+                        .abort_multipart_upload()
+                        .bucket(&bucket)
+                        .key(&full)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await;
+                }
+                result
+            })
+        })
+    }
+
+    fn get_object_to_writer(&self, key: &str, sink: &mut dyn Write) -> RepositoryResult<u64> {
+        let full = self.full_key(key)?;
+        let bucket = self.config.bucket.clone();
+        let client = self.client.clone();
+        tokio::task::block_in_place(|| {
+            self.runtime.handle().block_on(async {
+                let mut output = match client.get_object().bucket(&bucket).key(&full).send().await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let service_err = error.into_service_error();
+                        return Err(if service_err.is_no_such_key() {
+                            RepositoryError::NotFound {
+                                key: key.to_owned(),
+                            }
+                        } else {
+                            s3_error_to_repository(&full, service_err)
+                        });
+                    }
+                };
+                let mut written = 0u64;
+                while let Some(chunk) = output
+                    .body
+                    .try_next()
+                    .await
+                    .map_err(|error| s3_error_to_repository(&full, error))?
+                {
+                    sink.write_all(&chunk)
+                        .map_err(|source| RepositoryError::Io {
+                            key: key.to_owned(),
+                            source,
+                        })?;
+                    written += chunk.len() as u64;
+                }
+                Ok(written)
+            })
+        })
+    }
+
     fn settings(&self) -> serde_json::Value {
+        if let Some(echo) = &self.config.echo {
+            return echo.clone();
+        }
         let mut map = serde_json::Map::new();
         map.insert(
             "bucket".to_owned(),
@@ -954,6 +1514,170 @@ mod tests {
             repo.get_object("snap-1.dat"),
             Err(RepositoryError::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn fs_repository_streams_file_ranges_both_ways() {
+        let dir = tempdir();
+        let repo = FsRepository::new(dir.join("repo")).unwrap();
+        let source = dir.join("source.bin");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&source, &data).unwrap();
+        repo.put_file_range("blobs/x", &source, 1000, 2_000_000)
+            .unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            repo.get_object_to_writer("blobs/x", &mut out).unwrap(),
+            2_000_000
+        );
+        assert_eq!(out, &data[1000..2_001_000]);
+        assert!(repo.object_exists("blobs/x").unwrap());
+        assert!(!repo.object_exists("blobs/y").unwrap());
+        // A short source fails and leaves no object (nor a visible tmp).
+        assert!(repo
+            .put_file_range("blobs/short", &source, 2_999_000, 10_000)
+            .is_err());
+        assert!(!repo.object_exists("blobs/short").unwrap());
+        assert_eq!(
+            repo.list_objects("blobs/").unwrap(),
+            vec!["blobs/x".to_owned()]
+        );
+        assert!(matches!(
+            repo.get_object_to_writer("blobs/none", &mut Vec::new()),
+            Err(RepositoryError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn fs_readonly_is_reported_and_echoed() {
+        let dir = tempdir();
+        let repo = FsRepository::new(dir).unwrap().with_readonly(true);
+        assert!(repo.readonly());
+        assert_eq!(repo.settings()["readonly"], serde_json::json!("true"));
+    }
+
+    #[test]
+    fn s3_endpoint_url_follows_es_protocol_setting() {
+        let mut config = S3RepositoryConfig {
+            bucket: "b".into(),
+            endpoint: Some("s3.fr-par.scw.cloud".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.endpoint_url().unwrap().as_deref(),
+            Some("https://s3.fr-par.scw.cloud")
+        );
+        config.protocol = Some("http".into());
+        assert_eq!(
+            config.endpoint_url().unwrap().as_deref(),
+            Some("http://s3.fr-par.scw.cloud")
+        );
+        config.endpoint = Some("http://127.0.0.1:9000".into());
+        assert_eq!(
+            config.endpoint_url().unwrap().as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+        config.endpoint = Some("minio:9000".into());
+        config.protocol = Some("ftp".into());
+        assert!(config.endpoint_url().is_err());
+        // Path style: explicit wins, else on for custom endpoints.
+        assert!(config.effective_path_style());
+        config.path_style_access = Some(false);
+        assert!(!config.effective_path_style());
+        let aws = S3RepositoryConfig::default();
+        assert!(!aws.effective_path_style());
+    }
+
+    #[test]
+    fn s3_credentials_resolve_settings_then_client_env_then_aws_env() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        let base = S3RepositoryConfig {
+            bucket: "b".into(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_s3_credentials(&base, env(&[])), None);
+        let aws = resolve_s3_credentials(
+            &base,
+            env(&[("AWS_ACCESS_KEY_ID", "ak"), ("AWS_SECRET_ACCESS_KEY", "sk")]),
+        )
+        .unwrap();
+        assert_eq!(
+            (aws.access_key.as_str(), aws.secret_key.as_str()),
+            ("ak", "sk")
+        );
+        let client = resolve_s3_credentials(
+            &base,
+            env(&[
+                ("AWS_ACCESS_KEY_ID", "ak"),
+                ("AWS_SECRET_ACCESS_KEY", "sk"),
+                ("SURCH_S3_CLIENT_DEFAULT_ACCESS_KEY", "cak"),
+                ("SURCH_S3_CLIENT_DEFAULT_SECRET_KEY", "csk"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(client.access_key, "cak");
+        assert_eq!(
+            client.source,
+            "SURCH_S3_CLIENT_DEFAULT_ACCESS_KEY / SURCH_S3_CLIENT_DEFAULT_SECRET_KEY"
+        );
+        let named = S3RepositoryConfig {
+            client: Some("scw-prod".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            s3_client_env_name("scw-prod", "ACCESS_KEY"),
+            "SURCH_S3_CLIENT_SCW_PROD_ACCESS_KEY"
+        );
+        assert_eq!(
+            resolve_s3_credentials(
+                &named,
+                env(&[
+                    ("SURCH_S3_CLIENT_DEFAULT_ACCESS_KEY", "cak"),
+                    ("SURCH_S3_CLIENT_DEFAULT_SECRET_KEY", "csk"),
+                ])
+            ),
+            None,
+            "a named client never borrows the default client's keys"
+        );
+        let in_settings = S3RepositoryConfig {
+            access_key: Some("s".into()),
+            secret_key: Some("t".into()),
+            ..base
+        };
+        assert_eq!(
+            resolve_s3_credentials(&in_settings, env(&[("AWS_ACCESS_KEY_ID", "ak")]))
+                .unwrap()
+                .access_key,
+            "s"
+        );
+    }
+
+    #[test]
+    fn byte_sizes_and_booleans_parse_like_es() {
+        assert_eq!(parse_byte_size("100mb"), Some(100 << 20));
+        assert_eq!(parse_byte_size("5MB"), Some(5 << 20));
+        assert_eq!(parse_byte_size("1gb"), Some(1 << 30));
+        assert_eq!(parse_byte_size("1024"), Some(1024));
+        assert_eq!(parse_byte_size("12parsecs"), None);
+        let settings = serde_json::json!({"a": true, "b": "false", "c": "yes"});
+        assert_eq!(setting_bool(&settings, "a").unwrap(), Some(true));
+        assert_eq!(setting_bool(&settings, "b").unwrap(), Some(false));
+        assert!(setting_bool(&settings, "c").is_err());
+        assert_eq!(setting_bool(&settings, "missing").unwrap(), None);
+        let echoed = echo_settings(&serde_json::json!({
+            "bucket": "b", "readonly": true, "access_key": "x", "secret_key": "y", "buffer_size": 5
+        }));
+        assert_eq!(
+            echoed,
+            serde_json::json!({"bucket": "b", "readonly": "true", "buffer_size": "5"})
+        );
     }
 
     #[test]

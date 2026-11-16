@@ -13,17 +13,19 @@
 //! will be removed in `0.4.0`. The handlers here are the canonical
 //! shape going forward.
 //!
-//! The MVP is intentionally narrow: filesystem repository only,
-//! one tarball per snapshotted index, in-memory repository registry
-//! (no `surch.toml` persistence yet — comes in the follow-up phase).
-//! Concurrent writes during a snapshot take are not actively fenced
-//! either; matchID is read-mostly and the operator is expected to
-//! pause ingestion before triggering a take. The follow-up phase
-//! adds the `RwLock<SnapshotState>` write fence and persistent
-//! registration.
+//! Two payload formats (`docs/ops/snapshot-v2.md`): with `SURCH_DATA_DIR`
+//! the sealed L6 index files are uploaded as blake3-addressed blobs
+//! (`segments`, format v2, restored without re-indexing); without it, one
+//! logical tarball of documents per index (v1, restored by re-ingestion).
+//! `fs` and `s3` repositories; the registry is in memory (repositories are
+//! re-registered after a restart, as the matchID Job does on every run).
+//! A v2 take commits and pins one index generation, so concurrent writes
+//! are neither lost nor mixed into the snapshot.
 
+pub mod rename;
 pub mod repository;
 pub mod routes;
+pub mod segments;
 pub mod service;
 
 pub use repository::{
