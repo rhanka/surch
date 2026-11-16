@@ -85,8 +85,11 @@ caps, S3 restore time and artefact size measured.
 - [ ] L5 — Double run / multi-engine bench with matchid (owner order
   2026-11-15: ES, Postgres, DuckDB, Surch; byte-identical responses).
 - [ ] L6 — Persistent index: Surch restarts empty today (blocker).
-- [ ] L7 — Lucene score parity (f32 BM25 without `(k1+1)`, fuzzy blended
-  rewrite, tie order) for the byte-identical bar.
+- [ ] L7 — Lucene score parity for the byte-identical bar: f32 ES 8.6.1
+  `LegacyBM25Similarity` (keeps `(k1+1)`), Lucene boolean sums, fuzzy
+  blended rewrite, `function_score`, Java-float `_score` text — on branch
+  `worktree-agent-a3c9adc9e9b4682ab` (`07264ec`, not merged); ES gate
+  (`docs/wp-d-matchid/l7-score-parity-gate.md`) and tie-order reindex open.
 
 ## Track A - Perf / Optimisation
 
