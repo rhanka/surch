@@ -784,14 +784,14 @@ pub struct S3Repository {
 /// drop on *its* thread (where blocking is allowed).
 struct DedicatedRuntime {
     handle: tokio::runtime::Handle,
-    shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl DedicatedRuntime {
     fn new(name: &str) -> RepositoryResult<Self> {
         let (handle_tx, handle_rx) = std::sync::mpsc::channel::<tokio::runtime::Handle>();
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let thread_name = format!("surch-s3-{name}");
         let join_handle = std::thread::Builder::new()
             .name(thread_name)
@@ -804,12 +804,17 @@ impl DedicatedRuntime {
                     Err(_) => return,
                 };
                 let _ = handle_tx.send(runtime.handle().clone());
-                // Park here until the owning `S3Repository` drops the
-                // matching shutdown sender. `recv()` returns Err when
-                // the sender side has been closed — that's the cue to
-                // tear the runtime down (drop happens on this thread,
-                // where blocking is fine).
-                let _ = shutdown_rx.recv();
+                // Drive the runtime here until the owning `S3Repository`
+                // drops the shutdown sender. L6.2 fix: on a current-thread
+                // runtime only `Runtime::block_on` drives the IO and timer
+                // drivers — `Handle::block_on` from the callers cannot (tokio
+                // docs). The former plain `std::sync::mpsc::recv()` parked
+                // this thread without driving anything, so every S3 request
+                // waited forever for its socket. The runtime is then dropped
+                // on this thread, where blocking is fine.
+                runtime.block_on(async move {
+                    let _ = shutdown_rx.await;
+                });
                 drop(runtime);
             })
             .map_err(|source| RepositoryError::Io {
@@ -974,9 +979,11 @@ fn s3_error_to_repository<E: std::error::Error + Send + Sync + 'static>(
     key: &str,
     error: E,
 ) -> RepositoryError {
+    // `DisplayErrorContext` walks the source chain: the bare `to_string()`
+    // of an SDK service error is often just "unhandled error".
     RepositoryError::Io {
         key: key.to_owned(),
-        source: std::io::Error::other(error.to_string()),
+        source: std::io::Error::other(aws_sdk_s3::error::DisplayErrorContext(&error).to_string()),
     }
 }
 
