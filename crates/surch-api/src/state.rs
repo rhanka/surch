@@ -7662,10 +7662,13 @@ impl InMemoryIndex {
     /// MVP L6: reopen one committed index directory without re-analysing a
     /// single document. Fails closed on any missing/short/corrupt file or
     /// format-version mismatch; the error names the offending file.
-    fn open_persisted(dir: &std::path::Path) -> Result<(String, Self), PersistError> {
+    fn open_persisted(
+        dir: &std::path::Path,
+        full_verify: bool,
+    ) -> Result<(String, Self), PersistError> {
         let manifest = IndexManifest::read(dir)?;
         manifest.collect_garbage(dir)?;
-        manifest.verify_data_files(dir, full_verification_enabled())?;
+        manifest.verify_data_files(dir, full_verify)?;
 
         // MVP L1c: `META` format 3 appends the value kinds; a format-2
         // file still opens with unknown kinds.
@@ -7887,7 +7890,7 @@ impl AppState {
                 std::fs::remove_dir_all(&dir).map_err(|error| PersistError::io(&dir, error))?;
                 continue;
             }
-            let (name, index) = InMemoryIndex::open_persisted(&dir)?;
+            let (name, index) = InMemoryIndex::open_persisted(&dir, full_verification_enabled())?;
             store.indices.insert(name, index);
         }
         let mut aliases = data_dir.read_aliases()?;
@@ -7918,6 +7921,310 @@ impl AppState {
             .as_ref()
             .map(|data_dir| data_dir.root().to_path_buf())
     }
+
+    /// L6.2 snapshot (`docs/ops/snapshot-v2.md`): commit `index` as a new
+    /// generation (the ES snapshot flush), then pin that generation by hard
+    /// linking its `MANIFEST` and every file it references into a private
+    /// directory under `tmp/`. The pinned files are immutable (`source.dat`
+    /// only grows past the recorded prefix), so the upload runs without any
+    /// store lock while writes, refreshes and the garbage collection of
+    /// superseded generations go on. The caller removes [`PinnedIndex::dir`].
+    pub fn pin_index_for_snapshot(&self, index: &str) -> Result<PinnedIndex, SnapshotStateError> {
+        let mut guard = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        let store = &mut *guard;
+        let data_dir = store
+            .data_dir
+            .clone()
+            .ok_or(SnapshotStateError::NoDataDir)?;
+        let aliases: BTreeMap<String, Value> = store
+            .aliases
+            .iter()
+            .filter_map(|(alias, targets)| {
+                targets
+                    .get(index)
+                    .map(|definition| (alias.clone(), definition.clone()))
+            })
+            .collect();
+        let data = store
+            .indices
+            .get_mut(index)
+            .ok_or_else(|| SnapshotStateError::IndexMissing(index.to_owned()))?;
+        data.persist(&data_dir, index)?;
+        let dir = data
+            .persist
+            .as_ref()
+            .map(|state| state.dir.clone())
+            .expect("a successful persist leaves its state behind");
+        let manifest = IndexManifest::read(&dir)?;
+        let metadata = IndexMetadata {
+            aliases,
+            mapping: data.mapping_value(),
+            settings: data.settings_value(),
+        };
+        let doc_count = u64::from(data.live_count);
+        let pin = data_dir.staging_dir("snapshot")?;
+        let pinned = (|| {
+            let link = |name: &str| -> Result<(), PersistError> {
+                let (from, to) = (dir.join(name), pin.join(name));
+                if std::fs::hard_link(&from, &to).is_err() {
+                    std::fs::copy(&from, &to).map_err(|error| PersistError::io(&to, error))?;
+                }
+                Ok(())
+            };
+            let mut files = Vec::new();
+            link(MANIFEST_NAME)?;
+            let manifest_len = std::fs::metadata(pin.join(MANIFEST_NAME))
+                .map_err(|error| PersistError::io(pin.join(MANIFEST_NAME), error))?
+                .len();
+            files.push(PinnedFile {
+                name: MANIFEST_NAME.to_owned(),
+                len: manifest_len,
+                expected_hash: None,
+            });
+            // Framed files: the manifest records the whole length and the
+            // payload hash (checked when the restored index is opened).
+            for framed in [&manifest.meta, &manifest.ids] {
+                link(&framed.name)?;
+                files.push(PinnedFile {
+                    name: framed.name.clone(),
+                    len: framed.len,
+                    expected_hash: None,
+                });
+            }
+            for segment in &manifest.segments {
+                link(&segment.meta.name)?;
+                files.push(PinnedFile {
+                    name: segment.meta.name.clone(),
+                    len: segment.meta.len,
+                    expected_hash: None,
+                });
+                // Data files: the manifest hash covers exactly `[0, len)`.
+                for data_file in segment.postings.iter().chain(segment.subfields.iter()) {
+                    link(&data_file.name)?;
+                    files.push(PinnedFile {
+                        name: data_file.name.clone(),
+                        len: data_file.len,
+                        expected_hash: Some(data_file.hash),
+                    });
+                }
+            }
+            // Every committed directory has a `source.dat` (possibly empty).
+            link(SOURCE_NAME)?;
+            Ok::<_, PersistError>(PinnedIndex {
+                dir: pin.clone(),
+                files,
+                source_len: manifest.source_len,
+                source_chunks: manifest.source_chunks.clone(),
+                doc_count,
+                metadata,
+            })
+        })();
+        drop(guard);
+        if pinned.is_err() {
+            let _ = std::fs::remove_dir_all(&pin);
+        }
+        Ok(pinned?)
+    }
+
+    /// L6.2 restore: a fresh staging directory for the restored index
+    /// `target`, shaped `<data>/tmp/restore-*/i-<target>/` so the files can
+    /// be opened and committed in place before one atomic `rename` makes the
+    /// index live. Returns `(staging root, index dir)`; the caller removes
+    /// the root whatever the outcome (it is also swept at the next start).
+    pub fn restore_staging_dir(
+        &self,
+        target: &str,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf), SnapshotStateError> {
+        let data_dir = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned")
+            .data_dir
+            .clone()
+            .ok_or(SnapshotStateError::NoDataDir)?;
+        let root = data_dir.staging_dir("restore")?;
+        let dir = root.join(crate::persist::encode_index_dir_name(target));
+        std::fs::create_dir_all(&dir).map_err(|error| PersistError::io(&dir, error))?;
+        Ok((root, dir))
+    }
+
+    /// `PUT /<index>/_settings`: mutate the stored settings object of
+    /// `index` and commit it (with `SURCH_DATA_DIR`, as a new generation —
+    /// pending writes are sealed first, as for a mapping change). `false`
+    /// when the index does not exist.
+    pub fn update_index_settings(&self, index: &str, update: impl FnOnce(&mut Value)) -> bool {
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        let Some(data) = store.indices.get_mut(index) else {
+            return false;
+        };
+        update(&mut data.settings);
+        store.persist_index(index);
+        true
+    }
+
+    /// `true` when `name` is a live index or an alias name.
+    pub fn index_or_alias_exists(&self, name: &str) -> bool {
+        let store = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned");
+        store.indices.contains_key(name) || store.aliases.contains_key(name)
+    }
+
+    /// L6.2 restore: make the downloaded index directory `staging` (files
+    /// of a snapshot, verified by the caller) the live index `target`,
+    /// without re-analysing a document.
+    ///
+    /// 1. the snapshot `MANIFEST` is rewritten under the `target` name;
+    /// 2. the index is opened in the staging directory (framed files
+    ///    hash-checked, structure validated), `patch_settings` is applied
+    ///    to its settings (ES `index_settings`) and the result committed
+    ///    there as a new generation;
+    /// 3. under the store write lock: conflicts re-checked, one `rename`
+    ///    into `indices/` (the commit point, a crash before it leaves only
+    ///    `tmp/` garbage), reopen, aliases added and committed.
+    ///
+    /// Returns the live document count.
+    pub fn install_restored_index(
+        &self,
+        staging: &std::path::Path,
+        target: &str,
+        patch_settings: impl FnOnce(&mut Value) -> Result<(), String>,
+        aliases: BTreeMap<String, Value>,
+    ) -> Result<u64, SnapshotStateError> {
+        let data_dir = self
+            .store
+            .read()
+            .expect("in-memory API state lock should not be poisoned")
+            .data_dir
+            .clone()
+            .ok_or(SnapshotStateError::NoDataDir)?;
+        if staging.file_name()
+            != Some(std::ffi::OsStr::new(
+                &crate::persist::encode_index_dir_name(target),
+            ))
+        {
+            return Err(SnapshotStateError::Persist(PersistError::corrupt(
+                staging,
+                "restore staging directory does not match the target index name",
+            )));
+        }
+
+        // 1. Snapshot manifest -> target name.
+        let mut manifest = IndexManifest::decode_file(&staging.join(MANIFEST_NAME))?;
+        manifest.name = target.to_owned();
+        manifest.write(staging)?;
+
+        // 2. Open in staging (data files were blake3-verified on download),
+        //    apply `index_settings`, commit the new generation in place.
+        {
+            let (_, mut index) = InMemoryIndex::open_persisted(staging, false)?;
+            patch_settings(&mut index.settings).map_err(SnapshotStateError::Settings)?;
+            index.persist(&data_dir, target)?;
+        }
+
+        // 3. Go live.
+        let final_dir = data_dir.index_dir(target);
+        let mut store = self
+            .store
+            .write()
+            .expect("in-memory API state lock should not be poisoned");
+        if store.indices.contains_key(target) {
+            return Err(SnapshotStateError::IndexExists(target.to_owned()));
+        }
+        if store.aliases.contains_key(target) {
+            return Err(SnapshotStateError::AliasConflict(target.to_owned()));
+        }
+        if let Some(alias) = aliases
+            .keys()
+            .find(|alias| store.indices.contains_key(*alias))
+        {
+            return Err(SnapshotStateError::AliasIsIndex(alias.clone()));
+        }
+        if final_dir.exists() {
+            return Err(SnapshotStateError::Persist(PersistError::corrupt(
+                &final_dir,
+                "an index directory already exists for the restored name",
+            )));
+        }
+        std::fs::rename(staging, &final_dir)
+            .map_err(|error| PersistError::io(&final_dir, error))?;
+        fsync_dir(&data_dir.indices_dir())?;
+        let (name, index) = match InMemoryIndex::open_persisted(&final_dir, false) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let _ = data_dir.remove_index_dir(target);
+                return Err(error.into());
+            }
+        };
+        debug_assert_eq!(name, target);
+        let live = u64::from(index.live_count);
+        store.indices.insert(name, index);
+        for (alias, definition) in aliases {
+            store
+                .aliases
+                .entry(alias)
+                .or_default()
+                .insert(target.to_owned(), definition);
+        }
+        store.persist_aliases();
+        drop(store);
+        self.invalidate_search_cache(target);
+        refresh_memory_gauges(self, target);
+        Ok(live)
+    }
+}
+
+/// L6.2: one file of a pinned index generation.
+#[derive(Debug, Clone)]
+pub struct PinnedFile {
+    /// File name inside the index directory (and the pin directory).
+    pub name: String,
+    /// Bytes to snapshot: `[0, len)`.
+    pub len: u64,
+    /// blake3 of `[0, len)` when the manifest records it (`.pst` / `.sub`
+    /// data files); framed files carry a payload hash instead.
+    pub expected_hash: Option<[u8; 32]>,
+}
+
+/// L6.2: a committed index generation pinned for a snapshot upload.
+#[derive(Debug, Clone)]
+pub struct PinnedIndex {
+    /// Private directory holding hard links to every file below.
+    pub dir: std::path::PathBuf,
+    /// `MANIFEST` first, then `META`, `IDMP` and the segment files.
+    pub files: Vec<PinnedFile>,
+    /// Committed prefix of `source.dat` (`dir/source.dat`).
+    pub source_len: u64,
+    /// `(end, blake3 of [previous end, end))` chunks of that prefix.
+    pub source_chunks: Vec<(u64, [u8; 32])>,
+    pub doc_count: u64,
+    pub metadata: IndexMetadata,
+}
+
+/// L6.2 errors of the persistence side of snapshot / restore.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotStateError {
+    #[error("segment snapshots require SURCH_DATA_DIR on this node")]
+    NoDataDir,
+    #[error("index [{0}] missing")]
+    IndexMissing(String),
+    #[error("index [{0}] already exists")]
+    IndexExists(String),
+    #[error("an alias named [{0}] already exists")]
+    AliasConflict(String),
+    #[error("alias [{0}] conflicts with an existing index")]
+    AliasIsIndex(String),
+    #[error("{0}")]
+    Settings(String),
+    #[error(transparent)]
+    Persist(#[from] PersistError),
 }
 
 fn create_index_if_missing(

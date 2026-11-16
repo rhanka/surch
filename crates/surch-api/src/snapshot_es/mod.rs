@@ -22,8 +22,10 @@
 //! adds the `RwLock<SnapshotState>` write fence and persistent
 //! registration.
 
+pub mod rename;
 pub mod repository;
 pub mod routes;
+pub mod segments;
 pub mod service;
 
 pub use repository::{

@@ -24,6 +24,7 @@ pub mod error;
 mod es_json;
 pub mod field_caps;
 pub mod index;
+pub mod index_settings;
 pub mod index_template;
 pub mod metrics;
 pub mod mget;
@@ -225,7 +226,13 @@ pub fn app_router_with_state(shared: AppRouterState) -> Router {
         )
         .route(
             "/:index/_doc/:id",
-            put(document::document_handler).post(document::document_handler),
+            put(document::document_handler)
+                .post(document::document_handler)
+                .get(document::get_document_handler),
+        )
+        .route(
+            "/:index/_settings",
+            get(index_settings::get_settings_handler).put(index_settings::put_settings_handler),
         )
         .route("/:index/_refresh", post(index::refresh_index_handler))
         .route(

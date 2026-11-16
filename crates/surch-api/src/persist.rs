@@ -111,6 +111,25 @@ impl DataDir {
         self.root.join(SPILL_DIR)
     }
 
+    /// L6.2: a fresh private directory under `tmp/` for a snapshot pin or a
+    /// restore staging area. Same filesystem as `indices/` (hard links and
+    /// the final `rename` stay atomic) and wiped by [`Self::sweep_orphans`]
+    /// at the next start, so a crash mid-snapshot or mid-restore leaves
+    /// nothing behind.
+    pub(crate) fn staging_dir(&self, tag: &str) -> Result<PathBuf> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let dir = self
+            .spill_dir()
+            .join(format!("{tag}-{}-{nanos}-{seq}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|source| PersistError::io(&dir, source))?;
+        Ok(dir)
+    }
+
     pub(crate) fn indices_dir(&self) -> PathBuf {
         self.root.join(INDICES_DIR)
     }
@@ -498,8 +517,26 @@ impl IndexManifest {
     }
 
     pub(crate) fn read(dir: &Path) -> Result<Self> {
-        let mut input =
-            FramedReader::open(&dir.join(MANIFEST_NAME), MANIFEST_KIND, FORMAT_VERSION)?;
+        let manifest = Self::decode_file(&dir.join(MANIFEST_NAME))?;
+        if encode_index_dir_name(&manifest.name)
+            != dir.file_name().unwrap_or_default().to_string_lossy()
+        {
+            return Err(PersistError::corrupt(
+                dir.join(MANIFEST_NAME),
+                format!(
+                    "manifest names index {:?}, which does not match its directory",
+                    manifest.name
+                ),
+            ));
+        }
+        Ok(manifest)
+    }
+
+    /// Decode a `MANIFEST` file without tying it to its directory name
+    /// (L6.2 restore: the snapshot's manifest names the source index and is
+    /// rewritten under the restored name before the directory goes live).
+    pub(crate) fn decode_file(path: &Path) -> Result<Self> {
+        let mut input = FramedReader::open(path, MANIFEST_KIND, FORMAT_VERSION)?;
         let name = input.get_str()?;
         let generation = input.get_u64()?;
         let next_file_id = input.get_u64()?;
@@ -528,12 +565,6 @@ impl IndexManifest {
             return Err(input.corrupt("source chunks do not cover the recorded source length"));
         }
         input.finish()?;
-        if encode_index_dir_name(&name) != dir.file_name().unwrap_or_default().to_string_lossy() {
-            return Err(PersistError::corrupt(
-                dir.join(MANIFEST_NAME),
-                format!("manifest names index {name:?}, which does not match its directory"),
-            ));
-        }
         Ok(Self {
             name,
             generation,
