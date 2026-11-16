@@ -39,13 +39,20 @@ fn handle_msearch(
     default_index: Option<&str>,
     body: &str,
 ) -> axum::response::Response {
+    let started_at = std::time::Instant::now();
     match parse_msearch_pairs(body, default_index) {
         Ok(pairs) => {
             let responses: Vec<Value> = pairs
                 .into_iter()
                 .map(|pair| build_pair_response(state, pair))
                 .collect();
-            crate::es_json::es_json_response(&json!({ "responses": responses }))
+            // L2b: ES 8.6.1 `MultiSearchResponse.toXContent`
+            // (MultiSearchResponse.java:153-171) writes `took` (whole
+            // request, ms) then `responses`; each item is the search
+            // response body followed by `status`. `preserve_order` keeps
+            // this literal order.
+            let took = started_at.elapsed().as_millis() as u64;
+            crate::es_json::es_json_response(&json!({ "took": took, "responses": responses }))
         }
         Err(error) => error.into_response(),
     }

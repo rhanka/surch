@@ -196,8 +196,33 @@ Owner decisions relayed by matchid (2026-11-16):
   - [x] Empty `bool` (`bool{}`, `bool{should:[]}`) behaves as `match_all`
     instead of HTTP 400 (`ea2cd47`) (breaks `/agg` without criteria and `_msearch` link
     chunks).
-  - [ ] `GET /_cat/indices/{index}?h=creation.date.string` + stored creation
-    date (`/version` endpoint).
+  - [x] `GET /_cat/indices/{index}?h=creation.date.string` + stored creation
+    date (`/version` endpoint): `index.creation_date` in the persisted
+    settings, `strict_date_time` UTC print, `h` / `v` / `format`, patterns
+    and aliases, text table for the restore-job forms (`72a32e6`, branch
+    `worktree-agent-a4fe86f4ac68f17e0`, not merged to `main`).
+  - [ ] L2b — ES 8.6.1 response bytes (`docs/wp-d-matchid/l2b-response-shapes.md`,
+    every expectation `es-source-derived`, no ES run).
+    - [x] Key order of search / hit / msearch / scroll / count / aggs
+      (workspace serde_json `preserve_order`, ordered envelope structs),
+      `_source` in document key order, `sort` values on field sorts,
+      `_score` always written, `max_score` null on field sort / `size: 0`
+      (`72a32e6`).
+    - [x] Root `match_all` / no query score the boost 1.0 and honour
+      `min_score` (`72a32e6`).
+    - [x] Aggregations in request order; terms `doc_count_error_upper_bound`
+      + `sum_other_doc_count`; composite `after_key` first, numeric keys
+      sorted by value; keyword keys normalised (`72a32e6`).
+    - [x] Golden byte tests `tests/es_response_shapes.rs` (11/12
+      es-source-derived) + walk-vs-general-path guard on 3 layouts
+      (`72a32e6`).
+    - [x] `match_phrase`: not emitted by deces-backend (grep matchID
+      `6732755`), positions left out of scope.
+    - [ ] ES 8.6.1 differential run of the golden families (bytes,
+      `took` / `_scroll_id` masked).
+    - [ ] Residual deviations (doc §"Deviations kept"): exact `cardinality`
+      vs HLL++ above 3000, `_score: null` on root `term`-like queries (L7),
+      error envelopes without `root_cause`, `_cat` placeholders and `s`.
   - [ ] Analysis parity: `pattern_replace` char_filter (`alphanum`),
     configurable normalizer chain, real `deces_index.yml` mapping
     (DATE_* are `text` + `index_prefixes{4,6}`, `PRENOMS_NOM`, `PRENOM_NOM`,
@@ -250,9 +275,18 @@ Owner decisions relayed by matchid (2026-11-16):
     back-references, possessive quantifiers, `\p{InBlock}`) are rejected.
   - [x] Fuzzy semantics: OR over tokens (not AND), BM25 on expanded terms,
     `boost` honoured inside `match` objects (L1 `b746f0f`, tests `632c9fd`).
-  - [ ] `date_histogram` keys as epoch ms + empty buckets.
+  - [x] `date_histogram` keys as epoch ms + `key_as_string` (request format,
+    else field format) + empty buckets between first and last
+    (`min_doc_count` 0); composite date source keys formatted or epoch ms
+    (`72a32e6`).
   - [ ] Avoid whole-index materialisation for sort/agg on `.raw` and for
     `/version` (top-1 by date over 29 M docs).
+    - [x] `/version` (`sort` SOURCE desc + `DATE_DECES.raw` desc, no query,
+      size 1): term-dictionary walk with postings intersection, only the
+      window hydrated; equal to the general path on 3 layouts
+      (`72a32e6`). Not measured at 29 M.
+    - [ ] Field sorts with a real query and aggregations on `.raw`
+      (whole-index projection map, `_source` hydration).
   - [ ] `@elastic` client 8.18.2: ship with `SURCH_ELASTIC_PRODUCT_COMPAT=1`
     in the matchID deployment (header required on every 2xx).
   - [ ] Query corpus generator from `buildRequest.ts` + synthetic inputs,
@@ -340,9 +374,10 @@ Owner decisions relayed by matchid (2026-11-16):
     `docs/wp-d-matchid/l7-score-parity-gate.md`.
   - [ ] Differential gate RUN vs ES 8.6.1 (per-hit `_score` bits + token
     text + `explain`), then flip the `lucene-source-derived` marks.
-  - [ ] Residuals (gate doc §6): root `match_all` `_score` omitted,
-    `match_phrase` bag-of-words, hit key order for byte identity, 3+
-    non-power-of-two boost products, repeated keyword value in one doc.
+  - [ ] Residuals (gate doc §6): 3+ non-power-of-two boost products,
+    repeated keyword value in one doc; `match_phrase` bag-of-words (not
+    emitted by deces-backend). Root `match_all` `_score` and hit key order
+    closed by L2b `72a32e6`.
 
 ## Out of scope
 

@@ -283,6 +283,7 @@ pub fn app_router_with_state(shared: AppRouterState) -> Router {
             get(cluster::cluster_health_index_handler),
         )
         .route("/_cat/indices", get(cat::cat_indices_handler))
+        .route("/_cat/indices/:index", get(cat::cat_indices_target_handler))
         .route("/_cat/health", get(cat::cat_health_handler))
         .route("/_cat/aliases", get(cat::cat_aliases_handler))
         .route("/_cat/aliases/:name", get(cat::cat_aliases_by_name_handler))
