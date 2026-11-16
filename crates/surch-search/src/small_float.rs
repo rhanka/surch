@@ -192,43 +192,52 @@ mod tests {
         }
     }
 
-    /// BM25 parity sanity: a Surch score computed against the
-    /// Lucene-quantized `doc_len` must equal the score Lucene itself
-    /// would compute (modulo float epsilon) when fed the same raw
-    /// length. The test feeds raw doc_len=1500 to the encoder and
-    /// applies the BM25 kernel from `scoring.rs` on the reconstructed
-    /// length (1432), then compares to the manual reference formula.
+    /// BM25 parity (lot L7): the score Surch computes on a raw length of
+    /// 1500 is the score Lucene computes on the `SmallFloat` bucket of that
+    /// length (byte 91 -> 1432), i.e. the `cache[91]` entry of
+    /// `BM25Similarity.scorer`. The reference is re-derived here from the
+    /// Java expressions (BM25Similarity.java:105/110/207/236/251,
+    /// LegacyBM25Similarity.java:67), one `float` rounding per Java
+    /// operation, sharing no code with `scoring.rs` (the previous version
+    /// of this test re-applied Surch's own f64 kernel: self-referential).
+    /// `lucene-source-derived`: not yet confirmed by an ES 8.6.1 run.
     #[test]
     fn bm25_score_matches_lucene_quantized_reference() {
         use crate::scoring::{Bm25Config, Bm25TermScorer};
 
-        let config = Bm25Config::default();
         let doc_count = 1_000_000u64;
         let doc_freq = 5_000u64;
-        let avg_doc_len = 320.0f64;
+        let sum_total_term_freq = 320_000_000u64;
         let raw_doc_len = 1500u64;
         let term_freq = 3u64;
 
-        let quantized = byte4_to_int(int_to_byte4(raw_doc_len as u32)) as u64;
+        let norm = int_to_byte4(raw_doc_len as u32);
+        assert_eq!(norm, 91, "Lucene SmallFloat.intToByte4(1500)");
+        let quantized = byte4_to_int(norm) as u64;
         assert_eq!(quantized, 1432, "Lucene bucket reconstruction");
 
-        let scorer = Bm25TermScorer::new(config, doc_count, doc_freq, avg_doc_len)
+        let avg_doc_len = sum_total_term_freq as f64 / doc_count as f64;
+        let scorer = Bm25TermScorer::new(Bm25Config::default(), doc_count, doc_freq, avg_doc_len)
             .expect("scorer constructs");
-        let surch_score = scorer.score(term_freq, quantized);
+        let surch_score = scorer.score_f32(term_freq, quantized);
 
-        // Reference: BM25 kernel applied by hand with the same kernel
-        // we ship (left-associated to stay bit-identical).
-        let k1 = config.k1;
-        let b = config.b;
-        let freq = term_freq as f64;
-        let len_norm = quantized as f64 / avg_doc_len;
-        let denom = freq + k1 * (1.0 - b + b * len_norm);
-        let tf_norm = freq * (k1 + 1.0) / denom;
-        let idf = (1.0 + (doc_count as f64 - doc_freq as f64 + 0.5) / (doc_freq as f64 + 0.5)).ln();
-        let reference = idf * tf_norm;
+        // One binary32 rounding per Java float operation (binary64 then
+        // rounding is the correctly rounded binary32 result for + - * /).
+        let r = |x: f64| x as f32;
+        let w = f64::from;
+        let (k1, b) = (1.2_f32, 0.75_f32);
+        let idf = r((1.0 + ((doc_count - doc_freq) as f64 + 0.5) / (doc_freq as f64 + 0.5)).ln());
+        let avgdl = r(sum_total_term_freq as f64 / doc_count as f64);
+        let length = byte4_to_int(norm) as f32;
+        let b_len_avg = r(w(r(w(b) * w(length))) / w(avgdl));
+        let cache = r(1.0 / w(r(w(k1) * w(r(w(r(1.0 - w(b))) + w(b_len_avg))))));
+        let weight = r(w(r(1.0 + w(k1))) * w(idf));
+        let denom = r(1.0 + w(r(term_freq as f64 * w(cache))));
+        let reference = r(w(weight) - w(r(w(weight) / w(denom))));
 
-        assert!(
-            (surch_score - reference).abs() < 1e-12,
+        assert_eq!(
+            surch_score.to_bits(),
+            reference.to_bits(),
             "Surch {surch_score} vs Lucene-quantized reference {reference}"
         );
     }

@@ -4,6 +4,7 @@
 pub mod collector;
 pub mod execution;
 pub mod fuzzy;
+pub mod java_float;
 pub mod maxscore;
 pub mod query;
 pub mod scoring;

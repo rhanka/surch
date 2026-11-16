@@ -1399,7 +1399,14 @@ impl FieldLengthStats {
             return;
         }
         if !norms_enabled {
+            // L7: no per-doc norm, but `sumTotalTermFreq` still feeds
+            // Lucene's `avgFieldLength` (`LENGTH_TABLE[1] / avgdl` in the
+            // norm cache). For keyword fields (`IndexOptions.DOCS`) Lucene
+            // reports `sumTotalTermFreq == sumDocFreq`; `doc_len` here is
+            // the number of indexed values, equal to the unique-term count
+            // unless one document repeats a value.
             self.doc_count += 1;
+            self.total_terms += doc_len;
             return;
         }
         let idx = doc_id as usize;
@@ -3652,6 +3659,21 @@ fn analyze_document(
                     let analyzed_sub = subfield_terms(sub_mapping, value, mapping.analysis());
                     if let Some(stored) = lowest_position_term(&analyzed_sub) {
                         subfield_values.push((path.clone(), stored));
+                    }
+                    // L7: a multi-field sub-field (`NOM.raw`) is its own
+                    // Lucene field with its own `CollectionStatistics`
+                    // (`docCount`, `sumTotalTermFreq`): record its length
+                    // like any top-level field so BM25 can score it.
+                    let sub_token_count = analyzed_sub
+                        .values()
+                        .map(|positions| positions.len() as u64)
+                        .sum::<u64>();
+                    if sub_token_count > 0 {
+                        let sub_norms = sub_mapping.norms_enabled();
+                        let (doc_len, field_norms_enabled) =
+                            field_lengths.entry(path.clone()).or_insert((0, sub_norms));
+                        *doc_len += sub_token_count;
+                        *field_norms_enabled = *field_norms_enabled || sub_norms;
                     }
                     for (term, positions) in analyzed_sub {
                         postings.push((path.clone(), term, positions));

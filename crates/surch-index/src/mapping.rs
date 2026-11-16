@@ -1177,9 +1177,10 @@ impl IndexMapping {
         }
     }
 
+    /// Whether `field` (a top-level field or, since L7, a multi-field
+    /// sub-field path such as `NOM.raw`) stores norms.
     pub fn norms_enabled(&self, field: &str) -> bool {
-        self.fields
-            .get(field)
+        self.resolve_field(field)
             .map(FieldMapping::norms_enabled)
             .unwrap_or_else(|| default_norms_for(FieldType::Text))
     }

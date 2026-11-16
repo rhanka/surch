@@ -162,10 +162,11 @@ Owner decisions relayed by matchid (2026-11-16):
       O(candidates x expanded terms), follow-up); full-scan baseline
       (`wildcard`) median 151.8 ms.
     - [ ] B1 oracle re-run on `ci-k8s` and 1.36 M smoke latency per form.
-  - ES fuzzy deviations accepted (L1): BM25 kernel is Surch's (keeps
-    `(k1+1)`, f64, lot L7) applied over the expanded terms with Lucene's
-    per-term similarity boost and blended (max) doc freq per token — ranking
-    follows ES's `top_terms_blended_freqs_N`, absolute scores do not; the
+  - ES fuzzy deviations accepted (L1): scoring over the expanded terms with
+    Lucene's per-term similarity boost and blended (max) doc freq per token
+    follows ES's `top_terms_blended_freqs_N`; since L7 the kernel is ES 8.6.1
+    `LegacyBM25Similarity` in f32 (absolute scores lucene-source-derived,
+    ES gate pending); the
     `fuzzy` query still analyses its `value` and ANDs the tokens (ES takes
     one raw term); a `_source` re-check of a fuzzy clause (only under
     `must_not` or a should-disjunction superset) does not apply
@@ -304,18 +305,44 @@ Owner decisions relayed by matchid (2026-11-16):
     loaded without re-indexing).
   - [ ] Proof: restart at 29 M under the target caps, time to first query.
 - [ ] L7 — Lucene score parity (needed for the byte-identical bar).
-  - [ ] BM25 as Lucene 9 `BM25Similarity`: f32, no `(k1+1)` factor,
-    256-entry norm cache; Surch scores are ~2.2x ES today, which changes
-    `min_score: 5` full-text result sets (`buildRequest.ts:506`).
-  - [ ] Boolean scorer sums (double accumulation then f32 cast per scorer).
-  - [ ] Fuzzy `TopTermsBlendedFreqScoringRewrite` (max_expansions 50,
-    blended df/ttf, per-term boost `1 - ed/min(len)`).
-  - [ ] `function_score` arithmetic as ES; `_score` serialized as f32 the
-    way ES 8.6.1 (Jackson/JDK) prints it.
-  - [ ] Tie order: index Surch in the `sort:_doc` order exported from the
-    reference ES index (1 shard) so docid tie-breaks match.
-  - [ ] Differential gate: `_score` per hit vs ES 8.6.1, with ES `explain`
-    to localise each gap.
+  Branch `worktree-agent-a3c9adc9e9b4682ab` (base `01f2d94`), not merged to
+  `main`. Every expectation is `lucene-source-derived` until the ES gate runs.
+  - [x] BM25 kernel in strict f32 as Lucene 9.4.2 `BM25Similarity` (idf,
+    `avgFieldLength`, `LENGTH_TABLE` norm cache, `weight - weight / (1f +
+    freq * normInverse)`): `6805d18`. Finding: ES 8.6.1's default similarity
+    is `LegacyBM25Similarity`, which passes `boost * (1 + k1)` to Lucene
+    (`SimilarityService.java:48`, `LegacyBM25Similarity.java:66-67`), so ES
+    scores KEEP the `(k1+1)` factor; the "~2.2x" premise was wrong and the
+    `min_score: 5` result sets were already on the right scale (deces_v1
+    replay: totals and the 50-hit order are unchanged by L7).
+  - [x] Boolean combination (`ConjunctionScorer` / `DisjunctionSumScorer` /
+    `WANDScorer` double sum then `(float)`, `ReqOptSumScorer` float add,
+    FILTER-only `0`, empty `bool` = `match_all`), top-down boost threading,
+    duplicate-token weight boost, constant-score clauses, numeric `match`
+    constant, keyword `freq = 1` / no norms, multi-field sub-field stats
+    (`NOM.raw`), `min_score` as float, MaxScore admission on the suffix
+    bound compared in f32, fused / streamed paths rounded once: `70d3e6a`.
+  - [x] Fuzzy `TopTermsBlendedFreqScoringRewrite`: per-term boost
+    `1.0f - (float) ed / (float) min(cp(term), termLength)` (clamped `>= 0`
+    at clause build), blended df = max, SHOULD double sum: `70d3e6a`
+    (scoring) + `d3a2694` (tests).
+  - [x] `function_score` arithmetic as ES 8.6.1 (`CombineFunction` in
+    double then float, `LOG1P = log10`, AVG over weights; no-function
+    wrapper threads its boost): `70d3e6a` + `e9a74a0` (tests).
+  - [x] `_score` / `max_score` serialized as Jackson 2.13.3 +
+    JDK 19.0.1 `Float.toString` (`1.0E-4`, `0.33333334`, `1.2345678E7`):
+    `07264ec`.
+  - [ ] Tie order: Surch breaks ties on ascending internal id like
+    `HitQueue`; index Surch in the `sort:_doc` order exported from the
+    reference ES index (1 shard, force-merged) so docid tie-breaks match.
+  - [x] Differential gate specified (request list, comparator spec in Rust
+    `b1_oracle`, explain-leaf localisation):
+    `docs/wp-d-matchid/l7-score-parity-gate.md`.
+  - [ ] Differential gate RUN vs ES 8.6.1 (per-hit `_score` bits + token
+    text + `explain`), then flip the `lucene-source-derived` marks.
+  - [ ] Residuals (gate doc §6): root `match_all` `_score` omitted,
+    `match_phrase` bag-of-words, hit key order for byte identity, 3+
+    non-power-of-two boost products, repeated keyword value in one doc.
 
 ## Out of scope
 
